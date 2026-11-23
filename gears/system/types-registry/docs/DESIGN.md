@@ -79,7 +79,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-nfr-lookup-latency` | Exact lookup p95 < 10 ms | Identity, current-state read, availability | Derived references, keyed current-state joins, SQL availability evaluation, no plugin call on managed reads, and one cached authorization decision per request rather than per entity. | Benchmark profile in §4. |
 | `cpt-cf-types-registry-nfr-query-latency` | Bounded search p95 < 100 ms (P2) | Discovery and query assistance | Indexed exact managed filters before the page limit, GTS matching of external results, and bounded source-major federation. | Benchmark profile in §4. |
 | `cpt-cf-types-registry-nfr-multi-pod-correctness` | Every pod's first post-commit read sees the mutation | Database, outbox worker, derived caches | One authoritative database, leased outbox dispatch, idempotent guarded commits, and no process-local authority. | Integration tests for duplicate delivery, lease expiry, concurrent family admission, and cross-pod read-after-commit. |
-| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current after the client observes the mutation | SDK client cache | Projection-scoped validators, fail-closed revalidation, immediate invalidation of submitted keys, and bounded freshness for indirectly affected keys. | Integration tests in §3.3, *The client-side cache*. |
+| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current after the client observes the mutation | SDK client cache | Entity-state validators, projection-aware SDK conditions, fail-closed revalidation, immediate invalidation of committed keys, and bounded freshness for indirectly affected keys. | Integration tests in §3.3, *The client-side cache*. |
 
 #### Key ADRs
 
@@ -661,6 +661,8 @@ Reads are authorized under two actions of their own, `read` and `list`. `cpt-cf-
 
 Visibility cannot stand in for that check because it is a property of the requesting **tenant**. Without a grant, every subject of a tenant — an ordinary end user, a narrowly scoped third-party token, a leaked service credential — reads every contract that tenant can see, and type names and schemas describe a product's structure. `cpt-cf-adr-two-plane-auth` also puts the `PolicyEnforcer` on the tenant-plane path for entity state; AuthZ exemption belongs to the platform plane alone.
 
+> Superseded in P0 SPEC C6: reads take one decision per returned entity through batch evaluation (#5522) and report a denied key as `not_found`. This section awaits its rewrite.
+
 **One evaluation covers one request, not one key.** A `batchGet` of 500 keys is a single `read` decision, because a Region-free grant cannot answer differently per key and 500 round trips would end `cpt-cf-types-registry-nfr-lookup-latency` outright. A denial is therefore one `403` for the request rather than a per-key outcome, and `EntityLookup` keeps its four states. The grant is evaluated before the ancestor chain is fetched and before any entity lookup, as on the write path and for the same reason: a refusal must not depend on what exists. Preceding existence is also what makes one denial shape cover a free, visible, invisible, or reserved identifier alike.
 
 A read decision is a bare boolean: `require_constraints` is `false`, and `capabilities` and `supported_properties` are both empty. `false` is the documented pattern for a read whose PEP wants no SQL-level enforcement, and here the fence is not PDP-derived at all — the registry builds it from the tenant hierarchy and applies it whatever the answer was, so the boolean gates the operation while the scope stays local. A constraint arriving anyway is refused rather than applied, by the ordinary rule that a constraint naming a property the PEP never advertised is a contract violation resolved as a denial. The cost is that a deployment cannot express a data-scoping read policy at all: such a policy can only come back as a whole-request deny.
@@ -1010,9 +1012,18 @@ Deletion has two spellings of one operation. `:batchDelete` is a body-based cust
 
 ##### Conditional reads
 
-For one read, the validator is both HTTP `ETag` and SDK `Validator`; matching `If-None-Match` returns a bodyless `304` **carrying the `ETag`**, per [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified) and for the same reason the batch returns one on `unchanged`. Batch validators travel beside individual keys, in each item's `if_none_match`, because one header cannot represent them; each result may be `unchanged`, and the response remains `200` even when all are unchanged. The two body fields are the two header names, lowercased — `if_none_match` going out and `etag` coming back — so a reader who knows the single-read surface already knows this one, and a caller copying a value between them cannot misread which direction it travels. An `If-None-Match` **header** on `:batchGet` is refused rather than ignored, because a caller that sent one believes the batch is conditional and it is not. A validator names the entity's state and is the same under every projection, detected by recomputation rather than stored reader state. `unchanged` therefore says that what the client holds is current, not which fields it holds: a client sends a validator only for a read whose projection the representation it holds covers. The SDK enforces this with a typed condition bound to its entity and the fields it covers; a raw HTTP client owns it, as it owns sending an `If-None-Match` only with a URI it holds a response for.
+A matching `If-None-Match` on an exact read returns a bodyless `304` with the
+`ETag` ([RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified)).
+In `:batchGet`, each item carries its own `if_none_match` and each `unchanged` result
+returns its `etag`. The batch status stays `200`. The route refuses an
+`If-None-Match` header because it cannot express per-key conditions.
 
-**Where a client gets the validator it later sends back.** Both exact-read surfaces hand out and take back the same validator for one key, so it may cross between them — from a `GET` to a `:batchGet` item or back — for the same entity, under a `$select` the held representation covers:
+The registry recomputes one validator per entity state across projections. Send it
+only for its entity and a projection the held snapshot covers. The SDK binds both
+in its typed condition. Raw HTTP callers track them.
+
+The same validator can move between an exact read and a `:batchGet` item for the
+same entity when the held representation covers the requested `$select`.
 
 | Surface | Hands the validator out as | Takes it back as |
 |---|---|---|
@@ -1037,13 +1048,22 @@ Per `cpt-cf-types-registry-principle-derive-not-store`, validators are computed 
 | routing generation | — | ✓ |
 | `external_revision` | — | ✓, verbatim |
 
-Routing generation appears only externally: claim changes cannot affect managed results under ADR-0011, but must invalidate tokens tied to an old source. `resolution_fingerprint` appears only for Type Schemas, because Instances have no derived form. When subject and Context Tenant are the same, one chain version fills both roles; a platform read has no subject visibility chain and includes a Context Tenant chain whenever it names a Context Tenant. That chain enters the validator whether or not availability is selected, because one state has one validator under every `$select` of one scope (see *Projection is not a validator input*): a narrow read's validator must also answer for a wider read that selects availability.
+External validators include routing generation to reject tokens from an old source
+(ADR-0011). Only Type Schemas have a `resolution_fingerprint`. Tenant-plane reads
+include the subject visibility chain. A named Context Tenant contributes its chain
+to every projection, including those without availability. One chain fills both
+roles when the tenants coincide.
 
 The plugin token must be scoped to `(entity, tenant)` and change whenever any source-owned response field that affects the platform-visible result changes: canonical content, the effective artifacts of a Type Schema, source lifecycle, ownership scope, or source-owned tenant enablement. It need not change for platform-owned availability or visibility, which the chain-version inputs above cover; equal tokens under equal platform inputs therefore identify an equal platform-visible result. A plugin unable to guarantee this must always answer conditional reads as changed. The registry cannot verify that source-owned state, so it delegates the comparison.
 
 ##### Projection is not a validator input
 
-Every projection of one state carries one validator, so a client cache keeps one entry per entity, merges answers read under the same validator and confirms all of them with one conditional read. This is RFC 9110-correct: an `ETag` is compared only for the target resource, `$select` makes each projection its own URI, and the validator changes whenever the bytes of any projection change. The converse need not hold: a dependency refresh moves a Type Schema's validator even when its `content` is byte-identical, which costs a transfer, never a false `unchanged`. The cost is that a validator no longer tells the registry which fields its holder has: the client sends one only for a read its held representation covers (see *Conditional reads*). A validator also carries no identity — two entities in the same state may share one — so it is compared only with the current validator of the key it accompanies, and the SDK's condition is bound to its entity. A Type Schema's fingerprint enters every projection, so a dependency refresh can also cost an extra transfer for `$select=content`.
+A shared validator lets the client merge projections of one state and confirm them
+with one conditional read. It remains strong under RFC 9110. Each `$select` is a
+separate URI, and the validator changes whenever any projection's bytes change.
+A dependency refresh may also change the validator for byte-identical `content`,
+causing an extra transfer. Equal validators can occur on different entities, so
+each comparison uses the accompanying key.
 
 ##### Wire form
 
@@ -1284,7 +1304,11 @@ The single-entity spelling: one item's worth of `:batchDelete`, with the item sp
 
 This spelling carries no `publisher`, so it is a tenant-plane route only; on the platform plane a deletion goes through `:batchDelete`.
 
-**The precondition is not `If-Match`,** even though one entity would fit in one header. `If-None-Match` on the read of this same resource already carries a *validator* — naming the entity's state under every projection, and including `resolution_fingerprint`, which the caller's write precondition deliberately excludes (the worker's drift check includes it). Putting a `resource_version` in `If-Match` would give one resource two unrelated token vocabularies in two conditional headers, and a caller that reasonably fed the `ETag` back into `If-Match` would be refused for a reason the shape does not explain. So `If-Match` is not merely unused here: it is **refused** if sent on either deletion route, rather than ignored, because a caller that sent one believes the request is conditional in the RFC 9110 §13.1.1 sense — and it is not, per the next paragraph. `expected_resource_version` is the same name the batch body uses, taken from the entity body rather than from any response header.
+**Deletion uses `expected_resource_version` from the entity body.** The read
+validator includes `resolution_fingerprint`, which the write precondition omits
+and the worker's drift check still uses. Both deletion routes refuse `If-Match`
+to avoid giving one resource two incompatible token formats or accepting a
+condition they cannot enforce (RFC 9110 §13.1.1).
 
 **A precondition failure stays asynchronous.** The split is by mistake class, not by route:
 
@@ -1457,10 +1481,8 @@ pub enum Projection {
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
 pub enum EntityLookup {
-    /// `etag` is metadata outside `$select`; it names the entity's state and is
-    /// the same under every projection. Named for
-    /// the header it is carried in rather than for its `Validator` type, so
-    /// that it pairs by sight with `BatchGetItem::if_none_match_for`.
+    /// `etag` names the entity's state across projections. It is outside `$select`
+    /// and pairs with `BatchGetItem::if_none_match_for`.
     Found { snapshot: Box<EntitySnapshot>, etag: Validator },
     /// Validator matched; the snapshot was not transferred. The `etag` is
     /// still returned — RFC 9110 §15.4.5 — so every result but `NotFound`
@@ -1716,13 +1738,13 @@ No authored-content digest is selectable: reconciliation selects `content` and c
 
 SDK selection uses field constants and a value projection with `light()`, `with(&[…])`, and `full()`. A type parameter would break object-safe `hub.get::<dyn TypesRegistryApi>()`.
 
-Projection changes naturally cause validator mismatch and a full result. Inapplicable fields are absent; `kind` disambiguates them.
+The SDK sends a validator only when the held snapshot covers the requested projection. Inapplicable fields are absent and `kind` identifies which ones apply.
 
 ##### Resolution and availability
 
-Forward and reverse resolution are batch reads: `EntityKey` accepts either form and results carry both. `$select=gts_uuid` or `$select=availability` supplies the narrow form (identity is always returned) without another operation.
+`POST /entities:batchResolve` accepts GTS IDs and Registry References and returns the stored pair for each distinct key. The pair remains resolvable after deletion. Use a field read for lifecycle status or availability.
 
-Deleted reverse resolution succeeds with deleted state; invisible and never-issued references both return `not_found` (ADR-0009). Since references encode no source, unresolved ones walk plugins in order, batched once per plugin, without ADR-0007 memo or circuit breaker.
+Invisible and never-issued references both return `not_found` (ADR-0009). When P1 adds federation, unresolved references walk plugins in order in one batch per plugin without ADR-0007 memoization or circuit breaking.
 
 Availability is also a read and is in the default set. Tenant-plane `tenant_id` defaults to the subject tenant. Naming another calls `tenant-resolver.is_ancestor` with the propagated `SecurityContext`, subject tenant as ancestor, named Context Tenant as descendant, and barrier traversal disabled; `false`, authorization denial, absence, or resolver failure is a fail-closed refusal. This is the platform-authorized relation check required by the PRD, not a registry `read` grant. The platform plane has no default.
 
@@ -1730,7 +1752,7 @@ Visibility always uses the subject; availability uses the Context Tenant. Mixing
 
 ##### Extension methods
 
-Single and kind-narrowed reads compose `batch_get_entities`; `delete_entity` composes `delete_entities`. Helpers live on `…Ext` traits because contract default bodies denote optional methods. The API stays object-safe for `hub.get::<dyn TypesRegistryApi>()`, with one primitive implementation per plane.
+Single and kind-narrowed snapshot reads use `batch_get_entities`. Identity helpers use `batch_resolve_identities`, and `delete_entity` uses `delete_entities`. Helpers live on `…Ext` traits because contract default bodies denote optional methods. The API stays object-safe for `hub.get::<dyn TypesRegistryApi>()`.
 
 Kind narrowing costs no round trip: the kind is the trailing `~` of the identifier, so `get_type_schema` given an Instance identifier fails locally. Callers compare only canonical authored content when deciding whether a definition needs registration; dependency-derived effective content is not part of content equality.
 
@@ -1740,22 +1762,29 @@ Kind narrowing costs no round trip: the kind is the trailing `~` of the identifi
 
 The P1 SDK cache required by `cpt-cf-types-registry-fr-client-cache` lives in each consumer, not the registry. Server-side and replica caches validate against committed tokens before use. The SDK cache instead makes the explicit bounded-freshness trade below and offers authoritative reads through `fresh` or a zero window.
 
-Each client instance stores one entry per `(entity, visibility context, Context Tenant)`, containing the snapshot, the fields it covers, its validator, and the last-confirmed instant. A read is answered from the entry only when the entry covers its normalized projection, and is cut down to exactly that projection. An answer under the entry's validator is merged into the entry, unless the two together would not fit the store, in which case the entry is kept as it was; an answer under a new validator replaces it, and one too large to keep still removes the stale entry. Plane is implicit in the client instance. On the tenant plane, visibility context is the subject tenant from `SecurityContext`; on the platform plane it is a fixed unrestricted marker. Principal identity is otherwise absent because results are not grant-filtered: a `read` grant is gear-wide, so two subjects of one tenant that both hold it see identical content. The consequence is that this cache is not an authorization boundary — within the freshness window a subject whose grant was revoked may still be served an entry an authorized one populated, which is accepted because the consumer process legitimately holds that content already and a strict caller uses `fresh`. Keying by subject instead would multiply entries per end user for the same bytes. This prevents a shared client instance from serving a snapshot visible to one tenant subject to another subject that names the same Context Tenant.
+Each client instance stores one snapshot per entity and representation scope.
+It serves only fields it holds. A reply under the same validator adds fields
+if the merge fits. A new validator replaces the snapshot and drops the old one
+even when the replacement is too large to keep. The registry supplies the
+identifier and Registry Reference that address one snapshot (ADR-0001).
 
-Each `Found` supplies the canonical identifier and its Registry Reference. The client
-uses these two keys to address the same snapshot. It learns the binding from the
-registry and can resolve either spelling while the pair is cached. The registry's
-assignment and stability guarantees are defined in ADR-0001.
+The identity LRU learns positive pairs from checked reads, resolutions and discovery.
+It has its own entry limit and no expiry. A tenant client answers a pair only to a
+read context that a read or resolution showed it to within the window. Observed mutations leave identities
+intact because tombstones still resolve. A lookup checks the identity LRU,
+then a fresh snapshot, then `:batchResolve`. After purge or a logical registry
+change, recreate the cached client or restart its consumer.
 
-Identifier/Registry Reference resolution on the platform plane is answered from a separate, entry-bounded identity store kept beside the snapshots: positive only, without window, validator or lifecycle, learned from checked reads that found the entity and left alone by observed mutations, because identity is permanent and a deleted entity still resolves. Unknown keys are read through the snapshot entries under the mandatory fields. A future purge or a change of logical registry resets it.
-
-The P0 tenant client shares one snapshot per entity across all tenants that can see
-it. A separate LRU of visibility confirmations gates reuse. It expires confirmations
-with the freshness window and bounds their total count by `max_entries`. Each
-`NotFound` revokes only the caller's confirmation. The resolving REST client also
-keys confirmations by the bearer used for the registry read. When representations
-depend on visibility context or Context Tenant, the snapshot key must reflect those
-dimensions.
+P0 shares snapshots across tenants. A separate LRU holds up to `max_entries`
+confirmations keyed by entity and read context: subject, subject type, subject
+tenant and raw token scopes. Anonymous calls bypass it. `NotFound` revokes and
+fences that read context's confirmation. Refusals change none: a context reused
+after the registry refused its bearer keeps them until the window ends. Authorization
+and visibility changes can take effect at the next registry read, which `fresh`
+forces. The cache serves content the consumer already holds. Authorization
+remains the registry's responsibility. If a future representation varies by
+visibility context or Context Tenant, include both dimensions in its key. Gear-wide read grants
+do not currently require per-principal copies of the snapshot.
 
 ##### Freshness window
 
@@ -1772,9 +1801,9 @@ Availability drives the default because ADR-0010 may change it without entity mu
 | Knob | Default | Why this value |
 |---|---|---|
 | Freshness window | 30 s | Bounds how long a retired contract can be served as available, while letting a hot path serving hundreds of requests a second revalidate a given entity twice a minute rather than on every call. `0` is meaningful and supported |
-| `max_size_bytes` | 64 MiB | Counts compact JSON snapshot bytes and raw validator bytes. An individual entry larger than this budget is returned to the caller without being retained. |
+| `max_size_bytes` | 64 MiB | Compact JSON documents, GTS ID, raw validator and 256 bytes per snapshot. Oversized snapshots are returned without caching. |
 | `max_entries` | 16 384 snapshots | Limits per-entry overhead for small snapshots. The store evicts least-recently-used entries to meet both limits. Zero disables snapshot retention. |
-| `max_identity_entries` | 16 384 entries | One Registry Reference and one identifier each, at most 1 KB of identifier text, so a few MB at typical lengths; an entry count fits because an identity, unlike a resolved document, has a small fixed ceiling. `0` keeps none: resolutions are then ordinary light reads through the snapshot entries |
+| `max_identity_entries` | 16 384 identities | Bounds pairs of a Registry Reference and an identifier (up to 1 KiB). Set to zero to resolve via fresh snapshots or the registry. |
 | `fresh` on a read | false | Bypasses the window for one call and revalidates unconditionally. One boolean, and it is what makes the cache safe to leave enabled for a caller that occasionally needs an authoritative verdict |
 
 ##### What is not cached
@@ -1782,7 +1811,7 @@ Availability drives the default because ADR-0010 may change it without entity mu
 - **`NotFound`.** Registration is followed by a read often enough that caching absence would make a newly admitted entity invisible for the length of the window.
 - **`Failed`.** A source that could not answer said nothing about the entity; retaining that as knowledge is the conversion of unavailability into absence that ADR-0002 forbids.
 - **A `ConcreteReferenceSet`.** It is not a snapshot, and a validator over it would have to cover the availability inputs of every member.
-- **Discovery pages and snapshots from their items.** Each list request reads the registry. The P0 platform client learns each returned identifier and Registry Reference for future `resolve_*` calls. The page supplies no snapshot validator.
+- **Discovery pages and item snapshots.** Both caches learn their identity pairs. Discovery carries no snapshot validators and shows pairs to no read context.
 - **An operation resource.** `get_operation` reads progress that changes precisely because it is being polled.
 
 ##### Revalidation

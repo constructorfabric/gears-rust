@@ -1,11 +1,9 @@
 //! Directory-resolving wrappers over both REST clients, as `#[toolkit::consumes]` registers
 //! them for a consumer the registry is not linked into (SPEC §8.4).
 //!
-//! Each call that reaches the transport resolves the registry anew and rebuilds the client
-//! only when the endpoint changes (`DirectoryResolvingClient`). While the directory has no
-//! live registry, or cannot answer, such a call is a canonical `ServiceUnavailable`; nothing
-//! falls back to another implementation. A read the client cache answers inside
-//! its window does not reach the transport.
+//! Forwarded calls resolve through the directory. The SDK rebuilds the client
+//! only when the endpoint changes. A missing registry or directory failure
+//! returns `ServiceUnavailable`. Cache hits bypass resolution.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,29 +26,34 @@ use crate::models::{
     Operation, RegisterEntitiesRequest, RegistrationOperation,
 };
 
-/// [`PlatformTypesRegistryApi`] on whichever registry the directory names, behind the SDK
-/// client cache (SPEC §8.3) with [`CacheSettings::default`]: one cache for the logical
-/// client, above endpoint resolution, so a read the cache answers resolves nothing and
-/// replicas the directory rotates between share it. The tuning's internal-token source
-/// rides on every client built, so each attempt carries the token.
-///
-/// `#[toolkit::consumes]` builds this type with no cache settings of its own; a consumer
-/// needing others composes [`CachedPlatformTypesRegistry`] over its own client.
+/// One platform cache across resolved replicas. Registry requests use the internal
+/// token. Set both entry limits to zero to disable retention.
 pub struct PlatformTypesRegistryApiRestResolvingClient {
     inner: CachedPlatformTypesRegistry,
 }
 
 impl PlatformTypesRegistryApiRestResolvingClient {
-    /// Resolve `from_gear` through `resolver` on every call the cache does not answer.
+    /// Use [`CacheSettings::default`], as in `#[toolkit::consumes]`.
     #[must_use]
     pub fn new(
         resolver: Arc<dyn EndpointResolver>,
         from_gear: impl Into<String>,
         tuning: ClientTuning,
     ) -> Self {
+        Self::with_cache_settings(resolver, from_gear, tuning, CacheSettings::default())
+    }
+
+    /// Use explicit cache settings.
+    #[must_use]
+    pub fn with_cache_settings(
+        resolver: Arc<dyn EndpointResolver>,
+        from_gear: impl Into<String>,
+        tuning: ClientTuning,
+        cache: CacheSettings,
+    ) -> Self {
         let resolving = PlatformResolving::new(resolver, from_gear, tuning);
         Self {
-            inner: CachedPlatformTypesRegistry::new(Arc::new(resolving), CacheSettings::default()),
+            inner: CachedPlatformTypesRegistry::new(Arc::new(resolving), cache),
         }
     }
 }
@@ -193,28 +196,37 @@ impl PlatformTypesRegistryApi for PlatformResolving {
     }
 }
 
-/// [`TypesRegistryApi`] on whichever registry the directory names, with an SDK cache
-/// shared across tenants. Each request to the registry forwards the caller's bearer.
+/// Tenant cache over directory-resolved replicas. Hits need the read context's own confirmation.
+/// Registry requests forward the caller's bearer. Zero `max_entries` disables snapshot and
+/// confirmation retention; pairs follow `max_identity_entries` (see [`CacheSettings`]).
 pub struct TypesRegistryApiRestResolvingClient {
     inner: CachedTypesRegistry,
 }
 
 impl TypesRegistryApiRestResolvingClient {
-    /// Resolve `from_gear` through `resolver` on calls that reach the registry.
+    /// Use [`CacheSettings::default`], as in `#[toolkit::consumes]`.
     #[must_use]
     pub fn new(
         resolver: Arc<dyn EndpointResolver>,
         from_gear: impl Into<String>,
         tuning: ClientTuning,
     ) -> Self {
+        Self::with_cache_settings(resolver, from_gear, tuning, CacheSettings::default())
+    }
+
+    /// Use explicit cache settings.
+    #[must_use]
+    pub fn with_cache_settings(
+        resolver: Arc<dyn EndpointResolver>,
+        from_gear: impl Into<String>,
+        tuning: ClientTuning,
+        cache: CacheSettings,
+    ) -> Self {
         let inner = DirectoryResolvingClient::new(resolver, from_gear, tuning, |config| {
             TypesRegistryApiRestClient::new(config).map_err(TransportError::network)
         });
         Self {
-            inner: CachedTypesRegistry::new_rest(
-                Arc::new(TenantResolving { inner }),
-                CacheSettings::default(),
-            ),
+            inner: CachedTypesRegistry::new(Arc::new(TenantResolving { inner }), cache),
         }
     }
 }
@@ -237,7 +249,7 @@ impl TypesRegistryApi for TypesRegistryApiRestResolvingClient {
         self.inner.list_entities(ctx, request).await
     }
 
-    /// The cache's visibility-confirmed snapshots, so a known identity resolves nothing.
+    /// Pairs the registry showed this read context within the window resolve nothing.
     async fn batch_resolve_identities(
         &self,
         ctx: &SecurityContext,

@@ -28,13 +28,11 @@
 //!
 //! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
 //!
-//! The `resolve_*` helpers map a registered entity's identifier to its Registry Reference
-//! and back: an unregistered identifier does not resolve, a deleted entity does. They go
-//! through their plane's `batch_resolve_identities`
-//! ([`PlatformTypesRegistryApi::batch_resolve_identities`],
-//! [`TypesRegistryApi::batch_resolve_identities`]), which reads only the stored pair: a
-//! client cache answers the identities it already knows and sends only the others. For an
-//! identifier's deterministic UUID before registration, use [`GtsId::to_uuid`].
+//! The `resolve_*` helpers translate registered IDs and Registry References, including
+//! tombstones. Cache misses fetch the stored pair through
+//! [`PlatformTypesRegistryApi::batch_resolve_identities`] or
+//! [`TypesRegistryApi::batch_resolve_identities`]. For deterministic UUIDs before
+//! registration, use [`GtsId::to_uuid`].
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -840,9 +838,8 @@ fn fan_out<K, V: Clone>(
     out.extend(last.map(|k| (k, answer)));
 }
 
-/// Reads `keys` in bounded batches of distinct entity keys. Every asked key is answered,
-/// including different spellings that name one entity. A failed batch fails the call: no
-/// later batch is read, and no partial answer is returned beside the error.
+/// Read bounded batches of distinct keys, keeping both spellings when asked.
+/// A failed batch stops the call without partial results.
 async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
     reads: &R,
     keys: Vec<(K, EntityKey)>,
@@ -871,10 +868,8 @@ async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
 /// identifier and its Registry Reference.
 type Resolved<T> = (<T as Kinded>::Id, Uuid);
 
-/// Resolves `keys` to entities of `T`'s kind through the contract's
-/// `batch_resolve_identities`, in bounded batches of distinct keys as [`get_many`] reads
-/// them: every asked key answered, `None` when nothing of the kind is registered, and a
-/// failed batch failing the call.
+/// Resolve distinct keys in bounded batches like [`get_many`].
+/// Return `None` for absent or wrong-kind entities. Any batch failure stops the call.
 async fn resolve_many<R: EntityReads + ?Sized, K: Send, T: Kinded>(
     reads: &R,
     keys: Vec<(K, EntityKey)>,
@@ -928,10 +923,8 @@ fn resolved<T: Kinded>(identity: &EntityIdentity) -> Result<Option<Resolved<T>>,
     Ok(Some((id, identity.gts_uuid)))
 }
 
-/// Resolves `keys` with one batch read under the mandatory fields, through `read`: what
-/// `batch_resolve_identities` answers, for an implementation that has only a batch read,
-/// such as a test double. Bounded and refused as the batch read is; every distinct key is
-/// answered and checked as a resolution from the registry is.
+/// Adapt a batch reader, such as a test double, to `batch_resolve_identities`.
+/// Read the mandatory fields in one bounded batch and validate each distinct result.
 ///
 /// ```ignore
 /// async fn batch_resolve_identities(&self, ctx: &PlatformSecurityContext, keys: Vec<EntityKey>)
@@ -960,10 +953,8 @@ where
     checked_resolutions(&keys, answered)
 }
 
-/// Every distinct key's identity in a batch read of `keys` under the mandatory fields:
-/// the registered entity it names, Active or deleted, or `None` when absent. An
-/// unanswered key, `Unchanged` to an unconditional read, or a snapshot its own data
-/// contradicts fails the read rather than posing as an identity or as absence.
+/// Read active or deleted identities in one unconditional mandatory-field batch.
+/// Refuse missing, `Unchanged` or inconsistent replies.
 fn identities(
     keys: &[EntityKey],
     mut read: BatchGetEntitiesResponse,
@@ -983,11 +974,9 @@ fn identities(
     Ok(out)
 }
 
-/// The one check of a batch resolution's answers against the keys sent, whichever client
-/// received them: every distinct key answered and no other, each identity the entity its
-/// key names, no identifier or Registry Reference stated for two entities within the
-/// batch, and no entity both found by one spelling and absent by the other. Anything else fails the whole resolution rather than posing as an identity or as
-/// absence.
+/// Require one result per distinct requested key and agreement across key
+/// spellings. A mismatch, conflicting pair or one-sided absence for a found
+/// entity fails the whole batch.
 pub(crate) fn checked_resolutions(
     asked: &[EntityKey],
     mut answered: HashMap<EntityKey, Option<EntityIdentity>>,
@@ -1057,10 +1046,7 @@ fn unresolved(key: &EntityKey) -> CanonicalError {
     .create()
 }
 
-/// The identity of a snapshot answered for `key`, once it is the entity asked — by its
-/// identifier as spelled, or by the Registry Reference it carries, which is the
-/// registry's to state — and its data are consistent with its own kind as a
-/// kind-narrowed read requires.
+/// Extract the identity after checking the exact key and kind-specific fields.
 fn identity_of(key: &EntityKey, entity: Entity) -> Result<EntityIdentity, CanonicalError> {
     check_snapshot(key, &entity)?;
     let identity = EntityIdentity {

@@ -22,7 +22,7 @@ workspace = true
 # Default: production build, no test utilities.
 default = []
 # In-memory clients and fixtures for consumer tests.
-test-util = ["dep:toolkit", "dep:parking_lot"]
+test-util = ["dep:toolkit"]
 # Both REST clients and their private wire DTOs.
 rest-client = ["dep:serde", "dep:toolkit-http", "dep:bytes", "dep:secrecy", "toolkit-contract/rest-client"]
 # The HTTP binding descriptors `#[toolkit::provides(transports = [.., rest])]` validates.
@@ -75,7 +75,6 @@ secrecy = { workspace = true, optional = true }
 
 # Test doubles only (`test-util`).
 toolkit = { workspace = true, optional = true }
-parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Paused-clock tests of the submit/poll deadline and polling.
@@ -88,6 +87,5 @@ tracing-subscriber = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # The test doubles also compile under `cfg(test)` without `test-util`.
 toolkit = { workspace = true }
-parking_lot = { workspace = true }
 # The README's examples compile as doctests.
 anyhow = { workspace = true }

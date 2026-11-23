@@ -262,27 +262,24 @@ pub struct LocalClientSettings {
     pub cache: CacheSettings,
 }
 
-/// Cache settings: the SDK client caches over the platform and tenant APIs published
-/// here, each with its own store under these limits, and the legacy client's per-kind
-/// caches until T38 removes them.
+/// Independent SDK caches for the published platform and tenant APIs.
+/// The per-kind legacy caches remain until T38.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheSettings {
-    /// How long either API's client cache serves a confirmed entry before it
-    /// revalidates (SPEC §8.3); on the tenant API, also how long a tenant's confirmed
-    /// visibility of an entry is reused. `0s` revalidates every snapshot read.
+    /// Freshness of snapshots and tenant visibility confirmations (SPEC §8.3).
+    /// `0s` forces a registry check on every snapshot read.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub freshness_window: Duration,
-    /// Maximum total bytes of compact JSON snapshots and their raw validators per cache,
-    /// e.g. `64MB`, so up to twice this across both APIs. Each cache evicts
-    /// least-recently-used snapshots.
+    /// Per-cache budget: compact JSON documents, GTS ID and raw validator bytes,
+    /// plus 256 bytes per snapshot for its other metadata.
+    /// Both APIs combined can retain twice this budget.
     pub max_size_bytes: ByteSize,
     /// Maximum number of snapshots per cache. Zero disables snapshot retention.
     pub max_entries: usize,
-    /// Entries — one per entity — of the platform API cache's identity store, which the
-    /// platform `resolve_*` helpers answer from, evicted least-recently-used, with no
-    /// window; the tenant API keeps none. `0` keeps no identities: a snapshot inside the
-    /// freshness window can still answer a key, and other keys go to the registry.
+    /// Identity LRU entries per cache, without expiry. Zero leaves resolution to
+    /// fresh snapshots or the registry. A tenant cache answers a pair only to a read
+    /// context that the registry showed it to.
     pub max_identity_entries: usize,
     /// The legacy client's type-schema cache.
     pub type_schemas: SingleCacheSettings,

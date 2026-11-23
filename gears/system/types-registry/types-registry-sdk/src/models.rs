@@ -166,8 +166,7 @@ impl BatchGetItem {
         Self { key, condition }
     }
 
-    /// The `ETag` to send in this item's `if_none_match` when the held snapshot names
-    /// this entity and covers the requested fields. The `ETag` itself is projection-independent.
+    /// The held `ETag` if the key matches and the snapshot covers the projection.
     #[must_use]
     pub fn if_none_match_for(&self, projection: &Projection) -> Option<&Validator> {
         let held = self.condition.as_ref()?;
@@ -418,8 +417,7 @@ impl ReadOptions {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
-/// A registered entity's identity, as the `resolve_*` helpers answer it: its canonical
-/// identifier and Registry Reference, without lifecycle, validator or snapshot. See
+/// A registered GTS identifier and its assigned Registry Reference. See
 /// [`PlatformTypesRegistryApi::batch_resolve_identities`](crate::PlatformTypesRegistryApi::batch_resolve_identities).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntityIdentity {

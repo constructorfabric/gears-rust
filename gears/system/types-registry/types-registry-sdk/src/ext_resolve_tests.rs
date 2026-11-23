@@ -7,10 +7,10 @@
 //! identifier's own, to show the helpers return what the registry read, not a local hash.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use gts::{GtsId, GtsInstanceId, GtsTypeId};
-use parking_lot::Mutex;
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
@@ -58,16 +58,16 @@ impl Recording {
     }
 
     fn reads(&self) -> Vec<BatchGetEntitiesRequest> {
-        self.reads.lock().clone()
+        self.reads.lock().expect("lock").clone()
     }
 
     fn record<C>(&self, ctx: &C, request: &BatchGetEntitiesRequest) {
-        self.reads.lock().push(request.clone());
-        self.contexts.lock().push(address(ctx));
+        self.reads.lock().expect("lock").push(request.clone());
+        self.contexts.lock().expect("lock").push(address(ctx));
     }
 
     fn answer(&self, mut response: BatchGetEntitiesResponse) -> BatchGetEntitiesResponse {
-        if let Some(uuid) = *self.answered_uuid.lock() {
+        if let Some(uuid) = *self.answered_uuid.lock().expect("lock") {
             for lookup in response.0.values_mut() {
                 if let EntityLookup::Found { entity, .. } = lookup {
                     entity.gts_uuid = uuid;
@@ -91,6 +91,7 @@ impl Recording {
         assert!(
             self.contexts
                 .lock()
+                .expect("lock")
                 .iter()
                 .all(|&seen| seen == address(ctx)),
             "every read is made under the caller's own context"
@@ -371,7 +372,7 @@ macro_rules! plane_tests {
             async fn forward_helpers_answer_the_reference_the_registry_read() {
                 let client = Recording::seeded();
                 let answered = Uuid::from_u128(0xA5);
-                *client.answered_uuid.lock() = Some(answered);
+                *client.answered_uuid.lock().expect("lock") = Some(answered);
                 let api: &dyn $contract = &client;
                 let ctx = $context;
 
@@ -529,7 +530,7 @@ macro_rules! plane_tests {
             #[tokio::test]
             async fn a_reverse_read_answered_with_another_reference_fails() {
                 let client = Recording::seeded();
-                *client.answered_uuid.lock() = Some(Uuid::from_u128(0xA5));
+                *client.answered_uuid.lock().expect("lock") = Some(Uuid::from_u128(0xA5));
                 let api: &dyn $contract = &client;
                 let ctx = $context;
                 assert_kind($ext::resolve_type_id(api, &ctx, uuid(TYPE)).await, internal);

@@ -115,8 +115,7 @@ pub enum EntityLookup {
     NotFound,
 }
 
-/// The canonical identity of a registered entity, Active or deleted, as a batch
-/// resolution answers it: no lifecycle, validator or document.
+/// The registered pair returned for an active or deleted entity.
 #[domain_model]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntityIdentity {
@@ -677,18 +676,13 @@ impl RegistryService {
             .collect())
     }
 
-    /// Resolve a bounded set of keys to the identity of the registered entity each names,
-    /// Active or deleted, or `None` (DESIGN §3.3).
-    ///
-    /// Bounded, collapsed and answered per key exactly as [`Self::batch_get`] is, but it
-    /// reads only the keyed identity rows: no validator, no Type Schema projection or
-    /// fingerprint, no document. Identity is permanent, so the answer needs no snapshot
-    /// of anything else; the two keyed reads still share one, so one entity named by both
-    /// spellings is found by both or by neither.
+    /// Resolve each distinct key to an active or deleted entity's pair, or `None`
+    /// (DESIGN §3.3). Use [`Self::batch_get`]'s bounds and key rules. Both keyed
+    /// identity reads share one snapshot so the two spellings agree.
     ///
     /// # Errors
-    /// [`ServiceError::BatchReadOutOfRange`] for an empty or over-long batch,
-    /// [`ServiceError::KeyTooLong`] for a key over [`MAX_KEY_LEN`] bytes, or
+    /// [`ServiceError::BatchReadOutOfRange`] for an empty or oversized batch,
+    /// [`ServiceError::KeyTooLong`] above [`MAX_KEY_LEN`], or
     /// [`ServiceError::Storage`] for a read failure.
     pub async fn batch_resolve(
         &self,
@@ -817,9 +811,8 @@ pub(crate) fn is_canonical(gts_id: &str) -> bool {
     GtsId::try_new(gts_id).is_ok_and(|id| id.id() == gts_id)
 }
 
-/// The keyed identity reads both batch reads make: a batch's distinct keys split by
-/// spelling, a non-canonical identifier dropped because it cannot be stored, so it never
-/// reaches SQL.
+/// Group distinct keys by form for identity lookup. Skip non-canonical
+/// identifiers that cannot be stored.
 struct KeyedLookup {
     gts_ids: Vec<String>,
     gts_uuids: Vec<Uuid>,
@@ -857,8 +850,7 @@ impl KeyedLookup {
     ) -> Result<Vec<EntityRow>, ServiceError> {
         let mut rows = stores.find_by_gts_ids(tx, scope, &self.gts_ids).await?;
         rows.extend(stores.find_by_gts_uuids(tx, scope, &self.gts_uuids).await?);
-        // The two identity reads are independent, so a row named by both spellings
-        // arrives twice; the reads that follow must name it once.
+        // Deduplicate rows named by both key forms before further reads.
         rows.sort_by_key(|row| row.id);
         rows.dedup_by_key(|row| row.id);
         Ok(rows)

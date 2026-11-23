@@ -25,7 +25,7 @@ from .helpers import (
 
 @pytest.fixture
 def registry_api_path():
-    """Setup goes through the platform API, whichever plane a scenario then reads."""
+    """Register fixtures through the platform API."""
     return PLATFORM_API
 
 
@@ -33,7 +33,7 @@ def registry_api_path():
 async def test_both_planes_resolve_every_distinct_key(
     registry_http, registry_tenant_http, reading_fixture, given_registered
 ):
-    """One result per distinct key, by the key it was asked by; nothing but the pair."""
+    """Both planes return the stored pair for each distinct registered key."""
     person_schema, person_instance, other_schema, other_instance = map(
         reading_fixture,
         ("person_schema", "person_instance", "other_schema", "other_instance"),
@@ -62,7 +62,6 @@ async def test_both_planes_resolve_every_distinct_key(
         resolved(absent_uuid),
     )
 
-    # One expectation for both planes: the tenant answers the platform's body.
     assert_resolutions(await batch_resolve(registry_http, PLATFORM_API, keys), *expected)
     assert_resolutions(await batch_resolve(registry_tenant_http, TENANT_API, keys), *expected)
 
@@ -91,7 +90,6 @@ async def test_a_deleted_entity_keeps_its_identity(
         operation, completed("deletion", removal(person_schema, "succeeded", 2)), ordered=True
     )
 
-    # The same expectation as before the deletion: nothing about the pair changed.
     assert_resolutions(await batch_resolve(registry_http, registry_api_path, keys), *expected)
 
 
@@ -122,10 +120,7 @@ async def test_the_batch_bound_counts_duplicates(
 async def test_a_resolution_takes_no_selection_or_condition(
     registry_http, registry_api_path, reading_fixture
 ):
-    """A query `$select` and an item `if_none_match` are refused, not ignored.
-
-    The key is valid but unregistered: an ignored refusal would answer `200`.
-    """
+    """Reject `$select` and `if_none_match` even for a valid, unregistered key."""
     schema_id = reading_fixture("person_schema")["gts_id"]
 
     assert_bad_request(
@@ -146,8 +141,7 @@ async def test_a_resolution_takes_no_selection_or_condition(
     assert conditional.status_code == 422, conditional.text
     assert conditional.headers["content-type"].startswith("application/problem+json")
     problem = conditional.json()
-    # The deserializer's wording, with its column, is not a contract; that it
-    # names the refused field is.
+    # Check the field name and ignore the deserializer's wording and column.
     [violation] = problem["context"]["field_violations"]
     assert "if_none_match" in violation["description"], violation
     violation["description"] = "<description>"

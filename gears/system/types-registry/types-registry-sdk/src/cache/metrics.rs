@@ -43,7 +43,7 @@ impl CacheMetrics {
                 .i64_up_down_counter("types_registry_client_cache_size")
                 .with_unit("By")
                 .with_description(
-                    "Compact JSON snapshot and validator bytes summed across client instances",
+                    "Bytes charged against max_size_bytes summed across client instances",
                 )
                 .build(),
         }

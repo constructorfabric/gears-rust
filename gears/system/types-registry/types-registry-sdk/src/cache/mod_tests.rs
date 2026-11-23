@@ -566,8 +566,7 @@ async fn a_conflicting_pair_rejects_the_whole_discovery_page() {
     assert!(f.cache.identity(&gts_key(TYPE)).is_none());
 }
 
-/// An Instance carrying a Type Schema-only field is malformed wherever it arrives: the
-/// discovery page fails, and none of its pairs is learned.
+/// An inapplicable field rejects the discovery page before any pair is learned.
 #[tokio::test]
 async fn a_discovery_item_with_a_field_its_kind_lacks_rejects_the_page() {
     let f = fixture(WINDOW);
@@ -764,10 +763,8 @@ async fn one_entry_answers_every_projection_it_covers_and_no_other() {
     assert_eq!(f.recorder.batch_count(), 2, "merged under one validator");
 }
 
-/// The plain sequence that used to serve stale content: a narrow cold read, a change the
-/// client did not observe, a wider ordinary read the entry does not cover, then the narrow
-/// read again inside the window. The wider read sees the new state and replaces the entry,
-/// so the narrow read is answered from it, with the new content and no registry call.
+/// A wider read replaces a stale narrow snapshot so the next narrow hit serves
+/// the new state within the window.
 #[tokio::test(start_paused = true)]
 async fn a_wider_read_of_a_new_state_replaces_the_narrow_entry_it_does_not_cover() {
     let f = fixture(WINDOW);
@@ -1151,8 +1148,7 @@ async fn a_changed_validator_the_caller_sent_replaces_the_narrower_entry() {
     assert_eq!(f.recorder.batch_count(), 2);
 }
 
-/// The caller's coverage is checked as the registry's transports check it: a
-/// condition held for fewer fields than the read asks is not the caller's to match.
+/// The cache cannot match a caller condition with insufficient field coverage.
 #[tokio::test(start_paused = true)]
 async fn a_caller_condition_that_does_not_cover_the_read_is_answered_in_full() {
     let f = fixture(WINDOW);
@@ -1177,8 +1173,7 @@ async fn a_caller_condition_that_does_not_cover_the_read_is_answered_in_full() {
     assert_eq!(f.recorder.batch_count(), 1, "both answered from the cache");
 }
 
-/// A validator carries no identity; the condition does. One bound to another entity
-/// is never matched, even carrying this entity's own current validator.
+/// Even a matching validator cannot condition a different entity.
 #[tokio::test(start_paused = true)]
 async fn a_caller_condition_for_another_entity_is_never_matched() {
     let f = fixture(WINDOW);
@@ -1504,8 +1499,7 @@ async fn an_older_cold_read_does_not_overwrite_a_newer_one() {
     let (old, new) = tokio::join!(older, newer);
     assert_eq!((old.as_str(), new.as_str()), ("v1", "v2"));
     assert_eq!(f.title(gts_key(TYPE), full(), false).await, "v2");
-    // The two answers disagree and nothing orders revisions, so the resident entry was
-    // dropped rather than trusted: the read above went to the registry.
+    // Conflicting replies dropped the resident entry, forcing a refetch.
     assert_eq!(f.recorder.batch_count(), 3);
 }
 
@@ -2013,9 +2007,8 @@ async fn an_answer_for_a_key_nobody_asked_fails_the_read_and_caches_none_of_it()
     );
 }
 
-/// One batch names the entity twice: by identifier without a condition, and by UUID
-/// with the caller's covering condition on the new state. Whichever is applied first,
-/// the second judges against the entry as the first left it, not as the lookup saw it.
+/// ID and UUID replies for one entity may settle in either order. The second
+/// must judge against the resident state left by the first.
 #[tokio::test(start_paused = true)]
 async fn a_caller_match_beside_a_fill_of_the_new_state_keeps_that_fill() {
     for uuid_first in [false, true] {
@@ -2056,8 +2049,7 @@ async fn full_weight(registry: &MockTypesRegistry) -> usize {
     super::store::weight(&registry_snapshot(registry, TYPE).await).total()
 }
 
-/// Under one validator, an answer too large to keep beside the entry leaves the entry
-/// as it was: the smaller holding is still valid, and it is still served.
+/// An oversized merge leaves the valid smaller snapshot resident.
 #[tokio::test(start_paused = true)]
 async fn an_oversized_answer_of_the_same_state_keeps_the_smaller_entry() {
     let big = json!({
@@ -2094,8 +2086,7 @@ async fn an_oversized_answer_of_the_same_state_keeps_the_smaller_entry() {
     assert_eq!(f.recorder.batch_count(), 3, "the documents were never kept");
 }
 
-/// Under a new validator, an answer too large to keep still drops the entry it
-/// supersedes: nothing stale is left behind.
+/// An oversized reply with a new validator still drops the stale snapshot.
 #[tokio::test(start_paused = true)]
 async fn an_oversized_answer_of_a_new_state_drops_the_old_entry() {
     let f = fixture_with(
@@ -2136,10 +2127,8 @@ async fn an_oversized_answer_of_a_new_state_drops_the_old_entry() {
     assert_eq!(f.recorder.batch_count(), 3);
 }
 
-// Identity consistency: the registry alone states which identifier and Registry Reference
-// are one entity. Nothing derives one from the other; a pair contradicting one already
-// known — resident, remembered, pinned by the read, or stated elsewhere in the batch — is
-// a protocol fault that fails the read and changes neither store.
+// Validate registry-issued pairs against resident, remembered and pinned pairs,
+// including other replies in the batch. Conflicts leave both stores unchanged.
 
 /// A Registry Reference no derivation produces for any fixture identifier.
 const ISSUED: Uuid = Uuid::from_u128(0x0123_4567_89ab_4cde_8f01_2345_6789_abcd);
@@ -2183,9 +2172,8 @@ fn assert_protocol_fault(result: Result<BatchGetEntitiesResponse, CanonicalError
     );
 }
 
-/// A revalidation answered with the pinned entity under another Registry Reference fails,
-/// though both the entry and the remembered identity were evicted while it was in flight:
-/// the pair the read pinned is still known to it, and the forged one is learned nowhere.
+/// Reject a conflicting Registry Reference against the pinned pair even after
+/// both stores evict it.
 #[tokio::test(start_paused = true)]
 async fn a_revalidation_contradicting_its_pinned_pair_fails_after_both_stores_evicted_it() {
     let f = fixture_with(
@@ -2225,8 +2213,7 @@ async fn a_revalidation_contradicting_its_pinned_pair_fails_after_both_stores_ev
     assert!(store.peek(&pinned).is_none());
 }
 
-/// Two answers of one batch pairing one identifier with two Registry References: the
-/// batch fails and fills nothing, even with no identity store to remember either pair.
+/// Conflicting references within one batch fail before any fill, even without an identity LRU.
 #[tokio::test(start_paused = true)]
 async fn a_batch_contradicting_itself_fails_and_fills_nothing() {
     let f = fixture_with(
@@ -2255,8 +2242,7 @@ async fn a_batch_contradicting_itself_fails_and_fills_nothing() {
     );
 }
 
-/// A resident snapshot's pair holds with no identity store at all: another Registry
-/// Reference answered for its identifier fails the read and leaves the entry serving.
+/// A resident snapshot rejects a conflicting reference even without an identity LRU.
 #[tokio::test(start_paused = true)]
 async fn an_answer_contradicting_a_resident_pair_fails_and_leaves_the_entry() {
     let f = fixture_with(
@@ -2305,8 +2291,7 @@ async fn an_answer_contradicting_a_remembered_pair_fails_after_its_snapshot_was_
     assert_eq!(EntityKey::GtsUuid(known.gts_uuid), uuid_key(TYPE));
 }
 
-/// Two reads in flight are answered with contradicting pairs: the one settled first holds,
-/// and the other fails rather than replacing it, with no identity store to arbitrate.
+/// The first settled pair wins. A conflicting concurrent reply cannot replace it.
 #[tokio::test(start_paused = true)]
 async fn of_two_reads_answered_with_contradicting_pairs_the_later_settled_fails() {
     let f = fixture_with(
@@ -2337,9 +2322,8 @@ async fn of_two_reads_answered_with_contradicting_pairs_the_later_settled_fails(
     );
 }
 
-/// A miss on an unregistered identifier while a cold read by another identifier is in
-/// flight: two identifiers are never one entity, so the cold read still fills. A cold
-/// read by Registry Reference, which may be that identifier's entity, does not.
+/// A one-sided ID miss fences a cold read by UUID, which might be its counterpart.
+/// Another ID cannot alias it and still fills.
 #[tokio::test(start_paused = true)]
 async fn a_miss_on_another_identifier_does_not_fence_a_cold_read_by_identifier() {
     for (cold, fills) in [(gts_key(TYPE), true), (uuid_key(TYPE), false)] {
@@ -2359,11 +2343,8 @@ async fn a_miss_on_another_identifier_does_not_fence_a_cold_read_by_identifier()
     }
 }
 
-/// End to end through the cache, the registry issuing TYPE a Registry Reference no
-/// derivation produces: both spellings share one entry, `resolve_*` answers without a
-/// read, a revalidation is conditional under the issued one, and an observed
-/// registration by identifier drops what the issued one would be served. With no
-/// identity store, the snapshot index alone answers every spelling.
+/// An issued Registry Reference works for snapshot hits, resolution and
+/// revalidation. Registration by ID invalidates it even without an identity LRU.
 #[tokio::test(start_paused = true)]
 async fn an_issued_registry_reference_is_served_cached_under_either_spelling() {
     use crate::PlatformTypesRegistryApiExt;

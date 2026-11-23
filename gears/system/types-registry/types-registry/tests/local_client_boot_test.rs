@@ -375,12 +375,9 @@ async fn probe_cache(
     }
 }
 
-/// The published platform API keeps the identities its `resolve_*` helpers learned; the
-/// ordinary read and the tenant API do not. With a zero window, the base is resolved,
-/// then its row removed behind both APIs — a purge, which P0 does not have, simulated to
-/// make the store observable. The ordinary platform read under the mandatory fields and
-/// the tenant resolution see it gone at once; the platform resolution keeps the identity
-/// when `known`, and sees it gone otherwise.
+/// Simulate purge by removing a row with a zero freshness window. Snapshot
+/// reads and tenant resolution miss immediately. Only a warmed platform
+/// identity LRU still resolves the purged row.
 async fn probe_identity(
     ctx: &GearCtx,
     database: &std::path::Path,

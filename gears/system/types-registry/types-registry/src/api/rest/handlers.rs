@@ -583,8 +583,8 @@ pub async fn platform_batch_resolve_entities(
     batch_resolve(service, CallerContext::Platform(&ctx), req).await
 }
 
-/// Each key's canonical identity, Active or deleted, or `not_found`: the keyed identity
-/// rows only, with no validator and no document. A `POST` for the reasons `:batchGet` is.
+/// Read keyed identity rows for active and deleted entities.
+/// Return `not_found` for misses.
 async fn batch_resolve(
     service: Option<Arc<RegistryService>>,
     caller: CallerContext<'_>,

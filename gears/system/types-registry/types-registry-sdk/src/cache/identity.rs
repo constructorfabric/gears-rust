@@ -1,17 +1,10 @@
-//! The cache's identity store: the canonical identifier of each registered entity the
-//! client has read, by Registry Reference, for the platform `resolve_*` helpers.
+//! Positive-only LRU of registry-confirmed identity pairs. It has its own recency
+//! and no validator, expiry or mutation invalidation. Deleted entities still
+//! resolve in P0. A tenant cache answers a pair only to a read context that the
+//! registry showed it to.
 //!
-//! Positive only and permanent: an identity is learned from a checked registry answer
-//! that found the entity, and in P0 nothing makes it wrong later — identity is permanent
-//! and a deleted entity still resolves. So the store has no window, no validator, no
-//! negative entries and no invalidation on an observed mutation. It is bounded by
-//! entries, evicted least-recently-used, apart from the snapshot store: neither touches
-//! the other's recency.
-//!
-//! P0 has no purge (SPEC §2, deferred), so nothing ever forgets an identity. ADR-0013's purge,
-//! after which an identifier resolves to nothing, and a client switched to another
-//! logical registry, will each need this store reset; a `NotFound` seen in passing is no
-//! signal of either.
+//! After purge (ADR-0013, deferred) or a logical registry change, recreate the
+//! cached client or restart its consumer. `NotFound` alone leaves identities intact.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -25,13 +18,19 @@ use crate::models::{EntityIdentity, EntityKey};
 
 /// Each confirmed pair has one LRU position. Both indexes share its parsed identifier.
 pub struct Identities {
-    by_uuid: Option<LruCache<Uuid, Arc<GtsId>>>,
+    by_uuid: Option<LruCache<Uuid, Record>>,
     by_id: HashMap<Arc<GtsId>, Uuid>,
 }
 
+struct Record {
+    gts_id: Arc<GtsId>,
+    /// Identifies this residency. Proofs hold it weakly, so eviction retires them
+    /// even if the pair is learned again.
+    incarnation: Arc<()>,
+}
+
 impl Identities {
-    /// A store of at most `bound` identities, allocated as it fills rather than for the
-    /// whole bound up front.
+    /// Retains up to `bound` identities, allocating as it fills.
     pub fn new(bound: usize) -> Self {
         Self {
             by_uuid: NonZeroUsize::new(bound).map(LruCache::sparse),
@@ -47,9 +46,24 @@ impl Identities {
             EntityKey::GtsUuid(uuid) => *uuid,
         };
         Some(EntityIdentity {
-            gts_id: store.get(&gts_uuid)?.as_ref().clone(),
+            gts_id: store.get(&gts_uuid)?.gts_id.as_ref().clone(),
             gts_uuid,
         })
+    }
+
+    /// The Registry Reference `key` names, without promoting the pair.
+    pub fn peek_uuid(&self, key: &EntityKey) -> Option<Uuid> {
+        let store = self.by_uuid.as_ref()?;
+        let gts_uuid = match key {
+            EntityKey::GtsId(id) => *self.by_id.get(id)?,
+            EntityKey::GtsUuid(uuid) => *uuid,
+        };
+        store.contains(&gts_uuid).then_some(gts_uuid)
+    }
+
+    /// The current residency of the pair for `gts_uuid`, without promoting it.
+    pub fn incarnation(&self, gts_uuid: Uuid) -> Option<&Arc<()>> {
+        Some(&self.by_uuid.as_ref()?.peek(&gts_uuid)?.incarnation)
     }
 
     /// Can this pair coexist with every mapping we still remember?
@@ -57,8 +71,7 @@ impl Identities {
         self.conflict(id, uuid).is_none()
     }
 
-    /// The remembered counterpart of either spelling, when it is not the other one.
-    /// Changes no recency.
+    /// Return a conflicting counterpart without changing recency.
     pub fn conflict(&self, id: &GtsId, uuid: Uuid) -> Option<EntityKey> {
         if let Some(known) = self.by_id.get(id).filter(|known| **known != uuid) {
             return Some(EntityKey::GtsUuid(*known));
@@ -66,8 +79,8 @@ impl Identities {
         self.by_uuid
             .as_ref()
             .and_then(|store| store.peek(&uuid))
-            .filter(|known| known.as_ref() != id)
-            .map(|known| EntityKey::GtsId(known.as_ref().clone()))
+            .filter(|known| known.gts_id.as_ref() != id)
+            .map(|known| EntityKey::GtsId(known.gts_id.as_ref().clone()))
     }
 
     /// Number of resident pairs in the bounded identity store.
@@ -85,9 +98,15 @@ impl Identities {
             return false;
         }
         let id = Arc::new(gts_id.clone());
-        let evicted = store.push(gts_uuid, Arc::clone(&id));
+        let evicted = store.push(
+            gts_uuid,
+            Record {
+                gts_id: Arc::clone(&id),
+                incarnation: Arc::default(),
+            },
+        );
         if let Some((_, evicted)) = &evicted {
-            self.by_id.remove(evicted);
+            self.by_id.remove(&evicted.gts_id);
         }
         self.by_id.insert(id, gts_uuid);
         evicted.is_some()

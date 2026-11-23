@@ -9,10 +9,9 @@
 //! plane's credential.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use secrecy::SecretString;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use toolkit::directory::{
@@ -30,11 +29,14 @@ use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::{DbOptions, HostRuntime};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::runtime::config::{CredentialState, InternalTokenProvider};
+use toolkit_contract::runtime::resolving::{EndpointResolver, ResolveError};
+use toolkit_contract::wiring::ClientTuning;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use types_registry_sdk::{
-    BatchGetEntitiesRequest, EntityField, EntityKey, FieldSelection, GtsTypeId,
-    ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, Projection,
-    ReadOptions, TypesRegistryApi,
+    BatchGetEntitiesRequest, CacheSettings, EntityField, EntityKey, EntityLookup, FieldSelection,
+    GtsTypeId, ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+    PlatformTypesRegistryApiRestResolvingClient, Projection, ReadOptions, TypesRegistryApi,
+    TypesRegistryApiRestResolvingClient,
 };
 
 /// The kebab case of [`ConsumesFixture`], the name `#[toolkit::consumes]` derives.
@@ -57,7 +59,7 @@ impl DirectoryClient for StubDirectory {
     }
 
     async fn resolve_rest_service(&self, gear: &str) -> anyhow::Result<ServiceEndpoint> {
-        match (gear, self.0.lock().clone()) {
+        match (gear, self.0.lock().unwrap().clone()) {
             ("types-registry", Some(uri)) => Ok(ServiceEndpoint::new(uri)),
             _ => Err(DirectoryNotFound::new(format!("gear {gear}")).into()),
         }
@@ -84,12 +86,13 @@ impl DirectoryClient for StubDirectory {
     }
 }
 
-/// One request the stub registry received: its target and credential headers.
+/// Request target, credentials and batch item validator observed by the stub.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Received {
     target: String,
     authorization: Option<String>,
     internal_token: Option<String>,
+    if_none_match: Option<String>,
 }
 
 /// A registry stand-in serving one entity over discovery and batch reads.
@@ -127,21 +130,27 @@ async fn stub_registry() -> (String, Arc<Mutex<Vec<Received>>>) {
                         .then(|| value.trim().to_owned())
                 })
             };
-            log.lock().push(Received {
-                target: head.lines().next().unwrap_or_default().to_owned(),
-                authorization: header("authorization"),
-                internal_token: header("x-toolkit-internal-token"),
-            });
+            let mut if_none_match = None;
             let body = if head.starts_with("POST ") {
                 let len: usize = header("content-length").unwrap().parse().unwrap();
                 let mut bytes = vec![0; len];
                 stream.read_exact(&mut bytes).await.unwrap();
-                let request: Value = serde_json::from_slice(&bytes).unwrap();
+                let mut request: Value = serde_json::from_slice(&bytes).unwrap();
+                if_none_match = request["items"][0]
+                    .as_object_mut()
+                    .and_then(|item| item.remove("if_none_match"))
+                    .map(|etag| etag.as_str().unwrap().to_owned());
                 assert_eq!(request["items"], json!([{"entity_key": STUB_TYPE}]));
                 &batch
             } else {
                 &page
             };
+            log.lock().unwrap().push(Received {
+                target: head.lines().next().unwrap_or_default().to_owned(),
+                authorization: header("authorization"),
+                internal_token: header("x-toolkit-internal-token"),
+                if_none_match,
+            });
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
                  connection: close\r\n\r\n{body}",
@@ -272,7 +281,7 @@ async fn a_host_without_the_registry_reaches_it_only_through_the_directory() {
 
     // The directory names the registry: the same clients now reach it.
     let (uri, received) = stub_registry().await;
-    *directory.0.lock() = Some(uri);
+    *directory.0.lock().unwrap() = Some(uri);
     let platform_page = platform
         .list_entities(&marker, ListEntitiesRequest::default())
         .await
@@ -300,7 +309,7 @@ async fn a_host_without_the_registry_reaches_it_only_through_the_directory() {
         id
     );
     assert_eq!(
-        received.lock().len(),
+        received.lock().unwrap().len(),
         2,
         "both resolves used the page identity"
     );
@@ -310,12 +319,14 @@ async fn a_host_without_the_registry_reaches_it_only_through_the_directory() {
         .await
         .expect("exact read");
     assert_eq!(schema.content, Some(json!({"title": "from batchGet"})));
-    let received = received.lock().clone();
+    let received = received.lock().unwrap().clone();
     assert_eq!(received.len(), 3, "{received:?}");
     assert!(
         received[2]
             .target
             .starts_with("POST /types-registry/v2/platform/entities:batchGet ")
+            && received[2].if_none_match.is_none(),
+        "a first exact read is unconditional: {received:?}"
     );
     assert!(
         received[0]
@@ -336,4 +347,116 @@ async fn a_host_without_the_registry_reaches_it_only_through_the_directory() {
 
     cancel.cancel();
     host.await.expect("host task").expect("a clean shutdown");
+}
+
+struct Fixed(String);
+
+#[async_trait]
+impl EndpointResolver for Fixed {
+    async fn resolve_endpoint(&self, _gear: &str) -> Result<Option<String>, ResolveError> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+fn revalidating() -> CacheSettings {
+    CacheSettings {
+        freshness_window: Duration::ZERO,
+        ..CacheSettings::default()
+    }
+}
+
+fn disabled() -> CacheSettings {
+    CacheSettings {
+        max_entries: 0,
+        max_identity_entries: 0,
+        ..CacheSettings::default()
+    }
+}
+
+/// Validators sent on two reads per plane. `None` selects the default constructor.
+async fn validators_sent(settings: Option<CacheSettings>) -> [Vec<Option<String>>; 2] {
+    let (uri, received) = stub_registry().await;
+    let resolver: Arc<dyn EndpointResolver> = Arc::new(Fixed(uri));
+    let tuning =
+        ClientTuning::default().with_internal_token_provider(Some(InternalTokenProvider::new(
+            || CredentialState::Available(SecretString::from(INTERNAL_TOKEN.to_owned())),
+        )));
+    let (platform, tenant) = match settings {
+        None => (
+            PlatformTypesRegistryApiRestResolvingClient::new(
+                Arc::clone(&resolver),
+                "types-registry",
+                tuning.clone(),
+            ),
+            TypesRegistryApiRestResolvingClient::new(resolver, "types-registry", tuning),
+        ),
+        Some(settings) => (
+            PlatformTypesRegistryApiRestResolvingClient::with_cache_settings(
+                Arc::clone(&resolver),
+                "types-registry",
+                tuning.clone(),
+                settings,
+            ),
+            TypesRegistryApiRestResolvingClient::with_cache_settings(
+                resolver,
+                "types-registry",
+                tuning,
+                settings,
+            ),
+        ),
+    };
+    let request = || read().with_projection(FieldSelection::with(&[EntityField::Content]));
+    let marker = PlatformSecurityContext::outbound_marker();
+    for _ in 0..2 {
+        let response = platform
+            .batch_get_entities(&marker, request())
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.0.values().next(),
+            Some(EntityLookup::Found { .. })
+        ));
+    }
+    for _ in 0..2 {
+        let response = tenant
+            .batch_get_entities(&caller(), request())
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.0.values().next(),
+            Some(EntityLookup::Found { .. })
+        ));
+    }
+    let received = received.lock().unwrap().clone();
+    let plane = |prefix: &str| {
+        received
+            .iter()
+            .filter(|r| r.target.starts_with(prefix))
+            .map(|r| r.if_none_match.clone())
+            .collect()
+    };
+    [
+        plane("POST /types-registry/v2/platform/entities:batchGet "),
+        plane("POST /types-registry/v2/entities:batchGet "),
+    ]
+}
+
+#[tokio::test]
+async fn both_resolving_clients_cache_with_defaults_or_the_settings_they_are_built_with() {
+    let etag = Some("\"t1\"".to_owned());
+    assert_eq!(
+        validators_sent(None).await,
+        [vec![None], vec![None]],
+        "the default window serves each second read"
+    );
+    assert_eq!(
+        validators_sent(Some(revalidating())).await,
+        [vec![None, etag.clone()], vec![None, etag]],
+        "a zero window revalidates the one cache's snapshot"
+    );
+    assert_eq!(
+        validators_sent(Some(disabled())).await,
+        [vec![None, None], vec![None, None]],
+        "nothing retained, so nothing to revalidate"
+    );
 }

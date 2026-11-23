@@ -183,7 +183,7 @@ async fn tenant_metrics_include_visibility_revalidation_and_skip_anonymous_bypas
     let meter = provider.meter("cf-gears-types-registry-sdk");
     let registry = Arc::new(MockTypesRegistry::new());
     registry.seed(TYPE, schema(TYPE, "v1"));
-    let mut cache = CachedTypesRegistry::new_local(registry, CacheSettings::default());
+    let mut cache = CachedTypesRegistry::new(registry, CacheSettings::default());
     cache.cache.metrics.use_test_meter(&meter);
     let tenant = |id| {
         SecurityContext::builder()

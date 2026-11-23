@@ -5621,7 +5621,6 @@ dependencies = [
  "lru",
  "opentelemetry",
  "opentelemetry_sdk",
- "parking_lot",
  "proptest",
  "rand 0.10.3",
  "secrecy",

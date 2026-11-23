@@ -1,6 +1,12 @@
 # Types Registry e2e suite
 
-The suite covers asynchronous admission (`202` + `GET /operations/{id}`), exact and batch reads, batch resolution, discovery and plane separation through numbered scenarios. Ordinary scenarios use one selected API and HTTP client for submissions, deletions, operation polling and entity reads. By default this is `/types-registry/v2/platform/` with the internal token. The plane-separation scenarios additionally exercise tenant reads under `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit HTTP client and API path so the same workflows can exercise tenant mutations once supported. The [legacy suite](legacy/README.md) covers the original synchronous v1 API (`200` + a `results` array) and has no reserved scenario IDs.
+Numbered e2e scenarios cover asynchronous admission (`202` + `GET /operations/{id}`),
+exact and batch reads, resolution, discovery and both API planes. Workflows default
+to `/types-registry/v2/platform/` with the internal token. Tenant read scenarios
+use `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit client
+and API path for either plane, including future tenant mutations. The
+[legacy suite](legacy/README.md) covers synchronous v1 (`200` + `results`)
+and has no reserved scenario IDs.
 
 ## Scenario index
 

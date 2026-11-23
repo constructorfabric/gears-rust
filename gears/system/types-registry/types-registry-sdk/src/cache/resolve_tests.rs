@@ -1,6 +1,5 @@
-//! The identity store behind `batch_resolve_identities` and the platform `resolve_*`
-//! helpers: positive only, no window, separate from the snapshot entries. What the cache
-//! does not know goes to the registry's batch resolution, never to a batch read.
+//! Platform identity resolution uses a separate positive LRU without expiry.
+//! Misses reach batch resolution without reading snapshots.
 
 use gts::{GtsId, GtsInstanceId, GtsTypeId};
 use serde_json::json;
@@ -150,10 +149,8 @@ async fn a_mixed_batch_resolves_only_the_unknown_keys() {
     assert_eq!(f.recorder.batch_count(), 0);
 }
 
-/// With no identity store, a resident snapshot confirmed inside the window still answers
-/// its identity under either spelling, as it did when resolution read through the
-/// entries; an expired one does not, and the key goes to the batch resolution, which
-/// neither revalidates nor refills the entry.
+/// Without an identity LRU, a fresh snapshot resolves either key.
+/// An expired one sends the key to batch resolution without refreshing the snapshot.
 #[tokio::test(start_paused = true)]
 async fn with_no_identity_store_only_a_fresh_resident_snapshot_answers() {
     let f = fixture_bound(WINDOW, 0);
@@ -289,8 +286,8 @@ async fn a_known_identity_of_the_other_kind_resolves_nothing_without_a_read() {
     assert_eq!(f.recorder.resolution_count(), 1);
 }
 
-/// Room for two full snapshots, never three: a known identity answered while its
-/// snapshot is the least recently used leaves it so, and the next fill evicts it.
+/// An identity hit leaves snapshot recency unchanged, so the next fill evicts
+/// the least-recently-used snapshot.
 #[tokio::test(start_paused = true)]
 async fn a_known_identity_does_not_extend_its_snapshot_s_recency() {
     let registry = MockTypesRegistry::new().completing_after(0);
@@ -329,10 +326,8 @@ async fn a_known_identity_does_not_extend_its_snapshot_s_recency() {
     );
 }
 
-/// `GtsId::to_uuid` returns a UUID-tail as is: an unregistered identifier can share the
-/// Registry Reference of a registered one with no hash collision. Its resolution and its
-/// reads go to the registry, though both the snapshot and the identity of the registered
-/// one are warm, and its absence disturbs neither.
+/// An unregistered ID can share a registered entity's UUID tail without a hash
+/// collision. The alias still misses and leaves both cached records intact.
 #[tokio::test(start_paused = true)]
 async fn an_identifier_sharing_a_resident_registry_reference_is_read_and_stays_absent() {
     let f = fixture(WINDOW);
@@ -399,9 +394,7 @@ async fn an_identifier_sharing_a_resident_registry_reference_is_read_and_stays_a
     );
 }
 
-/// The alias's read is in flight while the registered entity's own fresh read commits,
-/// so its absence arrives after something else was recorded for the shared Registry
-/// Reference: it still says nothing of the entity resident.
+/// A late alias miss cannot invalidate the registered entity's just-refreshed snapshot.
 #[tokio::test(start_paused = true)]
 async fn an_alias_absence_arriving_late_leaves_the_resident_entity_alone() {
     let f = fixture(WINDOW);
@@ -428,11 +421,8 @@ async fn an_alias_absence_arriving_late_leaves_the_resident_entity_alone() {
     assert_eq!(f.recorder.batch_count(), 3, "still resident");
 }
 
-/// Room for exactly two light snapshots of equal weight — three instances whose
-/// identifiers differ only in their UUID-tails, so identity, kind and lifecycle measure
-/// alike. A read by another identifier sharing the resident's Registry Reference is a
-/// miss that leaves the resident least recently used, so the next fill evicts it rather
-/// than the more recent snapshot.
+/// The byte budget fits two of these three equal-weight snapshots.
+/// An alias miss leaves the old snapshot least recently used.
 #[tokio::test(start_paused = true)]
 async fn a_miss_by_another_spelling_leaves_the_resident_snapshot_s_recency() {
     let registered = format!("{TYPE}{TAIL}");
@@ -473,10 +463,8 @@ async fn a_miss_by_another_spelling_leaves_the_resident_snapshot_s_recency() {
     assert_eq!(f.recorder.batch_count(), 5, "the resident was evicted");
 }
 
-/// A resolution holds a known identity while it reads the rest. Both stores may lose that
-/// identity meanwhile; an answer pairing its Registry Reference with another identifier
-/// still contradicts it, so the resolution fails rather than answering two identifiers
-/// for one Registry Reference, and the contradicting pair is learned nowhere.
+/// Reject a conflicting reply against a pinned pair even if both stores evicted
+/// it during resolution.
 #[tokio::test(start_paused = true)]
 async fn a_resolution_answer_contradicting_an_identity_it_holds_fails() {
     let f = fixture_with(
@@ -526,9 +514,8 @@ async fn a_resolution_answer_contradicting_an_identity_it_holds_fails() {
     assert!(f.cache.identity(&EntityKey::GtsUuid(held)).is_none());
 }
 
-/// Every answer of the registry's resolution is checked before any is learned: a key left
-/// unanswered, an answer to a key not sent, an identity of another entity than its key
-/// names, or two identifiers for one Registry Reference fail the whole resolution.
+/// Missing or unsolicited keys, mismatched entities and conflicting pairs fail
+/// the whole resolution before any learning.
 #[tokio::test(start_paused = true)]
 async fn a_malformed_resolution_fails_whole_and_teaches_nothing() {
     type Rewrite = fn(&mut super::Resolutions);
@@ -577,8 +564,7 @@ async fn a_malformed_resolution_fails_whole_and_teaches_nothing() {
     }
 }
 
-/// A resolution's answer is checked against the resident snapshots too, with no identity
-/// store to remember the pair: another identifier for a resident Registry Reference fails.
+/// Resident snapshots reject conflicting pairs even without an identity LRU.
 #[tokio::test(start_paused = true)]
 async fn a_resolution_contradicting_a_resident_snapshot_fails() {
     let f = fixture_bound(WINDOW, 0);
@@ -600,8 +586,7 @@ async fn a_resolution_contradicting_a_resident_snapshot_fails() {
     );
 }
 
-/// A batch the registry refuses for its size is sent whole, known keys included, for the
-/// registry to refuse; the cache answers none of it.
+/// Forward an invalid-size batch intact, including known keys.
 #[tokio::test(start_paused = true)]
 async fn an_over_long_or_empty_resolution_is_sent_whole_for_the_registry_to_refuse() {
     let f = fixture(WINDOW);

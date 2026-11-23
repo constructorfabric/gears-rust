@@ -3344,9 +3344,8 @@ fn batch_resolve(body: &Value) -> Request<Body> {
     post(&format!("{PLATFORM}/entities:batchResolve"), body)
 }
 
-/// Every distinct key's stored identity, Active or deleted, or `not_found`; each result
-/// echoes its key, canonically for a Registry Reference, and carries nothing but the pair.
-/// The tenant plane answers the same body.
+/// Both planes return identity-only results for distinct active, deleted or absent
+/// keys. UUID echoes use their canonical spelling.
 #[tokio::test]
 async fn a_batch_resolution_answers_the_stored_pair_of_every_key() {
     let router = router_with_db().await;
@@ -3414,8 +3413,7 @@ async fn a_batch_resolution_answers_the_stored_pair_of_every_key() {
     assert_eq!(sorted(&tenant.body), sorted(&response.body));
 }
 
-/// Bounded like a batch read, on the raw item count — duplicates included — before any
-/// key is looked at; past the ceiling items are counted, not kept.
+/// Enforce the raw item cap before lookup, counting excess items without keeping them.
 #[tokio::test]
 async fn a_batch_resolution_is_bounded_on_its_raw_count() {
     let router = router_with_db().await;
@@ -5580,9 +5578,8 @@ async fn a_current_etag_answers_304_with_the_same_etag() {
     }
 }
 
-/// The `ETag` names the entity's state, not the `$select`: a current one answers `304`
-/// under any selection (holding the selected fields is the client's to track), and
-/// one from before a revision is not current.
+/// A current `ETag` matches across projections. A revision invalidates it, and
+/// the client tracks which selected fields it holds.
 #[tokio::test]
 async fn a_current_etag_answers_any_select_and_a_stale_one_200() {
     let router = router_with_db().await;

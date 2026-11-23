@@ -1,4 +1,28 @@
 //! The client-side representation cache (SPEC §8.3, DESIGN "The client-side cache").
+//!
+//! # One batch read
+//!
+//! 1. Plan under the lock. A hit requires a fresh snapshot covering the projection
+//!    and, for tenant reads, visibility confirmed to the same read context (subject,
+//!    its type, home tenant and token scopes). `fresh` forces a fetch.
+//! 2. Fetch remote keys in one `batchGet` outside the lock. A **pinned** read holds
+//!    a snapshot covering the projection and sends its `ETag`. Other reads forward
+//!    the caller's applicable validator.
+//! 3. Verify the whole batch, merge fields with matching `ETags` and build the response.
+//!    `Unchanged` confirms either the pinned snapshot ([`Verified::Confirmed`]) or
+//!    the caller's validator ([`Verified::Matched`]). A caller match confirms a
+//!    matching resident entry or drops a conflicting one.
+//! 4. Commit identities and snapshots under the lock. A tenant read's `NotFound`
+//!    revokes that read context's confirmation and fences its pending reads.
+//!
+//! # Why reads take tickets
+//!
+//! `ETags` cannot order revisions. A **ticket** records the event counter and the
+//! key's **spelling** (GTS ID, UUID or known pair) before the fetch. A read is
+//! **quiet** if no intervening event could concern that entity. Otherwise the event
+//! **fences** the read. A fenced reply can drop a conflicting snapshot but cannot
+//! fill or refresh one. For example, if the client observes a successful registration
+//! while a read is in flight, the old reply reaches its caller without refilling the cache.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -26,23 +50,25 @@ mod metrics;
 mod store;
 
 use metrics::CacheMetrics;
-use store::{Store, TenantTicket, TenantViewer, Ticket, Usage, Weight};
+use store::{ContextTicket, ReadContext, Store, Ticket, Usage, Weight};
 
 /// Freshness and retention limits for Types Registry client caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheSettings {
     /// `0` is meaningful: every snapshot read revalidates.
     pub freshness_window: Duration,
-    /// Maximum total bytes of compact JSON snapshots and their raw validators.
-    /// The cache evicts least-recently-used snapshots.
+    /// Charges compact JSON documents (including selected `null`), GTS ID bytes,
+    /// raw validator bytes and 256 bytes per entry. LRU eviction enforces the
+    /// budget. Oversized entries bypass retention. Heap usage may be higher.
     pub max_size_bytes: usize,
-    /// Maximum number of resident snapshots. Zero disables snapshot retention.
-    /// A tenant cache uses the same limit for its separate visibility records.
+    /// Maximum number of resident snapshots. Zero disables snapshot retention and,
+    /// in a tenant cache, which uses the same limit for its visibility records,
+    /// all local tenant answers.
     pub max_entries: usize,
-    /// Maximum number of identities retained for the platform `resolve_*` helpers.
-    /// Each identity holds a Registry Reference and a GTS identifier. With zero entries, a
-    /// snapshot inside the freshness window can still answer a key, and other keys go to
-    /// the registry.
+    /// Identity LRU limit. Zero leaves resolution to fresh snapshots or the registry.
+    /// A tenant cache answers a remembered pair only to a read context the registry
+    /// showed it to within the window; without pairs it resolves only from a fresh
+    /// read of a resident snapshot. A zero window disables local tenant resolution.
     pub max_identity_entries: usize,
 }
 
@@ -53,8 +79,7 @@ impl CacheSettings {
     pub const DEFAULT_MAX_SIZE_BYTES: usize = 64 * 1024 * 1024;
     /// Default maximum number of resident snapshots.
     pub const DEFAULT_MAX_ENTRIES: usize = 16 * 1024;
-    /// 16 384 identities: a few MB at typical identifier lengths, 16 MB of identifier
-    /// text at the most.
+    /// Default identity count limit (up to 16 MiB of identifier text).
     pub const DEFAULT_MAX_IDENTITY_ENTRIES: usize = 16 * 1024;
 }
 
@@ -69,26 +94,16 @@ impl Default for CacheSettings {
     }
 }
 
-/// A [`PlatformTypesRegistryApi`] that serves batch reads from a bounded, per-client
-/// cache and forwards everything else.
+/// A bounded per-client cache for platform reads and identity resolution.
 ///
-/// One entry per entity holds every field read of it under one validator, which names
-/// the entity's state under every projection. A read the entry covers is answered from
-/// it, projected to exactly the fields asked; any other goes to the registry, and its
-/// answer is merged into the entry under the same validator or replaces it under a
-/// new one.
+/// One snapshot per entity accumulates fields under one validator. Covered reads
+/// return the requested projection. Matching replies merge, while a new validator
+/// replaces the snapshot.
 ///
-/// Beside the entries, a separate bounded identity store keeps the canonical identifier
-/// of each entity a read found, for
-/// [`batch_resolve_identities`](PlatformTypesRegistryApi::batch_resolve_identities) and
-/// so the `resolve_*` helpers: known identities are answered from it with no window, and
-/// only the others are read, as a batch read under the mandatory fields.
-///
-/// An identifier and a Registry Reference are one entity only because the registry said
-/// so: nothing derives one from the other. A key finds an entry by the spelling its
-/// resident snapshot carries, and every answer must name the key asked and agree with
-/// every pair the cache knows — resident or remembered, and within the batch — or the
-/// whole read fails as a protocol fault and changes nothing.
+/// [`batch_resolve_identities`](PlatformTypesRegistryApi::batch_resolve_identities)
+/// checks a separate identity LRU without expiry, then fresh snapshots, then the
+/// registry. Both indexes use registry-issued pairs. The cache checks the whole
+/// reply against requested keys and known pairs before updating either store.
 pub struct CachedPlatformTypesRegistry {
     inner: Arc<dyn PlatformTypesRegistryApi>,
     cache: ReadCache,
@@ -99,9 +114,7 @@ struct ReadCache {
     freshness_window: Duration,
     /// The store's byte bound, so that a merge too large to keep is never built.
     max_size_bytes: usize,
-    /// The snapshot store and the identity store it holds. Every critical section is a
-    /// lookup or a few inserts and removals that leave both consistent at each step, so a
-    /// poisoned lock is recovered.
+    /// Both stores share one lock. Each mutation preserves consistency, so recover poison.
     store: Mutex<Store>,
 }
 
@@ -153,7 +166,7 @@ struct Resident {
 struct Tickets<'a> {
     store: &'a Mutex<Store>,
     held: Vec<Ticket>,
-    tenant: Option<TenantTicket>,
+    context: Option<ContextTicket>,
 }
 
 impl Drop for Tickets<'_> {
@@ -162,11 +175,14 @@ impl Drop for Tickets<'_> {
         for ticket in &self.held {
             store.release(ticket);
         }
-        if let Some(ticket) = self.tenant {
-            store.release_tenant_ticket(ticket);
+        if let Some(ticket) = &self.context {
+            store.release_context_ticket(ticket);
         }
     }
 }
+
+/// Resolution answers by requested key.
+type Resolutions = HashMap<EntityKey, Option<EntityIdentity>>;
 
 /// A registry answer checked against what was sent, ready to commit without further work.
 enum Verified {
@@ -174,8 +190,7 @@ enum Verified {
         /// The answer as read: exactly the selected fields.
         snapshot: Arc<Entity>,
         etag: Validator,
-        /// What the entry is to hold, or `None` when the answer and what the entry held
-        /// of the same state are too large together: the entry then stays as it is.
+        /// The snapshot to retain. `None` keeps the existing entry if the merge is oversized.
         keep: Option<Kept>,
     },
     /// `Unchanged` to the entry's validator: the pinned entry is current.
@@ -194,9 +209,7 @@ impl std::fmt::Debug for CachedPlatformTypesRegistry {
 }
 
 impl CachedPlatformTypesRegistry {
-    /// Wraps `inner` in a new cache of its own: every call builds a separate store, so
-    /// share one instance between consumers that should share cached reads. `settings`
-    /// sets its freshness window and retention limits.
+    /// Wrap `inner` in a bounded cache. Share the wrapper to share cached reads.
     #[must_use]
     pub fn new(inner: Arc<dyn PlatformTypesRegistryApi>, settings: CacheSettings) -> Self {
         Self {
@@ -232,10 +245,9 @@ impl CachedPlatformTypesRegistry {
 impl ReadCache {
     fn new(settings: CacheSettings, tenant: bool) -> Self {
         let mut store = Store::new(settings.max_size_bytes, settings.max_entries);
+        store.remember_identities(settings.max_identity_entries);
         if tenant {
-            store.track_tenant_visibility();
-        } else {
-            store.remember_identities(settings.max_identity_entries);
+            store.track_visibility();
         }
         Self {
             metrics: CacheMetrics::from_global(if tenant { "tenant" } else { "platform" }),
@@ -262,7 +274,7 @@ impl ReadCache {
     async fn read<F>(
         &self,
         request: BatchGetEntitiesRequest,
-        viewer: Option<TenantViewer>,
+        context: Option<&ReadContext>,
         fetch: impl FnOnce(BatchGetEntitiesRequest) -> F,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError>
     where
@@ -274,7 +286,7 @@ impl ReadCache {
         }
         let now = Instant::now();
         let selection = request.projection.normalized();
-        let (plans, tickets) = self.plan(&request, &selection, now, viewer);
+        let (plans, tickets) = self.plan(&request, &selection, now, context);
         let mut revalidations = 0;
         let remote: Vec<BatchGetItem> = plans
             .iter()
@@ -311,7 +323,7 @@ impl ReadCache {
         };
         let verified = verify(&plans, &selection, self.max_size_bytes, answers)?;
         let response = respond(&plans, &selection, &verified)?;
-        self.settle(&plans, &verified, now, tickets.tenant)?;
+        self.settle(&plans, &verified, now, tickets.context.as_ref())?;
         drop(tickets);
         Ok(response)
     }
@@ -322,7 +334,7 @@ impl ReadCache {
         plans: &[(EntityKey, Plan)],
         verified: &[Option<Verified>],
         sent_at: Instant,
-        tenant: Option<TenantTicket>,
+        context: Option<&ContextTicket>,
     ) -> Result<(), CanonicalError> {
         let found = plans
             .iter()
@@ -331,7 +343,7 @@ impl ReadCache {
             .map(|snapshot| (&snapshot.gts_id, snapshot.gts_uuid));
         let (identities, snapshots) = self.update_store(|store| {
             let identities = Self::learn_identities(store, &[], found)?;
-            let snapshots = commit(store, plans, verified, sent_at, tenant);
+            let snapshots = commit(store, plans, verified, sent_at, context);
             Ok::<_, CanonicalError>((identities, snapshots))
         })?;
         self.metrics.evictions("identity", identities);
@@ -350,17 +362,35 @@ impl ReadCache {
         Ok(())
     }
 
-    /// Validate the complete result before changing LRU membership or recency. `held` are
-    /// identities the caller answers beside these: an answer contradicting one fails like
-    /// any other contradiction, though both stores may have lost it while the request was
-    /// in flight.
+    /// Learns the pairs of a whole, consistent discovery page in page order.
+    fn learn_page(&self, page: &ListEntitiesResponse) -> Result<(), CanonicalError> {
+        if let Some(entity) = page
+            .items
+            .iter()
+            .find(|entity| !crate::ext::consistent(entity))
+        {
+            return Err(CanonicalError::internal(format!(
+                "the registry returned an inconsistent discovery item for {}",
+                entity.gts_id
+            ))
+            .create());
+        }
+        self.learn_from_reply(
+            &[],
+            page.items
+                .iter()
+                .map(|entity| (&entity.gts_id, entity.gts_uuid)),
+        )
+    }
+
+    /// Validate before learning or changing recency. `held` pairs remain part of
+    /// the batch even if they were evicted while the registry call was in flight.
     fn learn_identities<'a>(
         store: &mut Store,
         held: &[&'a EntityIdentity],
         found: impl Iterator<Item = (&'a GtsId, Uuid)> + Clone,
     ) -> Result<u64, CanonicalError> {
-        // Pairs the caller holds beside this read are part of the batch: checked against,
-        // not learned again.
+        // Validate against held pairs without relearning them.
         let mut by_id: HashMap<&GtsId, Uuid> = held
             .iter()
             .map(|known| (&known.gts_id, known.gts_uuid))
@@ -405,9 +435,8 @@ impl ReadCache {
             .sum())
     }
 
-    /// Every distinct key this cache can resolve without the registry: from the identity
-    /// store, which no window bounds, or else from a resident snapshot confirmed inside the
-    /// window. The others, in first-asked order, are left for the registry.
+    /// Resolve distinct keys from the identity LRU or fresh snapshots.
+    /// Return misses in request order.
     fn known_identities(
         &self,
         keys: Vec<EntityKey>,
@@ -439,15 +468,19 @@ impl ReadCache {
         (answers, unknown)
     }
 
-    /// Every distinct key a resident snapshot answers for `viewer`: one whose visibility
-    /// the registry confirmed for this viewer inside the window, under its current epoch.
-    /// The others, in first-asked order, are left for the registry.
+    /// Resolve distinct keys the read context was shown within the window. Return
+    /// misses in request order and, if any, a ticket fencing their confirmation.
     fn visible_identities(
         &self,
         keys: Vec<EntityKey>,
-        viewer: TenantViewer,
+        context: &ReadContext,
         now: Instant,
-    ) -> (HashMap<EntityKey, Option<EntityIdentity>>, Vec<EntityKey>) {
+    ) -> (Resolutions, Vec<EntityKey>, Tickets<'_>) {
+        let mut tickets = Tickets {
+            store: &self.store,
+            held: Vec::new(),
+            context: None,
+        };
         let mut store = self.store();
         let mut answers = HashMap::with_capacity(keys.len());
         let mut unknown = Vec::new();
@@ -455,43 +488,33 @@ impl ReadCache {
             if answers.contains_key(&key) || unknown.contains(&key) {
                 continue;
             }
-            // Only a visible entry is marked used: a viewer refused it leaves its recency.
-            let entry = if store.tenant_visible(&key, viewer, now, self.freshness_window) {
-                store.get(&key)
-            } else {
-                None
-            };
-            match entry {
-                Some(entry) => {
-                    let identity = EntityIdentity {
-                        gts_id: entry.snapshot.gts_id.clone(),
-                        gts_uuid: entry.snapshot.gts_uuid,
-                    };
+            match store.resolvable(&key, context, now, self.freshness_window) {
+                Some(identity) => {
                     answers.insert(key, Some(identity));
                 }
                 None => unknown.push(key),
             }
         }
-        (answers, unknown)
+        if !unknown.is_empty() {
+            tickets.context = Some(store.context_ticket(context));
+        }
+        (answers, unknown, tickets)
     }
 
-    /// Decides, per distinct key, whether the cache answers it or the registry does, and
-    /// with which condition. A repeated key keeps its first mention, as the registry does.
-    /// Each key sent to the registry takes a ticket in the same critical section as its
-    /// lookup, so a mutation observed after the lookup fences its answer.
+    /// Plan distinct keys in first-mention order. Take remote read tickets under
+    /// the lookup lock so intervening mutations can fence their replies.
     fn plan(
         &self,
         request: &BatchGetEntitiesRequest,
         selection: &FieldSelection,
         now: Instant,
-        viewer: Option<TenantViewer>,
+        context: Option<&ReadContext>,
     ) -> (Vec<(EntityKey, Plan)>, Tickets<'_>) {
-        // Declared before the guard, so that an unwind drops the guard first and the
-        // tickets' release can take the lock.
+        // Drop the guard before tickets reacquire the lock during unwind.
         let mut tickets = Tickets {
             store: &self.store,
             held: Vec::new(),
-            tenant: None,
+            context: None,
         };
         let mut store = self.store();
         let mut seen = HashSet::new();
@@ -500,12 +523,11 @@ impl ReadCache {
             if !seen.insert(&item.key) {
                 continue;
             }
-            // Only a condition for this key that covers the read is the caller's.
+            // The caller's validator must cover this key and projection.
             let caller = item.if_none_match_for(&request.projection).cloned();
-            // Only an entry whose snapshot carries the key's own spelling answers,
-            // conditions or merges it.
-            let visible = viewer.is_none_or(|viewer| {
-                store.tenant_visible(&item.key, viewer, now, self.freshness_window)
+            // Use only snapshots that carry the requested key.
+            let visible = context.is_none_or(|context| {
+                store.visible(&item.key, context, now, self.freshness_window)
             });
             let entry = if visible {
                 store.get(&item.key)
@@ -551,10 +573,10 @@ impl ReadCache {
             };
             plans.push((item.key.clone(), plan));
         }
-        if let Some(viewer) = viewer
+        if let Some(context) = context
             && !tickets.held.is_empty()
         {
-            tickets.tenant = Some(store.tenant_ticket(viewer));
+            tickets.context = Some(store.context_ticket(context));
         }
         (plans, tickets)
     }
@@ -583,9 +605,7 @@ impl CachedPlatformTypesRegistry {
         self.invalidate(&committed);
     }
 
-    /// Invalidates each entity by the key an operation or a forwarded read named it with,
-    /// and by the counterpart a resident snapshot carries; with the key alone it fences
-    /// every read in flight that knew only its own key, since the two may be one entity.
+    /// Invalidate the known pair or fence one-sided reads if the counterpart is unknown.
     fn invalidate(&self, keys: &[EntityKey]) {
         if keys.is_empty() {
             return;
@@ -631,18 +651,16 @@ fn stated<'a>(plan: &'a Plan, verified: &'a Verified) -> Option<(&'a GtsId, Uuid
     Some((&entity.gts_id, entity.gts_uuid))
 }
 
-/// Records verified answers whose identities were checked. Only map operations run under
-/// the lock. An answer to a read during which anything else was recorded for its entity
-/// changes nothing (the late-fill guard); the caller still receives it.
+/// Apply checked replies under the store lock. An intervening event prevents
+/// a fill, while the caller still receives its reply.
 fn commit(
     store: &mut Store,
     plans: &[(EntityKey, Plan)],
     verified: &[Option<Verified>],
     sent_at: Instant,
-    tenant: Option<TenantTicket>,
+    context: Option<&ContextTicket>,
 ) -> u64 {
-    // Judged before any of this batch is applied: its keys were ticketed together, so
-    // what one of them records is not news to another.
+    // Judge all tickets before applying any reply from this batch.
     let quiet: Vec<bool> = plans
         .iter()
         .map(|(_, plan)| match plan {
@@ -650,31 +668,28 @@ fn commit(
             Plan::Local { .. } => false,
         })
         .collect();
-    let confirmed_viewer = tenant
-        .filter(|ticket| store.tenant_ticket_current(*ticket))
-        .map(|ticket| ticket.viewer);
+    let confirmed_for = context
+        .filter(|ticket| store.context_ticket_current(ticket))
+        .map(|ticket| ticket.context.clone());
     let mut evictions = 0;
     for (((asked, plan), verified), quiet) in plans.iter().zip(verified).zip(quiet) {
         let (Plan::Remote { sent, resident, .. }, Some(verified)) = (plan, verified) else {
             continue;
         };
-        if tenant.is_some() && matches!(verified, Verified::NotFound) {
+        if context.is_some() && matches!(verified, Verified::NotFound) {
             continue;
         }
         let pair = stated(plan, verified);
         // The entry's validator when an entry carries the spelling asked.
         let current = store.peek(asked).map(|entry| entry.etag.clone());
         if !quiet {
-            // Something was recorded for this entity while the read was in flight — an
-            // observed mutation, or another read's answer — and nothing orders states,
-            // so this answer fills nothing. Unless it agrees with what is resident, one
-            // of the two is stale: drop the entity's entries and let the next read refetch.
+            // An intervening event blocks a fill. Validators cannot order revisions, so
+            // discard a conflicting resident snapshot and let the next read refetch.
             let agrees = match verified {
                 Verified::Found { etag, .. } | Verified::Matched(etag) => {
                     current.as_ref() == Some(etag)
                 }
-                // The registry confirmed the entry this read held: still agreement
-                // only if that is what is resident now.
+                // A confirmation agrees only while its pinned validator is resident.
                 Verified::Confirmed => resident
                     .as_ref()
                     .is_some_and(|ours| current.as_ref() == Some(&ours.etag)),
@@ -685,24 +700,19 @@ fn commit(
             }
             continue;
         }
-        // Quiet: nothing outside this batch was recorded since the lookup. Another key of
-        // this batch naming the same entity may have just been applied, so decisions are
-        // taken against the entry as it is now, not as the lookup saw it.
+        // Use current residency because an earlier reply in this batch may name
+        // the same entity under another key.
         match verified {
             Verified::Found { etag, keep, .. } => {
                 let same = current.as_ref() == Some(etag);
                 match keep {
-                    // Oversize policy: under the same validator, an answer too large to
-                    // keep (with what the entry holds, or alone) leaves the entry as it
-                    // is, confirmed, rather than losing a smaller valid holding.
+                    // An oversized merge retains the smaller snapshot under the same validator.
                     Some(kept) if !same || store.fits(&kept.weight, etag) => {
                         if !same && current.is_some()
                             || sent.as_ref().is_some_and(|held| held != etag)
                         {
-                            // A validator this read held is no longer current: a new
-                            // state, so reads of the old one started earlier must not
-                            // fill. An answer too large to keep still drops the stale
-                            // entry.
+                            // A new validator fences older fills and drops the stale snapshot even
+                            // if the reply is oversized.
                             store.invalidate(asked, pair);
                         }
                         evictions += store.insert(
@@ -714,8 +724,7 @@ fn commit(
                         );
                     }
                     _ if same => store.confirm(asked, etag, sent_at),
-                    // The union was not built for a state that is no longer resident:
-                    // whatever is resident now is another state, and stale.
+                    // The merge cannot be kept under the now-resident validator.
                     _ => store.invalidate(asked, pair),
                 }
             }
@@ -724,8 +733,7 @@ fn commit(
                     store.confirm(asked, &ours.etag, sent_at);
                 }
             }
-            // The caller's validator is current: so is the entry, if it holds the same
-            // state; otherwise the entry is stale.
+            // Confirm a matching resident validator and invalidate a conflicting one.
             Verified::Matched(etag) => match current {
                 Some(held) if held == *etag => store.confirm(asked, etag, sent_at),
                 Some(_) => store.invalidate(asked, pair),
@@ -733,30 +741,35 @@ fn commit(
             },
             Verified::NotFound => store.invalidate(asked, pair),
         }
-        if let Some(viewer) = confirmed_viewer
+        if let Some(confirmed) = &confirmed_for
             && let Some(etag) = match verified {
                 Verified::Found { etag, .. } | Verified::Matched(etag) => Some(etag),
                 Verified::Confirmed => sent.as_ref(),
                 Verified::NotFound => None,
             }
         {
-            store.confirm_tenant(asked, viewer, etag, sent_at);
+            store.confirm_visible(asked, confirmed, etag, sent_at);
+        }
+        // A checked answer shows its pair even when its snapshot is not kept or was
+        // evicted in flight. A caller-only `Unchanged` checks no pair.
+        if let Some(confirmed) = &confirmed_for
+            && let Some(snapshot) = identified(plan, Some(verified))
+        {
+            store.confirm_resolved(snapshot.gts_uuid, confirmed, sent_at);
         }
         store.record(asked, pair);
     }
-    if let Some(ticket) = tenant {
+    if let Some(ticket) = context {
         let absent = plans.iter().zip(verified).filter_map(|((key, _), answer)| {
             matches!(answer, Some(Verified::NotFound)).then_some(key)
         });
-        store.revoke_tenant_reads(ticket.viewer, absent);
+        store.revoke_visible(&ticket.context, absent);
     }
     evictions
 }
 
-/// Checks every answer against the request that was sent before any of it is cached:
-/// one answer per sent key and no other, the asked entity in a consistent shape, and
-/// `Unchanged` only to the exact validator sent. A `Found` under the entry's validator is
-/// merged with what the entry holds, outside the lock.
+/// Validate all keys, entity identities, field coverage and exact sent validators
+/// before caching. Merge matching snapshots outside the lock.
 fn verify(
     plans: &[(EntityKey, Plan)],
     selection: &FieldSelection,
@@ -797,9 +810,7 @@ fn verify(
                 let measured = store::weight(&entity);
                 let snapshot = Arc::new(*entity);
                 let keep = match resident {
-                    // One state: the entry's other fields stay beside the answer, if the
-                    // two fit together. Judged on measured weights, so a union too large to
-                    // keep is never built; the entry then keeps what it already holds.
+                    // Keep compatible fields only if their combined measured weight fits.
                     Some(r) if r.etag == etag && !selection.is_superset(&r.covers) => {
                         let weight = measured.merged(selection, &r.weight);
                         weight.fits(max_size_bytes, &etag).then(|| Kept {
@@ -851,10 +862,8 @@ fn protocol_fault(key: &EntityKey, what: &str) -> CanonicalError {
     .create()
 }
 
-/// The caller's response, built outside the lock and before anything is committed:
-/// exactly the selected fields, and `Unchanged` only where the caller itself sent the
-/// matching validator. Every pairing `verify` can produce is listed; any other is a
-/// broken invariant and fails the read rather than posing as an absent entity.
+/// Build the response outside the lock before committing. Return only selected
+/// fields and match only the caller's validator. Unhandled pairs are protocol faults.
 fn respond(
     plans: &[(EntityKey, Plan)],
     selection: &FieldSelection,
@@ -918,8 +927,7 @@ fn answer(
     }
 }
 
-/// Whether the snapshot carries exactly the fields `selection` asks for that apply to its
-/// kind, as the registry answers them. A selected JSON `null` is present.
+/// Require exactly the selected fields applicable to the kind, including JSON `null`.
 fn shaped(entity: &Entity, selection: &FieldSelection) -> bool {
     EntityField::ALL.into_iter().all(|field| {
         entity.has(field) == (field.applies_to(entity.kind) && selection.contains(field))
@@ -936,9 +944,8 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         self.read(ctx, request).await
     }
 
-    /// Known identities from the identity store, which no window bounds, then from a
-    /// resident snapshot inside the window; every other key resolved by the registry. A
-    /// batch the registry refuses for its size is sent whole.
+    /// Resolve from remembered pairs, then fresh snapshots, then the registry.
+    /// Forward invalid batch sizes intact.
     async fn batch_resolve_identities(
         &self,
         ctx: &PlatformSecurityContext,
@@ -957,8 +964,7 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
             .batch_resolve_identities(ctx, unknown.clone())
             .await?;
         let fetched = crate::ext::checked_resolutions(&unknown, fetched)?;
-        // The identities answered so far are held while the rest are resolved: an answer
-        // contradicting one of them fails the resolution, and is learned nowhere.
+        // Keep local pairs pinned while resolving misses to detect contradictions.
         let held: Vec<&EntityIdentity> = answers.values().flatten().collect();
         self.cache.learn_from_reply(
             &held,
@@ -977,23 +983,7 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         let page = self.inner.list_entities(ctx, request).await?;
-        if let Some(entity) = page
-            .items
-            .iter()
-            .find(|entity| !crate::ext::consistent(entity))
-        {
-            return Err(CanonicalError::internal(format!(
-                "the registry returned an inconsistent discovery item for {}",
-                entity.gts_id
-            ))
-            .create());
-        }
-        self.cache.learn_from_reply(
-            &[],
-            page.items
-                .iter()
-                .map(|entity| (&entity.gts_id, entity.gts_uuid)),
-        )?;
+        self.cache.learn_page(&page)?;
         Ok(page)
     }
 
@@ -1033,91 +1023,44 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
     }
 }
 
-/// Tenant reads over one snapshot cache. A tenant can reuse a snapshot after the
-/// registry has confirmed visibility for that tenant within the freshness window.
+/// Local or REST cache with one visibility confirmation per entity and read context:
+/// the subject, its type, home tenant and token scopes. The registry may authorize each
+/// entity per subject, so confirmations are never shared between read contexts.
+/// Snapshots and the identity LRU are shared; a pair resolves locally only for a
+/// read context that a read or resolution showed it to within the window. Anonymous calls bypass the cache. REST misses require the
+/// caller's bearer.
 pub struct CachedTypesRegistry {
     inner: Arc<dyn TypesRegistryApi>,
     cache: ReadCache,
-    binding: TenantCacheBinding,
 }
 
 impl std::fmt::Debug for CachedTypesRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let binding = match self.binding {
-            TenantCacheBinding::TrustedLocal => "trusted_local",
-            #[cfg(feature = "rest-client")]
-            TenantCacheBinding::Bearer => "bearer",
-        };
         f.debug_struct("CachedTypesRegistry")
             .field("freshness_window", &self.cache.freshness_window)
-            .field("binding", &binding)
             .finish_non_exhaustive()
     }
 }
 
-enum TenantCacheBinding {
-    TrustedLocal,
-    #[cfg(feature = "rest-client")]
-    Bearer,
-}
-
 impl CachedTypesRegistry {
-    /// Cache a trusted in-process client whose visibility is tenant-wide: a confirmation
-    /// is shared by every caller of the tenant. Use only with a client whose visibility
-    /// does not depend on the caller's credential; a REST client takes
-    /// `new_rest`.
+    /// Cache reads from `inner` using `settings`.
     #[must_use]
-    pub fn new_local(inner: Arc<dyn TypesRegistryApi>, settings: CacheSettings) -> Self {
+    pub fn new(inner: Arc<dyn TypesRegistryApi>, settings: CacheSettings) -> Self {
         Self {
             inner,
             cache: ReadCache::new(settings, true),
-            binding: TenantCacheBinding::TrustedLocal,
         }
     }
 
-    /// Cache a REST client that forwards the caller's bearer to the registry.
-    #[cfg(feature = "rest-client")]
-    #[must_use]
-    pub fn new_rest(inner: Arc<dyn TypesRegistryApi>, settings: CacheSettings) -> Self {
-        Self {
-            inner,
-            cache: ReadCache::new(settings, true),
-            binding: TenantCacheBinding::Bearer,
-        }
-    }
-
-    fn viewer(&self, ctx: &SecurityContext) -> Option<TenantViewer> {
-        if ctx.is_anonymous() {
-            return None;
-        }
-        let credential = match self.binding {
-            TenantCacheBinding::TrustedLocal => None,
-            #[cfg(feature = "rest-client")]
-            TenantCacheBinding::Bearer => {
-                use secrecy::ExposeSecret as _;
-                use toolkit_security::crypto::hash::Sha256;
-
-                let bearer = ctx.bearer_token()?;
-                Some(Sha256::digest(bearer.expose_secret().as_bytes()))
-            }
-        };
-        Some(TenantViewer::new(ctx.subject_tenant_id(), credential))
-    }
-
-    fn revoke_if_refused<T>(
-        &self,
-        viewer: Option<TenantViewer>,
-        result: &Result<T, CanonicalError>,
-    ) {
-        if let Some(viewer) = viewer
-            && matches!(
-                result,
-                Err(CanonicalError::Unauthenticated { .. }
-                    | CanonicalError::PermissionDenied { .. })
+    fn context(ctx: &SecurityContext) -> Option<ReadContext> {
+        (!ctx.is_anonymous()).then(|| {
+            ReadContext::new(
+                ctx.subject_id(),
+                ctx.subject_type(),
+                ctx.subject_tenant_id(),
+                ctx.token_scopes(),
             )
-        {
-            self.cache.store().revoke_viewer(viewer);
-        }
+        })
     }
 }
 
@@ -1128,14 +1071,12 @@ impl TypesRegistryApi for CachedTypesRegistry {
         ctx: &SecurityContext,
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
-        let Some(viewer) = self.viewer(ctx) else {
+        let Some(context) = Self::context(ctx) else {
             return self.inner.batch_get_entities(ctx, request).await;
         };
         self.cache
-            .read(request, Some(viewer), |request| async {
-                let result = self.inner.batch_get_entities(ctx, request).await;
-                self.revoke_if_refused(Some(viewer), &result);
-                result
+            .read(request, Some(&context), |request| {
+                self.inner.batch_get_entities(ctx, request)
             })
             .await
     }
@@ -1145,57 +1086,65 @@ impl TypesRegistryApi for CachedTypesRegistry {
         ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        let result = self.inner.list_entities(ctx, request).await;
-        self.revoke_if_refused(self.viewer(ctx), &result);
-        result
+        let page = self.inner.list_entities(ctx, request).await?;
+        // Discovery is a `list`: it teaches pairs but shows them to no read context.
+        // Anonymous calls bypass the cache, so they teach nothing.
+        if !ctx.is_anonymous() {
+            self.cache.learn_page(&page)?;
+        }
+        Ok(page)
     }
 
-    /// A resident snapshot answers a key only under a fresh visibility confirmation for
-    /// this viewer; every other key is resolved by the registry for this caller. An answer
-    /// confirms nothing — it carries no validator — but `not_found` withdraws this viewer's
-    /// confirmation of the key, and fences its confirmations in flight, as a batch read's
-    /// absence does; other viewers' confirmations and the snapshot stay.
+    /// Resolve locally from a fresh read or resolution shown to this read context.
+    /// A positive reply shows the pair to it, unless a revocation fenced the request.
+    /// `not_found` revokes this read context's confirmation for the key and fences
+    /// its in-flight confirmations, leaving the shared snapshot and pair available.
     async fn batch_resolve_identities(
         &self,
         ctx: &SecurityContext,
         keys: Vec<EntityKey>,
     ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
-        let viewer = self.viewer(ctx);
-        let Some(seen_by) = viewer.filter(|_| !keys.is_empty() && keys.len() <= MAX_BATCH_GET_KEYS)
+        let Some(seen_by) =
+            Self::context(ctx).filter(|_| !keys.is_empty() && keys.len() <= MAX_BATCH_GET_KEYS)
         else {
-            let result = self.inner.batch_resolve_identities(ctx, keys).await;
-            self.revoke_if_refused(viewer, &result);
-            return result;
+            return self.inner.batch_resolve_identities(ctx, keys).await;
         };
-        let (mut answers, unknown) = self.cache.visible_identities(keys, seen_by, Instant::now());
+        let sent_at = Instant::now();
+        let (mut answers, unknown, tickets) =
+            self.cache.visible_identities(keys, &seen_by, sent_at);
         self.cache.metrics.resolutions(answers.len(), unknown.len());
         if unknown.is_empty() {
             return Ok(answers);
         }
-        let result = self
+        let fetched = self
             .inner
             .batch_resolve_identities(ctx, unknown.clone())
-            .await;
-        self.revoke_if_refused(viewer, &result);
-        let fetched = crate::ext::checked_resolutions(&unknown, result?)?;
+            .await?;
+        let fetched = crate::ext::checked_resolutions(&unknown, fetched)?;
         let evictions = self.cache.update_store(|store| {
-            // Checked against the snapshots answered beside it and every resident one,
-            // as a batch read's answers are; a tenant cache learns no identity.
+            // Validate against pinned and resident pairs.
             let held: Vec<&EntityIdentity> = answers.values().flatten().collect();
-            let evictions = ReadCache::learn_identities(
-                store,
-                &held,
-                fetched
-                    .values()
-                    .flatten()
-                    .map(|identity| (&identity.gts_id, identity.gts_uuid)),
-            )?;
+            let found = fetched
+                .values()
+                .flatten()
+                .map(|identity| (&identity.gts_id, identity.gts_uuid));
+            let evictions = ReadCache::learn_identities(store, &held, found.clone())?;
+            if tickets
+                .context
+                .as_ref()
+                .is_some_and(|ticket| store.context_ticket_current(ticket))
+            {
+                for (_, gts_uuid) in found {
+                    store.confirm_resolved(gts_uuid, &seen_by, sent_at);
+                }
+            }
             let absent = fetched
                 .iter()
                 .filter_map(|(key, identity)| identity.is_none().then_some(key));
-            store.revoke_tenant_reads(seen_by, absent);
+            store.revoke_visible(&seen_by, absent);
             Ok::<_, CanonicalError>(evictions)
         })?;
+        drop(tickets);
         self.cache.metrics.evictions("identity", evictions);
         answers.extend(fetched);
         Ok(answers)

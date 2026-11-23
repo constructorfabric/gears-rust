@@ -104,8 +104,7 @@ fn read() -> BatchGetEntitiesRequest {
     }
 }
 
-/// A platform read that must reach the registry resolved: the platform client's cache
-/// would otherwise answer from its window while the test moves between endpoints.
+/// Force a registry read when testing a change of resolved endpoint.
 fn routed() -> BatchGetEntitiesRequest {
     BatchGetEntitiesRequest {
         fresh: true,
@@ -244,19 +243,39 @@ async fn the_tenant_resolving_client_follows_the_registry_with_the_callers_beare
         "{refused:?}"
     );
 
-    let mut fresh = read();
-    fresh.fresh = true;
-    let wrong_bearer = SecurityContext::builder()
-        .subject_id(tenant().subject_id())
+    // A trusted context with the same claims hits even without a forwarding token,
+    // while another subject's first read reaches the registry with its own credential.
+    let same_claims = |bearer: Option<&str>| {
+        let builder = SecurityContext::builder()
+            .subject_id(tenant().subject_id())
+            .subject_tenant_id(tenant().subject_tenant_id());
+        match bearer {
+            Some(bearer) => builder.bearer_token(bearer.to_owned()),
+            None => builder,
+        }
+        .build()
+        .expect("tenant context")
+    };
+    assert!(found(
+        &client
+            .batch_get_entities(&same_claims(None), read())
+            .await
+            .expect("the read context's confirmation")
+    ));
+    let no_bearer = SecurityContext::builder()
+        .subject_id(Uuid::from_u128(4))
         .subject_tenant_id(tenant().subject_tenant_id())
-        .bearer_token("wrong-bearer".to_owned())
         .build()
         .expect("tenant context");
-    assert!(matches!(
-        client.batch_get_entities(&wrong_bearer, read()).await,
-        Err(CanonicalError::Unauthenticated { .. })
-    ));
+    assert!(
+        matches!(
+            client.batch_get_entities(&no_bearer, read()).await,
+            Err(CanonicalError::Unauthenticated { .. })
+        ),
+        "another subject's miss reaches the registry with no credential"
+    );
 
+    // The empty second registry distinguishes a cache hit from a forwarded read.
     directory.point(Directory::At(second.base_url.clone()));
     assert!(found(
         &client
@@ -264,17 +283,42 @@ async fn the_tenant_resolving_client_follows_the_registry_with_the_callers_beare
             .await
             .expect("cache hit")
     ));
-    assert_eq!(
+    assert!(matches!(
         client
-            .batch_get_entities(&tenant(), fresh.clone())
-            .await
-            .expect("served by the registry it moved to")
-            .0
-            .values()
-            .next(),
-        Some(&EntityLookup::NotFound),
-        "the second registry holds nothing"
+            .batch_get_entities(&same_claims(Some("wrong-bearer")), routed())
+            .await,
+        Err(CanonicalError::Unauthenticated { .. })
+    ));
+    assert!(
+        found(
+            &client
+                .batch_get_entities(&tenant(), read())
+                .await
+                .expect("cache hit")
+        ),
+        "a refusal changes no confirmation"
     );
+    for (request, why) in [
+        (
+            routed(),
+            "a forced read reaches the second registry, which holds nothing",
+        ),
+        (read(), "its not_found revoked the confirmation"),
+    ] {
+        assert_eq!(
+            client
+                .batch_get_entities(&tenant(), request)
+                .await
+                .expect("served by the registry it moved to")
+                .0
+                .values()
+                .next(),
+            Some(&EntityLookup::NotFound),
+            "{why}"
+        );
+    }
+    let mut fresh = read();
+    fresh.fresh = true;
 
     directory.point(Directory::Empty);
     assert_unavailable(
@@ -425,9 +469,8 @@ async fn await_completed(
     }
 }
 
-/// The platform client's cache sits above resolution (T36): a read it answers resolves
-/// nothing, one it cannot answer fails as the directory does, and a registration polled
-/// to its terminal outcome through the client leaves no stale entry.
+/// Cache hits bypass the directory. Misses surface its errors, and polling a
+/// successful registration invalidates the affected snapshot.
 #[tokio::test]
 async fn the_platform_resolving_client_caches_above_resolution() {
     let server = serve().await;
@@ -519,11 +562,9 @@ async fn the_platform_resolving_client_caches_above_resolution() {
     );
 }
 
-/// The platform resolving client keeps the identities its `resolve_*` helpers learned
-/// above resolution, and they outlive an observed revision: once the revision drops the
-/// snapshot entry, an ordinary read under the mandatory fields needs the registry, while
-/// a known identity resolves with the directory down. An unknown one, and every tenant
-/// resolution, still need it.
+/// Observed revisions invalidate snapshots but preserve known platform identities.
+/// With the directory down, snapshot reads and unresolved keys fail. Tenant
+/// resolution also needs the directory when it has no confirmed snapshot.
 #[tokio::test]
 async fn the_platform_resolving_client_resolves_known_identities_without_resolution() {
     use types_registry_sdk::{

@@ -84,9 +84,8 @@ impl Default for TypesRegistryGear {
     }
 }
 
-/// The seeded database-backed client and both APIs' cache settings, held in the
-/// `ClientHub` only while `init` wires the two contracts: the `provides` factories receive
-/// a context, not the gear.
+/// Share the seeded client and cache settings through `ClientHub` during
+/// `init` because the `provides` factories receive only a context.
 struct SeededClient {
     client: Arc<LocalClient>,
     cache: types_registry_sdk::CacheSettings,
@@ -127,8 +126,7 @@ impl TypesRegistryGear {
         })
     }
 
-    /// `provides` factory: the platform API over the seeded database, behind the SDK
-    /// client cache (SPEC §8.3). Every local consumer shares this one instance.
+    /// Publish one cached platform client over the seeded database (SPEC §8.3).
     fn seeded_platform_api(
         ctx: &GearCtx,
         _policies: Arc<PolicyStack>,
@@ -140,14 +138,13 @@ impl TypesRegistryGear {
         )))
     }
 
-    /// `provides` factory: the tenant API over the seeded database, behind its own SDK
-    /// client cache, whose snapshots are shared across tenants.
+    /// Publish a separate tenant cache that shares snapshots across tenants.
     fn seeded_tenant_api(
         ctx: &GearCtx,
         _policies: Arc<PolicyStack>,
     ) -> anyhow::Result<Arc<dyn TypesRegistryApi>> {
         let seeded = Self::seeded(ctx)?;
-        Ok(Arc::new(CachedTypesRegistry::new_local(
+        Ok(Arc::new(CachedTypesRegistry::new(
             Arc::clone(&seeded.client) as Arc<dyn TypesRegistryApi>,
             seeded.cache,
         )))

@@ -5,7 +5,7 @@ use serde_json::json;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::{Store, merge, project, union};
+use super::{ENTRY_ALLOWANCE_BYTES, Store, merge, project, union};
 use crate::models::{
     Entity, EntityField, EntityKey, EntityKind, FieldSelection, JsonDocument, LifecycleStatus,
     Origin, Provenance, Validator,
@@ -78,76 +78,58 @@ fn put(store: &mut Store, snapshot: &Arc<Entity>) {
     );
 }
 
-/// The compact length of `expected`, an independently written REST entity payload.
-fn wire_len(expected: &serde_json::Value) -> usize {
-    serde_json::to_string(expected).expect("serializable").len()
+fn fixed(gts_id: &str) -> usize {
+    gts_id.len() + ENTRY_ALLOWANCE_BYTES
 }
 
 #[test]
-fn a_light_snapshot_weighs_its_compact_rest_payload() {
-    let light = entity(TYPE, None);
-    let expected = json!({
-        "gts_id": TYPE,
-        "gts_uuid": light.gts_uuid.to_string(),
-        "kind": "type_schema",
-        "lifecycle_status": "active",
-    });
-    assert_eq!(weight(&light), wire_len(&expected));
+fn a_snapshot_without_documents_weighs_its_identifier_and_the_allowance() {
+    assert_eq!(weight(&entity(TYPE, None)), TYPE.len() + 256);
+    let id = instance_id(1);
+    assert_eq!(weight(&entity(&id, None)), id.len() + 256);
 }
 
 #[test]
-fn a_full_snapshot_weighs_its_compact_rest_payload() {
-    const AT: &str = "2026-11-20T10:00:00.5Z";
-    let at = time::OffsetDateTime::parse(AT, &time::format_description::well_known::Rfc3339)
-        .expect("timestamp");
-    let mut full = (*entity(TYPE, Some(json!({ "type": "object", "title": "T" })))).clone();
-    full.lifecycle_status = LifecycleStatus::Deleted;
-    full.origin = Some(Origin::Managed {
-        resource_version: 1234,
-        created_at: at,
-        updated_at: at,
+fn documents_are_charged_compact_json_and_other_metadata_only_the_allowance() {
+    let bare = {
+        let mut bare = (*entity(TYPE, Some(json!({ "type": "object", "title": "T" })))).clone();
+        bare.resolved_schema = Some(json!([1, 2]));
+        bare.effective_traits = Some(json!({}));
+        bare.effective_traits_schema = Some(json!("x\"y"));
+        bare
+    };
+    let documents = [
+        r#"{"type":"object","title":"T"}"#,
+        "[1,2]",
+        "{}",
+        r#""x\"y""#,
+    ];
+    let expected = fixed(TYPE) + documents.iter().map(|d| d.len()).sum::<usize>();
+    assert_eq!(weight(&bare), expected);
+
+    let mut annotated = bare;
+    annotated.lifecycle_status = LifecycleStatus::Deleted;
+    annotated.origin = Some(Origin::Managed {
+        resource_version: u64::MAX,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        updated_at: time::OffsetDateTime::UNIX_EPOCH,
     });
-    full.resolved_schema = Some(json!([1, 2]));
-    full.effective_traits = Some(json!({}));
-    full.effective_traits_schema = Some(json!("x\"y"));
-    full.provenance = Some(Provenance {
+    annotated.provenance = Some(Provenance {
         compatibility_check_skipped: true,
     });
-    let expected = json!({
-        "gts_id": TYPE,
-        "gts_uuid": full.gts_uuid.to_string(),
-        "kind": "type_schema",
-        "origin": {
-            "type": "managed",
-            "resource_version": 1234,
-            "created_at": AT,
-            "updated_at": AT,
-        },
-        "lifecycle_status": "deleted",
-        "content": { "type": "object", "title": "T" },
-        "resolved_schema": [1, 2],
-        "effective_traits": {},
-        "effective_traits_schema": "x\"y",
-        "provenance": { "compatibility_check_skipped": true },
-    });
-    assert_eq!(weight(&full), wire_len(&expected));
+    assert_eq!(
+        weight(&annotated),
+        expected,
+        "status, origin and provenance are within the allowance"
+    );
 }
 
 #[test]
-fn a_selected_null_is_charged_and_an_unselected_field_is_not() {
+fn a_selected_null_is_charged_four_bytes_and_an_unselected_field_nothing() {
     let id = instance_id(1);
-    let selected_null = entity(&id, Some(JsonDocument::Null));
-    let expected = json!({
-        "gts_id": id,
-        "gts_uuid": selected_null.gts_uuid.to_string(),
-        "kind": "instance",
-        "lifecycle_status": "active",
-        "content": null,
-    });
-    assert_eq!(weight(&selected_null), wire_len(&expected));
     assert_eq!(
-        weight(&selected_null) - weight(&entity(&id, None)),
-        r#","content":null"#.len()
+        weight(&entity(&id, Some(JsonDocument::Null))) - weight(&entity(&id, None)),
+        "null".len()
     );
 }
 
@@ -362,28 +344,46 @@ fn a_confirmation_only_refreshes_the_validator_it_names() {
 }
 
 #[test]
-fn an_unmeasurable_snapshot_is_never_retained_even_under_an_unlimited_bound() {
+fn an_unrepresentable_timestamp_is_charged_the_allowance_and_retained() {
     let mut store = Store::new(usize::MAX, usize::MAX);
-    let ordinary = entity(&instance_id(1), None);
-    put(&mut store, &ordinary);
-    let mut unmeasurable = (*entity(TYPE, None)).clone();
+    let mut unrepresentable = (*entity(TYPE, Some(JsonDocument::Null))).clone();
     let year_minus_one = time::OffsetDateTime::UNIX_EPOCH
         .replace_year(-1)
         .expect("a representable year");
-    unmeasurable.origin = Some(Origin::Managed {
+    unrepresentable.origin = Some(Origin::Managed {
         resource_version: 1,
         created_at: year_minus_one,
         updated_at: year_minus_one,
     });
-    let unmeasurable = Arc::new(unmeasurable);
-    assert_eq!(
-        resident_bytes(&unmeasurable),
-        usize::MAX,
-        "RFC 3339 cannot write year -1"
-    );
+    let unrepresentable = Arc::new(unrepresentable);
+    assert_eq!(weight(&unrepresentable), fixed(TYPE) + "null".len());
 
-    put(&mut store, &unmeasurable);
-    assert!(store.get(&key(&unmeasurable)).is_none());
+    put(&mut store, &unrepresentable);
+    assert!(store.get(&key(&unrepresentable)).is_some());
+    assert_eq!(store.used(), resident_bytes(&unrepresentable));
+}
+
+#[test]
+fn a_saturated_weight_is_never_retained_even_under_an_unlimited_bound() {
+    let mut store = Store::new(usize::MAX, usize::MAX);
+    let ordinary = entity(&instance_id(1), None);
+    put(&mut store, &ordinary);
+    let snapshot = entity(TYPE, Some(JsonDocument::Null));
+    let saturated = super::Weight {
+        fixed: fixed(TYPE),
+        documents: [(EntityField::Content, usize::MAX - 1)].into(),
+    };
+    assert_eq!(saturated.total(), usize::MAX);
+    assert!(!saturated.fits(usize::MAX, &etag("")));
+
+    store.insert(
+        Arc::clone(&snapshot),
+        FieldSelection::full(),
+        saturated,
+        etag("v1"),
+        Instant::now(),
+    );
+    assert!(store.get(&key(&snapshot)).is_none());
     assert_eq!(store.used(), resident_bytes(&ordinary));
 }
 
@@ -415,8 +415,7 @@ fn a_projection_keeps_exactly_the_selected_fields() {
     assert_eq!(project(&full, &FieldSelection::full()), full);
 }
 
-/// A merge is the answer for its selection and the resident entry for the rest, and its
-/// weight is summed from the two measured weights without serializing anything again.
+/// Merge selected replies with the remaining resident fields and reuse their weights.
 #[test]
 fn a_merge_takes_the_selection_from_the_answer_and_the_rest_from_the_entry() {
     let full = every_field();
@@ -444,8 +443,19 @@ fn a_merge_takes_the_selection_from_the_answer_and_the_rest_from_the_entry() {
     );
 }
 
-/// A field the answer selected but does not carry stays absent: the answer, not the
-/// entry, speaks for every field it selected.
+#[test]
+fn a_merged_selected_null_replaces_the_resident_document_charge() {
+    let content = FieldSelection::with(&[EntityField::Content]);
+    let resident = entity(TYPE, Some(json!({ "big": "x".repeat(100) })));
+    let answer = entity(TYPE, Some(JsonDocument::Null));
+    let merged = merge((*answer).clone(), &content, &resident);
+    assert_eq!(merged.content, Some(JsonDocument::Null));
+    let accounted = super::weight(&answer).merged(&content, &super::weight(&resident));
+    assert_eq!(accounted.total(), fixed(TYPE) + "null".len());
+    assert_eq!(accounted, super::weight(&merged));
+}
+
+/// An omitted selected field stays absent after merging.
 #[test]
 fn a_merge_never_resurrects_a_selected_field_the_answer_lacks() {
     let full = every_field();
@@ -456,17 +466,14 @@ fn a_merge_never_resurrects_a_selected_field_the_answer_lacks() {
     assert_eq!(merged, answer);
 }
 
-mod weight_matches_the_wire {
+mod weight_properties {
     use proptest::prelude::*;
-    use serde_json::{Map, Value, json};
-    use time::OffsetDateTime;
-    use time::format_description::well_known::Rfc3339;
+    use serde_json::{Value, json};
 
-    use super::{TYPE, entity, instance_id, weight, wire_len};
-    use crate::models::{LifecycleStatus, Origin, Provenance};
+    use super::{TYPE, entity, fixed, instance_id, merge, project, weight};
+    use crate::models::{EntityField, FieldSelection};
 
-    /// Arbitrary documents; strings draw on quotes, backslashes, control characters
-    /// and multi-byte text, the inputs where a hand count and a serializer part ways.
+    /// Exercise JSON sizing with quotes, backslashes, control characters and multibyte text.
     fn document() -> impl Strategy<Value = Value> {
         let text = prop_oneof![
             any::<String>(),
@@ -476,6 +483,7 @@ mod weight_matches_the_wire {
             Just(Value::Null),
             any::<bool>().prop_map(Value::Bool),
             any::<i64>().prop_map(|n| json!(n)),
+            any::<f64>().prop_map(|n| json!(n)),
             text.clone().prop_map(Value::String),
         ];
         leaf.prop_recursive(3, 24, 4, move |inner| {
@@ -487,62 +495,58 @@ mod weight_matches_the_wire {
         })
     }
 
-    fn at() -> impl Strategy<Value = OffsetDateTime> {
-        (0i64..4_000_000_000, 0u32..1_000_000_000).prop_map(|(secs, nanos)| {
-            OffsetDateTime::from_unix_timestamp(secs)
-                .expect("in range")
-                .replace_nanosecond(nanos)
-                .expect("nanoseconds")
-        })
+    fn snapshot(instance: bool, docs: Vec<Option<Value>>) -> crate::models::Entity {
+        let id = if instance {
+            instance_id(1)
+        } else {
+            TYPE.to_owned()
+        };
+        let mut snapshot = (*entity(&id, None)).clone();
+        let [content, resolved, traits, traits_schema] = <[_; 4]>::try_from(docs).expect("four");
+        snapshot.content = content;
+        snapshot.resolved_schema = resolved;
+        snapshot.effective_traits = traits;
+        snapshot.effective_traits_schema = traits_schema;
+        snapshot
+    }
+
+    fn selection() -> impl Strategy<Value = FieldSelection> {
+        prop::sample::subsequence(EntityField::ALL.to_vec(), 0..=EntityField::ALL.len())
+            .prop_map(|fields| FieldSelection::with(&fields))
     }
 
     proptest! {
         #[test]
-        fn any_snapshot_weighs_its_compact_serialization(
+        fn a_snapshot_weighs_its_fixed_charge_and_compact_documents(
             instance in any::<bool>(),
-            deleted in any::<bool>(),
-            origin in prop::option::of((any::<u64>(), at(), at())),
             docs in prop::collection::vec(prop::option::of(document()), 4),
-            skipped in prop::option::of(any::<bool>()),
         ) {
-            let id = if instance { instance_id(1) } else { TYPE.to_owned() };
-            let mut snapshot = (*entity(&id, None)).clone();
-            let mut expected = Map::new();
-            expected.insert("gts_id".into(), json!(id));
-            expected.insert("gts_uuid".into(), json!(snapshot.gts_uuid.to_string()));
-            expected.insert("kind".into(), json!(if instance { "instance" } else { "type_schema" }));
-            expected.insert("lifecycle_status".into(), json!(if deleted { "deleted" } else { "active" }));
-            if deleted {
-                snapshot.lifecycle_status = LifecycleStatus::Deleted;
-            }
-            if let Some((resource_version, created_at, updated_at)) = origin {
-                snapshot.origin = Some(Origin::Managed { resource_version, created_at, updated_at });
-                expected.insert("origin".into(), json!({
-                    "type": "managed",
-                    "resource_version": resource_version,
-                    "created_at": created_at.format(&Rfc3339).expect("format"),
-                    "updated_at": updated_at.format(&Rfc3339).expect("format"),
-                }));
-            }
-            let [content, resolved, traits, traits_schema] = <[_; 4]>::try_from(docs).expect("four");
-            for (name, doc, slot) in [
-                ("content", content, &mut snapshot.content),
-                ("resolved_schema", resolved, &mut snapshot.resolved_schema),
-                ("effective_traits", traits, &mut snapshot.effective_traits),
-                ("effective_traits_schema", traits_schema, &mut snapshot.effective_traits_schema),
-            ] {
-                if let Some(doc) = doc {
-                    expected.insert(name.into(), doc.clone());
-                    *slot = Some(doc);
-                }
-            }
-            if let Some(compatibility_check_skipped) = skipped {
-                snapshot.provenance = Some(Provenance { compatibility_check_skipped });
-                expected.insert("provenance".into(), json!({
-                    "compatibility_check_skipped": compatibility_check_skipped,
-                }));
-            }
-            prop_assert_eq!(weight(&snapshot), wire_len(&Value::Object(expected)));
+            let snapshot = snapshot(instance, docs.clone());
+            let documents: usize = docs
+                .iter()
+                .flatten()
+                .map(|doc| serde_json::to_string(doc).expect("serializable").len())
+                .sum();
+            prop_assert_eq!(
+                weight(&snapshot),
+                fixed(snapshot.gts_id.as_ref()) + documents
+            );
+        }
+
+        #[test]
+        fn merged_accounting_equals_measuring_the_merge(
+            resident in prop::collection::vec(prop::option::of(document()), 4),
+            answer in prop::collection::vec(prop::option::of(document()), 4),
+            covers in selection(),
+            selected in selection(),
+        ) {
+            let resident = project(&snapshot(false, resident), &covers);
+            let answer = project(&snapshot(false, answer), &selected);
+            let merged = merge(answer.clone(), &selected, &resident);
+            prop_assert_eq!(
+                super::super::weight(&answer).merged(&selected, &super::super::weight(&resident)),
+                super::super::weight(&merged)
+            );
         }
     }
 }
@@ -623,8 +627,7 @@ fn invalidating_by_one_spelling_drops_the_entry_and_fences_reads_by_the_other() 
     assert!(!store.indexes(&key(&snapshot)));
 }
 
-/// A read that knew both spellings keeps both slots: an invalidation under the other
-/// spelling after its entry was evicted still fences it.
+/// A ticket pins both spellings through eviction, so either still fences it.
 #[test]
 fn a_ticket_taken_with_both_spellings_is_fenced_by_either_after_eviction() {
     let snapshot = issued(&entity(TYPE, None), Uuid::from_u128(7));
@@ -643,8 +646,7 @@ fn a_ticket_taken_with_both_spellings_is_fenced_by_either_after_eviction() {
     assert!(!store.quiet_since(&by_uuid));
 }
 
-/// Neither spelling of an entity known: an invalidation under one of them may be the
-/// entity a read under the other is about, so it fences every such read — and only those.
+/// A one-sided invalidation fences one-sided reads of the other key form.
 #[test]
 fn an_invalidation_under_an_unknown_counterpart_fences_every_unresolved_read_of_the_other_form() {
     let mut store = Store::new(1024 * 1024, usize::MAX);
@@ -662,8 +664,7 @@ fn an_invalidation_under_an_unknown_counterpart_fences_every_unresolved_read_of_
     );
 }
 
-/// An answer that states both spellings resolves its entity: it fences reads under
-/// either, and leaves reads of other entities alone.
+/// A paired reply fences reads under either key of that entity.
 #[test]
 fn a_record_naming_both_spellings_fences_only_that_entity() {
     let mut store = Store::new(1024 * 1024, usize::MAX);
@@ -699,9 +700,8 @@ fn an_insert_contradicting_a_resident_pair_drops_the_resident_entity() {
     assert_eq!(store.used(), resident_bytes(&moved));
 }
 
-/// Two distinct identifiers, or two distinct Registry References, are never one entity:
-/// a one-sided event under one leaves a read that knew only another of the same form
-/// alone, and fences every such read of the other form.
+/// Distinct keys of the same form cannot alias. A one-sided event fences
+/// only matching keys and possible counterparts.
 #[test]
 fn a_one_sided_event_fences_unresolved_reads_of_the_other_form_only() {
     let (a, b) = (
@@ -762,4 +762,56 @@ fn entry_limit_evicts_the_lru_and_zero_keeps_no_snapshots() {
     put(&mut disabled, &a);
     assert_eq!(disabled.used(), 0);
     assert!(disabled.peek(&key(&a)).is_none());
+}
+
+/// A resolution shows only the pair. It never erases, extends or replaces a read
+/// proof, and a reply from an earlier request never moves a proof back.
+#[test]
+fn a_resolution_neither_erases_nor_extends_a_read_proof() {
+    use std::time::Duration;
+
+    use super::ReadContext;
+    use crate::models::EntityIdentity;
+
+    let window = Duration::from_secs(30);
+    let mut store = Store::new(1024 * 1024, 16);
+    store.remember_identities(16);
+    store.track_visibility();
+    let snapshot = entity(TYPE, None);
+    let t0 = Instant::now();
+    store.insert(
+        Arc::clone(&snapshot),
+        FieldSelection::light(),
+        super::weight(&snapshot),
+        etag("v1"),
+        t0,
+    );
+    store.identities.learn(&snapshot.gts_id, snapshot.gts_uuid);
+    let reader = ReadContext::new(Uuid::from_u128(10), None, Uuid::from_u128(1), &[]);
+    let pair = EntityIdentity {
+        gts_id: snapshot.gts_id.clone(),
+        gts_uuid: snapshot.gts_uuid,
+    };
+
+    store.confirm_visible(&spelled(&snapshot), &reader, &etag("v1"), t0);
+    let later = t0 + Duration::from_secs(10);
+    store.confirm_resolved(snapshot.gts_uuid, &reader, later);
+    store.confirm_resolved(snapshot.gts_uuid, &reader, t0 - Duration::from_secs(5));
+
+    let edge = t0 + window - Duration::from_millis(1);
+    assert!(store.visible(&key(&snapshot), &reader, edge, window));
+    assert!(
+        !store.visible(&key(&snapshot), &reader, t0 + window, window),
+        "a resolution does not extend the read"
+    );
+    assert_eq!(
+        store.resolvable(&spelled(&snapshot), &reader, t0 + window, window),
+        Some(pair),
+        "it extends resolution"
+    );
+    assert_eq!(
+        store.resolvable(&key(&snapshot), &reader, later + window, window),
+        None,
+        "until its own window ends"
+    );
 }

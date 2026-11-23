@@ -80,17 +80,12 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError>;
 
-    /// Resolve bounded keys to the canonical identity of the registered entity each names,
-    /// Active or deleted: its GTS identifier and Registry Reference, with no lifecycle,
-    /// validator or document. `None` when nothing is registered under the key. The platform
-    /// `resolve_*` helpers go through it.
-    ///
-    /// Bounded and refused as [`Self::batch_get_entities`] is. A client cache answers the
-    /// identities it already knows and sends only the others.
+    /// Resolve each distinct key to a registered GTS ID and Registry Reference,
+    /// including deleted entities, or `None`. Uses [`Self::batch_get_entities`]'s
+    /// bounds and key rules. The `resolve_*` helpers use this method.
     ///
     /// # Errors
-    /// `CanonicalError`; absent keys are answers, not errors. `Internal` when the registry
-    /// leaves a key unanswered or answers it with another entity's identity.
+    /// Returns `Internal` for incomplete or inconsistent replies.
     #[idempotency(SafeRead)]
     async fn batch_resolve_identities(
         &self,
@@ -101,6 +96,12 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
 
 /// The tenant-plane Types Registry contract: the platform's reads, with the same models,
 /// projection and validators, under a tenant's [`SecurityContext`].
+///
+/// Pass the host-authenticated caller's context. [`CachedTypesRegistry`](crate::CachedTypesRegistry)
+/// keeps visibility confirmations per read context: subject, subject type, home tenant
+/// and the raw token scope list. It trusts the context it is given, so a context reused
+/// after the registry refused its bearer can still hit within the freshness window.
+/// Anonymous calls bypass the cache. REST requests forward the caller's bearer.
 ///
 /// Every method fails with `CanonicalError`; project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError) for typed dispatch.
@@ -129,8 +130,7 @@ pub trait TypesRegistryApi: Send + Sync {
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError>;
 
-    /// As [`PlatformTypesRegistryApi::batch_resolve_identities`], under the tenant's read
-    /// access. The tenant `resolve_*` helpers go through it.
+    /// Like [`PlatformTypesRegistryApi::batch_resolve_identities`] under tenant read access.
     ///
     /// # Errors
     /// As [`PlatformTypesRegistryApi::batch_resolve_identities`].

@@ -1,6 +1,5 @@
-//! The cache's bounded store: one entry per entity, holding the fields read
-//! of it so far under one validator, evicted least-recently-used by the bytes it holds,
-//! and found by either spelling a resident snapshot carries.
+//! Snapshot LRU bounded by charged bytes and entry count. Both keys address
+//! one snapshot holding fields read under one validator.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -13,40 +12,74 @@ use lru::LruCache;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-
 use super::identity::Identities;
 use crate::models::{
-    Entity, EntityField, EntityKey, EntityKind, FieldSelection, JsonDocument, LifecycleStatus,
-    Origin, Validator,
+    Entity, EntityField, EntityIdentity, EntityKey, FieldSelection, JsonDocument, Validator,
 };
 
-/// Visibility follows the tenant. Remote confirmations also bind the bearer that was
-/// presented to the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TenantViewer {
+/// Who a tenant read is answered for: the subject, its type, home tenant and token
+/// scopes. The registry may authorize each entity per subject, so a positive answer
+/// to one read context proves nothing to another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ReadContext {
+    subject: Uuid,
+    subject_type: Option<Arc<str>>,
+    /// Visibility follows the home tenant's ancestor chain. A Context Tenant, once
+    /// the SDK carries one, joins rather than replaces it.
     tenant: Uuid,
-    credential: Option<[u8; 32]>,
+    /// As presented. Equivalent spellings stay distinct rather than assuming how
+    /// the policy reads them.
+    scopes: Arc<[String]>,
 }
 
-impl TenantViewer {
-    pub const fn new(tenant: Uuid, credential: Option<[u8; 32]>) -> Self {
-        Self { tenant, credential }
+impl ReadContext {
+    pub fn new(subject: Uuid, subject_type: Option<&str>, tenant: Uuid, scopes: &[String]) -> Self {
+        Self {
+            subject,
+            subject_type: subject_type.map(Arc::from),
+            tenant,
+            scopes: scopes.into(),
+        }
     }
 }
 
-struct TenantConfirmation {
-    version: Weak<()>,
-    viewer_epoch: u64,
-    read_at: Instant,
+/// That one entity is visible to one read context.
+#[derive(Default)]
+struct Confirmation {
+    /// From a read: the snapshot version it confirmed. Serves reads and resolutions.
+    content: Option<Proof>,
+    /// From a read or a resolution: the remembered pair it confirmed. Serves resolutions.
+    identity: Option<Proof>,
 }
 
-struct TenantVisibility {
-    confirmations: LruCache<(Uuid, TenantViewer), TenantConfirmation>,
-    /// Bounded separately so a credential refusal can revoke every confirmation in O(1).
-    epochs: LruCache<TenantViewer, u64>,
-    last_epoch: u64,
+/// What the registry showed, held weakly, and when the request that saw it started.
+struct Proof {
+    version: Weak<()>,
+    at: Instant,
+}
+
+impl Proof {
+    /// Whether `current` is still what was shown, inside the window.
+    fn live(&self, current: Option<&Arc<()>>, now: Instant, window: Duration) -> bool {
+        current.is_some_and(|current| std::ptr::eq(self.version.as_ptr(), Arc::as_ptr(current)))
+            && now.saturating_duration_since(self.at) < window
+    }
+
+    /// Record a showing of `version`. A later reply from an earlier request never
+    /// moves the time back. Only one version is current, so another one is dead.
+    fn renew(slot: &mut Option<Self>, version: &Arc<()>, at: Instant) {
+        match slot {
+            Some(proof) if std::ptr::eq(proof.version.as_ptr(), Arc::as_ptr(version)) => {
+                proof.at = proof.at.max(at);
+            }
+            _ => {
+                *slot = Some(Self {
+                    version: Arc::downgrade(version),
+                    at,
+                });
+            }
+        }
+    }
 }
 
 /// A resident entity: the fields read of it so far, all under `etag`.
@@ -61,36 +94,32 @@ pub struct Entry {
     /// When the registry last confirmed `etag` as current.
     pub confirmed_at: Instant,
     pub weight: Weight,
-    tenant_version: Option<Arc<()>>,
+    /// Confirmations hold it weakly, so a new validator retires them all.
+    confirmed_version: Option<Arc<()>>,
 }
 
-/// The bytes a snapshot is charged: its compact JSON as the REST plane writes an entity
-/// (TR's `EntityDto`) — identity, kind and lifecycle always, each selected field otherwise,
-/// a selected JSON `null` as `null`. Key order does not change the length. This is the
-/// payload's size, not retained heap.
-///
-/// Kept by field, so that a merge adds up what was measured rather than serializing the
-/// resident documents again.
+/// Fixed charge for metadata and per-entry bookkeeping.
+const ENTRY_ALLOWANCE_BYTES: usize = 256;
+
+/// Snapshot weight before the validator charge. Keeping compact JSON sizes by
+/// field lets merges reuse resident weights, including the four bytes for `null`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Weight {
-    /// `"name":value` of the mandatory fields, summed.
-    identity: usize,
-    /// `"name":value` of each selectable field the snapshot carries.
-    fields: BTreeMap<EntityField, usize>,
+    /// GTS ID bytes plus the fixed allowance.
+    fixed: usize,
+    /// Compact JSON bytes of each document field the snapshot carries.
+    documents: BTreeMap<EntityField, usize>,
 }
 
 impl Weight {
-    /// The whole object's bytes; `usize::MAX` when any part could not be measured.
+    /// The snapshot's bytes; `usize::MAX` when any part could not be measured.
     pub fn total(&self) -> usize {
-        let members = EntityField::MANDATORY.len() + self.fields.len();
-        self.fields
+        self.documents
             .values()
-            .fold(self.identity.saturating_add(2 + members - 1), |sum, f| {
-                sum.saturating_add(*f)
-            })
+            .fold(self.fixed, |sum, bytes| sum.saturating_add(*bytes))
     }
 
-    /// Total resident payload bytes, including the validator needed for revalidation.
+    /// Total resident bytes, including the raw validator needed for revalidation.
     pub fn bytes_with_validator(&self, etag: &Validator) -> usize {
         self.total().saturating_add(etag.as_bytes().len())
     }
@@ -102,103 +131,48 @@ impl Weight {
         bytes != usize::MAX && bytes <= bound
     }
 
-    /// This weight, of a snapshot read under `selection`, with the fields `resident`
-    /// carries outside `selection` beside it: the weight of [`merge`]'s result.
+    /// Weight of [`merge`]'s result, with resident documents outside `selection`.
     pub fn merged(&self, selection: &FieldSelection, resident: &Self) -> Self {
-        let mut fields = self.fields.clone();
-        for (field, bytes) in &resident.fields {
+        let mut documents = self.documents.clone();
+        for (field, bytes) in &resident.documents {
             if !selection.contains(*field) {
-                fields.insert(*field, *bytes);
+                documents.insert(*field, *bytes);
             }
         }
         Self {
-            identity: self.identity,
-            fields,
+            fixed: self.fixed,
+            documents,
         }
     }
 }
 
 pub fn weight(snapshot: &Entity) -> Weight {
-    let identity = [
-        field("gts_id", str_len(snapshot.gts_id.as_ref())),
-        field("gts_uuid", UUID_LEN),
-        field(
-            "kind",
-            quoted(match snapshot.kind {
-                EntityKind::TypeSchema => "type_schema",
-                EntityKind::Instance => "instance",
-            }),
-        ),
-        field(
-            "lifecycle_status",
-            quoted(match snapshot.lifecycle_status {
-                LifecycleStatus::Active => "active",
-                LifecycleStatus::Deleted => "deleted",
-            }),
-        ),
+    // A new field must be assigned a charge.
+    let Entity {
+        gts_id,
+        gts_uuid: _,
+        kind: _,
+        lifecycle_status: _,
+        origin: _,
+        content,
+        resolved_schema,
+        effective_traits,
+        effective_traits_schema,
+        provenance: _,
+    } = snapshot;
+    let documents = [
+        (EntityField::Content, content),
+        (EntityField::ResolvedSchema, resolved_schema),
+        (EntityField::EffectiveTraits, effective_traits),
+        (EntityField::EffectiveTraitsSchema, effective_traits_schema),
     ]
     .into_iter()
-    .fold(0_usize, usize::saturating_add);
-    let mut fields = BTreeMap::new();
-    // Exhaustive, so that a new origin cannot go uncharged.
-    match &snapshot.origin {
-        Some(Origin::Managed {
-            resource_version,
-            created_at,
-            updated_at,
-        }) => {
-            fields.insert(
-                EntityField::Origin,
-                field(
-                    "origin",
-                    object(&[
-                        field("type", quoted("managed")),
-                        field("resource_version", resource_version.to_string().len()),
-                        field("created_at", timestamp_len(*created_at)),
-                        field("updated_at", timestamp_len(*updated_at)),
-                    ]),
-                ),
-            );
-        }
-        None => {}
+    .filter_map(|(field, document)| Some((field, json_len(document.as_ref()?))))
+    .collect();
+    Weight {
+        fixed: gts_id.as_ref().len().saturating_add(ENTRY_ALLOWANCE_BYTES),
+        documents,
     }
-    for (name, selected, document) in [
-        ("content", EntityField::Content, &snapshot.content),
-        (
-            "resolved_schema",
-            EntityField::ResolvedSchema,
-            &snapshot.resolved_schema,
-        ),
-        (
-            "effective_traits",
-            EntityField::EffectiveTraits,
-            &snapshot.effective_traits,
-        ),
-        (
-            "effective_traits_schema",
-            EntityField::EffectiveTraitsSchema,
-            &snapshot.effective_traits_schema,
-        ),
-    ] {
-        if let Some(document) = document {
-            fields.insert(selected, field(name, json_len(document)));
-        }
-    }
-    if let Some(provenance) = &snapshot.provenance {
-        let skipped = if provenance.compatibility_check_skipped {
-            "true"
-        } else {
-            "false"
-        };
-        fields.insert(
-            EntityField::Provenance,
-            field(
-                "provenance",
-                object(&[field("compatibility_check_skipped", skipped.len())]),
-            ),
-        );
-    }
-    Weight { identity, fields }
 }
 
 /// `snapshot` as a read selecting `selection` is answered: every other field dropped.
@@ -239,27 +213,36 @@ fn kept(document: Option<&JsonDocument>, keep: bool) -> Option<JsonDocument> {
 /// Both must be one state, read under one validator.
 pub fn merge(mut fresh: Entity, selection: &FieldSelection, resident: &Entity) -> Entity {
     let take = |field: EntityField| !selection.contains(field);
+    // A new field needs an explicit merge rule.
+    let Entity {
+        gts_id: _,
+        gts_uuid: _,
+        kind: _,
+        lifecycle_status: _,
+        origin,
+        content,
+        resolved_schema,
+        effective_traits,
+        effective_traits_schema,
+        provenance,
+    } = &mut fresh;
     if take(EntityField::Origin) {
-        fresh.origin = resident.origin;
+        *origin = resident.origin;
     }
     if take(EntityField::Content) {
-        fresh.content.clone_from(&resident.content);
+        content.clone_from(&resident.content);
     }
     if take(EntityField::ResolvedSchema) {
-        fresh.resolved_schema.clone_from(&resident.resolved_schema);
+        resolved_schema.clone_from(&resident.resolved_schema);
     }
     if take(EntityField::EffectiveTraits) {
-        fresh
-            .effective_traits
-            .clone_from(&resident.effective_traits);
+        effective_traits.clone_from(&resident.effective_traits);
     }
     if take(EntityField::EffectiveTraitsSchema) {
-        fresh
-            .effective_traits_schema
-            .clone_from(&resident.effective_traits_schema);
+        effective_traits_schema.clone_from(&resident.effective_traits_schema);
     }
     if take(EntityField::Provenance) {
-        fresh.provenance = resident.provenance;
+        *provenance = resident.provenance;
     }
     fresh
 }
@@ -270,47 +253,10 @@ pub fn union(a: &FieldSelection, b: &FieldSelection) -> FieldSelection {
     FieldSelection::with(&fields)
 }
 
-/// A hyphenated UUID, quoted.
-const UUID_LEN: usize = 38;
-
-/// `"name":value`.
-fn field(name: &str, value: usize) -> usize {
-    quoted(name).saturating_add(1).saturating_add(value)
-}
-
-/// `{a,b,...}`.
-fn object(fields: &[usize]) -> usize {
-    fields
-        .iter()
-        .fold(2 + fields.len().saturating_sub(1), |sum, f| {
-            sum.saturating_add(*f)
-        })
-}
-
-/// A string needing no escapes, quoted.
-fn quoted(s: &str) -> usize {
-    s.len() + 2
-}
-
-/// RFC 3339, quoted. A timestamp RFC 3339 cannot write cannot be serialized either; it
-/// is charged as oversized so that its entity is never retained.
-fn timestamp_len(at: OffsetDateTime) -> usize {
-    at.format(&Rfc3339).map_or(usize::MAX, |s| quoted(&s))
-}
-
-fn str_len(s: &str) -> usize {
-    counted(|w| serde_json::to_writer(w, s))
-}
-
+/// Compact JSON bytes. Charge failures as oversized.
 fn json_len(document: &JsonDocument) -> usize {
-    counted(|w| serde_json::to_writer(w, document))
-}
-
-/// Bytes `write` produces. Writing to a counter cannot fail, and neither can a `Value`
-/// or `str`; were it to, the value is charged as oversized so that it is never retained.
-fn counted(write: impl FnOnce(&mut ByteCounter) -> serde_json::Result<()>) -> usize {
     let mut counter = ByteCounter(0);
-    match write(&mut counter) {
+    match serde_json::to_writer(&mut counter, document) {
         Ok(()) => counter.0,
         Err(_) => usize::MAX,
     }
@@ -329,9 +275,7 @@ impl io::Write for ByteCounter {
     }
 }
 
-/// The reads in flight under one spelling of an entity — its identifier or its Registry
-/// Reference — and when anything was last recorded under it. It lives while a read holds
-/// a ticket on it, so the bookkeeping is bounded by reads in flight.
+/// In-flight reads and the last event under one key. Tickets keep the slot alive.
 #[derive(Debug, Default)]
 struct Slot {
     tickets: usize,
@@ -357,10 +301,10 @@ impl Spelling {
     }
 }
 
-/// Fences visibility confirmation for a viewer while its request is in flight.
-#[derive(Clone, Copy)]
-pub struct TenantTicket {
-    pub viewer: TenantViewer,
+/// Fences visibility confirmation for a read context while its request is in flight.
+#[derive(Clone)]
+pub struct ContextTicket {
+    pub context: ReadContext,
     seen: u64,
 }
 
@@ -373,40 +317,33 @@ fn release_slot<K: Eq + std::hash::Hash>(slots: &mut HashMap<K, Slot>, name: &K)
     }
 }
 
-/// A read's view of its entity when it started: the spelling it is fenced under and the
-/// store's event count then. A read that knew only its key is also fenced by any event
-/// that knew only its own, since the two may be one entity.
+/// Keys and event count pinned at read start. An event under an unknown
+/// counterpart can fence a one-sided read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ticket {
     spelling: Spelling,
     seen: u64,
 }
 
-/// Entries bounded by the bytes they hold, found by either spelling, with the bookkeeping
-/// that lets an invalidation under either one fence the reads that started before it.
-///
-/// An identifier resolves to the Registry Reference its resident snapshot carries, for
-/// exactly as long as that snapshot stays resident: nothing derives one from the other.
+/// Snapshot LRU with per-key read tickets. Registry-issued pairs index resident
+/// snapshots and let either key fence in-flight reads.
 pub struct Store {
     entries: LruCache<Uuid, Entry>,
-    /// The identity store, under the same lock so that an answer's identities are checked
-    /// against both and learned in one critical section. Neither store touches the
-    /// other's recency.
+    /// Validate both stores atomically while keeping their recency independent.
     pub identities: Identities,
-    tenant_reads: Option<TenantVisibility>,
-    /// A revocation fences requests for this viewer, including requests under an alias
-    /// the cache may only learn after the answer arrives.
-    tenant_in_flight: HashMap<TenantViewer, Slot>,
+    /// Keyed by (entity, read context).
+    confirmations: Option<LruCache<(Uuid, ReadContext), Confirmation>>,
+    /// A revocation fences requests for this read context, including requests under
+    /// an alias the cache may only learn after the answer arrives.
+    contexts_in_flight: HashMap<ReadContext, Slot>,
     /// The identifier of every resident snapshot, to the Registry Reference it carries.
     aliases: HashMap<GtsId, Uuid>,
     by_id: HashMap<GtsId, Slot>,
     by_uuid: HashMap<Uuid, Slot>,
     /// Events recorded so far, across entities: orders events independently of the clock.
     events: u64,
-    /// The last event recorded under an identifier, or a Registry Reference, whose
-    /// counterpart was not known. Two distinct identifiers, or two distinct Registry
-    /// References, are never one entity, so a read that knew only its key is fenced by
-    /// its own slot and by these one-sided events of the other form only.
+    /// Last event under a key with no known counterpart of the other form.
+    /// Only one-sided reads of that other form may alias it.
     unresolved_by_id: u64,
     unresolved_by_uuid: u64,
     used: usize,
@@ -426,8 +363,8 @@ impl Store {
         Self {
             entries: LruCache::unbounded(),
             identities: Identities::new(0),
-            tenant_reads: None,
-            tenant_in_flight: HashMap::new(),
+            confirmations: None,
+            contexts_in_flight: HashMap::new(),
             aliases: HashMap::new(),
             by_id: HashMap::new(),
             by_uuid: HashMap::new(),
@@ -449,137 +386,201 @@ impl Store {
         Some(uuid)
     }
 
-    /// Remember up to `bound` identities for the platform `resolve_*` helpers.
+    /// Remember up to `bound` identity pairs for resolution.
     pub fn remember_identities(&mut self, bound: usize) {
         self.identities = Identities::new(bound);
     }
 
-    /// Limit confirmations independently of the number of tenants and entities.
-    pub fn track_tenant_visibility(&mut self) {
-        self.tenant_reads = NonZeroUsize::new(self.max_entries).map(|limit| TenantVisibility {
-            confirmations: LruCache::sparse(limit),
-            epochs: LruCache::sparse(limit),
-            last_epoch: 0,
-        });
+    /// Limit confirmations independently of the number of readers and entities.
+    pub fn track_visibility(&mut self) {
+        self.confirmations = NonZeroUsize::new(self.max_entries).map(LruCache::sparse);
     }
 
-    pub fn tenant_visible(
+    /// The Registry Reference `key` names, from a resident snapshot or a remembered
+    /// pair, without changing recency.
+    fn reference(&self, key: &EntityKey) -> Option<Uuid> {
+        match key {
+            EntityKey::GtsId(id) => self
+                .aliases
+                .get(id)
+                .copied()
+                .or_else(|| self.identities.peek_uuid(key)),
+            EntityKey::GtsUuid(uuid) => Some(*uuid),
+        }
+    }
+
+    /// Whether `context` holds a fresh read of the resident snapshot `key` spells.
+    pub fn visible(
         &mut self,
         key: &EntityKey,
-        viewer: TenantViewer,
+        context: &ReadContext,
         now: Instant,
         window: Duration,
     ) -> bool {
         let Some(uuid) = self.resident(key) else {
             return false;
         };
-        let Some(reads) = self.tenant_reads.as_mut() else {
-            return false;
-        };
         let version = self
             .entries
             .peek(&uuid)
-            .and_then(|entry| entry.tenant_version.as_ref());
-        let key = (uuid, viewer);
-        let epoch = reads.epochs.peek(&viewer);
-        let visible = reads.confirmations.peek(&key).is_some_and(|seen| {
-            version.is_some_and(|version| std::ptr::eq(seen.version.as_ptr(), Arc::as_ptr(version)))
-                && epoch == Some(&seen.viewer_epoch)
-                && now.saturating_duration_since(seen.read_at) < window
-        });
+            .and_then(|entry| entry.confirmed_version.as_ref());
+        let Some(confirmations) = self.confirmations.as_mut() else {
+            return false;
+        };
+        let key = (uuid, context.clone());
+        let Some(seen) = confirmations.peek_mut(&key) else {
+            return false;
+        };
+        let visible = seen
+            .content
+            .as_ref()
+            .is_some_and(|proof| proof.live(version, now, window));
         if visible {
-            reads.confirmations.promote(&key);
-            reads.epochs.promote(&viewer);
+            confirmations.promote(&key);
         } else {
-            reads.confirmations.pop(&key);
+            seen.content = None;
+            if seen.identity.is_none() {
+                confirmations.pop(&key);
+            }
         }
         visible
     }
 
-    pub fn confirm_tenant(
+    /// The pair `key` names, if `context` holds a fresh read of the resident
+    /// snapshot or a fresh showing of the remembered pair. Only a used store is
+    /// marked used.
+    pub fn resolvable(
         &mut self,
         key: &EntityKey,
-        viewer: TenantViewer,
+        context: &ReadContext,
+        now: Instant,
+        window: Duration,
+    ) -> Option<EntityIdentity> {
+        let uuid = self.reference(key)?;
+        let key = (uuid, context.clone());
+        let (by_read, by_showing) = {
+            let seen = self.confirmations.as_ref()?.peek(&key)?;
+            let version = self
+                .entries
+                .peek(&uuid)
+                .and_then(|entry| entry.confirmed_version.as_ref());
+            let incarnation = self.identities.incarnation(uuid);
+            (
+                seen.content
+                    .as_ref()
+                    .is_some_and(|proof| proof.live(version, now, window)),
+                seen.identity
+                    .as_ref()
+                    .is_some_and(|proof| proof.live(incarnation, now, window)),
+            )
+        };
+        let confirmations = self.confirmations.as_mut()?;
+        if !(by_read || by_showing) {
+            confirmations.pop(&key);
+            return None;
+        }
+        confirmations.promote(&key);
+        if by_read {
+            let snapshot = &self.entries.get(&uuid)?.snapshot;
+            Some(EntityIdentity {
+                gts_id: snapshot.gts_id.clone(),
+                gts_uuid: snapshot.gts_uuid,
+            })
+        } else {
+            self.identities.get(&EntityKey::GtsUuid(uuid))
+        }
+    }
+
+    /// Record that a read started at `read_at` showed `context` the resident
+    /// snapshot under `etag`, and the remembered pair with it.
+    pub fn confirm_visible(
+        &mut self,
+        key: &EntityKey,
+        context: &ReadContext,
         etag: &Validator,
         read_at: Instant,
     ) {
         let Some(uuid) = self.resident(key) else {
             return;
         };
-        if let Some(entry) = self.entries.peek(&uuid)
-            && entry.etag == *etag
-            && let Some(version) = &entry.tenant_version
-            && let Some(reads) = self.tenant_reads.as_mut()
-        {
-            let epoch = *reads.epochs.get_or_insert(viewer, || {
-                reads.last_epoch += 1;
-                reads.last_epoch
-            });
-            reads.confirmations.put(
-                (uuid, viewer),
-                TenantConfirmation {
-                    version: Arc::downgrade(version),
-                    viewer_epoch: epoch,
-                    read_at,
-                },
-            );
+        let Some(version) = self
+            .entries
+            .peek(&uuid)
+            .filter(|entry| entry.etag == *etag)
+            .and_then(|entry| entry.confirmed_version.clone())
+        else {
+            return;
+        };
+        let incarnation = self.identities.incarnation(uuid).cloned();
+        let Some(confirmations) = self.confirmations.as_mut() else {
+            return;
+        };
+        let seen = confirmations.get_or_insert_mut((uuid, context.clone()), Confirmation::default);
+        Proof::renew(&mut seen.content, &version, read_at);
+        if let Some(incarnation) = &incarnation {
+            Proof::renew(&mut seen.identity, incarnation, read_at);
         }
     }
 
-    pub fn revoke_tenant_reads<'a>(
+    /// Record that a resolution started at `read_at` showed `context` the
+    /// remembered pair for `gts_uuid`. Leaves any read proof as it is.
+    pub fn confirm_resolved(&mut self, gts_uuid: Uuid, context: &ReadContext, read_at: Instant) {
+        let Some(incarnation) = self.identities.incarnation(gts_uuid).cloned() else {
+            return;
+        };
+        let Some(confirmations) = self.confirmations.as_mut() else {
+            return;
+        };
+        let seen =
+            confirmations.get_or_insert_mut((gts_uuid, context.clone()), Confirmation::default);
+        Proof::renew(&mut seen.identity, &incarnation, read_at);
+    }
+
+    /// Revoke `context`'s confirmations of `keys` and fence its requests in flight.
+    pub fn revoke_visible<'a>(
         &mut self,
-        viewer: TenantViewer,
+        context: &ReadContext,
         keys: impl Iterator<Item = &'a EntityKey>,
     ) {
         let mut keys = keys.peekable();
-        if keys.peek().is_some() {
-            self.fence_tenant(viewer);
+        if keys.peek().is_none() {
+            return;
+        }
+        if let Some(slot) = self.contexts_in_flight.get_mut(context) {
+            slot.last_event += 1;
         }
         for key in keys {
-            if let Some(uuid) = self.resident(key)
-                && let Some(reads) = self.tenant_reads.as_mut()
+            if let Some(uuid) = self.reference(key)
+                && let Some(confirmations) = self.confirmations.as_mut()
             {
-                reads.confirmations.pop(&(uuid, viewer));
+                confirmations.pop(&(uuid, context.clone()));
             }
         }
     }
 
-    pub fn revoke_viewer(&mut self, viewer: TenantViewer) {
-        if let Some(reads) = self.tenant_reads.as_mut() {
-            reads.epochs.pop(&viewer);
-        }
-        self.fence_tenant(viewer);
-    }
-
-    fn fence_tenant(&mut self, viewer: TenantViewer) {
-        if let Some(slot) = self.tenant_in_flight.get_mut(&viewer) {
-            slot.last_event += 1;
-        }
-    }
-
-    pub fn tenant_ticket(&mut self, viewer: TenantViewer) -> TenantTicket {
-        let slot = self.tenant_in_flight.entry(viewer).or_default();
+    pub fn context_ticket(&mut self, context: &ReadContext) -> ContextTicket {
+        let slot = self.contexts_in_flight.entry(context.clone()).or_default();
         slot.tickets += 1;
-        TenantTicket {
-            viewer,
+        ContextTicket {
+            context: context.clone(),
             seen: slot.last_event,
         }
     }
 
-    pub fn release_tenant_ticket(&mut self, ticket: TenantTicket) {
-        release_slot(&mut self.tenant_in_flight, &ticket.viewer);
+    pub fn release_context_ticket(&mut self, ticket: &ContextTicket) {
+        release_slot(&mut self.contexts_in_flight, &ticket.context);
     }
 
-    /// Whether any read for `viewer` holds a ticket.
-    #[cfg(test)]
-    pub fn tenant_in_flight(&self, viewer: TenantViewer) -> bool {
-        self.tenant_in_flight.contains_key(&viewer)
-    }
-
-    pub fn tenant_ticket_current(&self, ticket: TenantTicket) -> bool {
-        self.tenant_in_flight
-            .get(&ticket.viewer)
+    pub fn context_ticket_current(&self, ticket: &ContextTicket) -> bool {
+        self.contexts_in_flight
+            .get(&ticket.context)
             .is_some_and(|slot| slot.last_event == ticket.seen)
+    }
+
+    /// Whether any read for `context` holds a ticket.
+    #[cfg(test)]
+    pub fn context_in_flight(&self, context: &ReadContext) -> bool {
+        self.contexts_in_flight.contains_key(context)
     }
 
     /// The entry `key` spells, marked most recently used.
@@ -593,9 +594,7 @@ impl Store {
         self.entries.peek(&self.resident(key)?)
     }
 
-    /// Whether `gts_id` and `gts_uuid` can be one entity beside every resident one: the
-    /// resident counterpart of either spelling, when it is not the other one. Changes no
-    /// recency.
+    /// Return a conflicting resident counterpart without changing recency.
     pub fn conflict(&self, gts_id: &GtsId, gts_uuid: Uuid) -> Option<EntityKey> {
         if let Some(known) = self.aliases.get(gts_id).filter(|known| **known != gts_uuid) {
             return Some(EntityKey::GtsUuid(*known));
@@ -606,8 +605,7 @@ impl Store {
             .map(|entry| EntityKey::GtsId(entry.snapshot.gts_id.clone()))
     }
 
-    /// The entity `key` spells, by the pair stated for it, or else by the one a resident
-    /// snapshot carries, or else by `key` alone.
+    /// Use the stated pair, then the resident pair, then `key` alone.
     fn spelling(&self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) -> Spelling {
         let resident = || {
             self.peek(key)
@@ -619,9 +617,8 @@ impl Store {
         }
     }
 
-    /// Registers a read of the entity `key` spells, about to go to the registry, under
-    /// `key` and the counterpart a resident snapshot carries. Every ticket is
-    /// [released](Self::release) exactly once.
+    /// Pin `key` and any known counterpart before a registry read.
+    /// [Release](Self::release) the ticket exactly once.
     pub fn ticket(&mut self, key: &EntityKey) -> Ticket {
         let spelling = self.spelling(key, None);
         let (id, uuid) = spelling.parts();
@@ -647,10 +644,8 @@ impl Store {
         }
     }
 
-    /// Whether nothing was recorded for the entity since `ticket` was taken: under neither
-    /// spelling it knew, and, if it knew only its key, under no key of the other form known
-    /// only by itself either — that may be the same entity; another key of its own form is
-    /// not. A ticket keeps its slots, so the event counts they saw are never reused.
+    /// Check pinned slots for intervening events. A one-sided ticket also
+    /// checks events under unknown counterparts of the other key form.
     pub fn quiet_since(&self, ticket: &Ticket) -> bool {
         let quiet = |slot: Option<&Slot>| slot.is_some_and(|slot| slot.last_event <= ticket.seen);
         let other_form = match &ticket.spelling {
@@ -664,10 +659,8 @@ impl Store {
             && uuid.is_none_or(|uuid| quiet(self.by_uuid.get(&uuid)))
     }
 
-    /// Records that an answer for the entity `key` spells was taken into the store; `stated`
-    /// is the pair the answer, or the entry the read started from, names. Reads in flight
-    /// under either spelling are fenced, and with the key alone, so is every read that
-    /// knew only its own key of the other form.
+    /// Record the answer's event under both known spellings. A one-sided event
+    /// also fences one-sided reads under the other key form.
     pub fn record(&mut self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) {
         let spelling = self.spelling(key, stated);
         self.event(&spelling);
@@ -694,13 +687,10 @@ impl Store {
         self.max_entries > 0 && weight.fits(self.bound, etag)
     }
 
-    /// Stores `snapshot`, holding `covers` under `etag`, as its entity's entry, replacing
-    /// what was there. Returns the number of LRU entries evicted for capacity. A snapshot
-    /// that does not [fit](Self::fits) is not retained, and the entry it would replace is
-    /// dropped rather than left stale. `weight` is [`weight`] of `snapshot`, measured
-    /// before taking the store's lock. The caller has checked that its identity has no
-    /// [conflict](Self::conflict) with what is resident; a resident entity it contradicts is
-    /// dropped all the same, so that no spelling ever finds two entities.
+    /// Replace the resident snapshot and return the number of capacity evictions.
+    /// An oversized replacement drops the stale entry. Measure `weight` before locking.
+    /// Callers check [identity conflicts](Self::conflict) first. Insertion still drops
+    /// a conflicting resident alias to preserve uniqueness.
     pub fn insert(
         &mut self,
         snapshot: Arc<Entity>,
@@ -715,11 +705,11 @@ impl Store {
         {
             self.remove(&other);
         }
-        let tenant_version = self.tenant_reads.as_ref().map(|_| {
+        let confirmed_version = self.confirmations.as_ref().map(|_| {
             self.entries
                 .peek(&key)
                 .filter(|old| old.etag == etag)
-                .and_then(|old| old.tenant_version.clone())
+                .and_then(|old| old.confirmed_version.clone())
                 .unwrap_or_default()
         });
         self.remove(&key);
@@ -747,14 +737,13 @@ impl Store {
                 etag,
                 confirmed_at,
                 weight,
-                tenant_version,
+                confirmed_version,
             },
         );
         evictions
     }
 
-    /// Records that the registry confirmed `etag` for the entity `key` spells at `at`, if
-    /// that is still the resident validator; a confirmation never moves the instant back.
+    /// Advance confirmation time only for the matching resident validator.
     pub fn confirm(&mut self, key: &EntityKey, etag: &Validator, at: Instant) {
         let Some(resident) = self.resident(key) else {
             return;
@@ -772,10 +761,8 @@ impl Store {
         }
     }
 
-    /// An observed mutation of the entity `key` spells — `stated` is its pair, where an
-    /// answer stated one: its entry is dropped, and reads that started before it can no
-    /// longer fill the store, under either spelling known here or, with the key alone,
-    /// any read that knew only its own.
+    /// Drop the snapshot and fence older reads under either known key, or under
+    /// a possible unknown counterpart.
     pub fn invalidate(&mut self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) {
         let spelling = self.spelling(key, stated);
         if let (_, Some(uuid)) = spelling.parts() {

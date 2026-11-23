@@ -117,19 +117,17 @@ startup seed:
   stay unpublished.
 - **Database required:** without `gears.types-registry.database`, or after seed
   failure, neither contract is registered; resolution fails.
-- **Client cache:** the published platform API caches reads for
-  `local_client.cache.freshness_window` (30 s) within `local_client.cache.max_size_bytes`
-  (64 MiB of compact JSON and raw validators) and `local_client.cache.max_entries`
-  (16 384 snapshots). Setting either limit to zero disables snapshot retention. A registration or deletion polled to its terminal outcome through it drops
-  the affected entries; read with `fresh` when another writer's change must be seen at
-  once. The platform `resolve_*` helpers also answer known identities from
-  `local_client.cache.max_identity_entries` entries (16 384; `0` keeps none, leaving ordinary
-  light reads through the entries), with no window. A platform list primes both resolution
-  directions for the entities on that page.
-  The local platform and tenant caches each have their own byte and entry budgets.
-  The tenant API shares its snapshots across tenants. Each tenant must get a
-  successful read for an entity before it can use the snapshot cache. Use `fresh`
-  to check visibility and content with the registry immediately.
+- **Client cache:** each local API has its own snapshot budget under
+  `local_client.cache`. The defaults are a 30 s `freshness_window`, 64 MiB
+  `max_size_bytes` (compact JSON documents, GTS IDs, raw validators and 256 bytes
+  per snapshot), and 16 384 `max_entries`.
+  Either retention limit set to zero disables snapshots. The platform client
+  invalidates entries when it sees a successful registration or deletion reach
+  its terminal outcome. Use `fresh` to check content and tenant visibility immediately.
+  Tenants share snapshots after the registry confirms visibility for each tenant.
+  Platform reads and lists also teach the `resolve_*` helpers up to
+  `max_identity_entries` identities (default 16 384) in both directions, with no
+  expiry. Set it to zero to resolve from fresh snapshots or the registry.
 - **Independent catalogues:** legacy `/v1` shares initial declarations but no later
   writes with the database until T38.
 - **Multiple instances:** outbox polling can delay admission by one minute. Keep
@@ -277,9 +275,8 @@ key count does not bound response bytes once documents are selected.
 
 ### Skip an unchanged body
 
-An exact read's `ETag` and a batch result's `etag` are the same value, quotes included, for
-that key's current state, whatever the `$select`. Send it back unchanged and an unchanged
-entity costs no body:
+An exact read and a batch result return the same quoted validator for an entity's
+state across all `$select` values. Send it back unchanged to skip an unchanged body.
 
 ```bash
 URL="$TENANT/entities/gts.cf.core.example.event.v1~"
@@ -297,12 +294,10 @@ curl -s -X POST "$TENANT/entities:batchGet" \
 # {"items": [{"entity_key": "...", "status": "unchanged", "etag": "<$ETAG>"}]}
 ```
 
-A revision or a refreshed dependency yields a new validator; another `$select` does not, so
-`304`/`unchanged` says the response you hold is current, not that it has the fields you now
-select. Send a validator only with a `$select` whose fields the response you hold carries,
-and only for the key it came from. The Rust SDK enforces both (`BatchGetItem::new(key).revalidate(&previous_lookup)`).
-Discovery pages carry no validator. On `:batchGet` the `If-None-Match` header is refused:
-validators are per key.
+Revisions and dependency refreshes change the validator. Send it only for the
+same key and a selection the held snapshot covers. The SDK checks both with
+`BatchGetItem::new(key).revalidate(&previous_lookup)`. Discovery returns no validators.
+For `:batchGet`, send per-item validators in the body. The `If-None-Match` header is refused.
 
 ### Discover what exists
 

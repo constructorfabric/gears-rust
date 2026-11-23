@@ -2,9 +2,16 @@
 
 End-to-end read scenarios cover exact `GET /entities/{entity_key}`, `:batchGet`, `:batchResolve` and conditional reads over live entities and tombstones. The local launcher uses **SQLite**; these tests do not prove PostgreSQL/MySQL or tenant/PDP behavior.
 
-Every exact, batch, consistency and conditional read scenario has an e2e test in [test_reading.py](../test_reading.py); every batch resolution scenario has one in [test_resolution.py](../test_resolution.py); the [suite README](../README.md) lists each group. Each scenario lists its source fixtures before Given and refers to them by name in Given/When/Then; all fixture links point to `fixtures/reading/`. Every scenario uses a fresh namespace, and registration and deletion in a Given are completed before the read. Independent `other_*` and `device_*` entities are controls: they show that each response answers its own key and that unrequested entities stay out of it.
+[Read tests](../test_reading.py) and [resolution tests](../test_resolution.py) cover
+every scenario in the [suite index](../README.md). Each scenario uses named fixtures
+from `fixtures/reading/`, a fresh namespace and completed setup operations.
+Independent `other_*` and `device_*` entities check keys and omissions.
 
-Responses are compared whole as JSON values. On exact reads and `:batchGet` the mandatory `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` accompany every selection, and an absent `$select` returns the document-free default metadata. Fields that do not apply to an entity's kind are omitted. Tests match batch results by echoed `entity_key` and check completeness and uniqueness. Exact read and `:batchGet` ETags are compared byte for byte. A `304` carries its ETag and has no body. Reads follow a terminal operation immediately, without sleeps or retries.
+Tests compare whole JSON responses. Exact and batch reads include `gts_id`,
+`gts_uuid`, `kind` and `lifecycle_status`. The default selection is document-free
+and inapplicable fields are omitted. Batch results must echo each distinct key.
+Exact and batch validators match byte for byte. A `304` carries its ETag and no
+body. Reads follow terminal operations without sleeps or retries.
 
 ## Contents
 
@@ -234,7 +241,10 @@ Responses are compared whole as JSON values. On exact reads and `:batchGet` the 
 
 **When:** GET `person_schema` and `person_instance` without `$select` and retain their ETags. GET each key with `$select=content` unconditionally, then again with `If-None-Match` set to its retained ETag. GET `other_schema` with `$select=content` as a contrasting key.
 
-**Then:** each content read returns `200`, its own full authored content and the same ETag as its metadata read: one state has one validator under every `$select`. The conditional content reads return bodyless `304` carrying that ETag — the client holds the content by then, and sending a validator only for fields it holds is the client's responsibility (the SDK enforces it with a typed condition). The other schema returns its own document.
+**Then:** both content reads return `200` with the full authored content and the
+metadata ETag. After the client holds that content, conditional reads return
+bodyless `304` with the same ETag. The SDK binds conditions to held fields.
+`other_schema` returns its own document.
 
 ### TR-READ-304 — A base refresh invalidates its derived schema's ETag
 
@@ -248,7 +258,9 @@ Responses are compared whole as JSON values. On exact reads and `:batchGet` the 
 
 ## Batch resolution
 
-`POST /entities:batchResolve` maps each distinct key to the canonical identity the registry stored for it, `gts_id` and `gts_uuid`, for both active and deleted entities. Absent keys return `not_found`. The tenant route `/types-registry/v2/entities:batchResolve` has the same response contract as the platform route. Setup uses the platform API. The tests derive expected Registry References from the fixtures' GTS IDs.
+Both `:batchResolve` routes return the stored `gts_id` and `gts_uuid` for each
+distinct key, including tombstones, or `not_found` for absent keys. Setup uses
+the platform API. Expected Registry References come from the fixture identifiers.
 
 ### TR-READ-401 — Both planes resolve every distinct key to its stored identity
 
@@ -256,9 +268,15 @@ Responses are compared whole as JSON values. On exact reads and `:batchGet` the 
 
 **Given:** register `person_schema`, `person_instance`, `other_schema` and `other_instance` in one fresh namespace through the platform API. Prepare an absent valid GTS ID in that namespace and an unregistered UUID.
 
-**When:** POST `:batchResolve` on the platform route with the internal token and on the tenant route with the bearer. In both requests, send `person_schema`'s GTS ID, its uppercase Registry Reference, `person_instance`'s GTS ID, the repeated schema ID, its lowercase Registry Reference, the absent GTS ID and the absent UUID in that order.
+**When:** send the same batch to the platform route (internal token) and tenant
+route (bearer): schema ID, uppercase schema Registry Reference, instance ID,
+repeated schema ID, lowercase schema Registry Reference, absent ID and absent UUID.
 
-**Then:** each response is `200` with exactly five results. The schema's GTS ID and Registry Reference are distinct keys and both return `found` with the schema's identity. The repeated ID and second spelling of the Registry Reference are deduplicated. The Registry Reference is echoed lowercase and hyphenated. The instance is `found` with its own identity. Both absent keys return `not_found` without `identity`. The responses omit lifecycle, validators, documents and the unrequested `other_*` entities. The two planes return the same results by echoed key.
+**Then:** both planes return the same five results by echoed key in `200` responses.
+The schema resolves under its ID and canonical lowercase, hyphenated UUID.
+Repeated keys collapse. The instance returns its own identity. The two absent
+keys have `not_found` without identity. Lifecycle, validators, documents and
+unrequested `other_*` entities are omitted.
 
 ### TR-READ-402 — A deleted entity keeps its identity
 
@@ -268,7 +286,8 @@ Responses are compared whole as JSON values. On exact reads and `:batchGet` the 
 
 **When:** delete `person_schema` with a completed, succeeded operation and resolve the same three keys again.
 
-**Then:** both responses are `200` and have the same results by echoed key. The schema is `found` by either key with the same identity before and after deletion. The absent key stays `not_found`.
+**Then:** both `200` responses match by echoed key. Both schema keys keep the same
+identity and the absent key stays `not_found`.
 
 ### TR-READ-403 — The batch bound counts duplicates
 
@@ -278,7 +297,9 @@ Responses are compared whole as JSON values. On exact reads and `:batchGet` the 
 
 **When:** POST `:batchResolve` with `person_schema`'s GTS ID repeated 100 times, then repeated 101 times.
 
-**Then:** 100 items return `200` with one `found` result. 101 items return `400` Problem JSON with one `items` field violation `VALIDATION_FAILED`. The bound counts every item before deduplication.
+**Then:** the raw item count applies before deduplication. 100 items return
+`200` with one `found` result. 101 return `400` Problem JSON with one
+`VALIDATION_FAILED` violation on `items`.
 
 ### TR-READ-404 — A resolution takes no selection or condition
 

@@ -124,8 +124,7 @@ impl LocalClient {
         Ok(sdk::BatchGetEntitiesResponse(lookups))
     }
 
-    /// The batch resolution both contracts serve: every key answered by the key it was
-    /// asked by, with the identity the registry stored for it.
+    /// Resolve each key to the registry's stored identity for either contract.
     async fn batch_resolve(
         &self,
         caller: CallerContext<'_>,

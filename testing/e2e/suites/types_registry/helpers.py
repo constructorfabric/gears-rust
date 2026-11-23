@@ -390,8 +390,7 @@ async def batch_resolve(client, api_path, keys, *, params=None):
 
 
 def resolved(key, document=None):
-    """One complete resolution result: `found` with the identity `document`
-    was registered under, or `not_found` without one. `key` is the echoed key."""
+    """Expected result for an echoed key, with identity only when found."""
     if document is None:
         return {"entity_key": key, "status": "not_found"}
     gts_id = document["gts_id"]
@@ -403,12 +402,7 @@ def resolved(key, document=None):
 
 
 def assert_resolutions(response, *expected):
-    """Compare a batch resolution body in full, results sorted by echoed key.
-
-    As in `assert_batch`, sorting both sides still catches a missing, extra or
-    duplicated key. Nothing is masked: a resolution has no validator or timestamp,
-    neither in a result nor as a response `ETag`.
-    """
+    """Compare whole results by echoed key, catching missing, extra and duplicate keys."""
     assert response.status_code == 200, response.text
     assert response.headers["content-type"].startswith("application/json")
     assert "etag" not in response.headers, response.headers

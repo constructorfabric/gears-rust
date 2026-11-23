@@ -495,9 +495,8 @@ async fn an_over_long_validator_is_refused_by_the_service(h: &Harness, backend: 
     );
 }
 
-/// A batch resolution reads the keyed identity rows and nothing else: no Type Schema
-/// projection, no resolution fingerprint, no revision and no document — the `entity`
-/// table only, both spellings in one snapshot, a bounded number of statements.
+/// Batch resolution reads only the `entity` table, with both key forms in one
+/// snapshot and a bounded number of statements.
 async fn a_resolution_reads_only_identity_rows(h: &Harness, backend: &str) {
     let instance_uuid = gts::GtsId::try_new(INSTANCE).expect("identifier").to_uuid();
     let absent = gts_id!("cf.core.projread.absent.v1~");
@@ -560,8 +559,7 @@ async fn a_resolution_reads_only_identity_rows(h: &Harness, backend: &str) {
         assert!(!named(&statements, column), "{backend}: {statements:#?}");
     }
 
-    // The batch read of the same Type Schema does read its fingerprint: the assertion
-    // above is about the resolution, not about a schema with nothing to read.
+    // A regular batch read exercises the fingerprint lookup that resolution skips.
     h.recorder.clear();
     h.service
         .batch_get(
@@ -580,8 +578,8 @@ async fn a_resolution_reads_only_identity_rows(h: &Harness, backend: &str) {
     );
 }
 
-/// A resolution refused for its bounds, or naming only keys that cannot be stored, runs
-/// no SQL: the raw count bounds the batch, duplicates included.
+/// Invalid batch sizes and keys that cannot exist require no SQL. Duplicates count
+/// toward the raw batch limit.
 async fn a_refused_or_non_canonical_resolution_runs_no_sql(h: &Harness, backend: &str) {
     h.recorder.clear();
     let over = EntityKey::GtsId("a".repeat(MAX_KEY_LEN + 1));
