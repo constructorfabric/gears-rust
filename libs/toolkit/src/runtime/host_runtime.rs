@@ -2205,9 +2205,9 @@ impl HostRuntime {
 #[path = "rest_advertiser_tests.rs"]
 mod rest_advertiser_tests;
 
-/// Composed `OoP` router, serialized `OpenAPI`, and auth policy from the same specs.
+/// Composed `OoP` router, serialized `OpenAPI`, and listener policy from the same specs.
 #[cfg(feature = "bootstrap")]
-type ComposedOopRouter = (Router, String, toolkit_http_middleware::RouteAuthPolicy);
+type ComposedOopRouter = (Router, String, super::oop_serve::OopRoutePolicy);
 
 /// The host-less `OoP` router composed so far: each gear's routes are
 /// registered once, the system gears' before the application group.
@@ -2225,7 +2225,7 @@ impl HostRuntime {
     /// Register the routes of the `RestApiCap` gears among `entries` not
     /// registered yet into the **host-less** `composition`, and return the
     /// router so far with its generated `OpenAPI` document (serialized JSON)
-    /// and auth policy.
+    /// and listener policy.
     ///
     /// Unlike [`run_rest_phase`](Self::run_rest_phase), this does not require an
     /// `ApiGatewayCap` host: `OoP` gears serve their own routes directly.
@@ -2281,10 +2281,11 @@ impl HostRuntime {
             .build_openapi(&info)
             .context("OoP router: build OpenAPI document")?;
         let json = serde_json::to_string(&openapi).context("OoP router: serialize OpenAPI")?;
-        let route_auth =
-            super::oop_serve::route_auth_policy(composition.registry.operation_specs.iter());
+        let policy = super::oop_serve::OopRoutePolicy::from_specs(
+            composition.registry.operation_specs.iter(),
+        );
 
-        Ok((composition.router.clone(), json, route_auth))
+        Ok((composition.router.clone(), json, policy))
     }
 
     /// Run the full `OoP` gear lifecycle: phases (`pre_init` … `start`), then
@@ -2438,10 +2439,10 @@ impl HostRuntime {
         // System routes on the bound listener: platform-plane calls
         // only until the application group attached its routes.
         if system.iter().any(|e| e.caps.has::<RestApiCap>()) {
-            let (router, openapi, route_auth) = self
+            let (router, openapi, policy) = self
                 .compose_oop_router(server.options(), hc_registry, &system, composition)
                 .await?;
-            server.publish_bootstrap_routes(router, openapi, route_auth);
+            server.publish_bootstrap_routes(router, openapi, policy);
             if advertised_is_system && root_is_advertised() {
                 server.start_presence();
             }
@@ -2490,13 +2491,13 @@ impl HostRuntime {
         // `oop_http.internal_auth`.)
         server.resolve_bearer_authenticator(&self.client_hub);
         let all: Vec<&GearEntry> = self.registry.gears().iter().collect();
-        let (router, openapi, route_auth) = self
+        let (router, openapi, policy) = self
             .compose_oop_router(server.options(), hc_registry, &all, composition)
             .await?;
         // Publish the full routes (they go live), then start directory
         // presence of the advertised gear: the directory never advertises it
         // while its routes reply 503.
-        server.attach(router, openapi, route_auth)?;
+        server.attach(router, openapi, policy)?;
         // First presence of an application root; a system root's restarts
         // with the full `OpenAPI` document.
         if root_is_advertised() {

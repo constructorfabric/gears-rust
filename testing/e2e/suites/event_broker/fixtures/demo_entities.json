@@ -1,0 +1,75 @@
+{
+  "items": [
+    {
+      "gts_id": "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1",
+      "content": {
+        "id": "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1",
+        "description": "Demo stream for the standalone quickstart."
+      }
+    },
+    {
+      "gts_id": "gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~",
+      "content": {
+        "$id": "gts://gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Demo event type for the standalone quickstart.",
+        "x-gts-traits": {
+          "topic": "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1",
+          "allowed_subject_types": [
+            "gts.cf.core.demo.subject.v1~"
+          ],
+          "partition_key": "/subject_tenant"
+        },
+        "type": "object",
+        "allOf": [
+          {
+            "$ref": "gts://gts.cf.core.events.event.v1~"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "gts_id": "gts.cf.core.events.event.v1~cf.core.demo.spread.v1~",
+      "content": {
+        "$id": "gts://gts.cf.core.events.event.v1~cf.core.demo.spread.v1~",
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "description": "Demo event type partitioned by event id, for multi-partition fan-out.",
+        "x-gts-traits": {
+          "topic": "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1",
+          "allowed_subject_types": [
+            "gts.cf.core.demo.subject.v1~"
+          ],
+          "partition_key": "/id"
+        },
+        "type": "object",
+        "allOf": [
+          {
+            "$ref": "gts://gts.cf.core.events.event.v1~"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "data": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

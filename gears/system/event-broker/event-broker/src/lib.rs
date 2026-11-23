@@ -16,4 +16,4 @@ pub mod module;
 pub mod test_support;
 
 pub use config::{DeploymentMode, EventBrokerConfig};
-pub use module::EventBrokerModule;
+pub use module::{EventBrokerModule, ExternallyManagedDirectoryPresence};

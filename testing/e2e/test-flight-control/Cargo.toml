@@ -1,0 +1,111 @@
+[package]
+name = "test-flight-control"
+version = "0.1.0"
+description = "Test flight-control fixture for out-of-process gear integration"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "test-flight-control"
+path = "src/main.rs"
+
+[[test]]
+name = "core_process_tests"
+path = "src/core_process_tests.rs"
+required-features = ["core"]
+
+[[test]]
+name = "policy_process_tests"
+path = "src/policy_process_tests.rs"
+required-features = ["event-broker"]
+
+[features]
+default = []
+core = ["registry", "directory", "http-host", "grpc-host", "authn", "fixture-authn"]
+event-broker = ["core", "authz-hierarchy", "eb-test-policy"]
+event-broker-remote-cluster = ["event-broker", "cluster"]
+registry = ["dep:types-registry", "dep:toolkit-db"]
+directory = ["dep:service-discovery"]
+http-host = ["dep:api-gateway"]
+grpc-host = ["dep:grpc_hub"]
+authn = ["dep:authn-resolver", "dep:static-authn-plugin"]
+fixture-authn = [
+    "dep:tonic",
+    "dep:prost",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:toolkit-security",
+    "dep:toolkit-trace-context",
+    "dep:toolkit-transport-grpc",
+    "dep:tracing",
+]
+authz-hierarchy = [
+    "dep:authz-resolver",
+    "dep:static-tr-plugin",
+    "dep:tenant-resolver",
+    "dep:tr-authz-plugin",
+    "dep:async-trait",
+    "dep:authz-resolver-sdk",
+    "dep:gts",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:toolkit-gts",
+    "dep:types-registry-sdk",
+    "dep:uuid",
+]
+eb-test-policy = []
+cluster = ["dep:cluster"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+toolkit = { workspace = true, features = ["bootstrap"] }
+toolkit-db = { workspace = true, features = ["sqlite"], optional = true }
+
+api-gateway = { workspace = true, optional = true }
+authn-resolver = { workspace = true, optional = true }
+grpc_hub = { workspace = true, optional = true }
+service-discovery = { workspace = true, optional = true }
+static-authn-plugin = { workspace = true, optional = true }
+types-registry = { workspace = true, optional = true }
+authz-resolver = { workspace = true, optional = true }
+cluster = { workspace = true, optional = true }
+static-tr-plugin = { workspace = true, optional = true }
+tenant-resolver = { workspace = true, optional = true }
+tr-authz-plugin = { workspace = true, optional = true }
+
+async-trait = { workspace = true, optional = true }
+authz-resolver-sdk = { workspace = true, optional = true }
+gts = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+toolkit-gts = { workspace = true, optional = true }
+types-registry-sdk = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+prost = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+toolkit-security = { workspace = true, optional = true }
+toolkit-trace-context = { workspace = true, optional = true }
+toolkit-transport-grpc = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+cluster-sdk = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+uuid = { workspace = true, features = ["v4"] }

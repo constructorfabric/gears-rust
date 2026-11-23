@@ -131,6 +131,7 @@ name = "gen_grpc_proto"
 required-features = ["grpc-client"]
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 # Backs `tests/protogen_shape.rs`, which asserts that the `cluster.v1` contract IR
 # and DTO schemas actually project to a `.proto`. Three of protogen's constraints
 # are violated by writing ordinary Rust, and one of them — `Vec<u8>` rendering as

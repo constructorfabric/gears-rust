@@ -10,6 +10,8 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+toolkit_gts::declare_gts_inventory!();
+
 pub mod api;
 pub mod backend;
 pub mod consumer;

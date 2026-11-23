@@ -52,6 +52,7 @@ debug = true
 members = [
     "apps/cf-gears-example-server",
     "apps/cf-gears-flight-control",
+    "testing/e2e/test-flight-control",
     "tools/gts-analyze",
     "tools/xtask",
     "libs/toolkit",
@@ -415,6 +416,7 @@ cf-gears-system-sdks = { version = "0.1.55", path = "libs/system-sdks" }
 cf-gears-system-sdk-directory = { version = "0.5.0", path = "libs/system-sdks/sdks/directory" }
 
 # System gears
+service-discovery = { package = "cf-gears-service-discovery", version = "0.4.5", path = "gears/system/service-discovery" }
 types-registry = { package = "cf-gears-types-registry", version = "0.8.1", path = "gears/system/types-registry/types-registry" }
 authn-resolver = { package = "cf-gears-authn-resolver", version = "0.3.5", path = "gears/system/authn-resolver/authn-resolver" }
 authz-resolver = { package = "cf-gears-authz-resolver", version = "0.5.2", path = "gears/system/authz-resolver/authz-resolver" }
@@ -431,6 +433,8 @@ api-gateway = { package = "cf-gears-api-gateway", version = "0.7.7", path = "gea
 # Concrete plugins needed to link a standalone-mode binary.
 static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.4.4", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
 static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.2.4", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
+static-tr-plugin = { package = "cf-gears-static-tr-plugin", version = "0.2.4", path = "gears/system/tenant-resolver/plugins/static-tr-plugin" }
+tr-authz-plugin = { package = "cf-gears-tr-authz-plugin", version = "0.1.30", path = "gears/system/authz-resolver/plugins/tr-authz-plugin" }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.17", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
 cf-gears-cluster-sdk = { version = "0.3.8", path = "gears/system/cluster/cluster-sdk" }

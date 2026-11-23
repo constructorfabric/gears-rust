@@ -27,14 +27,32 @@ Conventions for anything added here:
 
 from __future__ import annotations
 
+import asyncio
 import time
-import uuid
 from datetime import datetime, timezone
 
-import httpx
 import pytest
 
-from .conftest import EVENT_TYPE_LONGPOLL, SUBJECT_TYPE, TOPIC_LONGPOLL, SseFrameReader
+from .conftest import (
+    DEFAULT_TENANT_ID,
+    EVENT_TYPE_LONGPOLL,
+    SUBJECT_TYPE,
+    TOPIC_LONGPOLL,
+    SseFrameReader,
+)
+from .test_consumer_stream import (
+    _check_owner_request,
+    _live_event_fields,
+    _live_group,
+    _live_heartbeat,
+    _live_join,
+    _live_manifest_bounds,
+    _live_seek_earliest,
+    _live_sse_frame,
+    _live_stream,
+    _live_topology,
+)
+from .test_publish_consume import _stream_instant
 
 # Ceiling on publish-ack -> delivery for an event published onto an already-open
 # stream. A working figure, not a documented guarantee: no scenario states a
@@ -50,91 +68,69 @@ DELIVERY_BOUND = 15.0
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
 async def test_published_event_reaches_open_stream_within_bound(api, test_env):
-    """An event published while a stream is open is delivered within the bound.
-
-    The subscription covers only TOPIC_LONGPOLL and no other test publishes
-    there, so the single event this test publishes is the only one it can
-    receive - the measurement is not polluted by another test's traffic.
-    """
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
-
-        tenant_id = str(uuid.uuid4())
-        sub_resp = await client.post(
-            "/subscriptions",
-            json={
-                "consumer_group": group_id,
-                "client_agent": "e2e-test",
-                "interests": [
-                    {
-                        "topic": TOPIC_LONGPOLL,
-                        "subject_tenant": tenant_id,
-                        "ownership_filter": "entire_tenant",
-                        "types": [EVENT_TYPE_LONGPOLL],
-                    }
-                ],
-            },
-        )
-        assert sub_resp.status_code == 201
-        sub_id = sub_resp.json()["id"]
-
-        seek_resp = await client.post(
-            f"/subscriptions/{sub_id}:seek",
-            json={
-                "topology_version": 1, "positions": {TOPIC_LONGPOLL: [{"partition": 0, "value": "earliest"}]}
-            },
-        )
-        assert seek_resp.status_code == 200
-
-    async with httpx.AsyncClient(
-        base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
-    ) as stream_client:
-        async with stream_client.stream(
-            "GET", f"/events:sse?subscription={sub_id}"
-        ) as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            topology_kind, _ = await reader.next_frame(timeout=5)
-            assert topology_kind == "topology"
-
-            event_id = str(uuid.uuid4())
-            occurred_at = datetime.now(timezone.utc).isoformat()
-            async with api() as publish_client:
-                publish_resp = await publish_client.post(
-                    "/events",
-                    json={
-                        "id": event_id,
-                        "type": EVENT_TYPE_LONGPOLL,
-                        "subject_tenant": tenant_id,
-                        "source": "e2e-test",
-                        "subject": "s1",
-                        "subject_type": SUBJECT_TYPE,
-                        "occurred_at": occurred_at,
-                    },
-                )
-            assert publish_resp.status_code == 202
-            # Timed from the ack, so the bound covers ingest and sequencing as
-            # well as delivery - every step the publisher waits through.
-            published_at = time.monotonic()
-
-            event_data = await reader.await_kind("event", timeout=DELIVERY_BOUND)
-            elapsed = time.monotonic() - published_at
-
-    payload = event_data["payload"]
-    assert payload == {
-        "id": event_id,
+    """An event published while the TA SSE stream is open arrives within 15 seconds."""
+    topic = TOPIC_LONGPOLL
+    interest = {
+        "topic": topic,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "ownership_filter": "entire_tenant",
+        "types": [EVENT_TYPE_LONGPOLL],
+    }
+    event = {
+        "id": "29e20000-0000-4000-8002-000000000001",
         "type": EVENT_TYPE_LONGPOLL,
-        "subject_tenant": tenant_id,
+        "subject_tenant": DEFAULT_TENANT_ID,
         "source": "e2e-test",
         "subject": "s1",
         "subject_type": SUBJECT_TYPE,
-        "occurred_at": payload["occurred_at"],
-        "trace_parent": None,
-        "data": None,
-        "partition": 0,
-        "sequence": payload["sequence"],
-        "sequence_time": payload["sequence_time"],
+        "occurred_at": "2026-01-19T10:20:30Z",
     }
-    assert elapsed < DELIVERY_BOUND, f"delivery took {elapsed:.2f}s"
+    async with api() as client:
+        bounds = await _live_manifest_bounds(client, topic, [0])
+        # The mixed-topic batch is rejected before any LONGPOLL event is stored.
+        assert bounds == {0: (0, 0)}
+        offsets = {0: bounds[0][0]}
+        group_id = await _live_group(client)
+        sub_id = await _live_join(client, group_id, interest, [0])
+        await _live_seek_earliest(client, sub_id, topic, offsets)
+
+        async with _live_stream(api, sub_id) as response:
+            assert response.headers["content-type"] == "text/event-stream"
+            reader = SseFrameReader(response)
+            clock = asyncio.get_running_loop().time
+            _live_topology(await _live_sse_frame(reader, clock() + 5), topic, offsets)
+            began_at = datetime.now(timezone.utc).replace(microsecond=0)
+            published = await client.post("/events", json=event)
+            acknowledged_at = time.monotonic()
+            _check_owner_request(published)
+            assert (published.status_code, published.content) == (202, b"")
+
+            while True:
+                remaining = DELIVERY_BOUND - (time.monotonic() - acknowledged_at)
+                assert remaining > 0, "delivery deadline elapsed"
+                name, frame = await reader.next_frame(timeout=remaining)
+                received_at = time.monotonic()
+                assert isinstance(frame, dict)
+                assert name == frame.get("kind"), (name, frame)
+                if name != "heartbeat":
+                    break
+                _live_heartbeat(frame)
+
+            payload = _live_event_fields(frame, began_at)
+            assert payload["sequence"] > offsets[0]
+            assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+            assert frame == {
+                "kind": "event",
+                "payload": {
+                    **event,
+                    "occurred_at": payload["occurred_at"],
+                    "trace_parent": None,
+                    "data": None,
+                    "partition": 0,
+                    "sequence": payload["sequence"],
+                    "sequence_time": payload["sequence_time"],
+                },
+            }
+            elapsed = received_at - acknowledged_at
+            assert elapsed < DELIVERY_BOUND, f"delivery took {elapsed:.6f}s"
+            print(f"ack-to-event: {elapsed:.9f}s ({acknowledged_at=:.9f}, {received_at=:.9f})")

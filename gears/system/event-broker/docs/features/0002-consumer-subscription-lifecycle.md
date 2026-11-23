@@ -368,12 +368,13 @@ def join_new_member(G, member):
         # the JOIN first evicts the group's Disconnected members (gs.evict_disconnected_members(), §2.1)
         gs.members[member.id] = member
         rebalance(gs)                                  # range assignment, §3; bumps topology_version
+        # rebalance stores every member's assignment and version before publication
         for m in gs.members.values():                  # the joiner included
-            if m.new_assigned != m.assigned:           # a member whose set did not change is skipped
-                m.generations.send_replace((gs.topology_version, m.new_assigned))
-    # Each open stream whose set changed sees it at once: a lost partition is a
-    # topology frame and the stream continues; a gained partition ends the stream
-    # with rebalanced; losing every partition ends it with lose_all.
+            m.generations.send_replace((gs.topology_version, m.assigned))
+    # Intermediate generations may coalesce before the stream observes them.
+    # Strict loss or version-only change sends the full assignment and positions.
+    # A gain ends the stream with terminal/rebalanced. Losing every partition
+    # ends it with terminal/lose_all.
 
 # INVARIANT: no (topic, partition) is processed by two consumers simultaneously.
 # The distributed_lock around GroupState mutation serializes the reassignment (not yet implemented, tracked in #5979).
@@ -396,9 +397,11 @@ def remove_member(G, member_id, reason):               # reason in {"leave", "jo
         del gs.members[member_id]
         # a departed member still streaming (a LEAVE) gets an empty assignment: its stream ends with lose_all
         rebalance(gs)                                  # redistribute departed member's partitions; bumps topology_version
+        # rebalance stores all survivor assignments and versions before publication
         for survivor in gs.members.values():
-            if survivor.new_assigned != survivor.assigned:   # unchanged sets are skipped
-                survivor.generations.send_replace((gs.topology_version, survivor.new_assigned))
+            survivor.generations.send_replace((gs.topology_version, survivor.assigned))
+    # LEAVE and reaping publish the latest generation to every survivor, including
+    # unchanged sets; continuing streams may skip intermediate generations.
     # In-flight events held in the departed member's buffer are NOT shipped
     # elsewhere - after its re-JOIN the new owner's SDK SEEKs from its own offset store
     # and reads from cursor.offset + 1 (the consumer's store is the authority, ADR-0006).
@@ -489,7 +492,7 @@ async def release_ownership(G):
 
 The lock around `cluster.distributed_lock("evbk.group.<G>")` is the serialization point for every GroupState mutation (JOIN, LEAVE, rebalance, ownership transfer) (not yet implemented, tracked in #5979). Stream reads and pre-stream SEEK are NOT lock-protected by the GroupState mutation lock - they touch runtime cursor cache keys directly and rely on the cache's own consistency guarantees.
 
-`topology_version` is monotonically increasing per group; every mutation increments it. Consumers detect a rebalance from the `topology_version` carried in every `topology` frame, or from a stream that ends with `rebalanced` (a gained partition) or `lose_all` (every partition lost).
+Each rebalance increments the group's `topology_version`. On strict loss or a version-only change, a continuing stream sends a `topology` frame for the latest observed generation with the full retained assignment and current positions. Generations may coalesce. A gain ends the stream with terminal reason `rebalanced`, and total loss with `lose_all`.
 
 **Rebalance (v1): range assignment per topic.** Runs under the group lock on every JOIN, LEAVE and reap (a lapsed `join_timeout` or `session_timeout`), and recomputes the whole assignment:
 
@@ -533,7 +536,7 @@ A subscription carries a `created_at` timestamp set at JOIN. `GET /v1/subscripti
 - DeliveryService implements the v1 rebalance algorithm under `cluster.distributed_lock` (not yet implemented, tracked in #5979).
 - `GroupState` carries per-member filters / topic lists; rebalance respects them.
 - `cursor.offset` is updated atomically via cache CAS (compare-and-swap with `>=` semantics; only SEEK writes it, before the stream opens, and SEEK accepts any value in the valid range; delivery never moves it).
-- `topology_version` is carried in every `topology` frame, or signalled by a stream that ends with `rebalanced` (a gained partition) or `lose_all` (every partition lost).
+- On strict loss or a version-only change, `topology` carries the latest observed `topology_version`, retained partitions and positions. Generations may coalesce. A gain ends the stream with terminal reason `rebalanced`, and total loss with `lose_all`.
 - Reaper removes members past their state's lifetime (`join_timeout` before the first stream, `session_timeout` after a stream closes) and triggers rebalance.
 - The eight flows above are implemented end-to-end and visible through `evbk_*` metrics.
 

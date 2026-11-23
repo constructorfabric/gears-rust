@@ -9,60 +9,76 @@ in-process medium cannot be taken down from outside.
 
 from __future__ import annotations
 
-import json
-import os
+import asyncio
 import subprocess
-import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from pathlib import Path
 
 import httpx
 import pytest
 
-from lib.orchestrator import GearTestEnv, _log_path, _prepare_config, _wait_healthy
 from lib.sidecars import LABEL_KEY
 
 from .conftest import (
+    API_BASE,
     BACKEND,
-    CONFIG,
-    PROJECT_ROOT,
     SUBJECT_TYPE,
     TRACE_ID,
+    TRACEPARENT,
     SseFrameReader,
     _SIDECARS,
     _await_log_line,
     _derived_event_type,
     _topic_instance,
     patch_backend,
+    public_headers,
     wait_provisioned,
 )
+from .topology import (
+    OWNER_TENANT,
+    RECHECK,
+    STARTUP_TIMEOUT,
+    FlightControlBrokerEnv,
+    _event_fields,
+    own_sidecars,
+    replace_once,
+)
 
-OUTAGE_PORT = 8091
-BASE_URL = f"http://localhost:{OUTAGE_PORT}/event-broker/v1"
 TOPIC = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.outage.v1"
 EVENT_TYPE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.outage.v1~"
-# How long the backend stays down after the server is up.
-DOWN_FOR_S = 3
 
 
-def _patch(config_text: str, home_dir: str, sidecars) -> str:
-    config_text = config_text.replace(
-        'home_dir: "~/.cf-gears-event-broker"', f'home_dir: "{Path(home_dir).as_posix()}"'
+@contextmanager
+def _outage_env(root, *, down_at_start):
+    sidecar_type = _SIDECARS[BACKEND]
+    suffix = uuid.uuid4().hex[:8]
+    sidecar = type(
+        f"Outage{sidecar_type.__name__}",
+        (sidecar_type,),
+        {"NAME_PREFIX": f"eb-e2e-outage-{BACKEND}", "FIXED_HOST_PORT": True},
+    )(label=f"{LABEL_KEY}=eb-e2e-outage-{BACKEND}-{suffix}")
+
+    def config(text, home, sidecars):
+        text = patch_backend(text, sidecars, f"evbk_e2e_outage_{suffix}", home)
+        return replace_once(
+            text,
+            "      topics:\n",
+            f'      topics:\n        "{TOPIC}":\n          partitions: 1\n',
+        )
+
+    env = FlightControlBrokerEnv(
+        root, broker_config=config,
+        documents=[_topic_instance(TOPIC), _derived_event_type(EVENT_TYPE, TOPIC)],
+        health_path="/healthz",
     )
-    config_text = patch_backend(config_text, sidecars, "evbk_e2e_outage", home_dir)
-    config_text = config_text.replace(
-        'bind_addr: "127.0.0.1:8080"', f'bind_addr: "127.0.0.1:{OUTAGE_PORT}"'
-    )
-    config_text = config_text.replace(
-        "      topics:\n", f'      topics:\n        "{TOPIC}":\n          partitions: 1\n', 1
-    )
-    extra = "".join(
-        f"        - {json.dumps(e)}\n"
-        for e in (_topic_instance(TOPIC), _derived_event_type(EVENT_TYPE, TOPIC))
-    )
-    return config_text.replace("entities:\n", "entities:\n" + extra)
+    with own_sidecars([sidecar], redact=env.redact) as sidecars:
+        env.sidecars = sidecars
+        if down_at_start:
+            _docker("stop", sidecar.container_id)
+        with env:
+            yield env, sidecar
 
 
 def _docker(*args: str) -> None:
@@ -88,91 +104,65 @@ def _event(tenant_id: str) -> dict:
 )
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(150, func_only=True)
-async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_env):
-    """The server starts with its backend unreachable: it is live but not ready,
-    and a publish to a topic it could not provision answers 503. Once the
-    backend comes up the topic is provisioned without a restart, the server
-    turns ready, and a published event is delivered.
+async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_env, tmp_path):
+    """The live worker attaches its routes while storage is down.
+
+    With routes attached and storage still down, a publish to the unprovisioned
+    topic answers 503. When storage returns, the same worker provisions the
+    topic and delivers a published event.
     """
-    sidecar_type = _SIDECARS[BACKEND]
-    # A label of its own: `start` reaps every container carrying its label, and
-    # the session's sidecar carries the class default.
-    sidecar = type(
-        f"Outage{sidecar_type.__name__}",
-        (sidecar_type,),
-        {
-            "NAME_PREFIX": f"eb-e2e-outage-{BACKEND}",
-            "LABEL": f"{LABEL_KEY}=eb-e2e-outage-{BACKEND}",
-            "FIXED_HOST_PORT": True,
-        },
-    )()
-    sidecar.start()
-    proc = None
-    try:
-        # Stopped, not removed: the same container comes back on the same port.
-        _docker("stop", sidecar.container_id)
-
-        home_dir = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-outage-")
-        env = GearTestEnv(
-            config_path=CONFIG,
-            config_patch=lambda text, _env: _patch(text, home_dir, [sidecar]),
-            port=OUTAGE_PORT,
-            health_path="/healthz",
-            log_suffix="event-broker-outage",
-        )
-        config_path = _prepare_config(env)
-        log_offset = _log_path(env).stat().st_size if _log_path(env).exists() else 0
-        proc = subprocess.Popen(
-            [os.environ["E2E_BINARY"], "--config", str(config_path), "run"],
-            cwd=str(PROJECT_ROOT),
-            stdout=open(_log_path(env), "a"),
-            stderr=subprocess.STDOUT,
-            env={**os.environ},
-        )
-        _wait_healthy(env)
-        time.sleep(DOWN_FOR_S)
-
-        origin = f"http://localhost:{OUTAGE_PORT}"
-        tenant_id = str(uuid.uuid4())
-        async with httpx.AsyncClient(timeout=10, headers={"traceparent": f"00-{TRACE_ID}-b7ad6b7169203331-01"}) as client:
-            ready = await client.get(f"{origin}/readyz")
-            assert (ready.status_code, ready.json()) == (
-                503,
-                {
-                    "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
-                    "title": "Internal",
-                    "status": 503,
-                    "detail": "An internal error occurred. Please retry later.",
-                    "instance": "/readyz",
-                    "trace_id": TRACE_ID,
-                    "context": {},
-                },
+    with _outage_env(tmp_path, down_at_start=True) as (env, sidecar):
+        broker_pid = env.broker_pid
+        identity = env.redact(f"Event Broker pid={broker_pid} at {env.base_url}")
+        deadline = time.monotonic() + STARTUP_TIMEOUT
+        attached = "OoP gear routes attached (now serving)"
+        last_attach = None
+        while time.monotonic() < deadline:
+            last_attach = _event_fields(env.log()).get(attached, {}).get("gear")
+            assert env.broker_running(), env.redact(
+                f"{identity} exited before final route attachment with last gear {last_attach!r}"
             )
-            refused = await client.post(f"{BASE_URL}/events", json=_event(tenant_id))
-            assert (refused.status_code, refused.json()) == (
-                503,
-                {
-                    "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
-                    "title": "Service Unavailable",
-                    "status": 503,
-                    "detail": "Service temporarily unavailable",
-                    "instance": "/event-broker/v1/events",
-                    "trace_id": TRACE_ID,
-                    "context": {},
-                },
+            if last_attach == "event-broker" and time.monotonic() < deadline:
+                break
+            await asyncio.sleep(min(RECHECK, max(0, deadline - time.monotonic())))
+        else:
+            raise AssertionError(env.redact(
+                f"{identity} did not report final route attachment: "
+                f"last attachment gear={last_attach!r}"
+            ))
+
+        base_url = f"{env.base_url}{API_BASE}"
+        tenant_id = OWNER_TENANT
+        async with httpx.AsyncClient(
+            timeout=10, headers={**public_headers(), "traceparent": TRACEPARENT}, trust_env=False,
+        ) as client:
+            refused = await client.post(f"{base_url}/events", json=_event(tenant_id))
+            assert (refused.status_code, refused.headers.get("content-type")) == (
+                503, "application/problem+json",
+            ), env.redact(
+                f"{base_url}/events on Event Broker pid={env.broker_pid} returned "
+                f"HTTP {refused.status_code}, {refused.headers.get('content-type')!r}"
             )
-            _await_log_line(env, f"topic '{TOPIC}' is not provisioned on its storage backend yet", log_offset)
+            assert refused.json() == {
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+                "title": "Service Unavailable",
+                "status": 503,
+                "detail": "Service temporarily unavailable",
+                "instance": "/event-broker/v1/events",
+                "trace_id": TRACE_ID,
+                "context": {},
+            }
+            _await_log_line(env, f"topic '{TOPIC}' is not provisioned on its storage backend yet")
 
         _docker("start", sidecar.container_id)
         sidecar._wait_ready()
 
-        deadline = time.monotonic() + 90
-        while httpx.get(f"{origin}/readyz", timeout=5).status_code != 200:
-            assert time.monotonic() < deadline, "the server never turned ready after the backend came up"
-            time.sleep(0.5)
-        wait_provisioned(BASE_URL, {TOPIC: EVENT_TYPE})
+        env.wait_ready(deadline=time.monotonic() + 90)
+        wait_provisioned(base_url, {TOPIC: EVENT_TYPE})
 
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=10) as client:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=10, headers=public_headers(),
+        ) as client:
             group = await client.post("/consumer-groups")
             assert group.status_code == 201
             sub = await client.post(
@@ -194,7 +184,9 @@ async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_
             published = await client.post("/events", json=event)
             assert published.status_code == 202
 
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=None) as stream_client:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=None, headers=public_headers(),
+        ) as stream_client:
             async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
                 assert resp.status_code == 200
                 reader = SseFrameReader(resp)
@@ -209,15 +201,10 @@ async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_
             "sequence": 1,
             "sequence_time": payload["sequence_time"],
         }
-    finally:
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        sidecar.stop()
+        current_pid = env.broker_pid
+        assert (current_pid, env.broker_running()) == (broker_pid, True), env.redact(
+            f"{identity} did not stay live through delivery (current pid={current_pid})"
+        )
 
 
 @pytest.mark.skipif(
@@ -227,7 +214,7 @@ async def test_a_server_started_with_its_backend_down_serves_once_it_is_up(test_
 )
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(150, func_only=True)
-async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env):
+async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env, tmp_path):
     """A synchronous publish (`Prefer: wait=N`) to a provisioned topic whose
     backend is then unreachable is admitted and durably enqueued (the producer
     chain lives in the gear database, not the event backend), but the outbox
@@ -238,59 +225,20 @@ async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env):
     a live backend that test races the drain, whereas a stopped backend makes a
     timed-out wait certain.
     """
-    sidecar_type = _SIDECARS[BACKEND]
-    sidecar = type(
-        f"Outage{sidecar_type.__name__}",
-        (sidecar_type,),
-        {
-            "NAME_PREFIX": f"eb-e2e-outage-{BACKEND}",
-            "LABEL": f"{LABEL_KEY}=eb-e2e-outage-{BACKEND}",
-            "FIXED_HOST_PORT": True,
-        },
-    )()
-    sidecar.start()
-    proc = None
-    try:
-        # Unlike the companion test, the backend is UP at boot so the topic
-        # provisions; it is stopped only after provisioning, so a later publish
-        # is admitted (provisioning is recorded in the gear DB) yet never stored.
-        home_dir = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-outage-sync-")
-        env = GearTestEnv(
-            config_path=CONFIG,
-            config_patch=lambda text, _env: _patch(text, home_dir, [sidecar]),
-            port=OUTAGE_PORT,
-            health_path="/healthz",
-            log_suffix="event-broker-outage-sync",
-        )
-        config_path = _prepare_config(env)
-        proc = subprocess.Popen(
-            [os.environ["E2E_BINARY"], "--config", str(config_path), "run"],
-            cwd=str(PROJECT_ROOT),
-            stdout=open(_log_path(env), "a"),
-            stderr=subprocess.STDOUT,
-            env={**os.environ},
-        )
-        _wait_healthy(env)
-
-        origin = f"http://localhost:{OUTAGE_PORT}"
-        deadline = time.monotonic() + 90
-        while httpx.get(f"{origin}/readyz", timeout=5).status_code != 200:
-            assert time.monotonic() < deadline, "the server never turned ready"
-            time.sleep(0.5)
-        wait_provisioned(BASE_URL, {TOPIC: EVENT_TYPE})
+    with _outage_env(tmp_path, down_at_start=False) as (env, sidecar):
+        base_url = f"{env.base_url}{API_BASE}"
+        env.wait_ready(deadline=time.monotonic() + 90)
+        wait_provisioned(base_url, {TOPIC: EVENT_TYPE})
 
         # Take the backend down now that the topic is provisioned.
         _docker("stop", sidecar.container_id)
 
-        tenant_id = str(uuid.uuid4())
-        # `wait=20` is under the `publish.max_wait_secs` cap (50): the hold runs
-        # its full length with the backend down and must still answer `202`
-        # through the real api-gateway, not `504` - so the wait sits inside the
-        # publish route's declared request deadline. The client timeout clears
-        # the full hold.
-        async with httpx.AsyncClient(timeout=30) as client:
+        tenant_id = OWNER_TENANT
+        # The 30-second client deadline includes the worker's full 20-second
+        # publish hold while storage is down.
+        async with httpx.AsyncClient(timeout=30, headers=public_headers()) as client:
             resp = await client.post(
-                f"{BASE_URL}/events",
+                f"{base_url}/events",
                 headers={"Prefer": "wait=20"},
                 json=_event(tenant_id),
             )
@@ -303,12 +251,3 @@ async def test_sync_publish_times_out_to_202_when_the_backend_is_down(test_env):
         # Bring the backend back so the container stops cleanly in teardown.
         _docker("start", sidecar.container_id)
         sidecar._wait_ready()
-    finally:
-        if proc is not None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=5)
-        sidecar.stop()

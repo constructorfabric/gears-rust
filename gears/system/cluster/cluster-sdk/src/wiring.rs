@@ -1,71 +1,48 @@
 //! Cluster's hand-written `ConsumerRegistration` — how a deployed consumer finds
 //! the cluster gear (DESIGN.md).
 //!
-//! Nothing here is called from consumer code. The `inventory::submit!` at the
-//! bottom of this file is replayed by the framework's proxy-wiring phase, once,
-//! before any gear's `start` — so by the time a consumer resolves a facade in its
-//! own `start`, the process's `dyn ClusterClient` is already in the hub.
+//! The SDK submits one inventory registration on behalf of the gears that link
+//! it with the `grpc-client` feature. In normal and out-of-process startup, the
+//! host wires registrations involving local system gears after system `init`
+//! and before system `post_init` and `start`. It wires other consumers after
+//! application `init` and before application `post_init` and `start`. Registry
+//! clients can wire earlier. Facade resolution uses the client visible to the
+//! caller and can also invoke DNS registration if wiring leaves the hub empty.
 //!
-//! # Why it is hand-written
+//! # Why the SDK submits its own registration
 //!
-//! `#[toolkit::consumes(.., transport = grpc)]` now generates a gRPC consumer: a
-//! `<Contract>GrpcResolvingClient` that finds its provider in the directory by
-//! service name. Cluster still writes its registration by hand because that
-//! client does not fit cluster's data plane (§2.2.1): cluster resolves by DNS
-//! convention without the directory (see below), shares one channel across its
-//! four services, and needs RPCs without a deadline (`Lock` waits server-side,
-//! watches are long-lived), while the generated client applies a per-call
-//! timeout to every RPC. `ConsumerRegistration` is a plain transport-agnostic
-//! struct, so cluster reuses the *mechanism* and writes only the closure (§4.9.2).
+//! The generated gRPC consumer resolves a service through the directory and
+//! applies a per-call deadline. Cluster shares one channel across its four
+//! services and supports calls without a deadline, including server-side lock
+//! waits and watches. Its synchronous closure uses the same transport-agnostic
+//! inventory mechanism and can build a client from Kubernetes DNS convention.
 //!
-//! # The endpoint is derived, not resolved
+//! # Client selection and host addressing
 //!
-//! [`derive_endpoint`] builds `cluster.{namespace}.svc.cluster.local:{port}` and
-//! the framework's `EndpointResolver` is ignored. Three reasons, in descending
-//! order of how load-bearing they are:
+//! The local-only lookup yields `WireOutcome::Local` on a hit. Otherwise a
+//! separate lookup for any visible client yields `WireOutcome::RemoteGrpc` for
+//! `cluster.profile.v1.ClusterProfileApi` on a hit. It can see a newly registered
+//! local client or a proxy, including a root proxy inherited by an owner view.
+//! Composition chooses the endpoint and credentials for a proxy it supplies.
+//! Both early returns skip client construction and descriptor prefetch.
 //!
-//! - **It resolves the wrong plane.** `EndpointResolver::resolve_endpoint`
-//!   answers with the gear's REST base URI. Cluster's coordination plane is
-//!   gRPC on a different port; handing that URI to
-//!   `RemoteClusterClient::connect_lazy` would build a channel to the wrong
-//!   listener. (`resolve_grpc_endpoint` looks one service up in the directory,
-//!   and cluster resolves without a directory.)
-//! - **It cannot be consulted here.** `EndpointResolver::resolve_endpoint` is
-//!   `async` and `ConsumerRegistration::wire` is a sync `fn`. Blocking on the
-//!   future would block a runtime worker inside the wiring phase.
-//! - **Cluster knows the port and a framework resolver does not** (§4.5). DNS
-//!   returns a name, not a URI, so a generic resolver needs a port convention
-//!   that does not exist yet — decision 21, and a platform-PRD question.
+//! For that gRPC outcome the host looks up
+//! `gears.cluster-sdk.clients.consumes.cluster.grpc_endpoint`. A static gRPC
+//! address satisfies this registration's address requirement without a probe.
+//! A configured `endpoint` also supplies gRPC addressing when `grpc_endpoint`
+//! is absent. Without a static address the host tracks a directory target for
+//! the gRPC service and probes when a directory is available. Any outstanding
+//! target for the dependency still gates host readiness. A static address says
+//! only that addressing is available. Consumers can use the SDK readiness
+//! contributor to check their profile requirements and descriptor health.
 //!
-//! **The cost, stated rather than buried**: the ADR-0004 static override
-//! (`gears.<owner>.clients.consumes.<dep>`) therefore does not reach
-//! cluster, and §4.5 names that override as the current mechanism for a
-//! directory-less Kubernetes deployment. For cluster, DNS convention *is* that
-//! mechanism — which is the intended end state and needs no directory, so nothing
-//! is lost in Profile 3. What is lost is the ability to point a consumer at an
-//! arbitrary cluster endpoint from config, and by invariant I9 that is deliberate:
-//! there is no cluster-side endpoint key, in any form.
-//!
-//! **Only the *endpoint* half is inert, though — the key is still read, and it
-//! silently drops a readiness gate.** The phase's `clients.consumes` read
-//! (`host_runtime.rs`) does not consult `known_gears`, so a
-//! `gears.cluster-sdk.clients.consumes.cluster` value is picked up even
-//! though `owner_gear: "cluster-sdk"` names no registered gear. The phase then
-//! takes its static-override branch and calls `dep_checker.mark_resolved("cluster")`
-//! **with no probe**, while `wire` below still builds its own DNS-derived
-//! channel. Measured: with the key set, a consumer's `unresolved_deps()` at
-//! `start` is `[]`; without it, `["cluster"]`. So the override cannot redirect
-//! cluster, but it *can* put a consumer into rotation against a cluster that was
-//! never resolved — and the framework's own `warn!` on that path ("the … static
-//! override will never resolve") is, in this one respect, false. The durable repair is
-//! framework-side: skipping overrides whose `owner_gear` is unknown.
-//!
-//! # What this closure must never do
-//!
-//! Await, connect, or fail on cluster being absent (invariant I6, ADR-0005).
-//! `connect_lazy` touches no network, the descriptor prefetch is spawned, and the
-//! only error it can return is a genuinely permanent one: a namespace it cannot
-//! determine, or an endpoint that is not a URI.
+//! After both misses, the fallback helper checks visibility again. On its own
+//! miss, it uses [`derive_endpoint`] to build the Kubernetes URI from `POD_NAMESPACE`
+//! and the SDK port convention, then registers a lazy proxy without consulting
+//! host overrides or the directory. An unusable namespace or URI is a wiring error.
+//! When the helper succeeds, wiring schedules descriptor prefetch on the returned
+//! client and returns the legacy `WireOutcome::Remote`. The host uses its REST
+//! addressing rules for this outcome. Connection and descriptor I/O are deferred.
 
 use std::sync::Arc;
 
@@ -89,11 +66,9 @@ pub const CLUSTER_GEAR: &str = "cluster";
 
 /// The port cluster's coordination plane is reached on, by convention.
 ///
-/// An SDK **constant**, not configuration (invariant I9), and the convention half
-/// of §4.5's "the name is derivable; the port is not". Cluster can write this
-/// where a framework resolver cannot, because cluster is what chooses the port —
-/// but only as a convention, so `D2`'s Helm chart must render the Service on this
-/// port and a deployment that changes it has no way to tell a consumer.
+/// The Kubernetes Service must expose this port for convention-derived
+/// addresses. A deployment that changes the port needs a client supplied by
+/// composition to use that address.
 ///
 /// It matches the platform's conventional gRPC port, which an operator
 /// reading `grpc: { port: 50051 }` in the values file expects.
@@ -153,25 +128,17 @@ pub fn derive_endpoint() -> Result<String, ClusterError> {
     ))
 }
 
-/// Builds and registers the process's remote cluster client, unless one is
-/// already there.
+/// Reuses a visible cluster client or registers a lazy DNS proxy in the supplied hub.
 ///
-/// Shared by the wiring closure below and by `binding::process_client`'s
-/// self-construction arm, so the two cannot drift: whichever runs first is the one
-/// that builds the channel, and the other finds it. The wiring closure registers
-/// through the process-wide hub (cluster-sdk is not a gear), so every gear finds
-/// that client. The self-construction arm registers through the calling gear's
-/// view, so when wiring did not run, each gear that resolves builds its own
-/// channel.
+/// Consumer wiring and facade binding share this helper so they use the same
+/// endpoint convention. The SDK inventory registration uses the process-wide
+/// hub when `cluster-sdk` is absent from the gear registry. Facade binding
+/// passes the caller's hub view. That view sees the shared local implementation,
+/// then its own proxy, then any root proxy.
 ///
-/// The `try_get` guard is what keeps this from ever overwriting a client that is
-/// already there, local or remote: the hub's `register` is last-write-wins with no
-/// if-absent form, so a check-then-register is the only available shape. Combined
-/// with the caller's local-wins probe, that is what keeps invariant I4's "exactly
-/// one client, local winning, decided at registration time" true. `try_get` and not
-/// `try_get_local` here on purpose - a remote proxy some other consumer's wiring
-/// registered is a perfectly good client, and building a second channel beside it
-/// would be waste, not safety.
+/// The independent `try_get` guard lets either caller reuse all visible clients.
+/// The lookup and insertion are separate operations. Concurrent misses can
+/// each build a proxy.
 ///
 /// `internal_token_provider` is the process's platform-plane credential source,
 /// forwarded to [`RemoteClusterClient::connect_lazy`] so every outbound call
@@ -196,28 +163,21 @@ pub fn register_remote_client(
         endpoint = %endpoint,
         "cluster: registered a remote client (derived from Kubernetes DNS convention)"
     );
-    // `register_remote_proxy`, not `register`: it is what makes `try_get_local`
-    // answer `None` for this registration, which is how a second consumer wiring
-    // the same contract in one process correctly reports `Remote` instead of
-    // mistaking this proxy for a co-located implementation.
+    // Keep the local map separate so later wiring can report RemoteGrpc
+    // for the visible proxy and still give a co-located implementation priority.
     hub.register_remote_proxy::<dyn ClusterClient>(Arc::clone(&client));
     Ok(client)
 }
 
-/// Fetches the whole bound-profile set in the background, so the synchronous
-/// descriptor accessors are populated before a consumer reads them (§5.5).
+/// Schedules descriptor prefetch on the client returned by the wiring fallback.
 ///
-/// Spawned, never awaited: this gates `/readyz` only, never `start` and never
-/// `resolve()` (§4.9.3 step 3). `resolve()` awaits the descriptor itself on a
-/// bounded timeout, so a prefetch that has not landed costs latency at the first
-/// resolve and nothing else.
+/// The detached task reads the inventoried profiles to report ones that are
+/// unbound or unavailable at startup. Without markers it calls
+/// `descriptor("")` once on the returned client.
 ///
-/// The inventoried profile markers are what make the log line useful: they are the
-/// profiles this *process* declared, so a profile the server does not bind is a
-/// configuration mismatch worth naming — and naming it here, at startup, is much
-/// earlier than the `CapabilityNotMet`/`ProfileNotBound` a consumer would
-/// otherwise meet at its first call. The prefetch itself needs no filter, because
-/// `DescribeProfiles` with an empty one answers with the entire bound set.
+/// Binding has its own bounded descriptor lookup and the readiness contributor
+/// checks recorded requirements independently. Prefetch supplies neither the
+/// host's address decision nor a prerequisite for `start` or `resolve()`.
 fn spawn_descriptor_prefetch(client: Arc<dyn ClusterClient>) {
     let expected = registered_profiles();
     tokio::spawn(async move {
@@ -254,44 +214,20 @@ fn spawn_descriptor_prefetch(client: Arc<dyn ClusterClient>) {
 
 /// The wiring closure the framework replays. See the [module docs](self).
 ///
-/// `resolver` is deliberately unused — see the module docs for the three reasons,
-/// of which the binding one is that it resolves REST endpoints and cluster's
-/// coordination plane is gRPC.
+/// The SDK chooses a visible client or derives its own DNS URI. The host retains
+/// responsibility for interpreting the returned addressing outcome.
 ///
-/// The return type is spelled `toolkit::Result` rather than `anyhow::Result`, which
-/// it is: `ConsumerRegistration::wire` is typed in terms of `anyhow`, and going
-/// through the toolkit's own re-export means this crate needs no `anyhow`
-/// dependency of its own for one signature.
-// The platform-plane credential source is threaded in by the runtime
-// (`WireFn`, toolkit/src/discovery.rs). Every method on the cluster contract takes
-// a `PlatformSecurityContext`, so it is forwarded to the remote client, which
-// attaches `X-ToolKit-Internal-Token` at the channel — see
-// `RemoteClusterClient::connect_lazy`. `None` attaches nothing.
-//
-// It is not read on the local branch, and that is correct rather than an omission:
-// a co-located gear is reached by a direct call, so there is no wire to
-// authenticate and no channel to attach to.
+/// The signature uses the toolkit's `anyhow::Result` re-export to avoid a
+/// direct dependency on `anyhow` for this closure.
+// The runtime's platform-plane credential is used when constructing a DNS
+// proxy. The client attaches `X-ToolKit-Internal-Token` through its interceptor
+// when a provider is configured. An existing client keeps its credential setup.
 fn wire(
     hub: &ClientHub,
     _resolver: Arc<dyn EndpointResolver>,
     tuning: ClientTuning,
 ) -> toolkit::Result<WireOutcome> {
-    // The signature is fixed by `toolkit::discovery::WireFn`, which hands over the
-    // whole prepared `ClientTuning` by value. Cluster's coordination plane is gRPC
-    // and reads none of the tuning knobs — `connect_lazy` builds the channel from
-    // SDK constants — so we take ownership of just the platform-plane credential
-    // source and forward it to `RemoteClusterClient::connect_lazy`. Anything else
-    // set under `clients.consumes.cluster` has no effect (see the module docs and
-    // the `ConsumerWiring` docs). `None` attaches nothing.
-    let internal_token_provider = tuning.internal_token_provider;
-    // 1. Local wins, and `try_get_local` is the right probe: it ignores anything
-    //    registered through `register_remote_proxy`, so a second consumer in this
-    //    process cannot mistake the proxy *this* closure registered for a
-    //    co-located cluster gear. A co-located gear registers its
-    //    `LocalClusterClient` in `init`, one phase before this runs, precisely so
-    //    that this branch is taken in every process that hosts cluster - including
-    //    the `cluster-oop` binary itself, which would otherwise wire a remote
-    //    client to its own socket.
+    // Cluster registers its local client in init before consumer wiring runs.
     if hub.try_get_local::<dyn ClusterClient>().is_some() {
         tracing::debug!(
             "cluster wiring: a local cluster client is registered in this process; \
@@ -300,10 +236,15 @@ fn wire(
         return Ok(WireOutcome::Local);
     }
 
-    // 2. Build and register the remote client. Pure - no I/O, nothing awaited.
-    let client = register_remote_client(hub, internal_token_provider.as_ref())?;
+    // A gear's hub view can inherit the process-wide proxy.
+    if hub.try_get::<dyn ClusterClient>().is_some() {
+        return Ok(WireOutcome::RemoteGrpc {
+            service: crate::grpc::stubs::profile::cluster_profile_api_server::SERVICE_NAME,
+        });
+    }
 
-    // 3. Warm the descriptor cache in the background. Readiness only.
+    let internal_token_provider = tuning.internal_token_provider;
+    let client = register_remote_client(hub, internal_token_provider.as_ref())?;
     spawn_descriptor_prefetch(client);
 
     Ok(WireOutcome::Remote)
@@ -311,22 +252,12 @@ fn wire(
 
 toolkit::inventory::submit! {
     ConsumerRegistration {
-        // Neither name is a free choice, and the first one is a known mismatch
-        // with the framework's model. `owner_gear` is meant to be the consuming
-        // gear's registry name, so that `gears.<owner>.clients.consumes.*`
-        // resolves - but this registration is submitted by an *SDK*, once per
-        // process, on behalf of however many consumer gears link it. There is no
-        // single owner to name. The framework logs a `warn!` when `owner_gear` is
-        // not a registered gear, saying the static override will never resolve;
-        // for cluster that statement is true and harmless, since the override is
-        // unreachable here anyway (see the module docs). Recorded as a finding for
-        // ADR-0004, which already asks that an SDK-submitted registration be
-        // specified.
+        // The SDK owns this registration for every linked consumer. The host
+        // reads configuration under this owner even when the gear registry has
+        // no matching entry. In that case wiring uses the process-wide hub.
         owner_gear: "cluster-sdk",
-        // This one is exact: it is the provider gear's registry name, and the
-        // framework uses it as the readiness dependency key - so a consumer's
-        // `/readyz` gates on `cluster` resolving, which `deps = [cluster]`
-        // already means.
+        // The host tracks addressing for the provider under its gear name.
+        // This SDK registration declares the dependency for readiness.
         dep_gear: CLUSTER_GEAR,
         wire,
     }

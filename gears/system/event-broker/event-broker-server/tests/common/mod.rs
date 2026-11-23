@@ -1,46 +1,30 @@
-//! Shared harness for `tests/standalone_integration_tests.rs`
-//! (design.md D8, task group 10): spawns the real, compiled
-//! `cf-gears-event-broker-server` binary as a subprocess against a
-//! temp-file `SQLite` DB and drives it over real HTTP - unlike the in-crate
-//! `EventBrokerHarness` (`test_support/harness.rs`), which stubs the type
-//! registry and bypasses the platform gear lifecycle entirely. This is the
-//! only way to exercise `toolkit::bootstrap`'s real `pre_init`/`init`/
-//! `post_init`/start-phase sequencing, the same sequencing whose ordering
-//! bugs (task 9) no mock-backed test could have caught.
+//! Shared process fixture for the standalone and consumer-group rebalance targets.
 
-// `dead_code`: each file under `tests/` is its own binary and includes this via
-// `mod common`, so a helper used by only one binary reads as dead in the other -
-// a false positive of the shared-`tests/common` pattern, not real dead code.
 // Follow-up: rework `common` into a shared test-support library crate (where `pub`
 // items are API and are never flagged), then drop `dead_code` here.
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
-use std::fmt::Write as _;
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+mod cutover;
+
+use cutover::{OWNER, Pair, Process};
+pub use cutover::{OWNER_SUBJECT, OWNER_TENANT};
+
+use std::net::SocketAddr;
+use std::path::Path;
+use std::process::ExitStatus;
 use std::time::Duration;
 
-use serde_json::Value;
-use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::{Child, Command};
+use anyhow::{Context as _, Result, ensure};
+use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
+use serde_json::{Value, json};
+use tokio::time::{Instant, sleep, timeout};
 
-fn bin_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cf-gears-event-broker-server"))
-}
-
-/// Binds an ephemeral port and immediately releases it - standard test
-/// practice; the small TOCTOU window before the child binds it is an
-/// accepted risk, same as every other ephemeral-port test in this repo.
-fn alloc_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral port")
-        .local_addr()
-        .expect("local_addr")
-        .port()
-}
+const STARTUP: Duration = Duration::from_secs(30);
+const STARTUP_RECHECK: Duration = Duration::from_millis(40);
+const REQUEST_BOUND: Duration = Duration::from_secs(10);
+const PUBLISH_RECHECK: Duration = Duration::from_millis(20);
+const TOPIC: &str = "gts.cf.core.events.topic.v1~";
+const EVENT: &str = "gts.cf.core.events.event.v1~";
 
 /// Splits declarative fixtures into what each side of the process receives.
 ///
@@ -54,8 +38,6 @@ fn alloc_port() -> u16 {
 /// An event-type fixture may name `partition_key` to point the type at a member
 /// other than the tenant the base defaults to.
 fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
-    let topic_base = "gts.cf.core.events.topic.v1~";
-    let event_base = "gts.cf.core.events.event.v1~";
     let mut documents = Vec::new();
     let mut partitions = Vec::new();
 
@@ -63,7 +45,7 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
         let id = entity["id"]
             .as_str()
             .expect("a fixture entity names its id");
-        if id.starts_with(topic_base) && !id.ends_with('~') {
+        if id.starts_with(TOPIC) && !id.ends_with('~') {
             partitions.push((
                 id.to_owned(),
                 entity["partitions"]
@@ -74,7 +56,7 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
                 "id": id,
                 "description": "a topic this integration test publishes to",
             }));
-        } else if id.starts_with(event_base) {
+        } else if id.starts_with(EVENT) {
             let topic = entity["topic_id"]
                 .as_str()
                 .expect("an event-type fixture names its topic");
@@ -84,8 +66,10 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
                 { "id": topic, "partitions": 1 },
                 event,
             ]));
-            let schema = fixtures.event_type_schemas()[0].clone();
-            documents.push(schema);
+            let [schema] = fixtures.event_type_schemas() else {
+                panic!("expected exactly one schema for {id}");
+            };
+            documents.push(schema.clone());
         } else {
             panic!("fixture '{id}' is neither a topic instance nor an event type");
         }
@@ -94,28 +78,25 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
     (documents, partitions)
 }
 
-/// Where the spawned server keeps its event log.
+/// Where the broker keeps its event log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLog {
-    /// The in-process memory backend: the log dies with the process.
+    /// The log lives in the broker process.
     Memory,
-    /// The `SQLite` backend plugin, in `events.db` under the server's home
-    /// directory, beside the gear's own database: the log survives a restart.
+    /// The log lives in `events.db` under the broker home and survives a restart.
     Sqlite,
 }
 
 impl EventLog {
-    /// The `backends:` entry `main` for this log.
-    fn backend_entry(self, home_dir: &Path) -> String {
+    fn backend_entry(self, home: &Path) -> Value {
         match self {
             Self::Memory => {
-                "        main:\n          type: \"gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~\"\n"
-                    .to_owned()
+                json!({"type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"})
             }
-            Self::Sqlite => format!(
-                "        main:\n          type: \"gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~\"\n          path: '{}'\n",
-                home_dir.join("events.db").display()
-            ),
+            Self::Sqlite => json!({
+                "type": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+                "path": home.join("events.db"),
+            }),
         }
     }
 }
@@ -136,8 +117,7 @@ pub struct Streaming {
 }
 
 impl Default for Streaming {
-    /// The values `StreamingConfig::default()` gives these keys: heartbeat 5,
-    /// scope TTL 60 and evaluation deadline 10 seconds.
+    /// Mirrors the broker's default heartbeat, scope TTL and evaluation deadline.
     fn default() -> Self {
         Self {
             heartbeat_secs: 5,
@@ -147,257 +127,33 @@ impl Default for Streaming {
     }
 }
 
-/// Builds the server's config. The `types-registry` `entities:` list is a
-/// YAML flow sequence of JSON-object literals (YAML is a superset of JSON for
-/// values) - avoids hand-crafting indentation-sensitive block-style YAML per
-/// entity.
-fn config_yaml(
-    home_dir: &Path,
-    port: u16,
-    entities: &[Value],
-    streaming: Streaming,
-    event_log: EventLog,
-) -> String {
-    let (documents, partitions) = split_fixtures(entities);
-    let entities_json: Vec<String> = documents
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-    let mut topic_settings = String::new();
-    for (id, count) in &partitions {
-        writeln!(
-            topic_settings,
-            "        \"{id}\":\n          partitions: {count}"
-        )
-        .expect("writing to a String never fails");
-    }
-    // The `streaming:` block below is spelled out in full so every value a
-    // test's server runs with is visible here. `StreamingConfig` defaults any
-    // key left out (`#[serde(deny_unknown_fields, default)]`), and every key a
-    // test does not set is written at that default.
-    let Streaming {
-        heartbeat_secs,
-        authz_scope_ttl_secs,
-        authz_eval_deadline_secs,
-    } = streaming;
-    format!(
-        r#"
-server:
-  home_dir: '{home}'
-
-database:
-  servers: {{}}
-
-gears:
-  # The broker reads topics and event types through the platform API, which the
-  # registry publishes only with a database.
-  types-registry:
-    database:
-      engine: sqlite
-      file: "types_registry.db"
-    config:
-      # The fixtures' event types and topics use vendor `x`; it is open in
-      # their `x.eb` namespace only.
-      registration_policy:
-        "gts.cf.core.events.event.v1~x.eb.*":
-          allowed_vendors: [x]
-        "gts.cf.core.events.topic.v1~x.eb.*":
-          allowed_vendors: [x]
-      entities: [{entities}]
-
-  cluster:
-    config:
-      profiles:
-        event-broker:
-          cache:
-            provider: standalone
-
-  authn-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  authz-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  static-authn-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-      mode: accept_all
-
-  static-authz-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-
-  event-broker:
-    database:
-      engine: sqlite
-      file: "event_broker.db"
-    config:
-      mode: standalone
-      backends:
-{backend_entry}      backend_routing:
-        "gts.cf.core.events.topic.v1~": main
-      streaming:
-        heartbeat_interval_secs: {heartbeat_secs}
-        read_batch_max_events: 256
-        read_batch_max_bytes: 1048576
-        progress_drift_threshold: 1000
-        progress_min_interval_secs: 30
-        authz_scope_ttl_secs: {authz_scope_ttl_secs}
-        authz_eval_deadline_secs: {authz_eval_deadline_secs}
-      topics:
-        "gts.cf.core.events.topic.v1~": {{}}
-{topic_settings}
-
-  api-gateway:
-    config:
-      bind_addr: "127.0.0.1:{port}"
-      enable_docs: false
-      auth_disabled: true
-"#,
-        home = home_dir.display(),
-        entities = entities_json.join(", "),
-        topic_settings = topic_settings,
-        backend_entry = event_log.backend_entry(home_dir),
-    )
-}
-
-fn drain<R: AsyncRead + Unpin + Send + 'static>(reader: R, logs: &Arc<Mutex<Vec<String>>>) {
-    let logs = Arc::clone(logs);
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            logs.lock().expect("logs mutex").push(line);
-        }
-    });
-}
-
-/// Writes the config into `home_dir` and builds the command that runs the
-/// binary against it. The process is killed when its handle is dropped.
-fn server_command(
-    home_dir: &Path,
-    port: u16,
-    entities: &[Value],
-    streaming: Streaming,
-    event_log: EventLog,
-) -> Command {
-    let config_path = home_dir.join("config.yaml");
-    std::fs::write(
-        &config_path,
-        config_yaml(home_dir, port, entities, streaming, event_log),
-    )
-    .expect("write config");
-
-    let mut command = Command::new(bin_path());
-    command
-        .arg("--config")
-        .arg(&config_path)
-        .arg("run")
-        .kill_on_drop(true);
-    command
-}
-
-fn spawn_server(
-    home_dir: &Path,
-    port: u16,
-    entities: &[Value],
-    streaming: Streaming,
-    event_log: EventLog,
-) -> (Child, Arc<Mutex<Vec<String>>>) {
-    let mut child = server_command(home_dir, port, entities, streaming, event_log)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn cf-gears-event-broker-server");
-
-    let logs = Arc::new(Mutex::new(Vec::new()));
-    drain(child.stdout.take().expect("stdout was piped"), &logs);
-    drain(child.stderr.take().expect("stderr was piped"), &logs);
-
-    (child, logs)
-}
-
-/// Polls `GET /readyz` (unauthenticated, unprefixed - `api-gateway`'s main
-/// router merges health routes outside the auth layer) until it answers
-/// `200`, the process exits early, or 15s elapse. Captured stdout/stderr is
-/// included in the panic message either way, so a boot failure is
-/// diagnosable without re-running under `-- --nocapture`.
-///
-/// Readiness, not `/healthz`: the listener accepts traffic as soon as the
-/// start phase spawns `serve()`, so `/healthz` - a liveness probe that is
-/// always `200` - says nothing about whether a publish can be accepted yet.
-/// `/readyz` folds in the gear's own check (`infra::health`), which reports
-/// `Starting` until the outbox and cluster cache are wired. Its report is
-/// cached for ~2s upstream, which the 15s deadline absorbs.
-async fn wait_for_ready(child: &mut Child, base_url: &str, logs: &Arc<Mutex<Vec<String>>>) {
-    let client = reqwest::Client::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            let captured = logs.lock().expect("logs mutex").join("\n");
-            panic!(
-                "server exited early ({status}) before becoming ready; captured output:\n{captured}"
-            );
-        }
-        if let Ok(resp) = client.get(format!("{base_url}/readyz")).send().await
-            && resp.status().is_success()
-        {
-            return;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let captured = logs.lock().expect("logs mutex").join("\n");
-            panic!("server never became ready within 15s; captured output:\n{captured}");
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// A running `cf-gears-event-broker-server` subprocess, bound to an
-/// ephemeral port and a temp-file `SQLite` DB under a per-test `home_dir`.
+/// Owns both children and the owner's broker HTTP connection pool.
 pub struct TestServer {
-    child: Child,
-    logs: Arc<Mutex<Vec<String>>>,
-    base_url: String,
-    home_dir: TempDir,
-    entities: Vec<Value>,
-    /// The `streaming:` keys this server was booted with, re-applied on
-    /// `restart` so a restarted server keeps whatever a test configured.
-    streaming: Streaming,
-    /// Where the event log lives, re-applied on `restart`.
-    event_log: EventLog,
+    // Declaration order stops the broker before Core on unwinding.
+    broker: Process,
+    pair: Pair,
+    listener: SocketAddr,
+    client: Client,
+    documents: Vec<Value>,
 }
 
-/// What a server that refused to start left behind.
 #[derive(Debug)]
 pub struct Refused {
-    /// How the process exited, or `None` when it was still running at the
-    /// bound and was killed.
-    pub status: Option<ExitStatus>,
-    /// Its stdout, then its stderr, one entry per line.
+    pub status: ExitStatus,
     pub logs: Vec<String>,
 }
 
 impl TestServer {
-    /// Boots a fresh server. `entities` seeds `types-registry`'s startup
-    /// config (the same `entities:` mechanism `config/event-broker-
-    /// standalone.yaml` documents) - typically topic/event-type fixtures.
     pub async fn start(entities: Vec<Value>) -> Self {
         Self::boot(entities, Streaming::default(), EventLog::Memory).await
     }
 
-    /// Boots with its event log in `event_log` instead of the memory backend.
     pub async fn start_with_event_log(entities: Vec<Value>, event_log: EventLog) -> Self {
         Self::boot(entities, Streaming::default(), event_log).await
     }
 
-    /// Boots with an explicit idle heartbeat cadence (seconds). The server has
-    /// no proactive disconnect watcher, so it notices a subscriber that departs
-    /// by dropping its connection no later than the next frame it fails to
-    /// write - a heartbeat, for an idle stream. A short cadence bounds that
-    /// detection latency, which a disconnect-departure test relies on.
+    /// On a quiet stream, the heartbeat bounds how long it takes the broker
+    /// to detect a dropped connection on a failed write.
     pub async fn start_with_heartbeat(entities: Vec<Value>, heartbeat_secs: u32) -> Self {
         let streaming = Streaming {
             heartbeat_secs,
@@ -406,155 +162,274 @@ impl TestServer {
         Self::boot(entities, streaming, EventLog::Memory).await
     }
 
-    /// Boots with the `streaming:` keys in `streaming`.
     pub async fn start_with_streaming(entities: Vec<Value>, streaming: Streaming) -> Self {
         Self::boot(entities, streaming, EventLog::Memory).await
     }
 
-    /// Runs a server that is expected to refuse to start, and waits up to 15s
-    /// for it to exit. A process still running then is killed and reported
-    /// with no status. Its home directory is a `TempDir`, removed on return.
     pub async fn start_refused(entities: Vec<Value>, streaming: Streaming) -> Refused {
-        let home_dir = TempDir::new().expect("tempdir");
-        let output = tokio::time::timeout(
-            Duration::from_secs(15),
-            server_command(
-                home_dir.path(),
-                alloc_port(),
-                &entities,
-                streaming,
-                EventLog::Memory,
+        let (mut pair, _) = Self::configure(entities, streaming, EventLog::Memory)
+            .await
+            .expect("prepare refused split-process fixture");
+        let mut broker = Self::launch(&pair, "broker-refused").expect("launch refused broker");
+        let status = broker.exited().await.unwrap_or_else(|error| {
+            panic!(
+                "wait for refused broker: {error}\nCaptured output:
+{}",
+                broker.safe_log(&pair.workload).unwrap_or_default()
             )
-            .output(),
-        )
-        .await;
-        match output {
-            Ok(output) => {
-                let output = output.expect("run cf-gears-event-broker-server");
-                let logs = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .chain(String::from_utf8_lossy(&output.stderr).lines())
-                    .map(str::to_owned)
-                    .collect();
-                Refused {
-                    status: Some(output.status),
-                    logs,
-                }
-            }
-            // Dropping the timed-out `output()` kills the process.
-            Err(_elapsed) => Refused {
-                status: None,
-                logs: Vec::new(),
-            },
+        });
+        let logs = broker
+            .safe_log(&pair.workload)
+            .expect("read refused broker output");
+        drop(broker);
+        pair.finish_selected()
+            .await
+            .expect("stop Core after broker refusal");
+        Refused {
+            status,
+            logs: logs.lines().map(str::to_owned).collect(),
         }
     }
 
     async fn boot(entities: Vec<Value>, streaming: Streaming, event_log: EventLog) -> Self {
-        let home_dir = TempDir::new().expect("tempdir");
-        let port = alloc_port();
-        let (mut child, logs) =
-            spawn_server(home_dir.path(), port, &entities, streaming, event_log);
-        let base_url = format!("http://127.0.0.1:{port}");
-        wait_for_ready(&mut child, &base_url, &logs).await;
-        Self {
-            child,
-            logs,
-            base_url,
-            home_dir,
-            entities,
-            streaming,
-            event_log,
-        }
-    }
-
-    /// Kills the process (`SIGKILL`, not a graceful shutdown - `run_server`
-    /// owns its own internal `CancellationToken` with no external hook, and
-    /// an abrupt kill is the more realistic "restart after crash" scenario
-    /// anyway) and boots a fresh one against the SAME `home_dir` - and
-    /// therefore the same `SQLite` file - on a new ephemeral port. For a
-    /// durability test: data must survive; subscription state must
-    /// not (it lives in the `ClusterCacheV1` standalone in-memory profile,
-    /// which dies with the process).
-    pub async fn restart(&mut self) {
-        self.child.kill().await.expect("kill for restart");
-        drop(self.child.wait().await);
-        let port = alloc_port();
-        let (mut child, logs) = spawn_server(
-            self.home_dir.path(),
-            port,
-            &self.entities,
-            self.streaming,
-            self.event_log,
-        );
-        let base_url = format!("http://127.0.0.1:{port}");
-        wait_for_ready(&mut child, &base_url, &logs).await;
-        self.child = child;
-        self.logs = logs;
-        self.base_url = base_url;
-    }
-
-    pub fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.base_url)
-    }
-
-    /// The lines the running process has written to stdout and stderr so far.
-    pub fn logs(&self) -> Vec<String> {
-        self.logs.lock().expect("logs mutex").clone()
-    }
-}
-
-/// `POST`s an event, retrying while ingest answers `503`.
-///
-/// What a real producer does, and what the protocol is built to make safe:
-/// `docs/features/0001-idempotent-producers.md` has the producer retry after a
-/// transport failure or an ambiguous ack, and the broker's chain re-check
-/// decides the outcome - `200 OK` if the first attempt had landed, `202` if it
-/// had not. A `503` is that same ambiguous case (the ingest pipeline may not be
-/// wired yet, or storage may be briefly unreachable), so giving up on one is a
-/// producer this suite would never ship, not a broker defect.
-///
-/// Only `503` is retried, and the first other status is returned untouched, so
-/// a caller's own assertion about `200` vs `202` still decides the test.
-pub async fn publish_retrying_while_unavailable(
-    client: &reqwest::Client,
-    url: &str,
-    body: &Value,
-) -> reqwest::Response {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut attempts = 0_u32;
-    loop {
-        let resp = client
-            .post(url)
-            .json(body)
-            .send()
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build owner HTTP client");
+        let (pair, documents) = Self::configure(entities, streaming, event_log)
             .await
-            .expect("publish request");
-        if resp.status() != 503 || tokio::time::Instant::now() >= deadline {
-            return resp;
+            .expect("prepare split-process fixture");
+        let mut broker = Self::launch(&pair, "broker").expect("launch broker");
+        pair.await_base_schemas(&mut broker)
+            .await
+            .expect("broker publishes its base schemas");
+        pair.admit_documents(&mut broker, &documents)
+            .await
+            .expect("admit the fixture documents after broker publication");
+        let listener = Self::ready(&pair, &mut broker)
+            .await
+            .expect("await broker readiness");
+        pair.await_catalogue(&mut broker, &format!("http://{listener}"), &documents)
+            .await
+            .expect("broker serves the fixture catalogue");
+        Self {
+            broker,
+            pair,
+            listener,
+            client,
+            documents,
         }
-        // Logged, never swallowed: retrying is correct, but a silent retry
-        // would hide the fact that ingest was unavailable at all, which is the
-        // one signal worth having when this suite fails on a slow runner.
-        attempts += 1;
-        let body = resp.text().await.unwrap_or_default();
-        eprintln!("publish attempt {attempts} returned 503, retrying: {body}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    async fn configure(
+        entities: Vec<Value>,
+        streaming: Streaming,
+        event_log: EventLog,
+    ) -> Result<(Pair, Vec<Value>)> {
+        let (documents, partitions) = split_fixtures(&entities);
+        let pair = Pair::start_selected(&documents).await?;
+        println!(
+            "Core {} serves registry at {} and directory at {}",
+            pair.core_pid()?,
+            pair.gateway,
+            pair.grpc
+        );
+        let mut config = pair.broker_config()?;
+        let home = config["server"]["home_dir"]
+            .as_str()
+            .context("broker home")?;
+        let mut topics = serde_json::Map::from_iter([(TOPIC.to_owned(), json!({}))]);
+        topics.extend(
+            partitions
+                .into_iter()
+                .map(|(topic, count)| (topic, json!({"partitions":count}))),
+        );
+        config["gears"]["event-broker"]["config"] = json!({
+            "mode": "standalone",
+            "process": {"cluster":{"mode":"memory"}},
+            "workers": {"specification_refresh_interval_secs": 1},
+            "backends": {"main": event_log.backend_entry(Path::new(home))},
+            "backend_routing": { (TOPIC): "main" },
+            "streaming": {
+                "heartbeat_interval_secs": streaming.heartbeat_secs,
+                "read_batch_max_events": 256,
+                "read_batch_max_bytes": 1_048_576,
+                "progress_drift_threshold": 1000,
+                "progress_min_interval_secs": 30,
+                "authz_scope_ttl_secs": streaming.authz_scope_ttl_secs,
+                "authz_eval_deadline_secs": streaming.authz_eval_deadline_secs,
+            },
+            "topics": topics,
+        });
+        pair.write_broker_config(&config)?;
+        Ok((pair, documents))
+    }
+
+    fn launch(pair: &Pair, name: &str) -> Result<Process> {
+        pair.core_pid()?;
+        pair.broker(name, &["--e2e-flight-control", "run"], Some(&pair.grpc))
+    }
+
+    async fn ready(pair: &Pair, broker: &mut Process) -> Result<SocketAddr> {
+        let started = Instant::now();
+        let bound = timeout(STARTUP, async {
+            loop {
+                pair.core_pid()?;
+                broker.require_owned()?;
+                // Only the owned child's bind event supplies a probe address.
+                if let Some(addr) = broker.bound_http(&pair.workload)? {
+                    ensure!(
+                        pair.gateway.port_or_known_default() != Some(addr.port()),
+                        "Core and broker HTTP listeners must be distinct"
+                    );
+                    let probe = pair
+                        .client
+                        .get(format!("http://{addr}/readyz"))
+                        .send()
+                        .await;
+                    if probe.is_ok_and(|response| response.status() == StatusCode::OK) {
+                        broker.require_owned()?;
+                        pair.core_pid()?;
+                        println!(
+                            "Broker {} ready at {addr} in {} ms",
+                            broker.pid(),
+                            started.elapsed().as_millis()
+                        );
+                        return Ok(addr);
+                    }
+                }
+                sleep(STARTUP_RECHECK).await;
+            }
+        })
+        .await;
+        match bound {
+            Ok(Ok(addr)) => Ok(addr),
+            Ok(Err(error)) => {
+                let output = broker.safe_log(&pair.workload)?;
+                Err(error.context(format!("broker failed before readiness:\n{output}")))
+            }
+            Err(_) => {
+                let output = broker.safe_log(&pair.workload)?;
+                anyhow::bail!("broker readiness timed out after {STARTUP:?}:\n{output}")
+            }
+        }
+    }
+
+    /// Reap the broker, then start a replacement in its existing data home.
+    pub async fn restart(&mut self) {
+        let core_pid = self.pair.core_pid().expect("live Core before restart");
+        let old_pid = self.broker.pid();
+        self.broker.stop().expect("reap old broker");
+        self.pair
+            .registry_documents(&self.documents)
+            .await
+            .expect("Core retains its admission");
+        let mut broker =
+            Self::launch(&self.pair, "broker-restarted").expect("launch replacement broker");
+        let listener = Self::ready(&self.pair, &mut broker)
+            .await
+            .expect("await replacement broker");
+        self.pair
+            .await_catalogue(&mut broker, &format!("http://{listener}"), &self.documents)
+            .await
+            .expect("replacement broker serves the fixture catalogue");
+        assert_ne!(old_pid, broker.pid());
+        assert_ne!(self.listener, listener);
+        assert_eq!(
+            self.pair.core_pid().expect("live Core after restart"),
+            core_pid
+        );
+        self.broker = broker;
+        self.listener = listener;
+    }
+
+    pub fn logs(&self) -> Vec<String> {
+        self.broker
+            .safe_log(&self.pair.workload)
+            .expect("read broker output")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn request(&self, method: Method, path: &str) -> RequestBuilder {
+        self.pair
+            .core_pid()
+            .expect("Core must own the platform listener");
+        self.broker
+            .verify_identity()
+            .expect("broker must own the tenant listener");
+        self.client
+            .request(method, format!("http://{}{path}", self.listener))
+            .bearer_auth(OWNER)
+    }
+
+    pub fn get(&self, path: &str) -> RequestBuilder {
+        self.request(Method::GET, path).timeout(REQUEST_BOUND)
+    }
+
+    pub fn post(&self, path: &str) -> RequestBuilder {
+        self.request(Method::POST, path).timeout(REQUEST_BOUND)
+    }
+
+    pub fn delete(&self, path: &str) -> RequestBuilder {
+        self.request(Method::DELETE, path).timeout(REQUEST_BOUND)
+    }
+
+    pub async fn open_stream(&self, path: &str) -> Response {
+        let started = Instant::now();
+        let response = timeout(REQUEST_BOUND, self.request(Method::GET, path).send())
+            .await
+            .expect("stream opens within the bound")
+            .expect("open SSE stream");
+        println!(
+            "Broker {} SSE headers returned {} in {} ms",
+            self.broker.pid(),
+            response.status(),
+            started.elapsed().as_millis()
+        );
+        response
+    }
+
+    /// Retry the same authenticated publish while ingest returns `503`.
+    /// The caller distinguishes an accepted event from a deduped retry.
+    pub async fn publish_retrying_while_unavailable(&self, body: &Value) -> Response {
+        let deadline = Instant::now() + REQUEST_BOUND;
+        let mut attempts = 0_u32;
+        loop {
+            let response = self
+                .post("/event-broker/v1/events")
+                .json(body)
+                .send()
+                .await
+                .expect("publish request");
+            if response.status() != StatusCode::SERVICE_UNAVAILABLE || Instant::now() >= deadline {
+                return response;
+            }
+            attempts += 1;
+            eprintln!("publish attempt {attempts} returned 503, retrying");
+            sleep(PUBLISH_RECHECK).await;
+        }
+    }
+
+    pub async fn finish(mut self) {
+        self.broker.finish().await.expect("stop broker");
+        self.broker
+            .safe_log(&self.pair.workload)
+            .expect("screen broker output");
+        self.pair.finish_selected().await.expect("stop Core");
     }
 }
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        // Surface the server's own output whenever a test is failing, not just
-        // when startup was what failed. Without this the subprocess's stdout
-        // and stderr are drained into `logs` and then discarded, so a failed
-        // assertion reaches CI as a bare status code with no way to tell which
-        // of the server's several 503 paths produced it - which is exactly how
-        // `gears-rust#4439` lost a Windows-only failure twice over.
         if std::thread::panicking() {
-            let captured = self.logs.lock().expect("logs mutex").join("\n");
-            eprintln!("--- captured event-broker server output ---\n{captured}");
+            match self.broker.safe_log(&self.pair.workload) {
+                Ok(output) => eprintln!("Captured broker output:\n{output}"),
+                Err(error) => eprintln!("Broker output unavailable: {error}"),
+            }
         }
-        drop(self.child.start_kill());
     }
 }
 

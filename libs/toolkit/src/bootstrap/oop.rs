@@ -57,44 +57,107 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::config::{
-    AppConfig, CliArgs, LoggingConfig, RenderedDbConfig, RenderedGearConfig,
-    TOOLKIT_MODULE_CONFIG_ENV,
+    AppConfig, LoggingConfig, RenderedDbConfig, RenderedGearConfig, TOOLKIT_MODULE_CONFIG_ENV,
 };
 use crate::bootstrap::host::{init_logging_unified, init_panic_tracing};
 use crate::runtime::{
-    ClientRegistration, DbOptions, OopServeOptions, RunOptions, ShutdownOptions,
-    TOOLKIT_DIRECTORY_ENDPOINT_ENV, run, run_oop_serving, shutdown,
+    ClientCleanup, ClientCleanupError, ClientRegistration, DbOptions, OopServeOptions, RunOptions,
+    ShutdownOptions, TOOLKIT_DIRECTORY_ENDPOINT_ENV, run, run_oop_serving, shutdown,
 };
 use cf_system_sdks::directory::{DirectoryClient, DirectoryGrpcClient};
+use toolkit_contract::runtime::config::InternalTokenProvider;
+
+/// Supplies process lifetime inputs to a composition factory.
+#[derive(Debug)]
+pub struct OopCompositionContext {
+    /// Cancels process work when shutdown starts.
+    pub cancel: CancellationToken,
+    /// The outbound credential shared with the directory client and gear contexts.
+    pub internal_token_provider: Option<InternalTokenProvider>,
+}
+
+/// Transfers the factory's clients and their cleanup operation to bootstrap.
+pub struct OopComposition {
+    /// The directory registration name for this serving role.
+    pub registration_name: String,
+    /// Registrations installed before gear initialization.
+    pub clients: Vec<ClientRegistration>,
+    /// Completes client shutdown after gears stop. Use a separate abort token so
+    /// process cancellation leaves client workers available during gear shutdown.
+    pub cleanup: ClientCleanup,
+}
+
+impl std::fmt::Debug for OopComposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OopComposition")
+            .field("registration_name", &self.registration_name)
+            .field("client_count", &self.clients.len())
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
+}
+
+/// Constructs clients from the effective configuration. Finish all fallible work
+/// before starting a factory-owned worker. Once a worker starts, transfer its
+/// cleanup owner through the successful return.
+pub type OopCompositionFactory =
+    fn(&AppConfig, &OopCompositionContext) -> Result<OopComposition, OopCompositionError>;
+
+/// A static failure category safe to report without exposing configuration values.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum OopCompositionError {
+    /// The named field has an invalid value.
+    #[error("invalid composition configuration field: {field}")]
+    InvalidConfig { field: &'static str },
+    /// Client construction failed in the named component.
+    #[error("client construction failed: {component}")]
+    ClientConstruction { component: &'static str },
+}
+
+/// The outcome of composition, gear execution, or client shutdown.
+#[derive(Debug, thiserror::Error)]
+pub enum OopCompositionRunError {
+    /// Composition failed before client ownership transferred to bootstrap.
+    #[error(transparent)]
+    Composition(#[from] OopCompositionError),
+    /// Bootstrap or the gear runtime failed.
+    #[error("OoP bootstrap failed: {source}")]
+    Bootstrap {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// Client cleanup failed after successful gear execution.
+    #[error(transparent)]
+    Cleanup(#[from] ClientCleanupError),
+    /// Both bootstrap and subsequent client cleanup failed.
+    #[error("OoP bootstrap failed: {source}. Client cleanup failed: {cleanup}")]
+    BootstrapAndCleanup {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        cleanup: ClientCleanupError,
+    },
+}
+
+impl OopCompositionRunError {
+    fn bootstrap(error: anyhow::Error) -> Self {
+        Self::Bootstrap {
+            source: error.reallocate_into_boxed_dyn_error_without_backtrace(),
+        }
+    }
+}
 
 /// Configuration options for `OoP` gear bootstrap
 #[derive(Debug, Clone)]
 pub struct OopRunOptions {
-    /// Logical gear name (e.g., "`file-parser`")
+    /// Directory registration name used by [`run_oop_with_options`].
     ///
-    /// **This is the directory registration name, and since roles it is not
-    /// always the gear's own id.** A role-split gear registers under its role's
-    /// directory name -- `event-broker-ingest` for the `cluster_ingest` mode --
-    /// while its configuration still lives under the gear id the
-    /// `#[toolkit::gear(name = ...)]` attribute declares, because that is the
-    /// key `GearCtx::config()` looks up. See [`Self::config_gear_name`].
+    /// [`run_oop_with_composition`] uses [`OopComposition::registration_name`] instead.
+    /// This value remains the configuration-key fallback when
+    /// [`Self::config_gear_name`](field@Self::config_gear_name) is `None`.
     pub gear_name: String,
 
-    /// The `gears.<key>` section this process's configuration lives under.
+    /// Key of the `gears.<key>` configuration section.
     ///
-    /// `None` means the same as [`Self::gear_name`], which is the answer for
-    /// every gear that runs in one undifferentiated shape -- so no existing
-    /// caller changes behaviour.
-    ///
-    /// **It exists because `gear_name` was doing two jobs that used to be one
-    /// string.** The registry names a gear by its attribute, and
-    /// `GearCtx::config()` reads `gears.<that name>.config`; a role changes the
-    /// name the instance *registers* under and not the name it *reads* under.
-    /// With the two conflated, a worker started as a role filed the master's
-    /// rendered blob under `gears["event-broker-ingest"]` while the gear read
-    /// `gears["event-broker"]`, so `TOOLKIT_MODULE_CONFIG` was inert under any
-    /// role and only the local `--config` file had any effect. Nothing failed;
-    /// the override simply did not arrive.
+    /// `None` selects [`Self::gear_name`] in both entrypoints.
+    /// The composition's registration name does not change this key.
     pub config_gear_name: Option<String>,
 
     /// Instance ID (defaults to a random UUID if None)
@@ -109,7 +172,11 @@ pub struct OopRunOptions {
     /// Log verbosity level (0=default, 1=debug, 2=trace)
     pub verbose: u8,
 
-    /// Print effective configuration and exit
+    /// Print configuration and exit before running the gear.
+    ///
+    /// [`run_oop_with_options`] prints the loaded local configuration.
+    /// [`run_oop_with_composition`] prints configuration after merging the rendered gear section
+    /// with local overrides, before client construction. Both apply CLI verbosity overrides.
     pub print_config: bool,
 
     /// Heartbeat interval in seconds (default: 5)
@@ -121,11 +188,8 @@ pub struct OopRunOptions {
 }
 
 impl OopRunOptions {
-    /// The `gears.<key>` section to read configuration from.
-    ///
-    /// [`Self::config_gear_name`] when set, and [`Self::gear_name`] otherwise --
-    /// so a caller that does not know about roles keeps exactly the behaviour it
-    /// had.
+    /// Configuration key from [`Self::config_gear_name`](field@Self::config_gear_name),
+    /// or [`Self::gear_name`] when unset.
     #[must_use]
     pub fn config_gear_name(&self) -> &str {
         self.config_gear_name.as_deref().unwrap_or(&self.gear_name)
@@ -441,33 +505,12 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
     }
 }
 
-/// Run an out-of-process gear with the given options
+/// Runs an out-of-process gear under the process signal token.
 ///
-/// This function:
-/// 1. Creates a root `CancellationToken` for the process
-/// 2. Hooks OS signals (SIGTERM, SIGINT, Ctrl+C) to trigger cancellation
-/// 3. Loads configuration and initializes logging
-/// 4. Creates a lazy `DirectoryService` client (connects on first use, not at
-///    bootstrap — `cpt-cf-adr-eventual-readiness`)
-/// 5. Registers the gear instance (background presence loop, with backoff)
-/// 6. Starts a background heartbeat loop (using a child token)
-/// 7. Runs the gear lifecycle with `ShutdownOptions::Token`
-/// 8. Deregisters from `DirectoryService` on shutdown
-///
-/// ## Shutdown Model
-///
-/// A single root cancellation token drives shutdown for the entire process.
-/// OS signals are hooked at this bootstrap level (not via `ShutdownOptions::Signals`).
-/// The heartbeat loop and gear runtime both observe this token tree.
-///
-/// # Arguments
-///
-/// * `opts` - Bootstrap configuration options
-///
-/// # Returns
-///
-/// * `Ok(())` - If the gear lifecycle completed successfully
-/// * `Err(e)` - If any step failed
+/// HTTP-serving gears manage directory presence through the serving lifecycle.
+/// Without HTTP configuration, a heartbeat maintains externally registered instances.
+/// Both modes use a lazy directory connection so a temporarily unavailable directory
+/// does not block startup.
 ///
 /// # Example
 ///
@@ -493,7 +536,8 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 /// ```
 ///
 /// # Errors
-/// Returns an error if the `OoP` gear fails to start or run.
+///
+/// Returns an error if configuration, setup, or the gear lifecycle fails.
 #[tracing::instrument(
     level = "info",
     name = "oop_bootstrap",
@@ -504,77 +548,273 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
     )
 )]
 pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
-    // Install the rustls crypto provider FIRST — before any TLS/network setup,
-    // mirroring `init_procedure` so OoP gears run the same crypto startup
-    // checks. Process-wide and idempotent.
-    super::init_crypto_provider()?;
-
-    // Generate instance ID if not provided
-    let instance_id = opts.instance_id.unwrap_or_else(Uuid::new_v4);
-
-    // Create root cancellation token for the entire process.
-    // This token drives shutdown for the gear runtime and all background tasks.
-    let cancel = CancellationToken::new();
-
-    // Hook OS signals to the root token at bootstrap level.
-    // This replaces the use of ShutdownOptions::Signals inside the runtime.
-    let cancel_for_signals = cancel.clone();
-    tokio::spawn(async move {
-        match shutdown::wait_for_shutdown().await {
-            Ok(()) => {
-                info!(target: "", "------------------");
-                info!("shutdown: signal received in OoP bootstrap");
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "shutdown: primary waiter failed in OoP bootstrap, falling back to ctrl_c()"
-                );
-                _ = tokio::signal::ctrl_c().await;
-            }
-        }
-        cancel_for_signals.cancel();
-    });
-
-    // Prepare CLI args for AppConfig loading
-    let args = CliArgs {
-        config: opts
-            .config_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string()),
-        print_config: opts.print_config,
-        verbose: opts.verbose,
-        mock: false,
+    let cancel = process_cancellation()?;
+    let _on_exit = cancel.clone().drop_guard();
+    let Some(prepared) = prepare(&opts, &cancel, Invocation::Legacy)? else {
+        return Ok(());
     };
+    let http = prepared.config.oop_http.clone();
+    let connected = prepared.connect(&opts.directory_endpoint).await?;
+    let result = if let Some(cfg) = http {
+        let (run_options, serve) = connected
+            .prepare_serving(&cfg, &opts.gear_name, &opts)
+            .await?;
+        run_oop_serving(run_options, serve).await
+    } else {
+        info!("Starting gear lifecycle (legacy gRPC-only)");
+        start_legacy_heartbeat(
+            connected.directory,
+            &opts,
+            connected.run_options.instance_id,
+            &cancel,
+        );
+        run(connected.run_options).await
+    };
+    report_runtime_result(&result);
+    #[cfg(feature = "otel")]
+    super::telemetry::tracing_shutdown().await;
+    result
+}
 
-    // Load configuration
+/// Runs an HTTP-serving gear with application-supplied clients and a registration name.
+///
+/// The factory runs once after configuration and directory credentials are ready.
+/// Printing the effective configuration returns before client construction.
+/// After successful composition, bootstrap awaits the host lifecycle, then client cleanup
+/// under the server shutdown deadline, then telemetry shutdown.
+///
+/// # Cancellation safety
+///
+/// Dropping this future during serving preparation, execution, or unfinished client cleanup
+/// requests abort through the cleanup owner's token. A drop or deadline does not join workers.
+///
+/// # Errors
+///
+/// Returns the factory's typed error, a bootstrap failure, a cleanup failure, or both failures.
+pub async fn run_oop_with_composition(
+    options: OopRunOptions,
+    compose: OopCompositionFactory,
+) -> Result<(), OopCompositionRunError> {
+    let cancel = process_cancellation().map_err(OopCompositionRunError::bootstrap)?;
+    let _on_exit = cancel.clone().drop_guard();
+    let Some(prepared) = prepare(&options, &cancel, Invocation::Composed)
+        .map_err(OopCompositionRunError::bootstrap)?
+    else {
+        return Ok(());
+    };
+    let config = prepared.config.clone();
+    let http = config
+        .oop_http
+        .as_ref()
+        .ok_or(OopCompositionError::InvalidConfig { field: "oop_http" })?;
+    let mut connected = prepared
+        .connect(&options.directory_endpoint)
+        .await
+        .map_err(OopCompositionRunError::bootstrap)?;
+    let context = OopCompositionContext {
+        cancel: cancel.clone(),
+        internal_token_provider: connected.run_options.internal_token_provider.clone(),
+    };
+    let OopComposition {
+        registration_name,
+        clients,
+        cleanup,
+    } = compose(&config, &context)?;
+    connected.run_options.clients.extend(clients);
+    let host = async {
+        let (run_options, serve) = connected
+            .prepare_serving(http, &registration_name, &options)
+            .await?;
+        run_oop_serving(run_options, serve).await
+    };
+    let result = Box::pin(finalize_composition(host, cleanup, &cancel, &config.server)).await;
+    report_runtime_result(&result);
+    #[cfg(feature = "otel")]
+    super::telemetry::tracing_shutdown().await;
+    result
+}
+
+async fn finalize_composition(
+    host: impl std::future::Future<Output = Result<()>>,
+    cleanup: ClientCleanup,
+    cancel: &CancellationToken,
+    server: &super::config::ServerConfig,
+) -> Result<(), OopCompositionRunError> {
+    let result = host.await;
+    if result.is_err() {
+        cancel.cancel();
+    }
+    let deadline = server
+        .shutdown_deadline()
+        .unwrap_or(crate::runtime::DEFAULT_SHUTDOWN_DEADLINE);
+    let completion = tokio::time::timeout(deadline, cleanup.finish())
+        .await
+        .unwrap_or(Err(ClientCleanupError::DeadlineExceeded));
+    match (result, completion) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(source), Ok(())) => Err(OopCompositionRunError::bootstrap(source)),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Err(source), Err(cleanup)) => Err(OopCompositionRunError::BootstrapAndCleanup {
+            source: source.reallocate_into_boxed_dyn_error_without_backtrace(),
+            cleanup,
+        }),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Invocation {
+    Legacy,
+    Composed,
+}
+
+struct Prepared {
+    config: Arc<AppConfig>,
+    db: DbOptions,
+    cancel: CancellationToken,
+    instance_id: Uuid,
+}
+
+struct Connected {
+    run_options: RunOptions,
+    directory: Arc<dyn DirectoryClient>,
+}
+
+impl Prepared {
+    async fn connect(self, endpoint: &str) -> Result<Connected> {
+        let auth = self
+            .config
+            .oop_http
+            .as_ref()
+            .and_then(|cfg| cfg.internal_auth.as_ref());
+        info!("Creating directory service client (lazy connect) for {endpoint}");
+        let (directory, provider) = build_directory_client(endpoint, auth, &self.cancel).await?;
+        info!("Directory service client ready (will connect on first use)");
+        let directory: Arc<dyn DirectoryClient> = Arc::new(directory);
+        let init_deadline = self.config.server.init_deadline();
+        let shutdown_deadline = self.config.server.shutdown_deadline();
+        let run_options = RunOptions::new(
+            self.config,
+            self.db,
+            ShutdownOptions::Token(self.cancel),
+            self.instance_id,
+        )
+        .with_clients(vec![ClientRegistration::new::<dyn DirectoryClient>(
+            directory.clone(),
+        )])
+        .with_internal_token_provider(provider)
+        .with_init_deadline(init_deadline)
+        .with_shutdown_deadline(shutdown_deadline);
+        Ok(Connected {
+            run_options,
+            directory,
+        })
+    }
+}
+
+impl Connected {
+    async fn prepare_serving(
+        self,
+        cfg: &super::config::OopHttpConfig,
+        name: &str,
+        opts: &OopRunOptions,
+    ) -> Result<(RunOptions, OopServeOptions)> {
+        let serve = build_oop_serve_options(
+            cfg,
+            name,
+            self.run_options.instance_id,
+            opts.version.clone(),
+            Duration::from_secs(opts.heartbeat_interval_secs),
+            self.directory,
+        )
+        .await?;
+        Ok((self.run_options, serve))
+    }
+}
+
+fn process_cancellation() -> Result<CancellationToken> {
+    super::init_crypto_provider()?;
+    Ok(arm_shutdown_wait(async {
+        wait_for_shutdown_or_fallback(
+            shutdown::wait_for_shutdown(),
+            tokio::signal::ctrl_c(),
+            std::io::stderr(),
+        )
+        .await;
+        info!("shutdown: signal received in OoP bootstrap");
+    }))
+}
+
+async fn wait_for_shutdown_or_fallback(
+    primary: impl std::future::Future<Output = anyhow::Result<()>>,
+    fallback: impl std::future::Future<Output = std::io::Result<()>>,
+    mut diagnostic: impl std::io::Write,
+) {
+    use futures_util::FutureExt;
+
+    let Err(error) = primary.await else {
+        return;
+    };
+    let mut fallback = std::pin::pin!(fallback);
+    // Arm Ctrl+C before stderr can block. The tracing subscriber may not be installed yet.
+    let fallback_pending = fallback.as_mut().now_or_never().is_none();
+    _ = writeln!(
+        diagnostic,
+        "OoP signal waiter failed, falling back to ctrl_c(): {error}"
+    );
+    drop(diagnostic);
+    if fallback_pending {
+        _ = fallback.await;
+    }
+}
+
+fn arm_shutdown_wait(
+    wait: impl std::future::Future<Output = ()> + Send + 'static,
+) -> CancellationToken {
+    use futures_util::FutureExt;
+
+    let cancel = CancellationToken::new();
+    let mut wait = Box::pin(wait);
+    // Register listeners before clients can start. The same waiter owns them until shutdown.
+    if wait.as_mut().now_or_never().is_some() {
+        cancel.cancel();
+    } else {
+        let process = cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = process.cancelled() => {},
+                () = wait => process.cancel(),
+            }
+        });
+    }
+    cancel
+}
+
+fn prepare(
+    opts: &OopRunOptions,
+    cancel: &CancellationToken,
+    invocation: Invocation,
+) -> Result<Option<Prepared>> {
+    let instance_id = opts.instance_id.unwrap_or_else(Uuid::new_v4);
     let mut config = AppConfig::load_or_default(opts.config_path.as_ref())?;
-    config.apply_cli_overrides(args.verbose);
-
-    // Read rendered gear config from master host via env var BEFORE logging init
-    // so we can use the tracing config from master for OTEL. Present but invalid
-    // fails startup, as it fails the deployment publication job.
+    config.apply_cli_overrides(opts.verbose);
     let rendered_config = rendered_config_from_env()?;
 
-    // Build final config by merging:
-    // 1. Rendered config from master host (base)
-    // 2. Local config file (override)
-    // This also merges logging configuration for proper initialization
+    if opts.print_config && matches!(invocation, Invocation::Composed) {
+        print_config(&effective_oop_config(
+            &config,
+            opts.config_gear_name(),
+            rendered_config.as_ref(),
+        ));
+        return Ok(None);
+    }
     let (final_config, merged_logging, db_options) =
-        // The *config* key, not the registration name: a role changes what this
-        // process registers as and not what section it reads. Conflating them
-        // filed the master's rendered blob under a key the gear never looks up.
         build_oop_config_and_db(&config, opts.config_gear_name(), rendered_config.as_ref())?;
-
-    // Use OpenTelemetry config from rendered (master) config only.
-    // OoP gears do not fall back to local config for telemetry — if the master
-    // does not provide an opentelemetry section, telemetry is skipped entirely.
+    // The master owns telemetry settings for every child process.
     #[cfg(feature = "otel")]
     let otel_cfg = rendered_config
         .as_ref()
         .and_then(|rc| rc.opentelemetry.as_ref());
 
-    // Initialize OTEL tracing layer (if tracing is enabled)
     #[cfg(feature = "otel")]
     let otel_layer = otel_cfg
         .filter(|cfg| cfg.tracing.enabled)
@@ -583,21 +823,13 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     #[cfg(not(feature = "otel"))]
     let otel_layer = None;
 
-    // Initialize OpenTelemetry metrics provider (if configured and enabled).
-    // Store error to log after logging is initialized.
+    // Defer the metrics diagnostic until the logging subscriber is installed.
     #[cfg(feature = "otel")]
     let metrics_init_error = otel_cfg
         .filter(|cfg| cfg.metrics.enabled)
         .and_then(|cfg| crate::telemetry::init::init_metrics_provider(cfg).err());
 
-    // Initialize logging with MERGED config (master base + local override)
-    // Trace-id injection follows the same rule as the other telemetry
-    // settings: it comes from the master's rendered config, never the local one.
-    //
-    // `is_none_or`, not `is_some_and`: an absent `opentelemetry` section resolves
-    // the splice ON, matching the in-process default (`bootstrap::run` over
-    // `OpenTelemetryConfig::default()` -> `unwrap_or(true)`). `is_some_and` would
-    // silently disable it for every OoP gear with no section.
+    // An absent telemetry section enables trace IDs, matching the in-process default.
     #[cfg(feature = "otel")]
     let inject_trace_ids =
         otel_cfg.is_none_or(crate::telemetry::OpenTelemetryConfig::inject_trace_ids_into_logs);
@@ -611,16 +843,13 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         inject_trace_ids,
     );
 
-    // Now that logging is available, report deferred metrics init error
     #[cfg(feature = "otel")]
     if let Some(e) = metrics_init_error {
         tracing::error!(error = %e, "OpenTelemetry metrics not initialized (OoP)");
     }
 
-    // Register custom panic hook to reroute panic backtrace into tracing.
     init_panic_tracing();
 
-    // Now we can log - report what we received from master
     if let Some(ref rc) = rendered_config {
         info!(
             env_var = TOOLKIT_MODULE_CONFIG_ENV,
@@ -644,128 +873,53 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         "OoP gear bootstrap starting"
     );
 
-    // Print config and exit if requested
     if opts.print_config {
         print_config(&config);
-        return Ok(());
+        return Ok(None);
     }
 
-    // Create the DirectoryService client on a LAZY channel. Per
-    // `cpt-cf-adr-eventual-readiness`, an OoP gear must start even when the
-    // DirectoryService is not yet reachable; blocking or crashing on it at
-    // bootstrap would make it a hard startup dependency (the SPOF the ADR
-    // rejects). A lazy channel performs no eager connection: it fails fast only
-    // on a malformed endpoint and defers the connect to the first RPC.
-    //
-    // Recovery from a cold directory differs by lifecycle:
-    // - `oop_http` configured: the presence loop retries registration with
-    //   exponential backoff (100ms -> 30s, forever).
-    // - Legacy path (no `oop_http`): only a fixed-interval heartbeat runs, with
-    //   no registration retry — it relies on an external orchestrator.
-    //
-    // When a platform-plane credential is configured, it is attached (as
-    // `x-toolkit-internal-token`) to outbound system calls via an
-    // InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
-    info!(
-        "Creating directory service client (lazy connect) for {}",
-        opts.directory_endpoint
-    );
-    let internal_auth_cfg = final_config
-        .oop_http
-        .as_ref()
-        .and_then(|h| h.internal_auth.as_ref());
-    let (directory_client, internal_token_provider) =
-        build_directory_client(&opts.directory_endpoint, internal_auth_cfg, &cancel).await?;
-    let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
-
-    info!("Directory service client ready (will connect on first use)");
-
-    // Capture OoP HTTP config (if any) before moving the config into the provider.
-    let oop_http = final_config.oop_http.clone();
-
-    // Apply configured lifecycle deadlines (absent fields keep framework defaults).
-    let init_deadline = final_config.server.init_deadline();
-    let shutdown_deadline = final_config.server.shutdown_deadline();
-
-    // Build config provider for gears
-    let config_provider = Arc::new(final_config);
-
-    // The DirectoryClient (gRPC client) is injected into the ClientHub so gears can access it.
-    // `oop` is left unset: OoP gears don't spawn other OoP gears.
-    let run_options = RunOptions::new(
-        config_provider,
-        db_options,
-        ShutdownOptions::Token(cancel.clone()),
+    Ok(Some(Prepared {
+        config: Arc::new(final_config),
+        db: db_options,
+        cancel: cancel.clone(),
         instance_id,
-    )
-    .with_clients(vec![ClientRegistration::new::<dyn DirectoryClient>(
-        Arc::clone(&directory_api),
-    )])
-    .with_internal_token_provider(internal_token_provider)
-    .with_init_deadline(init_deadline)
-    .with_shutdown_deadline(shutdown_deadline);
+    }))
+}
 
-    // When `oop_http` is configured, run the HTTP-serving lifecycle:
-    // Axum server + probes + directory presence (registration + heartbeat +
-    // self-heal, owned by `presence_loop`) + dependency resolution + drain.
-    // Otherwise fall back to the legacy gRPC-only lifecycle.
-    let result = if let Some(http_cfg) = oop_http {
-        info!("Starting OoP HTTP-serving lifecycle");
-        let serve = build_oop_serve_options(
-            &http_cfg,
-            &opts.gear_name,
-            instance_id,
-            opts.version.clone(),
-            Duration::from_secs(opts.heartbeat_interval_secs),
-            Arc::clone(&directory_api),
-        )
-        .await?;
-        run_oop_serving(run_options, serve).await
-    } else {
-        info!("Starting gear lifecycle (legacy gRPC-only)");
-        // Legacy path: presence is not self-managed by an HTTP serve lifecycle,
-        // so run a standalone heartbeat on a child token. (A no-op unless the
-        // instance is registered by an external orchestrator.)
-        let heartbeat_directory = Arc::clone(&directory_api);
-        let heartbeat_gear = opts.gear_name.clone();
-        let heartbeat_instance_id_str = instance_id.to_string();
-        let heartbeat_interval = Duration::from_secs(opts.heartbeat_interval_secs.max(1));
-        let heartbeat_cancel = cancel.child_token();
-        tokio::spawn(async move {
-            info!(interval_secs = ?heartbeat_interval, "Starting legacy heartbeat loop");
-            loop {
-                tokio::select! {
-                    () = heartbeat_cancel.cancelled() => {
-                        info!("Heartbeat loop stopping due to cancellation");
-                        break;
-                    }
-                    () = sleep(heartbeat_interval) => {
-                        if let Err(e) = heartbeat_directory
-                            .send_heartbeat(&heartbeat_gear, &heartbeat_instance_id_str)
-                            .await
-                        {
-                            warn!(error = %e, "Failed to send heartbeat, will retry");
-                        }
+fn start_legacy_heartbeat(
+    directory: Arc<dyn DirectoryClient>,
+    opts: &OopRunOptions,
+    instance_id: Uuid,
+    cancel: &CancellationToken,
+) {
+    let heartbeat_gear = opts.gear_name.clone();
+    let instance = instance_id.to_string();
+    let heartbeat_interval = Duration::from_secs(opts.heartbeat_interval_secs.max(1));
+    let cancel = cancel.child_token();
+    tokio::spawn(async move {
+        info!(interval_secs = ?heartbeat_interval, "Starting legacy heartbeat loop");
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    info!("Heartbeat loop stopping due to cancellation");
+                    break;
+                }
+                () = sleep(heartbeat_interval) => {
+                    if let Err(error) = directory.send_heartbeat(&heartbeat_gear, &instance).await {
+                        warn!(%error, "Failed to send heartbeat, will retry");
                     }
                 }
             }
-        });
-        run(run_options).await
-    };
+        }
+    });
+}
 
-    if let Err(ref e) = result {
-        error!(error = %e, "Gear runtime failed");
+fn report_runtime_result<E: std::fmt::Display>(result: &Result<(), E>) {
+    if let Err(error) = result {
+        error!(%error, "Gear runtime failed");
     } else {
         info!("Gear runtime completed successfully");
     }
-
-    // Graceful shutdown - flush remaining telemetry. An OoP gear is a separate
-    // OS process owning its own global providers, so the in-process host's
-    // flush in `bootstrap::run` does not cover it.
-    #[cfg(feature = "otel")]
-    super::telemetry::tracing_shutdown().await;
-
-    result
 }
 
 /// Build [`OopServeOptions`] from configuration.
@@ -830,6 +984,7 @@ async fn build_oop_serve_options(
         drain_timeout: Duration::from_secs(cfg.drain_timeout_secs),
         heartbeat_interval,
         healthcheck_timeout: Duration::from_millis(cfg.healthcheck_timeout_ms),
+        request_limits: cfg.request_limits,
         directory,
         bearer_authenticator: None,
         internal_authenticator,

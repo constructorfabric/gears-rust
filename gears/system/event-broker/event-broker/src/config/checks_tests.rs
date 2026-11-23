@@ -40,6 +40,122 @@ fn two_backends() -> serde_json::Value {
 }
 
 #[test]
+fn memory_process_profiles_and_sweep_interval_are_validated_at_startup() {
+    let outcomes = [
+        ("one profile at 1ms", json!(["secondary"]), "1ms"),
+        (
+            "64 profiles",
+            json!((0..64).map(|i| format!("p{i:02}")).collect::<Vec<_>>()),
+            "1s",
+        ),
+        ("255-byte name", json!(["a".repeat(255)]), "1s"),
+        ("empty list", json!([]), "1s"),
+        (
+            "65 profiles",
+            json!((0..65).map(|i| format!("p{i:02}")).collect::<Vec<_>>()),
+            "1s",
+        ),
+        ("duplicate", json!(["a", "b", "a"]), "1s"),
+        ("empty name", json!([""]), "1s"),
+        ("scoped name", json!(["a/b"]), "1s"),
+        ("256-byte name", json!(["a".repeat(256)]), "1s"),
+        ("zero interval", json!(["secondary"]), "0s"),
+    ]
+    .map(|(case, profiles, sweep_interval)| {
+        let cfg: EventBrokerConfig = serde_json::from_value(json!({
+            "mode": "standalone",
+            "backends": { "main": { "type": MEMORY_BACKEND } },
+            "backend_routing": { TOPIC_TYPE: "main" },
+            "process": {
+                "cluster": {
+                    "mode": "memory",
+                    "profiles": profiles,
+                    "sweep_interval": sweep_interval,
+                },
+            },
+        }))
+        .expect("fixture deserializes before startup validation");
+        (
+            case,
+            check(&cfg, cfg.mode).map(|deployment| deployment.is_some()),
+        )
+    });
+
+    assert_eq!(
+        outcomes,
+        [
+            ("one profile at 1ms", Ok(true)),
+            ("64 profiles", Ok(true)),
+            ("255-byte name", Ok(true)),
+            ("empty list", Err(Error::MemoryProcessProfileCount)),
+            ("65 profiles", Err(Error::MemoryProcessProfileCount)),
+            ("duplicate", Err(Error::DuplicateMemoryProcessProfile)),
+            ("empty name", Err(Error::InvalidMemoryProcessProfile)),
+            ("scoped name", Err(Error::InvalidMemoryProcessProfile)),
+            ("256-byte name", Err(Error::InvalidMemoryProcessProfile)),
+            ("zero interval", Err(Error::ZeroMemoryProcessSweepInterval)),
+        ]
+    );
+}
+
+#[test]
+fn only_standalone_accepts_a_memory_process_and_every_role_accepts_remote_or_absence() {
+    let outcomes = [
+        "standalone",
+        "cluster_ingest",
+        "cluster_delivery",
+        "cluster_dispatcher",
+    ]
+    .map(|mode| {
+        let input = json!({
+            "mode": mode,
+            "backends": { "main": { "type": MEMORY_BACKEND } },
+            "backend_routing": { TOPIC_TYPE: "main" },
+        });
+        let [memory, remote, absent] = [
+            Some(json!({"cluster": {"mode": "memory", "profiles": ["event-broker"]}})),
+            Some(json!({"cluster": {"mode": "remote"}})),
+            None,
+        ]
+        .map(|process| {
+            let mut input = input.clone();
+            if let Some(process) = process {
+                input["process"] = process;
+            }
+            let cfg: EventBrokerConfig =
+                serde_json::from_value(input).expect("fixture deserializes");
+            check(&cfg, cfg.mode).map(|deployment| deployment.is_some())
+        });
+        (mode, memory, remote, absent)
+    });
+
+    assert_eq!(
+        outcomes,
+        [
+            ("standalone", Ok(true), Ok(true), Ok(true)),
+            (
+                "cluster_ingest",
+                Err(Error::MemoryProcessOutsideStandalone),
+                Ok(true),
+                Ok(true)
+            ),
+            (
+                "cluster_delivery",
+                Err(Error::MemoryProcessOutsideStandalone),
+                Ok(true),
+                Ok(true)
+            ),
+            (
+                "cluster_dispatcher",
+                Err(Error::MemoryProcessOutsideStandalone),
+                Ok(false),
+                Ok(false)
+            ),
+        ]
+    );
+}
+
+#[test]
 fn a_configuration_keeping_every_rule_passes_with_the_routing_it_states() {
     let cfg = config(
         &two_backends(),

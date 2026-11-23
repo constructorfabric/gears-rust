@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::domain::streaming::assignment::AssignmentDelta;
+use crate::domain::model::{Assignment, Sequence};
+use crate::domain::streaming::assignment::{AssignmentDelta, Generation};
 use toolkit_gts::GtsInstanceId;
 
 use tokio::time::Instant;
@@ -620,22 +621,20 @@ fn an_assignment_published_with_no_stream_open_is_not_lost() {
 fn rapid_membership_changes_coalesce_to_the_latest() {
     let coordinator = coordinator();
     let group = group_id("gcoalesce");
-    let sub_a = Uuid::new_v4();
-    coordinator.join_member(&group, sub_a, &[topic("topic", 8)], Duration::from_secs(30));
+    let sub_a = Uuid::from_u128(1);
+    let interest = topic("topic", 8);
+    let interests = std::slice::from_ref(&interest);
+    coordinator.join_member(&group, sub_a, interests, Duration::from_secs(30));
 
     let (mut generations, _membership) =
         ConsumerGroupCoordinator::subscribe(&coordinator, &group, sub_a)
             .expect("sub_a is a member");
     generations.borrow_and_update();
 
-    // Three siblings join back to back, with nothing reading in between.
-    for _ in 0..3 {
-        coordinator.join_member(
-            &group,
-            Uuid::new_v4(),
-            &[topic("topic", 8)],
-            Duration::from_secs(30),
-        );
+    // The lowest member keeps [0, 1] on the last join. Its watch must still
+    // advance to the same version as the group.
+    for sub_id in [2, 3, 4].map(Uuid::from_u128) {
+        coordinator.join_member(&group, sub_id, interests, Duration::from_secs(30));
     }
 
     assert!(
@@ -646,19 +645,23 @@ fn rapid_membership_changes_coalesce_to_the_latest() {
     );
     let latest = generations.borrow_and_update().clone();
     assert_eq!(
-        latest.assigned.len(),
-        2,
-        "four members over eight partitions is two each - the newest split, not an \
-         intermediate one, got {latest:?}"
+        latest,
+        Generation::new(
+            4,
+            vec![
+                Assignment {
+                    topic: interest.id.clone(),
+                    partition: 0,
+                    offset: Sequence::assigned(0),
+                    last_examined: Sequence::assigned(0),
+                },
+                Assignment {
+                    topic: interest.id,
+                    partition: 1,
+                    offset: Sequence::assigned(0),
+                    last_examined: Sequence::assigned(0),
+                },
+            ],
+        ),
     );
-
-    // Deliberately no assertion on `topology_version`. A member whose partition
-    // set is unchanged by a rebalance is skipped, so its watch keeps the version
-    // at which its assignment last actually moved. With eight partitions the
-    // range split gives member 0 the range [0, 2) at both three and four
-    // members, so whether this member's version reaches the newest one depends
-    // on where it lands in the member ordering. What coalescing has to
-    // guarantee is that no change is dropped - that the value read is the
-    // newest split rather than an intermediate one - and the partition count
-    // above is what states that.
 }

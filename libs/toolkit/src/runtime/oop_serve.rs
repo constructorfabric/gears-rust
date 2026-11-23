@@ -32,7 +32,7 @@
 //! gear routes. Self-registration and dependency resolution live in
 //! [`super::oop_registration`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,26 +40,29 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Request, State},
-    http::{StatusCode, header::RETRY_AFTER},
+    extract::{DefaultBodyLimit, MatchedPath, Request, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header::RETRY_AFTER},
     middleware::{Next, from_fn, from_fn_with_state},
     response::{IntoResponse, Response},
     routing::get,
 };
 use futures_util::FutureExt as _;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
+use tower_http::limit::RequestBodyLimitLayer;
 use url::Url;
 
 use cf_system_sdks::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
-use toolkit_canonical_errors::CanonicalError;
+use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_http_middleware::{RouteAuthPolicy, TenantPlane, layer_route_auth_with};
 use toolkit_security::{DynBearerAuthenticator, DynInternalAuthenticator};
+use toolkit_trace_context::{TRACEPARENT, parse_trace_id};
 
 use super::presence_manager::{PresenceManager, ReportedStateSource};
 use super::readiness::ReadinessState;
 use crate::api::canonical_error_middleware;
-use crate::api::operation_builder::OperationSpec;
+use crate::api::operation_builder::{OperationSpec, RouteTimeout};
 
 /// `Retry-After` (seconds) advertised while the gear is draining.
 const DRAIN_RETRY_AFTER_SECONDS: u64 = 5;
@@ -71,6 +74,79 @@ const STARTING_RETRY_AFTER_SECONDS: u64 = 1;
 // ---------------------------------------------------------------------------
 // Serve options
 // ---------------------------------------------------------------------------
+
+/// Request body and response deadline policy for published `OoP` gear routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "RawOopRequestLimits")]
+pub struct OopRequestLimits {
+    body_limit_bytes: usize,
+    #[serde(with = "toolkit_utils::humantime_serde")]
+    request_timeout: Duration,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOopRequestLimits {
+    body_limit_bytes: usize,
+    #[serde(with = "toolkit_utils::humantime_serde")]
+    request_timeout: Duration,
+}
+
+impl TryFrom<RawOopRequestLimits> for OopRequestLimits {
+    type Error = OopRequestLimitsError;
+
+    fn try_from(raw: RawOopRequestLimits) -> Result<Self, Self::Error> {
+        Self::new(raw.body_limit_bytes, raw.request_timeout)
+    }
+}
+
+/// An invalid request limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OopRequestLimitsError {
+    /// The body byte limit is zero.
+    #[error("body_limit_bytes must be positive")]
+    BodyLimitZero,
+    /// The response deadline is zero.
+    #[error("request_timeout must be positive")]
+    RequestTimeoutZero,
+}
+
+impl OopRequestLimits {
+    /// Create a policy with positive body bytes and a positive response deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OopRequestLimitsError::BodyLimitZero`] for a zero byte limit or
+    /// [`OopRequestLimitsError::RequestTimeoutZero`] for a zero timeout.
+    pub fn new(
+        body_limit_bytes: usize,
+        request_timeout: Duration,
+    ) -> Result<Self, OopRequestLimitsError> {
+        if body_limit_bytes == 0 {
+            return Err(OopRequestLimitsError::BodyLimitZero);
+        }
+        if request_timeout.is_zero() {
+            return Err(OopRequestLimitsError::RequestTimeoutZero);
+        }
+        Ok(Self {
+            body_limit_bytes,
+            request_timeout,
+        })
+    }
+
+    /// Maximum number of request body bytes.
+    #[must_use]
+    pub const fn body_limit_bytes(&self) -> usize {
+        self.body_limit_bytes
+    }
+
+    /// Default time to produce a response. A registered operation may replace or
+    /// disable this deadline. Response streams continue independently.
+    #[must_use]
+    pub const fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+}
 
 /// Configuration and collaborators for the `OoP` HTTP runtime, assembled by the
 /// bootstrap layer and consumed by `HostRuntime`'s `OoP` serving path.
@@ -113,6 +189,8 @@ pub struct OopServeOptions {
     /// [`Healthcheck`](crate::healthcheck::Healthcheck) that exceeds this is
     /// reported `Unhealthy`. Mirrors the `api-gateway` `healthcheck_timeout_ms`.
     pub healthcheck_timeout: Duration,
+    /// Optional body and response deadline policy for published gear routes.
+    pub request_limits: Option<OopRequestLimits>,
     /// Directory client used for self-registration and dependency resolution.
     pub directory: Arc<dyn DirectoryClient>,
     /// Tenant-plane authenticator; when `Some`, `security_context_middleware`
@@ -134,8 +212,8 @@ impl OopServeOptions {
     /// Create `OopServeOptions` with the fields that have no meaningful default;
     /// every optional field defaults to the bootstrap config layer's own default
     /// (`drain_timeout` 30s, `heartbeat_interval` 5s, `healthcheck_timeout`
-    /// 500ms, no probe sidecar port, no authenticators, no labels). Layer the
-    /// rest on with the `with_*` builders.
+    /// 500ms). Add optional request limits, probe sidecar, authenticators, and labels
+    /// with the `with_*` builders.
     #[must_use]
     pub fn new(
         gear_name: String,
@@ -154,6 +232,7 @@ impl OopServeOptions {
             drain_timeout: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(5),
             healthcheck_timeout: Duration::from_millis(500),
+            request_limits: None,
             directory,
             bearer_authenticator: None,
             internal_authenticator: None,
@@ -215,6 +294,13 @@ impl OopServeOptions {
         self
     }
 
+    /// Apply request limits to published gear routes.
+    #[must_use]
+    pub fn with_request_limits(mut self, limits: OopRequestLimits) -> Self {
+        self.request_limits = Some(limits);
+        self
+    }
+
     /// Install the tenant-plane authenticator (`security_context_middleware`).
     #[must_use]
     pub fn with_bearer_authenticator(mut self, auth: Option<DynBearerAuthenticator>) -> Self {
@@ -249,6 +335,7 @@ impl std::fmt::Debug for OopServeOptions {
             .field("drain_timeout", &self.drain_timeout)
             .field("heartbeat_interval", &self.heartbeat_interval)
             .field("healthcheck_timeout", &self.healthcheck_timeout)
+            .field("request_limits", &self.request_limits)
             .field("bearer_authenticator", &self.bearer_authenticator.is_some())
             .field(
                 "internal_authenticator",
@@ -520,22 +607,41 @@ async fn bootstrap_plane_gate(
     }
 }
 
-/// Derive the listener policy from [`OperationSpec::auth`].
-pub(super) fn route_auth_policy<S>(specs: impl IntoIterator<Item = S>) -> RouteAuthPolicy
-where
-    S: std::ops::Deref<Target = OperationSpec>,
-{
-    specs
-        .into_iter()
-        .map(|spec| (spec.method.clone(), spec.path.clone(), spec.auth))
-        .collect()
+type RouteTimeouts = HashMap<Method, HashMap<String, RouteTimeout>>;
+
+/// Operation policies for one publication of the gear router.
+#[derive(Debug, Default)]
+pub(super) struct OopRoutePolicy {
+    auth: RouteAuthPolicy,
+    timeouts: RouteTimeouts,
 }
 
-/// Layer policy, auth, drain guard and canonical errors. Probes stay on
-/// [`build_outer_router`] so they remain available during startup and drain.
+impl OopRoutePolicy {
+    pub(super) fn from_specs<S>(specs: impl IntoIterator<Item = S>) -> Self
+    where
+        S: std::ops::Deref<Target = OperationSpec>,
+    {
+        let mut policy = Self::default();
+        for spec in specs {
+            policy
+                .auth
+                .insert(spec.method.clone(), spec.path.clone(), spec.auth);
+            if spec.request_timeout != RouteTimeout::Inherit {
+                policy
+                    .timeouts
+                    .entry(spec.method.clone())
+                    .or_default()
+                    .insert(spec.path.clone(), spec.request_timeout);
+            }
+        }
+        policy
+    }
+}
+
+/// Probes stay on [`build_outer_router`] so they remain available during startup and drain.
 fn layer_gear_router(
     gear_router: Router,
-    route_auth: RouteAuthPolicy,
+    policy: OopRoutePolicy,
     tenant_plane: TenantPlane,
     drain_guard: DrainGuard,
     options: &OopServeOptions,
@@ -547,52 +653,108 @@ fn layer_gear_router(
     // before that can happen for a declared tenant operation.
     let gear = layer_route_auth_with(
         gear_router,
-        route_auth,
+        policy.auth,
         tenant_plane,
         options.internal_authenticator.clone(),
     );
-    layer_serving(gear, drain_guard)
+    layer_serving(gear, drain_guard, options, policy.timeouts)
 }
 
-/// The layers every served gear router gets outside its auth stack: drain guard,
-/// canonical errors and the trace context.
-fn layer_serving(mut gear: Router, drain_guard: DrainGuard) -> Router {
-    // Drain guard sits just inside the canonical-error layer: it rejects new
-    // requests while draining and tracks the in-flight count (catching handler
-    // panics so the counter can never leak and stall the drain).
-    gear = gear.layer(from_fn_with_state(drain_guard, drain_guard_middleware));
+/// Assemble the gear ingress layers shared by early and final route publication.
+fn layer_serving(
+    gear: Router,
+    drain_guard: DrainGuard,
+    options: &OopServeOptions,
+    timeouts: RouteTimeouts,
+) -> Router {
+    let drain = from_fn_with_state(drain_guard, drain_guard_middleware);
+    let gear = match options.request_limits {
+        Some(limits) => {
+            let body_limit = limits.body_limit_bytes();
+            let deadlines = Arc::new(RequestDeadlines {
+                default: limits.request_timeout(),
+                timeouts,
+            });
+            // Both layers use the same cap so opting in can raise Axum's extractor default.
+            gear.layer(DefaultBodyLimit::max(body_limit))
+                .layer(RequestBodyLimitLayer::new(body_limit))
+                .layer(drain)
+                .layer(from_fn_with_state(deadlines, RequestDeadlines::apply))
+        }
+        None => gear.layer(drain),
+    };
 
-    // Canonical-error middleware post-processes every gear/auth response into
-    // `problem+json` with `trace_id` / `instance` filled — matching the
-    // in-process (`api-gateway`) path.
-    gear = gear.layer(from_fn(canonical_error_middleware));
-
-    // Trace-context layer is the *outermost* gear layer so its `http_request`
-    // span is active for every inner layer, including the canonical-error layer
-    // that resolves the wire `trace_id` and emits the log line.
-    gear.layer(from_fn(trace_context_middleware))
+    // Canonical errors use the outer request span to fill the wire trace ID.
+    gear.layer(from_fn(canonical_error_middleware))
+        .layer(from_fn(trace_context_middleware))
 }
 
-/// Run every gear request inside an `http_request` span that continues the
-/// caller's W3C trace when the inbound `traceparent` carries one.
-///
-/// Without this an `OoP` gear's request span is a fresh root, so the canonical-
-/// error layer would put the caller's inbound trace id on the wire while the
-/// gear's own log lines carried a different, freshly-minted one. Seeding the
-/// parent makes the span's trace id equal the inbound one, so the wire
-/// `trace_id` and the log-correlation splice agree. (`api-gateway` does the same
-/// in-process via its own `TraceLayer`.)
+#[resource_error(gts_id!("cf.core.http.request.v1~"))]
+struct RequestDeadlineError;
+
+struct RequestDeadlines {
+    default: Duration,
+    timeouts: RouteTimeouts,
+}
+
+impl RequestDeadlines {
+    fn resolve(&self, request: &Request) -> Option<Duration> {
+        let declared = request
+            .extensions()
+            .get::<MatchedPath>()
+            .and_then(|path| self.timeouts.get(request.method())?.get(path.as_str()));
+        match declared {
+            Some(RouteTimeout::Custom(timeout)) => Some(*timeout),
+            Some(RouteTimeout::Disabled) => None,
+            Some(RouteTimeout::Inherit) | None => Some(self.default),
+        }
+    }
+
+    async fn apply(State(deadlines): State<Arc<Self>>, request: Request, next: Next) -> Response {
+        let Some(timeout) = deadlines.resolve(&request) else {
+            return next.run(request).await;
+        };
+        // Expiry drops the request future and releases its drain guard.
+        match tokio::time::timeout(timeout, next.run(request)).await {
+            Ok(response) => response,
+            Err(_) => RequestDeadlineError::deadline_exceeded(format!(
+                "Request exceeded {timeout:?} timeout"
+            ))
+            .create()
+            .into_response(),
+        }
+    }
+}
+
+tokio::task_local! {
+    static INBOUND_TRACEPARENT: Option<HeaderValue>;
+}
+
+/// Forward the current `OoP` request's single valid inbound `traceparent`
+/// when the outbound headers lack a parent from the active span or caller.
+pub fn inject_inbound_traceparent(headers: &mut HeaderMap) {
+    if !headers.contains_key(TRACEPARENT)
+        && let Ok(Some(parent)) = INBOUND_TRACEPARENT.try_with(Clone::clone)
+    {
+        headers.insert(TRACEPARENT, parent);
+    }
+}
+
+/// Scope the caller's correlation headers to the gear request. Its span
+/// records the wire trace ID even when no tracing provider is installed.
 async fn trace_context_middleware(req: Request, next: Next) -> Response {
     use tracing::Instrument as _;
     use tracing::field::Empty;
 
-    // Record the inbound `x-request-id` — the edge-minted id, forwarded
-    // hop-to-hop by the gateway proxy and by `toolkit-http` clients, absent
-    // when the gear is reached without one — and the wire `trace_id` /
-    // `parent.trace_id` on the span, so an OoP gear's log lines join to the
-    // gateway access log and the wire trace even with the text console format,
-    // without OTel, or with the log-correlation splice off. This gear does not
-    // mint one.
+    let mut parents = req.headers().get_all(TRACEPARENT).iter();
+    let inbound = parents
+        .next()
+        .filter(|value| {
+            parents.next().is_none()
+                && value.len() == 55
+                && value.to_str().ok().and_then(parse_trace_id).is_some()
+        })
+        .cloned();
     let request_id = toolkit_trace_context::extract_request_id(req.headers());
 
     let span = tracing::info_span!(
@@ -604,14 +766,11 @@ async fn trace_context_middleware(req: Request, next: Next) -> Response {
         parent.trace_id = Empty,
     );
 
-    // Seed the span's parent from the inbound W3C trace context and record
-    // `trace_id` / `parent.trace_id`. Shared with the api-gateway via
-    // `toolkit_trace_context`; without `otel` it records the ids from the header.
     toolkit_trace_context::set_parent_from_headers(&span, req.headers());
 
-    // Install the edge request id as the task-local carrier so outbound
-    // `toolkit-http` calls (generated contract clients) forward it.
-    toolkit_trace_context::with_request_id(request_id, next.run(req).instrument(span)).await
+    let request =
+        toolkit_trace_context::with_request_id(request_id, next.run(req).instrument(span));
+    INBOUND_TRACEPARENT.scope(inbound, request).await
 }
 
 // ---------------------------------------------------------------------------
@@ -960,21 +1119,26 @@ impl OopHttpServer {
         &mut self,
         gear_router: Router,
         openapi_json: String,
-        route_auth: RouteAuthPolicy,
+        policy: OopRoutePolicy,
     ) {
         // The outer gate blocks tenant calls. Keep anonymous contexts anonymous,
         // even with `auth_disabled`; install tenant auth with the final routes.
         let authenticated = layer_route_auth_with(
             gear_router,
-            route_auth.clone(),
+            policy.auth.clone(),
             TenantPlane::Absent,
             self.options.internal_authenticator.clone(),
         );
         let gated = authenticated.layer(from_fn_with_state(
-            Arc::new(route_auth),
+            Arc::new(policy.auth),
             bootstrap_plane_gate,
         ));
-        let layered = layer_serving(gated, self.drain_guard.clone());
+        let layered = layer_serving(
+            gated,
+            self.drain_guard.clone(),
+            &self.options,
+            policy.timeouts,
+        );
         self.late.publish(layered, Arc::from(openapi_json));
         tracing::info!(
             gear = %self.options.gear_name,
@@ -982,7 +1146,7 @@ impl OopHttpServer {
         );
     }
 
-    /// Atomically publish the composed gear routes (with auth policy) and their
+    /// Atomically publish the composed gear routes with their listener policy and
     /// `OpenAPI` document on the bound listener, replacing the bootstrap
     /// routes, and mark startup complete.
     ///
@@ -996,14 +1160,14 @@ impl OopHttpServer {
         &mut self,
         gear_router: Router,
         openapi_json: String,
-        route_auth: RouteAuthPolicy,
+        policy: OopRoutePolicy,
     ) -> anyhow::Result<()> {
         // A declared operation whose plane has no validator would refuse every request;
         // stop here, before serving, and say why.
-        self.check_route_auth(&route_auth)?;
+        self.check_route_auth(&policy.auth)?;
         let layered = layer_gear_router(
             gear_router,
-            route_auth,
+            policy,
             self.options.tenant_plane(),
             self.drain_guard.clone(),
             &self.options,

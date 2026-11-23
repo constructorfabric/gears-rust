@@ -191,7 +191,7 @@ jobs:
     runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     # PR runs take about 30 minutes, but a manual run on main on 2026-11-26
     # needed more than 45 and was cut off in its last suite.
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     steps:
       - name: Checkout
@@ -344,6 +344,16 @@ jobs:
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker-pg.xml -o junit_suite_name=e2e-event-broker-pg"
         run: tools/scripts/with_rust_annotations.sh make e2e-event-broker-pg
+
+      - name: Run event-broker split-process Rust tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-event-broker-cutover
+
+      - name: Run current-source event-broker cutover tests
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker-remote.xml -o junit_suite_name=e2e-event-broker-remote"
+        run: tools/scripts/with_rust_annotations.sh make test-event-broker-cutover-current
 
       # pytest records the assertion but not where it failed; take that from
       # the traceback so the report can annotate the test's source line.

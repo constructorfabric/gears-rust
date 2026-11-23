@@ -2,16 +2,10 @@
 //! Dispatcher/Reaper per deployment mode (the Deployment Modes table of
 //! `DESIGN.md` "4.1 Deployment Modes"; `docs/ADR/0007-service-decomposition.md`).
 //!
-//! `init` resolves and stores the configured [`DeploymentMode`], whose
-//! `*_active()` predicates report which services/routes *should* exist for
-//! that mode. Dispatcher forwarding routes register when
-//! `dispatcher_active()` (`eb-dispatcher-routing`); ingest/delivery service
-//! construction happens in `register_rest()` against the real `Storage`
-//! (eb-single-process-implementation D2 risk mitigation - `InMemoryDomainRepo`
-//! is gone). `serve()` self-registers with `DirectoryService` in
-//! `cluster_ingest`/`cluster_delivery` mode (design.md D4/D5), starts the
-//! ingest outbox pipeline (design.md D5) whenever `ingest_active()`, and
-//! otherwise starts no background work.
+//! [`DeploymentMode`] determines the REST routes and workers. Embedded
+//! ingest and delivery cluster roles register with `DirectoryService`.
+//! A host that owns directory presence supplies
+//! [`ExternallyManagedDirectoryPresence`] before initialization.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
@@ -30,7 +24,10 @@ use toolkit::directory::{
     DirectoryClient, DirectoryNotFound, RegisterInstanceInfo, ServiceEndpoint,
 };
 use toolkit::runtime::PresenceManager;
-use toolkit::{DatabaseCapability, Gear, GearCtx, Healthcheck, RestApiCapability};
+use toolkit::{
+    DatabaseCapability, Gear, GearCtx, Healthcheck, HealthcheckResult, HealthcheckStatus,
+    RestApiCapability,
+};
 use toolkit_db::outbox::{Outbox, Partitions};
 use uuid::Uuid;
 
@@ -126,6 +123,12 @@ fn registry_to_build(
     deployment.zip(mode.backend_role())
 }
 
+/// Signals that the process host owns the broker's directory presence lifecycle.
+///
+/// The host registers this marker locally in the client hub before gear initialization.
+#[derive(Debug)]
+pub struct ExternallyManagedDirectoryPresence;
+
 #[toolkit::consumes(contract = [
     authz_resolver_sdk::AuthZResolverApi(from = "authz-resolver"),
     types_registry_sdk::PlatformTypesRegistryApi(from = "types-registry"),
@@ -134,7 +137,8 @@ fn registry_to_build(
     name = "event-broker",
     deps = [],
     capabilities = [db, rest, stateful],
-    lifecycle(entry = "serve", stop_timeout = "30s")
+    lifecycle(entry = "serve", stop_timeout = "30s"),
+    gts_publication(crates = [event_broker_sdk]),
 )]
 #[derive(Default)]
 pub struct EventBrokerModule {
@@ -194,9 +198,7 @@ pub struct EventBrokerModule {
 impl Gear for EventBrokerModule {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         let cfg: EventBrokerConfig = ctx.config()?;
-        // Checked before anything is wired, so a configuration that breaks a
-        // startup rule fails at startup rather than after half the gear is
-        // built (feature 0005 §2.4).
+        // Check deployment rules before wiring any services (feature 0005 §2.4).
         let deployment = crate::config::checks::check(&cfg, cfg.mode)?;
         self.config
             .set(cfg.clone())
@@ -207,10 +209,8 @@ impl Gear for EventBrokerModule {
         self.client_hub
             .set(ctx.client_hub())
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
-        if matches!(
-            cfg.mode,
-            DeploymentMode::ClusterIngest | DeploymentMode::ClusterDelivery
-        ) {
+        if self.embedded_directory_role(cfg.mode).is_some() {
+            // Reject an unroutable embedded endpoint before any workers start.
             let bound_addr: SocketAddr =
                 cfg.registration.listen_addr.parse().with_context(|| {
                     format!(
@@ -218,10 +218,6 @@ impl Gear for EventBrokerModule {
                         cfg.registration.listen_addr
                     )
                 })?;
-            // Fail fast at startup rather than only once `serve()` actually
-            // registers (design.md D5) - the resolved address itself is
-            // discarded; `register_self()` recomputes it (a pure, cheap
-            // string operation, not worth caching across the two calls).
             ConfigAdvertiseAddress {
                 config: &cfg.registration,
             }
@@ -237,8 +233,6 @@ impl Gear for EventBrokerModule {
             .set(cfg.streaming)
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
-        // Built here, not in `register_rest()` or `serve()`, because both of
-        // them need this exact instance - see the field comment.
         self.topics
             .set(crate::infra::wiring::build_topic_manager(&cfg.loader))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
@@ -265,15 +259,8 @@ impl Gear for EventBrokerModule {
             .set(Arc::clone(&db))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
-        // eb-single-process-implementation D1: the actual cache-table
-        // populate (`infra::specification::bulk_load`) happens later, in
-        // `serve()` - see the comment at the start of `start_workers` for
-        // why. The manager is usable immediately either way: `get_topic`/etc. query
-        // the gear-database cache table directly on every call, so handing
-        // services this not-yet-loaded manager now is safe as long as the
-        // table is populated before any real request can reach them
-        // (guaranteed: REST traffic doesn't arrive until the start phase,
-        // `serve()`'s own phase, completes).
+        // The manager reads the cache table on each lookup. Initial population
+        // runs in `serve()`, when the types registry proxy is available.
         let spec_manager: Arc<dyn crate::domain::specification::SpecificationManager> = Arc::new(
             crate::infra::specification::TypesRegistrySpecificationManager::new(Arc::clone(&db)),
         );
@@ -281,18 +268,8 @@ impl Gear for EventBrokerModule {
             .set(Arc::clone(&spec_manager))
             .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
 
-        // Each storage backend comes from a plugin, built through its provider
-        // the way the cluster gear builds a cache backend from a cache
-        // provider. The gear knows only the `backend::Backend` trait behind
-        // it, so each backend brings its own storage and its own retention.
-        //
-        // The storage each opens is its own. The database resolved above keeps
-        // ingest and delivery metadata - cursors, consumer groups, producers,
-        // the specification cache, topic bindings, the ingest outbox and its
-        // identity - and the event log is not among them.
-        //
-        // `cluster_dispatcher` reads and writes no event: it builds no backend,
-        // and its `backends` stay empty.
+        // Providers own event log storage and retention. The gear database
+        // holds ingest and delivery metadata.
         if let Some((deployment, role)) = registry_to_build(deployment, cfg.mode) {
             self.outbox_partitions
                 .set(deployment.outbox_partitions)
@@ -312,12 +289,8 @@ impl Gear for EventBrokerModule {
                 .map_err(|_| anyhow::anyhow!("{} module already initialized", Self::MODULE_NAME))?;
         }
 
-        // eb-single-process-implementation D2 risk mitigation: the real
-        // `Storage`, wired against the same `db` and `spec_manager`. Its
-        // `ClusterCacheV1` (backing the routing markers) is deliberately NOT
-        // resolved here - the cluster's backends are available only once the
-        // *start* phase has begun, so `serve()` wires it in. See
-        // `Storage::set_cache`.
+        // `serve()` attaches the routing marker cache once cluster backends
+        // are available in the start phase.
         self.storage
             .set(Arc::new(Storage::new(
                 db,
@@ -485,22 +458,12 @@ impl RestApiCapability for EventBrokerModule {
         Ok(router.layer(Extension(state)))
     }
 
-    /// Holds `/readyz` at `503` until `serve()` has wired the handles this
-    /// instance's roles need.
+    /// Keeps `/readyz` at `503` until the role's storage is wired and the
+    /// cluster requirements are satisfied.
     ///
-    /// Without it the platform advertises the pod the instant the start phase
-    /// *spawns* `serve()`, while `start_workers` is still resolving the
-    /// cluster cache and starting the outbox - so a publish can land on a pod
-    /// that reports itself ready and get a `503` from the storage facade.
-    ///
-    /// Captures the `Storage` rather than the handles themselves: it is
-    /// collected in the REST phase, a phase before either exists, and reads
-    /// them through `Storage`'s own `OnceLock`s at check time.
-    ///
-    /// Returning `None` would opt the gear out of readiness altogether, so the
-    /// unreachable no-`init` arm still yields a verdict - `Starting`, the
-    /// fail-safe direction - rather than reporting a pod with no storage ready.
-    fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
+    /// REST collects this check before `serve()` installs the role's
+    /// handles. Holding `Storage` lets each probe see the current wiring.
+    fn healthcheck(&self, ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
         let (Some(storage), Some(mode)) = (self.storage.get(), self.mode.get()) else {
             tracing::error!(
                 module = Self::MODULE_NAME,
@@ -508,10 +471,30 @@ impl RestApiCapability for EventBrokerModule {
             );
             return Some(Arc::new(NotInitialised));
         };
-        Some(Arc::new(EventBrokerReadiness::new(
-            Arc::clone(storage),
-            *mode,
-        )))
+        Some(Arc::new(EventBrokerModuleReadiness {
+            storage: EventBrokerReadiness::new(Arc::clone(storage), *mode),
+            cluster: cluster_sdk::cluster_readiness(ctx.client_hub()),
+        }))
+    }
+}
+
+struct EventBrokerModuleReadiness {
+    storage: EventBrokerReadiness,
+    cluster: Arc<dyn Healthcheck>,
+}
+
+#[async_trait]
+impl Healthcheck for EventBrokerModuleReadiness {
+    fn name(&self) -> &'static str {
+        self.storage.name()
+    }
+
+    async fn check(&self) -> HealthcheckResult {
+        let storage = self.storage.check().await;
+        if storage.status == HealthcheckStatus::Unhealthy {
+            return storage;
+        }
+        self.cluster.check().await
     }
 }
 
@@ -534,24 +517,15 @@ impl Healthcheck for NotInitialised {
 impl EventBrokerModule {
     /// Background lifecycle entry point (`lifecycle(entry = "serve")`).
     ///
-    /// Every background task this gear runs - specification refresh, the ingest
-    /// outbox pipeline, the delivery loader, and directory presence -
-    /// is one supervised worker in a single [`Supervisor`], keyed on a child of
-    /// the lifecycle token. `start_workers` registers exactly the workers the
-    /// [`DeploymentMode`] calls for; `supervise` then blocks until the first
-    /// worker returns for any reason (a clean cancel, an error, or a panic),
-    /// cancels the child token to bring the rest down, drains them, and returns
-    /// the first non-success outcome. So cancellation or any worker's fatal exit
-    /// tears the whole set down together, and no partially-started set is ever
-    /// leaked: if a `start_*` fails midway, `shutdown` cancels and drains
-    /// whatever already started.
+    /// One [`Supervisor`] owns the role's workers. It cancels and drains them
+    /// together after a worker exits or startup fails. The child token keeps
+    /// worker shutdown independent of the host lifecycle token.
     ///
-    /// Directory presence is just another worker: in `cluster_ingest`/
-    /// `cluster_delivery` it registers with `DirectoryService` (register-on-start
-    /// awaited so a failure is fatal), keeps its registration renewed until
-    /// cancelled, and deregisters on shutdown; in `standalone`/`cluster_dispatcher`
-    /// it is a bare cancel-gate that keeps the set non-empty so `serve()` blocks
-    /// until cancellation.
+    /// Embedded ingest and delivery cluster roles register before supervision
+    /// starts, renew their registrations until cancellation, and deregister on shutdown.
+    /// A registration failure drains the workers already started. In other
+    /// cases a cancel gate keeps the set non-empty, including a dispatcher
+    /// with no other workers.
     pub(crate) async fn serve(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         let mode = *self
             .mode
@@ -620,37 +594,42 @@ impl EventBrokerModule {
             self.start_subscription_sweeper(sup)?;
         }
 
-        // Registered last, so the instance advertises itself only once its
+        // Embedded presence starts last so peers see the endpoint once its
         // workers are up.
         self.start_directory_presence(sup, mode).await
     }
 
-    /// Registers directory presence as one supervised worker.
+    fn embedded_directory_role(&self, mode: DeploymentMode) -> Option<&'static str> {
+        let role = match mode {
+            DeploymentMode::ClusterIngest => "event-broker-ingest",
+            DeploymentMode::ClusterDelivery => "event-broker-delivery",
+            DeploymentMode::Standalone | DeploymentMode::ClusterDispatcher => return None,
+        };
+        if self.client_hub.get().is_some_and(|hub| {
+            hub.try_get_local::<ExternallyManagedDirectoryPresence>()
+                .is_some()
+        }) {
+            return None;
+        }
+        Some(role)
+    }
+
+    /// Keeps one supervised worker alive until cancellation.
     ///
-    /// In `cluster_ingest`/`cluster_delivery` it registers with
-    /// `DirectoryService` (register-on-start awaited, so a failure is fatal and
-    /// tears down the workers that already started), heartbeats until the child
-    /// token fires, and deregisters on shutdown. In `standalone`/
-    /// `cluster_dispatcher` there is no directory, so the worker is a bare
-    /// cancel-gate: it keeps the set non-empty - a dispatcher has no other
-    /// workers - so `serve()` blocks until cancellation instead of returning
-    /// against an empty set.
+    /// The cancel gate keeps the dispatcher running even when its worker set
+    /// is otherwise empty. Host-managed roles use the same gate.
     async fn start_directory_presence(
         &self,
         sup: &mut Supervisor,
         mode: DeploymentMode,
     ) -> anyhow::Result<()> {
-        let gear_name = match mode {
-            DeploymentMode::ClusterIngest => "event-broker-ingest",
-            DeploymentMode::ClusterDelivery => "event-broker-delivery",
-            DeploymentMode::Standalone | DeploymentMode::ClusterDispatcher => {
-                let token = sup.cancel().clone();
-                sup.spawn("cancel-gate", async move {
-                    token.cancelled().await;
-                    Ok(())
-                });
-                return Ok(());
-            }
+        let Some(gear_name) = self.embedded_directory_role(mode) else {
+            let token = sup.cancel().clone();
+            sup.spawn("cancel-gate", async move {
+                token.cancelled().await;
+                Ok(())
+            });
+            return Ok(());
         };
 
         let (directory, presence, info) = self.register_self(gear_name).await?;

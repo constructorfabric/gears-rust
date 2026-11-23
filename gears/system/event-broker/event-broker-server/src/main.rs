@@ -1,24 +1,27 @@
-//! Standalone-mode event-broker binary (eb-single-process-implementation
-//! design.md D7): the real production `DeploymentMode::Standalone` deployable,
-//! not a test fixture. Mirrors `apps/cf-gears-example-server`'s CLI shape
-//! (`toolkit::bootstrap`), scoped to exactly the gears standalone mode needs.
-//!
-//! A separate crate from the `cf-gears-event-broker` library on purpose: a gear
-//! self-registers in every binary linking it, so keeping the `cluster`/
-//! `api-gateway`/`authn`/`authz`/`types-registry` composition here keeps the
-//! library gear-free.
+//! Event Broker executable with process-owned cluster coordination.
 
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        unused_imports,
+        reason = "the cluster_memory integration target consumes the private backend test hooks"
+    )
+)]
+mod cluster_memory;
+/// Offline validation and runtime client wiring for the Event Broker process.
+mod composition;
+#[cfg(feature = "e2e-flight-control")]
+mod flight_control_auth;
 mod registered_gears;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use toolkit::bootstrap::{AppConfig, run_server};
+use toolkit::bootstrap::{OopRunOptions, oop::oop_publication_config, run_oop_with_composition};
 
 #[derive(Parser)]
-#[command(name = "cf-gears-event-broker-server")]
-#[command(about = "Event Broker - standalone-mode deployment")]
-#[command(version = env!("CARGO_PKG_VERSION"))]
+#[command(name = "cf-gears-event-broker-server", about = "Event Broker", version)]
 struct Cli {
     /// Path to configuration file
     #[arg(short, long)]
@@ -28,6 +31,11 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Authenticate tenant requests with the local test flight-control process.
+    #[cfg(feature = "e2e-flight-control")]
+    #[arg(long)]
+    e2e_flight_control: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -36,19 +44,33 @@ struct Cli {
 enum Commands {
     /// Start the server
     Run,
-    /// Do nothing (config/wiring validation only)
+    /// Validate the effective broker configuration offline
     Check,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    let mut config = AppConfig::load_or_default(cli.config.as_ref())?;
-    config.apply_cli_overrides(cli.verbose);
-
-    match cli.command {
-        None | Some(Commands::Run) => run_server(config).await,
-        Some(Commands::Check) => Ok(()),
+    let mut options = OopRunOptions {
+        gear_name: "event-broker".to_owned(),
+        verbose: cli.verbose,
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+        ..OopRunOptions::default()
+    };
+    if let Some(config) = cli.config {
+        options.config_path = Some(config);
     }
+    if matches!(cli.command, Some(Commands::Check)) {
+        composition::check(&oop_publication_config(&options)?)?;
+        return Ok(());
+    }
+    #[cfg(feature = "e2e-flight-control")]
+    if cli.e2e_flight_control {
+        return Ok(Box::pin(run_oop_with_composition(options, composition::compose_e2e)).await?);
+    }
+    Ok(Box::pin(run_oop_with_composition(
+        options,
+        composition::compose_production,
+    ))
+    .await?)
 }

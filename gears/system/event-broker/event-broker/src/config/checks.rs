@@ -1,12 +1,9 @@
 //! Configuration-level startup checks (feature 0005 section 2.4). Any failure stops
 //! the process from starting.
 //!
-//! The sections they read are held as written, as plain strings, so every
-//! rule is enforced here rather than half of them inside `serde`: a failure
-//! then always names the section, the rule it broke and what the rule
-//! requires, in one shape. A failure reproduces only names that passed
-//! validation - a registry name, a routing key that parsed as a GTS
-//! identifier - and never a settings value or an unvalidated key.
+//! Startup failures name the field and the rule it broke. Diagnostics include
+//! registry names and GTS routing keys after validation. Process diagnostics
+//! identify the rejected field using a fixed path.
 //!
 //! C1 and C2 need the linked providers and are enforced where the registry is
 //! built, `crate::infra::backend::Registry::build`. C10's half on the gear's
@@ -19,7 +16,7 @@ use event_broker_sdk::gts::TopicV1;
 use sea_orm::DbBackend;
 use toolkit_gts::GtsSchema;
 
-use super::{BackendEntry, DeploymentMode, EventBrokerConfig};
+use super::{BackendEntry, DeploymentMode, EventBrokerConfig, ProcessClusterConfig, ProcessConfig};
 use crate::domain::backend::{self, Routing};
 use crate::domain::outbox::{INGEST_QUEUE_NAME, OutboxPartitions};
 
@@ -69,6 +66,26 @@ pub struct Deployment {
 /// A startup check that failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
+    /// Process-local cluster state only serves a standalone broker.
+    #[error("process.cluster.mode must be remote for distributed deployment modes")]
+    MemoryProcessOutsideStandalone,
+
+    /// The configured number of memory profiles falls outside the supported range.
+    #[error("process.cluster.profiles must contain 1 to 64 names")]
+    MemoryProcessProfileCount,
+
+    /// A profile name appears more than once.
+    #[error("process.cluster.profiles must contain unique names")]
+    DuplicateMemoryProcessProfile,
+
+    /// A memory profile name fails the Cluster SDK's name rule.
+    #[error("process.cluster.profiles must use names matching {rule}", rule = cluster_sdk::CLUSTER_NAME_RULE)]
+    InvalidMemoryProcessProfile,
+
+    /// The memory backend needs a positive expiry sweep interval.
+    #[error("process.cluster.sweep_interval must be positive")]
+    ZeroMemoryProcessSweepInterval,
+
     /// Feature 0005 §2.1. The key itself is not reproduced: it failed
     /// validation, so nothing proves it is safe to print.
     #[error(
@@ -150,13 +167,56 @@ pub enum Error {
     ScopeTtlTooShort { ttl_secs: u32, deadline_secs: u32 },
 }
 
+impl EventBrokerConfig {
+    /// Validates process options before the selected cluster client can start.
+    ///
+    /// # Errors
+    ///
+    /// Memory requires standalone mode, 1 through 64 unique Cluster SDK profile
+    /// names and a positive sweep interval.
+    pub fn check_process(&self, mode: DeploymentMode) -> Result<(), Error> {
+        let Some(ProcessConfig {
+            cluster:
+                ProcessClusterConfig::Memory {
+                    profiles,
+                    sweep_interval,
+                },
+        }) = &self.process
+        else {
+            return Ok(());
+        };
+
+        if mode != DeploymentMode::Standalone {
+            return Err(Error::MemoryProcessOutsideStandalone);
+        }
+        if !(1..=64).contains(&profiles.len()) {
+            return Err(Error::MemoryProcessProfileCount);
+        }
+        let mut unique_profiles = BTreeSet::new();
+        for profile in profiles {
+            if !cluster_sdk::is_valid_cluster_name(profile) {
+                return Err(Error::InvalidMemoryProcessProfile);
+            }
+            if !unique_profiles.insert(profile) {
+                return Err(Error::DuplicateMemoryProcessProfile);
+            }
+        }
+        if sweep_interval.is_zero() {
+            return Err(Error::ZeroMemoryProcessSweepInterval);
+        }
+        Ok(())
+    }
+}
+
 /// Runs every configuration-level check this instance's role is subject to.
 ///
 /// `None` for `cluster_dispatcher`: it holds no registry and no routing, so
 /// it carries the sections without being subject to their rules.
 ///
 /// # Errors
-/// The first rule the configuration breaks, checked in this order: in the
+///
+/// Process options are checked first in every role. The first remaining
+/// rule the configuration breaks, checked in this order: in the
 /// ingest-serving modes (`standalone` and `cluster_ingest`), the
 /// synchronous-publish cap ([`MAX_PUBLISH_WAIT_SECS`]); in the
 /// delivery-serving modes (`standalone` and `cluster_delivery`), the consume
@@ -169,6 +229,7 @@ pub enum Error {
 ///
 /// [`StreamingConfig::outlasts_refresh_lead`]: super::StreamingConfig::outlasts_refresh_lead
 pub fn check(cfg: &EventBrokerConfig, mode: DeploymentMode) -> Result<Option<Deployment>, Error> {
+    cfg.check_process(mode)?;
     if mode.backend_role().is_none() {
         return Ok(None);
     }

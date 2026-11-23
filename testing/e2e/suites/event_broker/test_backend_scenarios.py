@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import uuid
 from datetime import datetime, timezone
 
@@ -25,12 +26,16 @@ import pytest
 
 from .conftest import (
     API_BASE,
+    BACKEND,
+    DEFAULT_SUBJECT_ID,
+    DEFAULT_TENANT_ID,
     EVENT_TYPE_FRESH,
     EVENT_TYPE_ORDER,
     EVENT_TYPE_BYTES,
     EVENT_TYPE_DRAIN,
     EVENT_TYPE_RETENTION,
     EVENT_TYPE_SLOW_PUBLISH,
+    REQUEST_TIMEOUT,
     RETENTION_DURATION_S,
     RETENTION_SEGMENT_EVENTS,
     SUBJECT_TYPE,
@@ -44,28 +49,76 @@ from .conftest import (
     TRACE_ID,
     SseFrameReader,
 )
+from .test_consumer_subscriptions import _created_subscription_id
 
 
-async def _subscribe(client, topic: str, interests: list[dict]) -> str:
+async def _subscribe(client, topic: str, interests: list[dict], partitions=range(1)) -> str:
     group = await client.post("/consumer-groups")
-    assert group.status_code == 201
+    assert (group.status_code, group.headers.get("content-type")) == (201, "application/json")
+    location = group.headers["location"]
+    group_prefix = f"{API_BASE}/consumer-groups/"
+    group_id = location.removeprefix(group_prefix)
+    gts_prefix = "gts.cf.core.events.consumer_group.v1~"
+    assert group_id.startswith(gts_prefix)
+    group_uuid = group_id.removeprefix(gts_prefix)
+    assert str(uuid.UUID(group_uuid)) == group_uuid
+    assert location == f"{group_prefix}{group_id}"
+    group_body = group.json()
+    assert isinstance(group_body, dict)
+    _stream_instant(group_body["created_at"])
+    assert group_body == {
+        "id": group_id,
+        "kind": "anonymous",
+        "tenant": DEFAULT_TENANT_ID,
+        "owner_principal": DEFAULT_SUBJECT_ID,
+        "description": None,
+        "created_at": group_body["created_at"],
+    }
+
     sub = await client.post(
         "/subscriptions",
-        json={"consumer_group": group.json()["id"], "client_agent": "e2e-test", "interests": interests},
+        json={"consumer_group": group_id, "client_agent": "e2e-test", "interests": interests},
     )
-    assert sub.status_code == 201
-    return sub.json()["id"]
+    assert (sub.status_code, sub.headers.get("content-type")) == (201, "application/json")
+    sub_id = _created_subscription_id(sub)
+    body = sub.json()
+    assert isinstance(body, dict)
+    _stream_instant(body["created_at"])
+    assert body == {
+        "id": sub_id,
+        "consumer_group": group_id,
+        "client_agent": "e2e-test",
+        "interests": [
+            {**interest, "barrier_mode": "respect", "filter": None, "unmatched_types": []}
+            for interest in interests
+        ],
+        "assigned": [{"topic": topic, "partition": p} for p in partitions],
+        "topology_version": 1,
+        "created_at": body["created_at"],
+    }
+    assert type(body["topology_version"]) is int
+    assert all(type(entry["partition"]) is int for entry in body["assigned"])
+    return sub_id
 
 
-def _event(event_type: str, tenant_id: str, n: int) -> dict:
+def _interest(topic: str, event_type: str, tenant_id: str = DEFAULT_TENANT_ID) -> dict:
     return {
-        "id": str(uuid.uuid4()),
+        "topic": topic,
+        "subject_tenant": tenant_id,
+        "ownership_filter": "entire_tenant",
+        "types": [event_type],
+    }
+
+
+def _event(case: int, event_type: str, n: int, tenant_id: str = DEFAULT_TENANT_ID) -> dict:
+    return {
+        "id": f"16e20000-0000-4000-8000-{case:02d}{tenant_id[-4:]}{n:06d}",
         "type": event_type,
         "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": f"s{n}",
         "subject_type": SUBJECT_TYPE,
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "occurred_at": "2026-01-19T10:20:30.123456789Z",
         "data": {"n": n},
     }
 
@@ -74,48 +127,78 @@ def _event(event_type: str, tenant_id: str, n: int) -> dict:
 async def test_events_of_one_key_arrive_in_publish_order_from_one_partition(api, test_env):
     """feature 0007 §11 S1 - key order.
 
-    Events of two keys (the type partitions by tenant) are published
-    interleaved on a four-partition topic; each key's events are delivered in
-    publish order, all from one partition.
+    The type routes by subject_tenant, so the two interests select distinct
+    keys even if the backend maps them to the same partition.
     """
-    tenants = [str(uuid.uuid4()), str(uuid.uuid4())]
+    tenants = [DEFAULT_TENANT_ID, "00000000-0000-0000-0000-000000000004"]
+    partitions = range(4)
+    interests = [_interest(TOPIC_ORDER, EVENT_TYPE_ORDER, tenant) for tenant in tenants]
+    published = [
+        _event(23, EVENT_TYPE_ORDER, n, tenant)
+        for n in range(1, 4)
+        for tenant in tenants
+    ]
     async with api() as client:
-        sub_id = await _subscribe(
-            client,
-            TOPIC_ORDER,
-            [{"topic": TOPIC_ORDER, "subject_tenant": t, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_ORDER]} for t in tenants],
-        )
-        seek = await client.post(
-            f"/subscriptions/{sub_id}:seek",
-            json={
-                "topology_version": 1,
-                "positions": {TOPIC_ORDER: [{"partition": p, "value": "latest"} for p in range(4)]},
-            },
-        )
-        assert seek.status_code == 200
+        sub_id = await _subscribe(client, TOPIC_ORDER, interests, partitions)
+        seek = await _seek(client, sub_id, "latest", TOPIC_ORDER, partitions)
+        starts = _positions(seek, TOPIC_ORDER, partitions)
+        assert starts == {0: 0, 1: 0, 2: 0, 3: 0}
 
-    async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            await reader.await_kind("topology", timeout=5)
+        async with _stream(api, sub_id, TOPIC_ORDER, starts) as stream:
+            for event in published:
+                resp = await client.post("/events", json=event)
+                assert (resp.status_code, resp.headers.get("content-type"), resp.content) == (
+                    202, None, b"",
+                )
+            delivered = await stream.take(len(published), wait_s=10)
 
-            async with api() as publish_client:
-                for n in range(1, 4):
-                    for tenant in tenants:
-                        resp = await publish_client.post("/events", json=_event(EVENT_TYPE_ORDER, tenant, n))
-                        assert resp.status_code == 202
-
-            delivered = []
-            for _ in range(6):
-                body = await reader.await_kind("event", timeout=10)
-                payload = body["payload"]
-                delivered.append((payload["subject_tenant"], payload["partition"], payload["data"]["n"]))
+    by_id = {event["id"]: event for event in published}
+    for payload in delivered:
+        assert payload["id"] in by_id
+        event = by_id[payload["id"]]
+        partition = payload["partition"]
+        assert partition in partitions
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        assert payload == {
+            **event,
+            "occurred_at": payload["occurred_at"],
+            "trace_parent": None,
+            "partition": partition,
+            "sequence": payload["sequence"],
+            "sequence_time": payload["sequence_time"],
+        }
 
     for tenant in tenants:
-        mine = [(partition, n) for t, partition, n in delivered if t == tenant]
-        assert [n for _, n in mine] == [1, 2, 3], f"{tenant}: {mine}"
-        assert len({partition for partition, _ in mine}) == 1, f"{tenant} split over partitions: {mine}"
+        mine = [payload for payload in delivered if payload["subject_tenant"] == tenant]
+        assert [payload["data"]["n"] for payload in mine] == [1, 2, 3], mine
+        assert len({payload["partition"] for payload in mine}) == 1, mine
+    last = starts.copy()
+    for payload in delivered:
+        partition = payload["partition"]
+        assert payload["sequence"] > last[partition]
+        last[partition] = payload["sequence"]
+
+
+def _stream_instant(value: str) -> tuple[datetime, int]:
+    assert isinstance(value, str), value
+    assert re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",
+        value,
+    ), value
+    clock = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(microsecond=0)
+    return clock, int(value[:-1].partition(".")[2].ljust(9, "0"))
+
+
+async def _read_sse_event(reader: SseFrameReader, deadline: float) -> dict:
+    clock = asyncio.get_running_loop().time
+    while True:
+        remaining = deadline - clock()
+        assert remaining > 0, "no SSE event before the deadline"
+        name, frame = await reader.next_frame(timeout=remaining)
+        assert name == frame["kind"], (name, frame)
+        if name == "event":
+            return frame
+        assert name == "heartbeat", frame
 
 
 @pytest.mark.backend_sensitive
@@ -126,266 +209,373 @@ async def test_a_consumer_joined_before_any_publish_receives_the_first_event(api
     earliest; the seek resolves to 0 and the first event published afterwards
     is delivered as sequence 1.
     """
-    tenant_id = str(uuid.uuid4())
-    async with api() as client:
-        sub_id = await _subscribe(
-            client,
-            TOPIC_FRESH,
-            [{"topic": TOPIC_FRESH, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_FRESH]}],
+    topic = TOPIC_FRESH
+    position = "earliest"
+    interests = [
+        {
+            "topic": topic,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "ownership_filter": "entire_tenant",
+            "types": [EVENT_TYPE_FRESH],
+        },
+    ]
+    unmatched_types = [[]]
+    event = {
+        "id": "16e20000-0000-4000-8000-000000240001",
+        "type": EVENT_TYPE_FRESH,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "e2e-test",
+        "subject": "s1",
+        "subject_type": SUBJECT_TYPE,
+        "occurred_at": "2026-01-19T10:20:30Z",
+        "data": {"n": 1},
+    }
+
+    async with api() as client, api() as stream_client:
+        group = await client.post("/consumer-groups")
+        assert (group.status_code, group.headers.get("content-type")) == (
+            201, "application/json",
         )
+        group_prefix = f"{API_BASE}/consumer-groups/"
+        group_id = group.headers["location"].removeprefix(group_prefix)
+        assert group.headers["location"] == f"{group_prefix}{group_id}"
+        gts_prefix = "gts.cf.core.events.consumer_group.v1~"
+        assert group_id.startswith(gts_prefix)
+        group_uuid = group_id.removeprefix(gts_prefix)
+        assert str(uuid.UUID(group_uuid)) == group_uuid
+        group_read = await client.get(f"/consumer-groups/{group_id}")
+        assert (group_read.status_code, group_read.headers.get("content-type")) == (
+            200, "application/json",
+        )
+        group_body = group_read.json()
+        _stream_instant(group_body["created_at"])
+        expected_group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": group_body["created_at"],
+        }
+        assert group_body == group.json() == expected_group
+        join = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "e2e-test",
+                "interests": interests,
+            },
+        )
+        assert (join.status_code, join.headers.get("content-type")) == (201, "application/json")
+        sub_id = _created_subscription_id(join)
+        sub_read = await client.get(f"/subscriptions/{sub_id}")
+        assert (sub_read.status_code, sub_read.headers.get("content-type")) == (
+            200, "application/json",
+        )
+        sub_body = sub_read.json()
+        _stream_instant(sub_body["created_at"])
+        expected_interests = [
+            {**interest, "barrier_mode": "respect", "filter": None} for interest in interests
+        ]
+        expected_sub = {
+            "id": sub_id,
+            "consumer_group": group_id,
+            "client_agent": "e2e-test",
+            "interests": expected_interests,
+            "assigned": [{"topic": topic, "partition": 0}],
+            "topology_version": 1,
+            "created_at": sub_body["created_at"],
+        }
+        assert sub_body == expected_sub
+        assert join.json() == {
+            **expected_sub,
+            "interests": [
+                {**interest, "unmatched_types": unmatched}
+                for interest, unmatched in zip(expected_interests, unmatched_types, strict=True)
+            ],
+        }
         seek = await client.post(
             f"/subscriptions/{sub_id}:seek",
-            json={"topology_version": 1, "positions": {TOPIC_FRESH: [{"partition": 0, "value": "earliest"}]}},
+            json={
+                "topology_version": 1,
+                "positions": {topic: [{"partition": 0, "value": position}]},
+            },
         )
-        assert seek.status_code == 200
-        assert seek.json() == {"positions": {TOPIC_FRESH: [{"partition": 0, "value": 0}]}}
-
-    async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            topology = await reader.await_kind("topology", timeout=5)
+        assert (seek.status_code, seek.headers.get("content-type")) == (200, "application/json")
+        start = 0
+        assert seek.json() == {"positions": {topic: [{"partition": 0, "value": start}]}}
+        before = await client.get("/topics/segments", params={"topic": topic, "partition": 0})
+        assert (before.status_code, before.headers.get("content-type")) == (200, "application/json")
+        assert before.json() == {
+            "topic": topic,
+            "partition": 0,
+            "start_sequence": 0,
+            "end_sequence": 0,
+            "start_time": None,
+            "end_time": None,
+            "segments": [],
+        }
+        async with stream_client.stream(
+            "GET", "/events:sse", params={"subscription": sub_id},
+            headers={"Accept": "text/event-stream"},
+        ) as response:
+            assert (response.status_code, response.headers.get("content-type")) == (
+                200, "text/event-stream",
+            )
+            reader = SseFrameReader(response)
+            name, topology = await reader.next_frame(timeout=5)
+            assert name == "topology"
             assert topology == {
                 "kind": "topology",
                 "topology_version": 1,
-                "assigned": [{"topic": TOPIC_FRESH, "partition": 0, "offset": 0, "last_examined": 0}],
+                "assigned": [
+                    {"topic": topic, "partition": 0, "offset": start, "last_examined": start}
+                ],
             }
 
-            event = _event(EVENT_TYPE_FRESH, tenant_id, 1)
-            async with api() as publish_client:
-                resp = await publish_client.post("/events", json=event)
-                assert resp.status_code == 202
+            publish = await client.post("/events", json=event)
+            assert (publish.status_code, publish.content) == (202, b"")
+            deadline = asyncio.get_running_loop().time() + 10
+            frame = await _read_sse_event(reader, deadline)
+            assert set(frame) == {"kind", "payload"}, frame
 
-            payload = (await reader.await_kind("event", timeout=10))["payload"]
-            assert payload == {
-                "id": event["id"],
-                "type": EVENT_TYPE_FRESH,
-                "subject_tenant": tenant_id,
-                "source": "e2e-test",
-                "subject": "s1",
-                "subject_type": SUBJECT_TYPE,
-                "occurred_at": payload["occurred_at"],
-                "trace_parent": None,
-                "data": {"n": 1},
-                "partition": 0,
-                "sequence": 1,
-                "sequence_time": payload["sequence_time"],
-            }
+        after = await client.get("/topics/segments", params={"topic": topic, "partition": 0})
+    assert (after.status_code, after.headers.get("content-type")) == (200, "application/json")
+    manifest = after.json()
+    segments = manifest.pop("segments")
+    assert isinstance(segments, list)
+    assert manifest == {
+        "topic": topic,
+        "partition": 0,
+        "start_sequence": 1,
+        "end_sequence": 1,
+        "start_time": frame["payload"]["sequence_time"],
+        "end_time": frame["payload"]["sequence_time"],
+    }
+    if BACKEND == "memory":
+        assert segments == [{"start_sequence": 1, "end_sequence": 1, "event_count": 1}]
+        assert all(type(value) is int for value in segments[0].values())
+    payload = frame["payload"]
+    assert type(payload["sequence"]) is int
+    assert payload["sequence"] > 0
+    assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+    _stream_instant(payload["sequence_time"])
+    assert frame == {
+        "kind": "event",
+        "payload": {
+            **event,
+            "occurred_at": payload["occurred_at"],
+            "trace_parent": None,
+            "data": event.get("data"),
+            "partition": 0,
+            "sequence": 1,
+            "sequence_time": payload["sequence_time"],
+        },
+    }
 
 
-# How long a read waits for each next event. `POST /events` acks with 202
-# before the outbox has stored the event, so a read-back waits on the drain:
-# its rate is ~80 events/s on a debug build (1000 events stored over 12-15 s
-# locally, idle or at load average 100+), so consecutive events arrive tens of
-# milliseconds apart and 15 s only trips on a stream that has stopped.
 EVENT_WAIT_S = 15
 
 
 class _Stream:
-    """An open SSE stream on one subscription, read `count` events at a time."""
-
     def __init__(self, reader: SseFrameReader):
         self._reader = reader
+        self.started_at = None
+        self.first_event_at = None
 
-    async def take(self, count: int) -> list[dict]:
-        """The next `count` event payloads.
+    async def next_event(self, deadline: float) -> dict:
+        frame = await _read_sse_event(self._reader, deadline)
+        assert frame.keys() == {"kind", "payload"}, frame
+        payload = frame["payload"]
+        assert isinstance(payload, dict), payload
+        assert {"id", "occurred_at", "sequence_time", "sequence", "partition", "data"} <= (
+            payload.keys()
+        ), payload
+        assert type(payload["sequence"]) is int, payload
+        assert payload["sequence"] > 0, payload
+        assert type(payload["partition"]) is int, payload
+        assert isinstance(payload["data"], dict), payload
+        assert type(payload["data"].get("n")) is int, payload
+        _stream_instant(payload["sequence_time"])
+        return payload
 
-        A stream that stops short fails with what it did deliver - how many
-        events, the first and last sequence and `data.n`, and how long the read
-        ran - so a short read because events were removed before they were
-        read (`n` starts late or skips) is told apart from a stall.
-        """
-        loop = asyncio.get_running_loop()
-        started = loop.time()
+    async def take(self, count: int, wait_s: float = EVENT_WAIT_S) -> list[dict]:
+        clock = asyncio.get_running_loop().time
+        self.started_at = clock()
         events: list[dict] = []
         while len(events) < count:
             try:
-                events.append((await self._reader.await_kind("event", timeout=EVENT_WAIT_S))["payload"])
-            except (AssertionError, TimeoutError) as stalled:
+                events.append(await self.next_event(clock() + wait_s))
+            except (TimeoutError, httpx.ReadTimeout, StopAsyncIteration) as stalled:
                 raise AssertionError(
-                    f"{_short_read(events, count, loop.time() - started)} ({type(stalled).__name__}: {stalled})"
+                    f"{_short_read(events, count, clock() - self.started_at)} ({stalled})"
                 ) from stalled
+            if len(events) == 1:
+                self.first_event_at = clock()
         return events
 
     async def take_during(self, count: int, publishing) -> list[dict]:
-        """The next `count` event payloads, read while `publishing` runs.
-
-        Read concurrently, not once `publishing` is done: frames left unread
-        fill the socket buffers, the server then stops reading the backend, and
-        what it has not read yet keeps ageing as if no one were reading.
-
-        A plain task rather than a `TaskGroup`, so a failure surfaces as itself
-        and not as an `ExceptionGroup` that hides its message in the summary.
-        """
-        reading = asyncio.ensure_future(self.take(count))
+        # A reader stalled behind the publisher can miss events once they expire.
+        reading = asyncio.create_task(self.take(count))
+        writing = asyncio.create_task(publishing)
         try:
-            await publishing
-        except BaseException:
+            events, _ = await asyncio.gather(reading, writing)
+            return events
+        finally:
             reading.cancel()
-            with contextlib.suppress(BaseException):
-                await reading
-            raise
-        return await reading
+            writing.cancel()
+            await asyncio.gather(reading, writing, return_exceptions=True)
 
 
 @contextlib.asynccontextmanager
-async def _stream(test_env, sub_id: str):
-    """`sub_id`'s SSE stream, open once its topology frame has arrived.
-
-    Open it before publishing what it is to read back: it then delivers each
-    event as soon as the outbox stores it, so an event's age when read is the
-    stream's lag behind storage, not that plus however long the publish took.
-    """
-    async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            await reader.await_kind("topology", timeout=5)
+async def _stream(api, sub_id: str, topic: str, starts: dict[int, int]):
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, read=EVENT_WAIT_S)
+    async with api() as client:
+        async with client.stream(
+            "GET", "/events:sse", params={"subscription": sub_id},
+            headers={"Accept": "text/event-stream"}, timeout=timeout,
+        ) as response:
+            assert (response.status_code, response.headers.get("content-type")) == (
+                200, "text/event-stream",
+            )
+            reader = SseFrameReader(response)
+            name, topology = await reader.next_frame(timeout=5)
+            assert name == "topology"
+            assert topology == {
+                "kind": "topology",
+                "topology_version": 1,
+                "assigned": [
+                    {"topic": topic, "partition": p, "offset": offset, "last_examined": offset}
+                    for p, offset in starts.items()
+                ],
+            }
+            assert type(topology["topology_version"]) is int
+            for entry in topology["assigned"]:
+                assert type(entry["partition"]) is int
+                assert type(entry["offset"]) is int
+                assert type(entry["last_examined"]) is int
             yield _Stream(reader)
 
 
-async def _read(test_env, sub_id: str, count: int) -> list[dict]:
-    """The next `count` event payloads on `sub_id`'s stream, then closes it."""
-    async with _stream(test_env, sub_id) as stream:
-        return await stream.take(count)
-
-
 def _short_read(events: list[dict], count: int, elapsed: float) -> str:
-    """What a read that stopped short delivered, for its failure message."""
     if not events:
         return f"0 of {count} events delivered in {elapsed:.1f}s"
     first, last = events[0], events[-1]
     return (
         f"{len(events)} of {count} events delivered in {elapsed:.1f}s: "
         f"sequences {first['sequence']}..{last['sequence']}, "
-        f"data.n {(first.get('data') or {}).get('n')}..{(last.get('data') or {}).get('n')}, "
+        f"data.n {first['data']['n']}..{last['data']['n']}, "
         f"first stored at {first['sequence_time']}, last at {last['sequence_time']}"
     )
 
 
-async def _seek(client, sub_id: str, value, topic: str = TOPIC_RETENTION) -> object:
-    resp = await client.post(
+async def _seek(client, sub_id: str, value, topic: str, partitions=range(1)) -> httpx.Response:
+    return await client.post(
         f"/subscriptions/{sub_id}:seek",
-        json={"topology_version": 1, "positions": {topic: [{"partition": 0, "value": value}]}},
+        json={
+            "topology_version": 1,
+            "positions": {topic: [{"partition": p, "value": value} for p in partitions]},
+        },
     )
-    return resp
+
+
+def _positions(response: httpx.Response, topic: str, partitions=range(1)) -> dict[int, int]:
+    assert (response.status_code, response.headers.get("content-type")) == (200, "application/json")
+    body = response.json()
+    assert isinstance(body, dict), body
+    assert body.keys() == {"positions"}, body
+    assert isinstance(body["positions"], dict), body
+    assert body["positions"].keys() == {topic}, body
+    entries = body["positions"][topic]
+    assert isinstance(entries, list), body
+    assert len(entries) == len(partitions), body
+    offsets = {}
+    for partition, entry in zip(partitions, entries, strict=True):
+        assert isinstance(entry, dict), body
+        assert entry.keys() == {"partition", "value"}, entry
+        assert type(entry["partition"]) is int, entry
+        assert entry["partition"] == partition, entry
+        assert type(entry["value"]) is int, entry
+        assert entry["value"] >= 0, entry
+        offsets[partition] = entry["value"]
+    return offsets
 
 
 async def _resolved(client, sub_id: str, value, topic: str) -> int:
-    """What a SEEK of `value` on partition 0 of `topic` resolves to."""
-    resp = await _seek(client, sub_id, value, topic)
-    assert resp.status_code == 200, resp.text
-    return resp.json()["positions"][topic][0]["value"]
+    return _positions(await _seek(client, sub_id, value, topic), topic)[0]
 
 
-# How long the age test polls for the floor to pass the old batch, from the
-# fresh event's publish. Not derived from the age bound, so the read after it
-# keeps TOPIC_RETENTION_AGE_S - FLOOR_POLL_S before the fresh event ages out.
+# The floor poll leaves at least 12 - 6 = 6 s of the fresh event's age
+# budget for opening its stream and reading it.
 FLOOR_POLL_S = 6
 
 
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
 async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(api, test_env):
-    """Retention by age (feature 0007 §2.6), seen through SEEK and delivery.
+    """Retention by storage age (feature 0007 §2.6) and the exclusive seek floor.
 
-    TOPIC_RETENTION keeps events TOPIC_RETENTION_AGE_S. One storage segment's
-    worth of events is published and left to age past that; one more is then
-    published. The backend removes exactly the aged ones - by event or by whole
-    segment, the old batch is one segment - and keeps the new one: "earliest"
-    resolves at or past the last aged event's sequence and below the new one's
-    (a backend with gaps may count a position between them as removed), a seek
-    below it is refused, and a read from the start delivers the new event first.
-
-    Margins (memory backend, debug build; sweeps run every second, so an event
-    goes at an age between TOPIC_RETENTION_AGE_S and one second more):
-
-    - Read-back of the old batch: the stream is open and read while the batch
-      is published, so an event's age when read is the stream's lag behind
-      the outbox - at most 0.06 s measured, against an age bound of 8 s, also
-      with the publish slowed to 11 s. Read only after the publish, as it
-      once was, the front of the batch aged out before the stream opened
-      whenever the publish went on longer than the age bound after the first
-      event was stored, and the read then waited for events that were gone;
-      test_a_batch_published_for_longer_than_its_age_bound_is_read_back_whole
-      fails every time on that shape on the memory backend.
-    - The batch is stored at the outbox's rate, ~80 events/s, so the read-back
-      takes 12-15 s; consecutive events arrived at most 0.5 s apart, against
-      EVENT_WAIT_S of 15 s.
-    - The floor deadline, `published_at + FLOOR_POLL_S`: the fresh event is
-      stored after its POST, so it ages out no earlier than
-      `published_at + TOPIC_RETENTION_AGE_S`, which leaves the read after the
-      poll at least TOPIC_RETENTION_AGE_S - FLOOR_POLL_S = 12 - 6 = 6 s for a
-      stream open and one stored event. The deadline does not follow the age:
-      `published_at + age - 2` leaves 2 s at any age.
-    - The 60 s bound: the read-back (12-15 s), the age wait (at most
-      TOPIC_RETENTION_AGE_S + 1 = 13 s), the floor poll (at most FLOOR_POLL_S
-      = 6 s) and one read, about 35 s; in CI the whole test took 22-26 s in
-      the 15 green runs of 2026-11-04, with an age bound 4 s shorter.
+    The old batch fills one segment on backends that expire whole segments.
+    Reading during publication keeps the read delay within the age budget.
     """
-    tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_RETENTION, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_RETENTION]}]
+    interest = [_interest(TOPIC_RETENTION, EVENT_TYPE_RETENTION)]
+    published = [_event(25, EVENT_TYPE_RETENTION, n) for n in range(RETENTION_SEGMENT_EVENTS)]
     async with api() as client:
         reader_sub = await _subscribe(client, TOPIC_RETENTION, interest)
-        assert (await _seek(client, reader_sub, "earliest")).status_code == 200
-    # Reading the batch back waits for it to be stored and gives the last
-    # sequence and storage time, which is what its age runs from. The stream
-    # opens first: the outbox stores the batch while it is still being
-    # published, and a read opened only afterwards could find its front
-    # already removed.
-    async with _stream(test_env, reader_sub) as stream, api() as client:
-        old = await stream.take_during(
-            RETENTION_SEGMENT_EVENTS,
-            _publish(client, EVENT_TYPE_RETENTION, tenant_id, RETENTION_SEGMENT_EVENTS),
-        )
-    assert [e["data"]["n"] for e in old] == list(range(RETENTION_SEGMENT_EVENTS))
-    last_old = old[-1]
-    stored_at = datetime.fromisoformat(last_old["sequence_time"].replace("Z", "+00:00"))
-    aged_for = (datetime.now(timezone.utc) - stored_at).total_seconds()
-    await asyncio.sleep(max(0.0, TOPIC_RETENTION_AGE_S - aged_for) + 1)
+        start = await _resolved(client, reader_sub, "earliest", TOPIC_RETENTION)
+        assert start == 0
+        async with _stream(api, reader_sub, TOPIC_RETENTION, {0: start}) as stream:
+            old = await stream.take_during(len(published), _publish(client, published))
 
-    fresh = _event(EVENT_TYPE_RETENTION, tenant_id, RETENTION_SEGMENT_EVENTS)
-    async with api() as client:
-        published_at = asyncio.get_running_loop().time()
-        assert (await client.post("/events", json=fresh)).status_code == 202
+        assert [payload["data"]["n"] for payload in old] == list(range(RETENTION_SEGMENT_EVENTS))
+        last = start
+        for payload, event in zip(old, published, strict=True):
+            assert payload["sequence"] > last
+            last = payload["sequence"]
+            assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+            assert payload == {
+                **event,
+                "occurred_at": payload["occurred_at"],
+                "trace_parent": None,
+                "partition": 0,
+                "sequence": last,
+                "sequence_time": payload["sequence_time"],
+            }
+        last_old = old[-1]
+        stored_at, nanos = _stream_instant(last_old["sequence_time"])
+        aged_for = (datetime.now(timezone.utc) - stored_at).total_seconds() - nanos / 1e9
+        await asyncio.sleep(max(0.0, TOPIC_RETENTION_AGE_S - aged_for) + 1)
 
-        sub_id = await _subscribe(client, TOPIC_RETENTION, interest)
-        # The fresh event ages out TOPIC_RETENTION_AGE_S after it was stored,
-        # so the floor must reach the old batch's end well before then.
-        deadline = published_at + FLOOR_POLL_S
-        while True:
-            seek = await _seek(client, sub_id, "earliest")
-            assert seek.status_code == 200
-            floor = seek.json()["positions"][TOPIC_RETENTION][0]["value"]
-            if floor >= last_old["sequence"]:
-                break
-            assert asyncio.get_running_loop().time() < deadline, (
-                f"the floor is {floor}, not {last_old['sequence']}, "
-                f"{FLOOR_POLL_S}s after the fresh event was published"
-            )
-            await asyncio.sleep(0.25)
+        fresh = _event(25, EVENT_TYPE_RETENTION, RETENTION_SEGMENT_EVENTS)
+        deadline = asyncio.get_running_loop().time() + FLOOR_POLL_S
+        async with asyncio.timeout_at(deadline):
+            response = await client.post("/events", json=fresh)
+            assert (
+                response.status_code, response.headers.get("content-type"), response.content,
+            ) == (202, None, b"")
+            sub_id = await _subscribe(client, TOPIC_RETENTION, interest)
+            while (floor := await _resolved(client, sub_id, "earliest", TOPIC_RETENTION)) < last:
+                await asyncio.sleep(0.25)
 
-    [delivered] = await _read(test_env, sub_id, 1)
-    assert delivered == {
-        "id": fresh["id"],
-        "type": EVENT_TYPE_RETENTION,
-        "subject_tenant": tenant_id,
-        "source": "e2e-test",
-        "subject": fresh["subject"],
-        "subject_type": SUBJECT_TYPE,
-        "occurred_at": delivered["occurred_at"],
-        "trace_parent": None,
-        "data": {"n": RETENTION_SEGMENT_EVENTS},
-        "partition": 0,
-        "sequence": delivered["sequence"],
-        "sequence_time": delivered["sequence_time"],
-    }
-    assert last_old["sequence"] <= floor < delivered["sequence"]
+        async with _stream(api, sub_id, TOPIC_RETENTION, {0: floor}) as stream:
+            [delivered] = await stream.take(1)
+        assert last_old["sequence"] <= floor
+        assert floor < delivered["sequence"]
+        assert _stream_instant(delivered["occurred_at"]) == _stream_instant(fresh["occurred_at"])
+        assert delivered == {
+            **fresh,
+            "occurred_at": delivered["occurred_at"],
+            "trace_parent": None,
+            "partition": 0,
+            "sequence": delivered["sequence"],
+            "sequence_time": delivered["sequence_time"],
+        }
 
-    async with api() as client:
         below_sub = await _subscribe(client, TOPIC_RETENTION, interest)
-        below = await _seek(client, below_sub, 0)
-    assert below.status_code == 400
+        below = await _seek(client, below_sub, 0, TOPIC_RETENTION)
+    assert (below.status_code, below.headers.get("content-type")) == (
+        400, "application/problem+json",
+    )
     assert below.json() == {
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
         "title": "Invalid Argument",
@@ -398,8 +588,8 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
                 {
                     "field": "positions",
                     "description": (
-                        f"topic {TOPIC_RETENTION} partition 0: the seek position is below the valid range "
-                        f"[{floor}, {delivered['sequence']}]"
+                        f"topic {TOPIC_RETENTION} partition 0: the seek position is below the "
+                        f"valid range [{floor}, {delivered['sequence']}]"
                     ),
                     "reason": "below_retention_floor",
                 }
@@ -410,106 +600,97 @@ async def test_retention_removes_the_events_past_their_age_and_keeps_the_rest(ap
 
 
 async def _publish(
-    client, event_type: str, tenant_id: str, count: int, data=lambda n: {"n": n}, pause_s: float = 0
-) -> list[dict]:
-    """Publish `count` events in batches of 100 (the batch limit), pausing
-    `pause_s` after each; returns them."""
-    events = []
-    for start in range(0, count, 100):
-        batch = []
-        for n in range(start, min(start + 100, count)):
-            event = _event(event_type, tenant_id, n)
-            event["data"] = data(n)
-            batch.append(event)
-        resp = await client.post("/events:batch", json={"events": batch})
-        assert resp.status_code == 202, resp.text
-        events.extend(batch)
+    client,
+    events: list[dict],
+    pause_s: float = 0,
+    timeline: list[tuple[float, datetime]] | None = None,
+) -> None:
+    for start in range(0, len(events), 100):
+        if timeline is not None:
+            timeline.append((asyncio.get_running_loop().time(), datetime.now(timezone.utc)))
+        resp = await client.post("/events:batch", json={"events": events[start:start + 100]})
+        assert (resp.status_code, resp.headers.get("content-type"), resp.content) == (
+            202, None, b"",
+        )
         if pause_s:
             await asyncio.sleep(pause_s)
-    return events
 
 
-# Events the byte-bound test publishes, each carrying about a kilobyte: enough
-# to fill two whole segments where a backend expires by segment (1000 events
-# on PostgreSQL and MySQL, a megabyte on Kafka) and leave an open one behind.
+# The pad crosses whole segments for backends that expire by segment.
 BYTES_EVENTS = 2500
 BYTES_PAD = "x" * 1000
 
 
 BYTES_TIMEOUT_S = 90
-# What the byte-bound test keeps of BYTES_TIMEOUT_S past its own deadline (the
-# final seek and the pytest timeout's slack), so that deadline fires first and
-# says which phase ran out.
+# Leave room for the independent final seek after the publish, floor poll and read.
 BYTES_FINAL_S = 5
 
 
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(BYTES_TIMEOUT_S, func_only=True)
 async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env):
-    """Retention by bytes (feature 0007 §2.6), seen through SEEK and delivery.
-
-    TOPIC_BYTES keeps at most RETENTION_BYTES per partition and has the default
-    age. Many times that is published, crossing whole segments on the backends
-    that remove by segment. The oldest events go - by event or by segment, as
-    the backend's granularity allows - and what stays is an unbroken run of the
-    newest ones: "earliest" moves above 0, and a read from it delivers the
-    newest events in publish order through the last one.
-
-    Budget: one deadline, BYTES_FINAL_S short of BYTES_TIMEOUT_S from the
-    start, bounds the publish, the floor poll and the read together, so the
-    run fails on its own message rather than on the pytest timeout. The read
-    ends with the last of the 2500 events, which is stored at the outbox's
-    rate (~80 events/s): in CI the whole test took 30-40 s in the 19 runs of
-    2026-11-04, under half of the 85 s the deadline gives.
-    """
-    loop = asyncio.get_running_loop()
-    started = loop.time()
-    deadline = started + BYTES_TIMEOUT_S - BYTES_FINAL_S
-    tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_BYTES, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_BYTES]}]
-    async with api() as client:
-        published = await _publish(
-            client, EVENT_TYPE_BYTES, tenant_id, BYTES_EVENTS, data=lambda n: {"n": n, "pad": BYTES_PAD}
-        )
-        # Every publish has been accepted; wait for the bound to take effect.
-        sub_id = await _subscribe(client, TOPIC_BYTES, interest)
-        while await _resolved(client, sub_id, "earliest", TOPIC_BYTES) == 0:
-            assert loop.time() < deadline, "nothing was removed past the byte bound"
-            await asyncio.sleep(0.5)
-
-    # The remaining run: read from the floor until the last published event.
+    """Retention by bytes (feature 0007 §2.6) keeps a suffix through the head."""
+    clock = asyncio.get_running_loop().time
+    deadline = clock() + BYTES_TIMEOUT_S - BYTES_FINAL_S
+    interest = [_interest(TOPIC_BYTES, EVENT_TYPE_BYTES)]
+    published = [
+        {**_event(26, EVENT_TYPE_BYTES, n), "data": {"n": n, "pad": BYTES_PAD}}
+        for n in range(BYTES_EVENTS)
+    ]
+    index_by_id = {event["id"]: n for n, event in enumerate(published)}
     delivered = []
-    read_started = loop.time()
-    async with httpx.AsyncClient(base_url=f"{test_env.base_url}/event-broker/v1", timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            await reader.await_kind("topology", timeout=5)
-            while not delivered or delivered[-1]["id"] != published[-1]["id"]:
-                remaining = min(EVENT_WAIT_S, deadline - loop.time())
-                try:
-                    delivered.append((await reader.await_kind("event", timeout=remaining))["payload"])
-                except (AssertionError, TimeoutError) as stalled:
-                    last_n = delivered[-1]["data"]["n"] if delivered else None
-                    raise AssertionError(
-                        f"the read from the floor stopped at data.n {last_n}, before the last published "
-                        f"event ({BYTES_EVENTS - 1}): {len(delivered)} events in "
-                        f"{loop.time() - read_started:.1f}s ({type(stalled).__name__}: {stalled})"
-                    ) from stalled
-
-    # Removal may go on while the run is read (a backend removing one segment
-    # per pass), so the reader can skip what goes under it. What must hold:
-    # everything delivered is in publish order, and above the floor once the
-    # read is done the run is unbroken through the last event.
-    ids = [e["id"] for e in published]
-    at = [ids.index(e["id"]) for e in delivered]
-    assert at == sorted(at), "delivered out of publish order"
     async with api() as client:
+        async with asyncio.timeout_at(deadline):
+            await _publish(client, published)
+            sub_id = await _subscribe(client, TOPIC_BYTES, interest)
+            while (floor := await _resolved(client, sub_id, "earliest", TOPIC_BYTES)) == 0:
+                await asyncio.sleep(0.5)
+
+            read_started = clock()
+            async with _stream(api, sub_id, TOPIC_BYTES, {0: floor}) as stream:
+                last_index = -1
+                sequence = floor
+                while True:
+                    try:
+                        payload = await stream.next_event(min(deadline, clock() + EVENT_WAIT_S))
+                    except (TimeoutError, httpx.ReadTimeout, StopAsyncIteration) as stalled:
+                        raise AssertionError(
+                            f"the read stopped at n={last_index} before {BYTES_EVENTS - 1}: "
+                            f"{len(delivered)} events in {clock() - read_started:.1f}s"
+                        ) from stalled
+                    assert payload["id"] in index_by_id, payload
+                    index = index_by_id[payload["id"]]
+                    assert index > last_index, (last_index, index)
+                    assert payload["sequence"] > sequence, payload
+                    event = published[index]
+                    assert _stream_instant(payload["occurred_at"]) == _stream_instant(
+                        event["occurred_at"]
+                    )
+                    assert payload == {
+                        **event,
+                        "occurred_at": payload["occurred_at"],
+                        "trace_parent": None,
+                        "partition": 0,
+                        "sequence": payload["sequence"],
+                        "sequence_time": payload["sequence_time"],
+                    }
+                    delivered.append(payload)
+                    last_index = index
+                    sequence = payload["sequence"]
+                    if index == BYTES_EVENTS - 1:
+                        break
+
         floor_sub = await _subscribe(client, TOPIC_BYTES, interest)
         final_floor = await _resolved(client, floor_sub, "earliest", TOPIC_BYTES)
-    kept = [e["id"] for e in delivered if e["sequence"] > final_floor]
-    assert 0 < len(kept) < BYTES_EVENTS
-    assert kept == ids[-len(kept):]
+    # A segment can expire during the read. Only events above the final floor
+    # must still form an unbroken suffix.
+    assert final_floor >= floor
+    kept = [
+        index_by_id[payload["id"]] for payload in delivered if payload["sequence"] > final_floor
+    ]
+    assert kept
+    assert len(kept) < BYTES_EVENTS
+    assert kept == list(range(BYTES_EVENTS - len(kept), BYTES_EVENTS))
 
 
 @pytest.mark.backend_sensitive
@@ -517,106 +698,101 @@ async def test_retention_by_bytes_keeps_a_suffix_within_the_bound(api, test_env)
 async def test_latest_still_names_the_last_event_once_retention_removed_every_one(api, test_env):
     """Retention down to an empty partition (feature 0007 §2.4).
 
-    TOPIC_DRAIN keeps events RETENTION_DURATION_S. One storage segment's worth
-    is published - a whole segment, so the backends that expire by segment can
-    remove all of it - and left to age out. Once nothing is stored, "earliest"
-    and "latest" both resolve to the last event's sequence, never back to 0,
-    and the next event published is delivered above it.
-
-    Margins (see the age test for the read-back's): the floor deadline, three
-    times RETENTION_DURATION_S from the end of the read-back, is against the
-    last event's removal at most RETENTION_DURATION_S + 1 s after it was
-    stored, and the last event is stored about when the read-back ends, so
-    its removal is due 8-9 s into the 24 s deadline. The 60 s bound covers the
-    read-back (12-15 s), that deadline (24 s) and one read; in CI the whole
-    test took 21-26 s in the 15 green runs of 2026-11-04.
+    The batch fills one storage segment so whole-segment retention can
+    remove it. Once empty, the partition retains the position of its head.
     """
-    tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_DRAIN, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_DRAIN]}]
+    clock = asyncio.get_running_loop().time
+    interest = [_interest(TOPIC_DRAIN, EVENT_TYPE_DRAIN)]
+    published = [_event(27, EVENT_TYPE_DRAIN, n) for n in range(RETENTION_SEGMENT_EVENTS)]
     async with api() as client:
         reader_sub = await _subscribe(client, TOPIC_DRAIN, interest)
-        assert (await _seek(client, reader_sub, "earliest", TOPIC_DRAIN)).status_code == 200
-    # Open before publishing, as in the age test: the batch starts ageing
-    # while it is still being published.
-    async with _stream(test_env, reader_sub) as stream, api() as client:
-        stored = await stream.take_during(
-            RETENTION_SEGMENT_EVENTS,
-            _publish(client, EVENT_TYPE_DRAIN, tenant_id, RETENTION_SEGMENT_EVENTS),
-        )
-    head = stored[-1]["sequence"]
+        start = await _resolved(client, reader_sub, "earliest", TOPIC_DRAIN)
+        assert start == 0
+        async with _stream(api, reader_sub, TOPIC_DRAIN, {0: start}) as stream:
+            stored = await stream.take_during(len(published), _publish(client, published))
+            deadline = clock() + RETENTION_DURATION_S * 3
 
-    async with api() as client:
-        sub_id = await _subscribe(client, TOPIC_DRAIN, interest)
-        deadline = asyncio.get_running_loop().time() + RETENTION_DURATION_S * 3
-        while (floor := await _resolved(client, sub_id, "earliest", TOPIC_DRAIN)) != head:
-            assert floor < head, f"the floor {floor} passed the head {head}"
-            assert asyncio.get_running_loop().time() < deadline, (
-                f"the floor is {floor}, not {head}, {RETENTION_DURATION_S * 3}s after publishing"
-            )
-            await asyncio.sleep(0.5)
+        assert [payload["data"]["n"] for payload in stored] == list(range(RETENTION_SEGMENT_EVENTS))
+        head = start
+        for payload, event in zip(stored, published, strict=True):
+            assert payload["sequence"] > head
+            head = payload["sequence"]
+            assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+            assert payload == {
+                **event,
+                "occurred_at": payload["occurred_at"],
+                "trace_parent": None,
+                "partition": 0,
+                "sequence": head,
+                "sequence_time": payload["sequence_time"],
+            }
+
+        async with asyncio.timeout_at(deadline):
+            sub_id = await _subscribe(client, TOPIC_DRAIN, interest)
+            while (floor := await _resolved(client, sub_id, "earliest", TOPIC_DRAIN)) != head:
+                assert floor < head, (floor, head)
+                await asyncio.sleep(0.5)
         assert await _resolved(client, sub_id, "latest", TOPIC_DRAIN) == head
 
-        fresh = _event(EVENT_TYPE_DRAIN, tenant_id, RETENTION_SEGMENT_EVENTS)
-        assert (await client.post("/events", json=fresh)).status_code == 202
-
-    [delivered] = await _read(test_env, sub_id, 1)
+        fresh = _event(27, EVENT_TYPE_DRAIN, RETENTION_SEGMENT_EVENTS)
+        response = await client.post("/events", json=fresh)
+        assert (response.status_code, response.headers.get("content-type"), response.content) == (
+            202, None, b"",
+        )
+        async with _stream(api, sub_id, TOPIC_DRAIN, {0: head}) as stream:
+            [delivered] = await stream.take(1)
+    assert delivered["sequence"] > head
+    assert _stream_instant(delivered["occurred_at"]) == _stream_instant(fresh["occurred_at"])
     assert delivered == {
-        "id": fresh["id"],
-        "type": EVENT_TYPE_DRAIN,
-        "subject_tenant": tenant_id,
-        "source": "e2e-test",
-        "subject": fresh["subject"],
-        "subject_type": SUBJECT_TYPE,
+        **fresh,
         "occurred_at": delivered["occurred_at"],
         "trace_parent": None,
-        "data": {"n": RETENTION_SEGMENT_EVENTS},
         "partition": 0,
         "sequence": delivered["sequence"],
         "sequence_time": delivered["sequence_time"],
     }
-    assert delivered["sequence"] > head
 
 
-# The slow-publish test's pause after each batch of 100: ten batches, so the
-# publish goes on ~10 s, past RETENTION_DURATION_S and the second a sweep may
-# take on top of it.
 SLOW_PUBLISH_PAUSE_S = 1
 
 
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
 async def test_a_batch_published_for_longer_than_its_age_bound_is_read_back_whole(api, test_env):
-    """The retention tests' read-back, against a publish slower than the age bound.
-
-    TOPIC_SLOW_PUBLISH keeps events RETENTION_DURATION_S. RETENTION_SEGMENT_EVENTS
-    events are published in batches of 100, SLOW_PUBLISH_PAUSE_S after each,
-    so the publish goes on ~10 s. The outbox stores each batch as it comes, so
-    the first events reach their age bound before the last ones are
-    published. A stream opened before the publish and read while it runs
-    delivers every event, in order.
-
-    This is a slow runner's publish made deterministic. Read only after the
-    publish, as the retention tests once did, the stream on the memory
-    backend opens after the front of the batch was swept and the read fails
-    every time, the first events missing:
-    `950 of 1000 events delivered ... data.n 50..999`. The backends that
-    remove whole segments keep the batch's segment until well after the
-    publish, so there the test passes either way.
-    """
-    tenant_id = str(uuid.uuid4())
-    interest = [{"topic": TOPIC_SLOW_PUBLISH, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_SLOW_PUBLISH]}]
+    """Read live through a publish longer than the storage age bound (feature 0007 §2.6)."""
+    interest = [_interest(TOPIC_SLOW_PUBLISH, EVENT_TYPE_SLOW_PUBLISH)]
+    published = [_event(28, EVENT_TYPE_SLOW_PUBLISH, n) for n in range(RETENTION_SEGMENT_EVENTS)]
+    timeline: list[tuple[float, datetime]] = []
     async with api() as client:
         sub_id = await _subscribe(client, TOPIC_SLOW_PUBLISH, interest)
-        assert (await _seek(client, sub_id, "earliest", TOPIC_SLOW_PUBLISH)).status_code == 200
-    async with _stream(test_env, sub_id) as stream, api() as client:
-        delivered = await stream.take_during(
-            RETENTION_SEGMENT_EVENTS,
-            _publish(
-                client,
-                EVENT_TYPE_SLOW_PUBLISH,
-                tenant_id,
-                RETENTION_SEGMENT_EVENTS,
-                pause_s=SLOW_PUBLISH_PAUSE_S,
-            ),
-        )
-    assert [e["data"]["n"] for e in delivered] == list(range(RETENTION_SEGMENT_EVENTS))
+        start = await _resolved(client, sub_id, "earliest", TOPIC_SLOW_PUBLISH)
+        assert start == 0
+        async with _stream(api, sub_id, TOPIC_SLOW_PUBLISH, {0: start}) as stream:
+            delivered = await stream.take_during(
+                len(published),
+                _publish(client, published, pause_s=SLOW_PUBLISH_PAUSE_S, timeline=timeline),
+            )
+    assert [payload["data"]["n"] for payload in delivered] == list(range(RETENTION_SEGMENT_EVENTS))
+    last = start
+    for payload, event in zip(delivered, published, strict=True):
+        assert payload["sequence"] > last
+        last = payload["sequence"]
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        assert payload == {
+            **event,
+            "occurred_at": payload["occurred_at"],
+            "trace_parent": None,
+            "partition": 0,
+            "sequence": last,
+            "sequence_time": payload["sequence_time"],
+        }
+
+    assert len(timeline) == 10
+    first_batch, _ = timeline[0]
+    last_batch, last_batch_wall = timeline[-1]
+    assert stream.started_at <= first_batch
+    assert stream.first_event_at < last_batch
+    assert last_batch - first_batch > RETENTION_DURATION_S
+    stored_at, nanos = _stream_instant(delivered[0]["sequence_time"])
+    first_age = (last_batch_wall - stored_at).total_seconds() - nanos / 1e9
+    assert first_age > RETENTION_DURATION_S

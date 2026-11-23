@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use gts::GtsTypeId;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 use crate::domain::model::BarrierMode;
 
@@ -39,6 +39,8 @@ pub enum DeploymentMode {
 pub struct EventBrokerConfig {
     pub mode: DeploymentMode,
 
+    /// Cluster options for the broker process. Embedded brokers may omit this section.
+    pub process: Option<ProcessConfig>,
     #[serde(default)]
     pub batch: BatchConfig,
     #[serde(default)]
@@ -74,6 +76,263 @@ pub struct EventBrokerConfig {
     /// absent, it has 16 partitions.
     #[serde(default)]
     pub outbox_groups: std::collections::BTreeMap<String, OutboxGroupEntry>,
+}
+
+// Derived struct deserializers also accept positional sequences.
+macro_rules! deserialize_config_map {
+    ($deserializer:expr, $config:ty, $expected:literal) => {{
+        struct ConfigMap;
+
+        impl<'de> de::Visitor<'de> for ConfigMap {
+            type Value = $config;
+
+            fn expecting(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                fmt.write_str($expected)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                <$config>::read_fields(map)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
+                Err(de::Error::custom($expected))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Err(E::custom($expected))
+            }
+
+            fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+
+            fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+                self.visit_unit()
+            }
+        }
+
+        $deserializer.deserialize_any(ConfigMap)
+    }};
+}
+
+/// Process settings owned by the Event Broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessConfig {
+    /// Selects the cluster client installed by the broker process.
+    pub cluster: ProcessClusterConfig,
+}
+
+impl<'de> Deserialize<'de> for ProcessConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_config_map!(deserializer, ProcessConfig, "process must be a mapping")
+    }
+}
+
+impl ProcessConfig {
+    fn read_fields<'de, A: de::MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Cluster,
+            #[serde(other)]
+            Unknown,
+        }
+
+        let mut cluster = None;
+        while let Some(field) = map.next_key()? {
+            match field {
+                Field::Cluster if cluster.is_none() => cluster = Some(map.next_value()?),
+                Field::Cluster => return Err(de::Error::duplicate_field("cluster")),
+                Field::Unknown => {
+                    return Err(de::Error::custom("process only supports the cluster field"));
+                }
+            }
+        }
+        let cluster = cluster.ok_or_else(|| de::Error::custom("process.cluster is required"))?;
+        Ok(Self { cluster })
+    }
+}
+
+/// Cluster client selection for the broker process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessClusterConfig {
+    /// Hosts cluster profiles with process-local state in standalone mode.
+    Memory {
+        /// Profile names to bind. Omit to bind only `event-broker`.
+        profiles: Vec<String>,
+        /// How often the memory backend expires entries. Defaults to one second.
+        sweep_interval: Duration,
+    },
+    /// Uses the endpoint configured for the Cluster SDK.
+    Remote {},
+}
+
+impl<'de> Deserialize<'de> for ProcessClusterConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_config_map!(
+            deserializer,
+            ProcessClusterConfig,
+            "process.cluster must be a mapping"
+        )
+    }
+}
+
+impl ProcessClusterConfig {
+    fn read_fields<'de, A: de::MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        #[derive(Deserialize)]
+        #[serde(field_identifier, rename_all = "snake_case")]
+        enum Field {
+            Mode,
+            Profiles,
+            SweepInterval,
+            #[serde(other)]
+            Unknown,
+        }
+
+        let mut mode = None;
+        let mut profiles = None;
+        let mut sweep_interval = None;
+        while let Some(field) = map.next_key()? {
+            match field {
+                Field::Mode if mode.is_none() => {
+                    let value = map.next_value_seed(PendingClusterField)?;
+                    mode = match value.as_str() {
+                        Some("memory") => Some(ProcessClusterMode::Memory),
+                        Some("remote") => Some(ProcessClusterMode::Remote),
+                        _ => {
+                            return Err(de::Error::custom(
+                                "process.cluster.mode must be memory or remote",
+                            ));
+                        }
+                    };
+                }
+                Field::Profiles if profiles.is_none() => {
+                    profiles = Some(map.next_value_seed(PendingClusterField)?);
+                }
+                Field::SweepInterval if sweep_interval.is_none() => {
+                    sweep_interval = Some(map.next_value_seed(PendingClusterField)?);
+                }
+                Field::Mode => return Err(de::Error::duplicate_field("mode")),
+                Field::Profiles => return Err(de::Error::duplicate_field("profiles")),
+                Field::SweepInterval => return Err(de::Error::duplicate_field("sweep_interval")),
+                Field::Unknown => {
+                    return Err(de::Error::custom(
+                        "process.cluster only supports mode, profiles and sweep_interval",
+                    ));
+                }
+            }
+        }
+
+        let mode = mode.ok_or_else(|| de::Error::custom("process.cluster.mode is required"))?;
+        match mode {
+            ProcessClusterMode::Memory => {
+                let profiles = match profiles {
+                    Some(value) => Vec::deserialize(value).map_err(|_| {
+                        de::Error::custom("process.cluster.profiles must be a list of strings")
+                    })?,
+                    None => vec!["event-broker".to_owned()],
+                };
+                let sweep_interval = match sweep_interval {
+                    Some(value) => {
+                        toolkit_utils::humantime_serde::deserialize(value).map_err(|_| {
+                            de::Error::custom("process.cluster.sweep_interval must be a duration")
+                        })?
+                    }
+                    None => Duration::from_secs(1),
+                };
+                Ok(Self::Memory {
+                    profiles,
+                    sweep_interval,
+                })
+            }
+            ProcessClusterMode::Remote => match (profiles, sweep_interval) {
+                (None, None) => Ok(Self::Remote {}),
+                (Some(_), _) => Err(de::Error::custom(
+                    "process.cluster.profiles is only supported in memory mode",
+                )),
+                (_, Some(_)) => Err(de::Error::custom(
+                    "process.cluster.sweep_interval is only supported in memory mode",
+                )),
+            },
+        }
+    }
+}
+
+// Preserve object shape so a member name cannot reinterpret a pending field.
+struct PendingClusterField;
+
+impl<'de> de::DeserializeSeed<'de> for PendingClusterField {
+    type Value = serde_json::Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> de::Visitor<'de> for PendingClusterField {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt.write_str("a cluster configuration value")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        de::IgnoredAny::deserialize(de::value::MapAccessDeserializer::new(map))?;
+        Ok(serde_json::Value::Object(serde_json::Map::new()))
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(PendingClusterField)? {
+            values.push(value);
+        }
+        Ok(serde_json::Value::Array(values))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(value.into())
+    }
+}
+
+enum ProcessClusterMode {
+    Memory,
+    Remote,
 }
 
 /// One `outbox_groups` entry, exactly as written.

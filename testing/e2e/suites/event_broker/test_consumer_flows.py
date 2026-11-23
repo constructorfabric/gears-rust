@@ -16,20 +16,27 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 
-import httpx
 import pytest
 
 from .conftest import (
+    API_BASE,
+    DEFAULT_SUBJECT_ID,
+    DEFAULT_TENANT_ID,
     EVENT_TYPE_4P,
-    group_seek_positions,
     EVENT_TYPE_STREAM,
     SUBJECT_TYPE,
     TOPIC_4P,
     TOPIC_STREAM,
-    SseFrameReader,
     TRACE_ID,
+)
+from .test_publish_consume import _stream_instant
+from .test_consumer_subscriptions import (
+    _created_subscription_id,
+    _member_stream,
+    _subscription_created_at,
 )
 
 
@@ -39,345 +46,1104 @@ def _now() -> str:
 
 @pytest.mark.timeout(5, func_only=True)
 async def test_two_consumer_rebalance(api, test_env):
-    """scenario: consumer/flows/1.01-flow-two-consumer-rebalance.md
-
-    Consumer A joins first and holds all 4 partitions of TOPIC_4P.  Consumer B
-    joins while A's stream is open.  Both streams receive a new topology frame
-    showing the rebalanced assignment; each consumer then receives only events
-    for its own partitions.
-    """
-    tenant_id = str(uuid.uuid4())
-    base_url = f"{test_env.base_url}/event-broker/v1"
-
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
-
-        # Consumer A JOINs first - gets all 4 partitions.
-        sub_a_resp = await client.post(
+    """scenario: consumer/flows/1.01-flow-two-consumer-rebalance.md"""
+    topic = TOPIC_4P
+    event_type = EVENT_TYPE_4P
+    partitions = list(range(4))
+    interest = {
+        "topic": topic,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "ownership_filter": "entire_tenant",
+        "types": [event_type],
+    }
+    async with api() as client, AsyncExitStack() as stack:
+        heads = {}
+        for partition in partitions:
+            manifest = await client.get(
+                "/topics/segments", params={"topic": topic, "partition": partition}
+            )
+            assert (manifest.status_code, manifest.headers["content-type"]) == (
+                200,
+                "application/json",
+            )
+            snapshot = manifest.json()
+            assert snapshot["topic"] == topic and snapshot["partition"] == partition
+            assert set(snapshot) == {
+                "topic",
+                "partition",
+                "start_sequence",
+                "end_sequence",
+                "start_time",
+                "end_time",
+                "segments",
+            }
+            assert isinstance(snapshot["segments"], list)
+            head = snapshot["end_sequence"]
+            assert type(head) is int and head >= 0
+            heads[partition] = head
+        created = await client.post("/consumer-groups")
+        assert (created.status_code, created.headers["content-type"]) == (201, "application/json")
+        group_id = created.headers["location"].removeprefix(f"{API_BASE}/consumer-groups/")
+        assert created.headers["location"] == f"{API_BASE}/consumer-groups/{group_id}"
+        group_uuid = group_id.removeprefix("gts.cf.core.events.consumer_group.v1~")
+        assert group_id == f"gts.cf.core.events.consumer_group.v1~{uuid.UUID(group_uuid)}"
+        read = await client.get(f"/consumer-groups/{group_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == created.json() == group
+        joined = await client.post(
             "/subscriptions",
             json={
                 "consumer_group": group_id,
                 "client_agent": "consumer-a",
-                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
+                "interests": [interest],
             },
         )
-        assert sub_a_resp.status_code == 201
-        sub_a_id = str(sub_a_resp.json()["id"])
-        assert len(sub_a_resp.json()["assigned"]) == 4
-
-        assigned_a = sub_a_resp.json()["assigned"]
-        seek_resp = await client.post(
-            f"/subscriptions/{sub_a_id}:seek",
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        sub_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{sub_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        member = {
+            "id": sub_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 1,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == member
+        assert joined.json() == {
+            **member,
+            "interests": [{**member["interests"][0], "unmatched_types": []}],
+        }
+        requested = [{"partition": p, "value": "latest"} for p in partitions]
+        seek = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            json={"topology_version": 1, "positions": {topic: requested}},
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": heads[p]} for p in partitions]},
+        }
+        reader = await stack.enter_async_context(_member_stream(api, sub_id, "sse"))
+        baseline = await reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 1,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": heads[p], "last_examined": heads[p]}
+                for p in partitions
+            ],
+        }
+        assert baseline == ("topology", topology)
+        joined = await client.post(
+            "/subscriptions",
             json={
-                "topology_version": 1, "positions": group_seek_positions({"topic": a["topic"], "partition": a["partition"], "value": "earliest"} for a in assigned_a)
+                "consumer_group": group_id,
+                "client_agent": "consumer-b",
+                "interests": [interest],
             },
         )
-        assert seek_resp.status_code == 200
-
-    # Open A's stream.
-    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_a:
-        async with stream_a.stream("GET", f"/events:sse?subscription={sub_a_id}") as resp_a:
-            assert resp_a.status_code == 200
-            reader_a = SseFrameReader(resp_a)
-            kind, _ = await reader_a.next_frame(timeout=5)
-            assert kind == "topology"
-
-            # Consumer B JOINs - triggers rebalance.
-            async with api() as client_b:
-                sub_b_resp = await client_b.post(
-                    "/subscriptions",
-                    json={
-                        "consumer_group": group_id,
-                        "client_agent": "consumer-b",
-                        "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
-                    },
-                )
-                assert sub_b_resp.status_code == 201
-                sub_b_id = str(sub_b_resp.json()["id"])
-                assigned_b = sub_b_resp.json()["assigned"]
-                assert len(assigned_b) == 2
-
-                seek_b = await client_b.post(
-                    f"/subscriptions/{sub_b_id}:seek",
-                    json={
-                        # B joined second, so the current version is 2 - use B's
-                        # own join-response version rather than a stale literal.
-                        "topology_version": sub_b_resp.json()["topology_version"],
-                        "positions": group_seek_positions({"topic": a["topic"], "partition": a["partition"], "value": "earliest"} for a in assigned_b)
-                    },
-                )
-                assert seek_b.status_code == 200
-
-            # A's stream must now receive a topology frame with 2 assigned partitions.
-            kind, topo = await reader_a.next_frame(timeout=10)
-            assert kind == "topology"
-            assert len(topo["assigned"]) == 2
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        peer_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{peer_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        assert peer_id != sub_id
+        kept, gained = partitions[:2], partitions[2:]
+        if uuid.UUID(sub_id) > uuid.UUID(peer_id):
+            kept, gained = gained, kept
+        peer = {
+            "id": peer_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-b",
+            "assigned": [{"topic": topic, "partition": p} for p in gained],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 2,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == peer
+        assert joined.json() == {
+            **peer,
+            "interests": [{**peer["interests"][0], "unmatched_types": []}],
+        }
+        current = await client.get(f"/subscriptions/{sub_id}")
+        assert (current.status_code, current.headers["content-type"]) == (200, "application/json")
+        assert current.json() == {
+            **member,
+            "topology_version": 2,
+            "assigned": [{"topic": topic, "partition": p} for p in kept],
+        }
+        first_parts = {a["partition"] for a in current.json()["assigned"]}
+        second_parts = {a["partition"] for a in peer["assigned"]}
+        assert first_parts.isdisjoint(second_parts)
+        assert first_parts | second_parts == set(partitions)
+        pushed = await reader.await_kind("topology", timeout=10)
+        assert pushed == {
+            "kind": "topology",
+            "topology_version": 2,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": heads[p], "last_examined": heads[p]}
+                for p in kept
+            ],
+        }
+        requested = [{"partition": p, "value": "latest"} for p in gained]
+        seek = await client.post(
+            f"/subscriptions/{peer_id}:seek",
+            json={"topology_version": 2, "positions": {topic: requested}},
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": heads[p]} for p in gained]},
+        }
+        peer_reader = await stack.enter_async_context(_member_stream(api, peer_id, "sse"))
+        baseline = await peer_reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 2,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": heads[p], "last_examined": heads[p]}
+                for p in gained
+            ],
+        }
+        assert baseline == ("topology", topology)
 
 
 @pytest.mark.timeout(5, func_only=True)
 async def test_positions_not_set_recovery(api):
-    """scenario: consumer/flows/1.02-flow-positions-not-set-recovery.md
-
-    A consumer deliberately skips the SEEK step and receives 409.  It then
-    SEEKs all unseeded partitions and successfully opens the stream.
-    """
-    tenant_id = str(uuid.uuid4())
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
-
-        sub_resp = await client.post(
+    """scenario: consumer/flows/1.02-flow-positions-not-set-recovery.md"""
+    topic = TOPIC_STREAM
+    event_type = EVENT_TYPE_STREAM
+    partitions = [0]
+    interest = {
+        "topic": topic,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "ownership_filter": "entire_tenant",
+        "types": [event_type],
+    }
+    async with api() as client, AsyncExitStack() as stack:
+        event = {
+            "id": "17e20000-0000-4000-8000-000000003001",
+            "type": event_type,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "source": "e2e-test",
+            "subject": "s1",
+            "subject_type": SUBJECT_TYPE,
+            "occurred_at": "2026-01-19T10:20:30Z",
+        }
+        marker = {**event, "id": "17e20000-0000-4000-8000-000000003000"}
+        fence = await client.post("/events", json=marker, headers={"Prefer": "wait=10"}, timeout=12)
+        assert (fence.status_code, fence.content, fence.headers.get("preference-applied")) == (
+            201,
+            b"",
+            "wait=10",
+        )
+        heads = {}
+        for partition in partitions:
+            manifest = await client.get(
+                "/topics/segments", params={"topic": topic, "partition": partition}
+            )
+            assert (manifest.status_code, manifest.headers["content-type"]) == (
+                200,
+                "application/json",
+            )
+            snapshot = manifest.json()
+            assert snapshot["topic"] == topic and snapshot["partition"] == partition
+            assert set(snapshot) == {
+                "topic",
+                "partition",
+                "start_sequence",
+                "end_sequence",
+                "start_time",
+                "end_time",
+                "segments",
+            }
+            assert isinstance(snapshot["segments"], list)
+            head = snapshot["end_sequence"]
+            assert type(head) is int and head >= 0
+            heads[partition] = head
+        created = await client.post("/consumer-groups")
+        assert (created.status_code, created.headers["content-type"]) == (201, "application/json")
+        group_id = created.headers["location"].removeprefix(f"{API_BASE}/consumer-groups/")
+        assert created.headers["location"] == f"{API_BASE}/consumer-groups/{group_id}"
+        group_uuid = group_id.removeprefix("gts.cf.core.events.consumer_group.v1~")
+        assert group_id == f"gts.cf.core.events.consumer_group.v1~{uuid.UUID(group_uuid)}"
+        read = await client.get(f"/consumer-groups/{group_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == created.json() == group
+        joined = await client.post(
             "/subscriptions",
             json={
                 "consumer_group": group_id,
-                "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
+                "client_agent": "consumer-a",
+                "interests": [interest],
             },
         )
-        assert sub_resp.status_code == 201
-        sub_id = str(sub_resp.json()["id"])
-        assigned = sub_resp.json()["assigned"]
-
-        # Step 1: try streaming without seek → 409.
-        bad_resp = await client.get(
-            f"/events:stream?subscription={sub_id}",
-            headers={"Accept": "multipart/mixed"},
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        sub_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{sub_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        member = {
+            "id": sub_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 1,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == member
+        assert joined.json() == {
+            **member,
+            "interests": [{**member["interests"][0], "unmatched_types": []}],
+        }
+        for _ in range(2):
+            async with client.stream(
+                "GET",
+                "/events:stream",
+                params={"subscription": sub_id},
+                headers={"Accept": "multipart/mixed"},
+            ) as refused:
+                assert refused.status_code == 409
+                await refused.aread()
+            assert (refused.status_code, refused.headers["content-type"]) == (
+                409,
+                "application/problem+json",
+            )
+            assert refused.json() == {
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+                "title": "Failed Precondition",
+                "status": 409,
+                "detail": "Operation precondition not met",
+                "instance": f"{API_BASE}/events:stream",
+                "trace_id": TRACE_ID,
+                "context": {
+                    "resource_type": "gts.cf.core.events.subscription.v1~",
+                    "violations": [
+                        {
+                            "type": "positions_not_set",
+                            "subject": f"{topic}:{p}",
+                            "description": (
+                                f"call POST /v1/subscriptions/{sub_id}:seek "
+                                "before re-opening the stream"
+                            ),
+                        }
+                        for p in partitions
+                    ],
+                },
+            }
+        requested = [{"partition": p, "value": "earliest"} for p in partitions]
+        seek = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            json={"topology_version": 1, "positions": {topic: requested}},
         )
-        assert bad_resp.status_code == 409
-        bad_body = bad_resp.json()
-        assert bad_body == {
-            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
-            "title": "Failed Precondition",
-            "status": 409,
-            "detail": bad_body["detail"],
-            "instance": bad_body["instance"],
-            "trace_id": TRACE_ID,
-            "context": {
-                "resource_type": "gts.cf.core.events.subscription.v1~",
-                "violations": bad_body["context"]["violations"],
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": 0} for p in partitions]},
+        }
+        reader = await stack.enter_async_context(_member_stream(api, sub_id, "stream"))
+        baseline = await reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 1,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": 0, "last_examined": 0}
+                for p in partitions
+            ],
+        }
+        assert baseline == topology
+        original_group = group_id
+        created = await client.post("/consumer-groups")
+        assert (created.status_code, created.headers["content-type"]) == (201, "application/json")
+        group_id = created.headers["location"].removeprefix(f"{API_BASE}/consumer-groups/")
+        assert created.headers["location"] == f"{API_BASE}/consumer-groups/{group_id}"
+        group_uuid = group_id.removeprefix("gts.cf.core.events.consumer_group.v1~")
+        assert group_id == f"gts.cf.core.events.consumer_group.v1~{uuid.UUID(group_uuid)}"
+        read = await client.get(f"/consumer-groups/{group_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == created.json() == group
+        assert group_id != original_group
+        joined = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "history-reader",
+                "interests": [interest],
+            },
+        )
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        witness_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{witness_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        witness = {
+            "id": witness_id,
+            "consumer_group": group_id,
+            "client_agent": "history-reader",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 1,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == witness
+        assert joined.json() == {
+            **witness,
+            "interests": [{**witness["interests"][0], "unmatched_types": []}],
+        }
+        requested = [{"partition": p, "value": "earliest"} for p in partitions]
+        seek = await client.post(
+            f"/subscriptions/{witness_id}:seek",
+            json={"topology_version": 1, "positions": {topic: requested}},
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": 0} for p in partitions]},
+        }
+        witness_reader = await stack.enter_async_context(_member_stream(api, witness_id, "sse"))
+        baseline = await witness_reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 1,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": 0, "last_examined": 0}
+                for p in partitions
+            ],
+        }
+        assert baseline == ("topology", topology)
+        group_id = original_group
+        deadline = asyncio.get_running_loop().time() + 5
+        sequence = 0
+        while sequence < heads[0]:
+            remaining = deadline - asyncio.get_running_loop().time()
+            assert remaining > 0
+            stored = await witness_reader.await_kind("event", timeout=remaining)
+            remaining = deadline - asyncio.get_running_loop().time()
+            assert remaining > 0
+            observed = await reader.await_kind("event", timeout=remaining)
+            assert observed == stored
+            assert set(stored) == {"kind", "payload"} and stored["kind"] == "event"
+            payload = stored["payload"]
+            assert payload["partition"] == 0 and type(payload["sequence"]) is int
+            assert sequence < payload["sequence"] <= heads[0]
+            sequence = payload["sequence"]
+        assert sequence == heads[0] and sequence > 0
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(marker["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert stored == {
+            "kind": "event",
+            "payload": {
+                **marker,
+                "occurred_at": payload["occurred_at"],
+                "partition": 0,
+                "sequence": sequence,
+                "sequence_time": payload["sequence_time"],
+                "trace_parent": None,
+                "data": None,
             },
         }
-        violations = bad_body["context"]["violations"]
-        unseeded = [v["subject"] for v in violations if v["type"] == "positions_not_set"]
-        assert len(unseeded) > 0
-
-        # Step 2: SEEK all unseeded partitions (recover).
-        seek_resp = await client.post(
-            f"/subscriptions/{sub_id}:seek",
-            json={
-                "topology_version": 1, "positions": group_seek_positions({"topic": a["topic"], "partition": a["partition"], "value": "earliest"} for a in assigned)
-            },
+        event["id"] = "17e20000-0000-4000-8000-000000003001"
+        publish = await client.post("/events", json=event)
+        assert (publish.status_code, publish.content) == (202, b"")
+        deadline = asyncio.get_running_loop().time() + 5
+        stored = await witness_reader.await_kind("event", timeout=5)
+        remaining = deadline - asyncio.get_running_loop().time()
+        assert remaining > 0
+        delivered = await reader.await_kind("event", timeout=remaining)
+        payload = stored["payload"]
+        assert type(payload["sequence"]) is int and payload["sequence"] > sequence
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert (
+            delivered
+            == stored
+            == {
+                "kind": "event",
+                "payload": {
+                    **event,
+                    "occurred_at": payload["occurred_at"],
+                    "trace_parent": None,
+                    "data": None,
+                    "partition": 0,
+                    "sequence": payload["sequence"],
+                    "sequence_time": payload["sequence_time"],
+                },
+            }
         )
-        assert seek_resp.status_code == 200
-
-        # Step 3: stream now succeeds - open it, check the status, close it.
-        async with client.stream(
-            "GET",
-            f"/events:stream?subscription={sub_id}",
-            headers={"Accept": "multipart/mixed"},
-        ) as stream_resp:
-            assert stream_resp.status_code == 200
+        sequence = delivered["payload"]["sequence"]
 
 
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(5, func_only=True)
 async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
-    """scenario: consumer/flows/1.03-flow-path-a-consumer-with-db.md
-
-    A consumer reads its own DB offset, SEEKs to that integer, streams,
-    processes an event, persists the sequence to its "DB", then disconnects and
-    reconnects.  The second stream starts from the persisted offset and must
-    not re-deliver the already-processed event.
-    """
-    tenant_id = str(uuid.uuid4())
-    base_url = f"{test_env.base_url}/event-broker/v1"
-
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
-
-        sub_resp = await client.post(
+    """scenario: consumer/flows/1.03-flow-path-a-consumer-with-db.md"""
+    topic = TOPIC_STREAM
+    event_type = EVENT_TYPE_STREAM
+    partitions = [0]
+    interest = {
+        "topic": topic,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "ownership_filter": "entire_tenant",
+        "types": [event_type],
+    }
+    async with api() as client, AsyncExitStack() as stack:
+        event = {
+            "id": "17e20000-0000-4000-8000-000000003101",
+            "type": event_type,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "source": "e2e-test",
+            "subject": "s1",
+            "subject_type": SUBJECT_TYPE,
+            "occurred_at": "2026-01-19T10:20:30Z",
+        }
+        marker = {**event, "id": "17e20000-0000-4000-8000-000000003100"}
+        fence = await client.post("/events", json=marker, headers={"Prefer": "wait=10"}, timeout=12)
+        assert (fence.status_code, fence.content, fence.headers.get("preference-applied")) == (
+            201,
+            b"",
+            "wait=10",
+        )
+        heads = {}
+        for partition in partitions:
+            manifest = await client.get(
+                "/topics/segments", params={"topic": topic, "partition": partition}
+            )
+            assert (manifest.status_code, manifest.headers["content-type"]) == (
+                200,
+                "application/json",
+            )
+            snapshot = manifest.json()
+            assert snapshot["topic"] == topic and snapshot["partition"] == partition
+            assert set(snapshot) == {
+                "topic",
+                "partition",
+                "start_sequence",
+                "end_sequence",
+                "start_time",
+                "end_time",
+                "segments",
+            }
+            assert isinstance(snapshot["segments"], list)
+            head = snapshot["end_sequence"]
+            assert type(head) is int and head >= 0
+            heads[partition] = head
+        created = await client.post("/consumer-groups")
+        assert (created.status_code, created.headers["content-type"]) == (201, "application/json")
+        group_id = created.headers["location"].removeprefix(f"{API_BASE}/consumer-groups/")
+        assert created.headers["location"] == f"{API_BASE}/consumer-groups/{group_id}"
+        group_uuid = group_id.removeprefix("gts.cf.core.events.consumer_group.v1~")
+        assert group_id == f"gts.cf.core.events.consumer_group.v1~{uuid.UUID(group_uuid)}"
+        read = await client.get(f"/consumer-groups/{group_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == created.json() == group
+        joined = await client.post(
             "/subscriptions",
             json={
                 "consumer_group": group_id,
-                "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
+                "client_agent": "consumer-a",
+                "interests": [interest],
             },
         )
-        assert sub_resp.status_code == 201
-        sub_id = str(sub_resp.json()["id"])
-
-        # SEEK to earliest before streaming.
-        await client.post(
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        sub_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{sub_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        member = {
+            "id": sub_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 1,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == member
+        assert joined.json() == {
+            **member,
+            "interests": [{**member["interests"][0], "unmatched_types": []}],
+        }
+        requested = [{"partition": p, "value": "earliest"} for p in partitions]
+        seek = await client.post(
             f"/subscriptions/{sub_id}:seek",
-            json={"topology_version": 1, "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]}},
+            json={"topology_version": 1, "positions": {topic: requested}},
         )
-
-    event_id = str(uuid.uuid4())
-    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
-            assert resp.status_code == 200
-            reader = SseFrameReader(resp)
-            _, _ = await reader.next_frame(timeout=5)  # topology
-
-            # Publish one event.
-            async with api() as pub_client:
-                pub_resp = await pub_client.post(
-                    "/events",
-                    json={
-                        "id": event_id,
-                        "type": EVENT_TYPE_STREAM,
-                        "subject_tenant": tenant_id,
-                        "source": "e2e-test",
-                        "subject": "s1",
-                        "subject_type": SUBJECT_TYPE,
-                        "occurred_at": _now(),
-                    },
-                )
-            assert pub_resp.status_code == 202
-
-            _, event_data = await reader.next_frame(timeout=5)
-            assert event_data["payload"]["id"] == event_id
-            # "Consumer persists this to its DB"
-            last_processed_sequence = event_data["payload"]["sequence"]
-
-    # Reconnect: create a new subscription in the same group and seek to the
-    # persisted sequence (Path-A: "DB has last processed offset").
-    async with api() as client:
-        sub2_resp = await client.post(
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": 0} for p in partitions]},
+        }
+        original_stream = await stack.enter_async_context(AsyncExitStack())
+        reader = await original_stream.enter_async_context(_member_stream(api, sub_id, "sse"))
+        baseline = await reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 1,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": 0, "last_examined": 0}
+                for p in partitions
+            ],
+        }
+        assert baseline == ("topology", topology)
+        original_group = group_id
+        created = await client.post("/consumer-groups")
+        assert (created.status_code, created.headers["content-type"]) == (201, "application/json")
+        group_id = created.headers["location"].removeprefix(f"{API_BASE}/consumer-groups/")
+        assert created.headers["location"] == f"{API_BASE}/consumer-groups/{group_id}"
+        group_uuid = group_id.removeprefix("gts.cf.core.events.consumer_group.v1~")
+        assert group_id == f"gts.cf.core.events.consumer_group.v1~{uuid.UUID(group_uuid)}"
+        read = await client.get(f"/consumer-groups/{group_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == created.json() == group
+        assert group_id != original_group
+        joined = await client.post(
             "/subscriptions",
             json={
                 "consumer_group": group_id,
-                "client_agent": "e2e-test",
-                "interests": [{"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}],
+                "client_agent": "history-reader",
+                "interests": [interest],
             },
         )
-        assert sub2_resp.status_code == 201
-        sub2_id = str(sub2_resp.json()["id"])
-
-        # SEEK to the last processed sequence (the cursor is exactly that value).
-        await client.post(
-            f"/subscriptions/{sub2_id}:seek",
-            json={"topology_version": sub2_resp.json()["topology_version"], "positions": {TOPIC_STREAM: [{"partition": 0, "value": last_processed_sequence}]}},
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        witness_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{witness_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        witness = {
+            "id": witness_id,
+            "consumer_group": group_id,
+            "client_agent": "history-reader",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 1,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == witness
+        assert joined.json() == {
+            **witness,
+            "interests": [{**witness["interests"][0], "unmatched_types": []}],
+        }
+        requested = [{"partition": p, "value": "earliest"} for p in partitions]
+        seek = await client.post(
+            f"/subscriptions/{witness_id}:seek",
+            json={"topology_version": 1, "positions": {topic: requested}},
         )
-
-    # The second stream should NOT immediately deliver the already-processed event.
-    # Publish a second event to verify the stream position is correct.
-    event2_id = str(uuid.uuid4())
-    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
-        async with stream_client.stream("GET", f"/events:sse?subscription={sub2_id}") as resp:
-            assert resp.status_code == 200
-            reader2 = SseFrameReader(resp)
-            _, _ = await reader2.next_frame(timeout=5)  # topology
-
-            async with api() as pub_client:
-                await pub_client.post(
-                    "/events",
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": 0} for p in partitions]},
+        }
+        witness_reader = await stack.enter_async_context(_member_stream(api, witness_id, "sse"))
+        baseline = await witness_reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 1,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": 0, "last_examined": 0}
+                for p in partitions
+            ],
+        }
+        assert baseline == ("topology", topology)
+        group_id = original_group
+        deadline = asyncio.get_running_loop().time() + 5
+        sequence = 0
+        while sequence < heads[0]:
+            remaining = deadline - asyncio.get_running_loop().time()
+            assert remaining > 0
+            stored = await witness_reader.await_kind("event", timeout=remaining)
+            remaining = deadline - asyncio.get_running_loop().time()
+            assert remaining > 0
+            observed = await reader.await_kind("event", timeout=remaining)
+            assert observed == stored
+            assert set(stored) == {"kind", "payload"} and stored["kind"] == "event"
+            payload = stored["payload"]
+            assert payload["partition"] == 0 and type(payload["sequence"]) is int
+            assert sequence < payload["sequence"] <= heads[0]
+            sequence = payload["sequence"]
+        assert sequence == heads[0] and sequence > 0
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(marker["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert stored == {
+            "kind": "event",
+            "payload": {
+                **marker,
+                "occurred_at": payload["occurred_at"],
+                "partition": 0,
+                "sequence": sequence,
+                "sequence_time": payload["sequence_time"],
+                "trace_parent": None,
+                "data": None,
+            },
+        }
+        event["id"] = "17e20000-0000-4000-8000-000000003101"
+        publish = await client.post("/events", json=event)
+        assert (publish.status_code, publish.content) == (202, b"")
+        deadline = asyncio.get_running_loop().time() + 5
+        stored = await witness_reader.await_kind("event", timeout=5)
+        remaining = deadline - asyncio.get_running_loop().time()
+        assert remaining > 0
+        delivered = await reader.await_kind("event", timeout=remaining)
+        payload = stored["payload"]
+        assert type(payload["sequence"]) is int and payload["sequence"] > sequence
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert (
+            delivered
+            == stored
+            == {
+                "kind": "event",
+                "payload": {
+                    **event,
+                    "occurred_at": payload["occurred_at"],
+                    "trace_parent": None,
+                    "data": None,
+                    "partition": 0,
+                    "sequence": payload["sequence"],
+                    "sequence_time": payload["sequence_time"],
+                },
+            }
+        )
+        sequence = delivered["payload"]["sequence"]
+        persisted = sequence
+        await original_stream.aclose()
+        # A stale SEEK passes the lease check only after release, then fails before any write.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 1
+        async with asyncio.timeout_at(deadline):
+            while True:
+                probe = await client.post(
+                    f"/subscriptions/{sub_id}:seek",
                     json={
-                        "id": event2_id,
-                        "type": EVENT_TYPE_STREAM,
-                        "subject_tenant": tenant_id,
-                        "source": "e2e-test",
-                        "subject": "s1",
-                        "subject_type": SUBJECT_TYPE,
-                        "occurred_at": _now(),
+                        "topology_version": member["topology_version"] + 1,
+                        "positions": {topic: [{"partition": 0, "value": "earliest"}]},
                     },
+                    timeout=deadline - loop.time(),
                 )
-
-            _, event2_data = await reader2.next_frame(timeout=5)
-            # Must be event2, not event1 (which was already processed). Its
-            # sequence is above the cursor; sequences may have gaps, so not
-            # necessarily the next integer.
-            assert event2_data["payload"]["id"] == event2_id
-            assert event2_data["payload"]["sequence"] > last_processed_sequence
+                assert probe.headers["content-type"] == "application/problem+json"
+                assert probe.status_code in (409, 412)
+                held = probe.status_code == 409
+                reason, description = (
+                    (
+                        "streaming_in_progress",
+                        "one stream per subscription; a second stream or a SEEK "
+                        "is refused while it is open",
+                    )
+                    if held
+                    else (
+                        "topology_version_mismatch",
+                        "subscription topology changed; re-read the subscription and re-seek",
+                    )
+                )
+                assert probe.json() == {
+                    "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+                    "title": "Failed Precondition",
+                    "status": 409 if held else 412,
+                    "detail": "Operation precondition not met",
+                    "instance": f"{API_BASE}/subscriptions/{sub_id}:seek",
+                    "trace_id": TRACE_ID,
+                    "context": {
+                        "resource_type": "gts.cf.core.events.subscription.v1~",
+                        "violations": [
+                            {"type": reason, "subject": sub_id, "description": description}
+                        ],
+                    },
+                }
+                if not held:
+                    break
+                await asyncio.sleep(0.05)
+        event["id"] = "17e20000-0000-4000-8000-000000003102"
+        publish = await client.post("/events", json=event)
+        assert (publish.status_code, publish.content) == (202, b"")
+        kind, stored = await witness_reader.next_frame(timeout=5)
+        assert kind == "event"
+        payload = stored["payload"]
+        assert type(payload["sequence"]) is int and payload["sequence"] > sequence
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert stored == {
+            "kind": "event",
+            "payload": {
+                **event,
+                "occurred_at": payload["occurred_at"],
+                "trace_parent": None,
+                "data": None,
+                "partition": 0,
+                "sequence": payload["sequence"],
+                "sequence_time": payload["sequence_time"],
+            },
+        }
+        joined = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "consumer-a",
+                "interests": [interest],
+            },
+        )
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        replacement_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{replacement_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        replacement = {
+            "id": replacement_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 2,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == replacement
+        assert joined.json() == {
+            **replacement,
+            "interests": [{**replacement["interests"][0], "unmatched_types": []}],
+        }
+        assert replacement_id != sub_id
+        absent = await client.get(f"/subscriptions/{sub_id}")
+        assert (absent.status_code, absent.headers["content-type"]) == (
+            404,
+            "application/problem+json",
+        )
+        assert absent.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            "title": "Not Found",
+            "status": 404,
+            "detail": f"subscription '{sub_id}' does not exist",
+            "instance": f"{API_BASE}/subscriptions/{sub_id}",
+            "trace_id": TRACE_ID,
+            "context": {
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+                "resource_name": sub_id,
+            },
+        }
+        requested = [{"partition": p, "value": persisted} for p in partitions]
+        seek = await client.post(
+            f"/subscriptions/{replacement_id}:seek",
+            json={
+                "topology_version": replacement["topology_version"],
+                "positions": {topic: requested},
+            },
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": persisted} for p in partitions]},
+        }
+        reader = await stack.enter_async_context(_member_stream(api, replacement_id, "sse"))
+        baseline = await reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 2,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": persisted, "last_examined": persisted}
+                for p in partitions
+            ],
+        }
+        assert baseline == ("topology", topology)
+        assert await reader.next_frame(timeout=5) == ("event", stored)
 
 
 @pytest.mark.parametrize("disconnect", [False, True], ids=["delete", "disconnect"])
 @pytest.mark.timeout(20, func_only=True)
 async def test_gain_and_terminate(api, test_env, disconnect):
-    """scenario: consumer/flows/1.04-flow-leave-triggers-gain-terminate.md
-
-    With two members in a TOPIC_4P group, A holds 2 partitions and B holds 2.
-    When B departs - either via DELETE (delete variant) or by dropping its SSE
-    connection (disconnect variant) - A gains the freed partitions and receives a
-    control/terminal frame.  The disconnect variant uses session_timeout=PT2S so
-    the server's grace-period timer fires quickly.
-    """
-    tenant_id = str(uuid.uuid4())
-    base_url = f"{test_env.base_url}/event-broker/v1"
-
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
-
-        sub_a_resp = await client.post(
+    """scenario: consumer/flows/1.04-flow-leave-triggers-gain-terminate.md"""
+    topic = TOPIC_4P
+    event_type = EVENT_TYPE_4P
+    partitions = list(range(4))
+    interest = {
+        "topic": topic,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "ownership_filter": "entire_tenant",
+        "types": [event_type],
+    }
+    async with api() as client, AsyncExitStack() as stack:
+        heads = {}
+        for partition in partitions:
+            manifest = await client.get(
+                "/topics/segments", params={"topic": topic, "partition": partition}
+            )
+            assert (manifest.status_code, manifest.headers["content-type"]) == (
+                200,
+                "application/json",
+            )
+            snapshot = manifest.json()
+            assert snapshot["topic"] == topic and snapshot["partition"] == partition
+            assert set(snapshot) == {
+                "topic",
+                "partition",
+                "start_sequence",
+                "end_sequence",
+                "start_time",
+                "end_time",
+                "segments",
+            }
+            assert isinstance(snapshot["segments"], list)
+            head = snapshot["end_sequence"]
+            assert type(head) is int and head >= 0
+            heads[partition] = head
+        created = await client.post("/consumer-groups")
+        assert (created.status_code, created.headers["content-type"]) == (201, "application/json")
+        group_id = created.headers["location"].removeprefix(f"{API_BASE}/consumer-groups/")
+        assert created.headers["location"] == f"{API_BASE}/consumer-groups/{group_id}"
+        group_uuid = group_id.removeprefix("gts.cf.core.events.consumer_group.v1~")
+        assert group_id == f"gts.cf.core.events.consumer_group.v1~{uuid.UUID(group_uuid)}"
+        read = await client.get(f"/consumer-groups/{group_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        group = {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == created.json() == group
+        joined = await client.post(
             "/subscriptions",
             json={
                 "consumer_group": group_id,
                 "client_agent": "consumer-a",
-                "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
+                "interests": [interest],
             },
         )
-        assert sub_a_resp.status_code == 201
-        sub_a_id = str(sub_a_resp.json()["id"])
-
-        b_join: dict = {
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        sub_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{sub_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        member = {
+            "id": sub_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 1,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == member
+        assert joined.json() == {
+            **member,
+            "interests": [{**member["interests"][0], "unmatched_types": []}],
+        }
+        joined = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "consumer-b",
+                "interests": [interest],
+                **({"session_timeout": "PT2S"} if disconnect else {}),
+            },
+        )
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        peer_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{peer_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        assert peer_id != sub_id
+        kept, gained = partitions[:2], partitions[2:]
+        if uuid.UUID(sub_id) > uuid.UUID(peer_id):
+            kept, gained = gained, kept
+        peer = {
+            "id": peer_id,
             "consumer_group": group_id,
             "client_agent": "consumer-b",
-            "interests": [{"topic": TOPIC_4P, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_4P]}],
+            "assigned": [{"topic": topic, "partition": p} for p in gained],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 2,
+            "created_at": _subscription_created_at(read.json()),
         }
+        assert read.json() == peer
+        assert joined.json() == {
+            **peer,
+            "interests": [{**peer["interests"][0], "unmatched_types": []}],
+        }
+        current = await client.get(f"/subscriptions/{sub_id}")
+        assert (current.status_code, current.headers["content-type"]) == (200, "application/json")
+        assert current.json() == {
+            **member,
+            "topology_version": 2,
+            "assigned": [{"topic": topic, "partition": p} for p in kept],
+        }
+        first_parts = {a["partition"] for a in current.json()["assigned"]}
+        second_parts = {a["partition"] for a in peer["assigned"]}
+        assert first_parts.isdisjoint(second_parts)
+        assert first_parts | second_parts == set(partitions)
+        requested = [{"partition": p, "value": "latest"} for p in kept]
+        seek = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            json={"topology_version": 2, "positions": {topic: requested}},
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": heads[p]} for p in kept]},
+        }
+        requested = [{"partition": p, "value": "latest"} for p in gained]
+        seek = await client.post(
+            f"/subscriptions/{peer_id}:seek",
+            json={"topology_version": 2, "positions": {topic: requested}},
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": heads[p]} for p in gained]},
+        }
+        reader = await stack.enter_async_context(_member_stream(api, sub_id, "sse"))
+        baseline = await reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 2,
+            "assigned": [
+                {"topic": topic, "partition": p, "offset": heads[p], "last_examined": heads[p]}
+                for p in kept
+            ],
+        }
+        assert baseline == ("topology", topology)
         if disconnect:
-            b_join["session_timeout"] = "PT2S"
-        sub_b_resp = await client.post("/subscriptions", json=b_join)
-        assert sub_b_resp.status_code == 201
-        sub_b_id = str(sub_b_resp.json()["id"])
-
-        # Both members seek after B has joined, so use each member's CURRENT
-        # version and assignment (A's captured assignment shrank from 4 to 2 and
-        # its captured version is stale). Re-read both from the subscription.
-        current_version = sub_b_resp.json()["topology_version"]
-        for sub_id in [sub_a_id, sub_b_id]:
-            assigned = (await client.get(f"/subscriptions/{sub_id}")).json()["assigned"]
-            seek_resp = await client.post(
-                f"/subscriptions/{sub_id}:seek",
-                json={
-                    "topology_version": current_version, "positions": group_seek_positions({"topic": a["topic"], "partition": a["partition"], "value": "earliest"} for a in assigned)
-                },
-            )
-            assert seek_resp.status_code == 200, (
-                f"seek for {sub_id} over {[a['partition'] for a in assigned]} "
-                f"returned {seek_resp.status_code}: {seek_resp.text}"
-            )
-
-    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_a:
-        async with stream_a.stream("GET", f"/events:sse?subscription={sub_a_id}") as resp_a:
-            assert resp_a.status_code == 200
-            reader_a = SseFrameReader(resp_a)
-            kind, _ = await reader_a.next_frame(timeout=5)
-            assert kind == "topology"
-
-            if disconnect:
-                async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_b:
-                    async with stream_b.stream("GET", f"/events:sse?subscription={sub_b_id}") as resp_b:
-                        assert resp_b.status_code == 200
-                        reader_b = SseFrameReader(resp_b)
-                        kind, _ = await reader_b.next_frame(timeout=5)
-                        assert kind == "topology"
-                    # B's connection closes here - server starts the session_timeout timer.
-            else:
-                async with api() as del_client:
-                    del_resp = await del_client.delete(f"/subscriptions/{sub_b_id}")
-                assert del_resp.status_code == 204
-
-            # A gains B's partitions → broker sends control/terminal frame.
-            while True:
-                kind, ctrl = await reader_a.next_frame(timeout=10)
-                if kind != "heartbeat":
-                    break
-            assert kind == "control"
-            assert ctrl["code"] == "terminal"
+            async with AsyncExitStack() as connection:
+                peer_reader = await connection.enter_async_context(
+                    _member_stream(api, peer_id, "sse")
+                )
+                baseline = await peer_reader.next_frame(timeout=5)
+                topology = {
+                    "kind": "topology",
+                    "topology_version": 2,
+                    "assigned": [
+                        {
+                            "topic": topic,
+                            "partition": p,
+                            "offset": heads[p],
+                            "last_examined": heads[p],
+                        }
+                        for p in gained
+                    ],
+                }
+                assert baseline == ("topology", topology)
+        else:
+            left = await client.delete(f"/subscriptions/{peer_id}")
+            assert (left.status_code, left.content) == (204, b"")
+        terminal = await reader.await_kind("control", timeout=10)
+        assert terminal == {
+            "kind": "control",
+            "code": "terminal",
+            "reason": "rebalanced",
+            "positions": [
+                {"topic": topic, "partition": p, "offset": heads[p], "last_examined": heads[p]}
+                for p in kept
+            ],
+        }
+        with pytest.raises(StopAsyncIteration):
+            await reader.next_frame(timeout=10)
+        recorded = {p: heads[p] for p in gained}
+        recorded.update(
+            {item["partition"]: item["last_examined"] for item in terminal["positions"]}
+        )
+        joined = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group_id,
+                "client_agent": "consumer-a",
+                "interests": [interest],
+            },
+        )
+        assert (joined.status_code, joined.headers["content-type"]) == (201, "application/json")
+        replacement_id = _created_subscription_id(joined)
+        read = await client.get(f"/subscriptions/{replacement_id}")
+        assert (read.status_code, read.headers["content-type"]) == (200, "application/json")
+        replacement = {
+            "id": replacement_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "assigned": [{"topic": topic, "partition": p} for p in partitions],
+            "interests": [{**interest, "barrier_mode": "respect", "filter": None}],
+            "topology_version": 4,
+            "created_at": _subscription_created_at(read.json()),
+        }
+        assert read.json() == replacement
+        assert joined.json() == {
+            **replacement,
+            "interests": [{**replacement["interests"][0], "unmatched_types": []}],
+        }
+        assert replacement_id not in (sub_id, peer_id)
+        requested = [{"partition": p, "value": recorded[p]} for p in partitions]
+        seek = await client.post(
+            f"/subscriptions/{replacement_id}:seek",
+            json={
+                "topology_version": replacement["topology_version"],
+                "positions": {topic: requested},
+            },
+        )
+        assert (seek.status_code, seek.headers["content-type"]) == (200, "application/json")
+        assert seek.json() == {
+            "positions": {topic: [{"partition": p, "value": recorded[p]} for p in partitions]},
+        }
+        replacement_reader = await stack.enter_async_context(
+            _member_stream(api, replacement_id, "sse")
+        )
+        baseline = await replacement_reader.next_frame(timeout=5)
+        topology = {
+            "kind": "topology",
+            "topology_version": 4,
+            "assigned": [
+                {
+                    "topic": topic,
+                    "partition": p,
+                    "offset": recorded[p],
+                    "last_examined": recorded[p],
+                }
+                for p in partitions
+            ],
+        }
+        assert baseline == ("topology", topology)
+        async with client.stream(
+            "GET",
+            "/events:stream",
+            params={"subscription": sub_id},
+            headers={"Accept": "multipart/mixed"},
+        ) as absent:
+            assert absent.status_code == 404
+            await absent.aread()
+        assert (absent.status_code, absent.headers["content-type"]) == (
+            404,
+            "application/problem+json",
+        )
+        assert absent.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            "title": "Not Found",
+            "status": 404,
+            "detail": f"subscription '{sub_id}' does not exist",
+            "instance": f"{API_BASE}/events:stream",
+            "trace_id": TRACE_ID,
+            "context": {
+                "resource_type": "gts.cf.core.events.subscription.v1~",
+                "resource_name": sub_id,
+            },
+        }

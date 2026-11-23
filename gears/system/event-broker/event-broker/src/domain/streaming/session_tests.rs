@@ -883,6 +883,120 @@ fn at_start(partition: i32) -> Position {
     Position::builder(gts(TOPIC), partition).build()
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_continuing_member_observes_a_new_version_with_unchanged_partitions() {
+    let (groups, group) = group_of(4, &[MEMBER, PEER]);
+    let subscription = groups.get(PEER).expect("the peer joined");
+    let streaming =
+        ConsumerGroupCoordinator::subscribe(&groups, &group, PEER).expect("the peer joined");
+    let mut harness = open_from(
+        Generation::new(subscription.topology_version, subscription.assigned),
+        vec![
+            PartitionSlot::new(key(2), StubPartition::empty()),
+            PartitionSlot::new(key(3), StubPartition::empty()),
+        ],
+        Arc::new(InterestFilter::compile(&[])),
+        ScopeInput::Alone,
+        streaming,
+    );
+
+    let opening = tokio::time::timeout(BOUND, harness.session.next_frame()).await;
+    let Ok(Some(Frame::Topology {
+        topology_version: 2,
+        positions,
+    })) = opening
+    else {
+        panic!("expected the opening topology at v2, got {opening:?}");
+    };
+    assert_eq!(positions, vec![at_start(2), at_start(3)]);
+
+    let joined = groups.join_member(
+        &group,
+        LOWER_PEER,
+        &[TopicInterest {
+            id: gts(TOPIC),
+            partitions: 4,
+        }],
+        Duration::from_secs(30),
+    );
+    assert_eq!(joined, (vec![assignment(0)], 3, vec![]));
+    let member = groups.get(MEMBER).expect("the first member remains");
+    assert_eq!(
+        Generation::new(member.topology_version, member.assigned),
+        Generation::new(3, vec![assignment(1)]),
+    );
+    let peer = groups.get(PEER).expect("the streaming peer remains");
+    assert_eq!(
+        Generation::new(peer.topology_version, peer.assigned),
+        Generation::new(3, vec![assignment(2), assignment(3)]),
+    );
+
+    let update = tokio::time::timeout(BOUND, harness.session.next_frame()).await;
+    let Ok(Some(Frame::Topology {
+        topology_version: 3,
+        positions,
+    })) = update
+    else {
+        panic!("expected the v3 topology on the continuing stream, got {update:?}");
+    };
+    assert_eq!(positions, vec![at_start(2), at_start(3)]);
+    assert_eq!(harness.session.state(), SessionState::Streaming);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_opening_member_observes_a_newer_version_with_unchanged_partitions() {
+    let (groups, group) = group_of(4, &[MEMBER, PEER]);
+    let subscription = groups.get(PEER).expect("the peer joined");
+    let baseline = Generation::new(subscription.topology_version, subscription.assigned);
+
+    groups.join_member(
+        &group,
+        LOWER_PEER,
+        &[TopicInterest {
+            id: gts(TOPIC),
+            partitions: 4,
+        }],
+        Duration::from_secs(30),
+    );
+    let streaming =
+        ConsumerGroupCoordinator::subscribe(&groups, &group, PEER).expect("the peer remains");
+    let watched = streaming.0.borrow().clone();
+    let mut harness = open_from(
+        baseline,
+        vec![
+            PartitionSlot::new(key(2), StubPartition::empty()),
+            PartitionSlot::new(key(3), StubPartition::empty()),
+        ],
+        Arc::new(InterestFilter::compile(&[])),
+        ScopeInput::Alone,
+        streaming,
+    );
+
+    let opening = tokio::time::timeout(BOUND, harness.session.next_frame()).await;
+    let update = tokio::time::timeout(BOUND, harness.session.next_frame()).await;
+    let frames = [opening, update];
+    let [
+        Ok(Some(Frame::Topology {
+            topology_version: 2,
+            positions: opening,
+        })),
+        Ok(Some(Frame::Topology {
+            topology_version: 3,
+            positions: update,
+        })),
+    ] = frames
+    else {
+        panic!("expected opening v2 followed by v3, got {frames:?}, with watch {watched:?}");
+    };
+    assert_eq!(opening, vec![at_start(2), at_start(3)]);
+    assert_eq!(update, vec![at_start(2), at_start(3)]);
+    assert_eq!(
+        watched,
+        Generation::new(3, vec![assignment(2), assignment(3)])
+    );
+    assert_eq!(harness.session.state(), SessionState::Streaming);
+}
+
 /// The stream open read the member's subscription at v1 with partitions 0
 /// and 1 and seeded its read set from it; the peer joined before the session
 /// opened, so the watch already holds v2 with partition 0. The opening frame
@@ -976,31 +1090,24 @@ async fn an_opening_whose_watch_gained_partitions_closes_with_a_rebalance() {
     assert_eq!(harness.session.state(), SessionState::Closed);
 }
 
-/// A watch can hold the subscription's partitions under an older version:
-/// the coordinator republishes a member only when its partitions move, while
-/// every rebalance advances the version the subscription carries. That is no
-/// change for the session: after the opening frame it owes nothing, not even
-/// the version-only `topology` frame a real version bump gets at once. In the
-/// second row the baseline lists its partitions in another order than the
-/// watch, which is the same set.
+/// An equal or older version does not add a topology frame when the watch
+/// lists the same partitions in a different order.
 #[tokio::test(start_paused = true)]
-async fn an_opening_whose_watch_differs_only_in_version_sends_no_version_frame() {
-    for (members, partitions, baseline) in [
-        (&[MEMBER, LOWER_PEER][..], 1, vec![assignment(0)]),
-        (&[MEMBER][..], 2, vec![assignment(1), assignment(0)]),
-    ] {
-        let (groups, group) = group_of(partitions, members);
+async fn an_opening_whose_watch_is_equal_or_older_sends_no_extra_topology() {
+    for baseline_version in [1, 2] {
+        let (groups, group) = group_of(2, &[MEMBER]);
         let streaming = ConsumerGroupCoordinator::subscribe(&groups, &group, MEMBER)
             .expect("the member joined");
         assert_eq!(
             *streaming.0.borrow(),
-            Generation::new(1, (0..partitions).map(assignment).collect())
+            Generation::new(1, vec![assignment(0), assignment(1)])
         );
         let mut harness = open_from(
-            Generation::new(2, baseline),
-            (0..partitions)
-                .map(|partition| PartitionSlot::new(key(partition), StubPartition::empty()))
-                .collect(),
+            Generation::new(baseline_version, vec![assignment(1), assignment(0)]),
+            vec![
+                PartitionSlot::new(key(0), StubPartition::empty()),
+                PartitionSlot::new(key(1), StubPartition::empty()),
+            ],
             Arc::new(InterestFilter::compile(&[])),
             ScopeInput::Alone,
             streaming,
@@ -1011,17 +1118,15 @@ async fn an_opening_whose_watch_differs_only_in_version_sends_no_version_frame()
 
         let [
             Frame::Topology {
-                topology_version: 2,
+                topology_version,
                 positions,
             },
         ] = frames.as_slice()
         else {
-            panic!("expected the opening at v2 alone, got {frames:?}");
+            panic!("expected the opening at v{baseline_version} alone, got {frames:?}");
         };
-        assert_eq!(
-            positions,
-            &(0..partitions).map(at_start).collect::<Vec<_>>()
-        );
+        assert_eq!(*topology_version, baseline_version);
+        assert_eq!(positions, &[at_start(0), at_start(1)]);
         assert_eq!(harness.session.state(), SessionState::Streaming);
     }
 }

@@ -165,6 +165,9 @@ pub struct OopHttpConfig {
     /// slow dependencies. Mirrors the `api-gateway` `healthcheck_timeout_ms`.
     #[serde(default = "default_healthcheck_timeout_ms")]
     pub healthcheck_timeout_ms: u64,
+    /// Optional limits for request bodies and response creation on published gear routes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_limits: Option<crate::runtime::OopRequestLimits>,
     /// Base URL other services use to reach this instance (registered as the
     /// instance's REST endpoint). Defaults to `http://<listen_addr>` with an
     /// unspecified host (`0.0.0.0`) rewritten to `127.0.0.1`.

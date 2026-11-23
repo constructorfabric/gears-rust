@@ -17,7 +17,8 @@
 //! validate behaviour against the freshly emitted base.
 
 use gts::GtsSchema;
-use toolkit_gts::{gts_id, gts_type_schema};
+use toolkit_gts::gts_id;
+use toolkit_gts::local::gts_type_schema;
 use uuid::Uuid;
 
 use crate::gts::{EventV1, EventV1Traits, TopicV1};
@@ -188,6 +189,31 @@ fn only_the_topic_and_event_base_types_are_declared() {
             toolkit_gts::gts_id!("cf.core.events.topic.v1~"),
         ],
         "the broker declares exactly the topic and event base types"
+    );
+}
+
+#[test]
+fn the_local_inventory_includes_the_two_bases_and_the_unit_test_example() {
+    let documents: Vec<_> = crate::gts_declarations()
+        .into_iter()
+        .map(|(id, schema)| (id, emitted(&schema)))
+        .collect();
+    assert_eq!(
+        documents,
+        [
+            (
+                <EventV1>::TYPE_ID.to_owned(),
+                emitted(&<EventV1>::gts_schema_with_refs_as_string()),
+            ),
+            (
+                OrderPlacedV1::TYPE_ID.to_owned(),
+                emitted(&OrderPlacedV1::gts_schema_with_refs_as_string()),
+            ),
+            (
+                TopicV1::TYPE_ID.to_owned(),
+                emitted(&TopicV1::gts_schema_with_refs_as_string()),
+            ),
+        ]
     );
 }
 

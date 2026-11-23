@@ -110,32 +110,22 @@ pub struct StreamSession {
 }
 
 impl StreamSession {
-    /// Opens a session and picks the assignment it classifies every later
-    /// one against.
+    /// Opens against the subscription baseline that seeded the read set.
     ///
-    /// `opening.baseline` is the subscription as the stream open read it: the
-    /// read set was seeded from it, and the opening `topology` frame carries
-    /// its version. The member's watch is taken after that read, so a
-    /// rebalance in between may already sit in it. When the watch holds other
-    /// partitions than the baseline, the session classifies against the
-    /// baseline, so its first pass reports the move: a loss narrows the read
-    /// set with a `topology` frame, and a gain or the loss of every partition
-    /// ends the stream.
-    /// When it holds the same partitions, the session classifies against the
-    /// watch: the coordinator republishes a member only when its partitions
-    /// move, while every rebalance advances the version the subscription
-    /// carries, so the watch's version can trail the baseline's, and
-    /// classifying against the baseline would send a `topology` frame with
-    /// that older version.
+    /// The first frame reports the baseline. The watch can already hold a
+    /// different assignment or a newer version, which the next pass applies.
+    /// For an older watch with the same partitions, the session compares
+    /// future updates against the watch and reports its opening version.
     #[must_use]
     pub fn open(opening: SessionOpening) -> Self {
         let watched = opening.generations.borrow().clone();
-        let moved = !matches!(
-            AssignmentDelta::classify(&opening.baseline, &watched),
-            AssignmentDelta::Unchanged | AssignmentDelta::VersionOnly { .. }
-        );
         let topology_version = opening.baseline.topology_version;
-        let current = if moved { opening.baseline } else { watched };
+        let current = match AssignmentDelta::classify(&opening.baseline, &watched) {
+            AssignmentDelta::VersionOnly {
+                topology_version: watched_version,
+            } if watched_version < topology_version => watched,
+            _ => opening.baseline,
+        };
         Self {
             state: SessionState::Opening,
             read_set: opening.read_set,

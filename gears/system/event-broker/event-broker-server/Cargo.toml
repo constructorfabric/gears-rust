@@ -15,50 +15,75 @@ publish = false
 name = "cf-gears-event-broker-server"
 path = "src/main.rs"
 
+[[test]]
+name = "standalone_integration_tests"
+path = "tests/standalone_integration_tests.rs"
+required-features = ["e2e-flight-control"]
+
+[[test]]
+name = "consumer_group_rebalance_integration_tests"
+path = "tests/consumer_group_rebalance_integration_tests.rs"
+required-features = ["e2e-flight-control"]
+
+[[test]]
+name = "process_cutover"
+path = "tests/process_cutover.rs"
+required-features = ["process-tests"]
+
 [lints]
 workspace = true
 
+[features]
+default = []
+process-tests = []
+e2e-flight-control = [
+    "process-tests",
+    "dep:prost",
+    "dep:tonic",
+    "dep:tonic-prost",
+    "dep:tonic-prost-build",
+    "dep:toolkit-security",
+    "dep:toolkit-trace-context",
+    "dep:toolkit-transport-grpc",
+]
+
 [dependencies]
-# Host-mode bootstrap: `toolkit::bootstrap::{AppConfig, run_server}` drives the
-# whole binary. This is the one crate in the event-broker tree that needs it -
-# the gear library itself is contract-only.
-toolkit = { workspace = true, features = ["bootstrap"] }
 anyhow = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tracing = { workspace = true }
-
-# The target gear. Its library pulls in the storage-backend plugins it wires
-# through `backend_providers()` (memory/sqlite/postgres/mysql/kafka), so they do
-# not need to be named here.
+cluster-sdk = { workspace = true, features = ["grpc-client", "otel"] }
 event-broker = { workspace = true }
+prost = { workspace = true, optional = true }
+rand = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+toolkit = { workspace = true, features = ["bootstrap"] }
+toolkit-security = { workspace = true, optional = true }
+toolkit-taskward = { workspace = true }
+toolkit-trace-context = { workspace = true, optional = true }
+toolkit-transport-grpc = { workspace = true, optional = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
-# The gears the single-process `Standalone` deployment runs in-process. Each is
-# linked only so its `inventory::submit!` registration is present in this
-# binary; `event_broker` reaches them at runtime through their SDK contracts via
-# the `ClientHub`, never by a direct crate path. `cluster` additionally brings
-# its own `standalone` cache provider (`ClusterGear::provider_registry()`), which
-# is how the `standalone` profile in the config resolves without linking
-# `standalone-cluster-plugin` here.
-cluster = { workspace = true }
-types-registry = { workspace = true }
-authz-resolver = { workspace = true }
-api-gateway = { workspace = true }
-authn-resolver = { workspace = true }
-# The static accept-all AuthN/AuthZ plugin gears standalone mode uses.
-static-authn-plugin = { workspace = true }
-static-authz-plugin = { workspace = true }
+[build-dependencies]
+tonic-prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The full-process integration tests spawn this crate's own compiled binary
-# (`CARGO_BIN_EXE_cf-gears-event-broker-server`, defined only here) and drive it
-# over real HTTP. `test-utils` gives the shared harness
-# (`event_broker::test_support::StaticTypesRegistry`) used to seed fixtures.
+prost = { workspace = true }
+tonic-prost = { workspace = true }
+cf-gears-cluster-conformance = { workspace = true }
+cluster-sdk = { workspace = true, features = ["grpc-client"] }
+# The standalone and rebalance targets select separate broker and flight-control
+# executables. `test-utils` builds the event schemas the fixture Core admits.
 event-broker = { workspace = true, features = ["test-utils"] }
+event-broker-sdk = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time", "test-util"] }
 tokio-stream = { workspace = true }
+tonic = { workspace = true }
+serde-saphyr = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["clock", "serde"] }

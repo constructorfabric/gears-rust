@@ -9,7 +9,8 @@ mod model;
 pub(crate) use model::MAX_REQUEST_BODY_BYTES;
 pub use model::{
     BUILT_IN_PARTITIONS, BackendEntry, BatchConfig, DEFAULT_RETENTION_DURATION, DeploymentMode,
-    EventBrokerConfig, LoaderConfig, OutboxGroupEntry, ProvisioningConfig, PublishConfig,
-    RegistrationConfig, RetentionSettings, RetentionSettingsEntry, RetentionSize, StreamingConfig,
-    SubscriptionConfig, TopicSettingsEntry, TopicSettingsError, TopicSettingsMap, WorkersConfig,
+    EventBrokerConfig, LoaderConfig, OutboxGroupEntry, ProcessClusterConfig, ProcessConfig,
+    ProvisioningConfig, PublishConfig, RegistrationConfig, RetentionSettings,
+    RetentionSettingsEntry, RetentionSize, StreamingConfig, SubscriptionConfig, TopicSettingsEntry,
+    TopicSettingsError, TopicSettingsMap, WorkersConfig,
 };

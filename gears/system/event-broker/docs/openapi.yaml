@@ -400,9 +400,11 @@ paths:
           `meta`); it carries no `topic`.
         - `{ "kind": "heartbeat", "at": "<iso8601>" }`
         - `{ "kind": "topology", "topology_version": <int>, "assigned": [{ "topic", "partition", "offset": <i64>, "last_examined": <i64> }] }`
-          — the full current assignment snapshot; emitted once at open (baseline,
-          the first frame) and again mid-stream, non-terminal, on a partition loss
-          (subscription retains ≥1) or a `topology_version`-only change.
+          - the full current assignment snapshot; emitted once at open (baseline,
+          the first frame). For both transports, a continuing stream reports the latest
+          observed streamable generation on strict loss or a version-only change. The
+          non-terminal snapshot includes retained positions. Generations may coalesce.
+          A newer same-set generation seen during open can follow the baseline.
         - `{ "kind": "control", "code": "progress" | "terminal", "positions": [{ "topic", "partition", "offset": <i64>, "last_examined": <i64> }], "reason": "rebalanced" | "lose_all" | "teardown" }`
           is the position carrier. `code: "progress"` is a non-terminal mid-stream report
           of the partitions whose filter rejected at least the drift threshold of events
