@@ -112,8 +112,12 @@ async fn proxy(
     ctx: SecurityContext,
     req: Request,
 ) -> Result<Response, DomainError> {
-    // Short-circuit CORS preflight — return permissive 204 without upstream resolution.
-    // The actual request validates the origin against the upstream's CORS config.
+    // A CORS preflight (OPTIONS with `Origin` and
+    // `Access-Control-Request-Method`) gets a permissive 204 without upstream
+    // resolution; the actual request validates the origin against the
+    // upstream's CORS config. It cannot be routed: the API gateway does not
+    // authenticate a preflight, so there is no tenant to resolve the alias
+    // for. Every other OPTIONS is routed like any other method.
     if req.method() == http::Method::OPTIONS
         && req.headers().contains_key(http::header::ORIGIN)
         && req

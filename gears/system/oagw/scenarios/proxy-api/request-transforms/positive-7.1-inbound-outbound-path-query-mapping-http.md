@@ -44,4 +44,4 @@ Host: api.openai.com
 ```
 
 - Path suffix is appended.
-- Only allowlisted query params are forwarded.
+- A query with a parameter the allowlist does not name is rejected (`400`), not filtered; an accepted query is forwarded as the client sent it ([7.8](positive-7.8-raw-query-forwarded-as-sent.md)).

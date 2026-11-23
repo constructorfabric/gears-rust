@@ -92,6 +92,8 @@ pub(super) fn method_text(method: HttpMethod) -> &'static str {
         HttpMethod::Put => "PUT",
         HttpMethod::Delete => "DELETE",
         HttpMethod::Patch => "PATCH",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Options => "OPTIONS",
     }
 }
 
@@ -103,6 +105,8 @@ pub(super) fn parse_stored_method(text: &str) -> Result<HttpMethod, String> {
         "PUT" => Ok(HttpMethod::Put),
         "DELETE" => Ok(HttpMethod::Delete),
         "PATCH" => Ok(HttpMethod::Patch),
+        "HEAD" => Ok(HttpMethod::Head),
+        "OPTIONS" => Ok(HttpMethod::Options),
         other => Err(format!("unknown HTTP method '{other}'")),
     }
 }
@@ -724,16 +728,18 @@ mod tests {
             HttpMethod::Put,
             HttpMethod::Delete,
             HttpMethod::Patch,
+            HttpMethod::Head,
+            HttpMethod::Options,
         ];
         for method in all {
             assert_eq!(parse_stored_method(method_text(method)), Ok(method));
         }
         assert_eq!(
             all.map(method_text),
-            ["GET", "POST", "PUT", "DELETE", "PATCH"]
+            ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
         );
         assert!(parse_stored_method("get").is_err());
-        assert!(parse_stored_method("HEAD").is_err());
+        assert!(parse_stored_method("TRACE").is_err());
     }
 
     #[test]

@@ -152,6 +152,8 @@ struct Setup {
     passthrough_all: bool,
     request_timeout: Option<Duration>,
     metrics: Option<Arc<dyn OagwMetricsPort>>,
+    /// Bind no transform, so the query is not changed before signing.
+    no_transform: bool,
 }
 
 struct Fx {
@@ -168,7 +170,7 @@ impl Fx {
     }
 
     /// An upstream on the mock with `signer` as its auth plugin (config
-    /// [`auth_config`]), `AddQuery` bound, and an allowlist passthrough of
+    /// [`auth_config`]), `AddQuery` bound unless `setup.no_transform`, and an allowlist passthrough of
     /// `x-multi` and `x-marker`; a route on [`PATH`] and one on the mock's
     /// WebSocket echo.
     async fn with(signer: Arc<Signer>, setup: Setup) -> Self {
@@ -232,10 +234,14 @@ impl Fx {
                 })
                 .plugins(PluginsConfig {
                     sharing: SharingMode::Private,
-                    items: vec![PluginBinding {
-                        plugin_ref: REQUEST_ID_TRANSFORM_PLUGIN_ID.into(),
-                        config: Default::default(),
-                    }],
+                    items: if setup.no_transform {
+                        vec![]
+                    } else {
+                        vec![PluginBinding {
+                            plugin_ref: REQUEST_ID_TRANSFORM_PLUGIN_ID.into(),
+                            config: Default::default(),
+                        }]
+                    },
                 })
                 .build(),
             )
@@ -373,6 +379,38 @@ async fn signing_sees_the_final_request_and_its_output_is_sent() {
     assert_eq!(header_values(&rec[0], "x-multi"), ["a", "b"]);
     assert_eq!(header_values(&rec[0], "host"), [host]);
     assert_eq!(rec[0].body, body.as_ref());
+}
+
+/// Without a transform that changes the query, the signing phase gets the
+/// client's query bytes, which re-encoding would have changed (`%20` to `+`,
+/// `k` to `k=`), and the upstream gets the same bytes.
+#[tokio::test]
+async fn signing_sees_the_raw_query_when_no_transform_changed_it() {
+    let fx = Fx::with(
+        Signer::new(Some(SigningOutput {
+            set_headers: vec![("x-signature".into(), b"sig".to_vec())],
+            query: QueryChange::Keep,
+        })),
+        Setup {
+            no_transform: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let raw = "q=a%20b&q&q=%2b";
+    let req = http::Request::post(format!("/{}{}?{raw}", fx.alias, fx.guard.path(PATH)))
+        .header("content-type", "application/json")
+        .body(Body::Bytes(Bytes::from_static(b"{}")))
+        .unwrap();
+    assert_eq!(fx.send(req).await.unwrap(), StatusCode::OK);
+
+    let seen = fx.signer.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].query.as_deref(), Some(raw));
+    let rec = fx.guard.recorded_requests().await;
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0].uri, format!("{}?{raw}", fx.guard.path(PATH)));
+    assert_eq!(header_values(&rec[0], "x-signature"), ["sig"]);
 }
 
 /// A streamed body is not read for signing: the phase gets the marker, and

@@ -50,6 +50,6 @@ Authorization: Bearer <token>
 
 ## What to check
 
-- Preflight is handled at the handler level (no upstream resolution, no tenant context required).
+- Preflight is handled at the handler level (no upstream resolution, no tenant context required). A preflight is an `OPTIONS` with both `Origin` and `Access-Control-Request-Method`; any other `OPTIONS` is routed and proxied when the route lists `OPTIONS` ([12.9](../../protocols/http/positive-12.9-options-routed-preflight-answered-gateway.md)).
 - Origin enforcement happens on the actual request after upstream resolution.
 - Disallowed origins never reach the upstream.

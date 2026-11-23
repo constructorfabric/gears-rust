@@ -119,7 +119,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Create HTTP route with method + path
 - **Scenario**: [positive-3.1-create-http-route-method-path.md](management-api/routes/positive-3.1-create-http-route-method-path.md)
-- **Mechanism**: `POST /routes` with `match.http.methods` and `match.http.path`. Returns `201`. Route is associated to the target upstream.
+- **Mechanism**: `POST /routes` with `match.http.methods` and `match.http.path`. Returns `201`. Route is associated to the target upstream. Methods: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, each listed explicitly (`GET` does not imply `HEAD`).
 
 #### Path suffix mode = append (prefix routes for REST resources)
 - **Scenario**: [positive-3.5-path-suffix-mode-append.md](management-api/routes/positive-3.5-path-suffix-mode-append.md)
@@ -215,11 +215,11 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Inbound → outbound path + query mapping for HTTP
 - **Scenario**: [positive-7.1-inbound-outbound-path-query-mapping-http.md](proxy-api/request-transforms/positive-7.1-inbound-outbound-path-query-mapping-http.md)
-- **Mechanism**: Outbound path = `route.match.http.path` (+ suffix if enabled). Only allowlisted query params forwarded.
+- **Mechanism**: Outbound path = `route.match.http.path` (+ suffix if enabled). A query parameter the allowlist does not name is rejected; an accepted query is forwarded as sent.
 
 #### Hop-by-hop headers stripped
 - **Scenario**: [positive-7.2-hop-hop-headers-stripped.md](proxy-api/request-transforms/positive-7.2-hop-hop-headers-stripped.md)
-- **Mechanism**: `Connection`, `Upgrade`, `Transfer-Encoding`, `TE`, etc. do not reach upstream unless explicitly allowed by protocol handler. Under `passthrough: all`, client forwarding and override headers (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`, ...) are not forwarded unless the allowlist names them. With an auth plugin, repeated and non-UTF-8 client headers reach the upstream unchanged; only the plugin's header is replaced. A transform plugin rewrites only the header names it changes; the credential and other lines keep their bytes and sensitive flag, request and response.
+- **Mechanism**: On a plain request (not a WebSocket handshake), `Connection`, `Upgrade`, `Transfer-Encoding`, `TE`, etc. and the headers `Connection` nominates do not reach upstream unless explicitly allowed by protocol handler. Under `passthrough: all`, client forwarding and override headers (`Forwarded`, `Via`, `X-Forwarded-*`, `X-Real-IP`, ...) are not forwarded unless the allowlist names them. With an auth plugin, repeated and non-UTF-8 client headers reach the upstream unchanged; only the plugin's header is replaced. A transform plugin rewrites only the header names it changes; the credential and other lines keep their bytes and sensitive flag, request and response.
 
 #### Host header replaced by upstream host
 - **Scenario**: [positive-7.3-host-header-replaced-upstream-host.md](proxy-api/request-transforms/positive-7.3-host-header-replaced-upstream-host.md)
@@ -232,6 +232,10 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 #### Request correlation headers propagate end-to-end
 - **Scenario**: [positive-7.6-request-correlation-headers-propagate-end-end.md](proxy-api/request-transforms/positive-7.6-request-correlation-headers-propagate-end-end.md)
 - **Mechanism**: Client `X-Request-ID` forwarded to upstream and included in response. If absent, gateway generates one.
+
+#### Query forwarded as sent
+- **Scenario**: [positive-7.8-raw-query-forwarded-as-sent.md](proxy-api/request-transforms/positive-7.8-raw-query-forwarded-as-sent.md)
+- **Mechanism**: The upstream gets the client's query byte for byte: `%2B` vs `+`, `%20`, unescaped reserved characters, characters the gateway used to escape, raw UTF-8 bytes, repeated keys, empty values, keys without `=`, escape case and order. The allowlist checks the names decoded as `application/x-www-form-urlencoded` (`my%20key` and `my+key` are `my key`). A transform that changes the pairs, or a literal `;` (which the allowlist does not split on and some upstreams do), makes the gateway form-encode them again.
 
 ---
 
@@ -339,6 +343,14 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 - **Scenario**: [positive-12.4-http-version-negotiation.md](protocols/http/positive-12.4-http-version-negotiation.md)
 - **Mechanism**: First call attempts HTTP/2 via ALPN. On failure, falls back to HTTP/1.1. Subsequent calls use cached protocol decision.
 
+#### HEAD returns the upstream's head without a body
+- **Scenario**: [positive-12.8-head-request-returns-upstream-head.md](protocols/http/positive-12.8-head-request-returns-upstream-head.md)
+- **Mechanism**: A route that lists `HEAD` proxies it; the client gets the upstream's status and headers, `Content-Length` included, and no body, also for an event stream. `GET` does not imply `HEAD`: a `GET`-only route answers `HEAD` with `404`.
+
+#### OPTIONS routed; CORS preflight answered by the gateway
+- **Scenario**: [positive-12.9-options-routed-preflight-answered-gateway.md](protocols/http/positive-12.9-options-routed-preflight-answered-gateway.md)
+- **Mechanism**: A route that lists `OPTIONS` proxies it, with or without `Origin`. A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) gets the gateway's permissive `204` and never reaches the upstream. Without a route for `OPTIONS`, `404`. With the API gateway's `cors_enabled`, the gateway answers every `OPTIONS` itself.
+
 ---
 
 ### Streaming (SSE)
@@ -405,7 +417,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Built-in CORS handling (preflight + actual request)
 - **Scenario**: [positive-10.2-built-cors-handling.md](plugins/guards/positive-10.2-built-cors-handling.md)
-- **Mechanism**: OPTIONS preflight returns permissive `204` at handler level (no upstream resolution). Origin enforcement happens on actual requests after upstream resolution — disallowed origins are rejected with `403` before reaching the upstream. Allowed origins receive CORS response headers (`Access-Control-Allow-Origin`, `Vary: Origin`, etc.).
+- **Mechanism**: A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) returns permissive `204` at handler level (no upstream resolution); other `OPTIONS` requests are routed ([12.9](protocols/http/positive-12.9-options-routed-preflight-answered-gateway.md)). Origin enforcement happens on actual requests after upstream resolution — disallowed origins are rejected with `403` before reaching the upstream. Allowed origins receive CORS response headers (`Access-Control-Allow-Origin`, `Vary: Origin`, etc.).
 
 #### Hierarchical merge/union for CORS allowed origins
 - **Scenario**: *Covered within hierarchical configuration scenarios.*
@@ -595,7 +607,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Method allowlist enforcement → 404
 - **Scenario**: [negative-3.2-method-allowlist-enforcement.md](management-api/routes/negative-3.2-method-allowlist-enforcement.md)
-- **What happens**: Route allows `POST`; invoking `GET` returns `404 ROUTE_NOT_FOUND` as a gateway error.
+- **What happens**: Route allows `POST`; invoking `GET` returns `404 ROUTE_NOT_FOUND` as a gateway error. `HEAD` and `OPTIONS` match only routes that list them ([12.8](protocols/http/positive-12.8-head-request-returns-upstream-head.md), [12.9](protocols/http/positive-12.9-options-routed-preflight-answered-gateway.md)).
 
 #### Query allowlist enforcement → 400
 - **Scenario**: [negative-3.3-query-allowlist-enforcement.md](management-api/routes/negative-3.3-query-allowlist-enforcement.md)

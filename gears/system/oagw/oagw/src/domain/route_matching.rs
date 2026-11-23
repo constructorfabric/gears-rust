@@ -21,6 +21,8 @@ pub(crate) fn parse_method(s: &str) -> Option<HttpMethod> {
         "PUT" => Some(HttpMethod::Put),
         "DELETE" => Some(HttpMethod::Delete),
         "PATCH" => Some(HttpMethod::Patch),
+        "HEAD" => Some(HttpMethod::Head),
+        "OPTIONS" => Some(HttpMethod::Options),
         _ => None,
     }
 }
@@ -658,6 +660,9 @@ mod tests {
     #[test]
     fn parse_method_is_case_insensitive() {
         assert_eq!(parse_method("post"), Some(HttpMethod::Post));
-        assert_eq!(parse_method("OPTIONS"), None);
+        assert_eq!(parse_method("HEAD"), Some(HttpMethod::Head));
+        assert_eq!(parse_method("OPTIONS"), Some(HttpMethod::Options));
+        assert_eq!(parse_method("TRACE"), None);
+        assert_eq!(parse_method("CONNECT"), None);
     }
 }

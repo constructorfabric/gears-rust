@@ -2,7 +2,9 @@ use crate::domain::error::DomainError;
 use crate::domain::model::{Endpoint, Scheme};
 use oagw_sdk::field;
 
-/// Build the full upstream URL from endpoint, route path, path suffix, and query params.
+/// Build the full upstream URL from endpoint, route path, path suffix and
+/// query. `query` (without the `?`) is appended as given; `Some("")` keeps a
+/// bare `?`.
 ///
 /// # Errors
 ///
@@ -11,7 +13,7 @@ pub fn build_upstream_url(
     endpoint: &Endpoint,
     route_path: &str,
     path_suffix: &str,
-    query_params: &[(String, String)],
+    query: Option<&str>,
 ) -> Result<String, DomainError> {
     let scheme = match endpoint.scheme {
         Scheme::Http => "http",
@@ -47,12 +49,9 @@ pub fn build_upstream_url(
 
     let mut url = format!("{scheme}://{host_port}{path}");
 
-    if !query_params.is_empty() {
+    if let Some(query) = query {
         url.push('?');
-        let qs = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(query_params)
-            .finish();
-        url.push_str(&qs);
+        url.push_str(query);
     }
 
     Ok(url)
@@ -76,7 +75,7 @@ mod tests {
             &endpoint("api.openai.com", 443),
             "/v1/chat",
             "/completions",
-            &[],
+            None,
         )
         .unwrap();
         assert_eq!(url, "https://api.openai.com/v1/chat/completions");
@@ -88,7 +87,7 @@ mod tests {
             &endpoint("api.openai.com", 443),
             "/v1/chat",
             "/models/gpt-4",
-            &[("version".into(), "2".into())],
+            Some("version=2"),
         )
         .unwrap();
         assert_eq!(url, "https://api.openai.com/v1/chat/models/gpt-4?version=2");
@@ -96,24 +95,24 @@ mod tests {
 
     #[test]
     fn nonstandard_port() {
-        let url =
-            build_upstream_url(&endpoint("api.openai.com", 443), "/v1/chat", ".json", &[]).unwrap();
+        let url = build_upstream_url(&endpoint("api.openai.com", 443), "/v1/chat", ".json", None)
+            .unwrap();
         assert_eq!(url, "https://api.openai.com/v1/chat.json");
-        let url = build_upstream_url(&endpoint("localhost", 8080), "/api", "", &[]).unwrap();
+        let url = build_upstream_url(&endpoint("localhost", 8080), "/api", "", None).unwrap();
         assert_eq!(url, "https://localhost:8080/api");
     }
 
     #[test]
     fn empty_suffix() {
         let url =
-            build_upstream_url(&endpoint("api.openai.com", 443), "/v1/models", "", &[]).unwrap();
+            build_upstream_url(&endpoint("api.openai.com", 443), "/v1/models", "", None).unwrap();
         assert_eq!(url, "https://api.openai.com/v1/models");
     }
 
     #[test]
     fn avoids_double_slash() {
         let url =
-            build_upstream_url(&endpoint("api.openai.com", 443), "/v1/", "/chat", &[]).unwrap();
+            build_upstream_url(&endpoint("api.openai.com", 443), "/v1/", "/chat", None).unwrap();
         assert_eq!(url, "https://api.openai.com/v1/chat");
     }
 
@@ -123,24 +122,31 @@ mod tests {
     #[test]
     fn trailing_slash_route_with_segment_suffix() {
         let ep = endpoint("api.example.com", 443);
-        let url = build_upstream_url(&ep, "/v1/admin/", ".json", &[]).unwrap();
+        let url = build_upstream_url(&ep, "/v1/admin/", ".json", None).unwrap();
         assert_eq!(url, "https://api.example.com/v1/admin.json");
-        let url = build_upstream_url(&ep, "/v1/admin/", "", &[]).unwrap();
+        let url = build_upstream_url(&ep, "/v1/admin/", "", None).unwrap();
         assert_eq!(url, "https://api.example.com/v1/admin/");
-        let url = build_upstream_url(&ep, "/", "/x", &[]).unwrap();
+        let url = build_upstream_url(&ep, "/", "/x", None).unwrap();
         assert_eq!(url, "https://api.example.com/x");
     }
 
+    /// The query goes out byte for byte: encoding, `+`, repeated keys,
+    /// empty values, keys without `=` and the order are the client's.
     #[test]
-    fn multiple_query_params() {
-        let url = build_upstream_url(
-            &endpoint("example.com", 443),
-            "/api",
-            "/data",
-            &[("key".into(), "val".into()), ("foo".into(), "bar".into())],
-        )
-        .unwrap();
-        assert_eq!(url, "https://example.com/api/data?key=val&foo=bar");
+    fn query_is_appended_verbatim() {
+        let ep = endpoint("example.com", 443);
+        for query in [
+            "key=val&foo=bar",
+            "q=a%2Bb&q=a+b&q=a%20b",
+            "b=2&a=1&b=1",
+            "empty=&flag&=v",
+            "path=/x/y?z&at=@&colon=:&comma=,&semi=;",
+            "lower=%c3%a9&upper=%C3%A9",
+            "",
+        ] {
+            let url = build_upstream_url(&ep, "/api", "/data", Some(query)).unwrap();
+            assert_eq!(url, format!("https://example.com/api/data?{query}"));
+        }
     }
 
     #[test]
@@ -150,7 +156,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port: 3000,
         };
-        let url = build_upstream_url(&ep, "/v1/test", "", &[]).unwrap();
+        let url = build_upstream_url(&ep, "/v1/test", "", None).unwrap();
         assert_eq!(url, "http://127.0.0.1:3000/v1/test");
     }
 
@@ -161,7 +167,7 @@ mod tests {
             host: "example.com".into(),
             port: 80,
         };
-        let url = build_upstream_url(&ep, "/api", "", &[]).unwrap();
+        let url = build_upstream_url(&ep, "/api", "", None).unwrap();
         assert_eq!(url, "http://example.com/api");
     }
 
@@ -175,24 +181,12 @@ mod tests {
                 host: "example.com".into(),
                 port,
             };
-            build_upstream_url(&ep, "/api", "", &[]).unwrap()
+            build_upstream_url(&ep, "/api", "", None).unwrap()
         };
         assert_eq!(url(Scheme::Http, 443), "http://example.com:443/api");
         assert_eq!(url(Scheme::Https, 80), "https://example.com:80/api");
         assert_eq!(url(Scheme::Wss, 443), "wss://example.com/api");
         assert_eq!(url(Scheme::Wt, 443), "https://example.com/api");
-    }
-
-    #[test]
-    fn query_value_with_ampersand_is_encoded() {
-        let url = build_upstream_url(
-            &endpoint("api.openai.com", 443),
-            "/v1/search",
-            "",
-            &[("q".into(), "a&b".into())],
-        )
-        .unwrap();
-        assert_eq!(url, "https://api.openai.com/v1/search?q=a%26b");
     }
 
     #[test]
@@ -202,7 +196,7 @@ mod tests {
             host: "grpc.example.com".into(),
             port: 443,
         };
-        let err = build_upstream_url(&ep, "/service", "", &[]).unwrap_err();
+        let err = build_upstream_url(&ep, "/service", "", None).unwrap_err();
         match err {
             DomainError::Validation { field, reason, .. } => {
                 assert_eq!(field, "server.endpoints.scheme");

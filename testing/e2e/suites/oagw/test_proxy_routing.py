@@ -414,3 +414,146 @@ async def test_client_forwarding_headers_not_forwarded(
         echoed = resp.json()["headers"]
         assert echoed.get("x-forwarded-for") == "203.0.113.7"
         assert "x-forwarded-host" not in echoed
+
+
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
+
+async def _upstream_with_query_route(client, base, headers, mock_url, cleanup, prefix, method,
+                                     path, query_allowlist):
+    alias = unique_alias(prefix)
+    upstream = cleanup.upstream(headers, await create_upstream(
+        client, base, headers, mock_url, alias=alias,
+    ))
+    await create_route(
+        client, base, headers, upstream["id"], [method], path,
+        match={"http": {"methods": [method], "path": path, "query_allowlist": query_allowlist}},
+    )
+    return alias
+
+
+@pytest.mark.scenario("positive-7.8-raw-query-forwarded-as-sent", part="A")
+@pytest.mark.asyncio
+async def test_query_forwarded_as_sent(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """#4979: the upstream gets the client's query byte for byte.
+
+    Raw sockets send the query: an HTTP client may re-encode it. The query
+    used to be decoded and re-encoded, which turned `%2B` and `%20` into `+`,
+    escaped reserved characters and added `=` to bare keys. The last case has
+    characters it escaped and raw UTF-8 bytes. A literal `;` is covered by
+    `test_query_literal_semicolon_sent_encoded`.
+    """
+    _ = mock_upstream
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _upstream_with_query_route(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "raw-query", "GET", "/echo-any",
+            ["q", "a", "b", "empty", "flag", "path", "lower", "upper", "n", "bad"],
+        )
+    for query in ("q=a%2Bb&q=a+b&q=a%20b", "b=2&a=1&b=1", "empty=&flag&flag=",
+                  "path=/x/y?z:@!$'()*,", "lower=%c3%a9&upper=%C3%A9", "q=a%26b%3Dc",
+                  "q=a|b{c}[d]\\e^f`g&n=%C3%A9&n=\u00e9&bad=%zz"):
+        status, headers, body = await _raw_get(
+            oagw_base_url, f"/oagw/v1/proxy/{alias}/echo-any?{query}", oagw_headers,
+        )
+        assert status == 200, (query, status, body[:300])
+        assert headers.get("x-oagw-error-source") == "upstream", query
+        assert json.loads(body)["query"] == query
+
+
+@pytest.mark.scenario("positive-7.8-raw-query-forwarded-as-sent", part="B")
+@pytest.mark.asyncio
+async def test_query_allowlist_checks_decoded_names(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """The allowlist compares decoded names; the upstream still gets the
+    client's bytes."""
+    _ = mock_upstream
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _upstream_with_query_route(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "query-names", "GET", "/echo-any", ["q", "my key"],
+        )
+    for query in ("my%20key=v", "my+key=v"):
+        status, _, body = await _raw_get(
+            oagw_base_url, f"/oagw/v1/proxy/{alias}/echo-any?{query}", oagw_headers,
+        )
+        assert status == 200, (query, status, body[:300])
+        assert json.loads(body)["query"] == query
+    for query in ("my%2520key=v", "q=1&debug=1"):
+        status, headers, body = await _raw_get(
+            oagw_base_url, f"/oagw/v1/proxy/{alias}/echo-any?{query}", oagw_headers,
+        )
+        assert status == 400, (query, status, body[:300])
+        assert headers.get("x-oagw-error-source") == "gateway", query
+        violations = json.loads(body)["context"]["field_violations"]
+        assert [(v["field"], v["reason"]) for v in violations] == [("query", "QUERY_NOT_ALLOWED")]
+
+
+@pytest.mark.scenario("positive-7.8-raw-query-forwarded-as-sent", part="D")
+@pytest.mark.asyncio
+async def test_query_literal_semicolon_sent_encoded(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """The allowlist splits on `&` only, so `model=x;admin=1` is the one
+    parameter `model`. An upstream that also splits on `;` would read an
+    `admin` nobody checked, so the gateway sends the checked pair
+    form-encoded, the `;` as `%3B`. An escaped `;` is forwarded as sent; an
+    empty allowlist admits no parameter."""
+    _ = mock_upstream
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _upstream_with_query_route(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "query-semi", "GET", "/echo-any", ["model"],
+        )
+        closed = await _upstream_with_query_route(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "query-closed", "GET", "/echo-any", [],
+        )
+    for query, received in (("model=x;admin=1", "model=x%3Badmin%3D1"),
+                            ("model=x%3Badmin%3D1", "model=x%3Badmin%3D1")):
+        status, _, body = await _raw_get(
+            oagw_base_url, f"/oagw/v1/proxy/{alias}/echo-any?{query}", oagw_headers,
+        )
+        assert status == 200, (query, status, body[:300])
+        assert json.loads(body)["query"] == received, query
+    status, headers, body = await _raw_get(
+        oagw_base_url, f"/oagw/v1/proxy/{closed}/echo-any?model=x;admin=1", oagw_headers,
+    )
+    assert status == 400, (status, body[:300])
+    assert headers.get("x-oagw-error-source") == "gateway"
+
+
+@pytest.mark.scenario("positive-7.1-inbound-outbound-path-query-mapping-http")
+@pytest.mark.asyncio
+async def test_path_suffix_and_query_mapping(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 7.1: the suffix is appended to the route path; a query with a
+    parameter outside the allowlist is rejected, an accepted one forwarded.
+
+    The mock has no handler for the outbound path; its 404 names the path and
+    query it received.
+    """
+    _ = mock_upstream
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _upstream_with_query_route(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
+            "query-map", "POST", "/v1/chat/completions", ["version"],
+        )
+        url = f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/chat/completions/models/gpt-4"
+        resp = await client.post(
+            f"{url}?version=2&debug=1", headers=oagw_headers, json={"stream": False},
+        )
+        assert resp.status_code == 400, resp.text[:300]
+        assert resp.headers.get("x-oagw-error-source") == "gateway"
+
+        resp = await client.post(f"{url}?version=2", headers=oagw_headers, json={"stream": False})
+        assert resp.status_code == 404, resp.text[:300]
+        assert resp.headers.get("x-oagw-error-source") == "upstream"
+        echoed = resp.json()
+        assert echoed["path"] == "/v1/chat/completions/models/gpt-4"
+        assert echoed["query"] == "version=2"

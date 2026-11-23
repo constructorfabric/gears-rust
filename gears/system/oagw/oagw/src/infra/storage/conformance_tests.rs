@@ -1498,13 +1498,16 @@ async fn case_tags_and_methods_keep_canonical_order(f: &Fixture) {
     let mut canonical = tags.clone();
     canonical.sort();
     assert_eq!(canonical, tags, "fixture tags must be canonical");
-    // Declaration order; alphabetical would be DELETE, GET, PATCH, POST, PUT.
+    // Declaration order; alphabetical would be DELETE, GET, HEAD, OPTIONS,
+    // PATCH, POST, PUT.
     let methods = vec![
         HttpMethod::Get,
         HttpMethod::Post,
         HttpMethod::Put,
         HttpMethod::Delete,
         HttpMethod::Patch,
+        HttpMethod::Head,
+        HttpMethod::Options,
     ];
 
     let up = add_upstream(
@@ -1536,10 +1539,13 @@ async fn case_tags_and_methods_keep_canonical_order(f: &Fixture) {
         list_routes(f, tenant, None, &ListQuery::default()).await,
         vec![route.clone()]
     );
-    assert_eq!(
-        find(f, &[tenant], &[up.id], "PATCH", "/v1").await.unwrap(),
-        route
-    );
+    for method in ["PATCH", "HEAD", "OPTIONS"] {
+        assert_eq!(
+            find(f, &[tenant], &[up.id], method, "/v1").await.unwrap(),
+            route,
+            "{method}"
+        );
+    }
 
     // Updates rewrite the child rows; the order survives that too.
     let up = Upstream {

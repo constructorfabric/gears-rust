@@ -318,14 +318,21 @@ pub struct CorsConfig {
 // Route matching
 // ---------------------------------------------------------------------------
 
-/// HTTP methods supported by route matching.
+/// HTTP methods a route can match. A route matches only the methods it
+/// lists: `Get` does not imply `Head`.
+///
+/// Non-exhaustive: the gateway may route more methods later. A `match` on it
+/// needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum HttpMethod {
     Get,
     Post,
     Put,
     Delete,
     Patch,
+    Head,
+    Options,
 }
 
 /// How path_suffix from the proxy URL is handled.

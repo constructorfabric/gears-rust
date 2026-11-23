@@ -218,7 +218,7 @@ The system **MUST** provide CRUD operations for upstream configurations. Each up
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-fr-route-mgmt`
 
-The system **MUST** provide CRUD operations for routes. Routes define matching rules (HTTP method, path pattern, query parameter allowlist) that map inbound proxy requests to specific upstreams.
+The system **MUST** provide CRUD operations for routes. Routes define matching rules (HTTP method, path pattern, query parameter allowlist) that map inbound proxy requests to specific upstreams. A route lists its methods explicitly, from `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` and `OPTIONS`; `GET` does not imply `HEAD`.
 
 - **Rationale**: Routes control which requests reach which upstream endpoints and with what transformations.
 - **Actors**: `cpt-cf-oagw-actor-platform-operator`, `cpt-cf-oagw-actor-tenant-admin`
@@ -247,7 +247,7 @@ The system **MUST** persist upstreams and routes created through the Management 
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-fr-request-proxy`
 
-The system **MUST** proxy requests via `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]`. It **MUST** resolve the upstream by alias, match the route by method/path, merge configurations (upstream < route < tenant), execute the plugin chain, and forward the request to the external service. The gateway performs no automatic full client-request retries—i.e., it will not re-issue the original client request as a whole—but connector-level endpoint/connection failover or connection-retry attempts (endpoint-level retries) performed by the upstream connector are permitted.
+The system **MUST** proxy requests via `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]`. It **MUST** resolve the upstream by alias, match the route by method/path, merge configurations (upstream < route < tenant), execute the plugin chain, and forward the request to the external service. The query **MUST** reach the external service as the client sent it, unless a transform plugin changed it or it has a literal `;` (then it is form-encoded, so an upstream that splits on `;` sees the parameters the allowlist checked). The gateway performs no automatic full client-request retries—i.e., it will not re-issue the original client request as a whole—but connector-level endpoint/connection failover or connection-retry attempts (endpoint-level retries) performed by the upstream connector are permitted.
 
 - **Rationale**: Core value proposition — unified proxy endpoint that handles credential injection, transformation, and forwarding transparently.
 - **Actors**: `cpt-cf-oagw-actor-app-developer`

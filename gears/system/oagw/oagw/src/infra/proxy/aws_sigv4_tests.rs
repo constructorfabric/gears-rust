@@ -503,6 +503,80 @@ async fn signed_request_verifies_at_the_upstream() {
     }
 }
 
+/// Without a transform the gateway forwards the client's raw query, and the
+/// signer rewrites what it sends: `+` read as a space, `%2B` kept, `%7E` as
+/// the unreserved `~`, `*` as `%2A`, the order kept. A query with a literal
+/// `;`, which the gateway re-encodes (`%3B`), is signed as re-encoded. Each request
+/// verifies at the upstream.
+#[tokio::test]
+async fn raw_query_is_signed_as_sent() {
+    const RAW: &str = "/v1/raw";
+    let h = harness().await;
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "GET",
+        RAW,
+        MockResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: MockBody::Json(json!({"ok": true})),
+        },
+    );
+    let alias = format!("sigv4-{}", Uuid::new_v4().as_simple());
+    let ctx = h.security_context().clone();
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            upstream_builder(h.mock_port(), &alias, auth_config(&[]), allowlist(&[]))
+                .plugins(PluginsConfig {
+                    sharing: SharingMode::Private,
+                    items: vec![],
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Get],
+                        path: guard.path(RAW),
+                        query_allowlist: vec!["b".to_owned(), "a".to_owned()],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // The query the client sends, and the one the upstream receives.
+    const CASES: [(&str, &str); 2] = [
+        ("b=x+y*z&a=%7E1&b=c%2Bd", "b=x%20y%2Az&a=~1&b=c%2Bd"),
+        ("b=x;admin=1", "b=x%3Badmin%3D1"),
+    ];
+    for (query, _) in CASES {
+        let req = http::Request::get(format!("/{alias}{}?{query}", guard.path(RAW)))
+            .body(Body::Empty)
+            .unwrap();
+        let resp = h.facade().proxy_request(ctx.clone(), req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{query}");
+    }
+    let rec = guard.recorded_requests().await;
+    assert_eq!(rec.len(), 2);
+    for (r, (_, sent)) in rec.iter().zip(CASES) {
+        assert_eq!(r.uri, format!("{}?{sent}", guard.path(RAW)));
+        verify(r, SECRET).unwrap();
+    }
+}
+
 /// A signed request's streamed (SSE) response comes back to the caller.
 #[tokio::test]
 async fn response_streams_back_from_a_signed_request() {
