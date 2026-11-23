@@ -68,6 +68,8 @@ fn declared_paths() -> Routes {
         ("GET", "/bss-pricing/v1/price-book-entries/{id}/prices"),
         ("POST", "/bss-pricing/v1/plan-revisions/{id}/unschedule"),
         ("GET", "/bss-pricing/v1/plan-revisions/{id}/reservations"),
+        ("GET", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
+        ("PUT", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
         ("GET", "/bss-pricing/v1/approval-policy/{kind}/effective"),
     ]
     .into_iter()
@@ -91,6 +93,7 @@ fn if_match_routes() -> Routes {
         ("PATCH", "/bss-pricing/v1/plan-items/{id}"),
         ("DELETE", "/bss-pricing/v1/approval-policy/{kind}"),
         ("PATCH", "/bss-pricing/v1/dimension-keys"),
+        ("PUT", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
     ]
     .into_iter()
     .map(|(m, p)| (m.to_owned(), p.to_owned()))
@@ -114,6 +117,7 @@ fn idempotency_key_routes() -> Routes {
         ("POST", "/bss-pricing/v1/plan-revisions/{id}/submit"),
         ("POST", "/bss-pricing/v1/plans/{id}/clone"),
         ("POST", "/bss-pricing/v1/plan-revisions/{id}/unschedule"),
+        ("PUT", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
     ]
     .into_iter()
     .map(|(m, p)| (m.to_owned(), p.to_owned()))
@@ -134,7 +138,7 @@ async fn the_registered_route_set_is_exactly_the_declared_paths() {
         .collect();
     assert_eq!(registered, declared_paths());
     assert_eq!(census::source_routes(), registered);
-    assert_eq!(registered.len(), 61);
+    assert_eq!(registered.len(), 63);
     assert!(router.has_routes());
 }
 
@@ -193,9 +197,9 @@ fn every_precondition_reading_route_is_in_the_precondition_census() {
         idempotency_key_routes()
     );
     for (needle, control, production) in [
-        // + 2: the book's archive and unarchive (D-522).
-        ("preconditions::if_match(", 1, 15),
-        ("preconditions::idempotency_key(", 1, 16),
+        // + 2: the book's archive and unarchive (D-522); + 1 each: the quota rules PUT (D-543).
+        ("preconditions::if_match(", 1, 16),
+        ("preconditions::idempotency_key(", 1, 17),
         ("Query<", 1, 0),
         // + 1: plan_items::delete answers 204 below its door; + 16: the plan and revision doors
         // (eight registrations and the statuses their handlers and operations answer); + 6: the
@@ -224,8 +228,9 @@ fn every_precondition_reading_route_is_in_the_precondition_census() {
         // (`StatusCode::OK` once), not each from its own function; + 3: the book's archive and
         // unarchive (D-522), two registrations and two 200 answers, while the book read answers
         // through `names::named` now; + 2: the currency table (D-537), its registration and its
-        // 200 answer.
-        ("StatusCode::", 2, 112),
+        // 200 answer; + 2: the quota rules read (D-540), its registration and its 200 answer;
+        // + 2: the quota rules replace (D-543), its registration and its recorded 200 answer.
+        ("StatusCode::", 2, 116),
     ] {
         assert_eq!(census::count_in_functions(census::CONTROL, needle), control);
         assert_eq!(census::production_count(needle), production, "{needle}");
@@ -269,6 +274,7 @@ fn etag_routes() -> Routes {
         ("GET", "/bss-pricing/v1/approval-policy"),
         ("GET", "/bss-pricing/v1/plans/{id}"),
         ("GET", "/bss-pricing/v1/plan-revisions/{id}"),
+        ("GET", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
         ("GET", "/bss-pricing/v1/plan-items/{id}"),
         // D-518: the list reads. The tag is a weak hash of the JSON body, not an If-Match version.
         ("GET", "/bss-pricing/v1/plans"),
@@ -299,6 +305,8 @@ fn etag_routes() -> Routes {
         ("POST", "/bss-pricing/v1/plan-revisions/{id}/unschedule"),
         ("POST", "/bss-pricing/v1/plan-revisions/{id}/items"),
         ("PATCH", "/bss-pricing/v1/plan-items/{id}"),
+        // D-543: the quota rules PUT answers the revision's new version.
+        ("PUT", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
     ]
     .into_iter()
     .map(|(m, p)| (m.to_owned(), p.to_owned()))
@@ -335,7 +343,7 @@ async fn every_operation_has_a_human_summary_and_a_description() {
         assert_ne!(description, summary, "{id}");
         described += 1;
     }
-    assert_eq!(described, 61);
+    assert_eq!(described, 63);
 }
 
 /// Every answer that sets an `ETag` declares the header on its success response, and nothing else
@@ -374,7 +382,7 @@ async fn every_answer_that_sets_an_etag_declares_it() {
         })
         .count();
     assert_eq!(
-        anywhere, 38,
+        anywhere, 40,
         "only the success answer of those ops declares it, plus the 304 of the three list reads \
          and of the settings read, the 201 of the cancel and end drafts, and the 200 of the book's \
          archive and unarchive"
@@ -482,6 +490,10 @@ async fn no_operation_declares_a_422() {
 // Run 9.6 (D-480, D-481): method | path | resource:action | If-Match | Idempotency-Key
 // GET /plan-revisions/{id}/reservations plan:read false false
 // GET /approval-policy/{kind}/effective price_book_entry:read for prices, plan:read for plan_revision false false
+
+// Quota rules (D-540, D-543): method | path | resource:action | If-Match | Idempotency-Key
+// GET /plan-revisions/{id}/quota-rules plan:read false false
+// PUT /plan-revisions/{id}/quota-rules plan:author true true
 #[tokio::test]
 async fn init_registers_pricing_read_beside_sku_usage_and_checks_pdp() {
     use bss_pricing_sdk::read::{CatalogRef, PriceQuery, PricingReadV1};

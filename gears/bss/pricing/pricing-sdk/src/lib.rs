@@ -8,3 +8,4 @@ pub type Digest = [u8; 32];
 pub mod acceptance;
 pub mod meter_semantics;
 pub mod numeric;
+pub mod plan_quota;

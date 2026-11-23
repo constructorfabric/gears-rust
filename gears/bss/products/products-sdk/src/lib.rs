@@ -1,6 +1,6 @@
 //! SKU registry SDK, the usage-type catalog port, the SKU usage port pricing fills, the derived
 //! usage declaration with its one evaluator (P-D-230), and the commercial quota contract
-//! (P-D-267, P-D-272).
+//! (P-D-267, P-D-272) with the quota-set validation Pricing calls (P-D-275).
 #![forbid(unsafe_code)]
 pub mod api;
 pub mod derived;

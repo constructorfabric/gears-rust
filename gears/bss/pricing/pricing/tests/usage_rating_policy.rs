@@ -511,7 +511,8 @@ async fn legacy_published_usage_upgrades_without_inventing_policy_and_keeps_reso
                 || name.contains("000020")
                 || name.contains("000021")
                 || name.contains("000022")
-                || name.contains("000023"))
+                || name.contains("000023")
+                || name.contains("000024"))
         })
         .collect();
     run_migrations_for_testing(&db, prior).await.unwrap();

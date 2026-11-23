@@ -4,6 +4,7 @@ use crate::api::rest::closed_sets::{
     PricingApprovalKind, PricingBillingTiming, PricingChangeKind, PricingChargeKind,
     PricingDecisionKind, PricingEligibility, PricingEntryReferenceState, PricingItemReferenceState,
     PricingModel, PricingPeriod, PricingPlanChange, PricingPriceState, PricingPriceStatus,
+    PricingQuotaAvailabilityState, PricingQuotaBasis, PricingQuotaSubjectSelector,
     PricingReferenceOpKind, PricingReferenceOpReason, PricingReferenceOpRefKind,
     PricingReferenceOpState, PricingRevisionState, PricingSkuEntryStatus, PricingUnitState,
     PricingVoteOutcome,
@@ -1361,6 +1362,169 @@ pub struct PricingPlanRevisionReadDto {
     /// effect today (D-447), `[]` when none is in effect. The set a re-add of a deprecated SKU
     /// judges (D-465).
     pub carried_sku_ids: Option<Vec<Uuid>>,
+    /// The revision's quota rules as stored, ordered by `rule_id` (D-540); `[]` for a revision
+    /// without rules.
+    pub quota_rules: Vec<PricingPlanQuotaRuleDto>,
+    /// The stored digest of the rules, lowercase hex (D-541): the empty set's for a revision
+    /// without rules.
+    pub quota_rules_digest: String,
+}
+/// An exact Products quota definition version a rule names (D-541): its version a decimal string
+/// and its digest lowercase hex, as Products gave them. The quota rule answers also read back from
+/// a stored answer, which the SDK's local client answers from (D-540).
+#[toolkit_macros::api_dto(response)]
+#[derive(serde::Deserialize)]
+pub struct PricingQuotaDefinitionRefDto {
+    pub id: Uuid,
+    pub version: String,
+    pub digest: String,
+}
+/// The availability of a rule's definition version when the rule was saved (D-542). The checks
+/// judge the current one.
+#[toolkit_macros::api_dto(response)]
+#[derive(serde::Deserialize)]
+pub struct PricingQuotaAvailabilityDto {
+    pub state: PricingQuotaAvailabilityState,
+    /// The revision of Products' observation, a decimal string.
+    pub revision: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub observed_at: time::OffsetDateTime,
+    /// Why the version is not enabled; null when it is.
+    pub reason_code: Option<String>,
+}
+/// One plan quota rule as stored (D-541): an exact definition version, an amount in an allowed
+/// unit, a basis, a logical binding and a scope selection, for one item of the revision.
+#[toolkit_macros::api_dto(response)]
+#[derive(serde::Deserialize)]
+pub struct PricingPlanQuotaRuleDto {
+    pub rule_id: Uuid,
+    pub definition_ref: PricingQuotaDefinitionRefDto,
+    pub item_id: Uuid,
+    /// The item's dimension value; null only for an item without a dimension.
+    pub dimension_value: Option<String>,
+    pub logical_binding_key: String,
+    pub subject_selector: PricingQuotaSubjectSelector,
+    pub scope_selection: BTreeMap<String, String>,
+    /// A canonical decimal integer in `unit_ref`.
+    pub amount: String,
+    pub unit_ref: String,
+    pub basis: PricingQuotaBasis,
+    /// The definition's availability when the rule was saved; the checks read the current one.
+    pub availability: PricingQuotaAvailabilityDto,
+}
+impl PricingPlanQuotaRuleDto {
+    /// A stored rule as the wire shows it.
+    #[must_use]
+    pub fn of(stored: &crate::infra::plan_quota::StoredRule) -> Self {
+        let rule = &stored.rule;
+        let availability = &stored.availability;
+        Self {
+            rule_id: rule.rule_id,
+            definition_ref: PricingQuotaDefinitionRefDto {
+                id: rule.definition_ref.id,
+                version: rule.definition_ref.version.to_string(),
+                digest: crate::infra::usage_policy_wire::digest_text(rule.definition_ref.digest),
+            },
+            item_id: rule.item_id,
+            dimension_value: rule.dimension_value.clone(),
+            logical_binding_key: rule.logical_binding_key.clone(),
+            subject_selector: rule.subject_selector.into(),
+            scope_selection: rule.scope_selection.clone(),
+            amount: rule.amount.clone(),
+            unit_ref: rule.unit_ref.clone(),
+            basis: rule.basis.into(),
+            availability: PricingQuotaAvailabilityDto {
+                state: availability.state.into(),
+                revision: availability.revision.to_string(),
+                observed_at: availability.observed_at,
+                reason_code: availability.reason_code.clone(),
+            },
+        }
+    }
+}
+/// A stored set's rules as the wire shows them, in its order (`rule_id`).
+/// # Errors
+/// `CorruptRow` for a stored rule that does not convert.
+pub fn quota_rules(
+    set: &crate::infra::storage::repo::plan_quota_repo::StoredSet,
+) -> Result<Vec<PricingPlanQuotaRuleDto>, RepoError> {
+    set.rules
+        .iter()
+        .map(|row| {
+            crate::infra::plan_quota::stored_rule(row).map(|s| PricingPlanQuotaRuleDto::of(&s))
+        })
+        .collect()
+}
+/// `PUT /plan-revisions/{id}/quota-rules` (D-543): the whole set that replaces a draft's rules.
+/// The schema documents the body; the endpoint reads the body as JSON and the parse owns every
+/// refusal code (D-403), so a value outside a set is the rule's own refusal, not a 400 of the
+/// reader.
+#[toolkit_macros::api_dto(request)]
+pub struct PricingPlanQuotaRulesPut {
+    /// At most 200 rules, each `rule_id` once; `[]` clears the set.
+    pub quota_rules: Vec<PricingPlanQuotaRuleInput>,
+}
+/// One rule of a `PUT` body (D-541): its ten members.
+#[toolkit_macros::api_dto(request)]
+pub struct PricingPlanQuotaRuleInput {
+    /// A client UUID, unique in the revision and kept on an edit.
+    pub rule_id: Uuid,
+    /// The exact Products quota definition version: its id, its version a decimal string and its
+    /// digest 64 lowercase hex characters, as Products' catalog answers them.
+    pub definition_ref: PricingQuotaDefinitionRefInput,
+    /// An item of the same revision.
+    pub item_id: Uuid,
+    /// Null for an item without a dimension, else one value of the item's dimension.
+    pub dimension_value: Option<String>,
+    /// 1 to 64 of ASCII letters, digits, `_`, `-` and `.`.
+    pub logical_binding_key: String,
+    /// `resource_owner`.
+    pub subject_selector: String,
+    /// At most 8 keys of the key rule, each value 1 to 255 printable ASCII bytes.
+    pub scope_selection: BTreeMap<String, String>,
+    /// A canonical decimal integer: no sign, point, exponent or leading zero, at most 39 digits.
+    pub amount: String,
+    /// One of the definition's allowed units.
+    pub unit_ref: String,
+    /// `fixed` or `per_plan_unit`.
+    pub basis: String,
+}
+/// A rule's definition reference in a `PUT` body (D-541).
+#[toolkit_macros::api_dto(request)]
+pub struct PricingQuotaDefinitionRefInput {
+    pub id: Uuid,
+    pub version: String,
+    pub digest: String,
+}
+/// `GET` and `PUT /plan-revisions/{id}/quota-rules` (D-540, D-543): a revision's whole rule set,
+/// its stored digest and the revision version its `ETag` carries.
+#[toolkit_macros::api_dto(response)]
+#[derive(serde::Deserialize)]
+pub struct PricingPlanQuotaRulesDto {
+    pub revision_id: Uuid,
+    /// The revision's version: the `ETag` a following PUT sends back as If-Match.
+    pub revision_version: i64,
+    /// Ordered by `rule_id`; `[]` for a revision without rules.
+    pub quota_rules: Vec<PricingPlanQuotaRuleDto>,
+    /// The stored digest of the rules, lowercase hex (D-541).
+    pub quota_rules_digest: String,
+}
+impl PricingPlanQuotaRulesDto {
+    /// The stored set of revision `revision_id` at `revision_version`.
+    /// # Errors
+    /// `CorruptRow` for a stored rule that does not convert.
+    pub fn of(
+        revision_id: Uuid,
+        revision_version: i64,
+        set: &crate::infra::storage::repo::plan_quota_repo::StoredSet,
+    ) -> Result<Self, RepoError> {
+        Ok(Self {
+            revision_id,
+            revision_version,
+            quota_rules: quota_rules(set)?,
+            quota_rules_digest: set.digest.clone(),
+        })
+    }
 }
 /// `GET /plan-revisions/{id}/reservations` (D-480): each item's reference, and whether they have
 /// all settled.
@@ -1436,17 +1600,21 @@ fn nullable<'de, D: serde::Deserializer<'de>, T: serde::Deserialize<'de>>(
 ) -> Result<Option<Option<T>>, D::Error> {
     <Option<T> as serde::Deserialize>::deserialize(d).map(Some)
 }
-/// An item a check row is about (D-466): the item, its SKU and the entry it names.
+/// An item a check row is about (D-466): the item, its SKU and the entry it names, and on a quota
+/// row the rule and its member (D-544).
 #[toolkit_macros::api_dto(response)]
-#[expect(
-    clippy::struct_field_names,
-    reason = "the wire names of ask 29, each an id of another aggregate (D-466)"
-)]
 pub struct PricingPlanCheckSubject {
     pub item_id: Uuid,
     pub sku_id: Uuid,
     /// Null for an item that names no entry.
     pub price_book_entry_id: Option<Uuid>,
+    /// The quota rule a quota row names; left out on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_rule_id: Option<Uuid>,
+    /// The rule's top-level member the failure is about (`amount`, `scope_selection`, ...), or
+    /// `""` for the rule as a whole; left out on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
 }
 /// A pending price that blocks a check row (D-466): its approval unit, the price and its entry.
 #[toolkit_macros::api_dto(response)]
@@ -1495,6 +1663,8 @@ impl From<crate::domain::plan::Check> for PricingPlanCheckDto {
                     item_id: s.item,
                     sku_id: s.sku,
                     price_book_entry_id: s.entry,
+                    quota_rule_id: s.quota.map(|quota| quota.rule_id),
+                    field: s.quota.map(|quota| quota.field.to_owned()),
                 })
                 .collect(),
             blocked_by_prices: c
@@ -1520,6 +1690,11 @@ pub struct PricingPlanChecksDto {
     /// The `plan_revision` quorum a submit of this revision needs (D-481): the tenant's effective
     /// policy, the number the APPROVAL info row already shows. The revision itself has no quorum.
     pub quorum_required: u32,
+    /// The revision version the checks judged: the `ETag` of the revision read (D-544).
+    pub revision_version: i64,
+    /// The stored digest of the rules the checks judged, lowercase hex: the empty set's for a
+    /// revision without rules (D-544).
+    pub quota_rules_digest: String,
 }
 /// `GET /plan-revisions/checks` (D-482): one revision's checks, the single read's answer.
 #[toolkit_macros::api_dto(response)]

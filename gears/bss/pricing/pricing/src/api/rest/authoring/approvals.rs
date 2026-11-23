@@ -5,6 +5,7 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-generation-and-duplicate-vote:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-unit-contended:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-terminal-audit-event:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-governance:p1
 use super::{
     dto::{
         PriceBookDto, PricingApprovalPolicyDto, PricingApprovalPolicyPut,
@@ -728,7 +729,10 @@ pub async fn submit_price(db: &Db, cmd: Command, id: Uuid) -> Result<Response, C
 /// # Errors
 /// 404 for a revision the tenant does not hold; 409 `REVISION_NOT_DRAFT`; 400
 /// `REVISION_CHECKS_RED` with the red checks and no unit; 409 `ROW_LOCKED_PENDING` for a lost
-/// lock; 503 when the registry cannot answer.
+/// lock; 503 `REGISTRY_UNAVAILABLE` when the registry cannot answer, `QUOTA_CATALOG_UNAVAILABLE`
+/// when the quota catalog cannot answer for a revision with quota rules; a Products refusal of
+/// the quota rules' validation as Products gave it, for example 403 for a caller without `read`
+/// on `quota_definition` (D-542, D-545).
 pub async fn submit_revision(
     db: &Db,
     cmd: Command,
@@ -748,7 +752,10 @@ pub async fn submit_revision(
             return Ok(replay);
         }
 
-        let observations = observe_revision(db, &cmd, id).await?;
+        // One instant for the capture's day and the subject's (D-545); it is also every stored
+        // instant of this attempt, a price unit's apply day included (D-461).
+        let now = cmd.now();
+        let observations = observe_revision(db, &cmd, id, now).await?;
         let sink = cmd.outbox.clone();
         let cmd = cmd.clone();
         let note = note.clone();
@@ -767,11 +774,12 @@ pub async fn submit_revision(
                 if !plans::open_draft(&r) {
                     return Err(support::conflict("REVISION_NOT_DRAFT").into());
                 }
-                let now = cmd.now();
                 // @cpt-begin:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-4
+                // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-submit
                 let mut subject =
                     PlanRevisionSubject::new(cmd.ctx.clone(), cmd.hub.clone(), id, now);
                 subject.meter_observations = observations;
+                // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-submit
                 let submission = Submission {
                     ref_id: id,
                     common_effective_date: None,
@@ -1308,6 +1316,9 @@ fn subject_of(
 }
 /// `POST /approval-units/{id}/approve|reject|withdraw`.
 /// Content drift commits the refreshed unit and answers `UNIT_STALE` with the new generation.
+/// Every kind takes its instant once per attempt, before the captures of the meter policy and the
+/// quota rules: a decision's `at`, a revision's publish time and a price unit's apply day are
+/// that instant, so the capture and the judgement see one day (D-461, D-545).
 /// # Errors
 /// Returns the canonical refusal; a generation mismatch carries the current generation.
 pub async fn vote(
@@ -1330,6 +1341,9 @@ pub async fn vote(
             return Ok(replay);
         }
 
+        // One instant for the capture's day and the subject's (D-545); it is also every stored
+        // instant of this attempt, a price unit's apply day included (D-461).
+        let now = cmd.now();
         let observations = if action == Vote::Withdraw {
             crate::infra::meter_semantics::Observations::default()
         } else {
@@ -1349,7 +1363,7 @@ pub async fn vote(
             .ok_or_else(|| support::missing_what("approval_unit"))?;
             if unit.state == UnitState::Pending {
                 match Kind::of(&unit).map_err(DoorError::from)? {
-                    Kind::PlanRevision => observe_revision(db, &cmd, unit.ref_id).await?,
+                    Kind::PlanRevision => observe_revision(db, &cmd, unit.ref_id, now).await?,
                     Kind::Prices => {
                         let items = crate::infra::storage::repo::approval_repo::items_of_units(
                             &conn,
@@ -1379,9 +1393,9 @@ pub async fn vote(
         support::unit_transaction_observed_with_events(db, &sink, move |tx, outbox| {
             let observations = observations.clone();
             let (cmd, body) = (cmd.clone(), body.clone());
-            Box::pin(
-                async move { vote_in(tx, &outbox, &cmd, id, action, body, observations).await },
-            )
+            Box::pin(async move {
+                vote_in(tx, &outbox, &cmd, id, action, body, (observations, now)).await
+            })
         })
         .await
     })
@@ -1400,7 +1414,7 @@ async fn vote_in(
     id: Uuid,
     action: Vote,
     body: Option<PricingVoteRequest>,
-    observations: crate::infra::meter_semantics::Observations,
+    (observations, now): (crate::infra::meter_semantics::Observations, OffsetDateTime),
 ) -> Result<Response, DoorError> {
     let endpoint = format!("/bss-pricing/v1/approval-units/{id}/{}", action.path());
     let store = PricingApprovalStore {
@@ -1416,7 +1430,6 @@ async fn vote_in(
         return Err(support::conflict("UNIT_ALREADY_DECIDED").into());
     }
     observations.check_local(tx, cmd.tenant()).await?;
-    let now = cmd.now();
     let mut subject = subject_of(cmd, &unit, action, now)?;
     match &mut subject {
         Subject::Prices(s) => s.meter_observations = observations,
@@ -1690,10 +1703,16 @@ async fn observe_entries(
     )
     .await?)
 }
+/// Detach a draft or pending revision's selection and its quota validation before the unit's
+/// transaction (D-545): the entries' meter evidence and the item SKUs, then the quota half, for
+/// every revision, the one without rules included (its stored set digest, no catalog call). The
+/// quota half reads the SKU versions on the sale date of `now`'s UTC day, the day the subject
+/// judges on. Another state captures nothing: the subject refuses it.
 async fn observe_revision(
     db: &Db,
     cmd: &Command,
     id: Uuid,
+    now: OffsetDateTime,
 ) -> Result<crate::infra::meter_semantics::Observations, CanonicalError> {
     let conn = db.conn().map_err(DoorError::from)?;
     let revision = plans::find_revision(&conn, &cmd.scope, cmd.tenant(), id).await?;
@@ -1710,14 +1729,24 @@ async fn observe_revision(
     .map_err(DoorError::from)?;
     let entry_ids = items.iter().filter_map(|i| i.price_book_entry_id).collect();
     let sku_ids = items.iter().map(|i| i.sku_id).collect();
-    observe_entries(
+    let mut observations = observe_entries(
         db,
         cmd,
         entry_ids,
         sku_ids,
         crate::infra::meter_semantics::Selection::Revision { id, items },
     )
-    .await
+    .await?;
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-recheck
+    let today = now.to_offset(time::UtcOffset::UTC).date();
+    observations.quota = Some(
+        crate::infra::plan_quota::QuotaObservation::capture(
+            db, &cmd.hub, &cmd.ctx, &revision, today,
+        )
+        .await?,
+    );
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-recheck
+    Ok(observations)
 }
 async fn observe_prices(
     db: &Db,

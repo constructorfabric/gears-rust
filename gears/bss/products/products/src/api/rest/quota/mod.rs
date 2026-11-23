@@ -55,6 +55,9 @@ mod discovery_tests;
 #[path = "dto_tests.rs"]
 mod dto_tests;
 #[cfg(test)]
+#[path = "plan_rules_e2e_tests.rs"]
+mod plan_rules_e2e_tests;
+#[cfg(test)]
 #[path = "review_tests.rs"]
 mod review_tests;
 #[cfg(test)]

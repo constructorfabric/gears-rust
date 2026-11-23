@@ -143,7 +143,8 @@ from its own registry (spec §2 decision 17, §4, §7.3, §13).
 Typed SKUs; flat categories; billing descriptors and billing-timing override; usage-type resolution; derived
 usage types (P-D-229); lifecycle; durable dated versions; the three SKU approval kinds; policy settings; reference reservations and fences;
 concurrency and idempotency; browse/search and reference summaries; audit and transactional events
-(spec §3 D, §4, §6, §7.2–§7.3); the commercial quota catalog of the quotas package (P-D-266).
+(spec §3 D, §4, §6, §7.2–§7.3); the commercial quota catalog of the quotas package (P-D-266) and the validation of
+a complete quota set for Pricing (P-D-275).
 
 ### 4.2 Out of Scope
 
@@ -302,6 +303,30 @@ into immutable definition versions, and serves them to plan authors (P-D-266).
 - Grants: `quota_definition` read, author, submit, approve; `quota_adapter_target` read, author (P-D-273).
 
 **Rationale**: the quotas package (ADR 0001, feature 1); owner decisions of 2026-11-19.
+
+#### `fr-quota-set-validation`
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-products-fr-quota-set-validation`
+
+The registry shall validate a complete set of plan quota rules for Pricing against its catalog
+(`cpt-cf-bss-quotas-fr-plan-amount`, `cpt-cf-bss-quotas-fr-qualification-recheck`,
+`cpt-cf-bss-quotas-fr-qualification-changes`): it resolves each exact definition version the caller may read and
+reports every rule and set check it finds (P-D-275, P-D-276).
+
+**Rules**
+
+- `ProductsQuotaCatalogClientV1::validate_quota_set` serves Pricing in the same process, as its caller, under `read`
+  on `quota_definition`; there is no REST endpoint and no new permission (P-D-275).
+- Each rule is judged for its exact version and digest, its SKU and SKU version, its basis and unit, its amount on
+  the unit's grid and its final limit at the quantity, its exact conversion, its scope policy, and the version's
+  availability (P-D-276).
+- The rules of one logical binding need one profile content, one adapter target and one scope selection, whatever
+  their dimension value; an increase or an unchanged set keeps a rule for every prior limit; an increase needs
+  increase support and no lower limit, and an unchanged set equal limits (P-D-276).
+- The answer is facts: every check found and each resolved definition. Only a malformed request, the PDP and a
+  stored row that does not read are errors (P-D-275).
+
+**Rationale**: the quotas package (feature 2, DESIGN §3.3.1.1–§3.3.1.3); owner decision of 2026-11-21.
 
 #### `fr-sku-bundle`
 
@@ -591,8 +616,9 @@ The `products-sdk` surface exposes `Sku`, `SkuType`, `Lifecycle`, `Category`, `S
 `SkuChangedPayload`. The usage-type catalog port remains available, and the `SkuUsageV1` port, which pricing
 fills, carries pricing's usage of SKUs to the SKU reads (P-D-197). `ProductCatalogClientV1` and its browse
 transport (`GET /bss-products/v1/browse`) remain until phase 2, as required by the Task 3 interface boundary.
-`ProductsQuotaCatalogClientV1` serves the two quota definition reads in-process, as its caller (P-D-272); its
-module also holds the quota GTS schemas, the discovery plugin specification, exact units and the canonical
+`ProductsQuotaCatalogClientV1` serves the two quota definition reads in-process, as its caller (P-D-272), and
+validates a complete set of plan quota rules for Pricing with `validate_quota_set`, with no REST endpoint (P-D-275).
+Its module also holds the quota GTS schemas, the discovery plugin specification, exact units and the canonical
 digests (P-D-267).
 
 ### 7.2 External Integration Contracts
@@ -954,6 +980,18 @@ digests (P-D-267).
   and the independent approval publishes definition version 1 with availability `disabled`, reason
   `qualification_pending` and no qualification reference (P-D-269, P-D-271).
 
+**AC #38. Quota-set validation — `fr-quota-set-validation`**
+
+- **Given** definitions approved in the caller's tenant, one of them not enabled, a definition of a second tenant,
+  and Pricing's plan rules on them (quotas criteria Q-C02, Q-C58 and Q-C65).
+- **When** Pricing validates sets that name an unknown or foreign version, a changed digest, another SKU, a unit
+  outside the allowed ones, an amount off the grid or a fraction, a wrong scope selection, rules of one binding on
+  two adapter targets, or a decrease, and a valid set.
+- **Then** each set is answered with each check on its rule and field, and no content of a foreign definition is
+  answered; the valid set answers its definitions; a version that is not enabled is reported
+  `QUOTA_QUALIFICATION_UNAVAILABLE` with its state and reason; a malformed request is 400 `VALIDATION` (P-D-275,
+  P-D-276).
+
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
@@ -1009,6 +1047,7 @@ in their actor, requirement or use-case blocks above.
 | `fr-sku-metering`, `fr-sku-bundle` | Spec §3 D; §4; §5; §15. |
 | `fr-derived-usage-type` | Owner decision of 2026-10-01 (P-D-229; rating T-D-39); P-D-230; P-D-231; P-D-232; P-D-233. |
 | `fr-quota-catalog` | Owner decisions of 2026-11-19 (quotas programme); the quotas package's ADR 0001 and feature 1; P-D-266 … P-D-274; AC #33 … #37. |
+| `fr-quota-set-validation` | Owner decision of 2026-11-21 (quotas programme); the quotas package's feature 2 and DESIGN §3.3.1.1; P-D-275, P-D-276; AC #38. |
 | `fr-sku-lifecycle`, `fr-sku-retire-fenced`, `fr-reference-registry` | Spec §2 decision 17; §2.2; §4; §6; §7.2; §13. |
 | `fr-approval-units`, `fr-concurrency-idempotency` | Spec §2 decision 8; §2.2; §3 items 23 and 27; §6; §7.2; §14. |
 | `fr-events`, `fr-read-model` | Spec §3 item 43; §4; §6; §7.3; §12–§13. |

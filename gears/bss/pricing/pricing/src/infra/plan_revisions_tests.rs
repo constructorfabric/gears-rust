@@ -103,3 +103,102 @@ fn a_poisoned_lock_keeps_what_the_apply_and_the_refusal_recorded() {
     subject.refuse(toolkit_canonical_errors::CanonicalError::internal("kept").create());
     assert!(subject.take_refusal().is_some(), "the refusal is kept");
 }
+
+/// A revision with stored rules, as the checks read it, with no quota verdict yet.
+fn ruled_context(revision_id: Uuid) -> crate::domain::plan::PlanContext {
+    use crate::domain::plan::{Defaults, Plan, PlanContext, Revision, RevisionState};
+    use bss_pricing_sdk::plan_quota::{
+        PlanQuotaBasis, PlanQuotaRuleV1, QuotaDefinitionRef, QuotaSubjectSelector,
+    };
+    PlanContext {
+        plan: Plan {
+            id: Uuid::new_v4(),
+            code: "pro".into(),
+            name: "Pro".into(),
+        },
+        revision: Revision {
+            id: revision_id,
+            rev_no: 1,
+            book_id: Uuid::new_v4(),
+            state: RevisionState::Draft,
+            available_from: None,
+        },
+        items: Vec::new(),
+        skus: Vec::new(),
+        entries: Vec::new(),
+        books: Vec::new(),
+        dimension_values: Vec::new(),
+        published_sku_ids: Vec::new(),
+        quorum: 1,
+        defaults: Defaults {
+            gl: None,
+            tax_category: None,
+        },
+        quota_rules: vec![PlanQuotaRuleV1 {
+            rule_id: Uuid::from_u128(1),
+            definition_ref: QuotaDefinitionRef {
+                id: Uuid::new_v4(),
+                version: std::num::NonZeroU64::MIN,
+                digest: [0xab; 32],
+            },
+            item_id: Uuid::new_v4(),
+            dimension_value: None,
+            logical_binding_key: "compute".into(),
+            subject_selector: QuotaSubjectSelector::ResourceOwner,
+            scope_selection: std::collections::BTreeMap::new(),
+            amount: "10".into(),
+            unit_ref: "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1".into(),
+            basis: PlanQuotaBasis::PerPlanUnit,
+        }],
+        quota_digest: "d".repeat(64),
+        quota_verdict: None,
+        quota_sku_versions: std::collections::BTreeMap::new(),
+        revision_version: 2,
+    }
+}
+
+/// A revision with rules judged without its quota capture refuses with the kept 409
+/// `UNIT_CONTENDED`, as a missing meter capture does, and takes no verdict; a revision without
+/// rules needs no capture.
+#[test]
+fn a_revision_with_rules_and_no_quota_capture_is_the_kept_unit_contended() {
+    let ctx = toolkit_security::SecurityContext::builder()
+        .subject_id(Uuid::new_v4())
+        .subject_tenant_id(Uuid::new_v4())
+        .subject_type("user")
+        .build()
+        .unwrap();
+    let revision_id = Uuid::new_v4();
+    let subject = super::PlanRevisionSubject::new(
+        ctx,
+        std::sync::Arc::new(toolkit::ClientHub::default()),
+        revision_id,
+        OffsetDateTime::UNIX_EPOCH,
+    );
+    assert!(subject.meter_observations.quota.is_none());
+    let mut context = ruled_context(revision_id);
+    let refused = subject.quota(&mut context).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            bss_approval::ApprovalError::InvalidSubmit {
+                code: "UNIT_CONTENDED",
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    let kept = subject.take_refusal().expect("the kept refusal");
+    assert_eq!(kept.status_code(), 409);
+    assert_eq!(
+        crate::infra::reference_work::error_code(&kept).as_deref(),
+        Some("UNIT_CONTENDED")
+    );
+    assert!(
+        context.quota_verdict.is_none(),
+        "no verdict is judged green"
+    );
+    let mut free = ruled_context(revision_id);
+    free.quota_rules.clear();
+    assert!(subject.quota(&mut free).is_ok(), "no rule, no capture");
+}

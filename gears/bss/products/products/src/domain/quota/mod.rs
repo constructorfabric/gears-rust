@@ -11,6 +11,7 @@ pub mod locale;
 pub mod ports;
 pub mod record;
 pub mod review;
+pub mod set;
 pub mod snapshot;
 
 use bss_products_sdk::quota::catalog::{QuotaAvailabilityState, QuotaOwnerRef, QuotaVersion};

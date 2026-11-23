@@ -41,6 +41,7 @@ pub mod currency;
 pub mod dimension;
 pub mod money;
 pub mod plan;
+pub mod plan_quota;
 pub mod price;
 pub mod price_book_entry;
 pub mod reference_op;

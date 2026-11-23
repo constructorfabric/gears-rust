@@ -87,6 +87,11 @@ fn availability(f: &RepoFixture, definition: Uuid, revision: u64, state: &str) -
 /// A target, a candidate, a mapping, the definition version 1 and its availability revision 1,
 /// disabled until qualification.
 async fn definition_of_shape(f: &RepoFixture, shape: Shape) -> Uuid {
+    stored_of_shape(f, shape).await.0.definition_id
+}
+
+/// [`definition_of_shape`], answering the stored definition version and its mapping.
+async fn stored_of_shape(f: &RepoFixture, shape: Shape) -> (DefinitionVersion, MappingVersion) {
     let c = candidate(f).await;
     let m = mapping(f, &c, Uuid::new_v4(), 1);
     insert_mapping(&f.conn(), &f.scope, f.tenant, &m)
@@ -126,7 +131,7 @@ async fn definition_of_shape(f: &RepoFixture, shape: Shape) -> Uuid {
     )
     .await
     .unwrap();
-    id
+    (definition, m)
 }
 
 async fn definition(f: &RepoFixture, sku: Uuid, sku_version: u64) -> Uuid {
@@ -662,4 +667,184 @@ async fn a_version_beyond_the_stored_range_is_refused_not_wrapped() {
         .unwrap()
         .unwrap();
     assert_eq!(current.revision, v(1));
+}
+
+/// The definition versions of a set and their availability are two statements whatever the set
+/// holds, and each version answers its own availability (P-D-275).
+#[tokio::test]
+async fn a_set_of_versions_reads_with_its_availability_in_two_statements() {
+    for n in [1, 3] {
+        let (f, recorder) = RepoFixture::recorded().await;
+        let mut keys = Vec::new();
+        for _ in 0..n {
+            let (row, _) = stored_of_shape(&f, Shape::at(f.sku, 1)).await;
+            keys.push((row.definition_id, row.version));
+        }
+        let enabled = keys[0].0;
+        insert_availability(
+            &f.conn(),
+            &f.scope,
+            f.tenant,
+            &availability(&f, enabled, 2, "enabled"),
+        )
+        .await
+        .unwrap();
+        recorder.clear();
+        let rows = find_definitions(&f.conn(), &f.scope, f.tenant, &keys)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), n);
+        for (definition, current) in &rows {
+            assert_eq!(current.definition_id, definition.definition_id);
+            let expected = if definition.definition_id == enabled {
+                (v(2), QuotaAvailabilityState::Enabled)
+            } else {
+                (v(1), QuotaAvailabilityState::Disabled)
+            };
+            assert_eq!((current.revision, current.state), expected);
+        }
+        let statements = products_statements(&recorder);
+        assert_eq!(statements.len(), 2, "{statements:#?}");
+        assert!(
+            statements[1].contains("products_quota_availability"),
+            "{statements:#?}"
+        );
+    }
+}
+
+/// A version not stored, one beyond the stored range, or another tenant's is absent from the
+/// answer; another tenant's scope reads none of the caller's.
+#[tokio::test]
+async fn a_version_not_stored_or_of_another_tenant_is_absent_from_the_set_read() {
+    let mut f = RepoFixture::new().await;
+    let (mine, _) = stored_of_shape(&f, Shape::at(f.sku, 1)).await;
+    let (tenant, scope) = (f.tenant, f.scope.clone());
+    let other = Uuid::new_v4();
+    f.tenant = other;
+    f.scope = AccessScope::for_tenant(other);
+    let (theirs, _) = stored_of_shape(&f, Shape::at(f.sku, 1)).await;
+    f.tenant = tenant;
+    f.scope = scope;
+    let keys = [
+        (mine.definition_id, mine.version),
+        (theirs.definition_id, theirs.version),
+        (Uuid::new_v4(), v(1)),
+        (mine.definition_id, v(u64::MAX)),
+    ];
+    let rows = find_definitions(&f.conn(), &f.scope, f.tenant, &keys)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|(d, _)| d.definition_id)
+            .collect::<Vec<_>>(),
+        [mine.definition_id]
+    );
+    assert_eq!(rows[0].0, mine, "the version as stored");
+    let foreign = find_definitions(&f.conn(), &AccessScope::for_tenant(other), f.tenant, &keys)
+        .await
+        .unwrap();
+    assert!(foreign.is_empty(), "another tenant's scope reads none");
+    assert!(
+        find_definitions(&f.conn(), &f.scope, f.tenant, &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// The set read matches each id with its own version, pair by pair: with definition A at
+/// versions 1 and 2 and B at version 1, asking for A at 2 and B at 1 answers exactly those two,
+/// each with its own availability, never A at 1 or a cross product of the ids and versions.
+#[tokio::test]
+async fn a_set_read_matches_each_definition_with_its_own_version() {
+    let f = RepoFixture::new().await;
+    let (a, _) = stored_of_shape(&f, Shape::at(f.sku, 1)).await;
+    let a2 = DefinitionVersion {
+        version: v(2),
+        candidate_id: candidate(&f).await.id,
+        ..a.clone()
+    };
+    insert_definition(&f.conn(), &f.scope, f.tenant, &a2, &[Uuid::from_u128(0x3e)])
+        .await
+        .unwrap();
+    insert_availability(
+        &f.conn(),
+        &f.scope,
+        f.tenant,
+        &Availability {
+            version: v(2),
+            ..availability(&f, a.definition_id, 1, "enabled")
+        },
+    )
+    .await
+    .unwrap();
+    let (b, _) = stored_of_shape(&f, Shape::at(f.sku, 1)).await;
+    let rows = find_definitions(
+        &f.conn(),
+        &f.scope,
+        f.tenant,
+        &[(a.definition_id, v(2)), (b.definition_id, v(1))],
+    )
+    .await
+    .unwrap();
+    let mut found: Vec<(Uuid, QuotaVersion, QuotaVersion, QuotaAvailabilityState)> = rows
+        .iter()
+        .map(|(d, current)| (d.definition_id, d.version, current.version, current.state))
+        .collect();
+    found.sort_by_key(|row| (row.0, row.1));
+    let mut expected = vec![
+        (a.definition_id, v(2), v(2), QuotaAvailabilityState::Enabled),
+        (
+            b.definition_id,
+            v(1),
+            v(1),
+            QuotaAvailabilityState::Disabled,
+        ),
+    ];
+    expected.sort_by_key(|row| (row.0, row.1));
+    assert_eq!(found, expected);
+}
+
+/// The adapter target and the profile content of each mapping version a set names, in one
+/// statement; a version not stored is absent.
+#[tokio::test]
+async fn the_mapping_facts_of_a_set_read_in_one_statement() {
+    let (f, recorder) = RepoFixture::recorded().await;
+    let (row, m) = stored_of_shape(&f, Shape::at(f.sku, 1)).await;
+    recorder.clear();
+    let facts = mapping_facts(
+        &f.conn(),
+        &f.scope,
+        f.tenant,
+        &[
+            (row.mapping_id, row.mapping_version),
+            (Uuid::new_v4(), v(1)),
+            (row.mapping_id, v(u64::MAX)),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    let fact = &facts[&(row.mapping_id, row.mapping_version)];
+    assert_eq!(fact.target_id, m.target_id);
+    assert_eq!(fact.profile["profile"], "bounded_allocation");
+    assert_eq!(fact.profile, m.profile_json);
+    let statements = products_statements(&recorder);
+    assert_eq!(statements.len(), 1, "{statements:#?}");
+    assert!(
+        statements[0].contains("products_quota_mapping_version")
+            && !statements[0].contains("mapping_json"),
+        "{statements:#?}"
+    );
+    let other = Uuid::new_v4();
+    let foreign = mapping_facts(
+        &f.conn(),
+        &AccessScope::for_tenant(other),
+        other,
+        &[(row.mapping_id, row.mapping_version)],
+    )
+    .await
+    .unwrap();
+    assert!(foreign.is_empty(), "another tenant reads none");
 }

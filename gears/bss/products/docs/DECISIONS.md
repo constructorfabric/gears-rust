@@ -91,9 +91,11 @@
 | P-D-269 | H | A quota definition is approved on its candidate, with separation of duties | DECIDED 2026-11-19 · Owner, 2026-11-19 |
 | P-D-270 | H | Quota definitions, mappings and profiles are append-only versions | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DESIGN §3.3.1.1 (amended) |
 | P-D-271 | M | Every approved quota definition is unavailable for sale until qualification | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DECOMPOSITION §3 |
-| P-D-272 | M | Plan authors read the quota catalog through two endpoints and one SDK client | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DESIGN §3.3.1.1 (amended) |
+| P-D-272 | M | Plan authors read the quota catalog through two endpoints and one SDK client | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas DESIGN §3.3.1.1 (amended); extended by P-D-275 |
 | P-D-273 | M | Two quota resources with six grants | DECIDED 2026-11-19 · Owner, 2026-11-19 |
 | P-D-274 | M | Migration 000015 creates the quota catalog store | DECIDED 2026-11-19 · quotas DESIGN §3.7 |
+| P-D-275 | H | Products validates a complete quota set for Pricing | DECIDED 2026-11-21 · Owner, 2026-11-21 (the `read` grant); quotas DESIGN §3.3.1.1 (amended); extends P-D-272 |
+| P-D-276 | H | The quota-set judgement: rule checks, set checks and change kinds | DECIDED 2026-11-21 · quotas DESIGN §3.3.1.1 (amended), §3.3.1.3; quotas feature 2 |
 
 ## Entries
 
@@ -2776,3 +2778,149 @@ package's feature 1 algorithm step `inst-authorize`.
   `the_quota_migration_refuses_to_revert_while_a_row_exists_on_postgres`.
 
 **Source:** Quotas DESIGN §3.7 (owner designs define their physical migrations) and P-D-268 … P-D-271.
+
+#### P-D-275 [H] Products validates a complete quota set for Pricing
+
+**Status:** DECIDED 2026-11-21.
+
+- **The method.** `ProductsQuotaCatalogClientV1::validate_quota_set(ctx, QuotaSetRequest) -> QuotaSetValidation`,
+  added in place on the trait, as P-D-272 said it would be. No REST endpoint: Pricing runs in the same process.
+  `QuotaDefinitionRef {id, version, digest}` names one exact version, as a plan rule does.
+- **The request.** `QuotaSetRequest` carries the purpose (`Authoring` or `Acceptance`), the change kind
+  (`InitialSet`, `Increase` or `Unchanged`), the purchased plan quantity (a canonical integer from 1, required for
+  `Acceptance`), the prior limits (for `Increase` and `Unchanged` only, one per binding and metric), the locale, and
+  at most 200 rules (`MAX_RULES`). Each rule carries its rule id, its definition reference, the plan item's SKU and
+  the SKU version in force for the plan, the logical binding key, the requested dimension value, the subject
+  selector, the scope selection, the amount, the unit and the basis.
+- **The answer.** `QuotaSetValidation` holds one verdict per rule, in request order, and every check found. A
+  verdict carries the resolved definition, absent when the caller's scope does not hold it, and, with a quantity,
+  the final limit in the rule's unit. A check (`QuotaCheck`) carries its code (P-D-276), the rules it is about, the
+  field and the reason. `ok()` is true exactly when no check failed.
+- **The grant** (the owner's ruling of 2026-11-21). The method asks `read` on `quota_definition` for the caller's
+  tenant (P-D-265, P-D-273) and reads the definitions under the whole grant, with its row constraints. A definition
+  the grant does not reach is unknown to the set, as for a read, and none of its content is answered. There is no
+  new permission. Deployments give that grant, as they give SKU `read`, to every caller Pricing validates for: the
+  authors who save plan quota rules, the readers of a plan's checks (single and batch), the plan submitter, the final
+  approver (whose apply re-runs the checks) and the caller of an acceptance (Orders' principal). A non-final vote
+  keeps a refusal as an observation (pricing D-503) and needs no grant.
+- **Facts, not policy.** The answer lists every check it finds and the definitions it resolved. Pricing decides
+  what each boundary refuses: a draft may hold a definition that is not enabled, and submit, approval and acceptance
+  refuse it (pricing D-542).
+- **Errors.** Only a malformed request is an error, 400 `VALIDATION` on its field: more than 200 rules (`rules`) or
+  200 prior limits (`prior`), a locale over 64 bytes (`locale`), a repeated `rule_id` (`rules[i].rule_id`), a
+  quantity that is not a canonical integer from 1 or an acceptance without one (`quantity`), prior limits with
+  `InitialSet` or none with `Increase` or `Unchanged` (`prior`), a prior amount that is not a canonical integer
+  (`prior[i].amount`), and one binding and metric in two prior limits (`prior[i]`, the second). The PDP answers 403
+  or 503 before the request is read, and a stored row that does not read is a 500 (P-D-273, P-D-274).
+- **Bounds.** Products bounds the request as follows, each refusal 400 `VALIDATION` on its field: a logical binding key
+  (a rule's or a prior limit's) and a scope key are 1 to 64 bytes (`MAX_KEY_BYTES`), a scope selection names at most 8
+  keys (`MAX_SCOPE_KEYS`), a dimension value and a subject selector are at most 512 bytes (`MAX_TEXT_BYTES`), and a
+  rule's unit and a prior limit's metric and unit are at most 1024 bytes (`MAX_REF_BYTES`), the longest GTS id the
+  catalog stores, so no reference to a stored unit or metric is refused. The rule count, the scope-key count and the
+  binding key's length are Pricing's caps too (pricing D-541); the locale, text and reference bounds are Products' own,
+  and Products does not check the binding key's characters. A rule's amount and a scope value keep their own checks
+  (P-D-276), which bound them; the scope value's bound is the SDK's `MAX_SCOPE_VALUE_BYTES` (255), which Pricing's
+  parse takes too. Every caller text a detail repeats (a binding key, a scope key, a unit, a metric, an
+  amount, a quantity or a subject selector) is quoted, with its control characters escaped, and cut after 32 characters.
+  A field path `scope_selection.<key>` carries the scope key, which its bound keeps at 64 bytes.
+- **Reads.** Three statements whatever the set holds: the named versions, their current availability, and their
+  mappings' adapter targets with their profile content. The mapping read takes the grant's tenant-only scope, as an
+  approval's mapping rows do (P-D-273). No registry or plugin call is made, and no digest is computed again. A
+  resolved version that does not project, whose allowed units' `min`, `step`, `max` or factor does not read, or
+  whose mapping does not read, is a corrupt row: a 500 and no partial answer. A catalog defect is never reported as
+  the author's `QUOTA_AMOUNT_INVALID`.
+- **The tests.** `products-sdk/src/quota/validation_tests.rs`: `every_check_code_has_its_stable_token`,
+  `a_validation_is_ok_exactly_without_checks` and `a_definition_ref_round_trips_with_a_string_version`.
+  `infra/storage/repo/quota_catalog_repo_tests.rs`: `a_set_of_versions_reads_with_its_availability_in_two_statements`,
+  `a_version_not_stored_or_of_another_tenant_is_absent_from_the_set_read`,
+  `a_set_read_matches_each_definition_with_its_own_version` and `the_mapping_facts_of_a_set_read_in_one_statement`.
+  `infra/quota/catalog_client_tests.rs`: `the_set_validation_answers_the_catalogs_definitions_and_their_availability`,
+  `the_set_validation_reads_in_three_statements_after_the_pdp`, `a_definition_outside_the_grant_is_unknown_to_the_set`,
+  `a_grant_narrowed_to_the_definition_resolves_it_in_the_set`,
+  `validation_asks_read_on_quota_definition_for_the_callers_tenant`, `a_malformed_set_is_400_validation`,
+  `a_pdp_outage_is_503_for_a_set`, `a_caller_without_the_grant_is_403_before_the_request_is_read`,
+  `another_tenants_definition_is_unknown_to_the_set`, `a_stored_definition_that_does_not_read_is_500_for_a_set` and
+  `a_stored_unit_grid_that_does_not_read_is_500_for_a_set`. `domain/quota/set_tests.rs`:
+  `a_malformed_request_is_refused_before_any_judgement`, `a_repeated_or_non_canonical_prior_limit_is_refused`,
+  `oversized_inputs_are_refused_without_echoing_them`, `a_binding_key_in_a_detail_is_quoted`,
+  `an_extra_scope_key_in_a_detail_is_quoted`, `a_rule_unit_in_a_detail_is_quoted`,
+  `a_prior_metric_in_a_detail_is_quoted` and `a_prior_unit_in_a_detail_is_quoted`. On Postgres,
+  `tests/postgres_quota_catalog.rs`: `the_definition_versions_of_a_set_read_on_postgres` and
+  `a_set_read_matches_each_definition_with_its_own_version_on_postgres`.
+
+**Source:** Owner, 2026-11-21 (the validation asks `read` on `quota_definition`; no new permission). Quotas DESIGN
+§3.3.1.1, amended in the same change: the answer is facts, and Pricing decides what each boundary refuses. Extends
+P-D-272.
+
+#### P-D-276 [H] The quota-set judgement: rule checks, set checks and change kinds
+
+**Status:** DECIDED 2026-11-21.
+
+- **Per rule.** In this order, each check naming its rule:
+  - *definition*: the exact version exists in the caller's scope, else `QUOTA_RULE_INVALID` on `definition_ref` and
+    the rule's other checks are skipped; its stored digest is the rule's, else `QUOTA_DEFINITION_CHANGED` on
+    `definition_ref.digest`.
+  - *applicability*: the definition's SKU is the rule's, and the rule's SKU version is the one the definition was
+    approved at or a later one (P-D-270), else `QUOTA_RULE_INVALID` on `definition_ref`.
+  - *unit*: the basis is one of the definition's bases, else `QUOTA_RULE_INVALID` on `basis`; the unit is one of its
+    allowed units, else `QUOTA_RULE_INVALID` on `unit_ref`, and the amount is not judged.
+  - *amount*: the amount is a canonical decimal integer (P-D-267) on the unit's grid, `min + n × step`, within `max`,
+    else `QUOTA_AMOUNT_INVALID` on `amount`. With a quantity, the final limit (the amount for `Fixed`, the amount times
+    the quantity for `PerPlanUnit`) is on the grid and within `max` too, else `QUOTA_AMOUNT_INVALID` on `quantity`.
+    The amount converts exactly into the canonical unit, else `QUOTA_UNIT_INEXACT` on `amount`. The arithmetic is
+    checked `u128`, and an overflow is `QUOTA_AMOUNT_INVALID`.
+  - *scope*: the subject selector is the scope policy's, else `QUOTA_SCOPE_UNSUPPORTED` on `subject_selector`; the
+    scope selection names exactly the policy's required dimensions, each with a value of 1 to 255 printable ASCII
+    bytes, else `QUOTA_SCOPE_UNSUPPORTED` on `scope_selection.<key>`. Only the form of a value is checked: Products
+    resolves no alias and knows no wildcard, and the scope authority refuses both at purchase (the quotas package's
+    feature 3).
+  - *availability*: a version that is not `enabled` is `QUOTA_QUALIFICATION_UNAVAILABLE` on `definition_ref`, with
+    its state and reason (`disabled: qualification_pending`).
+- **Per set.** Among the rules whose definition resolved:
+  - the rules of one logical binding share the profile's content (its kind, aggregation, accounting and required
+    operations, without the change support) and one adapter target, else one `QUOTA_SET_INCOMPATIBLE` on
+    `logical_binding_key` naming every rule of the binding. Products mints one profile id per mapping lineage
+    (P-D-270), so equal ids would keep vCPU and RAM apart; equal content on one target is what one supported profile
+    means here. Joint qualification of a set is the package's feature 5.
+  - the rules of one logical binding share one subject selector and one scope selection, whatever their item or
+    dimension value, at authoring and at acceptance alike: a binding installs one target and one scope. Else one
+    `QUOTA_SET_INCOMPATIBLE` on `scope_selection` naming every rule of the binding. The rule's dimension value is
+    carried, not judged: it groups nothing.
+- **Change kinds.** `InitialSet` judges the limits, and each definition must support initial installation. `Increase`
+  and `Unchanged` need a prior limit for each rule's binding and metric, and a rule for each prior limit, else
+  `QUOTA_SET_INCOMPATIBLE` on `prior`. A rule without a prior limit names its rule, and so does a prior limit whose unit
+  is neither the metric's canonical unit nor an allowed unit, or that does not convert exactly into the canonical unit.
+  A prior limit that no rule keeps (matched by binding and metric among the rules whose definition resolved) is reported
+  with empty `rule_ids`, and its detail names the prior limit's binding and metric: dropping a rule would remove an
+  installed cap. A prior limit of a binding that holds a rule whose definition did not resolve is not reported this way:
+  that rule's own check is the one failure, and its metric is unknown. Pricing reports a check that names no rule on the
+  set. `Increase` needs every final limit at least its prior one, at least one above it, and each definition to support
+  an increase. A lower limit is refused as a decrease; "nothing increases" is reported only when there is no decrease,
+  since the decrease is the cause. `Unchanged` needs every final limit equal to its prior one. Limits are compared in
+  the canonical unit, and a failure is `QUOTA_SET_INCOMPATIBLE` on `change_kind`.
+- **Zero and unbounded.** Zero is an explicit limit where the unit's `min` is zero. There is no unbounded amount: a
+  unit without `max` still needs a finite amount on its grid.
+- **Every failure.** The judgement never stops at the first failure and never drops a rule: rule checks in rule
+  order, then set checks. It is pure: it reads nothing and calls nothing.
+- **The tests.** `domain/quota/set_tests.rs`: `an_exact_valid_rule_passes_with_its_definition`,
+  `an_unknown_definition_is_rule_invalid_without_its_content`, `a_changed_digest_is_definition_changed`,
+  `a_sku_version_before_the_approval_is_rule_invalid`, `a_unit_outside_the_allowed_units_is_rule_invalid`,
+  `amounts_off_the_grid_or_not_canonical_are_amount_invalid`, `zero_is_an_explicit_limit_when_the_minimum_is_zero`,
+  `an_unbounded_definition_still_needs_a_finite_amount`,
+  `per_plan_unit_limits_are_judged_at_the_acceptance_quantity`,
+  `an_amount_that_does_not_convert_exactly_is_unit_inexact`, `an_overflow_is_amount_invalid`,
+  `scope_selection_must_name_exactly_the_required_dimensions`,
+  `rules_of_one_binding_need_one_compatible_profile_and_one_adapter_target`,
+  `rules_of_one_binding_share_one_scope_selection`, `a_definition_not_enabled_is_qualification_unavailable`,
+  `an_increase_needs_increase_support_and_a_decrease_is_refused`,
+  `nothing_increases_is_reported_only_without_a_decrease`, `a_prior_limit_without_a_rule_is_set_incompatible`,
+  `an_initial_set_needs_initial_set_support`, `an_increase_judges_the_final_limits`,
+  `limits_are_compared_in_the_canonical_unit`, `unchanged_needs_equal_limits` and
+  `every_failure_is_reported_without_dropping_a_rule`. `infra/quota/catalog_client_tests.rs`, on two stored
+  definitions: `vcpu_and_ram_approved_on_one_target_share_a_binding` and
+  `vcpu_and_ram_approved_on_two_targets_are_refused_in_one_binding`. The in-crate e2e with Pricing in
+  `api/rest/quota/plan_rules_e2e_tests.rs`: `vcpu_and_ram_of_two_adapter_targets_cannot_share_a_binding`.
+
+**Source:** Quotas DESIGN §3.3.1.1, amended in the same change (the rules of one logical binding need equal profile
+content and one adapter target), §3.3.1.3 and feature 2 §3.4. Implements the Products half of the package's feature
+2 step `inst-select` and algorithm step `inst-validate`.

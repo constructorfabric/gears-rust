@@ -1,6 +1,9 @@
 //! Versioned C00 canonical JSON projections. Public contracts never expose untyped JSON.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-store:p1
 use crate::{
     Digest,
+    plan_quota::PlanQuotaRuleV1,
     read::{
         AcceptedBinding, BindingSelection, ChargeKind, ImmutablePrice, PriceModel,
         ResolvedBindings, Tier,
@@ -572,5 +575,64 @@ pub fn fulfilment_digest(q: &crate::acceptance::FulfilmentQuery) -> Digest {
             ),
             ("activation_at", instant(q.activation_at)),
         ]),
+    )
+}
+
+/// One rule's payload, shared by the set, selected and snapshot digests: its rule id, its
+/// definition reference, item, dimension value, binding, subject token, scope selection (an
+/// object, so its keys are sorted), amount, unit and basis token.
+pub(crate) fn quota_rule(rule: &PlanQuotaRuleV1) -> V {
+    object([
+        ("rule_id", text(rule.rule_id)),
+        (
+            "definition_ref",
+            object([
+                ("id", text(rule.definition_ref.id)),
+                ("version", text(rule.definition_ref.version)),
+                ("digest", hex(&rule.definition_ref.digest)),
+            ]),
+        ),
+        ("item_id", text(rule.item_id)),
+        (
+            "dimension_value",
+            optional(rule.dimension_value.as_ref(), text),
+        ),
+        ("logical_binding_key", text(&rule.logical_binding_key)),
+        ("subject_selector", text(rule.subject_selector.token())),
+        (
+            "scope_selection",
+            V::Object(
+                rule.scope_selection
+                    .iter()
+                    .map(|(key, value)| (key.clone(), V::String(value.clone())))
+                    .collect(),
+            ),
+        ),
+        ("amount", text(&rule.amount)),
+        ("unit_ref", text(&rule.unit_ref)),
+        ("basis", text(rule.basis.token())),
+    ])
+}
+/// A revision's whole rule collection (D-541): the rules ordered by `rule_id`, each with its
+/// definition reference, item, dimension value, binding, subject, scope selection (sorted),
+/// amount, unit and basis token; domain `pricing.quota-rules.v1`. Input order does not matter:
+/// rules that share a `rule_id`, which a stored set never holds, are ordered by their canonical
+/// bytes. The empty set has its own digest.
+#[must_use]
+pub fn quota_rules_digest(rules: &[PlanQuotaRuleV1]) -> Digest {
+    let mut ordered: Vec<(uuid::Uuid, Vec<u8>, V)> = rules
+        .iter()
+        .map(|rule| {
+            let payload = quota_rule(rule);
+            (rule.rule_id, canonical_json_bytes(&payload), payload)
+        })
+        .collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    hash_document(
+        "pricing.quota-rules.v1",
+        object([(
+            "rules",
+            V::Array(ordered.into_iter().map(|(_, _, payload)| payload).collect()),
+        )]),
     )
 }

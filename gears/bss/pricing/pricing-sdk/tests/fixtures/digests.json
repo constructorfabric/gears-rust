@@ -721,6 +721,92 @@
       },
       "canonical_text": "{\"domain\":\"bss.billing-terms.v1\",\"payload\":{\"anchor\":\"calendar\",\"anchor_at\":\"2026-10-01T00:00:00.000000000Z\",\"cycle\":\"month\",\"schema_version\":\"1\",\"source\":{\"id\":\"00000000-0000-0000-0000-000000000014\",\"kind\":\"seller_policy\",\"version\":\"18446744073709551615\"},\"timezone\":\"UTC\"}}",
       "sha256": "330fa67c5203671aa5ba9079c672eb514d5034605966afb8b2e9ee8049cf382e"
+    },
+    {
+      "name": "quota_rules_v1",
+      "domain": "pricing.quota-rules.v1",
+      "payload": {
+        "rules": [
+          {
+            "rule_id": "00000000-0000-0000-0000-000000000001",
+            "definition_ref": {
+              "id": "00000000-0000-0000-0000-0000000000d1",
+              "version": "1",
+              "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "item_id": "00000000-0000-0000-0000-000000000011",
+            "dimension_value": null,
+            "logical_binding_key": "compute",
+            "subject_selector": "resource_owner",
+            "scope_selection": {
+              "region": "region-1",
+              "resource_pool": "pool-1"
+            },
+            "amount": "10",
+            "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1",
+            "basis": "per_plan_unit"
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.quota-rules.v1\",\"payload\":{\"rules\":[{\"amount\":\"10\",\"basis\":\"per_plan_unit\",\"definition_ref\":{\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"00000000-0000-0000-0000-0000000000d1\",\"version\":\"1\"},\"dimension_value\":null,\"item_id\":\"00000000-0000-0000-0000-000000000011\",\"logical_binding_key\":\"compute\",\"rule_id\":\"00000000-0000-0000-0000-000000000001\",\"scope_selection\":{\"region\":\"region-1\",\"resource_pool\":\"pool-1\"},\"subject_selector\":\"resource_owner\",\"unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\"}]}}",
+      "sha256": "46acf781c29e3a66a22e89c2393f557386c8e649f03d8986b6a89e20896dfbd7"
+    },
+    {
+      "name": "quota_rules_empty_v1",
+      "domain": "pricing.quota-rules.v1",
+      "payload": {
+        "rules": []
+      },
+      "canonical_text": "{\"domain\":\"pricing.quota-rules.v1\",\"payload\":{\"rules\":[]}}",
+      "sha256": "599cdcc359ef3e8e6f8a32068b381eb4db89aa0d2fd0e702ed2935a793dd1d5a"
+    },
+    {
+      "name": "quota_rules_two_v1",
+      "domain": "pricing.quota-rules.v1",
+      "payload": {
+        "rules": [
+          {
+            "rule_id": "00000000-0000-0000-0000-000000000001",
+            "definition_ref": {
+              "id": "00000000-0000-0000-0000-0000000000d1",
+              "version": "1",
+              "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "item_id": "00000000-0000-0000-0000-000000000011",
+            "dimension_value": null,
+            "logical_binding_key": "compute",
+            "subject_selector": "resource_owner",
+            "scope_selection": {
+              "region": "region-1",
+              "resource_pool": "pool-1"
+            },
+            "amount": "10",
+            "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1",
+            "basis": "per_plan_unit"
+          },
+          {
+            "rule_id": "00000000-0000-0000-0000-000000000002",
+            "definition_ref": {
+              "id": "00000000-0000-0000-0000-0000000000d1",
+              "version": "1",
+              "digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "item_id": "00000000-0000-0000-0000-000000000011",
+            "dimension_value": null,
+            "logical_binding_key": "compute",
+            "subject_selector": "resource_owner",
+            "scope_selection": {
+              "region": "region-1",
+              "resource_pool": "pool-1"
+            },
+            "amount": "20",
+            "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1",
+            "basis": "per_plan_unit"
+          }
+        ]
+      },
+      "canonical_text": "{\"domain\":\"pricing.quota-rules.v1\",\"payload\":{\"rules\":[{\"amount\":\"10\",\"basis\":\"per_plan_unit\",\"definition_ref\":{\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"00000000-0000-0000-0000-0000000000d1\",\"version\":\"1\"},\"dimension_value\":null,\"item_id\":\"00000000-0000-0000-0000-000000000011\",\"logical_binding_key\":\"compute\",\"rule_id\":\"00000000-0000-0000-0000-000000000001\",\"scope_selection\":{\"region\":\"region-1\",\"resource_pool\":\"pool-1\"},\"subject_selector\":\"resource_owner\",\"unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\"},{\"amount\":\"20\",\"basis\":\"per_plan_unit\",\"definition_ref\":{\"digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"id\":\"00000000-0000-0000-0000-0000000000d1\",\"version\":\"1\"},\"dimension_value\":null,\"item_id\":\"00000000-0000-0000-0000-000000000011\",\"logical_binding_key\":\"compute\",\"rule_id\":\"00000000-0000-0000-0000-000000000002\",\"scope_selection\":{\"region\":\"region-1\",\"resource_pool\":\"pool-1\"},\"subject_selector\":\"resource_owner\",\"unit_ref\":\"gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1\"}]}}",
+      "sha256": "3e1f3935aa78d797c72032f6108aebc515ef18a46a86e25786f39b0968fdeae7"
     }
   ],
   "semantic_projections": [

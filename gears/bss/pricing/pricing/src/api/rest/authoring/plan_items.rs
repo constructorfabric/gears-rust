@@ -5,10 +5,13 @@
 //! of the caller), the entry, the revision's items and the SKU read fresh, all before any claim or
 //! reservation (a refusal is 400 and costs nothing, D-403); then [`create`] writes the create op
 //! and drives it. `PATCH /plan-items/{id}` (`patch`) edits an item of an unlocked draft of the
-//! caller, never its SKU. `DELETE /plan-items/{id}` ([`delete`]) removes it with its delete op;
-//! a draft revision's delete removes every item through `remove`. A copy or a clone writes each
-//! copied item `unreserved` with its attach op ([`reference_work::attach_op`]) in its own
+//! caller, never its SKU. `DELETE /plan-items/{id}` ([`delete`]) removes it with its delete op,
+//! and refuses an item a quota rule names (`ITEM_HAS_QUOTA_RULES`, D-543); a draft revision's
+//! delete removes its quota rules, then every item through `remove`. A copy or a clone writes
+//! each copied item `unreserved` with its attach op ([`reference_work::attach_op`]) in its own
 //! transaction and drives them with [`drive_best_effort`].
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-checks:p1
 use super::{
     AuthoringState,
     dto::{PricingPlanItemCreate, PricingPlanItemDto, PricingPlanItemPatch},
@@ -26,9 +29,10 @@ use crate::{
         reference_registry,
         reference_work::{self, Caller, Receipt, Ref, Target, WallClock, Work},
         storage::{
+            RepoError,
             entity::plan_revision,
             repo::{
-                idempotency_repo as idem, plan_item_repo, plan_revision_repo,
+                idempotency_repo as idem, plan_item_repo, plan_quota_repo, plan_revision_repo,
                 price_book_entry_repo, reference_op_repo,
             },
         },
@@ -405,7 +409,8 @@ pub async fn create(
 /// it; an item of a pending, published or superseded revision is never removed
 /// (`REVISION_NOT_DRAFT`): its reference outlives the revision (D-414); an item of another
 /// author's draft is not the caller's to remove (`NOT_DRAFT_AUTHOR`, D-404). A draft revision's
-/// delete removes every item through this, before the revision itself.
+/// delete removes every item through this, before the revision itself, once it has removed the
+/// draft's quota rules (`plan_quota_repo::delete_for_draft`).
 /// # Errors
 /// 404 for an unknown item, the refusals above, `STALE_REVISION` for a lost race.
 pub(crate) async fn remove(
@@ -414,6 +419,25 @@ pub(crate) async fn remove(
     ctx: &SecurityContext,
     correlation: Uuid,
     id: Uuid,
+) -> Result<Uuid, DoorError> {
+    remove_guarded(tx, scope, ctx, correlation, id, Rules::Removed).await
+}
+/// What an item removal knows about the quota rules that may name its item (D-543).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rules {
+    /// The item delete: a rule may name the item, and then the delete is refused.
+    MayName,
+    /// A draft's delete: its rules were removed first, so none names the item.
+    Removed,
+}
+/// [`remove`], refusing an item a quota rule names when `rules` says one may.
+async fn remove_guarded(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    ctx: &SecurityContext,
+    correlation: Uuid,
+    id: Uuid,
+    rules: Rules,
 ) -> Result<Uuid, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let item = plan_item_repo::find(tx, scope, tenant, id)
@@ -424,18 +448,51 @@ pub(crate) async fn remove(
     if item.reference_state == ReferenceState::ConfirmationPending.as_str() {
         return Err(support::conflict("ITEM_CONFIRMATION_PENDING").into());
     }
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-item-delete
+    let children = AccessScope::for_tenant(tenant);
+    if rules == Rules::MayName && plan_quota_repo::item_has_rules(tx, &children, tenant, id).await?
+    {
+        return Err(item_has_quota_rules(id));
+    }
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-item-delete
     let now = crate::infra::storage::stored_now();
     let op = reference_work::plan_item::delete_op(ctx, &item, correlation, now)?;
     let op_id = op.op_id;
-    plan_item_repo::delete_draft(tx, scope, tenant, id, item.version).await?;
+    plan_item_repo::delete_draft(tx, scope, tenant, id, item.version)
+        .await
+        .map_err(|error| ruled_item(id, error))?;
     reference_op_repo::insert(tx, &AccessScope::for_tenant(tenant), op).await?;
     support::audit(tx, ctx, correlation, "plan_item.delete", id, item.version).await?;
     Ok(op_id)
 }
+/// An item delete's storage failure: the rule's foreign key to its item backs the check before it
+/// (D-543), and no other row references a plan item, so a foreign key refusal is
+/// `ITEM_HAS_QUOTA_RULES`. A new table that references `pricing_plan_item` must revisit this
+/// mapping.
+fn ruled_item(id: Uuid, error: RepoError) -> DoorError {
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-item-delete
+    if let RepoError::Driver { source, .. } = &error
+        && toolkit_db::secure::is_foreign_key_violation(source)
+    {
+        return item_has_quota_rules(id);
+    }
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-item-delete
+    error.into()
+}
+/// 409 `ITEM_HAS_QUOTA_RULES`: a quota rule names the item (D-543).
+fn item_has_quota_rules(id: Uuid) -> DoorError {
+    support::conflict_because(
+        "ITEM_HAS_QUOTA_RULES",
+        format!("plan item {id} is named by a quota rule; replace the rules without it first"),
+    )
+    .into()
+}
 /// `DELETE /plan-items/{id}` below its door: the removal and its delete op commit together
-/// (204); the release is durable work, and what this call does not finish, the ticker does.
+/// (204); the release is durable work, and what this call does not finish, the ticker does. An
+/// item a quota rule names is refused (D-543).
 /// # Errors
-/// The removal's refusals; a failed release is never an error of the delete.
+/// The removal's refusals; 409 `ITEM_HAS_QUOTA_RULES`; a failed release is never an error of the
+/// delete.
 pub async fn delete(
     state: Arc<AuthoringState>,
     scope: AccessScope,
@@ -446,7 +503,9 @@ pub async fn delete(
     let original_ctx = ctx.clone();
     let op_id = support::transaction(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), ctx.clone());
-        Box::pin(async move { remove(tx, &scope, &ctx, correlation, id).await })
+        Box::pin(
+            async move { remove_guarded(tx, &scope, &ctx, correlation, id, Rules::MayName).await },
+        )
     })
     .await?;
     drive_best_effort(&state, &original_ctx, &[op_id]).await;
@@ -470,5 +529,29 @@ pub async fn drive_best_effort(state: &Arc<AuthoringState>, ctx: &SecurityContex
             );
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every foreign-key refusal of an item delete reads `ITEM_HAS_QUOTA_RULES`; another driver
+    /// failure stays a storage failure.
+    #[test]
+    fn a_foreign_key_refusal_of_an_item_delete_is_item_has_quota_rules() {
+        let id = Uuid::from_u128(0x17);
+        let driver = |message: &str| RepoError::Driver {
+            context: "delete plan item".into(),
+            source: sea_orm::DbErr::Custom(message.to_owned()),
+        };
+        let refused = CanonicalError::from(ruled_item(id, driver("FOREIGN KEY constraint failed")));
+        assert_eq!(refused.status_code(), 409, "{refused}");
+        assert!(
+            refused.to_string().contains("ITEM_HAS_QUOTA_RULES"),
+            "{refused}"
+        );
+        let other = CanonicalError::from(ruled_item(id, driver("disk I/O error")));
+        assert_eq!(other.status_code(), 500, "{other}");
     }
 }

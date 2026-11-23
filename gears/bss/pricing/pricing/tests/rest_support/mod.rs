@@ -293,6 +293,8 @@ impl Harness {
             ("GET", "/bss-pricing/v1/price-book-entries/{id}/prices"),
             ("POST", "/bss-pricing/v1/plan-revisions/{id}/unschedule"),
             ("GET", "/bss-pricing/v1/plan-revisions/{id}/reservations"),
+            ("GET", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
+            ("PUT", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
             ("GET", "/bss-pricing/v1/approval-policy/{kind}/effective"),
         ]
         .into_iter()
@@ -375,3 +377,7 @@ impl Harness {
 // Run 9.6 (D-480, D-481): method | path | resource:action | If-Match | Idempotency-Key
 // GET /plan-revisions/{id}/reservations plan:read false false
 // GET /approval-policy/{kind}/effective price_book_entry:read for prices, plan:read for plan_revision false false
+
+// Quota rules (D-540, D-543): method | path | resource:action | If-Match | Idempotency-Key
+// GET /plan-revisions/{id}/quota-rules plan:read false false
+// PUT /plan-revisions/{id}/quota-rules plan:author true true

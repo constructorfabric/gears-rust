@@ -645,7 +645,7 @@ async fn the_reservations_door_reads_in_two_statements() {
 
 /// D-480: absolute statement counts of the revision read, the same for 10 items and for 100.
 /// Base after 9.5d-2, plus 3 (entries, admission, prices) and, on draft and pending, the
-/// in-effect items.
+/// in-effect items; plus 2 for the quota set row and its rules (D-540).
 #[tokio::test]
 async fn the_revision_read_is_pinned_per_state_for_10_and_100_items() {
     let (db, recorder, tenant, dsn) = entry_support::recorded_db().await;
@@ -656,7 +656,7 @@ async fn the_revision_read_is_pinned_per_state_for_10_and_100_items() {
         let body = get(&f, &format!("/plan-revisions/{rev}")).await;
         (body, sql(&recorder))
     };
-    // Draft: 3 + 3 + 1.
+    // Draft: 3 + 3 + 1 + 2.
     let (_, small, _) = draft(&f, &catalog, "d10", 10).await;
     let (body, ten) = measure(small).await;
     assert_eq!(body["state"], "draft");
@@ -670,14 +670,14 @@ async fn the_revision_read_is_pinned_per_state_for_10_and_100_items() {
     }
     let (body, hundred) = measure(small).await;
     assert_eq!(body["entries"].as_array().unwrap().len(), 100);
-    assert_eq!(ten.len(), 7, "{ten:#?}");
+    assert_eq!(ten.len(), 9, "{ten:#?}");
     assert_eq!(ten, hundred);
-    // Pending: 5 + 3 + 1. Scheduled, published, superseded: 4 + 3.
+    // Pending: 5 + 3 + 1 + 2. Scheduled, published, superseded: 4 + 3 + 2.
     for (code, state, want) in [
-        ("pend", "pending", 9usize),
-        ("sched", "scheduled", 7usize),
-        ("pub", "published", 7usize),
-        ("old", "superseded", 7usize),
+        ("pend", "pending", 11usize),
+        ("sched", "scheduled", 9usize),
+        ("pub", "published", 9usize),
+        ("old", "superseded", 9usize),
     ] {
         let (plan_id, rev, _) = draft_recurring(&f, &catalog, &format!("{code}10"), 10).await;
         prepare(&f, rev, state).await;

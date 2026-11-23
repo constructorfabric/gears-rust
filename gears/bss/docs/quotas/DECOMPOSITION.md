@@ -129,7 +129,7 @@ The Entitlements contracts are pending in [PR #5744](https://github.com/construc
 
 - [ ] `p1` - `cpt-cf-bss-quotas-component-commercial-chain`
 
-**API**: PricingQuotaAuthoringClientV1, PricingReadV1::resolve and SellabilityV1::check (DESIGN §3.3.1.2 and §3.6.1).
+**API**: PricingQuotaAuthoringClientV1 and Pricing's quota-rule endpoints, PricingReadV1::resolve and SellabilityV1::check (DESIGN §3.3.1.2 and §3.6.1).
 
 **Sequences**:
 

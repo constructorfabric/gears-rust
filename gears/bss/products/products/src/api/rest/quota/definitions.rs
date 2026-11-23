@@ -1,4 +1,5 @@
 //! @cpt-dod:cpt-cf-bss-products-dod-quota-catalog-reads:p1
+//! @cpt-dod:cpt-cf-bss-products-dod-quota-set-validation:p1
 //! The catalog reads (P-D-272): `GET /quota-definitions`, the definition versions applicable to
 //! one SKU version, and `GET /quota-definitions/{id}/versions/{version}`, one exact version, both
 //! under the whole `read` grant on `quota_definition` (its row constraints included, P-D-273) and
@@ -10,7 +11,11 @@
 //! required), `subject_type_ref`, `resource_type_ref` and `profile_id`; its cursor binds the
 //! caller's tenant, those terms and `availability`, so a cursor reused by another tenant or under
 //! other filters is refused.
-use std::collections::BTreeMap;
+//!
+//! The quota-set validation (P-D-275) reads under the same grant: the versions a set names, their
+//! current availability and their mappings' facts, then judges them (`domain::quota::set`). It
+//! has no REST projection; the SDK client calls it.
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
@@ -55,7 +60,9 @@ use uuid::Uuid;
 
 use crate::domain::quota::locale::resolve;
 use crate::domain::quota::review::parse_basis;
+use crate::domain::quota::set::{ResolvedDefinition, judge, request_refusal, units_read};
 use crate::domain::quota::{Availability, DefinitionVersion};
+use bss_products_sdk::quota::validation::{QuotaSetRequest, QuotaSetValidation};
 
 /// The definitions' path.
 pub(crate) const DEFINITIONS: &str = "/bss-products/v1/quota-definitions";
@@ -648,6 +655,81 @@ pub(crate) async fn read_one(
         locale,
     )
     .await
+}
+
+/// Validate a set for a caller (P-D-275): `read` on `quota_definition` first, the request's
+/// shape, three statements, then the judgement (P-D-276). The SDK client calls it.
+///
+/// The versions and their availability are read under the whole grant, its row constraints
+/// included, so a version outside it is unknown to the set; the mappings under its tenant-only
+/// scope, as an approval writes them (P-D-273). A resolved version that does not project, whose
+/// allowed units' grids or factors do not read, or whose mapping is not stored, is a corrupt
+/// row: no partial answer.
+///
+/// # Errors
+/// 400 `VALIDATION` on the malformed field; 403 / 503 from the PDP; 500 for a corrupt row.
+// @cpt-flow:cpt-cf-bss-products-flow-quota-set-validate:p1
+pub(crate) async fn validate_set(
+    state: &QuotaState,
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    request: QuotaSetRequest,
+) -> Result<QuotaSetValidation, CanonicalError> {
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-authorize
+    let scope = definition_read_scope(enforcer, ctx).await?;
+    if let Some((field, detail)) = request_refusal(&request) {
+        return Err(refused("VALIDATION", &field, detail));
+    }
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-authorize
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-read
+    let tenant = ctx.subject_tenant_id();
+    let keys: Vec<(uuid::Uuid, QuotaVersion)> = request
+        .rules
+        .iter()
+        .map(|rule| (rule.definition.id, rule.definition.version))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let conn = On::DEFINITION.conn(&state.api)?;
+    let rows = catalog::find_definitions(&conn, &scope, tenant, &keys)
+        .await
+        .map_err(|e| On::DEFINITION.stored(&e))?;
+    let mappings: Vec<(uuid::Uuid, QuotaVersion)> = rows
+        .iter()
+        .map(|(row, _)| (row.mapping_id, row.mapping_version))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let facts = catalog::mapping_facts(&conn, &scope.tenant_only(), tenant, &mappings)
+        .await
+        .map_err(|e| On::DEFINITION.stored(&e))?;
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-read
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-answer
+    let locale = request.locale.as_deref();
+    let resolved = rows
+        .iter()
+        .map(|(row, availability)| {
+            let definition = project(row, availability, locale)
+                .and_then(|definition| units_read(&definition).map(|()| definition))
+                .map_err(|why| corrupt(row, tenant, &why))?;
+            let fact = facts
+                .get(&(row.mapping_id, row.mapping_version))
+                .ok_or_else(|| corrupt(row, tenant, "its mapping version is not stored"))?;
+            let resolved = ResolvedDefinition {
+                definition,
+                target_id: fact.target_id,
+                profile: fact.profile.clone(),
+            };
+            Ok(((row.definition_id, row.version), resolved))
+        })
+        .collect::<Result<BTreeMap<_, _>, CanonicalError>>()?;
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-answer
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-judge
+    let answer = judge(&request, &resolved);
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-judge
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-answer
+    Ok(answer)
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-answer
 }
 
 fn not_found(id: uuid::Uuid) -> CanonicalError {

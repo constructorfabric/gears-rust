@@ -3,7 +3,7 @@
 #[allow(dead_code)]
 #[path = "../src/digest.rs"]
 pub mod digest;
-use bss_pricing_sdk::{Digest, acceptance, read, terms};
+use bss_pricing_sdk::{Digest, acceptance, plan_quota, read, terms};
 use digest::{CanonicalValue, canonical_json_bytes, hash_document};
 use read::{ImmutablePrice, PriceModel};
 use rust_decimal::Decimal;
@@ -625,4 +625,90 @@ fn fulfilment_identity_covers_every_field_and_normalizes_instants() {
         }
         assert_ne!(fulfilment_digest(&changed), digest);
     }
+}
+
+/// The rule `plan_quota_tests` builds first: one rule of every member, its scope of two keys.
+fn quota_rule(n: u128, amount: &str) -> plan_quota::PlanQuotaRuleV1 {
+    use plan_quota::{PlanQuotaBasis, PlanQuotaRuleV1, QuotaDefinitionRef, QuotaSubjectSelector};
+    PlanQuotaRuleV1 {
+        rule_id: uuid::Uuid::from_u128(n),
+        definition_ref: QuotaDefinitionRef {
+            id: uuid::Uuid::from_u128(0xd1),
+            version: std::num::NonZeroU64::new(1).unwrap(),
+            digest: [0xaa; 32],
+        },
+        item_id: uuid::Uuid::from_u128(0x11),
+        dimension_value: None,
+        logical_binding_key: "compute".into(),
+        subject_selector: QuotaSubjectSelector::ResourceOwner,
+        scope_selection: BTreeMap::from([
+            ("region".into(), "region-1".into()),
+            ("resource_pool".into(), "pool-1".into()),
+        ]),
+        amount: amount.into(),
+        unit_ref: "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1".into(),
+        basis: PlanQuotaBasis::PerPlanUnit,
+    }
+}
+/// D-541: the frozen `pricing.quota-rules.v1` vector is the SDK function's digest, and its payload
+/// is the SDK's projection of the rule.
+#[test]
+fn quota_rules_vector_matches_the_sdk_function() {
+    let vector = quota_vector(&fixture(), "quota_rules_v1");
+    assert_eq!(vector["domain"], "pricing.quota-rules.v1");
+    let rule = quota_rule(1, "10");
+    assert_eq!(
+        restricted(&vector["payload"]).unwrap(),
+        CanonicalValue::Object(BTreeMap::from([(
+            "rules".to_owned(),
+            CanonicalValue::Array(vec![digest::quota_rule(&rule)]),
+        )]))
+    );
+    assert_eq!(
+        hex(bss_pricing_sdk::digest::quota_rules_digest(&[rule])),
+        vector["sha256"]
+    );
+}
+
+/// The empty set's digest is a contract value: every revision without rules reads it (D-541,
+/// D-544), so it is pinned here as a literal as well as in the fixture.
+const EMPTY_QUOTA_RULES: &str = "599cdcc359ef3e8e6f8a32068b381eb4db89aa0d2fd0e702ed2935a793dd1d5a";
+fn quota_vector(fixture: &Value, name: &str) -> Value {
+    fixture["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == name)
+        .unwrap_or_else(|| panic!("the fixture pins {name}"))
+        .clone()
+}
+/// The empty set and a set of two rules given in reverse order: the fixture pins both, so the
+/// order by `rule_id` is frozen in the data as well as in the code.
+#[test]
+fn quota_rules_vectors_pin_the_empty_set_and_the_rule_order() {
+    let fixture = fixture();
+    let empty = quota_vector(&fixture, "quota_rules_empty_v1");
+    assert_eq!(empty["sha256"], EMPTY_QUOTA_RULES);
+    assert_eq!(
+        hex(bss_pricing_sdk::digest::quota_rules_digest(&[])),
+        EMPTY_QUOTA_RULES
+    );
+    let two = quota_vector(&fixture, "quota_rules_two_v1");
+    let (first, second) = (quota_rule(1, "10"), quota_rule(2, "20"));
+    assert_eq!(
+        restricted(&two["payload"]).unwrap(),
+        CanonicalValue::Object(BTreeMap::from([(
+            "rules".to_owned(),
+            CanonicalValue::Array(vec![
+                digest::quota_rule(&first),
+                digest::quota_rule(&second)
+            ]),
+        )]))
+    );
+    assert_eq!(
+        hex(bss_pricing_sdk::digest::quota_rules_digest(&[
+            second, first
+        ])),
+        two["sha256"]
+    );
 }

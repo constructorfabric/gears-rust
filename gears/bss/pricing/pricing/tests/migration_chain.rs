@@ -1,8 +1,10 @@
 //! The new chain is replayable and every migration reverses independently, with two named
 //! exceptions: the forward migration `m20260926_000013` (D-427) moves data and is irreversible, so it
 //! applies once through the runner and its down refuses; `m20260929_000017` (D-446) widens a CHECK a
-//! stored row may then need, so its down refuses too. The schema guard (D-423) sorts first and
-//! creates nothing.
+//! stored row may then need, so its down refuses too. Two more reverse only on the rows they allow:
+//! `m20261003_000023` (D-522) refuses while a row needs its wider CHECKs, and
+//! `m20261121_000024` (D-546) while a plan quota rule is stored. The schema guard (D-423) sorts
+//! first and creates nothing.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use bss_pricing::infra::storage::migrations::Migrator;
@@ -158,33 +160,39 @@ async fn m20260926_000013_applies_once_and_refuses_to_revert() {
 }
 
 #[test]
-fn gear_chain_is_the_guard_coord_then_twenty_two_ordered_unique_migrations() {
+fn gear_chain_is_the_guard_coord_then_the_ordered_unique_pricing_migrations() {
     let names: Vec<_> = Migrator::migrations()
         .iter()
         .map(|m| m.name().to_owned())
         .collect();
-    assert_eq!(names.len(), 25);
+    assert_eq!(names.len(), 26);
     let mut sorted = names.clone();
     sorted.sort();
     sorted.dedup();
     assert_eq!(names, sorted);
-    assert_eq!(names[0], "m0000_pricing_refuse_a_legacy_or_stale_schema");
-    assert_eq!(names[1], "m0001_create_coord_leases");
-    assert_eq!(names[2], "m20260926_000001_create_pricing_settings");
-    assert_eq!(names[10], "m20260926_000009_create_pricing_idempotency");
-    assert_eq!(names[11], "m20260926_000010_create_pricing_plan");
-    assert_eq!(names[13], "m20260926_000012_create_pricing_plan_item");
-    assert_eq!(names[14], "m20260926_000013_model_on_the_entry");
-    assert_eq!(names[15], "m20260927_000014_settings_currencies_and_author");
-    assert_eq!(names[16], "m20260928_000015_book_description");
-    assert_eq!(names[17], "m20260928_000016_unit_submit_note");
-    assert_eq!(names[18], "m20260929_000017_revision_scheduled");
-    assert_eq!(names[19], "m20260930_000018_usage_rating_policy");
-    assert_eq!(names[20], "m20260930_000019_commercial_receipts");
-    assert_eq!(names[21], "m20261002_000020_plan_summary");
-    assert_eq!(names[22], "m20261002_000021_policy_references_sku");
-    assert_eq!(names[23], "m20261003_000022_price_cancel_and_end");
-    assert_eq!(names[24], "m20261003_000023_book_archive");
+    // One loop rather than one assertion per name: the list outgrew clippy's complexity budget.
+    for (index, name) in [
+        (0, "m0000_pricing_refuse_a_legacy_or_stale_schema"),
+        (1, "m0001_create_coord_leases"),
+        (2, "m20260926_000001_create_pricing_settings"),
+        (10, "m20260926_000009_create_pricing_idempotency"),
+        (11, "m20260926_000010_create_pricing_plan"),
+        (13, "m20260926_000012_create_pricing_plan_item"),
+        (14, "m20260926_000013_model_on_the_entry"),
+        (15, "m20260927_000014_settings_currencies_and_author"),
+        (16, "m20260928_000015_book_description"),
+        (17, "m20260928_000016_unit_submit_note"),
+        (18, "m20260929_000017_revision_scheduled"),
+        (19, "m20260930_000018_usage_rating_policy"),
+        (20, "m20260930_000019_commercial_receipts"),
+        (21, "m20261002_000020_plan_summary"),
+        (22, "m20261002_000021_policy_references_sku"),
+        (23, "m20261003_000022_price_cancel_and_end"),
+        (24, "m20261003_000023_book_archive"),
+        (25, "m20261121_000024_plan_quota_rules"),
+    ] {
+        assert_eq!(names[index], name, "migration {index}");
+    }
 }
 
 /// D-446: 000017 widens the revision state CHECK and adds the scheduled index. It replays without
@@ -405,4 +413,11 @@ async fn m20260930_000019_commercial_receipts() {
         ],
     )
     .await;
+}
+
+/// D-546: 000024 creates the quota set and rule tables, re-applies without effect and reverses on
+/// its own while no rule is stored.
+#[tokio::test]
+async fn m20261121_000024_plan_quota_rules() {
+    migration(25, &["pricing_plan_quota_set", "pricing_plan_quota_rule"]).await;
 }

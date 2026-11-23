@@ -811,6 +811,20 @@ impl QuotaPdp {
     }
 }
 
+/// A PDP that fails to evaluate: an unreachable PDP.
+pub struct FailingResolver;
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for FailingResolver {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        _req: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<authz_resolver_sdk::models::EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::internal("pdp unreachable".to_owned()).create())
+    }
+}
+
 #[async_trait]
 impl authz_resolver_sdk::AuthZResolverApi for QuotaPdp {
     async fn evaluate(
@@ -1279,7 +1293,28 @@ impl QuotaApp {
         sku: Uuid,
         sku_version: i64,
     ) -> (Uuid, bss_products_sdk::quota::catalog::QuotaVersion) {
-        let candidate = self.manual_candidate(tenant, record.clone()).await;
+        let target = self.fresh_target(tenant).await;
+        self.approved_on(tenant, target, record, sku, sku_version)
+            .await
+    }
+
+    /// [`QuotaApp::approved`] on a given adapter target (`manual_candidate_on`), so that several
+    /// definitions share one target, as the rules of one logical binding must (P-D-276).
+    pub async fn approved_on(
+        &self,
+        tenant: Uuid,
+        target: Uuid,
+        record: Value,
+        sku: Uuid,
+        sku_version: i64,
+    ) -> (Uuid, bss_products_sdk::quota::catalog::QuotaVersion) {
+        let candidate = self
+            .manual_candidate_on(
+                &crate::test_support::tenant_user(tenant),
+                target,
+                record.clone(),
+            )
+            .await;
         let candidate = self
             .submit(tenant, &candidate, &record, sku, sku_version, None)
             .await;
@@ -1307,6 +1342,38 @@ impl QuotaApp {
                 .and_then(|v| v.parse().ok())
                 .expect("a version"),
         )
+    }
+
+    /// Write availability revision 2 `enabled` for one version, as the qualification of the quotas
+    /// package's feature 5 will: through `quota_catalog_repo::insert_availability`, copying the
+    /// revision-1 write of the approval (`inst-quota-availability` in `api/rest/quota/review.rs`)
+    /// with `revision: 2`, the enabled state and no reason. Test only: no endpoint enables a
+    /// version.
+    pub async fn enable(
+        &self,
+        tenant: Uuid,
+        definition_id: Uuid,
+        version: bss_products_sdk::quota::catalog::QuotaVersion,
+    ) {
+        let (db, scope) = crate::test_support::repo_connection(&self.dsn, tenant).await;
+        crate::infra::storage::repo::quota_catalog_repo::insert_availability(
+            &db.conn().expect("a connection"),
+            &scope.tenant_only(),
+            tenant,
+            &crate::domain::quota::Availability {
+                definition_id,
+                version,
+                revision: bss_products_sdk::quota::catalog::QuotaVersion::new(2)
+                    .expect("a version"),
+                state: bss_products_sdk::quota::catalog::QuotaAvailabilityState::Enabled,
+                reason_code: None,
+                qualification: None,
+                observed_at: crate::infra::storage::stored_now(),
+                decided_by: Uuid::new_v4(),
+            },
+        )
+        .await
+        .expect("availability revision 2");
     }
 }
 

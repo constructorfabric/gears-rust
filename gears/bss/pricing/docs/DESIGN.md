@@ -60,6 +60,7 @@ The plan's D-399 deviation removes the phase 2 SkuChanged listener; current SKU 
 | `cpt-cf-bss-pricing-fr-settings` | Tenant settings provide default billing timing, GL code, tax category and invoice-line templates by SKU type; an invoice line always rounds HALF_EVEN (D-535). | Books & Entries, phase 2; §3 and slice 02. |
 | `cpt-cf-bss-pricing-fr-events` | Persist PricesPublished and ApprovalUnitDecided with state and audit in the toolkit outbox, using broker TypedEvent envelopes; include PriceBookEntryReferenceLost for a failed reference confirmation that proves release. | Read Contract & Events, phase 2; §3 and slice 07. |
 | `cpt-cf-bss-pricing-fr-plans` | A plan has immutable published revisions; each revision binds one book and contains items, availability, minimal Grants and optional sold-as bundle SKU; an item is a SKU and its entry in the plan's book (D-467). An approved revision whose sale date is after the day of its approval is scheduled and takes effect on that date (D-446, D-449, D-450). Grants and the sold-as bundle SKU are deferred (D-411). | Plans, phase 3; §3 and slice 04. |
+| `cpt-cf-bss-pricing-fr-plan-quota-rules` | Exact allocation rules on revisions, validated by Products and frozen at acceptance: a draft revision carries quota rules that select exact Products definition versions, replaced as one set under the revision's ETag, rechecked at submit and approval, and frozen with the price terms at acceptance (D-540 … D-548). | Plan Quota Rules, quotas programme; §3.1, §3.2 Plans and Read contract, §3.3 Quota rules row, §3.6 and §3.7 quota tables; slice 08. |
 | `cpt-cf-bss-pricing-fr-promotions` | A dated percentage promotion targets plans and recurring or recurring-plus-usage charges. | Promotions & Migrations; deferred by the owner (D-409); §3 and slice 06. |
 | `cpt-cf-bss-pricing-fr-migrations` | An approved migration_request records target plan/revision, subscription ids, next_renewal or explicit date, and the period-aware preview, then emits SubscriptionMigrationRequested. | Promotions & Migrations; deferred by the owner (D-410); §3 and slice 06. |
 | `cpt-cf-bss-pricing-fr-resolve` | GET /bss-pricing/v1/resolve (spec §7.1's /pricing/v1/resolve, D-419) accepts plan_revision_id, date, an optional item_id and optional pins (price_id, or price_id:dim_value for a default-chain price a value was bound to) and returns, for a published or superseded revision, or a scheduled one on or after its sale date (D-454), each item's full default/value chain matrix without totals; the active promotion (id, version) is deferred with promotions (D-409). | Read Contract & Events, phase 4; §3 and slice 07. |
@@ -175,7 +176,14 @@ classDiagram
   PlanRevision --> PriceBook
   PlanRevision "1" --> "many" PlanItem
   PlanItem --> PriceBookEntry
+  PlanRevision "1" --> "many" PlanQuotaRule
+  PlanQuotaRule --> PlanItem
 ```
+
+The quotas programme adds plan quota rules. A revision owns a collection of quota rules (D-540, D-541) and one set
+row with their digest. Each rule names one item of the same revision and one exact Products quota definition
+version, and states an amount, a unit, a basis and a logical binding; it carries no money, and no price reads it. A
+revision without rules has no set row and reads the empty set.
 
 Approved prices are immutable money facts. Conditional normalization may close predecessor windows and set
 keep_for_bound when the successor is new; it cannot rewrite money or remove historical pins. Value chains can
@@ -223,7 +231,7 @@ Phase 2 core TypedEvent payloads and toolkit outbox dispatcher; phase 3 adds the
 
 **ID**: `cpt-cf-bss-pricing-component-plans`
 
-Phase 3: revision composition, sale-date checks, blocked_by and clone; retirement prerequisites are deferred (D-410). Phase 8: scheduled revisions. An approval before the sale date schedules the revision (D-449); the switch duty of the pricing ticker persists the switch on its date and announces it once (D-450); the copy, clone and unschedule doors catch a due switch up first, and a copy is refused while a revision waits (D-451); POST /plan-revisions/{id}/unschedule withdraws a waiting revision to a draft (D-452); every read derives the effective state, and the counts read the stored state (D-447, D-453). Phase 9: each plan of the plans list and read names its current revision (the draft or pending one, else the scheduled one, else the published one in effect) with its items' SKUs, and the published revision in effect (D-460); a revision says who made it and when it was submitted and approved (D-461), and a pending one its vote progress, counts only, under plan read (D-462); a plan's create and clone take its sale date (D-463); a plan submit carries a note (D-464); and a draft may add again a deprecated SKU the published revision in effect carries (D-465).
+Phase 3: revision composition, sale-date checks, blocked_by and clone; retirement prerequisites are deferred (D-410). Phase 8: scheduled revisions. An approval before the sale date schedules the revision (D-449); the switch duty of the pricing ticker persists the switch on its date and announces it once (D-450); the copy, clone and unschedule doors catch a due switch up first, and a copy is refused while a revision waits (D-451); POST /plan-revisions/{id}/unschedule withdraws a waiting revision to a draft (D-452); every read derives the effective state, and the counts read the stored state (D-447, D-453). Phase 9: each plan of the plans list and read names its current revision (the draft or pending one, else the scheduled one, else the published one in effect) with its items' SKUs, and the published revision in effect (D-460); a revision says who made it and when it was submitted and approved (D-461), and a pending one its vote progress, counts only, under plan read (D-462); a plan's create and clone take its sale date (D-463); a plan submit carries a note (D-464); and a draft may add again a deprecated SKU the published revision in effect carries (D-465). Quotas programme: a draft revision carries allocation quota rules, replaced as one set under its ETag through REST or the SDK's `PricingQuotaAuthoringClientV1`, validated through Products outside the transaction, reported in the checks and carried through submit, approval, copy and clone (D-540 … D-545).
 
 #### Promotions and migrations
 
@@ -241,40 +249,44 @@ bindings and canonical JSON digests over the shared read snapshot. `current_revi
 scheduled revisions before returning the published pointer. REST's preview and approved-price goldens
 remain unchanged; [slice 07](design/07-read-contract-events.md) defines the exact producer surface.
 Acceptance, holds and usage-policy persistence are later deliveries.
+In the quotas programme, resolve answers a revision's quota terms, from which the selected quota digest is
+computed, and an acceptance freezes the selected rules in its receipt (D-547, D-548).
 
 ### 3.3 API Contracts
 
-The mounted authoring base is `/bss-pricing/v1`. Every mutation passes authenticated PolicyEnforcer scope,
-headers + Bytes, preconditions::parse_body and correlation::establish. OperationBuilder registers matching
-OpenAPI success/error schemas. Every operation declares a 503 problem, since every door judges its caller at the
-policy decision point first, and an unreachable one is 503; the texts name REGISTRY_UNAVAILABLE on exactly the eight
-operations that read Products hard (the checks, the item create, the plan submit, the approve, the entry create,
-resolve, the price submit and publish-changes), never on a reject or an item PATCH. Every answer that sets an ETag
-declares it: the eight reads and twenty-one write answers (D-469, and the cancel and end drafts, D-520, D-521),
-and the plan list, the plan counts
-and the book list, whose ETag is a weak tag of the JSON body and whose `Cache-Control` is
-`private, no-cache`. A matching `If-None-Match` on those three reads is 304 with an empty body
-(D-518). `GET /settings` keeps the strong version tag a `PUT` sends back as `If-Match`; an
-`If-None-Match` that matches that tag is 304, and both answers send `Cache-Control: private,
-no-cache` (D-518). Every actor id a read shows (`created_by`, `updated_by`, `actor`, `submitted_by`) carries a
-sibling `<field>_name`: the current name through Account Management's user read, under the caller's own rights,
-resolved once per answer after the read's transaction (ids deduplicated, chunks of 200, at most four at once, one 2 s
-budget). It is null when no name is available now, and pricing's system actor reads "System". No write answer
-names anyone, since a POST answer is the key's stored receipt. Names are never stored or cached; the weak tags cover them (D-519). POST
-requires Idempotency-Key; PATCH/PUT require If-Match. Queue reads return
-stored snapshots and live impact: a prices unit's GET /approval-units item and GET /approval-units/{id}, and the GET
-publish-changes listing, carry the same impact object, {prices, entries, plans, subscriptions}: from phase 3, plans lists
-every plan revision, in any state, whose items name an entry of the unit or listing, as { plan_id, code, revision_id,
-rev_no, state }, and subscriptions reads "unavailable until the Subscriptions integration" (it read "unavailable until
-phase 3" in phase 2). A plan_revision unit's impact is {subscriptions} alone, with the same text: publishing a revision
-moves no existing pin (D-394). Never label unavailable impact as a measured zero. Each price of the stored prices snapshot, in before
-and after, carries its currency and currency_scale (D-539); a snapshot stored before D-539 gets them at read from the price rows. The stored prices snapshot also carries each
-entry SKU's current descriptors, beside the fingerprinted after, never in it (D-408); their read is best-effort, and a
+The mounted authoring base is `/bss-pricing/v1`. Every mutation passes authenticated PolicyEnforcer scope, headers +
+Bytes, preconditions::parse_body and correlation::establish. OperationBuilder registers matching OpenAPI success/error
+schemas. Every operation declares a 503 problem, since every operation judges its caller at the policy decision point
+first, and an unreachable one is 503; the texts name REGISTRY_UNAVAILABLE on exactly the ten operations that read
+Products hard (the checks, single and batch, the item create, the plan submit, the approve, the entry create, resolve,
+the price submit, publish-changes and the quota-rules put; D-469, D-542), never on a reject or an item PATCH, and
+QUOTA_CATALOG_UNAVAILABLE on exactly the five operations that validate quota rules through the quota catalog (the
+quota-rules put, the checks, single and batch, the plan submit and the approve; D-542). Every answer that sets an ETag
+declares it: the eight reads and twenty-one write answers (D-469, and the cancel and end drafts, D-520, D-521), the
+quota-rules read and put (D-543), and the plan list, the plan counts and the book list, whose ETag is a weak tag of the
+JSON body and whose `Cache-Control` is `private, no-cache`. A matching `If-None-Match` on those three reads is 304 with
+an empty body (D-518). `GET /settings` keeps the strong version tag a `PUT` sends back as `If-Match`; an `If-None-Match`
+that matches that tag is 304, and both answers send `Cache-Control: private, no-cache` (D-518). Every actor id a read
+shows (`created_by`, `updated_by`, `actor`, `submitted_by`) carries a sibling `<field>_name`: the current name through
+Account Management's user read, under the caller's own rights, resolved once per answer after the read's transaction
+(ids deduplicated, chunks of 200, at most four at once, one 2 s budget). It is null when no name is available now, and
+pricing's system actor reads "System". No write answer names anyone, since a POST answer is the key's stored receipt.
+Names are never stored or cached; the weak tags cover them (D-519). POST requires Idempotency-Key; PATCH/PUT require
+If-Match. Queue reads return stored snapshots and live impact: a prices unit's GET /approval-units item and GET
+/approval-units/{id}, and the GET publish-changes listing, carry the same impact object, {prices, entries, plans,
+subscriptions}: from phase 3, plans lists every plan revision, in any state, whose items name an entry of the unit or
+listing, as { plan_id, code, revision_id, rev_no, state }, and subscriptions reads "unavailable until the Subscriptions
+integration" (it read "unavailable until phase 3" in phase 2). A plan_revision unit's impact is {subscriptions} alone,
+with the same text: publishing a revision moves no existing pin (D-394). Never label unavailable impact as a measured
+zero. Each price of the stored prices snapshot, in before and after, carries its currency and currency_scale (D-539); a
+snapshot stored before D-539 gets them at read from the price rows. The stored prices snapshot also carries each entry
+SKU's current descriptors, beside the fingerprinted after, never in it (D-408); their read is best-effort, and a
 registry that cannot answer or refuses the caller records "descriptors": "unavailable" and refuses nothing (D-416).
 Products read (D-416): the reads a rule needs are made as the caller, so the plan_revision submitter and its final
-approver, readers of GET /plan-revisions/{id}/checks and GET /plan-revisions/checks, plan item authors, price-book entry authors (the period rule and
-the create re-read), and the submitter and final approver of a prices unit on a usage chain (the dated metering read, D-402) need products read; an approve-only reviewer votes on every other
-unit and rejects any unit.
+approver, readers of GET /plan-revisions/{id}/checks and GET /plan-revisions/checks, plan item authors, price-book entry
+authors (the period rule and the create re-read), and the submitter and final approver of a prices unit on a usage chain
+(the dated metering read, D-402) need products read; an approve-only reviewer votes on every other unit and rejects any
+unit.
 
 | Area | Phase | Operations below the authoring base |
 | --- | --- | --- |
@@ -287,6 +299,7 @@ unit and rejects any unit.
 | Plans | 3 | POST /plans with code, name, book_id and an optional available_from, rev 1's sale date (D-463); the code is 1 to 32 characters of A-Z, 0-9, - and _, starting with a letter or a digit, judged as sent with no trim or case folding, else 400 PLAN_CODE_INVALID, and a code stored before the rule keeps reading (D-468) (201: the plan and its draft rev 1 on that book; the caller also needs price_book read on that book, and so do the clone and a PATCH that names a book: 403 PRICE_BOOK_READ_REQUIRED, D-456); GET /plans, set-based, and GET /plans?sku_id= for the plans whose draft, pending, scheduled or published revisions name the SKU through an entry (D-434), each revision header with the state it reads today (D-453) and book { id, code, name, currency } beside book_id (D-516), and each plan with current { revision_id, rev_no, state, item_count, sku_ids, created_by } and in_effect { revision_id, rev_no, sku_ids } (D-460, D-480), four statements whatever the number of plans; every header and revision carries submitted_at and approved_at, from the unit it names, and a header created_by and created_at (D-461); GET/PATCH /plans/{id} (name); POST /plans/{id}/revisions copies the published revision (book, availability, items) into a new draft under D-413, refused while a draft or pending revision exists (REVISION_DRAFT_EXISTS) or a revision waits for its sale date (REVISION_SCHEDULED), after a due scheduled revision is switched (D-451); GET /plan-revisions/{id}, a pending one with approval { unit_id, approvals, quorum_required } under plan read (D-462); PATCH /plan-revisions/{id} with book_id?, available_from?, draft only (REVISION_NOT_DRAFT), with no item list (D-407): a new book_id remaps each item to the new book's entry of the same (SKU, charge kind, normalized period, model, policy digest), with an equal dimension key (D-502), bumping the item's version, and an unmatched item keeps its entry (the checks then show ITEM_BOOK_FOREIGN); DELETE /plan-revisions/{id} draft only, with a delete op for every item reference (D-414), and the last revision of a never-published plan takes the plan with it in the same transaction, freeing its code (D-417); GET /plan-revisions/{id}/checks answers { checks, ready, sale_date } from one fresh SKU read (D-408, D-482); GET /plan-revisions/checks?revision_ids= answers the same checks for 1 to 50 revisions, and missing names a revision the tenant does not hold or the plan-read scope does not admit (D-482), each row with subjects, the items that turn it red { item_id, sku_id, price_book_entry_id }, and blocked_by_prices, the pending prices behind blocked_by { unit_id, price_id, price_book_entry_id } (D-466); POST /plan-revisions/{id}/submit (plan submit, D-418, as POST /prices/{id}/submit is price submit; an optional body { note }, the submitter's note stored as the unit's submit_note, D-464) makes an unlocked draft a plan_revision unit (201 { applied, unit, revision }; REVISION_NOT_DRAFT otherwise), judged by the checks of GET …/checks built by the same function from fresh SKU reads: a red check is 400 REVISION_CHECKS_RED with the red checks (code, label, detail, blocked_by, subjects, blocked_by_prices, D-466) in the problem detail and no unit; its lock is the conditional pending_unit_id, a lost one 409 ROW_LOCKED_PENDING; quorum 0 applies at once; an applied revision whose sale date is after today is scheduled, and published on that date (D-449, D-450); POST /plan-revisions/{id}/unschedule (plan submit, Idempotency-Key, no body) returns a waiting revision to a draft, 409 REVISION_IN_EFFECT for a published revision and REVISION_NOT_SCHEDULED for any other (D-452); POST /plans/{id}/clone with code (the rule of POST /plans, D-468), name and an optional available_from, which overrides the copied sale date or, null, clears it (D-463) (plan author, Idempotency-Key; 201 with the new plan, as POST /plans answers) makes a new plan whose draft rev 1 copies the source's published revision (book, availability, items), the one in effect (D-451), under D-413, without the source's decisions, approval identity or pins; a deprecated SKU is carried and the new plan's checks show ITEM_SKU_DEPRECATED (D-408). Deferred by the owner: grants and bundle_sku_id in the revision PATCH (D-411); POST /plans/{id}/retire with migration_request_id, and PLAN_RETIRING on a retiring plan (D-410) |
 | Plans | 3 | POST /plans with code, name, book_id and an optional available_from, rev 1's sale date (D-463); the code is 1 to 32 characters of A-Z, 0-9, - and _, starting with a letter or a digit, judged as sent with no trim or case folding, else 400 PLAN_CODE_INVALID, and a code stored before the rule keeps reading (D-468) (201: the plan and its draft rev 1 on that book; the caller also needs price_book read on that book, and so do the clone and a PATCH that names a book: 403 PRICE_BOOK_READ_REQUIRED, D-456); GET /plans, set-based, and GET /plans?sku_id= for the plans whose draft, pending, scheduled or published revisions name the SKU through an entry (D-434), each revision header with the state it reads today (D-453) and book { id, code, name, currency } beside book_id (D-516), and each plan with current { revision_id, rev_no, state, item_count, sku_ids, created_by, book: { id, code, name, currency, valid_from, valid_until } (D-515) } and in_effect { revision_id, rev_no, sku_ids } (D-460, D-480, D-485), selling, change and last_activity_at (D-484), five statements for a non-empty page, and GET /plans/counts under the same narrowing (D-485); every header and revision carries submitted_at and approved_at, from the unit it names, and a header created_by and created_at (D-461); GET/PATCH /plans/{id} (name); POST /plans/{id}/revisions copies the published revision (book, availability, items) into a new draft under D-413, refused while a draft or pending revision exists (REVISION_DRAFT_EXISTS) or a revision waits for its sale date (REVISION_SCHEDULED), after a due scheduled revision is switched (D-451); GET /plan-revisions/{id}, a pending one with approval { unit_id, approvals, quorum_required } under plan read (D-462); PATCH /plan-revisions/{id} with book_id?, available_from?, draft only (REVISION_NOT_DRAFT), with no item list (D-407): a new book_id remaps each item to the new book's entry of the same (SKU, charge kind, normalized period, model, policy digest), with an equal dimension key (D-502), bumping the item's version, and an unmatched item keeps its entry (the checks then show ITEM_BOOK_FOREIGN); DELETE /plan-revisions/{id} draft only, with a delete op for every item reference (D-414), and the last revision of a never-published plan takes the plan with it in the same transaction, freeing its code (D-417); GET /plan-revisions/{id}/checks answers { checks, ready, sale_date } from fresh SKU reads (D-408), each row with subjects, the items that turn it red { item_id, sku_id, price_book_entry_id }, and blocked_by_prices, the pending prices behind blocked_by { unit_id, price_id, price_book_entry_id } (D-466); POST /plan-revisions/{id}/submit (plan submit, D-418, as POST /prices/{id}/submit is price submit; an optional body { note }, the submitter's note stored as the unit's submit_note, D-464) makes an unlocked draft a plan_revision unit (201 { applied, unit, revision }; REVISION_NOT_DRAFT otherwise), judged by the checks of GET …/checks built by the same function from fresh SKU reads: a red check is 400 REVISION_CHECKS_RED with the red checks (code, label, detail, blocked_by, subjects, blocked_by_prices, D-466) in the problem detail and no unit; its lock is the conditional pending_unit_id, a lost one 409 ROW_LOCKED_PENDING; quorum 0 applies at once; an applied revision whose sale date is after today is scheduled, and published on that date (D-449, D-450); POST /plan-revisions/{id}/unschedule (plan submit, Idempotency-Key, no body) returns a waiting revision to a draft, 409 REVISION_IN_EFFECT for a published revision and REVISION_NOT_SCHEDULED for any other (D-452); POST /plans/{id}/clone with code (the rule of POST /plans, D-468), name and an optional available_from, which overrides the copied sale date or, null, clears it (D-463) (plan author, Idempotency-Key; 201 with the new plan, as POST /plans answers) makes a new plan whose draft rev 1 copies the source's published revision (book, availability, items), the one in effect (D-451), under D-413, without the source's decisions, approval identity or pins; a deprecated SKU is carried and the new plan's checks show ITEM_SKU_DEPRECATED (D-408). Deferred by the owner: grants and bundle_sku_id in the revision PATCH (D-411); POST /plans/{id}/retire with migration_request_id, and PLAN_RETIRING on a retiring plan (D-410) |
 | Plan items | 3 | POST /plan-revisions/{id}/items with sku_id and an optional price_book_entry_id: absent or null adds the SKU with no entry (D-512), and treatment, included_qty or qty_min is 400 BODY_UNEXPECTED (D-467) (a plan_item create op, D-407; at most 200 items per revision; a deprecated SKU only when the plan's published revision in effect carries it, else 400 ITEM_SKU_DEPRECATED, judged by the door and by the op's SKU re-read, D-465); the checks keep ITEM_ENTRY_MISSING ("Every item points at a price") red until a PATCH sets the entry, and submit refuses that revision; GET /plan-items/{id} reads one item with its plan_id, rev_no and its revision's state as it reads today (D-453), its version as the ETag (D-434); PATCH /plan-items/{id} with price_book_entry_id only, including on an item that has none (null is 400 ITEM_ENTRY_MISSING and never clears an entry; the three removed keys are 400 BODY_UNEXPECTED, D-467), draft only and never a SKU change; DELETE /plan-items/{id} (a delete op); the revision's creator edits it and its items (D-404) |
+| Quota rules | quotas | GET /plan-revisions/{id}/quota-rules (plan read; the ETag is the revision's version; 404 for an unknown or foreign revision) answers { revision_id, revision_version, quota_rules, quota_rules_digest }, each rule with the definition's availability it saw at its save, the set row and the rules read in one serializable read transaction (D-546); PUT /plan-revisions/{id}/quota-rules (plan author, the draft's author, If-Match, Idempotency-Key; body { quota_rules: [...] }, at most 200 rules) replaces the complete set and answers 200 with the saved set and the new ETag: a missing If-Match or Idempotency-Key, or an empty or unreadable body, is 400; the key is bound to the If-Match version and the rules as they parse, so the same rules spelled otherwise replay under it, on REST and through the SDK alike; a stored answer replays first, even after the ETag moved, other content under the key is 409 IDEMPOTENCY_CONFLICT and a key still in flight 409 IDEMPOTENCY_KEY_IN_FLIGHT; then 404, 409 REVISION_NOT_DRAFT and 403 NOT_DRAFT_AUTHOR; then one refusal that names every failure as quota_rules[i].<field> with its code (a failure of the whole set on quota_rules), 409 when every failure is QUOTA_RULE_DUPLICATE or QUOTA_DEFINITION_CHANGED, else 400, either one an invalid-argument problem whose field violations carry the codes, with no reason; Products' 400, 403 or 500 as Products gave it; then 409 STALE_REVISION in the transaction, 409 UNIT_CONTENDED when the items keep moving and 409 CONTENDED when a transaction stays contended past its retries; 503 QUOTA_CATALOG_UNAVAILABLE for every catalog outage (a 429 and a contention conflict included) and REGISTRY_UNAVAILABLE (D-541, D-542, D-543). The revision read carries quota_rules and quota_rules_digest; the checks and the batch checks carry revision_version and quota_rules_digest and, for a revision with rules, the eight quota rows, each subject with quota_rule_id and field ("" for the rule as a whole), the batch reading each SKU's version once per sale date (D-544); DELETE /plan-items/{id} adds 409 ITEM_HAS_QUOTA_RULES (D-543). At the plan submit and the final approve, a red quota row refuses as any red check does, a catalog outage is 503 QUOTA_CATALOG_UNAVAILABLE and a Products refusal keeps Products' own status and code (D-416, D-545). The SDK's `PricingQuotaAuthoringClientV1`, whose local client the gear registers in the ClientHub at init, offers `get_quota_rules`, `replace_quota_rules` and `check_plan_revision` over the same functions as the GET, the PUT and `GET /plan-revisions/{id}/checks`, and answers each request as the endpoints do: `check_plan_revision` answers the complete saved revision's checks, quota rows included (D-540). Products' quota_definition read is needed by the authors who save rules, the readers of the checks (single and batch), the submitter, the final approver (apply re-runs the checks) and the caller of an acceptance (Orders' principal); a non-final vote keeps a refusal as an observation (D-503) and needs no grant (D-542) |
 | Read contract | 4 | GET /resolve?plan_revision_id&date&item_id?&pins? (plan read, D-419): a published or superseded revision on one date, or a scheduled one on a date on or after its sale date (D-454), each item with its entry's model (null without an entry, D-427) and its chain matrix (default and every value, `binding` or `uncovered`), its SKU version as of the date and its resolved invoice inputs with their source (D-420, D-421); no totals, no promotion (D-409, D-415); pins are price_id or price_id:dim_value, at most 1 000. Each binding carries its price's stored currency and currency_scale (D-531). GET /prices/{id} (price read, D-422): an approved price of the tenant, whatever its window, with its entry's SKU, charge kind, period, model, book, currency and currency_scale, stored facts only. Both are reads: no audit row, no idempotency key, no binding |
 | Promotions | deferred (D-409) | Deferred by the owner and not built in phase 3; the planned shape: POST /promotions with name, percent, from_date, to_date, plan_ids (at most 50), apply_to; GET /promotions; GET /promotions/{id} (the current approved version, the open version and the history); PATCH /promotions/{id} under If-Match on the promotion, editing the open draft version or creating it from the current approved one; POST /promotions/{id}/submit, /end-today, /cancel |
 | Migrations | deferred (D-410) | Deferred by the owner and not built in phase 3; the planned shape: POST /plans/{id}/migrations with target_plan_id, target_revision_id, timing (next_renewal or date), at?, scope (all or listed) and subscriptions [{ subscription_id, current_plan_revision_id, current_period_end }] (at most 1000; caller-supplied, D-410) answers the request with its preview and its migration unit; GET /migration-requests/{id}; GET /plans/{id}/migrations |
@@ -584,6 +597,11 @@ A future out-of-process transport uses the REST reference_principals mapping and
 service_principal_id credentials with the same semantics; that transport is not implemented here.
 The fresh sku_for_write read accepts every lifecycle; sku_version_as_of resolves the version in force
 at each price start for the D-402 pair guard.
+Products also registers `ProductsQuotaCatalogClientV1`. Pricing resolves it at each use, on a task of its own. Its
+absence and every other outage (a call that does not finish, a 429, a contention conflict, a 5xx other than 500) are
+503 QUOTA_CATALOG_UNAVAILABLE; a Products 400, 403 or 500 is answered as Products gave it. The quota-rules put, the
+checks (single and batch), the plan submit, the votes and acceptance call its `validate_quota_set` as the caller,
+after reading each rule item's SKU version on the sale date through `sku_version_as_of` (D-542, D-548).
 In the other direction, pricing implements Products' SkuUsageV1 port (products-sdk, P-D-197) and registers
 it in the ClientHub at init as dyn SkuUsageV1; Products resolves it at each SKU read. For the SKU ids of one
 tenant it answers each distinct id once with { sku_id, entries, currencies (sorted), prices { approved, pending,
@@ -727,6 +745,15 @@ sequenceDiagram
 blocked_by is never a stored dependency graph or automatic submission trigger. Each check row also names the items
 that turn it red (subjects) and the pending prices behind blocked_by (blocked_by_prices), from the same context (D-466). Plan and price approval outcomes
 remain independent. Rejecting the revision leaves the approved money visible to existing revisions on the book.
+
+**Quota rules** (D-542, D-545). Submit and every vote capture the quota validation before their transaction, beside
+the meter observations: the revision's stored set and items, then, each on a task of its own, each rule item's SKU
+version on the sale date and Products' answer. Inside the transaction the subject checks that the set digest and the
+items are still the captured ones; a moved selection rolls back and is captured again. The capture and the subject
+take one instant, before the capture. A red quota row then refuses submit and apply as any other red check does; a
+catalog outage is 503 QUOTA_CATALOG_UNAVAILABLE at submit and at the final approve, a Products refusal is answered as
+Products gave it, and a non-final vote keeps either as an observation. A scheduled revision's switch makes no catalog
+call: acceptance rechecks every sale (D-548).
 
 ### 3.7 Database schemas & tables
 
@@ -989,6 +1016,42 @@ chain: the promotion tables (D-409), the migration-request table and the plan's 
 plan's bundle SKU with its unique index, the revision's grants and its sold-as columns (D-411); slices 04 and 06
 keep their planned shape.
 
+The quotas programme adds migration m20261121_000024_plan_quota_rules after m20261003_000023_book_archive (D-546): a
+revision's quota set and its rules. A revision holds a set row exactly when it holds a rule (a replace with no rules
+deletes the set row), and a revision without a set row reads the empty set and the empty set's digest. The set row and
+its rules are read in one serializable transaction, so both statements see one snapshot. The rule's foreign key to its
+item, with no cascade, refuses the delete of an item with rules. No trigger guards the rules: the draft fence is the
+conditional revision write (D-543). JSON columns are text, as pricing_acceptance.receipt_json is. A later SQLite rebuild
+of pricing_plan_item or pricing_plan_revision must carry both tables, their children. `down` refuses while a rule row
+exists.
+
+```sql
+-- migration 000024 (D-546): plan quota rules.
+CREATE TABLE bss.pricing_plan_quota_set (
+  revision_id uuid PRIMARY KEY REFERENCES bss.pricing_plan_revision(id), tenant_id uuid NOT NULL,
+  quota_rules_digest text NOT NULL, rule_count integer NOT NULL, updated_by uuid NOT NULL,
+  updated_at timestamptz NOT NULL,
+  CONSTRAINT chk_pricing_plan_quota_set_count CHECK (rule_count BETWEEN 1 AND 200),
+  CONSTRAINT chk_pricing_plan_quota_set_digest CHECK (length(quota_rules_digest) = 64)
+);
+CREATE TABLE bss.pricing_plan_quota_rule (
+  revision_id uuid NOT NULL REFERENCES bss.pricing_plan_revision(id), rule_id uuid NOT NULL,
+  tenant_id uuid NOT NULL, item_id uuid NOT NULL REFERENCES bss.pricing_plan_item(id),
+  definition_id uuid NOT NULL, definition_version text NOT NULL, definition_digest text NOT NULL,
+  dimension_value text, logical_binding_key text NOT NULL, subject_selector text NOT NULL,
+  scope_selection_json text NOT NULL, amount text NOT NULL, unit_ref text NOT NULL, basis text NOT NULL,
+  evidence_json text NOT NULL, availability_json text NOT NULL, created_at timestamptz NOT NULL,
+  PRIMARY KEY (revision_id, rule_id),
+  CONSTRAINT chk_pricing_plan_quota_rule_basis CHECK (basis IN ('fixed','per_plan_unit')),
+  CONSTRAINT chk_pricing_plan_quota_rule_subject CHECK (subject_selector = 'resource_owner'),
+  CONSTRAINT chk_pricing_plan_quota_rule_key CHECK (length(logical_binding_key) BETWEEN 1 AND 64),
+  CONSTRAINT chk_pricing_plan_quota_rule_digest CHECK (length(definition_digest) = 64),
+  CONSTRAINT chk_pricing_plan_quota_rule_amount CHECK (length(amount) BETWEEN 1 AND 39),
+  CONSTRAINT chk_pricing_plan_quota_rule_version CHECK (length(definition_version) BETWEEN 1 AND 20)
+);
+CREATE INDEX pricing_plan_quota_rule_item ON bss.pricing_plan_quota_rule (item_id);
+```
+
 Audit and idempotency use the Products document's retained shapes, renamed pricing_. The audit trigger permits
 only the reserved one-way seal transition without changing record facts. The following is schema, not a new
 pricing-owned outbox: the actual event schema comes from toolkit migrations under bss_pricing_outbox (D-400).
@@ -1096,7 +1159,7 @@ no separate connection can make a failed act look successful. Implement append-o
 
 ## 4. Additional context
 
-The old 22-file set remains on bss/products-backup and in history. Seven slices map one-to-one to FEATUREs.
+The old 22-file set remains on bss/products-backup and in history. Eight slices map one-to-one to FEATUREs.
 Part 2a writes all phases' contracts; phase 2b removes the legacy implementation; phase 2c builds only the core.
 The prototype is the pure-model reference except where the spec corrects it, especially half-open tier bands.
 
@@ -1143,6 +1206,7 @@ observation is never a reusable admission token.
 | 05 Approvals | approvals | `cpt-cf-bss-pricing-fr-publish-changes`, `cpt-cf-bss-pricing-fr-approval-units`; phase 2. |
 | 06 Promotions & Migrations | promotions-migrations | `cpt-cf-bss-pricing-fr-promotions`, `cpt-cf-bss-pricing-fr-migrations`; deferred by the owner (D-409, D-410). |
 | 07 Read Contract & Events | read-contract-events | `cpt-cf-bss-pricing-fr-events`, `cpt-cf-bss-pricing-fr-resolve`, `cpt-cf-bss-pricing-fr-price-read`, `cpt-cf-bss-pricing-fr-quote`; phase 4 (core events in phase 2; quote not built, D-415). |
+| 08 Plan Quota Rules | plan-quota-rules | `cpt-cf-bss-pricing-fr-plan-quota-rules`; quotas programme (D-540 … D-548). |
 
 All four ADRs are cited in §1.2. [PRD](PRD.md) owns requirements; [DECISIONS](DECISIONS.md) owns D-384–D-433.
 Source: `docs/superpowers/specs/2026-09-24-pricebook-model-design.md`, §2.2, §5–§8, §12–§13.
@@ -1184,6 +1248,12 @@ The declarations live in [read.rs](../pricing-sdk/src/read.rs) and
 [PricingAcceptanceProvider](../pricing/src/api/pricing_acceptance.rs) and
 [SellabilityProvider](../pricing/src/api/sellability.rs). Commands remain SDK-only; a remote
 adapter must bind these ports to the same services. No REST command or consumer integration is implied.
+
+**Quota members (D-547, D-548).** `ResolvedBindings.quota_terms`, `NewSaleQuery.expected_quota_digest` and
+`AcceptanceReceipt.quota` are optional members added in place. They are `None` for a plan without quota rules, and
+then `terms_digest`, `request_digest`, the schema-1 receipt bytes, every seam fixture and every digest vector stay as
+they are. A sale of a plan with rules needs the preview's `selected_quota_digest`, and its receipt freezes the
+selected rules, their evidence, the original quantity and the selected and snapshot digests.
 
 PDP-derived scope and explicit catalog tenant qualify every lookup, including replay. Caller tenant
 and subject come from SecurityContext, never the idempotency key or a system-looking actor name.

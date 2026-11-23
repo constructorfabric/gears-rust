@@ -76,6 +76,7 @@ async fn migrate(pg: &Pg, without: Option<&str>) -> Result<MigrationResult, Migr
                 && !m.name().contains("000021")
                 && !m.name().contains("000022")
                 && !m.name().contains("000023")
+                && !m.name().contains("000024")
         })
         .collect();
     run_migrations_for_testing(&pg.db().await, chain).await

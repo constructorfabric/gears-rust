@@ -40,7 +40,7 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-401 | H | Reference work is a durable op written before reserve | DECIDED 2026-09-25 · Phase 2 plan 2c.1/2c.6; plan review findings 2, 3; amended 2026-10-02 |
 | D-402 | H | The pair guard compares SKU metering as of each price's start | DECIDED 2026-09-25 · Phase 2 reconciliation matrix row 24; spec §5 pair guard; supersession-continuity family |
 | D-403 | M | Validation refusals are 400 with a code; no wire 422 | DECIDED 2026-09-25 · toolkit canonical error mapping; Products phase 1 behaviour; deviation from spec §2 decision 16 and §6 |
-| D-404 | H | A draft belongs to its author | DECIDED 2026-09-25 · Phase 2 review (chains MEDIUM-1, docs F2); spec §6 "author ≠ approver" (finding 8) |
+| D-404 | H | A draft belongs to its author | DECIDED 2026-09-25 · Phase 2 review (chains MEDIUM-1, docs F2); spec §6 "author ≠ approver" (finding 8); extended by D-543 |
 | D-405 | M | Publish changes completes a selected pair | DECIDED 2026-09-25 · Phase 2 plan and reconciliation row 23; Phase 2 review (docs F4) |
 | D-406 | H | A temporary window is not crossed | DECIDED 2026-09-25 · Phase 2 second review (behaviour MEDIUM-2) |
 | D-407 | H | Plan items are reserved references; items are a sub-resource | DECIDED 2026-09-25 · Phase 3 plan rev 2; plan review HIGH 2; owner, 2026-09-25 (kind plan_item only); deviation from spec §7.2; amended by D-467, D-512 |
@@ -86,7 +86,7 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-447 | M | A scheduled revision takes effect on its date: the effective state is derived | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 |
 | D-448 | M | The storage writes of a scheduled revision: schedule, switch, unschedule and the due scan | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 |
 | D-449 | M | An approval before the sale date schedules the revision | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 (run 8.2) |
-| D-450 | M | The switch job persists a due switch on its date and announces it once | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 (run 8.2); plan review H1, M4, L2, L7 |
+| D-450 | M | The switch job persists a due switch on its date and announces it once | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 (run 8.2); plan review H1, M4, L2, L7; extended by D-545 |
 | D-451 | M | The copy, clone and unschedule doors catch a due switch up; one scheduled revision at a time | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 (run 8.2); plan review M1; amended by D-463 |
 | D-452 | M | A scheduled revision can be withdrawn to a draft | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 (run 8.2); plan review M5 |
 | D-453 | M | Every read derives the effective state; the counts read the stored state | DECIDED 2026-09-29 · Owner, 2026-09-28; phase 8 plan rev 2 (run 8.2); plan review M2, L5; amended by D-460, D-461, D-484, D-485 |
@@ -97,40 +97,40 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-458 | M | The approval-unit list pages and reads its page set-based | DECIDED 2026-09-29 · Owner, 2026-09-29 (dispositions O2, "2"); whole-branch review PS-13 (fix run W1a); amended by D-470 |
 | D-459 | M | One approve-eligibility predicate for the engine and its readers | DECIDED 2026-09-30 · Phase 9 plan rev 2 (W2, binding; plan review W2, L5); extends D-393; amended by the phase 9 review (E, fix run 9.5d-1) |
 | D-460 | M | The plans list names each plan's current revision and the one in effect | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 1); phase 9 plan rev 2 (decision 1; plan review M6, M7, W3, L4); amends D-434, D-453; amended by D-461, D-480, D-482, D-485, D-516; extended by D-519 |
-| D-461 | M | A revision says who made it and when it was submitted and approved | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 7); phase 9 plan rev 2 (decision 2; plan review M6, M7, L1, L9); amends D-434, D-453, D-460; extended by D-519 |
+| D-461 | M | A revision says who made it and when it was submitted and approved | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 7); phase 9 plan rev 2 (decision 2; plan review M6, M7, L1, L9); amends D-434, D-453, D-460; extended by D-519; amended by D-545 |
 | D-462 | M | A pending revision shows its vote progress under plan read | DECIDED 2026-09-30 · Owner, 2026-09-30 (O-9a, "yes"); phase 9 plan rev 2 (decision 4; plan review M7, L5); amended by the phase 9 review (E, fix run 9.5d-1) |
 | D-463 | M | A plan's sale date on create and clone | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 7); phase 9 plan rev 2 (decision 3; plan review L10); amends D-451, extends D-456 |
 | D-464 | L | A plan submit and a publish-changes carry the submitter's note | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 6); phase 9 plan rev 2 (decision 5; plan review L3); amends D-445; amended by the phase 9 review (fix run 9.5d-2) |
 | D-465 | M | A revision may carry again a deprecated SKU its plan sells | DECIDED 2026-09-30 · Owner, 2026-09-30 (O-9b, "yes"); phase 9 plan rev 2 (decision 6; plan review L2); amends D-408 |
-| D-466 | M | Each check row names its items and its blocking prices | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 5); phase 9 plan rev 2 (decision 7); extends D-408; amended by the phase 9 review (fix run 9.5d-2) |
+| D-466 | M | Each check row names its items and its blocking prices | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 5); phase 9 plan rev 2 (decision 7); extends D-408; amended by the phase 9 review (fix run 9.5d-2); extended by D-544 |
 | D-467 | H | A plan item is a SKU and its entry: no treatment, no included quantity, no minimum quantity | DECIDED 2026-09-30 · Owner, 2026-09-30 (the included quantity, then the treatment, then qty_min removed); phase 9 plan rev 2 (run 9.2); amends D-388, D-394, D-407, D-413, D-419, D-420, D-421, D-439; amended by the phase 9 review (G, fix run 9.5d-1); amended by D-512 |
 | D-468 | M | A new plan's code follows a declared rule | DECIDED 2026-09-30 · Owner, 2026-09-30 (ask 39, "do it"); phase 9 run 9.2 scope addition; extends D-456, D-457 |
-| D-469 | M | The served contract declares every door's 503, every ETag it sets and the refusals of the plan doors | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 2); phase 9 plan rev 2 (M1 and W1, binding; decisions 8 and 9; L8); extended by D-470; amended by the phase 9 review (fix run 9.5d-2); amended by D-512; extended by D-518 |
+| D-469 | M | The served contract declares every door's 503, every ETag it sets and the refusals of the plan doors | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 2); phase 9 plan rev 2 (M1 and W1, binding; decisions 8 and 9; L8); extended by D-470; amended by the phase 9 review (fix run 9.5d-2); amended by D-512; extended by D-518; extended by D-542, D-543 |
 | D-470 | M | The approval units are counted by state and kind, list newest first on request, and skip the live impact on request | DECIDED 2026-09-30 · Owner, 2026-09-30 (the approvals option 1, "ok"); phase 9 plan rev 2 (decision 10; plan review M3, M4, L11); amends D-458, extends D-469; amended by the phase 9 review (C, R32; fix run 9.5d-1; I, fix run 9.5d-2); amended by D-490 |
 | D-471 | M | A unit says whether its reader may approve it | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 4, "ok"); phase 9 plan rev 2 (decision 11; W2; plan review M2); amended by the phase 9 review (E, fix run 9.5d-1) |
 | D-472 | M | An entry names its next price | DECIDED 2026-10-01 · Owner, 2026-09-30 (validation 3 item 7, "ok"); phase 9 plan rev 2 (decision 12; plan review M5, L7); amends D-434, D-440; amended by D-473 |
 | D-473 | M | The book's entries list reads its prices on a date | DECIDED 2026-10-01 · Owner, 2026-09-30 (validation 3 item 7, "ok"); phase 9 plan rev 2 (decision 13; plan review M5, L6); amends D-440, D-472; amended by the phase 9 review R1 (fix run 9.5d-1), D-483 |
-| D-480 | M | A revision read carries its entries, sale-date prices and reservation state | DECIDED 2026-10-01 · phase 9 plan rev 4 (run 9.6, asks 48, 49, 50); amends D-442, D-460, D-462 |
+| D-480 | M | A revision read carries its entries, sale-date prices and reservation state | DECIDED 2026-10-01 · phase 9 plan rev 4 (run 9.6, asks 48, 49, 50); amends D-442, D-460, D-462; amended by D-540 |
 | D-481 | M | The quorum a submit needs is on the checks and on an effective-policy read | DECIDED 2026-10-01 · phase 9 plan rev 4 (run 9.6, asks 54, 55); amends D-435, D-462; amended 2026-10-02 (phase 9 review F1) |
-| D-482 | M | The checks read their context as a set, and many revisions in one read | DECIDED 2026-10-01 · phase 9 plan rev 4 (run 9.7, ask 47); amends D-408, D-460 |
+| D-482 | M | The checks read their context as a set, and many revisions in one read | DECIDED 2026-10-01 · phase 9 plan rev 4 (run 9.7, ask 47); amends D-408, D-460; amended by D-544 |
 | D-483 | M | A book's entries page on the toolkit's pager, in the order (sku_id, charge_kind, model, id) | DECIDED 2026-10-01 · Owner, 2026-10-01 (asks v4, 51); phase 9 plan rev 4 (run 9.8; review H3, A4); amends D-434, D-473 |
-| D-484 | M | A plan stores time-stable list facts; selling and change are derived from the day | DECIDED 2026-10-02 · Owner, 2026-10-01 (#31, form B); phase 9 plan rev 4 (run 9.8b; review N1, N2); amends D-453 |
+| D-484 | M | A plan stores time-stable list facts; selling and change are derived from the day | DECIDED 2026-10-02 · Owner, 2026-10-01 (#31, form B); phase 9 plan rev 4 (run 9.8b; review N1, N2); amends D-453; extended by D-543 |
 | D-485 | M | The plans list pages on the stored summary and counts the derived axes | DECIDED 2026-10-02 · Owner, 2026-10-01 (#31, form B); phase 9 plan rev 4 (run 9.8b; review N1, N7); amends D-434, D-460, D-453; amended 2026-10-02 (phase 9 review F1b); amended by D-515 |
 | D-486 | M | A SKU's entries narrow, order and page in memory | DECIDED 2026-10-01 · Owner, 2026-10-01 (#25, form A); phase 9 plan rev 4 (run 9.8c; N5); amends D-434; amended by D-517 |
 | D-490 | M | Pricing's approval units answer the approvals inbox through pricing's own doors | DECIDED 2026-10-01 · Owner, 2026-10-01 (option A, "yes, A, agreed", then "write the plan"; Run 2 started before 9.5d-2); approvals inbox plan rev 2 (Run 2; design 1 and 3; plan review H1, H3, H4, M1, M5, L1); amends D-470; amended by D-496 |
 | D-491 | M | An entry op stores its policy reference as a named object | DECIDED 2026-10-02 · phase 9 review F1b |
 | D-496 | M | The inbox source judges `state` before a foreign empty page | DECIDED 2026-10-02 · phase 9 review; amends D-490 |
 | D-497 | M | A unit says whether its reader may reject or withdraw it, and approve includes the grant | DECIDED 2026-10-02 · Owner, 2026-10-02 (ask 63); amends D-471 |
-| D-501 | H | Authorized SDK reads share the frozen preview snapshot and canonical JSON digests | DECIDED 2026-09-30 · Pricing Seam Contracts Task 1; amended 2026-10-02 (phase 9 review F1); amended by D-532 |
+| D-501 | H | Authorized SDK reads share the frozen preview snapshot and canonical JSON digests | DECIDED 2026-09-30 · Pricing Seam Contracts Task 1; amended 2026-10-02 (phase 9 review F1); amended by D-532; extended by D-547 |
 | D-502 | H | Immutable usage policies belong to entries and their semantic key | DECIDED 2026-10-01 · Pricing Seam Contracts Task 2; amends D-386, D-401, D-427; amended by D-513, D-514 |
 | D-503 | H | Exact meter evidence gates usage publication and stays out of historical reads | DECIDED 2026-10-01 · Pricing Seam Contracts Task 3; amended 2026-10-01 by the owner (E1a raw and E1b derived meters; products P-D-229 and rating T-D-39 on branch `bss/pricebook-meters`); amended 2026-10-01 by products P-D-233 (E1b provided by Products, E1a still external); amended by D-514 |
 | D-504 | H | Pure new-sale terms validate a bounded commercial profile and snapshot integrity | DECIDED 2026-10-01 · Pricing Seam Contracts Task 4; amended 2026-10-02 (phase 9 review F1b); amended by D-514, D-527, D-533 |
-| D-505 | H | Durable commercial receipt storage | DECIDED 2026-10-01 · Pricing Seam Contracts Task 5a; amended by D-532 |
+| D-505 | H | Durable commercial receipt storage | DECIDED 2026-10-01 · Pricing Seam Contracts Task 5a; amended by D-532; extended by D-548 |
 | D-506 | H | Authorized commercial provider boundary | DECIDED 2026-10-01 · Pricing Seam Contracts Task 5b |
 | D-507 | H | Atomic acceptance and durable authenticated command replay | DECIDED 2026-10-01 · Pricing Seam Contracts Task 5c |
 | D-508 | H | Frozen first holds and fresh original-binding eligibility | DECIDED 2026-10-01 · Pricing Seam Contracts Task 6 |
 | D-509 | H | Executable Pricing seam fixtures and transport boundary | DECIDED 2026-10-01 · Pricing Seam Contracts Task 7 |
-| D-510 | H | Database parity and provider handoff | DECIDED 2026-10-01 · Pricing Seam Contracts Task 8; E1 restated as E1a and E1b per the D-503 amendment; E1b delivered by products P-D-233 |
+| D-510 | H | Database parity and provider handoff | DECIDED 2026-10-01 · Pricing Seam Contracts Task 8; E1 restated as E1a and E1b per the D-503 amendment; E1b delivered by products P-D-233; extended by D-548 |
 | D-511 | H | Commercial commands enforce scoped prices and nonempty activation windows | DECIDED 2026-10-01 · Pricing Seam Contracts review fix run |
 | D-512 | H | A plan item may wait for its entry in a draft | DECIDED 2026-10-02 · Owner, 2026-10-02; amends D-407, D-413, D-420, D-467, D-469 |
 | D-513 | M | A usage policy's single-valued fields default on input | DECIDED 2026-10-02 · Owner, 2026-10-02; amends D-502; amended by D-514 |
@@ -160,6 +160,15 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-537 | M | The currency table is a read: GET /currencies | DECIDED 2026-10-14 · Owner, 2026-10-14; extends D-529; amended 2026-10-21 (no permission) |
 | D-538 | M | A field violation names the refused decimal's path | DECIDED 2026-10-21 · Owner, 2026-10-21 (a client parsed the prose); extends D-528 |
 | D-539 | M | Snapshot prices carry their currency spec | DECIDED 2026-10-21 · Owner, 2026-10-21 (a review rendered money without its scale); extends D-531 |
+| D-540 | H | A plan revision carries allocation quota rules; Pricing stores them | DECIDED 2026-11-21 · Owner, 2026-11-19 (quotas programme); quotas feature 2; Owner, 2026-11-21 (SDK and REST) |
+| D-541 | H | The rule's v1 shape lives in pricing-sdk; amounts are exact integers | DECIDED 2026-11-21 · Owner, 2026-11-21; quotas DESIGN §3.3.1.2 (amended) |
+| D-542 | H | Products validates the complete set before the transaction; drafts may hold a definition not yet sellable | DECIDED 2026-11-21 · Owner, 2026-11-21; quotas DESIGN §3.3.1.1; products P-D-275 |
+| D-543 | H | Quota rules are replaced as one set: the key before the version, one fence, one commit | DECIDED 2026-11-21 · quotas feature 2 algorithm; extends D-404 |
+| D-544 | M | The revision checks report every quota rule and field | DECIDED 2026-11-21 · quotas DESIGN §3.3.1.2; extends D-466; amends D-482 (thirteen statements) |
+| D-545 | H | Submit, approval, copy and clone carry the rules; acceptance rechecks every sale | DECIDED 2026-11-21 · Owner, 2026-11-21 (the scheduled switch); extends D-450 to quota rules |
+| D-546 | M | Migration 000024 stores quota rules and their set | DECIDED 2026-11-21 · quotas DESIGN §3.7 |
+| D-547 | H | The preview carries the quota terms and the selected quota digest | DECIDED 2026-11-21 · quotas DESIGN §3.3.1.2; extends D-501 |
+| D-548 | H | An acceptance freezes the selected quota rules with the price terms | DECIDED 2026-11-21 · Owner, 2026-11-21 (shapes in place); extends D-505, D-510 |
 
 ## Entries
 
@@ -351,7 +360,7 @@ D-465 amends this entry: "newly added" does not cover a re-add. The item create 
 
 D-466 extends this entry: each check row names the items that turn it red and the pending prices behind its blocked_by.
 
-D-482 amends this entry: checks, submit and apply read their item SKUs in one `skus_for_write` (products P-D-245), not one `sku_for_write` per SKU. A SKU Products no longer knows is still left out, so the checks show it unavailable. The checks doors read the stored context on a connection, as a set (`stored_contexts`).
+D-482 amends this entry: checks, submit and apply read their item SKUs in one `skus_for_write` (products P-D-245), not one `sku_for_write` per SKU. A SKU Products no longer knows is still left out, so the checks show it unavailable. The checks endpoints read the stored context as a set (`stored_contexts`), in one serializable read transaction (D-544).
 
 D-522 amends this entry: an entry whose reference is `released` (its book archived) holds no reference, so the checks count an item that names one as they count an item on a `lost` entry (`ENTRY_REFERENCE_LOST`), and no item create or PATCH names it: 409 `BOOK_ARCHIVED` while its book is archived, 409 `ENTRY_REFERENCE_RELEASED` after an unarchive could not re-reserve it.
 
@@ -1060,8 +1069,10 @@ The plans screen shows who made each revision and when it was submitted and appr
 
 D-519 extends this entry: on a read, the header's and the revision's `created_by` carry `created_by_name`, the author's current name; the write answers' is null.
 
+D-545 amends this entry: a plan submit and every vote take their instant once per attempt, before the captures of the meter policy and the quota rules, so the capture's day and the subject's are one. A unit's `submitted_at`, each decision's `at`, a revision's publish time and a price unit's apply day are that instant, for every kind of unit, a price unit included: it can be some seconds before the transaction when Products answers slowly. A capture taken again takes a new instant.
+
 **Source:** Owner, 2026-09-30 (validation 3 item 7); phase 9 plan rev 2 (decision 2; plan review M6, M7, L1, L9). Amends D-434,
-D-453 and D-460 (GET /plans makes four statements, not three). Extended by D-519.
+D-453 and D-460 (GET /plans makes four statements, not three). Extended by D-519. Amended by D-545.
 
 #### D-462 [M] A pending revision shows its vote progress under plan read
 
@@ -1210,7 +1221,9 @@ The phase 9 review (fix run 9.5d-2; R27, R28): tests/read_contract.rs measures t
 
 D-518 extends this entry: the plan list, the plan counts and the book list declare a weak ETag of their JSON body on their 200 and their 304, and the settings read declares its version ETag on its 304 too. module_test counts 34 ETag declarations, not 27.
 
-**Source:** Owner, 2026-09-30 (validation 3 item 2, approved); phase 9 plan rev 2 (M1 and W1, binding: 503 on every op; decisions 8 and 9; L8: the contracts notes correct served texts to match the code). Extended by D-470. Amended by the phase 9 review (fix run 9.5d-2). Extended by D-518.
+D-542 and D-543 extend this entry: the quota-rule read and replace are two ops more, so the census and the 503 on every op count 63 ops. The served texts name `REGISTRY_UNAVAILABLE` on ten ops: the eight above, the batch checks (D-482) and the quota-rules PUT, which reads each rule item's SKU version. They name `QUOTA_CATALOG_UNAVAILABLE` on exactly the five ops that validate quota rules through Products: the PUT, the checks (single and batch), the plan submit and the approve. The quota-rules GET and PUT declare the revision's version as their ETag, so module_test counts 36 ETag declarations. tests/served_contract.rs (`the_quota_texts_name_their_outage_and_refusals`) pins the quota texts.
+
+**Source:** Owner, 2026-09-30 (validation 3 item 2, approved); phase 9 plan rev 2 (M1 and W1, binding: 503 on every op; decisions 8 and 9; L8: the contracts notes correct served texts to match the code). Extended by D-470. Amended by the phase 9 review (fix run 9.5d-2). Extended by D-518. Extended by D-542 and D-543.
 
 #### D-470 [M] The approval units are counted by state and kind, list newest first on request, and skip the live impact on request
 
@@ -1327,7 +1340,9 @@ The plan page read a revision, then each entry, then each price (asks 48, 49, 50
 - **The statements.** Measured after 9.5d-2, then pinned absolute in tests/revision_reads.rs for 10 items and for 100, the same SQL: draft 7, pending 9, scheduled 7, published 7, superseded 7. The reservations read is 2 for 10 and for 100.
 - **The book list.** $filter names id (D-442).
 
-**Source:** Phase 9 plan rev 4 (run 9.6, asks 48, 49, 50; A1, M1, M3, M7). Amends D-442, D-460 and D-462.
+D-540 amends this entry: the revision read also carries `quota_rules` and `quota_rules_digest` (an empty array and the empty set's digest for a revision without rules), read in two more statements, the set row and the rules, in the read's transaction. tests/revision_reads.rs pins draft 9, pending 11, and scheduled, published and superseded 9.
+
+**Source:** Phase 9 plan rev 4 (run 9.6, asks 48, 49, 50; A1, M1, M3, M7). Amends D-442, D-460 and D-462. Amended by D-540.
 
 #### D-481 [M] The quorum a submit needs is on the checks and on an effective-policy read
 
@@ -1349,11 +1364,13 @@ The book page and the plan page showed a quorum the submit would need only by re
 
 The plan page read each revision's checks on its own, and each check read its entries and prices one at a time (ask 47). Fifty revisions of twenty entries were thousands of statements in one serializable transaction.
 
-- **The context.** `stored_contexts` reads, once for the whole set, the revisions, their plans, their items, the entries, the prices, the books, the dimensions, the plans' revisions, the in-effect items, the policy and the settings. Eleven statements whatever the number of revisions and entries, once any revision is held. `stored_context` is that read for one id, so the single checks and the batch are the same function. Submit and apply keep calling it inside their transaction. The checks doors read it on a connection, not under a serializable transaction.
+- **The context.** `stored_contexts` reads, once for the whole set, the revisions, their plans, their items, every revision's quota set rows and quota rules (D-544), the entries, the prices, the books, the dimensions, the plans' revisions, the in-effect items, the policy and the settings. Thirteen statements whatever the number of revisions and entries, once any revision is held. `stored_context` is that read for one id, so the single checks and the batch are the same function. Submit and apply keep calling it inside their transaction. The checks endpoints read it in one serializable read transaction (`support::transaction_door_read`), so the quota set rows and the rules are one snapshot (D-546); a read contended past its retries is 409 `CONTENDED`.
 - **The SKUs.** One `skus_for_write` over the union (D-408, products P-D-245). A left-out SKU is unavailable. An answer that is all missing makes no Products call.
 - **The batch.** GET /bss-pricing/v1/plan-revisions/checks?revision_ids= takes 1 to 50 distinct ids and answers { items: [{ revision_id, checks }], missing }. Each checks is byte-identical to GET /plan-revisions/{id}/checks. A revision the tenant does not hold, or one outside the caller's plan-read scope, is missing, which is that door's 404. GET /plan-revisions/{id} is unchanged. The plans list gains no ready flag (D-460).
-- **Refusals.** 400 QUERY_INVALID for an empty list, more than 50, a repeated id, a repeated revision_ids key, a malformed id, or any other key. 503 REGISTRY_UNAVAILABLE. Products' definite refusal as it gave it (D-416). Under plan read.
-- **The statements.** tests/plan_checks_batch.rs pins 11 for one revision, for 5 revisions of 1 entry and for 50 of 20, the same SQL, none of them inside a transaction.
+- **Refusals.** 400 QUERY_INVALID for an empty list, more than 50, a repeated id, a repeated revision_ids key, a malformed id, or any other key. 503 REGISTRY_UNAVAILABLE, and 503 QUOTA_CATALOG_UNAVAILABLE for a revision with quota rules (D-544). Products' definite refusal as it gave it (D-416). Under plan read.
+- **The statements.** tests/plan_checks_batch.rs pins 13 for one revision, for 5 revisions of 1 entry and for 50 of 20, the same SQL, every one of them in one transaction asked for at serializable.
+
+**Amended by D-544.** The context also reads every revision's quota rules and set rows, two more statements (thirteen in all), and the checks endpoints read it in one serializable read transaction: two statements that must agree need one snapshot.
 
 **Source:** Phase 9 plan rev 4 (run 9.7, ask 47; review H2, A2, L5). Amends D-408 and D-460.
 
@@ -1387,7 +1404,9 @@ A plan's list state depends on the day: a scheduled revision reads published fro
 - **The backfill** runs in Rust inside the migration: it reads the plans and the revisions separately and updates by id. It does not join on a uuid, which on SQLite compares a blob with text and updates nothing. It is tested on both backends over a plan with no revisions, a draft only, a draft beside a published revision, a future scheduled revision, a due scheduled revision not yet switched, and a superseded history.
 - **One maintenance point.** `plan_summary::refresh` recomputes the summary from the plan's revisions (one select with each book's currency, one update of the summary columns only). It runs inside the writing functions of `plan_revision_repo` (`insert`, `update_draft`, `try_lock`, `unlock`, `publish`, `supersede`, `schedule`, `switch_due`, `unschedule`, `delete_draft`) and `plan_repo` (`insert`, `rename`, `set_published`), on the caller's runner, only after a write that matched a row. It never changes the plan's `version` or `updated_at`. `try_lock` refreshes only when it locked. `switch_due` refreshes once, only when it switched, after `advance_published`; `advance_published` does not refresh again. A no-op `catch_up` adds no statement. `delete_unpublished` is on the allow-list: the row is gone. A source scan fails when a new write in those two repos neither refreshes nor is on that list.
 
-**Source:** Owner, 2026-10-01 (#31, form B); phase 9 plan rev 4 (run 9.8b; review N1, N2). Amends D-453.
+D-543 extends this entry: `plan_revision_repo::bump_draft`, the conditional version write of a quota-rule replace, is one more writing function that refreshes the summary. It moves the revision's `updated_at`, so the plan's `last_activity_at` follows, and a quota-rule replace and a plan PATCH on one plan both write its row: of two concurrent ones, one retries (serializable).
+
+**Source:** Owner, 2026-10-01 (#31, form B); phase 9 plan rev 4 (run 9.8b; review N1, N2). Amends D-453. Extended by D-543.
 
 #### D-485 [M] The plans list pages on the stored summary and counts the derived axes
 
@@ -2503,3 +2522,473 @@ Pricing rates the actual quantity. No tariff field says "per started hour" or "w
 - **A plan revision.** Its snapshot names entries and SKUs, no money, so nothing is added there.
 
 **Source:** Owner, 2026-10-21 (a review needed the currency table or other prices to show the right decimals). Extends D-531, D-516.
+
+#### D-540 [H] A plan revision carries allocation quota rules; Pricing stores them
+
+**Status:** DECIDED 2026-11-21.
+
+- **What.** A draft revision carries a bounded collection of allocation quota rules. This is the quotas package's
+  feature 2 (`cpt-cf-bss-quotas-feature-plan-rules`). Each rule selects one exact Products quota definition version
+  and states an amount, a unit, a basis and a logical binding.
+- **Where.** `GET` and `PUT /plan-revisions/{id}/quota-rules` and the SDK's `PricingQuotaAuthoringClientV1`, the full
+  revision read, the checks, submit, approval, copy and clone. Slice 08 and `features/plan-quota-rules.md` hold the
+  design.
+- **Separate from money.** A rule has no price, rate or inclusion. Prices never read a rule, and a price change leaves
+  the rules and their digest as they are.
+- **Two surfaces** (the owner's ruling of 2026-11-21). The rules are authored through the REST endpoints and through
+  `bss_pricing_sdk::plan_quota::PricingQuotaAuthoringClientV1`, each method with the caller's `SecurityContext`:
+  `get_quota_rules(ctx, revision_id)` (a revision's rules and their set digest),
+  `replace_quota_rules(ctx, revision_id, expected_version, operation_id, rules)` (the whole set under the revision's
+  fence and an idempotency key) and `check_plan_revision(ctx, revision_id)` (the complete saved revision's checks,
+  quota rows included, as `GET /plan-revisions/{id}/checks` answers them: every row, `ready`, `sale_date`,
+  `quorum_required`, `revision_version` and `quota_rules_digest`). Its local client is registered in the ClientHub at
+  init. Both surfaces call the same functions under the same authorization, fences, idempotency and Products
+  validation, and they answer the same request identically: the same body, the same refusals and the same ETag (the
+  SDK's `revision_version`). `replace_quota_rules` sends its typed rules as the PUT's JSON body through the PUT's own
+  function, so the parse, its codes and the stored answer are the PUT's, and the two surfaces share one key space: a
+  key used with the same `If-Match` version and the same rules replays on either surface, whatever the body's
+  spelling (D-543). The SDK reuses the shapes of `bss_pricing_sdk::plan_quota`; there is no second wire shape.
+- **The tests.** `tests/plan_quota_rules.rs`: `get_answers_the_empty_set_with_the_revision_etag`,
+  `the_revision_read_carries_the_rules_and_digest`, `another_tenants_revision_is_404_for_quota_rules`,
+  `another_tenants_caller_cannot_replace_quota_rules`, `a_denied_caller_is_403_before_the_path_is_read` and
+  `put_replaces_the_complete_set_and_answers_the_new_etag`.
+  `tests/plan_quota_governance.rs`: `a_price_change_leaves_the_rules_and_their_digest`.
+  `tests/plan_quota_authoring.rs` (one parity test per method, and the ClientHub):
+  `the_sdk_get_answers_what_rest_answers`, `the_sdk_replace_answers_what_rest_answers`,
+  `the_sdk_check_answers_what_rest_answers` and `the_hub_resolves_the_quota_authoring_client`.
+  `src/api/plan_quota_authoring_tests.rs`: `a_typed_rule_is_sent_as_the_put_body_carries_it` and
+  `an_answer_that_does_not_read_back_is_500`. The route, authz, precondition and OpenAPI censuses with the two
+  operations.
+
+**Source:** Owner, 2026-11-19 (quotas programme: Pricing stores the plan quota rules). Quotas package feature 2 and
+DESIGN §3.3.1.2. Owner, 2026-11-21: the rules are authored through both an SDK trait and REST.
+
+#### D-541 [H] The rule's v1 shape lives in pricing-sdk; amounts are exact integers
+
+**Status:** DECIDED 2026-11-21.
+
+- **The shape.** `bss_pricing_sdk::plan_quota::PlanQuotaRuleV1`: `rule_id` (a client UUID, unique in the revision),
+  `definition_ref {id, version, digest}` (on REST the version a canonical decimal from 1, the digest 64 lowercase hex
+  characters), `item_id` (an item of this revision), `dimension_value` (null only for an item without a dimension; at
+  most 512 bytes), `logical_binding_key` (1 to 64 of ASCII letters, digits, `_`, `-` and `.`), `subject_selector`
+  (`resource_owner`), `scope_selection` (at most 8 keys, each key 1 to 64 of the binding key's characters, each value 1
+  to 255 printable ASCII bytes), `amount`, `unit_ref` (1 to 1024 bytes, the longest GTS id the catalog stores) and
+  `basis`. These bounds are Products' own (`MAX_TEXT_BYTES`, `MAX_REF_BYTES`), so a body that parses is never a Products
+  400 (products P-D-275). Pricing's own caps are tied to Products' bounds at compile time: the rule count, the key
+  length and the scope-key count are within `MAX_RULES`, `MAX_KEY_BYTES` and `MAX_SCOPE_KEYS`, and the scope value's
+  bound is `MAX_SCOPE_VALUE_BYTES`. REST spells the basis `fixed` or `per_plan_unit`, as Products' REST does (products
+  P-D-272); the SDK's `PlanQuotaBasis` maps to and from Products' `QuotaBasis` with no wildcard.
+- **Scope values.** Pricing checks only the form of a scope value, as Products does (products P-D-276): it resolves
+  no alias and knows no wildcard. The scope authority refuses a wildcard or an unresolved alias at purchase (the
+  quotas package's feature 3).
+- **The owner** (the owner's ruling of 2026-11-21). Pricing defines the v1 shape as plain types until Entitlements
+  publishes a rule schema. No GTS id is registered for it.
+- **Amounts.** An amount is a canonical decimal integer in the rule's unit: no sign, point, exponent or leading zero,
+  at most 39 digits (`bss_products_sdk::quota::units::Amount::parse`). Every catalog bound and step is an integer in
+  its unit (products P-D-267), so a fraction is never on a grid. `0` is an explicit zero limit where the definition's
+  minimum is 0. There is no unbounded amount, and a rule has no absent amount: a metric without a rule is an absent
+  declaration, so this plan states no quota for it.
+- **The body.** A request body is `{"quota_rules": [...]}` and nothing else; an empty or unreadable body is 400. An
+  unknown member, a null collection, a member of the wrong JSON type, a repeated `rule_id` and U+0000 in any string
+  are refused (D-543), U+0000 as `QUOTA_RULE_INVALID` on the member that holds it, whatever the member. A refusal
+  names at most the first 10 unknown members of the body and of each rule, and one more failure counts the rest. An
+  absent `dimension_value` reads as null. The SDK's typed rules are judged with the same codes.
+- **Caps.** At most 200 rules per revision.
+- **The digest.** `quota_rules_digest` is Pricing's canonical JSON (D-501) over the rules ordered by `rule_id`, each
+  with its rule id, definition reference, item, dimension value, binding, subject, sorted scope selection, amount,
+  unit and basis token, in the domain `pricing.quota-rules.v1`. Input order does not move it; every member does. The
+  empty set has its own digest, which a revision without rules reads. The digest is computed once, when the set is
+  written, and stored; no read computes it again. Lowercase hex on the wire.
+- **The tests.** `pricing-sdk/src/plan_quota_tests.rs`: `the_binding_key_rule_takes_one_to_64_of_its_characters`,
+  `basis_and_subject_tokens_round_trip`, `the_rule_set_digest_ignores_input_order`,
+  `every_rule_member_moves_the_digest`, `the_empty_set_has_its_own_digest` and
+  `rules_that_share_a_rule_id_digest_alike_in_either_order`. `pricing-sdk/tests/digest_vectors.rs`:
+  `quota_rules_vector_matches_the_sdk_function` and `quota_rules_vectors_pin_the_empty_set_and_the_rule_order`.
+  `src/domain/plan_quota_tests.rs`: `a_complete_body_parses_into_normalized_rules`, `the_package_example_body_parses`,
+  `a_body_is_one_object_with_one_array`, `unknown_members_and_null_collections_are_refused`,
+  `every_member_is_required_with_its_type`, `ids_and_tokens_are_exact`,
+  `a_definition_ref_is_its_three_members_with_a_version_and_lowercase_hex`, `more_than_200_rules_are_refused`,
+  `a_repeated_rule_id_is_refused`, `amounts_are_canonical_integers`, `a_binding_key_off_the_rule_is_rule_invalid`,
+  `scope_keys_follow_the_binding_key_rule_and_values_are_printable`,
+  `unit_and_dimension_texts_stay_within_the_catalogs_bound`, `a_nul_in_any_member_is_rule_invalid`,
+  `every_rule_is_parsed_and_its_failures_keep_member_order`, `a_stray_body_member_still_reports_every_rule_failure`,
+  `typed_rules_are_judged_with_the_parses_codes`, `a_caller_text_is_echoed_escaped_and_short` and
+  `many_unknown_members_name_the_first_ten_and_count_the_rest`.
+  `src/api/rest/closed_sets_tests.rs`: `quota_rule_sets_carry_the_sdk_and_products_tokens`.
+
+**Source:** Owner, 2026-11-21 (Pricing defines the rule's shape until Entitlements publishes a schema). Quotas DESIGN
+§3.3.1.2, amended in the same change: amounts are integers, and REST spells the bases `fixed` and `per_plan_unit`.
+
+#### D-542 [H] Products validates the complete set before the transaction; drafts may hold a definition not yet sellable
+
+**Status:** DECIDED 2026-11-21.
+
+- **Before the transaction.** The PUT, the checks (single and batch), submit and every vote read the SKU version in
+  force on the revision's sale date for each rule item (`ReferenceRegistryV1::sku_version_as_of`, one read per
+  distinct SKU; the batch reads one per distinct SKU and sale date across its revisions). Then they call
+  `ProductsQuotaCatalogClientV1::validate_quota_set` (products P-D-275) as the caller. Both reads run outside any
+  transaction, each on a task of its own, as D-503 reads meters. A SKU with no version on that day is
+  `QUOTA_RULE_INVALID` on `item_id`, judged before the catalog call, and that rule is left out of the call; a set none
+  of whose SKUs has a version asks no catalog. An empty set reads nothing. A rule is never stored without Products'
+  verdict.
+- **Two calls only.** Products' answer carries each resolved definition, so Pricing never lists or reads a definition
+  itself. The editor reads the catalog through Products' own endpoints.
+- **Facts, not policy.** Products reports every check it finds (products P-D-276). Pricing decides what each boundary
+  refuses: the PUT, the checks, submit, approval and acceptance.
+- **Pricing's own checks.** The rule's item is an item of the revision. Its dimension value is null for an item
+  without a dimension, else a value that the dimension registry lists for the item's key. No two rules for one logical
+  binding and one metric apply together: two such rules on two items, or on one item with one dimension value, are
+  `QUOTA_RULE_DUPLICATE`; dimension alternatives of one item are not duplicates.
+- **The grant.** Products asks `read` on `quota_definition` for the caller's tenant (products P-D-273). These callers
+  need that grant, as they need SKU `read` (D-416): the authors who save rules, the readers of the checks (single and
+  batch), the submitter, the final approver (apply re-runs the checks) and the caller of an acceptance (Orders'
+  principal, D-548). A non-final vote keeps a refusal as an observation (D-503) and needs no grant.
+- **Availability** (the owner's ruling of 2026-11-21). A draft may save a definition version that is `disabled` or
+  `withdrawn`, and the rule stores the availability it saw. The checks show it red (`QUOTA_QUALIFICATION_UNAVAILABLE`
+  with the state and reason), and submit, approval and acceptance refuse it. Every definition stays `disabled` until
+  qualification (products P-D-271), so no plan with rules is sold before then.
+- **The stored evidence.** Each rule keeps the identity-bearing content of its definition: identity and digest, SKU
+  and SKU version, metric and its digest, canonical unit, the rule's unit with its digest and factor, mapping, profile
+  and qualification references, both policies' references and digests, change support, subject and resource types. It
+  keeps no text and no availability; the availability it observed is stored apart from it. A stored rule converts back
+  through one conversion; a value that does not (a version that is not a canonical integer from 1, a digest that is
+  not 64 lowercase hex characters, a token outside its closed set, a scope selection that is not an object of strings,
+  evidence or an observation that does not read) is a corrupt row (500).
+- **Outage.** Every catalog outage is 503 `QUOTA_CATALOG_UNAVAILABLE`, never an empty or a green answer: a catalog
+  that is not registered, a call that does not finish, a rate limit (429), a contention conflict (409 `CONTENDED` or
+  `UNIT_CONTENDED`) and any Products 5xx but 500. A Products 400, 403 or 500, and any other 4xx, is forwarded as
+  Products gave it (D-416). On the SKU-version read, a 404 means no version, a definite refusal is forwarded, and any
+  other failure is 503 `REGISTRY_UNAVAILABLE`.
+- **The tests.** `src/domain/plan_quota_tests.rs`: `a_rule_for_a_foreign_item_is_rule_invalid`,
+  `a_dimension_value_must_be_the_items_registered_value`,
+  `a_rule_whose_sku_has_no_version_on_the_sale_date_is_rule_invalid`,
+  `two_rules_for_one_binding_and_metric_that_apply_together_are_duplicates`,
+  `dimension_alternatives_of_one_item_are_not_duplicates`, `catalog_checks_map_to_rule_paths_and_a_refusal_status`
+  and `products_fields_that_name_no_rule_member_map_to_the_member_they_are_about`. `src/infra/plan_quota_tests.rs`:
+  `an_absent_catalog_is_503_quota_catalog_unavailable`, `a_catalog_outage_is_503_and_a_refusal_is_forwarded`,
+  `a_rate_limit_or_a_contention_conflict_is_an_outage`, `a_catalog_call_that_does_not_finish_is_503`,
+  `the_catalog_answers_on_a_task_of_its_own_even_inside_a_transaction`,
+  `the_sku_versions_are_read_once_per_sku_and_a_missing_version_is_absent`,
+  `a_set_whose_skus_have_no_version_on_the_sale_date_asks_no_catalog`,
+  `the_set_request_carries_each_items_sku_version`, `the_evidence_keeps_identity_and_no_text_or_availability`,
+  `a_stored_rule_round_trips_with_its_evidence_and_observation`, `a_tampered_row_is_a_corrupt_row` and
+  `a_capture_reads_the_sku_version_on_the_sale_date_not_today`. `tests/plan_quota_governance.rs`:
+  `each_rule_is_judged_against_the_sku_version_on_its_sale_date` and `products_is_asked_as_the_caller_at_every_step`.
+  `tests/plan_quota_rules.rs`: `a_definition_pending_qualification_is_saved_and_checks_red`,
+  `a_quota_catalog_outage_is_503_and_writes_nothing`,
+  `a_rule_whose_sku_has_no_version_on_the_sale_date_is_refused_on_item_id`, `a_corrupt_stored_rule_answers_500`,
+  `a_moved_rule_set_rolls_back_and_is_captured_again` and `the_catalog_is_never_called_on_a_transactions_task`.
+  Products' in-crate e2e `products/src/api/rest/quota/plan_rules_e2e_tests.rs`:
+  `a_plan_carries_10_vcpu_and_20_gb_per_unit_through_the_real_catalog`,
+  `the_real_catalog_refuses_an_amount_off_its_grid_and_reports_a_pending_definition` and
+  `vcpu_and_ram_of_two_adapter_targets_cannot_share_a_binding`.
+
+**Source:** Owner, 2026-11-21 (a draft may hold a definition that is not yet sellable; the validation asks Products'
+`read` grant). Quotas DESIGN §3.3.1.1. Products P-D-275.
+
+#### D-543 [H] Quota rules are replaced as one set: the key before the version, one fence, one commit
+
+**Status:** DECIDED 2026-11-21.
+
+- **The order.** Authenticate. Ask `author` on `plan` before any header or body is read. `If-Match` and
+  `Idempotency-Key` are required, else 400, and an empty or unreadable body is 400. The request digest covers the
+  `If-Match` version and the rules as they parse, by their set digest (D-541), so it does not depend on the body's
+  spelling (member order, an absent `dimension_value`, UUID case, the rules' order); a body that does not parse is
+  bound by its JSON, and it is refused and never recorded. The key space is shared with the SDK's
+  `replace_quota_rules` (D-540). The key's stored answer comes next: the same key and content answer the stored body
+  and ETag, even when the ETag has moved since, the same key with other content is 409 `IDEMPOTENCY_CONFLICT`, and a
+  key whose first request has not answered yet is 409 `IDEMPOTENCY_KEY_IN_FLIGHT` (D-429). Then the revision: 404 for
+  an unknown or foreign one, 409 `REVISION_NOT_DRAFT`, 403 `NOT_DRAFT_AUTHOR` (D-404). Then the parse (D-541) and the
+  validation (D-542), outside any transaction.
+- **One transaction.** Claim the key. Require the unlocked draft at the `If-Match` version, else 409 `STALE_REVISION`,
+  also for a revision that was locked or stopped being a draft since the validation. Require the items and the sale
+  date that the validation saw, each rule's item among the revision's items; else roll back and capture again, as
+  D-503's captures do (a revision gone since then answers 404). A selection that keeps moving past the transaction
+  retry budget is 409 `UNIT_CONTENDED`, and a read or write transaction contended past its own retries is 409
+  `CONTENDED`. Write the rules with their evidence and availability, the set row with its digest, the revision's next
+  version, the audit row `plan_revision.quota_rules` and the key's answer. The version write refreshes the plan
+  summary, so the plan's last activity moves (D-484). The answer is 200 with the saved set and the new ETag. No event
+  is written (D-545).
+- **The fence.** No item write moves the revision version; that is unchanged. The quota fence is the rule's foreign
+  key to its item, the item delete's check in its own transaction, the PUT's comparison of the items inside its
+  transaction, and serializable transactions. Submit's lock and the PUT's conditional version write exclude each
+  other.
+- **Refusals.** A body that does not parse is refused with every parse failure, before any call to another gear; a
+  stray body member does not stop the parse of the rules, so their failures come in the same refusal. The body and
+  each rule name at most their first 10 unknown members and count the rest, so a body of many stray members gets a
+  small refusal. The body is parsed once: the key's digest and every capture use that parse. A body that
+  parses gets every semantic failure, Pricing's and Products', in one refusal. Each failure is a field violation
+  `quota_rules[i].<field>` with its code, and no rule is left out. `<field>` is the rule's top-level member, and the
+  detail carries Products' full path (`scope_selection.region` is reported on `scope_selection`). A Products check on
+  a field that names no rule member maps to the member it is about: `change_kind` to `definition_ref`, `prior` and
+  `quantity` to `amount`. A Products check that names several rules is one violation per rule; one that names no rule
+  is a violation of the set, on `quota_rules`. A rule counts as judged only against the definition it names, by id,
+  version and digest. A rule Pricing sent that Products' verdict does not judge so (left out; judged without a
+  definition and named in no check; resolved to another definition version; or resolved to another digest with no
+  `QUOTA_DEFINITION_CHANGED` check on the rule) is Products' contract break, never the author's: the PUT answers 500
+  before any refusal, logs an error naming the rule and the revision, and writes nothing. The answer is 409 when every
+  failure is `QUOTA_RULE_DUPLICATE` or `QUOTA_DEFINITION_CHANGED`, else 400. Both are one invalid-argument problem on
+  the plan resource whose field violations carry the codes, with no `reason`; the 409 is that problem with an HTTP
+  status override, because an aborted problem carries no field violations. The parse answers `QUOTA_RULE_INVALID` for
+  the body, a rule and its members, `QUOTA_SCOPE_UNSUPPORTED` for the subject selector and the scope selection, and
+  `QUOTA_AMOUNT_INVALID` for the amount; U+0000 is `QUOTA_RULE_INVALID` on whichever member holds it. A Products 400,
+  403 or 500 is forwarded, and `QUOTA_QUALIFICATION_UNAVAILABLE` never refuses a PUT (D-542). A refused body writes
+  nothing, and its key stays free.
+- **The set.** An empty array clears the set and deletes its set row (D-546). An empty set makes no SKU or catalog
+  call, so an outage never blocks clearing the rules. The PUT and the SDK's `replace_quota_rules` are the only edits
+  of a draft's rules: a revision PATCH and an item write never change them (a copy and a clone write the new draft's
+  rules, D-545). The SDK's `replace_quota_rules` follows the same order and answers the same way (D-540).
+- **Items.** Deleting an item that a rule names is 409 `ITEM_HAS_QUOTA_RULES`. The item endpoint checks first, and
+  the foreign key backs it: a foreign-key refusal of an item delete reads `ITEM_HAS_QUOTA_RULES` while the rule table
+  is the plan item's only child table. A draft delete removes its rules first (D-545).
+- **The tests.** `tests/plan_quota_rules.rs`: `put_replaces_the_complete_set_and_answers_the_new_etag`,
+  `an_empty_array_clears_every_rule`, `an_invalid_set_writes_nothing_and_names_every_failure`,
+  `a_stale_if_match_is_409_and_writes_nothing`, `the_same_key_and_content_replays_after_the_etag_moved`,
+  `the_same_key_with_other_content_is_idempotency_conflict`, `the_same_rules_spelled_otherwise_replay_under_the_key`,
+  `a_duplicate_set_is_409_quota_rule_duplicate`, `a_changed_definition_digest_is_409`,
+  `a_published_or_pending_revision_refuses_rules`, `another_author_is_not_draft_author`,
+  `the_package_example_body_is_accepted`, `a_missing_if_match_or_key_is_400`,
+  `a_write_contended_past_its_retries_is_409_contended`, `a_rule_products_does_not_judge_is_a_logged_500_at_the_put`,
+  `a_body_of_many_unknown_members_is_refused_with_a_bounded_answer` and
+  `deleting_an_item_with_rules_is_409_item_has_quota_rules`.
+  `src/domain/plan_quota_tests.rs`: `only_a_changed_definition_or_a_duplicate_is_a_conflict` and
+  `a_set_check_names_each_of_its_rules_and_one_naming_none_is_on_the_set`. `src/api/rest/authoring/plan_items.rs`:
+  `a_foreign_key_refusal_of_an_item_delete_is_item_has_quota_rules`. `src/infra/storage/repo/plan_quota_repo_tests.rs`:
+  `replace_writes_the_set_and_bumps_the_revision_version`, `replace_at_a_stale_version_writes_nothing`,
+  `replace_on_a_locked_revision_writes_nothing`, `replace_on_a_published_revision_is_stale_revision`,
+  `replace_refuses_a_rule_of_another_revision_and_writes_nothing` and `item_has_rules_answers_for_one_item`.
+  `tests/served_contract.rs`: `the_quota_texts_name_their_outage_and_refusals`. On Postgres,
+  `tests/postgres_plan_quota_rules.rs`: `the_quota_rule_endpoints_replace_replay_and_fence_on_postgres`, and
+  `two_replaces_on_one_version_store_one_set_on_postgres` and
+  `an_item_delete_racing_a_replace_leaves_no_orphan_on_postgres`, each race run in both orders.
+
+**Source:** Quotas package feature 2, `cpt-cf-bss-quotas-algo-plan-rules` (the stored answer is looked up before the
+revision version is judged). Extends D-404.
+
+#### D-544 [M] The revision checks report every quota rule and field
+
+**Status:** DECIDED 2026-11-21.
+
+- **The rows.** A revision with rules gets eight quota rows after the existing rows, in this order:
+  `QUOTA_RULE_INVALID`, `QUOTA_DEFINITION_CHANGED`, `QUOTA_AMOUNT_INVALID`, `QUOTA_UNIT_INEXACT`,
+  `QUOTA_SCOPE_UNSUPPORTED`, `QUOTA_RULE_DUPLICATE`, `QUOTA_SET_INCOMPATIBLE`, `QUOTA_QUALIFICATION_UNAVAILABLE`. A
+  revision without rules has no quota row and makes no catalog call. Every code a Products check carries has its own
+  row; a failure whose code has no row of its own is never dropped and never green: it turns `QUOTA_RULE_INVALID` red,
+  with its code in its line.
+- **The subjects.** Each red row names, for each failure, the item, its SKU and its entry (D-466), and the rule
+  (`quota_rule_id`) and its top-level member (`field`, as D-543 maps it; `""` for the rule as a whole, such as a
+  Products field that maps to no member). `quota_rule_id` and `field` are left out when they are null, so the subjects
+  of every other row read as before. A failure of the whole set (a Products check that names no rule, or a rule that was
+  not sent) is a line of its row's detail with no subject.
+- **The version and the digest.** Every checks answer carries `revision_version` and `quota_rules_digest`, so an
+  editor sees which saved state the checks judged. These two members are the only change that a quota-free revision's
+  checks show.
+- **Fresh.** The checks validate the rules through Products on every read, as they read SKUs fresh (D-408), outside
+  the read transaction. A catalog outage is 503 `QUOTA_CATALOG_UNAVAILABLE`, never `ready=true`, and a Products
+  refusal is answered as Products gave it. A rule Pricing sent that Products' verdict does not judge against the
+  definition it names (left out; judged without a definition and named in no check; resolved to another definition
+  version; or resolved to another digest with no `QUOTA_DEFINITION_CHANGED` check on the rule) reads red
+  `QUOTA_RULE_INVALID` on its `definition_ref`, never green, and the read logs an error naming the rule and the
+  revision; at submit and at apply it refuses as any red row does. Duplicates are judged by the metrics of the
+  definition versions the rules name. A revision with rules whose verdict was not read fails closed:
+  every rule is red `QUOTA_QUALIFICATION_UNAVAILABLE` on its `definition_ref`; no reader of the checks reaches this.
+- **The batch.** `GET /plan-revisions/checks` answers each revision as the single read does, with one validation per
+  revision that holds rules and one SKU-version read per distinct SKU and sale date across its revisions. The checks
+  context reads every revision's rules and set rows in two more statements, thirteen in all, whatever the number of
+  revisions (D-482 said eleven), in one serializable read transaction, so a set row and its rules are one snapshot
+  (D-546).
+- **The SDK.** `PricingQuotaAuthoringClientV1::check_plan_revision` answers these checks as
+  `GET /plan-revisions/{id}/checks` does: the complete saved revision's checks, quota rows included (D-540).
+- **The tests.** `src/domain/plan_quota_tests.rs`: `quota_rows_name_the_rule_and_field`,
+  `a_disabled_definition_turns_only_the_qualification_row_red`, `the_quota_rows_keep_their_order`,
+  `the_quota_rows_follow_every_other_row_and_fail_closed_without_a_verdict`,
+  `the_rows_judge_items_versions_and_duplicates_from_the_context`,
+  `a_check_that_names_no_rule_is_a_line_of_its_row_without_a_subject`,
+  `a_check_naming_a_rule_that_was_not_sent_is_on_the_set`, `a_rule_with_no_definition_and_no_check_is_rule_invalid`,
+  `a_rule_products_leaves_out_of_its_verdict_reads_red`, `every_products_code_turns_its_own_row_red`,
+  `a_violation_without_a_row_of_its_own_turns_rule_invalid_red`, `a_rule_is_judged_only_against_the_definition_it_names`
+  and `a_rule_resolved_to_another_version_lends_no_metric`. `src/domain/plan_tests.rs`:
+  `a_revision_without_rules_has_no_quota_row`. `src/infra/plan_quota_tests.rs`:
+  `the_checks_contexts_carry_each_revisions_own_set`. `src/infra/storage/repo/plan_quota_repo_tests.rs`:
+  `the_sets_of_many_revisions_read_in_two_statements`. `tests/plan_quota_rules.rs`:
+  `checks_name_the_rule_field_version_and_digest`, `a_quota_free_revisions_checks_keep_their_rows`,
+  `a_catalog_outage_makes_the_checks_503_not_green`, `a_rule_products_does_not_judge_checks_red` and
+  `batch_checks_match_the_single_read_with_rules`. On Postgres, `tests/postgres_plan_quota_rules.rs`:
+  `the_checks_read_with_rules_on_postgres`. `tests/plan_checks_batch.rs`
+  (`the_checks_read_is_thirteen_statements_whatever_the_set`) pins thirteen statements in one serializable
+  transaction.
+
+**Source:** Quotas DESIGN §3.3.1.2 (the checks report the evaluated revision version and quota digest, and each
+failing rule and field). Extends D-466; amends D-482.
+
+#### D-545 [H] Submit, approval, copy and clone carry the rules; acceptance rechecks every sale
+
+**Status:** DECIDED 2026-11-21.
+
+- **Content.** When a revision holds rules, its approval content carries them and their digest, as `quota_rules_digest`
+  and `quota_rules`, each rule as the digest encodes it (`rule_json`), in `rule_id` order. A quota-free revision's
+  content and fingerprint do not move. A different set is a different content, so a pending unit refreshes its
+  generation on a changed set as it does on a changed item (D-393).
+- **Rechecks.** Submit and every vote capture the quota validation before their transaction, beside the meter
+  observations (D-503), and check inside it that the set digest and the items are still the captured ones; a moved
+  selection rolls back and is captured again. The capture and the judgement use one instant, taken once per attempt
+  before the capture, so they judge one sale date; the stored instants of the unit and its decisions, and a price unit's
+  apply day, are that instant for every kind of unit (D-461). A subject that finds no quota capture for a revision with
+  rules refuses with the kept 409 `UNIT_CONTENDED`, as a missing meter capture does. A red quota row refuses submit (400
+  `REVISION_CHECKS_RED`) and apply (409 `APPLY_REFUSED`). A catalog outage is 503 `QUOTA_CATALOG_UNAVAILABLE` at submit
+  and at the final approve, and a Products refusal keeps Products' own status and code (D-416); neither publishes the
+  revision, and a non-final vote keeps either as an observation (D-503).
+- **The switch** (the owner's ruling of 2026-11-21). A scheduled revision is checked at its approval. Its switch on
+  the sale date makes no catalog call, as D-450's switch revalidates no dependency, and the ticker's system actor has
+  no catalog grant. Acceptance rechecks availability on every sale (D-548), so a definition withdrawn after the
+  approval cannot be sold.
+- **Copy and clone.** A copy of a published revision and a clone of a plan write each rule onto its copied item, with
+  its rule id, its definition reference, its evidence and its availability observation, in the copy's transaction. The
+  digest is computed again over the moved rules, since item ids are part of it. Approval and current availability are
+  never copied: the copy's checks judge them fresh.
+- **Delete.** A draft delete removes its rules and its set row before its items. An item delete with rules is 409
+  `ITEM_HAS_QUOTA_RULES` (D-543).
+- **History.** A published or superseded revision reads its stored rules forever, also after a definition is
+  withdrawn. No read of stored rules asks Products.
+- **No reservation.** Pricing reserves a SKU because a SKU can be retired (D-398). Products never deletes a quota
+  definition version (products P-D-270), so a rule reserves nothing. A future deletion path must add a reference kind.
+- **No event.** No event is added, and `PlanRevisionPublished` gains no member: a consumer reads the revision, which
+  carries its rules.
+- **The tests.** `tests/plan_quota_governance.rs`: `submit_refuses_a_definition_pending_qualification`,
+  `quorum_zero_publishes_a_revision_with_rules_unchanged`,
+  `a_final_approve_rechecks_and_publishes_a_revision_with_rules`,
+  `apply_rechecks_and_refuses_a_definition_withdrawn_after_submit`,
+  `a_catalog_outage_at_submit_is_503_and_records_no_unit`, `a_catalog_outage_refuses_only_the_final_approve`,
+  `a_catalog_refusal_at_submit_is_answered_as_products_gave_it`,
+  `a_catalog_refusal_at_the_final_approve_is_answered_as_products_gave_it`,
+  `a_set_replaced_during_submits_capture_is_captured_again`, `a_rule_products_leaves_out_refuses_submit`,
+  `a_rule_products_leaves_out_refuses_the_final_approve`,
+  `a_rule_judged_against_another_version_refuses_submit_and_the_final_approve`, `the_unit_content_carries_the_rules`,
+  `a_quota_free_units_content_has_no_quota_member`, `a_submitted_revision_refuses_a_replace`,
+  `a_price_change_leaves_the_rules_and_their_digest`, `the_scheduled_switch_publishes_without_a_catalog_call`,
+  `a_copy_keeps_exact_definitions_and_remaps_items`, `a_copys_digest_is_computed_again_over_its_items`,
+  `a_published_revision_reads_its_rules_after_withdrawal`, `a_clone_copies_rules_into_the_new_plan` and
+  `the_copy_of_a_withdrawn_definition_checks_red`. `src/infra/plan_quota_tests.rs`:
+  `a_capture_calls_products_outside_the_transaction_and_its_check_sees_a_moved_set`,
+  `an_empty_capture_sees_a_set_added_before_the_transaction` and `a_dependency_failure_is_kept_in_the_capture`.
+  `src/infra/plan_revisions_tests.rs`: `a_revision_with_rules_and_no_quota_capture_is_the_kept_unit_contended`.
+  `tests/served_contract.rs`: `the_quota_texts_name_their_outage_and_refusals` (the submit and approve texts).
+  `tests/plan_quota_rules.rs`: `deleting_a_draft_with_rules_removes_them`.
+  `src/infra/storage/repo/plan_quota_repo_tests.rs`: `copy_moves_each_rule_onto_its_copied_item`,
+  `copy_refuses_a_rule_whose_item_was_not_copied`, `a_quota_free_copy_writes_no_set_row`,
+  `delete_for_draft_removes_the_rules_and_the_set_row` and `delete_for_draft_leaves_a_locked_revisions_rules`.
+
+**Source:** Owner, 2026-11-21 (a scheduled switch relies on acceptance's recheck of every sale). Quotas package
+feature 2 §3.3, amended in the same change. Extends D-450 to quota rules.
+
+#### D-546 [M] Migration 000024 stores quota rules and their set
+
+**Status:** DECIDED 2026-11-21.
+
+- **The set table.** `pricing_plan_quota_set`: `revision_id` (the primary key, a foreign key to
+  `pricing_plan_revision`), `tenant_id`, `quota_rules_digest` (64 characters), `rule_count` (1 to 200), `updated_by`
+  and `updated_at`. A revision holds a set row exactly when it holds a rule: a replace with no rules deletes the set
+  row. A revision without a set row reads the empty set and the empty set's digest.
+- **One snapshot.** The set row and the rules are read in two statements that must agree, so they are read in one
+  serializable transaction, as every Pricing transaction is (`support::transaction_door_read` for a read): on Postgres,
+  two statements on a connection, or in a default-isolation transaction, see two snapshots. The repository's reads
+  take the caller's transaction. A set row without rules, rules without a set row, or a count that disagrees is a
+  corrupt row (500).
+- **The rule table.** `pricing_plan_quota_rule`: the primary key `(revision_id, rule_id)`; foreign keys `revision_id`
+  to `pricing_plan_revision` and `item_id` to `pricing_plan_item`, with no cascade; `tenant_id`, `definition_id`,
+  `definition_version` (1 to 20 characters), `definition_digest` (64 characters), `dimension_value`,
+  `logical_binding_key` (1 to 64 characters), `subject_selector` (`resource_owner`), `scope_selection_json`, `amount`
+  (1 to 39 characters), `unit_ref`, `basis` (`fixed` or `per_plan_unit`), `evidence_json`, `availability_json` and
+  `created_at`; the index `pricing_plan_quota_rule_item` on `item_id`. JSON is stored as text, as
+  `pricing_acceptance.receipt_json` is.
+- **Both engines.** The same tables, CHECKs, keys and index on SQLite and Postgres; SQLite stores uuid and timestamptz
+  as text, and its set key is `NOT NULL` too. Migration `m20261121_000024_plan_quota_rules` follows
+  `m20261003_000023_book_archive`.
+- **No trigger.** The draft fence is the conditional revision write (D-543), as for items.
+- **A later rebuild.** A later SQLite rebuild of `pricing_plan_item` or `pricing_plan_revision` must carry both
+  tables, which are their children. The migration's documentation says so.
+- **The revert.** `down` refuses while a rule row exists, naming the table. On empty tables it drops the rule table,
+  then the set table.
+- **What stays.** No shipped migration changes (D-412).
+- **The tests.** `src/infra/storage/migrations/m20261121_000024_plan_quota_rules_tests.rs`: `the_rule_checks_hold`,
+  `the_set_checks_hold`, `a_rule_names_an_item_and_a_revision_that_exist`, `an_item_with_rules_cannot_be_deleted` and
+  `down_refuses_while_a_rule_exists`. `src/infra/storage/repo/plan_quota_repo_tests.rs`:
+  `a_revision_without_a_set_reads_the_empty_set`, `clearing_a_set_deletes_its_set_row`,
+  `a_rule_without_a_set_row_is_a_corrupt_row`, `a_set_count_that_disagrees_is_a_corrupt_row` and
+  `a_set_row_without_rules_is_a_corrupt_row`. On Postgres, `tests/postgres_plan_quota_rules.rs`:
+  `the_rule_checks_hold_on_postgres`, `down_refuses_while_a_rule_exists_on_postgres`,
+  `the_rule_repository_round_trips_on_postgres`, `a_damaged_set_is_a_corrupt_row_on_postgres` and
+  `a_set_read_in_one_transaction_keeps_its_snapshot_on_postgres`. `tests/migration_chain.rs` with the new step, the
+  schema guard's census and the two schema goldens.
+
+**Source:** Quotas DESIGN §3.7 (each owner's design defines its physical migrations). D-540 to D-545.
+
+#### D-547 [H] The preview carries the quota terms and the selected quota digest
+
+**Status:** DECIDED 2026-11-21.
+
+- **The terms.** `ResolvedBindings.quota_terms` is null for a revision without rules. For a revision with rules it
+  carries every rule with its pinned evidence and the revision's `quota_rules_digest`. The evidence is the part of
+  what the rule stored at its save (D-542) that the arithmetic needs: the definition's SKU and SKU version, metric and
+  digest, canonical unit, the rule's unit with its digest and factor, mapping and profile references, both policies'
+  references and digests, and change support. Resolve reads it from the stored rules and makes no catalog call.
+- **The selection.** `bss_pricing_sdk::digest::select_quota_rules` selects the rules of a selection: an item's rule
+  applies to the dimension value that the sale requests, and only to it. There is no default-chain fallback, also when
+  the price comes through the default chain. `selected_quota_digest` hashes the selected rules and their evidence,
+  ordered by `rule_id`, in the domain `pricing.selected-quota.v1`, with no text, locale or availability.
+- **REST.** `GET /resolve` answers the same terms as `quota_terms`, left out for a revision without rules, so every
+  existing resolve answer and golden stays as it is.
+- **In place.** `ResolvedBindings` gains the optional member in place, `None` for a revision without rules (D-532: no
+  version moves before production).
+- **The tests.** `pricing-sdk` digest tests: `selected_quota_digest_follows_the_requested_value_not_the_default_chain`
+  and `quota_free_terms_and_request_digests_are_unchanged`, with one new vector per domain in
+  `pricing-sdk/tests/fixtures/digests.json`. `tests/pricing_read_sdk.rs`:
+  `resolve_carries_the_quota_terms_of_every_rule`, `a_quota_free_revision_resolves_without_terms` and
+  `resolve_reads_the_quota_terms_without_a_catalog_call`. `tests/read_contract.rs`:
+  `get_resolve_answers_the_quota_terms`.
+
+**Source:** Quotas DESIGN §3.3.1.2 (the versioned read extension and its digests). Extends D-501.
+
+#### D-548 [H] An acceptance freezes the selected quota rules with the price terms
+
+**Status:** DECIDED 2026-11-21.
+
+- **The expected digest.** `NewSaleQuery.expected_quota_digest` carries the preview's `selected_quota_digest`. A
+  revision with rules refuses a sale without it, or with another digest, as `RESOLUTION_CHANGED`, also when no price
+  changed. A quota-free revision refuses a sale that sends one, as `RESOLUTION_CHANGED`. A caller that does not know
+  quotas cannot buy a plan with rules.
+- **The quantity.** A sale with selected rules needs a whole quantity from 1, else `QUANTITY_INVALID`.
+- **The recheck.** Outside the acceptance transaction, acceptance validates the selected rules through Products:
+  purpose acceptance, change kind `initial_set`, the accepted quantity, and each rule with its binding's SKU and SKU
+  version. A definition that is not enabled is `NOT_SELLABLE`, a changed definition `RESOLUTION_CHANGED`, a final
+  limit off its grid at the quantity `QUANTITY_INVALID`, any other check `UNSUPPORTED_TERMS`, and an outage 503.
+  Acceptance calls Products as its caller, so the caller of an acceptance (Orders' principal) needs `read` on
+  `quota_definition` (products P-D-275, D-542). Unlike resolve's SKU read (D-424), this call is not made as Pricing's
+  system actor.
+- **The freeze.** `AcceptanceReceipt.quota` (`AcceptedQuotaSnapshot`) holds the selected rules with their evidence,
+  each final limit at the original quantity, each availability revision seen, the selected digest, the original
+  quantity and `quota_snapshot_digest` (domain `pricing.quota-snapshot.v1`: the selected digest, the original
+  quantity, the tenant axes, the plan revision and the order line, that is the order id, the order version and the
+  line id). It is written in the same receipt and transaction as the prices; the transaction checks that the selection
+  has not moved. `PricingAcceptanceV1::acceptance` returns it, and a replay answers the stored receipt after any
+  catalog change.
+- **The digests.** `terms_digest` adds `quota_snapshot_digest` and `request_digest` adds `expected_quota_digest` only
+  when a quota part exists, so a quota-free sale hashes the same bytes as before.
+- **In place** (the owner's ruling of 2026-11-21). `NewSaleQuery`, `ResolvedBindings` and `AcceptanceReceipt` gain
+  optional members in place, and the receipt's schema stays 1 (D-532). A stored receipt without them decodes with
+  `None`.
+- **The tests.** `pricing-sdk` digest tests: `the_snapshot_digest_binds_quantity_and_tenant_axes` and
+  `an_expected_digest_moves_the_request_digest_and_a_snapshot_moves_the_terms_digest`. The receipt wire tests:
+  `a_receipt_without_quota_reads_and_writes_as_before`, `a_receipt_with_a_snapshot_round_trips` and
+  `a_snapshot_with_a_bad_digest_is_a_corrupt_row`. `tests/sellability.rs`:
+  `a_quota_bearing_plan_needs_the_expected_quota_digest`,
+  `a_stale_expected_quota_digest_is_resolution_changed_with_prices_unchanged`,
+  `acceptance_freezes_rules_quantity_and_digests_in_the_receipt`,
+  `a_replay_after_a_catalog_change_answers_the_frozen_receipt`, `acceptance_refuses_a_definition_not_enabled`,
+  `per_plan_unit_limits_are_validated_at_the_accepted_quantity`,
+  `a_fractional_quantity_with_rules_is_invalid_quantity` and `a_quota_free_sale_keeps_its_receipt_bytes`.
+  `tests/acceptance_receipts.rs`: `the_receipt_read_returns_the_frozen_snapshot`. Products' in-crate e2e:
+  `a_purchase_of_two_units_freezes_20_vcpu_and_40_gb`.
+
+**Source:** Owner, 2026-11-21 (the three commercial structs change in place). Quotas DESIGN §3.3.1.2. Extends D-505
+and D-510.

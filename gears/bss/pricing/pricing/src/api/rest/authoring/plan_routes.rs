@@ -2,7 +2,7 @@
 use super::{
     AuthoringState,
     caps::Capped,
-    dto, plan_items, plans,
+    dto, plan_items, plan_quota, plans,
     support::{
         authz_failure, etag, header, invalid_because, require_authenticated, transaction,
         transaction_read,
@@ -167,7 +167,9 @@ pub(super) fn routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              name and, while it is draft or pending, carried_sku_ids (D-480). Each summary's \
              price_on_sale_date is the default chain's approved price in force on sale_date, or \
              null when the caller's price_book read does not admit that entry's book, when only \
-             a value chain prices it, or when none is in force. reservations_settled is true when \
+             a value chain prices it, or when none is in force. quota_rules and \
+             quota_rules_digest are the revision's stored quota rules and their digest (D-540), \
+             [] and the empty set's digest without rules. reservations_settled is true when \
              no item is unreserved or confirmation_pending; lost counts as settled. Its version \
              is the ETag a following PATCH sends back as If-Match. Refusals: 403 without plan \
              read; 503 when the policy cannot judge the money; 404 for a revision the tenant \
@@ -179,6 +181,81 @@ pub(super) fn routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .path_param("id", "Plan revision id")
         .handler(get_revision)
         .json_response_with_schema::<dto::PricingPlanRevisionReadDto>(
+            openapi,
+            StatusCode::OK,
+            "Response",
+        )
+        .response_header(etag())
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    let router = OperationBuilder::get("/bss-pricing/v1/plan-revisions/{id}/quota-rules")
+        .operation_id("bss_pricing.get_plan_revision_quota_rules")
+        .summary("Read a revision's quota rules")
+        .description(
+            "Returns a plan revision's quota rules as stored, ordered by rule_id, and their \
+             stored digest, with the revision's version as revision_version and as the ETag a \
+             following PUT sends back as If-Match (D-540). Each rule carries the availability \
+             of its definition version that it saw when it was saved; the checks judge the \
+             current one. The read asks Products nothing. Refusals: 403 without plan read; 404 \
+             for a revision the tenant does not hold; 503 when the policy cannot judge.",
+        )
+        .tag("Pricing")
+        .authenticated()
+        .no_license_required()
+        .path_param("id", "Plan revision id")
+        .handler(get_quota_rules)
+        .json_response_with_schema::<dto::PricingPlanQuotaRulesDto>(
+            openapi,
+            StatusCode::OK,
+            "Response",
+        )
+        .response_header(etag())
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    let router = OperationBuilder::put("/bss-pricing/v1/plan-revisions/{id}/quota-rules")
+        .operation_id("bss_pricing.put_plan_revision_quota_rules")
+        .summary("Replace a draft revision's quota rules")
+        .description(
+            "Replaces the whole quota rule set of an unlocked draft revision, by its author, at \
+             the version the author read (If-Match), once per Idempotency-Key (D-543). The body \
+             is {\"quota_rules\": [...]}, at most 200 rules, each an exact Products quota \
+             definition version, an item of the revision, its dimension value, a logical binding, \
+             the subject resource_owner, a scope selection, a canonical integer amount, an \
+             allowed unit and the basis fixed or per_plan_unit; an empty array clears the set and \
+             reads nothing from Products. Each rule item's SKU version on the sale date and \
+             Products' validation of the complete set are read outside any transaction; a \
+             definition that is not enabled is saved with the availability it showed, and the \
+             checks show it red. The answer is the saved set ordered by rule_id with its digest \
+             and the new version as the ETag; the same key, If-Match and rules answer the first \
+             answer again, even after the ETag moved, whatever the body's spelling (member or \
+             rule order, an absent dimension_value, UUID case), and the key is shared with the \
+             SDK's replace_quota_rules. Refusals: 400 when If-Match or Idempotency-Key is \
+             missing or malformed, or the body is empty or unreadable; 409 \
+             IDEMPOTENCY_CONFLICT for other content under the key, IDEMPOTENCY_KEY_IN_FLIGHT \
+             while its first request has not answered; 404 for a revision the tenant does not \
+             hold; 409 REVISION_NOT_DRAFT; 403 NOT_DRAFT_AUTHOR; one refusal naming every \
+             failure as quota_rules[i].<field> with its code (QUOTA_RULE_INVALID, \
+             QUOTA_DEFINITION_CHANGED, QUOTA_AMOUNT_INVALID, QUOTA_UNIT_INEXACT, \
+             QUOTA_SCOPE_UNSUPPORTED, QUOTA_RULE_DUPLICATE, QUOTA_SET_INCOMPATIBLE), 409 when \
+             every failure is QUOTA_RULE_DUPLICATE or QUOTA_DEFINITION_CHANGED and 400 \
+             otherwise; either is an invalid-argument problem whose field violations carry the \
+             codes, with no reason; Products' own refusal; 409 STALE_REVISION when the revision \
+             moved or stopped being a draft, UNIT_CONTENDED when the items keep moving under the \
+             validation, CONTENDED when the read or the write stays contended past its retries; \
+             503 QUOTA_CATALOG_UNAVAILABLE when the Products quota catalog cannot answer, \
+             REGISTRY_UNAVAILABLE when the SKU versions cannot be read.",
+        )
+        .tag("Pricing")
+        .authenticated()
+        .no_license_required()
+        .path_param("id", "Plan revision id")
+        .json_request::<dto::PricingPlanQuotaRulesPut>(openapi, "Request")
+        .param(header("If-Match"))
+        .param(header("Idempotency-Key"))
+        .handler(put_quota_rules)
+        .json_response_with_schema::<dto::PricingPlanQuotaRulesDto>(
             openapi,
             StatusCode::OK,
             "Response",
@@ -432,6 +509,59 @@ async fn get_revision(
     .await?;
     super::names::named(&state, &ctx, body, Some(version)).await
 }
+async fn get_quota_rules(
+    Extension(state): Extension<Arc<AuthoringState>>,
+    Extension(enforcer): Extension<PolicyEnforcer>,
+    ctx: Option<Extension<SecurityContext>>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, CanonicalError> {
+    let ctx = require_authenticated(ctx)?;
+    let scope = authz::access_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::PLAN,
+        actions::READ,
+        None,
+        None,
+    )
+    .await
+    .map_err(authz_failure)?;
+    plan_quota::get(&state, scope, &ctx, id).await
+}
+async fn put_quota_rules(
+    Extension(state): Extension<Arc<AuthoringState>>,
+    Extension(enforcer): Extension<PolicyEnforcer>,
+    ctx: Option<Extension<SecurityContext>>,
+    Path(id): Path<Uuid>,
+    corr: Option<Extension<correlation::CorrelationId>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, CanonicalError> {
+    let ctx = require_authenticated(ctx)?;
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-replace:p1:inst-quota-authorize
+    let scope = authz::access_scope(
+        &enforcer,
+        &ctx,
+        &resource_types::PLAN,
+        actions::AUTHOR,
+        Some(OwnerTenant(ctx.subject_tenant_id())),
+        None,
+    )
+    .await
+    .map_err(authz_failure)?;
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-replace:p1:inst-quota-authorize
+    let correlation = correlation::require_correlation(corr)?;
+    let version = preconditions::if_match(&headers)?.get();
+    let key = preconditions::idempotency_key(&headers)?;
+    let body = plan_quota::body(&body)?;
+    let request = plan_quota::Replace {
+        id,
+        version,
+        key,
+        body,
+    };
+    plan_quota::put(&state, scope, &ctx, correlation, request).await
+}
 async fn get_reservations(
     Extension(state): Extension<Arc<AuthoringState>>,
     Extension(enforcer): Extension<PolicyEnforcer>,
@@ -612,7 +742,8 @@ pub(super) fn item_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Rout
         .summary("Remove a plan item")
         .description(
             "Removes an item from a draft revision and releases its SKU reference. Refusals: 403 \
-             NOT_DRAFT_AUTHOR; 404; 409 REVISION_NOT_DRAFT or ITEM_CONFIRMATION_PENDING.",
+             NOT_DRAFT_AUTHOR; 404; 409 REVISION_NOT_DRAFT, ITEM_CONFIRMATION_PENDING, or \
+             ITEM_HAS_QUOTA_RULES while a quota rule of the revision names the item (D-543).",
         )
         .tag("Pricing")
         .authenticated()
@@ -653,11 +784,15 @@ pub(super) fn item_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Rout
             "Returns the checks of 1 to 50 revisions, each byte-identical to GET \
              /plan-revisions/{id}/checks, and missing: the ids the tenant does not hold or the \
              caller's plan-read scope does not admit (that door's 404). One stored read and one \
-             Products call over the union of SKUs. An answer that is all missing makes no \
-             Products call. The plans list gains no ready flag (D-460). Refusals: 400 \
-             QUERY_INVALID for an empty list, more than 50 ids, a repeated id, a repeated \
-             revision_ids key, a malformed id, or any other key; Products' own refusal; 503 \
-             REGISTRY_UNAVAILABLE.",
+             Products call over the union of SKUs; each revision with quota rules adds the SKU \
+             versions on its sale date and one validation of its rules by Products (D-544), so \
+             each answer carries revision_version, quota_rules_digest and, with rules, the \
+             quota rows whose subjects name quota_rule_id and field. An answer that is all \
+             missing makes no Products call. The plans list gains no ready flag (D-460). \
+             Refusals: 400 QUERY_INVALID for an empty list, more than 50 ids, a repeated id, a \
+             repeated revision_ids key, a malformed id, or any other key; Products' own refusal; \
+             503 REGISTRY_UNAVAILABLE, or QUOTA_CATALOG_UNAVAILABLE when the Products quota \
+             catalog cannot answer, never a ready answer.",
         )
         .tag("Pricing")
         .authenticated()
@@ -685,9 +820,13 @@ pub(super) fn item_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Rout
              book), whether it may be submitted, and quorum_required, the plan_revision quorum a \
              submit will need (D-481), from fresh SKU reads. An item with no entry keeps the row \
              ITEM_ENTRY_MISSING (\"Every item points at a price\") red (D-512); submit, the \
-             scheduled apply and publish refuse the revision while any row is red. Refusals: 404 \
-             for a revision the tenant does not hold; Products' own refusal; 503 \
-             REGISTRY_UNAVAILABLE.",
+             scheduled apply and publish refuse the revision while any row is red. The answer \
+             names the revision_version and the quota_rules_digest it judged; a revision with \
+             quota rules is validated by Products on every read and adds eight quota rows after \
+             the others, each red row's subjects naming the item, the quota_rule_id and the \
+             field (D-544). Refusals: 404 for a revision the tenant does not hold; Products' own \
+             refusal; 503 REGISTRY_UNAVAILABLE, or QUOTA_CATALOG_UNAVAILABLE when the Products \
+             quota catalog cannot answer, never a ready answer.",
         )
         .tag("Pricing")
         .authenticated()

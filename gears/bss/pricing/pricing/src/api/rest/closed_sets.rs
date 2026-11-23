@@ -14,6 +14,8 @@ use crate::domain::{
 };
 use crate::infra::{approval_kinds::Kind as ApprovalKind, storage::RepoError};
 use bss_approval::{UnitState, Verdict};
+use bss_pricing_sdk::plan_quota::{PlanQuotaBasis, QuotaSubjectSelector};
+use bss_products_sdk::quota::catalog::QuotaAvailabilityState;
 
 macro_rules! closed_set {
     ($(#[$meta:meta])* $name:ident from $domain:ident { $($variant:ident => $token:literal),+ $(,)? }) => {
@@ -32,6 +34,14 @@ macro_rules! closed_set {
                 }
             }
         }
+    };
+    (readable $(#[$meta:meta])* $name:ident from $domain:ident {
+        $($variant:ident => $token:literal),+ $(,)?
+    }) => {
+        closed_set!(
+            $(#[$meta])* #[derive(serde::Deserialize)]
+            $name from $domain { $($variant => $token),+ }
+        );
     };
     ($(#[$meta:meta])* $name:ident { $($variant:ident => $token:literal),+ $(,)? }) => {
         $(#[$meta])*
@@ -249,6 +259,28 @@ closed_set!(
         Priced => "priced",
         Scheduled => "scheduled",
         Unpriced => "unpriced",
+    }
+);
+// The three quota sets also read back from a stored answer of the quota rules PUT, which the
+// SDK's local client answers from (D-540); a request still keeps `string`.
+closed_set!(
+    readable
+    /// How a plan quota rule states its amount (D-541): the limit itself, or the limit for one
+    /// plan unit.
+    PricingQuotaBasis from PlanQuotaBasis { Fixed => "fixed", PerPlanUnit => "per_plan_unit" }
+);
+closed_set!(
+    readable
+    /// Whose quota a plan quota rule sets (D-541).
+    PricingQuotaSubjectSelector from QuotaSubjectSelector { ResourceOwner => "resource_owner" }
+);
+closed_set!(
+    readable
+    /// A Products quota definition version's availability, as a rule saw it at its save (D-542).
+    PricingQuotaAvailabilityState from QuotaAvailabilityState {
+        Enabled => "enabled",
+        Disabled => "disabled",
+        Withdrawn => "withdrawn",
     }
 );
 

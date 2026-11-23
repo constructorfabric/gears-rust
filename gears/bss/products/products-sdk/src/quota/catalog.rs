@@ -15,6 +15,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::gts::{QuotaAccountingPolicyV1, QuotaChangeSupport, QuotaKind, QuotaScopePolicyV1};
+use super::validation::{QuotaSetRequest, QuotaSetValidation};
 
 /// A positive version, serialized as a decimal string (quotas DESIGN §3.3.1.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -96,6 +97,17 @@ pub struct QuotaOwnerRef {
     /// The record's version.
     pub version: QuotaVersion,
     /// The version's canonical digest, lowercase hex.
+    pub digest: String,
+}
+
+/// An exact definition version as a plan rule names it (P-D-275).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct QuotaDefinitionRef {
+    /// The definition.
+    pub id: Uuid,
+    /// The version.
+    pub version: QuotaVersion,
+    /// The version's digest as the plan saw it, lowercase hex.
     pub digest: String,
 }
 
@@ -259,7 +271,8 @@ pub struct QuotaDefinitionPage {
     pub next_cursor: Option<String>,
 }
 
-/// The approved quota catalog for plan authoring (P-D-272). Pricing calls it as its caller.
+/// The approved quota catalog for plan authoring (P-D-272) and the quota-set validation
+/// (P-D-275). Pricing calls it as its caller.
 #[async_trait]
 pub trait ProductsQuotaCatalogClientV1: Send + Sync {
     /// The definition versions applicable to one SKU version, in the caller's tenant.
@@ -285,6 +298,24 @@ pub trait ProductsQuotaCatalogClientV1: Send + Sync {
         version: QuotaVersion,
         locale: Option<&str>,
     ) -> Result<QuotaDefinition, CanonicalError>;
+
+    /// Validate one complete set of plan quota rules for Pricing (P-D-275, P-D-276): every check
+    /// found and each resolved definition; facts, not a refusal policy.
+    ///
+    /// # Errors
+    /// 400 `VALIDATION` on the malformed field: more than 200 rules or 200 prior limits, a
+    /// locale over 64 bytes, a repeated `rule_id`, a logical binding key or a scope key that is
+    /// not 1 to 64 bytes, more than 8 scope keys, a dimension value or subject selector over 512
+    /// bytes, a unit or metric reference over the GTS id maximum (1024 bytes), a quantity that is
+    /// not a canonical integer from 1, `Acceptance` without a quantity, prior limits with
+    /// `InitialSet` or none with `Increase` or `Unchanged`, a prior amount that is not a canonical
+    /// integer, or one binding and metric in two prior limits (`validation::MAX_RULES` and its
+    /// siblings name the bounds); 403 / 503 from the PDP; 500 for a stored row that does not read.
+    async fn validate_quota_set(
+        &self,
+        ctx: &SecurityContext,
+        request: QuotaSetRequest,
+    ) -> Result<QuotaSetValidation, CanonicalError>;
 }
 
 #[cfg(test)]

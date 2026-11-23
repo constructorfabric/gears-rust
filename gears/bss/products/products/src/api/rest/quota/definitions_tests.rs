@@ -7,19 +7,16 @@ use std::sync::Arc;
 
 use super::definitions::DEFINITIONS;
 use crate::authz::labels;
-use crate::infra::storage::repo::quota_catalog_repo::insert_availability;
 use crate::quota_test_support::{
-    FakeQuotaRegistry, LogCapture, QuotaApp, QuotaFakes, VCPU_METRIC, VM_TYPE, quota_app,
-    quota_app_for, refusal, registered, seed_sku_version, vcpu_record, vcpu_record_numbered,
+    FailingResolver, FakeQuotaRegistry, LogCapture, QuotaApp, QuotaFakes, VCPU_METRIC, VM_TYPE,
+    quota_app, quota_app_for, refusal, registered, seed_sku_version, vcpu_record,
+    vcpu_record_numbered,
 };
-use crate::test_support::{body_json, get, problem_code, repo_connection};
-use async_trait::async_trait;
-use authz_resolver_sdk::models::{EvaluationRequest, EvaluationResponse};
-use bss_products_sdk::quota::catalog::{QuotaAvailabilityState, QuotaVersion};
+use crate::test_support::{body_json, get, problem_code};
+use bss_products_sdk::quota::catalog::QuotaVersion;
 use sea_orm::{ConnectionTrait, Database};
 use serde_json::{Value, json};
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_security::PlatformSecurityContext;
 use uuid::Uuid;
 
 /// The quota endpoints for one tenant, with the catalog's helpers.
@@ -72,24 +69,7 @@ impl CatalogFixture {
     /// Availability revision 2 of `definition` `version`, enabled: test-only, since no endpoint
     /// enables a version.
     async fn enable(&self, definition: Uuid, version: QuotaVersion) {
-        let (db, scope) = repo_connection(&self.q.dsn, self.tenant).await;
-        insert_availability(
-            &db.conn().unwrap(),
-            &scope.tenant_only(),
-            self.tenant,
-            &crate::domain::quota::Availability {
-                definition_id: definition,
-                version,
-                revision: QuotaVersion::new(2).unwrap(),
-                state: QuotaAvailabilityState::Enabled,
-                reason_code: None,
-                qualification: None,
-                observed_at: crate::infra::storage::stored_now(),
-                decided_by: Uuid::new_v4(),
-            },
-        )
-        .await
-        .unwrap();
+        self.q.enable(self.tenant, definition, version).await;
     }
 }
 
@@ -527,20 +507,6 @@ async fn another_tenants_definition_is_not_found() {
     assert_eq!(foreign.status(), 404);
     let page = body_json(get(&q.app, other, &list_uri(sku, 1, "&availability=all")).await).await;
     assert!(items(&page).is_empty(), "another tenant lists none");
-}
-
-/// A PDP that fails to evaluate: an unreachable PDP.
-struct FailingResolver;
-
-#[async_trait]
-impl authz_resolver_sdk::AuthZResolverApi for FailingResolver {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        Err(CanonicalError::internal("pdp unreachable".to_owned()).create())
-    }
 }
 
 #[tokio::test]

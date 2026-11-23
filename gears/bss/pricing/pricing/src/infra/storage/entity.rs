@@ -8,6 +8,8 @@ pub mod dimension_key;
 pub mod idempotency;
 pub mod plan;
 pub mod plan_item;
+pub mod plan_quota_rule;
+pub mod plan_quota_set;
 pub mod plan_revision;
 pub mod price;
 pub mod price_book;

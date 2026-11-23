@@ -1396,11 +1396,12 @@ async fn exactly_the_reads_that_declare_an_etag_answer_one() {
         assert_eq!(!tag.is_empty(), declares, "{path}: ETag {tag:?}");
         measured += 1;
     }
-    // 27 with the currency table (D-537), which declares no ETag; 26 was run 9.7's batch checks
+    // 28 with the quota rules read (D-540), whose ETag is the revision's version; 27 with the
+    // currency table (D-537), which declares no ETag; 26 was run 9.7's batch checks
     // read (D-482); 25 was run 9.8b's plans counts (D-485). 24 was run 9.6's reservations read and
     // effective-policy read (D-480, D-481), which declare no ETag. 22 was run 9.3's unit counts
     // (D-470).
-    assert_eq!(measured, 27, "every GET operation is measured");
+    assert_eq!(measured, 28, "every GET operation is measured");
 }
 
 // ------------------------------------------------------------------ phase 9 review R27: the writes' ETag
@@ -1717,6 +1718,12 @@ async fn exactly_the_writes_that_declare_an_etag_answer_one() {
     writes
         .call(f, &me, delete, &item_path, json!({}), None)
         .await;
+    // D-543: the draft's quota rules cleared, which asks Products nothing.
+    let tag = etag_of(f, &revision_path).await;
+    let replace = ("PUT", "/plan-revisions/{id}/quota-rules");
+    let path = format!("{revision_path}/quota-rules");
+    let body = json!({"quota_rules": []});
+    writes.call(f, &me, replace, &path, body, Some(&tag)).await;
     let submit = ("POST", "/plan-revisions/{id}/submit");
     let path = format!("{revision_path}/submit");
     let receipt = writes.call(f, &me, submit, &path, json!({}), None).await.1;
@@ -1779,7 +1786,7 @@ async fn exactly_the_writes_that_declare_an_etag_answer_one() {
         unmeasured.is_empty(),
         "every write op is measured: {unmeasured:?}"
     );
-    assert_eq!(measured.len(), 34, "the 34 write ops of the 61");
+    assert_eq!(measured.len(), 35, "the 35 write ops of the 63");
 }
 
 // ------------------------------------------------------------------ phase 4 review F1: what was refused

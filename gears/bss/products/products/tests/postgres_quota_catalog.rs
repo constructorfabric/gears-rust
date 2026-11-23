@@ -893,6 +893,129 @@ async fn the_definition_digests_answer_each_stored_version_on_postgres() {
     assert!(foreign.is_empty(), "another tenant's scope reads none");
 }
 
+/// The definition versions of a quota set in two statements and their mappings' facts in one:
+/// each stored version of the caller's tenant with its current availability; a version not
+/// stored, or of another tenant, is absent (P-D-275).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_definition_versions_of_a_set_read_on_postgres() {
+    let mut f = Fixture::new().await;
+    let sku = Uuid::new_v4();
+    let mine = f.definition(sku, 1, Uuid::from_u128(0x1)).await;
+    f.availability(mine, 2, QuotaAvailabilityState::Enabled)
+        .await
+        .unwrap();
+    let (tenant, scope) = (f.tenant, f.scope.clone());
+    let other = Uuid::new_v4();
+    f.tenant = other;
+    f.scope = AccessScope::for_tenant(other);
+    let theirs = f.definition(sku, 1, Uuid::from_u128(0x1)).await;
+    f.tenant = tenant;
+    f.scope = scope;
+    let keys = [(mine, v(1)), (theirs, v(1)), (Uuid::new_v4(), v(1))];
+    let conn = f.db.conn().unwrap();
+    let rows = catalog::find_definitions(&conn, &f.scope, f.tenant, &keys)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (row, current) = &rows[0];
+    assert_eq!(row.definition_id, mine);
+    assert_eq!(
+        (current.revision, current.state),
+        (v(2), QuotaAvailabilityState::Enabled)
+    );
+    let facts = catalog::mapping_facts(
+        &conn,
+        &f.scope,
+        f.tenant,
+        &[
+            (row.mapping_id, row.mapping_version),
+            (Uuid::new_v4(), v(1)),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert_eq!(
+        facts[&(row.mapping_id, row.mapping_version)].profile,
+        json!({})
+    );
+    let foreign = catalog::find_definitions(&conn, &AccessScope::for_tenant(other), other, &keys)
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign
+            .iter()
+            .map(|(d, _)| d.definition_id)
+            .collect::<Vec<_>>(),
+        [theirs],
+        "the other tenant reads only its own"
+    );
+}
+
+/// The set read matches each id with its own version, pair by pair: with definition A at
+/// versions 1 and 2 and B at version 1, asking for A at 2 and B at 1 answers exactly those two,
+/// each with its own availability.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_set_read_matches_each_definition_with_its_own_version_on_postgres() {
+    let f = Fixture::new().await;
+    let sku = Uuid::new_v4();
+    let a = f.definition(sku, 1, Uuid::from_u128(0x1)).await;
+    let b = f.definition(sku, 1, Uuid::from_u128(0x1)).await;
+    let conn = f.db.conn().unwrap();
+    let (a1, _) = catalog::find_definition(&conn, &f.scope, f.tenant, a, v(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let target = f.target(&Uuid::new_v4().to_string()).await;
+    let candidate = f.candidate(target.id, None, "tenant-vcpu").await;
+    catalog::insert_definition(
+        &conn,
+        &f.scope,
+        f.tenant,
+        &DefinitionVersion {
+            version: v(2),
+            candidate_id: candidate.id,
+            ..a1
+        },
+        &[Uuid::from_u128(0x1)],
+    )
+    .await
+    .unwrap();
+    catalog::insert_availability(
+        &conn,
+        &f.scope,
+        f.tenant,
+        &Availability {
+            definition_id: a,
+            version: v(2),
+            revision: v(1),
+            state: QuotaAvailabilityState::Enabled,
+            reason_code: None,
+            qualification: None,
+            observed_at: f.now,
+            decided_by: f.actor,
+        },
+    )
+    .await
+    .unwrap();
+    let rows = catalog::find_definitions(&conn, &f.scope, f.tenant, &[(a, v(2)), (b, v(1))])
+        .await
+        .unwrap();
+    let mut found: Vec<(Uuid, QuotaVersion, QuotaVersion, QuotaAvailabilityState)> = rows
+        .iter()
+        .map(|(d, current)| (d.definition_id, d.version, current.version, current.state))
+        .collect();
+    found.sort_by_key(|row| (row.0, row.1));
+    let mut expected = vec![
+        (a, v(2), v(2), QuotaAvailabilityState::Enabled),
+        (b, v(1), v(1), QuotaAvailabilityState::Disabled),
+    ];
+    expected.sort_by_key(|row| (row.0, row.1));
+    assert_eq!(found, expected);
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_highest_revision_compares_as_a_number_on_postgres() {

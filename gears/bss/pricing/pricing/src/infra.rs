@@ -5,6 +5,7 @@ pub mod book_stats;
 pub mod broker;
 pub mod error_mapping;
 pub mod events;
+pub mod plan_quota;
 pub mod plan_revisions;
 pub mod plan_summary;
 pub mod prices;

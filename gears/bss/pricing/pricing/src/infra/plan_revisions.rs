@@ -11,6 +11,7 @@
 //! built by the same function from the same fresh reads.
 //!
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-revision-unit:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-governance:p1
 use crate::{
     api::rest::authoring::{
         plans,
@@ -19,11 +20,12 @@ use crate::{
     domain::plan::{self, RevisionState},
     infra::{
         events::{self, PlanRevisionPublished, TxOutbox},
+        plan_quota,
         reference_ticker::system_actor,
         storage::{
             RepoError,
             entity::{plan_item, plan_revision},
-            repo::{approval_repo, plan_item_repo, plan_repo, plan_revision_repo},
+            repo::{approval_repo, plan_item_repo, plan_quota_repo, plan_repo, plan_revision_repo},
         },
     },
 };
@@ -215,15 +217,22 @@ pub async fn catch_up(
 /// item is its SKU and its entry (D-467). A unit submitted before D-467 fingerprinted each item's
 /// treatment and quantities too, so its first vote or reject after D-467 finds its content changed
 /// and refreshes it once, at the next generation (`bss_approval`'s stale refresh).
-#[must_use]
+///
+/// A revision with quota rules (`quota`, its stored set) also carries `quota_rules_digest` and
+/// `quota_rules`: each rule's members as its digest encodes them, in `rule_id` order, as JSON
+/// strings (D-545), so another set is another content. A revision without rules carries neither,
+/// and its content is what it was before quota rules.
+/// # Errors
+/// `CorruptRow` for a stored rule that does not convert.
 pub fn content(
     revision: &plan_revision::Model,
     items: &[plan_item::Model],
     entries: &[crate::infra::storage::entity::price_book_entry::Model],
-) -> Value {
+    quota: Option<&plan_quota_repo::StoredSet>,
+) -> Result<Value, RepoError> {
     let mut items: Vec<&plan_item::Model> = items.iter().collect();
     items.sort_by_key(|i| i.sku_id);
-    json!({
+    let mut content = json!({
         "book_id": revision.book_id,
         "available_from": revision.available_from.map(|d| d.to_string()),
         "items": items
@@ -246,7 +255,19 @@ pub fn content(
                 item
             })
             .collect::<Vec<_>>(),
-    })
+    });
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-fingerprint
+    if let Some(set) = quota.filter(|set| !set.rules.is_empty()) {
+        let rules = set
+            .rules
+            .iter()
+            .map(|row| plan_quota::rule_of(row).map(|rule| plan_quota::rule_json(&rule)))
+            .collect::<Result<Vec<_>, _>>()?;
+        content["quota_rules_digest"] = Value::String(set.digest.clone());
+        content["quota_rules"] = Value::Array(rules);
+    }
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-fingerprint
+    Ok(content)
 }
 
 /// One SKU's current descriptors, shown to the reviewer for information only (D-408).
@@ -377,9 +398,11 @@ fn codes(red: &[plan::Check]) -> String {
 }
 
 impl PlanRevisionSubject {
+    /// [`content`] of `revision`, its entries and its quota set read in the subject's
+    /// transaction.
     async fn content(
         &self,
-        tx: &impl DBRunner,
+        tx: &DbTx<'_>,
         revision: &plan_revision::Model,
         items: &[plan_item::Model],
     ) -> Result<Value, ApprovalError> {
@@ -395,7 +418,10 @@ impl PlanRevisionSubject {
         )
         .await
         .map_err(storage)?;
-        Ok(content(revision, items, &entries))
+        let quota = plan_quota_repo::for_revision(tx, &self.scope(), self.tenant_id, revision.id)
+            .await
+            .map_err(storage)?;
+        content(revision, items, &entries, Some(&quota)).map_err(storage)
     }
 
     /// A subject for the caller's tenant.
@@ -483,8 +509,9 @@ impl PlanRevisionSubject {
         }
     }
     /// The checks of `GET /plan-revisions/{id}/checks` on the stored state of this transaction
-    /// and fresh SKU reads, on the subject's day (its UTC date). No scheduled revision stands
-    /// beside the pending one it judges (D-451), so its plan's revisions read as stored.
+    /// and fresh SKU reads, with Products' fresh quota verdict, on the subject's day (its UTC
+    /// date), the day the capture read the SKU versions on. No scheduled revision stands beside
+    /// the pending one it judges (D-451), so its plan's revisions read as stored.
     async fn judge(&self, tx: &DbTx<'_>) -> Result<Vec<plan::Check>, ApprovalError> {
         let today = self.now.to_offset(time::UtcOffset::UTC).date();
         let mut context =
@@ -518,7 +545,53 @@ impl PlanRevisionSubject {
             })?;
         }
         context.skus = self.skus(context.items.iter().map(|i| i.sku_id))?;
+        self.quota(&mut context)?;
         Ok(plan::checks(&context, today))
+    }
+    /// The quota half of the checks (D-545): a revision with stored rules takes Products' verdict
+    /// and the SKU versions its capture read before the transaction, whose stored state
+    /// `check_local` has already compared, so the quota rows judge the rules of this transaction.
+    /// A revision without rules reads nothing. A capture that is missing is `UNIT_CONTENDED`
+    /// (capture again); a catalog outage is `QUOTA_CATALOG_UNAVAILABLE` (503); any other failure
+    /// is kept and answered as its dependency gave it.
+    // @cpt-algo:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1
+    fn quota(&self, context: &mut plan::PlanContext) -> Result<(), ApprovalError> {
+        if context.quota_rules.is_empty() {
+            return Ok(());
+        }
+        // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-recheck
+        let Some(quota) = self.meter_observations.quota.as_ref() else {
+            // Every state that reaches the judgement is captured: a normal path never gets here.
+            tracing::error!(
+                revision_id = %self.revision_id,
+                "pricing: a revision with quota rules was judged without its quota capture"
+            );
+            self.refuse(support::conflict(support::UNIT_CONTENDED));
+            return Err(invalid(
+                "UNIT_CONTENDED",
+                format!("revision {} has no quota capture", self.revision_id),
+            ));
+        };
+        let judged = match quota.verdict() {
+            Ok(verdict) => {
+                context.quota_verdict = Some(verdict.clone());
+                context.quota_sku_versions = quota.versions().clone();
+                Ok(())
+            }
+            Err(error) if plan_quota::is_unavailable(&error) => Err(invalid(
+                "QUOTA_CATALOG_UNAVAILABLE",
+                "Products quota catalog",
+            )),
+            Err(error) => {
+                self.refuse(error);
+                Err(invalid(
+                    "QUOTA_CATALOG_REFUSED",
+                    "Products refused the quota rules' validation",
+                ))
+            }
+        };
+        // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-recheck
+        judged
     }
 }
 

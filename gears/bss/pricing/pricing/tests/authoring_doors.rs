@@ -434,6 +434,8 @@ async fn every_route_denies_authorization_before_preconditions_or_disclosure() {
         ("GET", format!("/price-book-entries/{id}/prices")),
         ("POST", format!("/plan-revisions/{id}/unschedule")),
         ("GET", format!("/plan-revisions/{id}/reservations")),
+        ("GET", format!("/plan-revisions/{id}/quota-rules")),
+        ("PUT", format!("/plan-revisions/{id}/quota-rules")),
         ("GET", "/approval-policy/prices/effective".into()),
     ] {
         assert_eq!(
@@ -868,6 +870,18 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
             "plan",
             "read",
         ),
+        (
+            "GET",
+            format!("/plan-revisions/{id}/quota-rules"),
+            "plan",
+            "read",
+        ),
+        (
+            "PUT",
+            format!("/plan-revisions/{id}/quota-rules"),
+            "plan",
+            "author",
+        ),
         // D-481: prices is read under price_book_entry read. plan_revision is the other grant
         // of the same door, pinned in tests/revision_reads.rs.
         (
@@ -891,10 +905,10 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
             )
         })
         .collect();
-    // 61: run 9.7's batch checks read (D-482), run 9.8b's plans counts (D-485), the cancel and
-    // end doors (D-520, D-521), the book's archive and unarchive (D-522), and the currency table
-    // (D-537).
-    assert_eq!(table.len(), 61);
+    // 63: run 9.7's batch checks read (D-482), run 9.8b's plans counts (D-485), the cancel and
+    // end doors (D-520, D-521), the book's archive and unarchive (D-522), the currency table
+    // (D-537), and the quota rules read and replace (D-540, D-543).
+    assert_eq!(table.len(), 63);
     assert_eq!(rows.len(), table.len(), "one row per route");
     assert_eq!(
         rows, f.registered,

@@ -16,7 +16,7 @@ use bss_products_sdk::models::Sku;
 use std::collections::BTreeMap;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::{
-    DbConn,
+    DbConn, DbTx,
     secure::{AccessScope, DBRunner},
 };
 use toolkit_security::SecurityContext;
@@ -93,6 +93,9 @@ pub struct Observations {
     entries: BTreeMap<Uuid, Result<ObservedEntry, CanonicalError>>,
     skus: BTreeMap<Uuid, Result<Sku, CanonicalError>>,
     versions: BTreeMap<Uuid, Result<Vec<bss_products_sdk::models::SkuVersion>, CanonicalError>>,
+    /// The quota half (D-545): `None` for a capture of no revision. A revision without rules
+    /// keeps the empty set's digest, so its check sees a set added since the capture.
+    pub(crate) quota: Option<crate::infra::plan_quota::QuotaObservation>,
 }
 /// The local selection that supplied a detached capture, including removals and re-pointing.
 #[derive(Clone, Default)]
@@ -190,6 +193,7 @@ impl Observations {
             entries: BTreeMap::new(),
             skus: BTreeMap::new(),
             versions: BTreeMap::new(),
+            quota: None,
         };
         let wanted: Vec<Uuid> = entries
             .iter()
@@ -259,10 +263,12 @@ impl Observations {
         Ok(result)
     }
     /// Compare the entire local selection and every captured entry before consuming any
-    /// provider result. Local drift is a typed rollback signal, never an evidence conflict.
+    /// provider result, then the quota half's stored state (its set digest, items and sale
+    /// date). Local drift is a typed rollback signal, never an evidence conflict. The quota half
+    /// reads a set, two statements that must see one snapshot, so this takes the transaction.
     /// # Errors
     /// Storage failure or a selection that must be captured again outside the transaction.
-    pub async fn check_local(&self, conn: &impl DBRunner, tenant: Uuid) -> Result<(), DoorError> {
+    pub async fn check_local(&self, conn: &DbTx<'_>, tenant: Uuid) -> Result<(), DoorError> {
         if !self.selection.matches(conn, tenant).await? {
             return Err(DoorError::SelectionMoved);
         }
@@ -284,6 +290,9 @@ impl Observations {
             .collect::<BTreeMap<_, _>>();
         if current != captured {
             return Err(DoorError::SelectionMoved);
+        }
+        if let Some(quota) = &self.quota {
+            quota.check_local(conn, tenant).await?;
         }
         Ok(())
     }

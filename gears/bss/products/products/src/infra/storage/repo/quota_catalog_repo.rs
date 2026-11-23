@@ -1,4 +1,5 @@
 //! @cpt-dod:cpt-cf-bss-products-dod-quota-catalog-store:p1
+//! @cpt-dod:cpt-cf-bss-products-dod-quota-set-validation:p1
 //! Quota catalog persistence (P-D-270, P-D-271, P-D-272, P-D-274): mapping versions with their
 //! profile, definition versions with their resource types, and availability observations, every
 //! read and write scoped by the caller's `AccessScope` and the tenant.
@@ -578,6 +579,141 @@ pub async fn find_definition(
             .await?
             .pop(),
     )
+}
+
+/// One condition naming each `(id, version)` pair of `keys` once: `any(all(id, version), …)`;
+/// `None` when no pair is left, since a version beyond the `bigint` column names no stored row.
+fn version_pairs<C: ColumnTrait>(
+    keys: &[(Uuid, QuotaVersion)],
+    id_column: C,
+    version_column: C,
+) -> Option<Condition> {
+    let pairs: BTreeSet<(Uuid, i64)> = keys
+        .iter()
+        .filter_map(|(id, version)| Some((*id, i64::try_from(version.get()).ok()?)))
+        .collect();
+    (!pairs.is_empty()).then(|| {
+        pairs
+            .into_iter()
+            .fold(Condition::any(), |any, (id, version)| {
+                any.add(
+                    Condition::all()
+                        .add(id_column.eq(id))
+                        .add(version_column.eq(version)),
+                )
+            })
+    })
+}
+
+/// The definition versions `keys` names, each with its current availability, in TWO statements
+/// whatever the set holds: the versions, then their availability grouped (the list's own read).
+/// A version not stored, or outside `scope`, is absent from the answer (P-D-275).
+/// # Errors
+/// Scoped storage failures; a stored row that does not decode, or a version without availability.
+pub async fn find_definitions(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    keys: &[(Uuid, QuotaVersion)],
+) -> Result<Vec<DefinitionRow>, RepoError> {
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-read
+    use quota_definition_version as dv;
+    let Some(pairs) = version_pairs(keys, dv::Column::DefinitionId, dv::Column::Version) else {
+        return Ok(Vec::new());
+    };
+    let rows = dv::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(dv::Column::TenantId.eq(tenant_id))
+                .add(pairs),
+        )
+        .order_by(dv::Column::DefinitionId, Order::Asc)
+        .order_by(dv::Column::Version, Order::Asc)
+        .all(runner)
+        .await
+        .map_err(|e| driver_failure("find quota definitions".into(), e))?
+        .into_iter()
+        .map(definition_of)
+        .collect::<Result<Vec<_>, _>>()?;
+    with_current_availability(runner, scope, tenant_id, rows).await
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-read
+}
+
+/// What the set judgement needs of a mapping version: its adapter target and its profile content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappingFacts {
+    /// The adapter target the mapping enforces on.
+    pub target_id: Uuid,
+    /// The profile version's content (P-D-270), as stored.
+    pub profile: serde_json::Value,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct MappingFactRow {
+    mapping_id: Uuid,
+    version: i64,
+    target_id: Uuid,
+    profile_json: serde_json::Value,
+}
+
+/// The facts of each mapping version `keys` names, in ONE statement that reads neither the
+/// mapping's own content nor its digests; absent when not stored or outside `scope`.
+/// # Errors
+/// Scoped storage failures; a stored row that does not decode. A version beyond the stored range
+/// names no row.
+pub async fn mapping_facts(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    keys: &[(Uuid, QuotaVersion)],
+) -> Result<HashMap<(Uuid, QuotaVersion), MappingFacts>, RepoError> {
+    // @cpt-begin:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-read
+    use quota_mapping_version as mv;
+    let Some(pairs) = version_pairs(keys, mv::Column::MappingId, mv::Column::Version) else {
+        return Ok(HashMap::new());
+    };
+    let rows: Vec<MappingFactRow> = mv::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(
+            Condition::all()
+                .add(mv::Column::TenantId.eq(tenant_id))
+                .add(pairs),
+        )
+        .project_all(runner, |query| {
+            query
+                .select_only()
+                .column(mv::Column::MappingId)
+                .column(mv::Column::Version)
+                .column(mv::Column::TargetId)
+                .column(mv::Column::ProfileJson)
+                .into_model::<MappingFactRow>()
+        })
+        .await
+        .map_err(|e| driver_failure("quota mapping facts".into(), e))?;
+    rows.into_iter()
+        .map(|row| {
+            let key = format!("{} version {}", row.mapping_id, row.version);
+            let version = stored_version(row.version, MAPPING_TABLE, tenant_id, &key, "version")?;
+            let profile = stored_object(
+                row.profile_json,
+                MAPPING_TABLE,
+                tenant_id,
+                &key,
+                "profile_json",
+            )?;
+            Ok((
+                (row.mapping_id, version),
+                MappingFacts {
+                    target_id: row.target_id,
+                    profile,
+                },
+            ))
+        })
+        .collect()
+    // @cpt-end:cpt-cf-bss-products-flow-quota-set-validate:p1:inst-quota-set-read
 }
 
 #[derive(Debug, FromQueryResult)]

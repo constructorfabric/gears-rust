@@ -234,7 +234,8 @@ async fn review_l2_policyless_fingerprint_matches_pre_seam() {
     entry.usage_policy_id = None;
     entry.usage_policy_version = None;
     entry.usage_policy_digest = None;
-    let after = bss_pricing::infra::plan_revisions::content(&revision, &items, &[entry]);
+    let after =
+        bss_pricing::infra::plan_revisions::content(&revision, &items, &[entry], None).unwrap();
     let fingerprint = bss_approval::hash::snapshot_hash(
         &[bss_approval::ItemRef {
             item_type: "plan_revision".into(),

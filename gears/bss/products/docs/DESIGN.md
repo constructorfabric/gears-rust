@@ -64,6 +64,7 @@ Every PRD FR and NFR appears once in this allocation. Section references identif
 | `cpt-cf-bss-products-fr-sku-metering` | Usage metering resolves at submit and apply | §3.1 type rules and the derived pin; §3.5 usage-type catalog and its derived sibling |
 | `cpt-cf-bss-products-fr-derived-usage-type` | A derived meter is data with one evaluator, stored append-only, pinned by a usage SKU at its first publish | §3.1 derived usage declaration, type and pin; §3.3 derived usage type doors and the SKU doors' derived codes; §3.4 products-sdk; §3.5 the derived sibling and pricing's meter semantics; §3.7 derived usage tables |
 | `cpt-cf-bss-products-fr-quota-catalog` | Reviewed, versioned quota definitions from authorized evidence | §3.1 quota catalog; §3.2 Quota catalog; §3.3 quota endpoints; §3.4 products-sdk and types-registry; §3.5 discovery plugin; §3.7 quota tables |
+| `cpt-cf-bss-products-fr-quota-set-validation` | One complete set of plan quota rules judged against the catalog, as facts for Pricing | §3.2 Quota catalog; §3.3 the quota-set validation; §3.4 products-sdk |
 | `cpt-cf-bss-products-fr-sku-bundle` | Bundle identity supports sold-as only | §3.1 bundle rules; §3.5 Pricing; §3.6 reserve/write/confirm |
 | `cpt-cf-bss-products-fr-sku-lifecycle` | One approval shape governs lifecycle | §3.1 lifecycle; §3.2 Approvals; §3.6 fenced retirement |
 | `cpt-cf-bss-products-fr-sku-versions` | Durable history determines dated truth | §3.3 dated read; §3.7 version table and ordering |
@@ -401,7 +402,7 @@ never through a float.
 | References — `cpt-cf-bss-products-component-references` | Local reservation registry, reciprocal fence checks, confirm/release and force-release | Registry, Pricing owner, Events |
 | Read model — `cpt-cf-bss-products-component-read-model` | Scoped list/search, SKU card, local reference summary, dated reads and retained browse transport | Registry, Versions, References |
 | Events — `cpt-cf-bss-products-component-events` | Audit and outbox writes in state transactions; outbound domain and approval events | All mutating components, toolkit-db outbox |
-| Quota catalog — `cpt-cf-bss-products-component-quota-catalog` | Targets, discovery intake, candidates, review, definition versions, availability, catalog reads | types-registry, discovery plugins, Registry (SKU versions), Events (audit only) |
+| Quota catalog — `cpt-cf-bss-products-component-quota-catalog` | Targets, discovery intake, candidates, review, definition versions, availability, catalog reads, quota-set validation for Pricing | types-registry, discovery plugins, Registry (SKU versions), Events (audit only), Pricing (the validation's caller) |
 
 Component definition sites:
 
@@ -583,6 +584,31 @@ with exact bounds, subject and resource types, mapping, profile and qualificatio
 qualification), both policies, change support, conditions, bases (`fixed` and `per_plan_unit` on REST, `Fixed` and
 `PerPlanUnit` in the SDK, as the quotas package spells them), and availability.
 
+**The quota-set validation** (P-D-275, P-D-276). `ProductsQuotaCatalogClientV1::validate_quota_set(ctx, request)`
+validates one complete set of plan quota rules for Pricing, in the same process and as the caller; it has no REST
+projection. It asks `read` on `quota_definition` for the caller's tenant before it reads anything, and it reads the
+definitions under the whole grant, so a definition the grant does not reach is unknown to the set. The request,
+`bss_products_sdk::quota::validation::QuotaSetRequest`, carries the purpose (`Authoring` or `Acceptance`), the
+change kind (`InitialSet`, `Increase` or `Unchanged`), the plan quantity, the prior limits and at most 200 rules,
+each with its definition reference `{id, version, digest}`, its SKU and SKU version, its logical binding, its
+dimension value, its subject selector and scope selection, its amount, unit and basis. The answer,
+`QuotaSetValidation`, is one verdict per rule (the resolved definition, and with a quantity the final limit) and
+every check found; Pricing decides what each boundary refuses. A malformed request, or one over Products' bounds
+(P-D-275), is 400 `VALIDATION` on its field; the PDP's 403 and 503 and a corrupt row's 500 are the only
+other errors. Three statements read a set whatever it holds: the versions, their current availability, and their
+mappings' adapter targets with their profile content. No registry or plugin is called. The checks, judged by a pure
+function that reports every failure:
+
+| Code | Field | When |
+| --- | --- | --- |
+| `QUOTA_RULE_INVALID` | `definition_ref`, `basis`, `unit_ref` | A version unknown to the caller's scope; another SKU, or a SKU version before the definition's; a basis or a unit the definition does not allow |
+| `QUOTA_DEFINITION_CHANGED` | `definition_ref.digest` | The rule's digest is not the stored one |
+| `QUOTA_AMOUNT_INVALID` | `amount`, `quantity` | An amount that is not a canonical integer, off the unit's grid (`min + n × step`) or above `max`; a final limit at the quantity off the grid or above `max`; an amount or a final limit whose arithmetic overflows 128 bits |
+| `QUOTA_UNIT_INEXACT` | `amount` | The amount does not convert exactly into the canonical unit |
+| `QUOTA_SCOPE_UNSUPPORTED` | `subject_selector`, `scope_selection.<key>` | Another subject selector; a required dimension missing, an extra key, an empty value, or a value over 255 bytes or not printable ASCII. Only the form of a value is checked: no alias is resolved and no wildcard is known (the scope authority refuses both, the quotas package's feature 3) |
+| `QUOTA_SET_INCOMPATIBLE` | `logical_binding_key`, `scope_selection`, `change_kind`, `prior` | Rules of one binding with other profile content or on another adapter target; rules of one binding, whatever their dimension value, with another subject or scope; a rule without a prior limit, a prior limit whose unit is neither the metric's canonical unit nor an allowed unit or that does not convert exactly (each naming the rule), or a prior limit that no rule keeps (naming no rule; not when a rule of its binding did not resolve); a decrease, no increase, a definition without increase support, or an unchanged set with other limits |
+| `QUOTA_QUALIFICATION_UNAVAILABLE` | `definition_ref` | The version is not `enabled`; the reason names the state and the reason code |
+
 ### 3.4 Internal Dependencies
 
 | Dependency | Design contract |
@@ -591,7 +617,7 @@ qualification), both policies, change support, conditions, bases (`fixed` and `p
 | toolkit-db / SecureORM | SecureConn and scoped transactions; PolicyEnforcer-derived AccessScope on all reads/writes, including audit, replay and child records. Conditional writes, no raw unscoped connection. |
 | toolkit-db outbox | State, audit and outbox records share the same transaction; dispatch happens after commit, and the outbox's sequencer is woken only after it (P-D-221). No success event escapes a rollback. |
 | toolkit REST / PolicyEnforcer | OperationBuilder, authenticated operations, RFC-9457 errors and deny-by-default resource/action checks. |
-| products-sdk / ClientHub | Public SKU/version/catalog contracts, usage-type port, and the derived usage declaration with its pure evaluator (P-D-230); consumers resolve typed clients without importing gear internals. Its `quota` module holds the five quota GTS schemas and the discovery plugin specification, which the toolkit inventory seeds into types-registry, the exact units, the canonical digests, `ProductsQuotaDiscoveryPluginClientV1` and `ProductsQuotaCatalogClientV1` (P-D-267). |
+| products-sdk / ClientHub | Public SKU/version/catalog contracts, usage-type port, and the derived usage declaration with its pure evaluator (P-D-230); consumers resolve typed clients without importing gear internals. Its `quota` module holds the five quota GTS schemas and the discovery plugin specification, which the toolkit inventory seeds into types-registry, the exact units, the canonical digests, `ProductsQuotaDiscoveryPluginClientV1` and `ProductsQuotaCatalogClientV1` (P-D-267), and the quota-set validation contract in `quota::validation` (P-D-275). |
 | types-registry / `TypesRegistryApi` | The quota intake resolves schemas, instances and ancestry and validates records through `TypesRegistryApi`, resolved from the ClientHub on every call (a remote registry is wired after init) and read as the caller. Not found or deleted is unknown; any other error, or no registry in the hub, is an outage (P-D-268). |
 
 Outbound events are `SkuPublished`, `SkuChanged`, `SkuRetired`, `ApprovalUnitDecided` and
@@ -1398,6 +1424,7 @@ defined here.
 | `cpt-cf-bss-products-fr-sku-metering` | 02 | `sku-categories` |
 | `cpt-cf-bss-products-fr-derived-usage-type` | none (P-D-230, P-D-231, P-D-232, P-D-233, P-D-257) | `derived-usage-types` |
 | `cpt-cf-bss-products-fr-quota-catalog` | none (P-D-266 … P-D-274) | `quota-catalog` |
+| `cpt-cf-bss-products-fr-quota-set-validation` | none (P-D-275, P-D-276) | `quota-set-validation` |
 | `cpt-cf-bss-products-fr-sku-bundle` | 02 | `sku-categories` |
 | `cpt-cf-bss-products-fr-sku-lifecycle` | 03 | `lifecycle-approvals` |
 | `cpt-cf-bss-products-fr-sku-versions` | 02 | `sku-categories` |
@@ -1416,4 +1443,4 @@ registry and Pricing protocol; P-D-196 → the optional category; P-D-197 → th
 P-D-198–P-D-204 → the rules carried from the backup register (replay mechanics, event delivery, the audit
 shape, the request digest, the validation answer, the usage-type resolve bound, the authz label registration);
 P-D-205 → the policy's `If-Match`; P-D-206 → the draft delete; P-D-207 → usage types as the caller and the
-picker; P-D-208 → category retirement; P-D-209 → the fence TTL as a deployment setting; P-D-216 → the override reset; P-D-218 → moving the default category; P-D-219 → the submitter's note on the unit; P-D-220 → a retired category is never the default; P-D-229 → derived usage meters (Products declares, Rating evaluates); P-D-230 → the declaration, grammar, evaluator and canonical bytes; P-D-231 → the derived usage type's storage, doors, grants and audit; P-D-232 → a usage SKU's derived ref and its pin; P-D-233 → the derived meter semantics Products answers to pricing (E1b); P-D-250 → the approvals inbox's source; P-D-251 → one input, and a raw meter moving onto its identity wrapper; P-D-257 → the derived type list carries each type's latest version; P-D-266 → quota catalog ownership; P-D-267 → the quota GTS contract; P-D-268 → quota intake; P-D-269 → quota review and separation of duties; P-D-270 → quota definition versions and SKU applicability; P-D-271 → availability slots; P-D-272 → the catalog reads and the SDK client; P-D-273 → the two quota resources; P-D-274 → migration 000015. The feature `features/quota-catalog.md` owns the quota DoDs. Spec §2.2, §4, §6, §7.2–§7.3 and §13 govern the corresponding sections.
+picker; P-D-208 → category retirement; P-D-209 → the fence TTL as a deployment setting; P-D-216 → the override reset; P-D-218 → moving the default category; P-D-219 → the submitter's note on the unit; P-D-220 → a retired category is never the default; P-D-229 → derived usage meters (Products declares, Rating evaluates); P-D-230 → the declaration, grammar, evaluator and canonical bytes; P-D-231 → the derived usage type's storage, doors, grants and audit; P-D-232 → a usage SKU's derived ref and its pin; P-D-233 → the derived meter semantics Products answers to pricing (E1b); P-D-250 → the approvals inbox's source; P-D-251 → one input, and a raw meter moving onto its identity wrapper; P-D-257 → the derived type list carries each type's latest version; P-D-266 → quota catalog ownership; P-D-267 → the quota GTS contract; P-D-268 → quota intake; P-D-269 → quota review and separation of duties; P-D-270 → quota definition versions and SKU applicability; P-D-271 → availability slots; P-D-272 → the catalog reads and the SDK client; P-D-273 → the two quota resources; P-D-274 → migration 000015. The feature `features/quota-catalog.md` owns the quota DoDs. P-D-275 → the quota-set validation for Pricing; P-D-276 → the quota-set judgement; the feature `features/quota-set-validation.md` owns their DoD. Spec §2.2, §4, §6, §7.2–§7.3 and §13 govern the corresponding sections.
