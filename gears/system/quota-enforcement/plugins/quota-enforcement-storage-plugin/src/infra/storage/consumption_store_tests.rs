@@ -19,7 +19,7 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
-use toolkit_db::secure::{SecureDeleteExt, SecureUpdateExt};
+use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_security::{AccessScope, SecurityContext};
 
 use super::SqlConsumptionStore;
@@ -331,6 +331,23 @@ impl Harness {
         .expect("read the period row")
         .expect("the period row exists")
         .consumed
+    }
+
+    /// The counter of the period row that contains `at`, read directly: a
+    /// snapshot shows only the current period.
+    async fn consumed_in_period_of(&self, id: QuotaId, at: OffsetDateTime) -> i64 {
+        let conn = self.db.conn().expect("conn");
+        counter::Entity::find()
+            .filter(counter::Column::QuotaId.eq(id.as_uuid()))
+            .filter(counter::Column::PeriodStart.lte(at))
+            .filter(counter::Column::PeriodEnd.gt(at))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .one(&conn)
+            .await
+            .expect("read the period row")
+            .expect("the period row exists")
+            .consumed
     }
 
     async fn pin_versions_at_max(&self, id: QuotaId) {
@@ -1328,6 +1345,61 @@ async fn a_period_holding_a_live_lease_is_not_settled() {
         "with no live lease left the closing period settles"
     );
     let _ = id;
+    h.down().await;
+}
+
+#[tokio::test]
+async fn closing_a_period_stores_the_total_its_rollover_event_reports() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(1000), Vec::new()).await;
+    h.debit("u1", 70, &write(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit on day one");
+    h.acquire("u1", 30, TTL, &write(OperationType::Reserve, "r1", 2))
+        .await
+        .expect("acquire on day one");
+    assert_eq!(h.consumed("u1", id).await, 100, "70 debited plus 30 held");
+
+    // Day two. The hold expired unused and nothing has returned it, so the
+    // first writer of the new period returns it while it closes day one.
+    let day_two = DAY_ONE + time::Duration::days(1);
+    h.set_now(day_two);
+    h.debit("u1", 5, &write(OperationType::Debit, "d2", 3))
+        .await
+        .expect("debit on day two");
+
+    let rollover = enqueued_messages(&h.db)
+        .await
+        .into_iter()
+        .find(|message| message.payload_type == NotificationEventKind::PeriodRollover.as_str())
+        .expect("day one closed");
+    let event: serde_json::Value =
+        serde_json::from_slice(&rollover.payload).expect("event payload");
+    assert_eq!(
+        event["payload"]["closing_consumed"],
+        serde_json::json!(70),
+        "the event reports day one without the expired hold"
+    );
+    assert_eq!(
+        h.consumed_in_period_of(id, DAY_ONE).await,
+        70,
+        "the stored row says what the event says"
+    );
+
+    // Neither a sweep nor a later writer moves the closed row again.
+    h.store
+        .reclaim_expired_leases(10, day_two)
+        .await
+        .expect("sweep");
+    h.debit("u1", 5, &write(OperationType::Debit, "d3", 4))
+        .await
+        .expect("another debit on day two");
+    assert_eq!(h.consumed_in_period_of(id, DAY_ONE).await, 70);
+    assert_eq!(
+        h.consumed("u1", id).await,
+        10,
+        "day two counts only its own debits"
+    );
     h.down().await;
 }
 

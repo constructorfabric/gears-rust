@@ -316,6 +316,26 @@ pub(super) async fn settle_elapsed_rows(
         let closing_consumed = u64::try_from(row.consumed)
             .unwrap_or(0)
             .saturating_sub(owed);
+        // The holds are stamped returned now, so no reader subtracts them any
+        // more: the row itself has to drop them, in this transaction.
+        if owed > 0 {
+            let stored = i64::try_from(closing_consumed).unwrap_or(i64::MAX);
+            let written = counter_repo::write_counter(
+                tx,
+                scope,
+                row.period_id,
+                row.record_version,
+                stored,
+                row.highest_crossed_threshold_pct,
+                now,
+            )
+            .await?;
+            if !written {
+                return Err(TxError::Storage(StorageError::Internal(
+                    "the locked closing period row moved before the write".to_owned(),
+                )));
+            }
+        }
         if !counter_repo::mark_settled(tx, scope, row.period_id, now).await? {
             continue;
         }
