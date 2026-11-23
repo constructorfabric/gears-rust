@@ -2,7 +2,7 @@
 name = "cf-gears-oidc-authn-plugin"
 edition.workspace = true
 license.workspace = true
-version = "0.6.0"
+version = "0.6.1"
 description = "OIDC Authentication Resolver Plugin"
 keywords = ["constructorfabric", "cf-gears"]
 metadata.docs.rs.all-features = true
@@ -22,7 +22,7 @@ authn-resolver-sdk = {
 }
 # Publishes through the consumed platform API (local or resolving REST client).
 types-registry-sdk = {
-    package = "cf-gears-types-registry-sdk", version = "0.5",
+    package = "cf-gears-types-registry-sdk", version = "0.6",
     path = "../../../types-registry/types-registry-sdk", features = ["rest-client"]
 }
 
