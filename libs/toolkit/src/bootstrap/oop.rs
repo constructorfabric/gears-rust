@@ -838,61 +838,24 @@ async fn build_oop_serve_options(
     })
 }
 
-/// Construct the inbound platform-plane authenticator from configuration.
-///
-/// The `shared_secret` provider is built here directly (no external backend).
-/// The `kube` provider is built (with the default positive/negative
-/// validation cache) by the single shared
-/// `toolkit_k8s_auth::build_cached_k8s_authenticator` helper also used by
-/// `grpc-hub`, so the two never drift on what `provider: kube` means or how
-/// it is cached. The `kube` provider requires the `k8s-auth` feature; without
-/// it, `provider: kube` is an error rather than a silent enforcement
-/// downgrade, as is any other unrecognized provider value. `Ok(None)` is
-/// returned only when no `internal_auth` is configured at all (Profile 1).
-#[cfg_attr(not(feature = "k8s-auth"), allow(clippy::unused_async))]
+/// Construct the inbound platform-plane authenticator from configuration, via
+/// the shared [`toolkit_security::build_inbound_authenticator`] (also used by
+/// api-gateway and `grpc-hub`). `provider: kube` needs the `k8s-auth` feature;
+/// without it, it is an error rather than a silent enforcement downgrade.
+/// `Ok(None)` only when no `internal_auth` is configured (Profile 1).
 async fn build_internal_authenticator(
     cfg: Option<&toolkit_security::InternalAuthConfig>,
 ) -> Result<Option<toolkit_security::DynInternalAuthenticator>> {
-    let Some(cfg) = cfg else {
-        return Ok(None);
-    };
-
-    // Dependency-light providers (shared-secret) build directly here. An
-    // unusable secret is an error rather than a fallthrough: dropping to the
-    // kube branch below would report the wrong problem entirely.
-    match cfg.build_authenticator()? {
-        toolkit_security::BuiltAuthenticator::Built(authenticator) => {
-            info!("Initializing shared-secret platform-plane authenticator");
-            return Ok(Some(authenticator));
-        }
-        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
-    }
-
     #[cfg(feature = "k8s-auth")]
-    {
-        if cfg.is_kube() {
-            info!("Initializing Kubernetes TokenReview platform-plane authenticator");
-            let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
-            let authenticator = toolkit_k8s_auth::build_cached_k8s_authenticator(
-                audiences,
-                Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
-                None,
-            )
-            .await
-            .context("failed to initialize Kubernetes TokenReview authenticator")?;
-            return Ok(Some(authenticator));
-        }
-    }
+    let kube = Some(toolkit_k8s_auth::kube_authenticator_builder(
+        Some(toolkit_security::DEFAULT_TOKEN_REVIEW_CACHE_TTL),
+        None,
+    ));
     #[cfg(not(feature = "k8s-auth"))]
-    {
-        if cfg.is_kube() {
-            anyhow::bail!("oop_http.internal_auth provider=kube requires the `k8s-auth` feature");
-        }
-    }
-
-    anyhow::bail!(
-        "internal_auth is configured but no authenticator could be built for the selected provider"
-    )
+    let kube = None;
+    toolkit_security::build_inbound_authenticator(cfg, kube)
+        .await
+        .map_err(|e| anyhow::anyhow!("oop_http: {e}"))
 }
 
 /// Build the `OoP` gear's `DirectoryService` client on a **lazy** channel, plus
@@ -902,8 +865,13 @@ async fn build_internal_authenticator(
 ///
 /// The lazy channel performs no eager connection, so this succeeds even when
 /// `directory_endpoint` is unreachable (`cpt-cf-adr-eventual-readiness`).
-/// Interceptor and provider come from one credential source (see
-/// [`build_platform_credentials`]) so they can't diverge after a rotation.
+///
+/// The provider is built by the shared
+/// [`build_internal_token_provider`](toolkit_contract::runtime::platform_credential::build_internal_token_provider),
+/// and the directory client's interceptor is a thin adapter over it, so the two
+/// can't diverge after a rotation and follow the same attach policy. An `OoP`
+/// gear always registers and heartbeats with `DirectoryService`, so a kube
+/// config without a `present` block is a startup error here.
 ///
 /// # Errors
 /// Only if the endpoint is malformed or a configured credential source fails to
@@ -928,90 +896,18 @@ async fn build_directory_client(
         return Ok((client, None));
     };
 
-    let (interceptor, provider) = build_platform_credentials(cfg, cancel).await?;
+    let provider =
+        toolkit_contract::runtime::platform_credential::build_internal_token_provider(cfg, cancel)
+            .await?;
+    let interceptor = toolkit_contract::runtime::platform_credential::internal_auth_interceptor(
+        Some(&provider),
+        "directory",
+    );
     // Rebuild with the interceptor attached (it must be set at construction);
     // the endpoint was already validated above.
     let client =
         DirectoryGrpcClient::connect_lazy_with_interceptor(directory_endpoint, interceptor)?;
-    Ok((client, provider))
-}
-
-/// Build the platform-plane credential material from config: the **outbound**
-/// gRPC [`InternalAuthInterceptor`] (for `DirectoryService` calls) and the
-/// transport-agnostic
-/// [`InternalTokenProvider`](toolkit_contract::runtime::config::InternalTokenProvider)
-/// that `#[toolkit::provides]` clients attach as `X-ToolKit-Internal-Token` on
-/// platform-plane methods (`cpt-cf-adr-two-plane-auth`).
-///
-/// Both derive from ONE credential source so they never disagree after a
-/// rotation:
-/// - `shared_secret` → a static token for both.
-/// - `kube` with `token_path` → one [`ServiceAccountTokenReader`] drives both;
-///   its "no token yet" maps to [`CredentialState::Unavailable`] so an attach
-///   site warns rather than silently sending nothing.
-/// - `kube` without `token_path` → inbound-only: disabled interceptor + `None`
-///   provider (warned).
-///
-/// The `match` is exhaustive so a future variant fails to compile here rather
-/// than silently downgrading to no outbound credential.
-pub(super) async fn build_platform_credentials(
-    cfg: &toolkit_security::InternalAuthConfig,
-    cancel: &CancellationToken,
-) -> Result<(
-    toolkit_transport_grpc::InternalAuthInterceptor,
-    Option<toolkit_contract::runtime::config::InternalTokenProvider>,
-)> {
-    use secrecy::SecretString;
-    use toolkit_contract::runtime::config::{CredentialState, InternalTokenProvider};
-    use toolkit_security::InternalAuthConfig;
-    use toolkit_transport_grpc::{
-        DEFAULT_REFRESH_INTERVAL, InternalAuthInterceptor, ServiceAccountTokenReader,
-    };
-
-    match cfg {
-        InternalAuthConfig::SharedSecret { secret, .. } => {
-            let token = SecretString::from(secret.clone());
-            Ok((
-                InternalAuthInterceptor::from_token(token.clone()),
-                Some(InternalTokenProvider::from_token(token)),
-            ))
-        }
-        InternalAuthConfig::Kube {
-            token_path: Some(path),
-            ..
-        } => {
-            let reader = ServiceAccountTokenReader::with_cancellation(
-                path,
-                DEFAULT_REFRESH_INTERVAL,
-                cancel.child_token(),
-            )
-            .await
-            .context("failed to read projected service-account token for outbound credential")?;
-            let interceptor = reader.interceptor();
-            // The reader yields `None` while the projected file is empty or the
-            // refresh has not populated it; surface that as `Unavailable` (warn)
-            // rather than `NotConfigured` (silent).
-            let token_fn = reader.token_provider();
-            let provider = InternalTokenProvider::new(move || match token_fn() {
-                Some(token) => CredentialState::Available(token),
-                None => CredentialState::Unavailable(
-                    "projected service-account token is currently unavailable \
-                     (file empty or not yet read)"
-                        .into(),
-                ),
-            });
-            Ok((interceptor, Some(provider)))
-        }
-        InternalAuthConfig::Kube {
-            token_path: None, ..
-        } => {
-            warn!(
-                "oop_http.internal_auth: provider=kube without token_path - this participant \
-                 validates inbound platform tokens but will attach NO outbound credential"
-            );
-            Ok((InternalAuthInterceptor::disabled(), None))
-        }
-    }
+    Ok((client, Some(provider)))
 }
 
 /// Derive a default advertise URI from the bind address. Unspecified hosts

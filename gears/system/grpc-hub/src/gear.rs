@@ -86,9 +86,11 @@ pub struct GrpcHubConfig {
     /// (`cpt-cf-adr-platform-plane-auth`); when absent, enforcement is disabled
     /// (Profile 1 / in-process only).
     ///
-    /// Mirrors the REST `oop_http.internal_auth` surface: a single flat
-    /// `InternalAuthConfig` provider, with the gRPC-only enforcement / exempt /
-    /// cache knobs as sibling fields below.
+    /// Mirrors the REST `oop_http.internal_auth` surface: one
+    /// `InternalAuthConfig` (`shared_secret`, or `kube` with nested `verify` /
+    /// `present` blocks), with the gRPC-only enforcement / exempt / cache knobs
+    /// as sibling fields below. The hub only validates, so a kube config needs
+    /// `verify`; `present` is unused.
     pub internal_auth: Option<InternalAuthConfig>,
 
     /// How an **absent** internal credential is treated when `internal_auth` is
@@ -185,62 +187,27 @@ fn expand_home(
     }
 }
 
-/// Build the inbound platform-plane validator from configuration.
-///
-/// The dependency-light shared-secret provider is built directly. The
-/// Kubernetes `TokenReview` provider requires the `k8s-auth` feature and is
-/// constructed (with the caching decision) by the single shared
-/// `toolkit_k8s_auth::build_cached_k8s_authenticator` helper also used by the
-/// `OoP` HTTP bootstrap, so the two never drift on what `provider: kube`
-/// means or how it is cached. Without the feature, configuring `provider:
-/// kube` is a hard error rather than a silent enforcement downgrade — as is
-/// any other unrecognized provider value.
-#[cfg_attr(
-    not(feature = "k8s-auth"),
-    allow(clippy::unused_async, unused_variables)
-)]
+/// Build the inbound platform-plane validator from configuration, via the
+/// shared [`toolkit_security::build_inbound_authenticator`] (also used by
+/// api-gateway and the `OoP` bootstrap). `provider: kube` needs the `k8s-auth`
+/// feature; without it, it is a hard error rather than a silent enforcement
+/// downgrade. A `cache_ttl_secs` of `0` disables the `TokenReview` cache; any
+/// positive TTL wraps the validator in the short-lived positive cache.
+#[cfg_attr(not(feature = "k8s-auth"), allow(unused_variables))]
 async fn build_internal_authenticator(
     cfg: Option<&InternalAuthConfig>,
     cache_ttl_secs: u64,
 ) -> anyhow::Result<Option<DynInternalAuthenticator>> {
-    let Some(cfg) = cfg else {
-        return Ok(None);
-    };
-
-    // Shared-secret (and any future dependency-light provider) builds here. An
-    // unusable secret fails the build rather than falling through to the kube
-    // branch, which would report the wrong problem.
-    match cfg.build_authenticator()? {
-        toolkit_security::BuiltAuthenticator::Built(auth) => return Ok(Some(auth)),
-        toolkit_security::BuiltAuthenticator::RequiresExternalBackend => {}
-    }
-
     #[cfg(feature = "k8s-auth")]
-    {
-        if cfg.is_kube() {
-            let audiences = cfg.kube_audiences().unwrap_or_default().to_vec();
-            // `0` disables caching; any positive TTL wraps the validator in the
-            // short-lived positive cache.
-            let cache_ttl =
-                (cache_ttl_secs > 0).then(|| std::time::Duration::from_secs(cache_ttl_secs));
-            let auth = toolkit_k8s_auth::build_cached_k8s_authenticator(audiences, cache_ttl, None)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!("failed to init Kubernetes TokenReview authenticator: {e}")
-                })?;
-            return Ok(Some(auth));
-        }
-    }
+    let kube = Some(toolkit_k8s_auth::kube_authenticator_builder(
+        (cache_ttl_secs > 0).then(|| std::time::Duration::from_secs(cache_ttl_secs)),
+        None,
+    ));
     #[cfg(not(feature = "k8s-auth"))]
-    {
-        if cfg.is_kube() {
-            anyhow::bail!("grpc-hub internal_auth provider=kube requires the `k8s-auth` feature");
-        }
-    }
-
-    anyhow::bail!(
-        "internal_auth is configured but no authenticator could be built for the selected provider"
-    )
+    let kube = None;
+    toolkit_security::build_inbound_authenticator(cfg, kube)
+        .await
+        .map_err(|e| anyhow::anyhow!("grpc-hub: {e}"))
 }
 
 /// Assemble the [`InternalAuthGrpcLayer`] from a built `authenticator` and the
@@ -1597,8 +1564,10 @@ mod tests {
     #[cfg(not(feature = "k8s-auth"))]
     async fn build_internal_authenticator_rejects_kube_without_feature() {
         let cfg = InternalAuthConfig::Kube {
-            audiences: vec!["toolkit-internal".to_owned()],
-            token_path: None,
+            verify: Some(toolkit_security::KubeVerify {
+                audiences: vec!["toolkit-internal".to_owned()],
+            }),
+            present: None,
         };
         let err = build_internal_authenticator(Some(&cfg), 30)
             .await

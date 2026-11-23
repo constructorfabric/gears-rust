@@ -78,6 +78,8 @@ bootstrap = [
     "dep:toolkit-http-middleware",
     # OoP outbound platform-plane credential (InternalAuthInterceptor + SA reader)
     "dep:toolkit-transport-grpc",
+    # Builds that credential from `internal_auth` config (host, OoP, publish-gts).
+    "toolkit-contract/platform-credential",
     "dep:secrecy",
 ]
 

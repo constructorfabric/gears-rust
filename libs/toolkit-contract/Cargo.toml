@@ -76,6 +76,17 @@ grpc-client = [
     "dep:toolkit-security",
     "dep:toolkit-transport-grpc",
 ]
+# Platform-plane outbound credential from `internal_auth` config
+# (`runtime::platform_credential`): the config -> `InternalTokenProvider` mapping
+# and the gRPC interceptor adapter over it. The rotating projected-token reader
+# lives in toolkit-transport-grpc, hence that dependency.
+platform-credential = [
+    "runtime-client",
+    "dep:secrecy",
+    "dep:tokio-util",
+    "dep:toolkit-security",
+    "dep:toolkit-transport-grpc",
+]
 
 [dependencies]
 toolkit-contract-macros.workspace = true
@@ -97,6 +108,7 @@ toolkit-http = { workspace = true, optional = true }
 http-body = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["time", "macros"], optional = true }
+tokio-util = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 futures-core = { workspace = true, optional = true }
@@ -128,6 +140,8 @@ toolkit-resilience = { workspace = true }
 secrecy.workspace = true
 toolkit-security.workspace = true
 uuid = { workspace = true, features = ["v4"] }
+# Drives the interceptor adapter in `runtime::platform_credential` tests.
+tonic.workspace = true
 # Dev-only cycle (Cargo permits dev-dependency cycles): `toolkit` regular-depends
 # on this crate, but the generated `register_<trait>_routes()` server codegen
 # (feature = "rest-server") references `::toolkit::api::{OperationBuilder,

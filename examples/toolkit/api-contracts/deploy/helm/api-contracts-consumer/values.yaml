@@ -90,8 +90,10 @@ config:
       advertise_uri: 'http://{{ include "toolkit-common.fullname" . }}:{{ .Values.service.port }}'
       internal_auth:
         provider: kube
-        audiences: ["toolkit-internal"]
-        token_path: '{{ .Values.saToken.mountPath }}/{{ .Values.saToken.fileName }}'
+        verify:
+          audiences: ["toolkit-internal"]
+        present:
+          token_path: '{{ .Values.saToken.mountPath }}/{{ .Values.saToken.fileName }}'
     # The embedded types-registry's catalogue, which AuthN publishes its plugin instance to
     # and selects it from. SQLite under `home_dir`, re-seeded when the pod restarts.
     database:

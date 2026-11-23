@@ -106,6 +106,7 @@ async fn run_with_capture(req: Request<Body>) -> (StatusCode, Vec<CapturedEvent>
     let events = layer.events.clone();
 
     let subscriber = tracing_subscriber::registry().with(layer);
+    keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let app = test_app();
@@ -134,6 +135,7 @@ async fn run_with_capture_full(
     let events = layer.events.clone();
 
     let subscriber = tracing_subscriber::registry().with(layer);
+    keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let app = test_app();
@@ -278,6 +280,7 @@ async fn run_with_otel_probe(consume_body: bool) -> (String, Vec<String>) {
     let subscriber = tracing_subscriber::registry()
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .with(probe);
+    keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
@@ -512,6 +515,7 @@ async fn e2e_full_middleware_stack_logs_remote_addr() -> anyhow::Result<()> {
     let layer = CapturingLayer::default();
     let events = layer.events.clone();
     let subscriber = tracing_subscriber::registry().with(layer);
+    keep_interest_shared();
     let _guard = tracing::subscriber::set_default(subscriber);
 
     // Build a request with ConnectInfo<SocketAddr> injected to simulate
@@ -587,4 +591,13 @@ async fn e2e_full_middleware_stack_logs_remote_addr() -> anyhow::Result<()> {
     assert!(e.fields.contains_key("pid"));
 
     Ok(())
+}
+
+/// Keeps a second dispatcher registered for the whole binary. With only one, tracing-core
+/// computes a callsite's interest from the registering thread's default, so a test without a
+/// capture can cache `never` for a callsite another test's capture needs. Call it before
+/// installing a thread-local subscriber (`set_default` / `with_default`).
+fn keep_interest_shared() {
+    static SHARED: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
 }

@@ -7,7 +7,8 @@
 //! process must re-read the file rather than caching the first value forever.
 //!
 //! [`ServiceAccountTokenReader`] reads the token once at construction and then
-//! re-reads it every [`DEFAULT_REFRESH_INTERVAL`] from a background task. It
+//! re-reads it on a fixed interval (typically [`DEFAULT_REFRESH_INTERVAL`]) from
+//! a background task bound to a [`CancellationToken`]. It
 //! exposes a [`token_provider`](ServiceAccountTokenReader::token_provider)
 //! closure for
 //! [`InternalAuthInterceptor::new`](crate::internal_auth::InternalAuthInterceptor::new)
@@ -33,10 +34,11 @@ type SharedToken = Arc<RwLock<Arc<str>>>;
 /// Reads a projected `ServiceAccount` token file and keeps a refreshed copy in
 /// memory so callers always observe the current (post-rotation) value.
 ///
-/// Dropping the reader stops the background refresh task **once no
-/// [`token_provider`](Self::token_provider) closures remain**: the task holds a
-/// [`Weak`] handle to the shared state and exits when the last strong reference
-/// (the reader and any live providers) is gone.
+/// The background refresh task stops when its [`CancellationToken`] is
+/// cancelled, or at its next tick once the reader and every
+/// [`token_provider`](Self::token_provider) closure are dropped (it holds only
+/// a [`Weak`] handle to the shared state). The cancel token is required, so a
+/// process-lifetime reader always stops promptly at shutdown.
 #[derive(Debug)]
 pub struct ServiceAccountTokenReader {
     path: PathBuf,
@@ -45,38 +47,10 @@ pub struct ServiceAccountTokenReader {
 
 impl ServiceAccountTokenReader {
     /// Read `path` once and spawn a background task that re-reads it every
-    /// [`DEFAULT_REFRESH_INTERVAL`].
-    ///
-    /// # Errors
-    /// Returns an error if the token file cannot be read or is empty on the
-    /// initial read.
-    pub async fn new(path: impl Into<PathBuf>) -> std::io::Result<Self> {
-        Self::with_refresh_interval(path, DEFAULT_REFRESH_INTERVAL).await
-    }
-
-    /// Like [`new`](Self::new) but with a custom re-read `interval` (primarily
-    /// for tests).
-    ///
-    /// # Errors
-    /// Returns an error if the token file cannot be read or is empty on the
-    /// initial read.
-    pub async fn with_refresh_interval(
-        path: impl Into<PathBuf>,
-        interval: Duration,
-    ) -> std::io::Result<Self> {
-        let path = path.into();
-        let token = read_token(&path).await?;
-        let current: SharedToken = Arc::new(RwLock::new(token));
-
-        spawn_refresh_task(path.clone(), Arc::downgrade(&current), interval, None);
-
-        Ok(Self { path, current })
-    }
-
-    /// Like [`new`](Self::new) but ties the refresh task to a
-    /// [`CancellationToken`] so it stops promptly on shutdown rather than
-    /// lingering (and re-reading the file) for up to a full interval. Used from
-    /// the bootstrap layer with the process cancel token.
+    /// `interval` (typically [`DEFAULT_REFRESH_INTERVAL`]) until `cancel` is
+    /// cancelled, so it stops promptly on shutdown rather than lingering (and
+    /// re-reading the file) for up to a full interval. Pass a child of the
+    /// caller's cancel token.
     ///
     /// # Errors
     /// Returns an error if the token file cannot be read or is empty on the
@@ -90,12 +64,7 @@ impl ServiceAccountTokenReader {
         let token = read_token(&path).await?;
         let current: SharedToken = Arc::new(RwLock::new(token));
 
-        spawn_refresh_task(
-            path.clone(),
-            Arc::downgrade(&current),
-            interval,
-            Some(cancel),
-        );
+        spawn_refresh_task(path.clone(), Arc::downgrade(&current), interval, cancel);
 
         Ok(Self { path, current })
     }
@@ -138,27 +107,21 @@ impl ServiceAccountTokenReader {
     }
 }
 
-/// Spawn the TTL re-read loop. Terminates when `current` can no longer be
-/// upgraded (the reader and all providers have been dropped) or, if a
-/// [`CancellationToken`] is supplied, when it is cancelled — so the task cannot
-/// linger for up to a full refresh interval (or re-read the token file) after
-/// shutdown has begun.
+/// Spawn the TTL re-read loop. Terminates when `cancel` is cancelled — so the
+/// task cannot linger for up to a full refresh interval (or re-read the token
+/// file) after shutdown has begun — or when `current` can no longer be upgraded
+/// (the reader and all providers have been dropped).
 fn spawn_refresh_task(
     path: PathBuf,
     current: Weak<RwLock<Arc<str>>>,
     interval: Duration,
-    cancel: Option<CancellationToken>,
+    cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
         loop {
-            match &cancel {
-                Some(token) => {
-                    tokio::select! {
-                        () = tokio::time::sleep(interval) => {}
-                        () = token.cancelled() => break,
-                    }
-                }
-                None => tokio::time::sleep(interval).await,
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = cancel.cancelled() => break,
             }
             let Some(current) = current.upgrade() else {
                 break;
@@ -211,6 +174,16 @@ mod tests {
         tokio::fs::write(path, contents).await.expect("write token");
     }
 
+    /// A reader with the default interval and a cancel token nobody cancels.
+    async fn reader(path: &Path) -> std::io::Result<ServiceAccountTokenReader> {
+        ServiceAccountTokenReader::with_cancellation(
+            path,
+            DEFAULT_REFRESH_INTERVAL,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn reads_initial_token_trimmed() {
         let dir = unique_dir("token");
@@ -218,7 +191,7 @@ mod tests {
         let path = dir.join("token");
         write(&path, "  header.payload.sig\n").await;
 
-        let reader = ServiceAccountTokenReader::new(&path).await.unwrap();
+        let reader = reader(&path).await.unwrap();
         assert_eq!(reader.current().expose_secret(), "header.payload.sig");
 
         let provider = reader.token_provider();
@@ -238,7 +211,7 @@ mod tests {
         let path = dir.join("token");
         write(&path, "iface.token").await;
 
-        let reader = ServiceAccountTokenReader::new(&path).await.unwrap();
+        let reader = reader(&path).await.unwrap();
         // `path()` returns the watched projected-token file.
         assert_eq!(reader.path(), path.as_path());
 
@@ -260,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn missing_file_is_an_error() {
         let path = unique_dir("missing").join("token");
-        assert!(ServiceAccountTokenReader::new(&path).await.is_err());
+        assert!(reader(&path).await.is_err());
     }
 
     #[tokio::test]
@@ -269,7 +242,7 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("token");
         write(&path, "   \n").await;
-        assert!(ServiceAccountTokenReader::new(&path).await.is_err());
+        assert!(reader(&path).await.is_err());
         tokio::fs::remove_dir_all(&dir).await.ok();
     }
 
@@ -280,10 +253,13 @@ mod tests {
         let path = dir.join("token");
         write(&path, "token-v1").await;
 
-        let reader =
-            ServiceAccountTokenReader::with_refresh_interval(&path, Duration::from_millis(20))
-                .await
-                .unwrap();
+        let reader = ServiceAccountTokenReader::with_cancellation(
+            &path,
+            Duration::from_millis(20),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         let provider = reader.token_provider();
         assert_eq!(provider().unwrap().expose_secret(), "token-v1");
 

@@ -258,6 +258,7 @@ mod tests {
             .with(tracing_opentelemetry::layer().with_tracer(tracer))
             .with(fmt_layer);
 
+        crate::test_tracing::keep_interest_shared();
         tracing::subscriber::with_default(subscriber, emit);
 
         buffer.contents()

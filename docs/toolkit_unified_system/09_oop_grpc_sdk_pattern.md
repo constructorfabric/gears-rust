@@ -213,7 +213,7 @@ gears:
     config:
       listen_addr: "0.0.0.0:50051"
       advertise_addr: "payments:50051"
-      internal_auth: { provider: kube, audiences: ["toolkit-internal"] }
+      internal_auth: { provider: kube, verify: { audiences: ["toolkit-internal"] } }
       internal_auth_enforcement: permissive
 ```
 

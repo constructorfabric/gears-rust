@@ -199,6 +199,108 @@ impl RestApiCapability for TestAuthGear {
     }
 }
 
+/// An enabled reverse proxy whose kube `internal_auth` has no `present` block
+/// could never authenticate its `DirectoryService` polls. It must fail `init`,
+/// before the gateway reports ready, rather than start with the proxy off.
+#[tokio::test]
+async fn init_rejects_enabled_proxy_without_outbound_credential() {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "auth_disabled": true,
+                "gateway_proxy": {
+                    "enabled": true,
+                    "directory_endpoint": "http://127.0.0.1:50051"
+                },
+                "internal_auth": {
+                    "provider": "kube",
+                    "verify": { "audiences": ["toolkit-internal"] }
+                }
+            }
+        }
+    });
+
+    let err = api_gateway::ApiGateway::default()
+        .init(&create_api_gateway_ctx(config))
+        .await
+        .expect_err("init must refuse a proxy with no outbound credential");
+    assert!(
+        err.to_string().contains("present.token_path"),
+        "the error must point at the missing block: {err:#}"
+    );
+}
+
+/// An empty `present.token_path` can never be read, so the proxy's credential
+/// could never be built and its connect loop would retry until shutdown. It
+/// must fail `init` like a missing `present` block.
+#[tokio::test]
+async fn init_rejects_enabled_proxy_with_empty_token_path() {
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "auth_disabled": true,
+                "gateway_proxy": {
+                    "enabled": true,
+                    "directory_endpoint": "http://127.0.0.1:50051"
+                },
+                "internal_auth": {
+                    "provider": "kube",
+                    "verify": { "audiences": ["toolkit-internal"] },
+                    "present": { "token_path": "" }
+                }
+            }
+        }
+    });
+
+    let err = api_gateway::ApiGateway::default()
+        .init(&create_api_gateway_ctx(config))
+        .await
+        .expect_err("init must refuse a proxy whose token path is empty");
+    assert!(
+        format!("{err:#}").contains("present.token_path"),
+        "the error must name the empty field: {err:#}"
+    );
+}
+
+/// An enabled reverse proxy whose projected token file cannot be read fails
+/// `init`, naming the file, like an `OoP` gear does, rather than starting with
+/// the proxy retrying in the background.
+#[tokio::test]
+async fn init_rejects_enabled_proxy_with_unreadable_token() {
+    let token_path = std::env::temp_dir()
+        .join(format!("gw-init-missing-{}", std::process::id()))
+        .join("token");
+    let config = json!({
+        "api-gateway": {
+            "config": {
+                "bind_addr": "0.0.0.0:8080",
+                "auth_disabled": true,
+                "gateway_proxy": {
+                    "enabled": true,
+                    "directory_endpoint": "http://127.0.0.1:50051"
+                },
+                "internal_auth": {
+                    "provider": "kube",
+                    "verify": { "audiences": ["toolkit-internal"] },
+                    "present": { "token_path": token_path }
+                }
+            }
+        }
+    });
+
+    let err = api_gateway::ApiGateway::default()
+        .init(&create_api_gateway_ctx(config))
+        .await
+        .expect_err("init must refuse a proxy whose token file cannot be read");
+    let message = err.to_string();
+    assert!(
+        message.contains("gateway_proxy") && message.contains(&token_path.display().to_string()),
+        "the error must name the unreadable token file: {message}"
+    );
+}
+
 #[tokio::test]
 async fn test_auth_disabled_mode() {
     // Create api-gateway with auth disabled

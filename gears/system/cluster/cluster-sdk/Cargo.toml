@@ -40,6 +40,8 @@ grpc-client = [
     # behind this feature, while the guard itself is always emitted — so a crate
     # projecting a contract whose methods take a security context must forward it.
     "toolkit-contract/grpc-client",
+    # The shared platform-credential interceptor adapter (`internal_auth_interceptor`).
+    "toolkit-contract/platform-credential",
     "dep:toolkit-security",
     "dep:futures-core",
     # Direct deps the generated client and the compiled stubs need by name.

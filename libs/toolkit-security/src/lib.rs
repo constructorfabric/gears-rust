@@ -47,6 +47,8 @@ pub mod context;
 /// Application cryptographic primitives with explicit per-OS FIPS routing.
 pub mod crypto;
 /// Platform-plane identity, credentials, and the authenticator contract.
+/// Building the inbound platform-plane validator from `internal_auth` config.
+pub mod inbound_authenticator;
 pub mod internal_auth;
 /// TTL-bounded caching for platform-plane validation.
 #[cfg(feature = "internal-auth-cache")]
@@ -76,6 +78,10 @@ pub use authenticator::{
     AuthNError, BearerAuthenticator, DynBearerAuthenticator, DynInternalAuthenticator,
 };
 pub use context::{SecurityContext, SecurityContextBuildError};
+pub use inbound_authenticator::{
+    InboundAuthenticatorError, KubeAuthenticatorBuilder, KubeBackendError,
+    build_inbound_authenticator,
+};
 pub use internal_auth::{
     InternalAuthNError, InternalAuthenticator, InternalCredential, PeerAuthenticated,
     PlatformAuthEnforced, PlatformIdentity, PlatformSecurityContext,
@@ -87,10 +93,12 @@ pub use internal_auth_cache::{
 };
 pub use internal_auth_config::{
     BuiltAuthenticator, DEFAULT_INTERNAL_PEER_NAME, InternalAuthConfig, InvalidInternalAuth,
+    InvalidOutboundAuth, KubePresent, KubeVerify, OutboundSpec,
 };
 pub use route_auth::RouteAuth;
 pub use shared_secret::{
     InvalidSharedSecret, REDACTED_PLACEHOLDER, SharedSecretInternalAuthenticator,
+    validate_shared_secret,
 };
 
 pub use bin_codec::{

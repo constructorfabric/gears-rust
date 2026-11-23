@@ -62,19 +62,20 @@ Sequencing:
 1. **First phase — K8s ServiceAccount tokens (steady state, not just enrollment).** A gear attaches its projected SA
    token as `X-ToolKit-Internal-Token`; the receiver validates it via the k8s TokenReview API (cached TTL) and builds a
    `PlatformIdentity::KubernetesServiceAccount`. Zero new infrastructure, K8s-native, auto-rotated. This ships the first OoP gear
-   without any PKI. Profile 2 single-node uses a bootstrap token (or plain UDS when all gears share a uid).
+   without any PKI. Profile 2 single-node uses a pre-shared secret (the `shared_secret` provider), or plain UDS when
+   all gears share a uid; an ephemeral bootstrap token minted by Flight Control is planned.
 2. **Next phase — mTLS + SPIFFE.** cert-manager (K8s) / an embedded CA (on-prem) mints a workload certificate
    (`SAN URI = spiffe://<trust_domain>/gear/<gear>/<version>`). The TLS handshake establishes peer identity *before* any
    application payload is read, building a `PlatformIdentity::Spiffe` and providing defense in depth alongside the
    tenant plane's per-hop JWT re-validation. The first-phase credential **doubles as the enrollment credential** for
    this transition: a gear authenticates to cert-manager / SPIRE with its projected SA token (Profile 3) or its
-   bootstrap token (Profile 2) to obtain its workload certificate, so the migration needs no separate enrollment secret.
+   Profile 2 credential to obtain its workload certificate, so the migration needs no separate enrollment secret.
 
 SA token and mTLS are **two backends of one stable abstraction** — swapping does not change gear code. Outbound, the
-runtime selects an `InternalCredential`; inbound, `InternalAuthMiddleware` validates it and produces a
-`PlatformIdentity`. The platform plane's *context type* (`PlatformSecurityContext`, defined by the
-[two-plane model ADR](0008-cpt-cf-adr-two-plane-auth.md)) is stable across both phases; only the populating mechanism —
-and thus the `PlatformIdentity` variant — changes.
+runtime builds an `InternalTokenProvider` from the `internal_auth` config; inbound, the platform-plane middleware
+validates the presented credential and produces a `PlatformIdentity`. The platform plane's *context type*
+(`PlatformSecurityContext`, defined by the [two-plane model ADR](0008-cpt-cf-adr-two-plane-auth.md)) is stable across
+both phases; only the populating mechanism — and thus the `PlatformIdentity` variant — changes.
 
 **Why not mTLS on day one (Option B directly):** mTLS is the destination, but tying the very first OoP deployment to a
 finished CA / enrollment story delays everything. SA tokens are a real, K8s-native first backend of the same
@@ -88,58 +89,80 @@ compromised sibling gear.
 | Profile            | First-phase mechanism                       | End-state mechanism                | Notes                                                        |
 |--------------------|---------------------------------------------|------------------------------------|--------------------------------------------------------------|
 | 1 (Embedded)       | n/a (same process)                          | n/a                                | No transport, no auth needed                                 |
-| 2 (single-node)    | Bootstrap token over UDS, or plain UDS      | mTLS over loopback (optional)      | Same-uid plain UDS is a trusted single-node mode, not ZTA-aligned      |
+| 2 (single-node)    | Shared secret over UDS (bootstrap token planned), or plain UDS | mTLS over loopback (optional)      | Same-uid plain UDS is a trusted single-node mode, not ZTA-aligned      |
 | 2 (multi-node, P2) | Bootstrap token for first enrollment        | **mTLS with platform CA (required)** | Plain TCP rejected at the listener once mTLS lands           |
 | 3 (K8s)            | **K8s SA token + TokenReview**              | **mTLS + SPIFFE (cert-manager)**   | NetworkPolicy is defense-in-depth, not the primary boundary  |
 
 ### Credential and identity abstraction
 
+Every participant selects its platform credential through one `internal_auth` config block
+(`toolkit_security::InternalAuthConfig`):
+
 ```rust
-// Outbound: what a gear attaches to its system calls (selected by profile/config).
-pub enum InternalCredential {
-    /// Profile 1: no auth needed (in-process)
-    None,
-    /// Profile 2 single-node: ephemeral token from Flight Control
-    BootstrapToken(SecretString),
-    /// Profile 3 first phase: k8s ServiceAccount JWT (auto-mounted, auto-rotated)
-    KubeServiceAccountToken { token_path: PathBuf, audience: String },
-    /// End state (and Profile 2 multi-node, P2): mTLS client identity
-    MtlsIdentity { cert: PathBuf, key: PathBuf, ca: PathBuf },
+pub enum InternalAuthConfig {
+    /// Dev / single-node: one pre-shared token, accepted inbound and attached outbound.
+    SharedSecret { secret: SecretString, peer_name: String },
+    /// Profile 3: projected k8s ServiceAccount tokens, configured per direction.
+    Kube {
+        /// Inbound: validate callers' tokens via TokenReview against `audiences` (non-empty).
+        verify: Option<KubeVerify>,   // { audiences: Vec<String> }
+        /// Outbound: the projected token this participant attaches, re-read on rotation.
+        present: Option<KubePresent>, // { token_path: PathBuf }
+    },
 }
 
-// Inbound: the validated identity InternalAuthMiddleware produces, carried inside PlatformSecurityContext.
+// Inbound: the validated identity the platform-plane middleware produces, carried inside PlatformSecurityContext.
 #[non_exhaustive]
 pub enum PlatformIdentity {
-    /// First phase: from a validated projected SA token (TokenReview).
+    /// From a validated projected SA token (TokenReview).
     KubernetesServiceAccount { namespace: String, service_account: String, pod: Option<String> },
-    /// Next phase: mTLS + SPIFFE, parsed from the X.509 SAN.
+    /// Next phase: mTLS + SPIFFE, parsed from the X.509 SAN. Nothing produces it yet.
     Spiffe { trust_domain: String, name: String, version: String },
+    /// From a validated pre-shared secret; `name` is the configured `peer_name`.
+    Shared { name: String },
+    /// Locally minted so outbound code can satisfy a platform-plane signature; never the result of
+    /// validation, never authorizes anything.
+    OutboundMarker,
+    /// A variant from a newer library version (deserialization only).
+    Unknown,
 }
 ```
 
-The OoP bootstrap reads the credential source from configuration and creates the appropriate `InternalCredential`
-variant. All outgoing system calls go through `attach_internal_auth(request, credential)`, which sets the correct
-header/metadata (`X-ToolKit-Internal-Token` for token-based phases — never `Authorization`, to avoid colliding with the
-tenant-plane user JWT). `PlatformSecurityContext` itself — the wrapper type, its no-tenant guarantee, and the rule that
-it is never passed to the tenant `PolicyEnforcer` — is defined by the [two-plane model ADR](0008-cpt-cf-adr-two-plane-auth.md);
-this ADR owns how its `PlatformIdentity` is *populated*.
+A participant requires only the block it uses: grpc-hub validates (`verify`); OoP gears register with DirectoryService
+and validate their own routes (both); the host process and `publish-gts` only send (`present`); api-gateway always
+validates and also sends when its reverse proxy is enabled. A participant missing a block it needs fails startup rather
+than running that direction unauthenticated.
+
+* **Outbound.** `toolkit_contract::runtime::platform_credential::build_internal_token_provider` maps the config to a
+  transport-agnostic `InternalTokenProvider`. Generated clients attach it through
+  `InternalTokenProvider::resolve_for_attach`, and hand-written tonic clients wrap it with `internal_auth_interceptor`,
+  so every system call carries it as `X-ToolKit-Internal-Token` — never `Authorization`, to avoid colliding with the
+  tenant-plane user JWT. A projected token is re-read on rotation by a refresh task bound to the caller's cancellation
+  token.
+* **Inbound.** `toolkit_security::build_inbound_authenticator` builds the validator: the shared secret directly, or a
+  TokenReview validator via `toolkit_k8s_auth::kube_authenticator_builder` (cached TTL). It is installed as
+  `internal_auth_middleware` (HTTP) or `InternalAuthGrpcLayer` (gRPC).
+
+`PlatformSecurityContext` itself — the wrapper type, its no-tenant guarantee, and the rule that it is never passed to
+the tenant `PolicyEnforcer` — is defined by the [two-plane model ADR](0008-cpt-cf-adr-two-plane-auth.md); this ADR owns
+how its `PlatformIdentity` is *populated*.
 
 **Carrier selection vs. credential population.** Which carrier a system call uses is *not* chosen by this credential
 machinery — it is chosen at compile time by the context type in the contract signature. A method that takes
 `&PlatformSecurityContext` is a platform-plane call and the generated client emits `X-ToolKit-Internal-Token`; a method
 that takes `&SecurityContext` is a tenant-plane call and emits `Authorization` (see the
-[two-plane model ADR](0008-cpt-cf-adr-two-plane-auth.md), "The context type *is* the plane marker"). `attach_internal_auth`
-then fills that platform-plane carrier with the actual secret from the selected `InternalCredential`. The contract picks
+[two-plane model ADR](0008-cpt-cf-adr-two-plane-auth.md), "The context type *is* the plane marker"). The generated
+client then fills that platform-plane carrier from the runtime's `InternalTokenProvider`. The contract picks
 the slot; this ADR's runtime fills it — so gear code never sets an auth header and codegen can never default a
 platform-plane call to `Authorization`.
 
 ### Consequences
 
 * **Phase 1 validates a per-request token.** Each inbound system call carries `X-ToolKit-Internal-Token` (SA token),
-  validated via TokenReview (cached). `InternalAuthMiddleware` builds `PlatformIdentity::KubernetesServiceAccount` and sets
+  validated via TokenReview (cached). The platform-plane middleware builds `PlatformIdentity::KubernetesServiceAccount` and sets
   `PeerAuthenticated { name }` for workload-policy decisions only.
 * **The end state removes the per-request token from the hot path.** Once mTLS lands, peer identity is established by
-  the TLS handshake (the cert-derived `PlatformIdentity::Spiffe`), and `InternalAuthMiddleware` becomes a thin
+  the TLS handshake (the cert-derived `PlatformIdentity::Spiffe`), and the platform-plane middleware becomes a thin
   shim asserting the connection-level identity — there is no per-request token to validate.
 * **Plain-TCP rejection applies once mTLS lands.** In the mTLS end state, the OoP runtime MUST refuse plain-TCP inbound
   on every multi-process profile (the listener requires client-certificate verification against the platform CA, and no
@@ -149,7 +172,7 @@ platform-plane call to `Authorization`.
   rotated certs from a well-known path (Profile 2: file watched by `notify`; Profile 3: projected volume).
 * Flight Control validates inbound `RegisterInstance` / `DeregisterInstance` / `Heartbeat` by the validated
   `PlatformIdentity` (the `ServiceAccount` variant in phase 1; the `Spiffe` variant from mTLS next), not by a bespoke token scheme.
-* `InternalAuthMiddleware` inserts two values from the validated credential: `PeerAuthenticated { name }` — a
+* The platform-plane middleware inserts two values from the validated credential: `PeerAuthenticated { name }` — a
   lightweight marker for **workload-policy** checks — and `PlatformSecurityContext { identity }` — the identity object
   that AuthZ-exempt platform handlers consume. Neither is ever passed to the tenant `PolicyEnforcer`, and neither
   substitutes for tenant-plane JWT validation.
@@ -159,18 +182,18 @@ platform-plane call to `Authorization`.
   requirement for protected inter-service transport
   ([SECURITY.md §15, requirement 7](../../../security/SECURITY.md#requirements-for-a-zta-aligned-gears-service)).
   A ZTA-aligned deployment needs a separate OS identity per gear or mTLS.
-* The optional JWT mode (`internal_auth.mode = "jwt"`, Option E) coexists as an escape hatch for operators who want one
-  auth backend for users and gears; it is **not** the default.
+* A service-to-service JWT provider (Option E) MAY be added to `internal_auth` as an escape hatch for operators who
+  want one auth backend for users and gears. It is not implemented, and would **not** be the default.
 * The platform plane SHOULD be served on a listener separate from business endpoints.
 
 ### Confirmation
 
-* Integration test (Profile 2): an unauthorized process attempts `RegisterInstance` without the bootstrap token —
+* Integration test (Profile 2): an unauthorized process attempts `RegisterInstance` without the platform credential —
   rejected with `UNAUTHENTICATED`.
 * Integration test (Profile 3): a pod registers with DirectoryService using its SA token — accepted; a wrong-audience
   token is rejected.
-* Code review: no gear source code touches `InternalCredential` or auth headers for system calls — all handled by the
-  ToolKit runtime.
+* Code review: no gear source code builds the platform credential or sets auth headers for system calls — all handled
+  by the ToolKit runtime.
 * Abstraction test: adding the `Spiffe` mechanism populates the same `PlatformSecurityContext` and does not change how
   platform handlers consume `PlatformIdentity`.
 
@@ -203,7 +226,7 @@ Bootstrap token (Profile 2 single-node) / K8s SA tokens (Profile 3) now, migrati
 
 * Good, because security matches the threat model — no over-engineering for low-risk profiles.
 * Good, because k8s SA tokens are zero-config (auto-mounted, auto-rotated) and give per-pod identity.
-* Good, because the `InternalCredential` / `PlatformIdentity` abstraction hides the mechanism from gear code.
+* Good, because the `internal_auth` config / `PlatformIdentity` abstraction hides the mechanism from gear code.
 * Good, because each phase is a real backend of the eventual abstraction — no throwaway work.
 * Neutral, because the runtime needs a small validation layer that dispatches by credential type.
 * Bad, because Profile 3 SA-token validation requires the k8s TokenReview API (mitigated by caching).
@@ -224,7 +247,8 @@ Every gear is provisioned a service identity; system calls carry an `Authorizati
 * Good, because it reuses the existing `AuthNResolverClient` and AuthZ machinery.
 * Neutral, because it conflates platform identity into the tenant-plane validation path.
 * Bad, because it does not provide transport-level peer authentication (defense in depth) the way mTLS does.
-* Retained only as an opt-in `internal_auth.mode = "jwt"` escape hatch, not the default.
+* Retained only as a possible opt-in escape hatch (a future `internal_auth` provider), not the default; not
+  implemented.
 
 ## More Information
 
@@ -250,8 +274,8 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-fr-oop-lifecycle` — Registration and deregistration calls to DirectoryService are authenticated via this
   mechanism.
 * `cpt-cf-fr-eventual-readiness` — Background self-registration retries carry the internal credential.
-* `cpt-cf-component-oop-bootstrap` — The OoP bootstrap initializes the `InternalCredential` and attaches it to all
-  system calls.
-* `cpt-cf-component-platform-plane-auth` — The platform-plane-auth component implements `InternalCredential`,
-  `PlatformIdentity`, and `InternalAuthMiddleware`.
+* `cpt-cf-component-oop-bootstrap` — The OoP bootstrap builds the platform credential from `oop_http.internal_auth`
+  and attaches it to all system calls.
+* `cpt-cf-component-platform-plane-auth` — The platform-plane-auth component implements `InternalAuthConfig`,
+  `PlatformIdentity`, and the platform-plane middleware (`internal_auth_middleware`, `InternalAuthGrpcLayer`).
 * `cpt-cf-adr-two-plane-auth` — Defines the two-plane model whose platform plane this ADR's mechanism authenticates.
