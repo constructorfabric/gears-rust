@@ -164,9 +164,10 @@ pub struct ServiceInstanceInfo {
     /// Stable content token for the published `OpenAPI` spec, if any.
     ///
     /// Enumeration is deliberately spec-free: only this hash rides along, never
-    /// the full document (fetched out-of-band via
-    /// [`DirectoryClient::get_openapi_spec`]). The hash lets a consumer detect a
-    /// spec change without inlining N copies of the document.
+    /// the full document (the edge fetches it from the instance's
+    /// `/.well-known/openapi.json` and verifies it against this hash). The hash
+    /// lets a consumer detect a spec change without inlining N copies of the
+    /// document.
     pub openapi_spec_hash: Option<String>,
     /// Published gRPC services as `(service name, endpoint)` pairs.
     ///
@@ -278,8 +279,12 @@ pub struct RegisterInstanceInfo {
     pub version: Option<String>,
     /// Optional REST endpoint (HTTP base URL) exposed by the gear.
     pub rest_endpoint: Option<ServiceEndpoint>,
-    /// Optional `OpenAPI` spec (JSON) published by the gear.
-    pub openapi_spec: Option<String>,
+    /// Lowercase-hex SHA-256 of the `OpenAPI` document the instance serves, or
+    /// `None` if the gear publishes no document. This is what the directory
+    /// stores and returns in [`ServiceInstanceInfo::openapi_spec_hash`]; the
+    /// edge fetches the document from the instance and verifies it against the
+    /// hash.
+    pub openapi_spec_hash: Option<String>,
     /// Stable addressing labels for this instance (k8s `matchLabels` style).
     pub labels: BTreeMap<String, String>,
     /// State the registrant declares about itself, or `None` when
@@ -321,10 +326,10 @@ impl RegisterInstanceInfo {
         self
     }
 
-    /// Set the published `OpenAPI` spec (JSON).
+    /// Set the lowercase-hex SHA-256 of the published `OpenAPI` document.
     #[must_use]
-    pub fn with_openapi_spec(mut self, openapi_spec: impl Into<String>) -> Self {
-        self.openapi_spec = Some(openapi_spec.into());
+    pub fn with_openapi_spec_hash(mut self, openapi_spec_hash: impl Into<String>) -> Self {
+        self.openapi_spec_hash = Some(openapi_spec_hash.into());
         self
     }
 
@@ -506,16 +511,14 @@ pub trait DirectoryClient: Send + Sync {
     /// make REST requests to the resolved gear.
     async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint>;
 
-    /// Retrieve the `OpenAPI` spec (JSON) published by a gear.
-    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String>;
-
     /// List all service instances for a given gear.
     ///
     /// Entries are **spec-free**: only the `openapi_spec_hash` is carried, never
     /// the full `OpenAPI` document, so a multi-instance response stays
-    /// bounded regardless of spec size. Callers fetch the document out-of-band
-    /// via [`get_openapi_spec`](Self::get_openapi_spec); the hash lets a consumer
-    /// detect a spec change without inlining N copies of the document.
+    /// bounded regardless of spec size. Consumers fetch the document directly
+    /// from the instance's `/.well-known/openapi.json` and verify it against the
+    /// hash; the hash lets a consumer detect a spec change without inlining N
+    /// copies of the document.
     ///
     /// An endpoint-less instance is still returned (`endpoint`/`rest_endpoint` =
     /// `None`, never an empty-URI sentinel): *no-endpoint, not an error*. Only
@@ -543,8 +546,8 @@ pub trait DirectoryClient: Send + Sync {
     ///
     /// Returned entries are **spec-free** on every implementation — the full
     /// `OpenAPI` document is omitted (only its hash is carried), so the
-    /// polled resolve payload stays bounded; the caller fetches documents via
-    /// [`get_openapi_spec`](Self::get_openapi_spec). This holds regardless of
+    /// polled resolve payload stays bounded; the caller fetches documents from
+    /// the instance's `/.well-known/openapi.json`. This holds regardless of
     /// whether the selector is empty. The default body enumerates via
     /// [`list_instances`](Self::list_instances) and filters in-process;
     /// transport-backed clients (e.g. the gRPC client) override it to push the
@@ -578,10 +581,9 @@ pub trait DirectoryClient: Send + Sync {
     /// Used by the edge gateway to discover which gears (and their REST
     /// endpoints) to reverse-proxy. This is a lightweight discovery snapshot.
     /// Like every enumeration path, it is **spec-free**: entries carry only the
-    /// `openapi_spec_hash`, never the full `OpenAPI` document, even when the
-    /// backing store holds a stored specification. The edge fetches a gear's
-    /// document once, on first discovery, via
-    /// [`get_openapi_spec`](Self::get_openapi_spec).
+    /// `openapi_spec_hash`, never the full `OpenAPI` document. The edge fetches
+    /// a gear's document from the instance's `/.well-known/openapi.json` when it
+    /// sees a hash it has not cached, and verifies it against the hash.
     ///
     /// The returned instances also do **not** carry `labels`: every
     /// implementation applies [`ServiceInstanceInfo::without_labels`] so the
@@ -666,7 +668,7 @@ mod tests {
         assert_eq!(info.instance_id, "instance1");
         assert_eq!(info.grpc_services.len(), 1);
         assert!(info.rest_endpoint.is_none());
-        assert!(info.openapi_spec.is_none());
+        assert!(info.openapi_spec_hash.is_none());
         assert!(info.labels.is_empty());
     }
 
@@ -679,7 +681,7 @@ mod tests {
             version: Some("2.0.0".to_owned()),
             labels: BTreeMap::new(),
             rest_endpoint: Some(ServiceEndpoint::http("billing", 8080)),
-            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+            openapi_spec_hash: Some("a".repeat(64)),
             reported_state: None,
         };
 
@@ -688,7 +690,7 @@ mod tests {
             info.rest_endpoint.as_ref().unwrap().uri,
             concat!("http", "://billing:8080")
         );
-        assert!(info.openapi_spec.is_some());
+        assert!(info.openapi_spec_hash.is_some());
     }
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -735,9 +737,6 @@ mod tests {
         }
         async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint> {
             Err(DirectoryNotFound::new(format!("gear {gear_name}")).into())
-        }
-        async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
-            Err(DirectoryNotFound::new(format!("spec {gear_name}")).into())
         }
         async fn list_instances(&self, gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
             Ok(self

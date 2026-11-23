@@ -142,7 +142,9 @@ pub struct GearInstance {
     pub grpc_services: HashMap<String, Endpoint>,
     pub version: Option<String>,
     pub rest_endpoint: Option<Endpoint>,
-    pub openapi_spec: Option<String>,
+    /// Lowercase-hex SHA-256 of the gear's `OpenAPI` document, advertised to the
+    /// edge so it can fetch and verify the document directly from the instance.
+    pub openapi_spec_hash: Option<String>,
     /// Stable addressing labels (k8s `matchLabels` style) advertised by this
     /// instance, used for label-based instance selection.
     pub labels: BTreeMap<String, String>,
@@ -164,7 +166,7 @@ impl Clone for GearInstance {
             grpc_services: self.grpc_services.clone(),
             version: self.version.clone(),
             rest_endpoint: self.rest_endpoint.clone(),
-            openapi_spec: self.openapi_spec.clone(),
+            openapi_spec_hash: self.openapi_spec_hash.clone(),
             labels: self.labels.clone(),
             reported_state: self.reported_state,
             inner: Arc::clone(&self.inner),
@@ -197,10 +199,10 @@ impl GearInstance {
                 .rest_endpoint
                 .clone()
                 .or_else(|| self.rest_endpoint.clone()),
-            openapi_spec: other
-                .openapi_spec
+            openapi_spec_hash: other
+                .openapi_spec_hash
                 .clone()
-                .or_else(|| self.openapi_spec.clone()),
+                .or_else(|| self.openapi_spec_hash.clone()),
             // Empty incoming labels mean "keep the stored set", not "clear"; a
             // non-empty set replaces it. See `RegisterInstanceInfo::with_labels`
             // for why (self-heal / REST-augmentation re-registers omit labels).
@@ -227,7 +229,7 @@ impl GearInstance {
             grpc_services: HashMap::new(),
             version: None,
             rest_endpoint: None,
-            openapi_spec: None,
+            openapi_spec_hash: None,
             labels: BTreeMap::new(),
             reported_state: None,
             // Placeholder lease: already expired, so an instance that is never
@@ -261,8 +263,8 @@ impl GearInstance {
         self
     }
 
-    pub fn with_openapi_spec(mut self, spec: impl Into<String>) -> Self {
-        self.openapi_spec = Some(spec.into());
+    pub fn with_openapi_spec_hash(mut self, hash: impl Into<String>) -> Self {
+        self.openapi_spec_hash = Some(hash.into());
         self
     }
 
@@ -947,17 +949,6 @@ impl GearManager {
         }
         None
     }
-
-    /// Retrieve the `OpenAPI` spec of a gear, taken from the first registered
-    /// instance that published one.
-    #[must_use]
-    pub fn openapi_spec_of(&self, gear: &str) -> Option<String> {
-        let instances_entry = self.inner.get(gear)?;
-        instances_entry
-            .value()
-            .iter()
-            .find_map(|inst| inst.openapi_spec.clone())
-    }
 }
 
 impl Default for GearManager {
@@ -1060,7 +1051,7 @@ mod tests {
         let rest = |id| {
             GearInstance::new("both", id)
                 .with_rest_endpoint(Endpoint::from_uri("http://127.0.0.1:8080"))
-                .with_openapi_spec("{}")
+                .with_openapi_spec_hash("a".repeat(64))
         };
         for grpc_first in [true, false] {
             let dir = GearManager::new();
@@ -1084,7 +1075,10 @@ mod tests {
                 Some("http://127.0.0.1:8080"),
                 "REST kept (grpc_first={grpc_first})"
             );
-            assert_eq!(registered[0].openapi_spec.as_deref(), Some("{}"));
+            assert_eq!(
+                registered[0].openapi_spec_hash.as_deref(),
+                Some("a".repeat(64).as_str())
+            );
         }
     }
 
@@ -1601,15 +1595,12 @@ mod tests {
         let instance = Arc::new(
             GearInstance::new("billing", id)
                 .with_rest_endpoint(Endpoint::http("billing", 8080))
-                .with_openapi_spec("{\"openapi\":\"3.1.0\"}"),
+                .with_openapi_spec_hash("b".repeat(64)),
         );
         seed(&dir, instance);
 
         let rest = dir.pick_rest_endpoint_round_robin("billing").unwrap();
         assert_eq!(rest.uri, "http://billing:8080");
-
-        let spec = dir.openapi_spec_of("billing").unwrap();
-        assert!(spec.contains("openapi"));
     }
 
     #[test]
@@ -1624,7 +1615,6 @@ mod tests {
         seed(&dir, instance);
 
         assert!(dir.pick_rest_endpoint_round_robin("grpc_only").is_none());
-        assert!(dir.openapi_spec_of("grpc_only").is_none());
         assert!(dir.pick_rest_endpoint_round_robin("missing").is_none());
     }
 

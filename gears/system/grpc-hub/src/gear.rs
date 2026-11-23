@@ -1757,9 +1757,6 @@ mod tests {
         async fn resolve_rest_service(&self, _g: &str) -> anyhow::Result<toolkit::ServiceEndpoint> {
             anyhow::bail!("unused")
         }
-        async fn get_openapi_spec(&self, _g: &str) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
         async fn list_instances(
             &self,
             gear: &str,
@@ -1958,7 +1955,6 @@ mod tests {
         let sent = directory.sent.lock().clone();
         assert_eq!(sent.len(), 1);
         assert!(sent[0].rest_endpoint.is_none(), "no REST endpoint sent");
-        assert!(sent[0].openapi_spec.is_none(), "no OpenAPI spec sent");
         assert!(!sent[0].grpc_services.is_empty());
         assert_eq!(
             directory
@@ -2623,9 +2619,6 @@ mod tests {
                 _gear_name: &str,
             ) -> anyhow::Result<ServiceEndpoint> {
                 Ok(ServiceEndpoint::new("mock://rest"))
-            }
-            async fn get_openapi_spec(&self, _gear_name: &str) -> anyhow::Result<String> {
-                Ok(String::new())
             }
             async fn list_instances(
                 &self,

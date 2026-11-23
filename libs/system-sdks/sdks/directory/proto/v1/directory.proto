@@ -13,8 +13,6 @@ service DirectoryService {
   // Resolve a REST endpoint (HTTP base URL) for a gear by its name
   rpc ResolveRestService(ResolveRestServiceRequest) returns (ResolveRestServiceResponse);
 
-  // Retrieve the OpenAPI spec (JSON) published by a gear
-  rpc GetOpenApiSpec(GetOpenApiSpecRequest) returns (GetOpenApiSpecResponse);
 
   // List all instances of a specific gear
   rpc ListInstances(ListInstancesRequest) returns (ListInstancesResponse);
@@ -24,8 +22,9 @@ service DirectoryService {
   // This response is a lightweight discovery snapshot: instances carry their
   // identity and REST endpoint but never the full OpenAPI document (only its
   // `openapi_spec_hash`), so the aggregated payload stays small and bounded
-  // even with many gears. The edge fetches a gear's document once, on first
-  // discovery, via `GetOpenApiSpec`.
+  // even with many gears. The edge fetches a gear's document from the
+  // instance's REST endpoint (`/.well-known/openapi.json`) when it sees a hash
+  // it has not cached, and verifies the fetched document against the hash.
   rpc ListAllInstances(ListAllInstancesRequest) returns (ListAllInstancesResponse);
 
   // Register a new gear instance with the directory
@@ -52,14 +51,6 @@ message ResolveRestServiceRequest {
 
 message ResolveRestServiceResponse {
   string endpoint_uri = 1;
-}
-
-message GetOpenApiSpecRequest {
-  string gear_name = 1;
-}
-
-message GetOpenApiSpecResponse {
-  string openapi_spec = 1;
 }
 
 message ListInstancesRequest {
@@ -119,17 +110,25 @@ message GrpcServiceEndpoint {
 }
 
 message RegisterInstanceRequest {
+  // Field 6 (`optional string openapi_spec`) was removed: the directory no
+  // longer stores OpenAPI documents, only `openapi_spec_hash` (ADR-0011).
+  reserved 6;
+  reserved "openapi_spec";
   string gear_name = 1;
   string instance_id = 2;
   repeated GrpcServiceEndpoint grpc_services = 3;
   string version = 4;
   optional string rest_endpoint_uri = 5;
-  optional string openapi_spec = 6;
   map<string, string> labels = 7;
   // State the registrant reports about itself. Unset/UNSPECIFIED is
   // read as STARTING on a new record; on a re-registration it leaves the stored
   // state unchanged, so a self-heal re-register never resets a serving instance.
   optional ReportedState reported_state = 8;
+  // Lowercase-hex SHA-256 of the OpenAPI document the instance serves at
+  // `/.well-known/openapi.json`. The directory stores only this hash and
+  // returns it in `InstanceInfo.openapi_spec_hash`; the edge fetches and
+  // verifies the document against it. Unset when the gear publishes no document.
+  optional string openapi_spec_hash = 9;
 }
 
 // Response to RegisterInstance. Replaces google.protobuf.Empty; an empty

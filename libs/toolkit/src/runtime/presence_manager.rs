@@ -89,8 +89,10 @@ fn merge_registration(
     if incoming.rest_endpoint.is_none() {
         incoming.rest_endpoint.clone_from(&stored.rest_endpoint);
     }
-    if incoming.openapi_spec.is_none() {
-        incoming.openapi_spec.clone_from(&stored.openapi_spec);
+    if incoming.openapi_spec_hash.is_none() {
+        incoming
+            .openapi_spec_hash
+            .clone_from(&stored.openapi_spec_hash);
     }
     if incoming.labels.is_empty() {
         incoming.labels.clone_from(&stored.labels);

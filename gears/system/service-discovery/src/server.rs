@@ -9,12 +9,12 @@ use tonic::{Extensions, Request, Response, Status};
 use cf_system_sdks::directory::labels::is_valid_label_segment;
 use cf_system_sdks::directory::{
     DeregisterInstanceRequest, DirectoryClient, DirectoryInvalidArgument, DirectoryNotFound,
-    DirectoryService, DirectoryServiceNameConflict, DirectoryServiceServer, GetOpenApiSpecRequest,
-    GetOpenApiSpecResponse, HeartbeatRequest, InstanceInfo, InstanceState, LabelSelector,
-    ListAllInstancesRequest, ListAllInstancesResponse, ListInstancesRequest, ListInstancesResponse,
-    ProtoInstanceState, ProtoReportedState, RegisterInstanceInfo, RegisterInstanceRequest,
-    RegisterInstanceResponse, ReportedState, ResolveGrpcServiceRequest, ResolveGrpcServiceResponse,
-    ResolveRestServiceRequest, ResolveRestServiceResponse, ServiceEndpoint, ServiceInstanceInfo,
+    DirectoryService, DirectoryServiceNameConflict, DirectoryServiceServer, HeartbeatRequest,
+    InstanceInfo, InstanceState, LabelSelector, ListAllInstancesRequest, ListAllInstancesResponse,
+    ListInstancesRequest, ListInstancesResponse, ProtoInstanceState, ProtoReportedState,
+    RegisterInstanceInfo, RegisterInstanceRequest, RegisterInstanceResponse, ReportedState,
+    ResolveGrpcServiceRequest, ResolveGrpcServiceResponse, ResolveRestServiceRequest,
+    ResolveRestServiceResponse, ServiceEndpoint, ServiceInstanceInfo,
 };
 use std::collections::BTreeMap;
 use toolkit_security::{PlatformAuthEnforced, PlatformSecurityContext};
@@ -217,22 +217,6 @@ impl DirectoryService for DirectoryServiceImpl {
         }))
     }
 
-    async fn get_open_api_spec(
-        &self,
-        request: Request<GetOpenApiSpecRequest>,
-    ) -> Result<Response<GetOpenApiSpecResponse>, Status> {
-        let gear_name = request.into_inner().gear_name;
-        validate_lookup_name("gear_name", &gear_name)?;
-
-        let openapi_spec = self
-            .api
-            .get_openapi_spec(&gear_name)
-            .await
-            .map_err(|e| lookup_status(&e))?;
-
-        Ok(Response::new(GetOpenApiSpecResponse { openapi_spec }))
-    }
-
     async fn list_instances(
         &self,
         request: Request<ListInstancesRequest>,
@@ -252,10 +236,11 @@ impl DirectoryService for DirectoryServiceImpl {
 
         // Enumerate once and filter by the selector (an empty selector matches
         // all). The response is always spec-free: only the `openapi_spec_hash`
-        // rides along, and the full document is fetched out-of-band via
-        // `GetOpenApiSpec`. This bounds every multi-instance response regardless
-        // of spec size, matching `resolve_by_labels` / `list_all_instances`
-        // (ADR-0009); the hash still lets a consumer detect a spec change.
+        // rides along, and the full document is fetched by the consumer from the
+        // instance's `/.well-known/openapi.json`. This bounds every
+        // multi-instance response regardless of spec size, matching
+        // `resolve_by_labels` / `list_all_instances` (ADR-0009); the hash still
+        // lets a consumer detect a spec change.
         let mut instances = self
             .api
             .list_instances(&gear_name)
@@ -325,8 +310,8 @@ impl DirectoryService for DirectoryServiceImpl {
         if let Some(uri) = &req.rest_endpoint_uri {
             validate_endpoint_uri("rest endpoint", uri)?;
         }
-        if let Some(spec) = &req.openapi_spec {
-            validate_openapi_spec(spec)?;
+        if let Some(hash) = &req.openapi_spec_hash {
+            validate_openapi_spec_hash(hash)?;
         }
 
         // Parse endpoints from GrpcServiceEndpoint messages
@@ -348,8 +333,8 @@ impl DirectoryService for DirectoryServiceImpl {
         if let Some(uri) = req.rest_endpoint_uri {
             info = info.with_rest_endpoint(ServiceEndpoint::new(uri));
         }
-        if let Some(spec) = req.openapi_spec {
-            info = info.with_openapi_spec(spec);
+        if let Some(hash) = req.openapi_spec_hash {
+            info = info.with_openapi_spec_hash(hash);
         }
         // An unset/UNSPECIFIED reported state leaves `info.reported_state` None,
         // which the store reads as Starting on a new record.
@@ -454,17 +439,6 @@ fn domain_state_to_proto(state: InstanceState) -> ProtoInstanceState {
 /// bounded and screened for control characters at the trust boundary.
 const MAX_ENDPOINT_URI_LEN: usize = 2048;
 
-/// Upper bound on a registrant-supplied `OpenAPI` document. Like endpoint URIs and
-/// labels, the spec is echoed to consumers - returned verbatim by
-/// `GetOpenApiSpec`, inlined into `list_instances` (when requested), and turned
-/// into a public route table by the edge - so it is bounded at the trust
-/// boundary rather than stored unbounded. This is a size guard only; structural
-/// `OpenAPI`/JSON validation is tracked separately by
-/// `cpt-cf-binding-fr-openapi-validation`. The cap sits well under the default
-/// 4 MiB gRPC message size so several specs can still be inlined in one
-/// `list_instances` response.
-const MAX_OPENAPI_SPEC_LEN: usize = 1024 * 1024;
-
 /// Schemes accepted for a registered endpoint URI.
 ///
 /// Both endpoint consumers speak HTTP transports only: gRPC service endpoints
@@ -534,20 +508,15 @@ fn validate_endpoint_uri(context: &str, uri: &str) -> Result<(), Status> {
     Ok(())
 }
 
-/// Reject a registrant-supplied `OpenAPI` document over [`MAX_OPENAPI_SPEC_LEN`].
-///
-/// The spec originates from an untrusted registrant and is later echoed to
-/// discovery consumers - returned verbatim by `GetOpenApiSpec`, inlined into
-/// `list_instances`, and rendered into the edge's public route table - so an
-/// unbounded value would let a single registrant inflate every such response.
-/// This bounds size only; structural `OpenAPI`/JSON validation is the separate
-/// `cpt-cf-binding-fr-openapi-validation`.
-fn validate_openapi_spec(spec: &str) -> Result<(), Status> {
-    if spec.len() > MAX_OPENAPI_SPEC_LEN {
-        return Err(Status::invalid_argument(format!(
-            "openapi spec too long: {} bytes (max {MAX_OPENAPI_SPEC_LEN})",
-            spec.len()
-        )));
+/// Reject a malformed `openapi_spec_hash`. It must be a lowercase-hex SHA-256
+/// digest (exactly 64 hex characters), the shape every worker and the edge
+/// agree on (ADR-0011). The value is echoed to every discovery consumer in
+/// `InstanceInfo.openapi_spec_hash`, so it is screened at the trust boundary.
+fn validate_openapi_spec_hash(hash: &str) -> Result<(), Status> {
+    if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(Status::invalid_argument(
+            "openapi_spec_hash must be a lowercase-hex SHA-256 digest (64 hex chars)",
+        ));
     }
     Ok(())
 }
@@ -884,23 +853,32 @@ mod tests {
     }
 
     #[test]
-    fn validate_openapi_spec_bounds_length() {
-        // At the cap passes; one byte over is rejected. The spec is echoed to
-        // every consumer, so an oversized value is refused at registration.
-        validate_openapi_spec(&"x".repeat(MAX_OPENAPI_SPEC_LEN)).unwrap();
-        let err = validate_openapi_spec(&"x".repeat(MAX_OPENAPI_SPEC_LEN + 1)).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    fn validate_openapi_spec_hash_requires_lowercase_hex_sha256() {
+        // A 64-char lowercase-hex digest passes.
+        validate_openapi_spec_hash(&"a".repeat(64)).unwrap();
+        // Wrong length, uppercase, and non-hex are all rejected.
+        for bad in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            assert_eq!(
+                validate_openapi_spec_hash(&bad).unwrap_err().code(),
+                tonic::Code::InvalidArgument,
+            );
+        }
     }
 
     #[tokio::test]
-    async fn register_rejects_oversized_openapi_spec() {
+    async fn register_rejects_malformed_openapi_spec_hash() {
         let svc = service();
         let err = svc
             .register_instance(Request::new(RegisterInstanceRequest {
                 gear_name: "billing".to_owned(),
                 instance_id: Uuid::new_v4().to_string(),
                 rest_endpoint_uri: Some("http://billing:8080".to_owned()),
-                openapi_spec: Some("x".repeat(MAX_OPENAPI_SPEC_LEN + 1)),
+                openapi_spec_hash: Some("not-a-valid-hash".to_owned()),
                 ..Default::default()
             }))
             .await
@@ -935,10 +913,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_then_resolve_rest_and_openapi() {
+    async fn register_then_resolve_rest_and_openapi_hash() {
         let svc = service();
 
-        // Register a gear with a REST endpoint and OpenAPI spec.
+        // Register a gear with a REST endpoint and an OpenAPI spec hash.
         svc.register_instance(Request::new(RegisterInstanceRequest {
             gear_name: "billing".to_owned(),
             instance_id: Uuid::new_v4().to_string(),
@@ -948,7 +926,7 @@ mod tests {
             }],
             version: "1.0.0".to_owned(),
             rest_endpoint_uri: Some("http://billing:8080".to_owned()),
-            openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+            openapi_spec_hash: Some("a".repeat(64)),
             ..Default::default()
         }))
         .await
@@ -964,17 +942,7 @@ mod tests {
             .into_inner();
         assert_eq!(rest.endpoint_uri, "http://billing:8080");
 
-        // Retrieve the OpenAPI spec.
-        let spec = svc
-            .get_open_api_spec(Request::new(GetOpenApiSpecRequest {
-                gear_name: "billing".to_owned(),
-            }))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(spec.openapi_spec.contains("openapi"));
-
-        // list_instances carries the REST endpoint back.
+        // list_instances carries the REST endpoint and the spec hash back.
         let listed = svc
             .list_instances(Request::new(ListInstancesRequest {
                 gear_name: "billing".to_owned(),
@@ -988,6 +956,10 @@ mod tests {
             listed.instances[0].rest_endpoint_uri.as_deref(),
             Some("http://billing:8080")
         );
+        assert_eq!(
+            listed.instances[0].openapi_spec_hash.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
     }
 
     #[tokio::test]
@@ -996,14 +968,6 @@ mod tests {
 
         let status = svc
             .resolve_rest_service(Request::new(ResolveRestServiceRequest {
-                gear_name: "missing".to_owned(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(status.code(), tonic::Code::NotFound);
-
-        let status = svc
-            .get_open_api_spec(Request::new(GetOpenApiSpecRequest {
                 gear_name: "missing".to_owned(),
             }))
             .await
@@ -1044,29 +1008,33 @@ mod tests {
                 .unwrap(),
         );
 
-        // Register a REST endpoint + OpenAPI spec.
+        // Register a REST endpoint + OpenAPI spec hash.
         client
             .register_instance(
                 RegisterInstanceInfo::new("billing", Uuid::new_v4().to_string())
                     .with_version("1.0.0")
                     .with_rest_endpoint(ServiceEndpoint::http("billing", 8080))
-                    .with_openapi_spec("{\"openapi\":\"3.1.0\"}"),
+                    .with_openapi_spec_hash("a".repeat(64)),
             )
             .await
             .unwrap();
 
-        // Resolve both back over the wire.
+        // Resolve the REST endpoint back over the wire.
         let rest = client.resolve_rest_service("billing").await.unwrap();
         assert_eq!(rest.uri, "http://billing:8080");
 
-        let spec = client.get_openapi_spec("billing").await.unwrap();
-        assert!(spec.contains("openapi"));
+        // The spec hash rides along on the instance enumeration.
+        let listed = client.list_instances("billing").await.unwrap();
+        assert_eq!(
+            listed[0].openapi_spec_hash.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
     }
 
     /// `list_all_instances` returns every registered gear (across gears) with
     /// its REST endpoint — the edge-gateway discovery path. The full `OpenAPI`
-    /// document is intentionally omitted from this snapshot (edge fetches it per
-    /// gear via `GetOpenApiSpec`).
+    /// document is intentionally omitted from this snapshot (the edge fetches it
+    /// from each instance's `/.well-known/openapi.json`).
     #[tokio::test]
     async fn list_all_instances_returns_all_gears_without_specs() {
         let svc = service();
@@ -1078,7 +1046,7 @@ mod tests {
                 grpc_services: vec![],
                 version: "1.0.0".to_owned(),
                 rest_endpoint_uri: Some(format!("http://{gear}:{port}")),
-                openapi_spec: Some(format!("{{\"openapi\":\"3.1.0\",\"x\":\"{gear}\"}}")),
+                openapi_spec_hash: Some("a".repeat(64)),
                 ..Default::default()
             }))
             .await
@@ -1207,7 +1175,7 @@ mod tests {
                 RegisterInstanceInfo::new("billing", Uuid::new_v4().to_string())
                     .with_version("1.0.0")
                     .with_rest_endpoint(ServiceEndpoint::http("billing", 8080))
-                    .with_openapi_spec("{\"openapi\":\"3.1.0\"}"),
+                    .with_openapi_spec_hash("a".repeat(64)),
             )
             .await
             .expect("authenticated register should succeed");
@@ -1476,14 +1444,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(grpc.code(), tonic::Code::InvalidArgument);
 
-        let spec = svc
-            .get_open_api_spec(Request::new(GetOpenApiSpecRequest {
-                gear_name: "bad name".to_owned(),
-            }))
-            .await
-            .unwrap_err();
-        assert_eq!(spec.code(), tonic::Code::InvalidArgument);
-
         let list = svc
             .list_instances(Request::new(ListInstancesRequest {
                 gear_name: String::new(),
@@ -1546,7 +1506,7 @@ mod tests {
                 instance_id: Uuid::new_v4().to_string(),
                 version: "1.0.0".to_owned(),
                 rest_endpoint_uri: Some(format!("http://ingest-{shard}:8080")),
-                openapi_spec: Some("{\"openapi\":\"3.1.0\"}".to_owned()),
+                openapi_spec_hash: Some("a".repeat(64)),
                 labels: [("shard".to_owned(), shard.to_owned())].into(),
                 ..Default::default()
             }))
@@ -1592,7 +1552,7 @@ mod tests {
 
         // Every `list_instances` response is spec-free (empty selector matches
         // all): the document is never inlined, but the hash still rides along so
-        // a consumer can detect a spec change and fetch it via GetOpenApiSpec.
+        // a consumer can detect a spec change and fetch it from the instance.
         let all_spec_free = svc
             .list_instances(Request::new(ListInstancesRequest {
                 gear_name: "ingest".to_owned(),
@@ -1645,7 +1605,7 @@ mod tests {
                 .register_instance(
                     RegisterInstanceInfo::new("ingest", Uuid::new_v4().to_string())
                         .with_rest_endpoint(ServiceEndpoint::http(&format!("ingest-{shard}"), 8080))
-                        .with_openapi_spec("{\"openapi\":\"3.1.0\"}")
+                        .with_openapi_spec_hash("a".repeat(64))
                         .with_labels([("shard".to_owned(), shard.to_owned())].into()),
                 )
                 .await

@@ -228,9 +228,6 @@ impl DirectoryClient for Directory {
     async fn resolve_rest_service(&self, _name: &str) -> anyhow::Result<ServiceEndpoint> {
         anyhow::bail!("unused")
     }
-    async fn get_openapi_spec(&self, _gear: &str) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
     async fn send_heartbeat(&self, _gear: &str, _instance: &str) -> anyhow::Result<()> {
         Ok(())
     }

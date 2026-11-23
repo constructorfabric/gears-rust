@@ -98,9 +98,6 @@ impl DirectoryClient for MockDir {
     async fn resolve_rest_service(&self, gear_name: &str) -> Result<ServiceEndpoint> {
         Err(DirectoryNotFound::new(gear_name).into())
     }
-    async fn get_openapi_spec(&self, gear_name: &str) -> Result<String> {
-        Err(DirectoryNotFound::new(gear_name).into())
-    }
     async fn list_instances(&self, _gear: &str) -> Result<Vec<ServiceInstanceInfo>> {
         Ok(vec![])
     }

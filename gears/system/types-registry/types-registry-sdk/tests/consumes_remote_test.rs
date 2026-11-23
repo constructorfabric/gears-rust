@@ -61,10 +61,6 @@ impl DirectoryClient for StubDirectory {
         }
     }
 
-    async fn get_openapi_spec(&self, gear: &str) -> anyhow::Result<String> {
-        Err(DirectoryNotFound::new(format!("spec {gear}")).into())
-    }
-
     async fn list_instances(&self, _gear: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
         Ok(Vec::new())
     }

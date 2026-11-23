@@ -1056,7 +1056,11 @@ impl OopHttpServer {
         .with_rest_endpoint(ServiceEndpoint::new(self.options.advertise_uri.clone()))
         .with_labels(self.options.labels.clone());
         if let Some(openapi) = openapi {
-            registration_info = registration_info.with_openapi_spec(openapi.to_string());
+            // The directory stores only the hash; the edge fetches the document
+            // from this worker's `/.well-known/openapi.json` and verifies it
+            // against the hash (ADR-0011). Send the hash, not the ~1 MiB body.
+            registration_info = registration_info
+                .with_openapi_spec_hash(crate::directory::openapi_spec_hash(openapi.as_bytes()));
         }
         if let Some(version) = self.options.version.clone() {
             registration_info = registration_info.with_version(version);
