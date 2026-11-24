@@ -205,6 +205,6 @@ Option E provides a cleaner contract between PDP and PEP with less implementatio
 The decision above stands; the current code differs from the implementation details listed under Decision Outcome:
 
 - **Operators.** Predicates are tagged by an `op` field and the operators are `eq`, `in`, `in_group`, `in_group_subtree` and `in_tenant_subtree` (`authz-resolver-sdk/src/constraints.rs`). There is no `in_closure` operator; closure-table traversal is expressed by `in_tenant_subtree` and `in_group_subtree`.
-- **Endpoints.** The only route is `POST /authz-resolver/v1/evaluate` (`authz-resolver-sdk/src/rest.rs`), an internal platform-plane route. `/access/v1/evaluation` and `/access/v1/evaluations` do not exist, and batch evaluation is not implemented (tracked in [#5522](https://github.com/constructorfabric/gears-rust/issues/5522)).
+- **Endpoints.** The only route is `POST /authz-resolver/v1/evaluate` (`authz-resolver-sdk/src/rest.rs`), an internal platform-plane route. `/access/v1/evaluation` and `/access/v1/evaluations` do not exist, and batch evaluation is not implemented (tracked in [#5522](https://github.com/constructorfabric/gears-rust/issues/5522); its design is recorded in [ADR 0006](./0006-batch-access-evaluation.md)).
 
 See [`DESIGN.md`](../DESIGN.md) for the current contract.

@@ -12,6 +12,7 @@
   - [PEP Enforcement](#pep-enforcement)
   - [Authorization Decision Caching](#authorization-decision-caching)
   - [API Specifications](#api-specifications)
+  - [Batch Evaluation (Access Evaluations API)](#batch-evaluation-access-evaluations-api)
   - [Predicate Types Reference](#predicate-types-reference)
   - [PEP Property Mapping](#pep-property-mapping)
   - [Capabilities -> Predicate Matrix](#capabilities---predicate-matrix)
@@ -263,7 +264,7 @@ A PEP can call the AuthZ Resolver in process or through its internal REST endpoi
 
 **Out-of-Process (Separate Service):**
 - Resolvers run as separate processes (same machine or remote)
-- Communication via REST/HTTP — the gear's `#[toolkit::rest_contract]` projection. Internal clients resolve the AuthZ evaluation endpoint through the directory and call it directly
+- Communication via REST/HTTP — the gear's `#[toolkit::rest_contract]` projection. Internal clients resolve the AuthZ evaluation endpoints through the directory and call them directly; [batch evaluation](#batch-evaluation-access-evaluations-api) adds `POST /authz-resolver/v1/evaluations` (designed, not implemented)
 - Trust model: explicit authentication required
 - **Platform-plane authentication** — the caller presents an `X-ToolKit-Internal-Token`; network-level hardening such as mTLS is an optional, orthogonal transport concern
 
@@ -839,7 +840,7 @@ Use deterministic serialization and canonical UUIDs. Preserve absent versus supp
 
 #### Access Evaluation API (AuthZEN-extended)
 
-The SDK's [REST contract](../../../gears/system/authz-resolver/authz-resolver-sdk/src/rest.rs) exposes the internal platform-plane route `POST /authz-resolver/v1/evaluate` for a single evaluation. The PDP returns `decision` and may include row constraints in `context.constraints`. ADR 0001 also describes batch evaluation, with a decision and optional constraints per input. Only the single-evaluation operation is exposed by the SDK today. [Authorization model ADR](./ADR/0001-pdp-pep-authorization-model.md)
+The SDK's [REST contract](../../../gears/system/authz-resolver/authz-resolver-sdk/src/rest.rs) exposes the internal platform-plane route `POST /authz-resolver/v1/evaluate` for a single evaluation. The PDP returns `decision` and may include row constraints in `context.constraints`. Batch evaluation, `POST /authz-resolver/v1/evaluations` with a decision and optional constraints for each evaluated input, is **designed, not implemented** — see [Batch Evaluation](#batch-evaluation-access-evaluations-api). [Authorization model ADR](./ADR/0001-pdp-pep-authorization-model.md)
 
 #### Design Principles
 
@@ -1157,6 +1158,268 @@ gts.cf.core.errors.err.v1~vendor.acme.quota_exceeded.v1
 ##### PEP Handling of Deny Reason
 
 The SDK returns `AccessDenial::Pdp` with the optional reason. Deny the operation regardless of whether the plugin supplies one. Return a generic 403 to the client. When supplied, the machine-readable error code lets the PEP distinguish a malformed evaluation from insufficient permissions in internal metrics or audit logs. Keep `deny_reason.details` out of client responses: it may reveal policy, tenant structure, or resource existence.
+
+---
+
+### Batch Evaluation (Access Evaluations API)
+
+> **Status: designed, not implemented** ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)). The implementation follows this section; rationale and rejected options are in [ADR 0006](./ADR/0006-batch-access-evaluation.md).
+
+Batch evaluation lets a PEP submit many independent access evaluations in one call: bulk operations, and gears that compute per-row permitted actions for a response they serve (for example, edit and delete flags for 50 rows of a page). The AuthZ Resolver stays an internal service; UIs reach it only through the gears that call it. It implements the AuthZEN Access Evaluations API (§7): top-level default values and the `execute_all` and `deny_on_first_deny` evaluation semantics. `permit_on_first_permit` is deferred (see [Evaluation semantics](#batch-request)).
+
+Batch evaluation answers explicit point checks. It does **not** replace constraint-based LIST authorization: a LIST still sends one evaluation and compiles the returned constraints to SQL, because fetch-then-filter loops break pagination and counts (see [LIST Operations](#list-operations)).
+
+#### Contract and Route
+
+```rust
+#[toolkit::contract(gear = "authz-resolver", version = "v1")]
+pub trait AuthZResolverApi: Send + Sync {
+    #[idempotency(SafeRead)]
+    async fn evaluate(&self, ctx: PlatformSecurityContext, req: EvaluationRequest)
+        -> Result<EvaluationResponse, CanonicalError>;
+
+    #[idempotency(SafeRead)]
+    async fn evaluate_batch(&self, ctx: PlatformSecurityContext, req: EvaluationBatchRequest)
+        -> Result<EvaluationBatchResponse, CanonicalError>;
+}
+```
+
+| Operation | Route | AuthZEN default path |
+|---|---|---|
+| `evaluate` | `POST /authz-resolver/v1/evaluate` (unchanged) | `/access/v1/evaluation` |
+| `evaluate_batch` | `POST /authz-resolver/v1/evaluations` | `/access/v1/evaluations` |
+
+- Both routes are internal and platform-plane authenticated, with the same trust model (see [Isolation, Trust and Diagnostics](#isolation-trust-and-diagnostics)).
+- The batch route keeps AuthZEN's resource name under the gear prefix. It follows the `/{service}/v{N}/{resource}` form that the DE0801 lint enforces; the REST guideline's `:batch` suffix is meant for batch writes and needs a lint exception.
+- No `/access/v1/*` routes or aliases exist. AuthZEN §10.1 lets a PDP advertise non-default endpoint URLs, the routes are not exposed at the edge, and `#[toolkit::rest_contract]` serves one path per operation.
+- Adding the batch route is a non-breaking change to the REST API within `v1`. `evaluate_batch` is a required method with no default body, which is a breaking change for Rust implementors (see [SDK and PEP Consumption](#sdk-and-pep-consumption)).
+- `evaluate_batch` is not `#[retryable]`: one call is exactly one HTTP request, and the caller decides whether to retry.
+
+#### Batch Request
+
+```
+POST /authz-resolver/v1/evaluations
+Content-Type: application/json
+```
+
+```jsonc
+{
+  // Optional top-level default values (AuthZEN §7.1.1). Each applies to every item
+  // that omits the same key.
+  "subject": { "id": "a254d252-7129-4240-bae5-847c59008fb6", "properties": { "tenant_id": "51f18034-3b2f-4bfa-bb99-22113bddee68" } },
+  "context": { "token_scopes": ["*"], "require_constraints": true, "supported_properties": ["owner_tenant_id", "id"] },
+
+  // Required. 1 up to the resolver's item limit. Each item supplies the keys it does not
+  // take from the defaults; a key present in an item replaces the default as a whole.
+  "evaluations": [
+    {
+      "action": { "name": "update" },
+      "resource": { "type": "gts.cf.core.events.event.v1~", "id": "e81307e5-5ee8-4c0a-8d1f-bd98a65c517e", "properties": { "owner_tenant_id": "51f18034-3b2f-4bfa-bb99-22113bddee68" } }
+    },
+    {
+      "action": { "name": "delete" },
+      "resource": { "type": "gts.cf.core.events.event.v1~", "id": "e81307e5-5ee8-4c0a-8d1f-bd98a65c517e", "properties": { "owner_tenant_id": "51f18034-3b2f-4bfa-bb99-22113bddee68" } }
+    }
+  ],
+
+  // Optional. "execute_all" (default) or "deny_on_first_deny".
+  "options": { "evaluations_semantic": "execute_all" }
+}
+```
+
+**Default values.** The resolver turns every item into a complete `EvaluationRequest` before any plugin sees it:
+
+| Key | Resolved value | Missing in both item and defaults |
+|---|---|---|
+| `subject` | the item's `subject`, else the top-level `subject` | `400`, naming the item index |
+| `action` | the item's `action`, else the top-level `action` | `400` |
+| `resource` | the item's `resource`, else the top-level `resource` | `400` |
+| `context` | the item's `context`, else the top-level `context` | `400` (`context` is required, as on `/evaluate`) |
+
+- **Replacement, not merging.** A key present in an item replaces the default as a whole (AuthZEN §7.1.1). An item `context` does not inherit fields from the top-level `context`; an item that sends `context: { "tenant_context": … }` gets `require_constraints: false`, empty `capabilities` and empty `supported_properties`, exactly as the same body would on `/evaluate`.
+- **The PEP enforces its own inputs.** `PolicyEnforcer` compiles each result against its own `require_constraints`, `supported_properties` and negotiated capabilities, not against what reached the PDP, so a replaced context cannot widen what the PEP applies. Callers that use `evaluate_batch` directly and act on `decision` alone must send complete contexts.
+- **`bearer_token`** is never serialized. In-process callers may set it on the top-level `context` or on an item `context`; it follows the same replacement rule.
+- **Equality with single evaluation.** Result `i` of a batch is defined as the result of `evaluate` on resolved item `i`. The resolver passes only resolved requests to the plugin.
+- **At least one item.** A missing `evaluations` key fails decoding (`422`), and an empty `evaluations` array is rejected with `400` before plugin lookup, whatever the top-level defaults or the semantic. This deliberately differs from AuthZEN §7.1, where an absent or empty array falls back to a single evaluation: here top-level defaults only supply fields for actual items, and a single check uses `/evaluate`. The OpenAPI schema declares `minItems: 1` for `evaluations`.
+
+**Evaluation semantics** (`options.evaluations_semantic`, AuthZEN §7.1.2.1):
+
+| Semantic | Evaluates | Stops after | Results returned |
+|---|---|---|---|
+| `execute_all` (default) | every item | — | one per item |
+| `deny_on_first_deny` | items in order | the first denied item (an evaluation failure fails the whole batch instead; see [Errors](#errors)) | items `0..=k`, where `k` is the stopping item; all `n` if none stops |
+
+- The short-circuit is decided by `decision` at the PDP. It says nothing about constraints: a `decision: true` result can still carry constraints that the PEP must apply, and that compile to nothing or fail.
+- Items after the stopping item are **not evaluated** and have no result. A missing result is never an allow.
+- An absent `options` (or `evaluations_semantic`) means `execute_all`; the SDK omits `options` when the semantic is `execute_all`.
+- `deny_on_first_deny` answers "may the subject do all of these?" (logical AND), for example a bulk delete that needs `delete` on every selected item. It is a safe optimization: one denial already refuses the whole operation, and when every item is permitted the gear still enforces each item's constraints.
+- `permit_on_first_permit` (logical OR) is **deferred**. The PDP stops on `decision: true` alone, but a permit can carry constraints even when the item sets `require_constraints: false` (a PDP may attach a filter on any property the PEP advertises, and `tr-authz-plugin` adds an `owner_tenant_id` filter to every permit). Such a scope can compile and still exclude the target: counting it as a yes could grant access wrongly, and if the PEP checks the target and finds it outside the scope, the PDP has already skipped the alternatives that might grant access. The SDK semantic enum has no variant for it, so a request naming it fails decoding (`422`). Adding it is tied to [Open Questions](#open-questions), item 10.
+- To check alternatives ("may the subject do at least one of these?"), use `execute_all`: one round trip evaluates every alternative, and the PEP picks a permit whose constraints cover the target.
+
+**Other rules:**
+
+| Rule | Behavior |
+|---|---|
+| Item independence | Items may differ in subject, tenant context, token scopes, capabilities and supported properties, either directly or by overriding a default. |
+| Unknown fields | Ignored, per AuthZEN §10.1.1. |
+
+Defaults resolution, the item limit and the empty-batch check run in the AuthZ Resolver domain (`EvaluationBatchRequest::resolve`), so in-process and REST callers get the same outcome.
+
+#### Batch Response
+
+```jsonc
+{
+  // One entry per evaluated item, in request order (see Evaluation semantics for
+  // how many items a short-circuit semantic evaluates).
+  "evaluations": [
+    // Item 0: allowed, with constraints (same fields as the single /evaluate response)
+    {
+      "decision": true,
+      "context": {
+        "constraints": [
+          { "predicates": [
+              { "op": "in", "property": "owner_tenant_id", "values": ["51f18034-3b2f-4bfa-bb99-22113bddee68"] },
+              { "op": "eq", "property": "id", "value": "e81307e5-5ee8-4c0a-8d1f-bd98a65c517e" }
+          ] }
+        ]
+      }
+    },
+    // Item 1: denied; a batch denial always carries its own error code
+    {
+      "decision": false,
+      "context": {
+        "deny_reason": {
+          "error_code": "gts.cf.core.errors.err.v1~x.authz.errors.insufficient_permissions.v1",
+          "details": "Subject lacks permission for action 'delete' on resource type 'gts.cf.core.events.event.v1~'"
+        }
+      }
+    }
+  ]
+}
+```
+
+Each entry is an `EvaluationResponse`, the same decision format as a single evaluation, and every entry in a `200` response is an actual PDP decision:
+
+- An allow carries any applicable constraints.
+- A denial MUST carry its own `context.deny_reason.error_code`, with optional `details`. On `/evaluate` a denial may omit `deny_reason`; in a batch, a denial without an error code is a plugin contract violation and fails the whole batch (`500`). The shipped plugins deny without a reason, so the implementation adds error codes to them.
+- A technical failure is never an entry. Any failure, including one while evaluating a single item, fails the whole batch with one canonical error and no `evaluations` array (see [Errors](#errors)). Partial results on failure are deliberately given up.
+
+The SDK converts a batch response with `EvaluationBatchResponse::into_results(expected, semantic)`, which returns one entry per request item, `None` for items the semantic did not evaluate (see the [SDK README](../../../gears/system/authz-resolver/authz-resolver-sdk/README.md#batch-evaluation)):
+
+| Item outcome | `decision` | `context` | `into_results` | PEP interpretation |
+|---|---|---|---|---|
+| Allowed | `true` | `constraints` (possibly empty) | `Some(EvaluationResponse)` | Validate and compile, as for a single evaluation |
+| Denied | `false` | `deny_reason` with `error_code` | `Some(EvaluationResponse)` | Denial (`AccessDenied`) |
+| Not evaluated (short-circuit) | — | — | `None` | No decision; never an allow |
+
+- `into_results` returns `Err(Internal)` when the results do not have the shape the semantic allows (see [Correlation, Duplicates and Empty Batches](#correlation-duplicates-and-empty-batches)) or a denial lacks an error code.
+- Callers of `AuthZResolverApi::evaluate_batch` MUST convert the response with `into_results`; the PEP helper does.
+- The response has no top-level `decision` (AuthZEN §7.2 recommends omitting it).
+
+#### Correlation, Duplicates and Empty Batches
+
+- **Correlation is positional.** Result `i` answers request item `i`; there are no item IDs. Short-circuit semantics return a prefix of the items, never a subset with gaps.
+- **Result shape.** For `n` items and `m` results, the resolver produces, and `into_results` accepts, only:
+
+| Semantic | `m` | Results before the last | Last result when `m < n` |
+|---|---|---|---|
+| `execute_all` | `m = n` | — | — |
+| `deny_on_first_deny` | `1 ≤ m ≤ n` | all allowed | denied |
+
+  Any other shape fails the whole call.
+- **Duplicates** are evaluated independently and each gets its own result. The resolver does not deduplicate.
+- **Empty batch:** `{"evaluations": []}` is rejected with `400` before plugin lookup (see [Batch Request](#batch-request)). The PEP helper returns an empty result for an empty list of checks without calling the resolver.
+
+#### Errors
+
+Failures are returned as the operation's `CanonicalError` (an RFC 9457 problem over REST) for the whole batch; no item result is returned. A `200` response contains only PDP decisions.
+
+| Condition | Level | Outcome |
+|---|---|---|
+| Body is not valid JSON | Whole request | `400` from the platform JSON extractor |
+| Body is JSON but does not match the schema: missing `evaluations`, a key with a wrong type, an unknown `evaluations_semantic` value | Whole request | `422` from the platform JSON extractor (the same behavior as `/evaluate`; AuthZEN §10.1.1 asks for `400`) |
+| An empty `evaluations` array; an item lacks `subject`, `action`, `resource` or `context` and no default supplies it; more items than the resolver's item limit | Whole request | `400` InvalidArgument from `EvaluationBatchRequest::resolve`, naming the limit; no item is evaluated |
+| Body larger than the resolver's request size limit | Whole request | `413` |
+| Missing or invalid platform-plane credential | Whole request | `401` |
+| Plugin discovery: types registry unavailable, plugin not found, plugin unavailable | Whole request | `503` ServiceUnavailable |
+| Plugin discovery: invalid plugin instance; internal error | Whole request | `500` Internal |
+| The resolver's batch deadline expired before the batch finished | Whole request | `503` ServiceUnavailable; completed results are discarded |
+| The plugin returns an error for the batch or for any item | Whole request | Classified as below; completed results are discarded |
+| The plugin returns results whose shape the semantic does not allow, or a denial without `deny_reason.error_code` | Whole request | `500` Internal |
+| The plugin denies one item | Item | `decision: false` with `deny_reason`; stops a `deny_on_first_deny` batch |
+
+A plugin error is classified exactly as the single route classifies the same error:
+
+| `AuthZResolverError` from the plugin | Single `/evaluate` | Batch (whole request) |
+|---|---|---|
+| `NoPluginAvailable` | `503` | `503` |
+| `ServiceUnavailable(_)` | `503` | `503` |
+| `Internal(_)` | `500` | `500` |
+
+- The deadline maps to `503` rather than `504` (DeadlineExceeded), matching the PEP's own evaluation deadline, so `EnforcerError::is_pdp_unavailable` classifies both the same way.
+- The resolver logs the underlying error with the index of the item that caused it (see [Isolation, Trust and Diagnostics](#isolation-trust-and-diagnostics)); the caller receives only the canonical problem.
+
+**Fail-closed invariant:** no item that is missing, not evaluated, timed out, undecodable, or answered by a result list of the wrong shape can become an allow anywhere between the plugin and the PEP, and a technical failure never appears as a decision.
+
+#### Limits
+
+The AuthZ Resolver bounds every batch: the number of items, the request size, the number of item evaluations in flight, and the time the batch may take. A batch that exceeds a bound fails as a whole, and the PEP observes one of the outcomes in [Errors](#errors):
+
+| Bound exceeded | PEP observes |
+|---|---|
+| Item limit | `400` InvalidArgument naming the limit; no item is evaluated |
+| Request size limit | `413` |
+| Batch deadline | `503` ServiceUnavailable; no item result is returned |
+
+Concurrency bounds never fail a batch; they only delay item evaluations, within the deadline. The limit values, their configuration and their enforcement are part of the AuthZ Resolver implementation ([AuthZ Resolver README — Batch evaluation](../../../gears/system/authz-resolver/README.md#batch-evaluation)); callers size their batches by the item limit documented in the [SDK README](../../../gears/system/authz-resolver/authz-resolver-sdk/README.md#batch-evaluation).
+
+When the caller disconnects, the deadline expires or a short-circuit semantic stops, outstanding item evaluations are cancelled. Plugin `evaluate` implementations are read-only and must tolerate being cancelled.
+
+#### Plugin Execution
+
+`AuthZResolverPluginClient` gains a required `evaluate_batch(requests, semantic, max_concurrency)` with no default body. It returns the decisions for the evaluated prefix of the requests in request order (all of them for `execute_all`), or one error for the whole batch; an error for any item is an error for the whole batch.
+
+- **Why required.** A plugin whose `evaluate` calls a remote PDP would otherwise inherit a fallback and silently turn one 50-item batch into 50 outbound requests, even when the PDP supports batching. Every plugin decides explicitly how it evaluates a batch.
+- **Shared fan-out helper (explicit).** The SDK provides a helper that evaluates each item with `evaluate` under bounded concurrency. Results follow request order, and each equals an independent `evaluate` of the same item, so batch and single evaluation agree by construction. For a short-circuit semantic it stops after the stopping item and cancels later evaluations still in flight. `static-authz-plugin`, `tr-authz-plugin` and the Orders test plugin call it explicitly.
+- **Native batching.** A plugin may implement `evaluate_batch` against its PDP's own batch API or share work across items. It MUST return the prefix the semantic defines, in order, and every result MUST equal what `evaluate` would return for that request under the same policy state. Shared work MUST be keyed by every input that affects it. For `tr-authz-plugin`, Tenant Resolver lookups could be memoized per batch by `(anchor, candidate, barrier_mode)` for ancestry and `(tenant, barrier_mode, statuses)` for descendants; a key that omits barrier mode or the status filter would widen access. A cached failure stays a failure for every item that uses it. Native batching in `tr-authz-plugin` is deferred.
+- An `Err` from the plugin fails the whole request; it is never spread into per-item allows.
+
+#### Isolation, Trust and Diagnostics
+
+- **Trust model.** Unchanged from [Deployment Modes and Trust Model](#deployment-modes-and-trust-model): the route is internal, the edge gateway does not expose it, and the platform-plane credential (`X-ToolKit-Internal-Token`) authenticates the calling workload. The PDP trusts each item's `subject` exactly as it trusts the subject of a single evaluation, so a batch grants a caller nothing it could not obtain with separate single calls.
+- **Isolation.** Each resolved item is evaluated with its own subject, tenant context, token scopes, capabilities and supported properties. Default values are a wire-level shorthand that the resolver expands before evaluation; nothing derived from one item's evaluation influences another item's result. Short-circuit semantics decide only which items are evaluated, never an item's result.
+- **Bearer tokens.** `bearer_token` is never serialized, so it never appears in a batch request body or response. The resolver passes in-process values to the plugin unchanged and never logs them.
+- **Diagnostics.** The resolver records a batch span with the item count, the semantic, the number of evaluated items, the selected plugin instance, outcome counts (allowed / denied) and duration. It never records subject IDs, subject or resource properties, token scopes or bearer tokens. A failure is logged with the index of the item that caused it; the client receives one canonical problem for the whole batch. Request and response DTOs are not `Debug`-logged.
+
+#### SDK and PEP Consumption
+
+- **REST client.** The generated `AuthZResolverApiRestClient` sends exactly one HTTP request per `evaluate_batch` call; the client timeout applies to the whole batch. It never falls back to single `evaluate` calls: an older resolver without the route answers `404`, which surfaces as an evaluation failure. Deploy the resolver before PEPs use the batch API.
+- **In-process client.** `AuthZResolverLocalClient::evaluate_batch` calls the resolver's batch execution directly, so in-process and REST callers get the same resolution, validation, limits, semantics and decisions.
+- **Required method.** `AuthZResolverApi::evaluate_batch` has no default body. A resolver adapter that inherited a loop over `evaluate` would turn one batch into one request per item, so every implementor, including test doubles and the shared SDK mock, implements it explicitly. This is a breaking change to the Rust API; the SDK provides a sequential helper that test doubles may call deliberately.
+- **PEP helper.** `PolicyEnforcer` gains `access_scope_batch` (`execute_all`, one result per check) and `access_scope_batch_with` (batch options, `None` for checks the PDP did not evaluate), the batch counterparts of `access_scope_with`. Both take one `SecurityContext` and a list of `AccessCheck`s (resource type, action, optional resource ID, `AccessRequest`). Batch-wide settings go in `AccessBatchOptions`, separate from each check's `AccessRequest`; its fields are private, it defaults to `execute_all`, and a builder selects the semantic: `AccessBatchOptions::default().with_semantic(EvaluationsSemantic::DenyOnFirstDeny)`.
+
+| Step | Behavior |
+|---|---|
+| Build | One `SecurityContext` (one subject) per call. Each item is built by the same `build_request_with` path as `access_scope_with`, including capability negotiation for the item's `ResourceType`. The helper sends the subject once as the top-level default. It also sends `action` and `context` once when every item has the same value, and otherwise in each item; `resource` is always per item. Contexts built from one `SecurityContext` carry the same `bearer_token`, so comparing their serialized form decides equality. |
+| Call | One `evaluate_batch` call under the enforcer's evaluation deadline (`with_deadline`, 30s default). An empty `checks` slice returns an empty result without a call. |
+| Whole-call failure | Transport error, deadline, whole-request error, or a result shape rejected by `into_results` returns the outer `Err(EnforcerError::EvaluationFailed(..))`. |
+| Item denied | `AccessDenied(AccessDenial::Pdp { reason })` |
+| Item allowed | Validated and compiled with the item's `ResourceType` and `AccessRequest` options, exactly as `access_scope_with`: `AccessScope`, `CompileFailed`, or `AccessDenied(ScopeMatchesNothing)` |
+| Item not evaluated | `None` |
+
+A PEP that uses a short-circuit semantic as a gate grants the gated operation only from compiled results:
+
+- `deny_on_first_deny` ("all of these"): proceed only if every entry is `Some(Ok(scope))`; any `None`, `Err` or failed compilation refuses the operation.
+- Point operations still apply each `AccessScope` to the affected rows (for example in the `UPDATE … WHERE`), whatever the semantic.
+
+Callers that need several subjects in one batch call `AuthZResolverApi::evaluate_batch` directly and convert the response with `into_results`. The shared AuthZ SDK mock ([#5519](https://github.com/constructorfabric/gears-rust/issues/5519)) implements `evaluate_batch` with the same resolution, semantics and decisions.
+
+#### Deferred
+
+- PDP-side reuse of work shared by items with the same subject or context, including native batching in `tr-authz-plugin` ([Open Questions](#open-questions), item 1).
+- Returning completed results when the batch deadline expires.
+- Decision caching ([#5502](https://github.com/constructorfabric/gears-rust/issues/5502)).
+- `permit_on_first_permit`, until the PEP can tell whether a permit's constraints cover the target before the PDP stops ([Open Questions](#open-questions), item 10).
 
 ---
 
@@ -1548,28 +1811,24 @@ S2S `SecurityContext` flows through the standard AuthZ pipeline unchanged. The t
 
 These questions require further design work.
 
-1. **Batch evaluation** - Should the SDK expose batch evaluation and allow the PDP to share work across requests with the same subject and context? Use cases: bulk operations, permission checks for UI rendering (checking permissions for 50 list items at once).
+1. **Batch evaluation optimization** - Should a PDP reuse work across batch items that share a subject or context (natively in `tr-authz-plugin`), and how is that reuse keyed so it never mixes authorization-relevant inputs across items?
 
 2. **Projection tables scalability** - Closure table approach works well for moderate scale, but may not perform for all scenarios. Key factors: tenant hierarchy depth (10+ levels), total object count (10M+), object distribution across tenants, and query patterns (root tenant queries are heavier than leaf). For large-scale deployments, vendors may need alternative strategies: denormalization (e.g., PostgreSQL ltree), materialized views, or sharding. This design doc describes the reference architecture; concrete optimization strategy depends on vendor's data model and scale requirements.
 
-3. **Local projections sync** - How to keep projection tables (`tenant_closure`, `resource_group_closure`) in sync with vendor's source of truth? Possible approaches: event-based sync (requires event broker), CDC-based (Debezium-like), or periodic polling via Resolver APIs. Each has trade-offs in consistency, latency, and infrastructure complexity. Note: `resource_group_membership` projection is not recommended (see [Capabilities Array](#capabilities-array)) but is not forbidden if the use case demands it.
+3. **Local projections sync** - How to keep projection tables (`tenant_closure`, `resource_group_closure`) in sync with vendor's source of truth? Possible approaches: event-based sync (requires event broker), CDC-based (Debezium-like), or periodic polling via Resolver APIs. Each has trade-offs in consistency, latency, and infrastructure complexity.
 
-4. ~~**Resource Group Service**~~ — The [Resource Group gear](../../../gears/system/resource-group/) provides group hierarchy and membership operations.
+4. **Authorization decision caching** - See [Authorization Decision Caching](#authorization-decision-caching) section for detailed open questions: cache key structure, cache-control protocol, invalidation strategy, token expiration handling.
 
-5. **Authorization decision caching** - See [Authorization Decision Caching](#authorization-decision-caching) section for detailed open questions: cache key structure, cache-control protocol, invalidation strategy, token expiration handling.
+5. **Observability** - Logging, tracing, and metrics for authorization flow. What to log (decisions, constraint compilation, PDP latency)? How to correlate authorization events with request traces? What metrics to expose (decision rates, cache hit/miss, PDP response times)? Privacy considerations for audit logs.
 
-6. **Observability** - Logging, tracing, and metrics for authorization flow. What to log (decisions, constraint compilation, PDP latency)? How to correlate authorization events with request traces? What metrics to expose (decision rates, cache hit/miss, PDP response times)? Privacy considerations for audit logs.
+6. **ABAC with related entity attributes** - Current predicates filter by resource's own properties (`owner_tenant_id`, `id`). Some ABAC policies require filtering by attributes of related entities (e.g., "tasks where project.status = 'active'" or "events where creator.department = 'engineering'"). This requires JOINs with other tables. Open questions: Should PDP return join-aware predicates? How to declare joinable relations in `supported_properties`? Performance implications of cross-table constraint compilation? Alternative: require denormalization of frequently-filtered attributes into the resource table.
 
-7. **ABAC with related entity attributes** - Current predicates filter by resource's own properties (`owner_tenant_id`, `id`). Some ABAC policies require filtering by attributes of related entities (e.g., "tasks where project.status = 'active'" or "events where creator.department = 'engineering'"). This requires JOINs with other tables. Open questions: Should PDP return join-aware predicates? How to declare joinable relations in `supported_properties`? Performance implications of cross-table constraint compilation? Alternative: require denormalization of frequently-filtered attributes into the resource table.
-
-8. **Closure table schema evolution** - How to handle schema changes in `tenant_closure` and `resource_group_closure` tables? Open questions:
+7. **Closure table schema evolution** - How to handle schema changes in `tenant_closure` and `resource_group_closure` tables? Open questions:
    - **Schema versioning** — How are closure table schemas versioned? (semantic versioning, version column, schema_version table?)
    - **Migration protocol** — When closure table schema changes, how do PEPs discover and adapt? Is there a capabilities negotiation mechanism?
    - **Backward compatibility** — Can old PEPs work with new schema, or is coordinated upgrade required? What's the compatibility matrix?
 
-9. ~~**S2S token issuance**~~ — **Resolved.** See [S2S Authentication (Service-to-Service)](#s2s-authentication-service-to-service).
-
-10. **Multi-Factor Authentication (MFA) support** — How should Gears handle MFA across both AuthN and AuthZ layers? Industry standards and best practices to study:
+8. **Multi-Factor Authentication (MFA) support** — How should Gears handle MFA across both AuthN and AuthZ layers? Industry standards and best practices to study:
     - **AuthN side:**
       - **OIDC `acr` / `amr` claims** — [OpenID Connect Core §2 (acr, amr)](https://openid.net/specs/openid-connect-core-1_0.html#IDToken) defines Authentication Context Class Reference (`acr`) and Authentication Methods References (`amr`) claims. Should AuthN Resolver extract and propagate these in `SecurityContext`?
       - **NIST SP 800-63B** — Authenticator Assurance Levels (AAL1/AAL2/AAL3). Should Gears be aware of AAL and map `acr` values to AAL levels?
@@ -1584,13 +1843,15 @@ These questions require further design work.
       - How do industry multi-tenant platforms (Azure AD Conditional Access, AWS IAM, Google Cloud IAP) handle MFA in the context of delegated authorization?
       - What is the interaction between MFA and token scopes? Should third-party apps be able to request MFA-elevated scopes?
 
-11. **S2S SecurityContext caching** — Gears may call `exchange_client_credentials()` frequently (on every background task iteration, on every inter-gear call). Open questions:
+9. **S2S SecurityContext caching** — Gears may call `exchange_client_credentials()` frequently (on every background task iteration, on every inter-gear call). Open questions:
     - **TTL strategy** — What default TTL for cached `SecurityContext`? Static plugin has no token expiry (effectively infinite), production plugins depend on OAuth2 token TTL. Proposal: default 5 min, configurable.
     - **Cache identity** — If credentials and scopes remain request-level inputs, any S2S cache key must include at least `client_id`, normalized scopes, and a non-reversible credential fingerprint. `client_id` alone is insufficient because it can reuse the wrong token across scope or credential changes.
     - **`AuthenticationResult.expires_at`** — Should `AuthenticationResult` include an `expires_at: Option<DateTime>` field so the plugin can communicate token lifetime to the caller? This enables smart caller-side caching without hardcoded TTLs.
     - **`S2sSecurityContextProvider`** — Should there be a standard cached wrapper in the SDK (`authn-resolver-sdk`) that gears use instead of calling `exchange_client_credentials()` directly? Design: ArcSwap-based cache with TTL from `expires_at`, automatic refresh on expiry.
     - **Plugin-level caching** — Production plugins can reuse `toolkit-auth::oauth2::Token` handles with auto-refresh internally. Should this be a requirement or recommendation for plugin implementors?
     - **Cache invalidation** — When credentials are rotated, how does the cached `SecurityContext` get invalidated? Is TTL-based expiry sufficient, or do we need explicit invalidation?
+
+10. **Mandatory enforcement of returned constraints** - The SDK `PolicyEnforcer` always compiles returned constraints, but nothing forces a PEP to use the result. Decision-only gates drop the compiled `AccessScope` and treat a conditional permit as a plain yes (for example event-broker's gates, OAGW proxy calls and the mini-chat catalog), and direct callers of `AuthZResolverApi::evaluate` need not compile constraints at all. Should the platform require every PEP to compile returned constraints and to verify that the target satisfies the full `AccessScope`, or explicitly allow gates that touch no rows to ignore it? The answer also decides whether `permit_on_first_permit` can be added to batch evaluation, which is deferred because the PDP would stop on a permit before the PEP knows whether its constraints cover the target.
 
 ---
 
@@ -1608,6 +1869,7 @@ These questions require further design work.
 - [OpenID AuthZEN Authorization API 1.0](https://openid.net/specs/authorization-api-1_0.html) (approved 2026-01-12)
 - [ADR 0001: PDP/PEP Authorization Model](./ADR/0001-pdp-pep-authorization-model.md)
 - [ADR 0002: Split AuthN and AuthZ Resolvers](./ADR/0002-split-authn-authz-resolvers.md)
+- [ADR 0006: Batch Access Evaluation](./ADR/0006-batch-access-evaluation.md)
 
 ### Internal
 - [TENANT_MODEL.md](./TENANT_MODEL.md) — Tenant topology, barriers, closure tables
