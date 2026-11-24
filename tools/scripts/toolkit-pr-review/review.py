@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import results
 import budget            # noqa: E402
 import classify          # noqa: E402
 import diffparse         # noqa: E402
@@ -188,8 +189,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     manifest_files = [p for p in in_scope if files[p]["manifest"]]
     has_rust = any(classify.is_rust(p) for p in in_scope)
 
-    corpus_tokens = sum(files[p]["est_tokens"] for p in in_scope)
-    diff_tokens = budget.est_tokens(len(diff_text.encode()))
+    rust_paths = [p for p in in_scope if classify.is_rust(p)]
+    patches = {"rust": rust_paths, "reviewable": in_scope}
+    for label, paths in patches.items():
+        (work / f"{label}.patch").write_text(diffparse.slice_diff(parsed, paths))
+    # Conservative ceiling for optional source reads. Count each diff only once.
+    corpus_tokens = sum(budget.est_tokens(files[p]["bytes"]) for p in in_scope)
+    diff_tokens = budget.est_tokens((work / "reviewable.patch").stat().st_size)
     costs = budget.agent_costs(corpus_tokens, diff_tokens) if has_rust else {}
     cost = sum(costs.values())
     if cost > args.max_total_tokens:
@@ -223,6 +229,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "manifest_files": [],
             "est_tokens": costs["architecture"],
         })
+
+    for agent in agents:
+        broad = agent["name"] in {"security", "toolkit", "architecture"}
+        agent["diff"] = "reviewable.patch" if broad else "rust.patch"
+        agent["files"] = in_scope if broad else rust_paths
 
     ctx = {
         "schema_version": SCHEMA_VERSION,
@@ -269,6 +280,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-total-tokens", type=int, default=budget.DEFAULT_MAX_TOTAL_TOKENS,
                    help="refuse the run above this estimate; context.json is not written")
     p.set_defaults(func=cmd_prepare)
+
+    f = sub.add_parser("finish", help="validate passes and render review outputs")
+    f.add_argument("--work-dir", required=True)
+    f.add_argument("--exclusions", help="JSON object mapping candidate IDs to reasons")
+    f.set_defaults(func=results.finish)
 
     args = ap.parse_args(argv)
     try:

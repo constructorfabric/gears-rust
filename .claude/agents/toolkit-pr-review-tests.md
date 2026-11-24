@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-tests
-description: "Test quality review sub-agent for toolkit-pr-review. Covers RUST-TEST-001 and TEST-QUALITY-1..10. Applies its module to the whole pull request. Returns JSON array only."
+description: "Test quality review sub-agent for toolkit-pr-review. Covers RUST-TEST-001 and TEST-QUALITY-1..10. Applies its module to the whole pull request. Returns a JSON pass object."
 tools: Read, Bash
 model: inherit
 ---

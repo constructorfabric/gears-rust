@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-design
-description: "Design, types & API review sub-agent for toolkit-pr-review. Covers RUST-API-001, RUST-TYPE-001, RUST-OWN-001, RUST-DATA-001, RUST-OBS-001..002, RUST-MOD-001, RUST-LINT-001, RUST-NO-007. Applies its module to the whole pull request. Returns JSON array only."
+description: "Design, types & API review sub-agent for toolkit-pr-review. Covers RUST-API-001, RUST-TYPE-001, RUST-OWN-001, RUST-DATA-001, RUST-OBS-001..002, RUST-MOD-001, RUST-LINT-001, RUST-NO-007. Applies its module to the whole pull request. Returns a JSON pass object."
 tools: Read, Bash
 model: inherit
 ---
