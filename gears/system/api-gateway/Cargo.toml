@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-api-gateway"
-version = "0.7.6"
+version = "0.7.7"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -30,7 +30,7 @@ toolkit-transport-grpc = { workspace = true }
 toolkit-contract = { workspace = true, features = ["platform-credential"] }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 cf-gears-system-sdks = { workspace = true, features = ["directory_grpc"] }
-authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.45", path = "../authn-resolver/authn-resolver-sdk" }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.46", path = "../authn-resolver/authn-resolver-sdk" }
 toolkit-gts = { workspace = true }
 grpc_hub = { workspace = true }
 authn-resolver = { workspace = true }
