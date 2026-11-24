@@ -1,6 +1,6 @@
 [package]
 name = "hello"
-version = "0.1.7"
+version = "0.1.8"
 publish = false
 edition.workspace = true
 license.workspace = true
