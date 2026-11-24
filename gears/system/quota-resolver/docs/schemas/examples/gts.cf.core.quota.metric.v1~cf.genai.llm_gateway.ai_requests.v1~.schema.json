@@ -1,0 +1,25 @@
+{
+  "$id": "gts://gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_requests.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Example metric type: requests to the llm-gateway. Its operations carry no attributes, so a caller sends an empty metadata object. It admits no subject type beyond the tenant, so its quotas are tenant quotas only.",
+  "x-gts-traits": {
+    "kind": "counter",
+    "admitted_subjects": []
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.quota.metric.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        }
+      }
+    }
+  ]
+}

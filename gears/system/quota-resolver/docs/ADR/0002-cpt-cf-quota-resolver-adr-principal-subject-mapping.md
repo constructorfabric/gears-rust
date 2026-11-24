@@ -32,7 +32,7 @@ A **principal** is whoever authenticated. AuthN puts its type, a GTS type id, in
 its UUID into `subject_id`. Principal types form a GTS hierarchy, and operators derive their own types from it.
 
 A **quota subject** is a quota subject type and an opaque id. A quota subject type is a GTS type derived from the base
-`gts.cf.core.quota.subj.v1~` that the resolver SDK registers. Principal types and quota subject types are different
+`gts.cf.core.quota.subj.v1~` that the resolver SDK declares. Principal types and quota subject types are different
 hierarchies: a GTS type has one parent, and the operator decides which principals take part in quotas and under which
 quota subject type. The most common quota subject is the principal itself, but the calling module does not know the
 operator's quota subject types. Who maps a principal type to a quota subject type, and where is the mapping stored?
@@ -79,14 +79,16 @@ empty; the plugin is not called. A registry failure during the lookup is `Servic
 
 * A mapping change needs a configuration change and a restart.
 * A mapping change takes effect on each replica as it restarts, so a call and its retry can be mapped differently. A
-  retry after a change of the type is a new call for the backend and charges the new quota subject once more; a retry
-  after the removal of the entry is not mapped. An operator therefore adds entries for new principal types freely, and
+  retry after a change of the type carries another quota subject under the same key, so a backend that compares a
+  repeat with the first request, as quota-enforcement does, rejects it with `AlreadyExists`, which a caller does not
+  retry; a new charge needs a new key. A retry after
+  the removal of the entry is not mapped. An operator therefore adds entries for new principal types freely, and
   changes or removes an existing entry as a migration of its quotas, at a time with no charges of that type in flight.
 * The backend checks that the metric admits the mapped quota subject type. A type the metric does not admit fails in
   the backend as an invalid request; the resolver logs it as a likely misconfiguration, throttled.
 * The mapping produces only the principal's own subject. Quotas of the tenant are the backend's concern, given the
-  tenant of the request; the SDK registers the tenant subject type so that a tenant quota can be named in a quota
-  state result.
+  tenant of the request. The SDK declares a final tenant subject type, so that a module can name the tenant as a
+  subject and a quota state result can name a tenant quota; a tenant subject must name the request's tenant.
 * A backend whose own model is not built on quota subject types translates them in its plugin.
 
 ### Confirmation

@@ -100,8 +100,8 @@ primitive (P2; P1 sinks filter on the tenant arm of `event.scope` themselves).
 2. [x] - `p1` - **IF** no sink is registered at bootstrap - `inst-del-nosink-if`
    1. [x] - `p1` - Surface the "no notification sinks registered" telemetry warning and continue serving - `inst-del-nosink-warn`
 3. [x] - `p1` - A mutating operation commits; its events are already in `notification_outbox` same-tx (I11) - `inst-del-enqueue`
-4. [x] - `p1` - DB: the `toolkit-db` Outbox processor claims a batch under a DB lease and invokes the QE leased handler with the dispatcher's system-level `SecurityContext` - `inst-del-claim`
-5. [x] - `p1` - API: the handler fans each event out to every registered sink concurrently, passing the system `SecurityContext`, each call bounded by the per-sink timeout (reference default 2 s) - `inst-del-fanout`
+4. [x] - `p1` - DB: the `toolkit-db` Outbox processor claims a batch under a DB lease and invokes the QE leased handler, which takes no `SecurityContext` - `inst-del-claim`
+5. [x] - `p1` - API: the handler fans each event out to every registered sink concurrently, with no `SecurityContext` (the event names its actor), each call bounded by the per-sink timeout (reference default 2 s) - `inst-del-fanout`
 6. [x] - `p1` - **IF** any sink answers `Timeout` or `Transient` - `inst-del-retry-if`
    1. [x] - `p1` - The handler returns retry; the framework re-delivers the event to **all** sinks later — duplicate delivery is permitted and sinks tolerate it per contract - `inst-del-retry`
 7. [x] - `p1` - **IF** any sink answers `Permanent`, or `OutboxMessage.attempts` has reached the operator-configured maximum with sinks still transient - `inst-del-reject-if`
@@ -116,7 +116,7 @@ primitive (P2; P1 sinks filter on the tenant arm of `event.scope` themselves).
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-dispatcher-singleton`
 
-**Input**: A framework-claimed event batch, the registered sink set, the dispatcher's system-level `SecurityContext`,
+**Input**: A framework-claimed event batch, the registered sink set,
 per-sink timeout
 
 **Output**: Per-event ack or retry returned to the Outbox framework; telemetry updated
@@ -124,7 +124,7 @@ per-sink timeout
 **Steps**:
 1. [x] - `p1` - The `toolkit-db` Outbox processor claims the batch under a DB lease; the handler future is dropped at the cancel point (`lease_duration − ack_headroom`), so an expired holder can never overlap its successor - `inst-disp-claim`
 2. [x] - `p1` - **FOR EACH** event in the claimed batch - `inst-disp-each`
-   1. [x] - `p1` - API: `dispatch(ctx_system, event)` to all registered sinks concurrently, each bounded by the per-sink timeout - `inst-disp-fanout`
+   1. [x] - `p1` - API: `dispatch(event)` to all registered sinks concurrently, each bounded by the per-sink timeout - `inst-disp-fanout`
 3. [x] - `p1` - **IF** the registered sink set is empty - `inst-disp-nosink-if`
    1. [x] - `p1` - **RETURN** ack unprocessed: events are dropped silently per the PRD §11 assumption, behind the bootstrap warning - `inst-disp-nosink`
 4. [x] - `p1` - **FOR EACH** `(event, sink)` outcome - `inst-disp-outcome`
@@ -187,12 +187,12 @@ sinks, then `dead_letter_resolve` or `dead_letter_reject`) is deferred to P2 alo
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-sink-contract`
 
 The system **MUST** define `QuotaNotificationSinkV1` in the SDK crate — async, two methods (`id() -> &str`,
-`dispatch(ctx: &SecurityContext, event: QuotaEvent) -> Result<(), DispatchError>`, invoked under the dispatcher's
-system-level context) — with the documented obligation that sinks tolerate duplicate delivery of the same `event_id`,
-and with the closed `DispatchError` enum
-(`Timeout`, `Transient(String)`, `Permanent(String)`) and the `QuotaEvent` shape carrying the closed event-kind enum,
-event-kind payloads, discriminators (`quota-changed.change_kind`, `policy-changed.change_kind` with rollback reported
-as `updated`), `event_id`, its scope, target reference, `subject` when applicable, and the emission timestamp.
+`dispatch(event: QuotaEvent) -> Result<(), DispatchError>`; the dispatcher has no caller, so a sink gets no
+`SecurityContext`, and the event names its actor) — with the documented obligation that sinks tolerate duplicate
+delivery of the same `event_id`, and with the closed `DispatchError` enum (`Timeout`, `Transient(String)`,
+`Permanent(String)`) and the `QuotaEvent` shape carrying the closed event-kind enum, event-kind payloads,
+discriminators (`quota-changed.change_kind`, `policy-changed.change_kind` with rollback reported as `updated`),
+`event_id`, its scope, target reference, `subject` when applicable, and the emission timestamp.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-sink-delivery`
@@ -212,7 +212,7 @@ The system **MUST** implement the `NotificationDispatcher` as the sole caller of
 (handler future dropped at the cancel point), redelivery, and the dead-letter store; the handler owns concurrent
 fan-out with a per-sink timeout, per-sink failure isolation, `Retry` on transient outcomes below the
 operator-configured `OutboxMessage.attempts` maximum (duplicates permitted), `Reject` on any `Permanent` outcome or at
-that maximum, and ack only when every sink succeeded — all under the dispatcher's system-level `SecurityContext`.
+that maximum, and ack only when every sink succeeded.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-dispatcher-singleton`
@@ -228,12 +228,16 @@ that maximum, and ack only when every sink succeeded — all under the dispatche
 
 ### Event Catalog Conformance
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-event-catalog`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-event-catalog`
 
 The system **MUST** deliver all eight catalog kinds — `threshold-crossed`, `period-rollover`, `lease-auto-released`,
 `lease-resolved-by-deactivation`, `quota-changed`, `quota-counter-adjusted`, `quota-rollback-applied`,
 `policy-changed` — with the payload fields PRD §5.15 names per kind, and **MUST** implement the threshold
-upward-transition semantics of this feature's emission process. Tenant-scope filtering is sink-side in P1.
+upward-transition semantics of this feature's emission process. `quota-rollback-applied` is the one event of a return
+and of a rollback, with no flag that tells them apart: it carries the operation and key of the charge (the record of
+an allowed debit or lease commit), the returned amount, what remains of the charge, the affected Quotas, and the
+actor, which is the caller on QE's API and the platform identity of the resolver's caller when the quota resolver
+calls QE in process through its plugin. Tenant-scope filtering is sink-side in P1.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-threshold-emission`

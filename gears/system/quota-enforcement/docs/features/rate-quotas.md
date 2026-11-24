@@ -54,7 +54,8 @@ transition that replaces the P1 `Unimplemented` rejection arms of the quota-life
 
 **Out of scope**: burst mechanism selection (sliding window vs token bucket vs fixed window, the smoothing axis, and
 the burst-vs-lease-TTL interaction) until the PRD §13 open question is resolved; the canonical pipeline, idempotency
-replay, and period machinery (consumption-operations feature, consumed unchanged); Quota CRUD flows and their
+replay, and period machinery (consumption-operations feature, consumed unchanged), including return and rollback,
+which never change a rate Quota's counter; Quota CRUD flows and their
 validation chain (quota-lifecycle feature, extended at exactly one arm); the batch-debit feature's rejection of
 `mode = independent`, which this feature does not lift (it is a P2 transport mode unrelated to the quota type);
 notification dispatch (notifications feature) and lease operations (lease-operations feature).
@@ -78,7 +79,7 @@ notification dispatch (notifications feature) and lease operations (lease-operat
   burst-semantics open question)
 - **Design**: [DESIGN.md](../DESIGN.md) (§4.3 future considerations: the `rate_spec` activation hook; §3.7 table
   inventory; `EvaluationOrchestrator`)
-- **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.11; §2.12 shared-component rule: the orchestrator is
+- **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.11; §2.13 shared-component rule: the orchestrator is
   established by consumption-operations and extended here through the same contract)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-consumption-operations` (the canonical pipeline, idempotency
   scope, counter machinery, and the debit sequence this feature reuses), plus transitively
@@ -108,8 +109,8 @@ a P3 DESIGN concern per DECOMPOSITION §2.11)
 - `rate_spec` absent or missing any of the three contract fields: rejected before persistence (canonical
   `InvalidArgument`)
 - A period field on a rate draft: rejected; the period specification is consumption-only per the PRD Quota definition
-- Every other lifecycle error (unknown metric, catalogue miss, subject-scope violation, metadata violation) fires
-  unchanged per the quota-lifecycle feature
+- Every other lifecycle error (a metric that is not registered or is unavailable, a subject type the metric does not
+  admit, Quota metadata that the Engine rejects) fires unchanged per the quota-lifecycle feature
 
 **Steps**:
 1. [ ] - `p3` - Caller sends `POST /v1/quota-enforcement/quotas` (or `PATCH /v1/quota-enforcement/quotas/{id}`) with
@@ -189,7 +190,7 @@ a P3 DESIGN concern per DECOMPOSITION §2.11)
    1. [ ] - `p3` - **RETURN** rejection; the period specification belongs to consumption types only per the PRD
       Quota definition, and rate smoothing is expressed by `rate_spec`, not by a period - `inst-rdv-period`
 5. [ ] - `p3` - Run the remainder of `cpt-cf-quota-enforcement-algo-quota-draft-validation` and the rest of the
-   lifecycle chain (metric validation, catalogue membership, subject scope, metadata validation) unchanged; this
+   lifecycle chain (the metric check, subject admission, the Engine's check of Quota metadata) unchanged; this
    algorithm adds the rate-spec and period validation branches and replaces the two P1 rejection arms
    (`inst-qdv-rate`, `inst-qup-rate`), nothing else - `inst-rdv-chain`
 6. [ ] - `p3` - Existing persisted Quotas with `type` in `allocation` / `consumption` require no migration when
@@ -268,7 +269,7 @@ batch-debit feature's `mode = independent` rejection untouched.
 
 The system **MUST** extend `EvaluationOrchestrator`
 (`cpt-cf-quota-enforcement-component-evaluation-orchestrator`, established by the consumption-operations feature and
-extended through the same contract per DECOMPOSITION §2.12) so rate Quotas evaluate through the unchanged canonical
+extended through the same contract per DECOMPOSITION §2.13) so rate Quotas evaluate through the unchanged canonical
 pipeline. For `quota_type = rate` the only valid admission outcomes **MUST** be `Allowed` and `Denied`; an exhausted
 rate Quota **MUST** produce `Denied(reason = "RATE_WINDOW_EXHAUSTED")` carrying a `Retry-After` floor (advisory;
 clients SHOULD add randomized jitter); cap-clamp **MUST NOT** apply. Rate admission-state mutations ride
@@ -298,7 +299,7 @@ existing `denial_total` instrument by the closed `reason` kind. No instrument is
 - [ ] A rate draft missing `rate_spec`, or missing any of `rate`, `burst_capacity`, `smoothing_window`, is rejected
   before persistence; a rate draft carrying any period field is rejected before persistence
 - [ ] Every non-rate arm of the lifecycle validation chain fires unchanged for rate drafts: an unknown metric still
-  returns `METRIC_NOT_REGISTERED`, a catalogue miss still returns `PROJECTION_NOT_RESOLVABLE`
+  returns `METRIC_NOT_REGISTERED`, a subject type the metric does not admit still returns `InvalidArgument`
 - [ ] A debit against an exhausted rate Quota returns HTTP 200 with
   `Denied(reason = "RATE_WINDOW_EXHAUSTED")` carrying a `Retry-After` floor, mutates no counter, and increments
   `denial_total` by the `reason` kind; a debit within capacity returns `Allowed` with its plan applied atomically

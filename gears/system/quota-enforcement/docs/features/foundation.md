@@ -39,8 +39,9 @@
 
 Stands up the `quota-enforcement` gear and SDK crates, the storage plugin contract with the storage-plugin skeleton
 whose trait implementation completes as later features add their primitives, the coordination adapter over the
-platform `cluster` gear's leader election, plus gear bootstrap, two-phase PDP authorization, tenant isolation, and the
-telemetry conventions every later feature emits through.
+platform `cluster` gear's leader election, plus gear bootstrap, two-phase PDP authorization with the trusted admission
+mode of the quota resolver plugin path, tenant isolation, and the telemetry conventions every later feature emits
+through.
 
 ### 1.2 Purpose
 
@@ -50,10 +51,12 @@ behavior without renegotiating infrastructure.
 
 **Scope**: the storage SDK plugin contract, the `cluster-sdk` dependency with the typed `quota-enforcement` profile
 and the coordination adapter, the storage-plugin crate skeleton and its foundation-table functions, gear bootstrap
-with idempotent seeding and startup validation, two-phase PDP admission, tenant isolation at both layers, and the
-telemetry conventions.
+with idempotent seeding and startup validation, two-phase PDP admission and trusted admission, tenant isolation at
+both layers, and the telemetry conventions.
 
-**Out of scope**: projection-catalogue publication and its consistency checks (projection-contracts feature), every
+**Out of scope**: the catalogue of metric types (the GTS types that metric owners register) and its checks
+(`cpt-cf-quota-enforcement-feature-projection-contracts`, Metric Types & Subject Admission; this document calls it
+the projection-contracts feature, after its file name), every
 evaluation/lease/notification behavior and the storage primitives they add (their owning features), and the
 `LeaseSweeper`/`RetentionSweeper` singletons that consume the coordination adapter delivered here, and the
 notification dispatch that runs under the `toolkit-db` Outbox lease instead.
@@ -71,7 +74,8 @@ notification dispatch that runs under the `toolkit-db` Outbox lease instead.
 |-------|-----------------|
 | `cpt-cf-quota-enforcement-actor-platform-operator` | Deploys the gear, selects the active storage plugin, configures defaults |
 | `cpt-cf-quota-enforcement-actor-storage-backend` | Persists all gear state behind `QuotaEnforcementStoragePluginV1` |
-| `cpt-cf-quota-enforcement-actor-authz-resolver` | Answers every admission query in the two-phase PDP integration |
+| `cpt-cf-quota-enforcement-actor-authz-resolver` | Answers every PDP-mode admission query in the two-phase PDP integration |
+| `cpt-cf-quota-enforcement-actor-quota-resolver` | Calls QE through the resolver plugin, whose operations are admitted in trusted mode |
 | `cpt-cf-quota-enforcement-actor-monitoring-system` | Scrapes the gear-specific telemetry surface |
 
 ### 1.4 References
@@ -79,6 +83,11 @@ notification dispatch that runs under the `toolkit-db` Outbox lease instead.
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md)
+- **ADR**: [ADR-0009 Quota resolver plugin path without a policy
+  check](../ADR/0009-cpt-cf-quota-enforcement-adr-resolver-plugin-path.md)
+  (`cpt-cf-quota-enforcement-adr-resolver-plugin-path`; trusted admission mode),
+  [ADR-0012 Metric catalogue](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)
+  (`cpt-cf-quota-enforcement-adr-contract-catalogue`; what fails bootstrap and what does not)
 - **Dependencies**: None
 
 ## 2. Actor Flows (CDSL)
@@ -100,6 +109,9 @@ consumption-operations feature)
 - No storage plugin resolves, or the `quota-enforcement` cluster profile is unbound or lacks a linearizable
   election: the gear refuses to serve
 - PDP unreachable at startup: readiness fails (fail-closed)
+- `types-registry` does not answer the catalogue read at start (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`):
+  bootstrap does not fail and readiness does not change; a metric type that was not read gets no catalogue entry
+  and is read when a request or a write names it (ADR-0012)
 
 **Steps**:
 1. [x] - `p1` - Operator starts the gear with a configuration naming exactly one active storage plugin - `inst-boot-start`
@@ -116,7 +128,7 @@ consumption-operations feature)
 
 ### Authorized Operation Admission
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-authorized-admission`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-authorized-admission`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-consumer`
 
@@ -128,16 +140,29 @@ consumption-operations feature)
 - Malformed public request/target shape: canonical `InvalidArgument` before PDP
 - PDP denies a structurally valid target: canonical `PermissionDenied`, no partial operation
 - PDP unreachable: canonical `ServiceUnavailable`, fail-closed, nothing mutated
+- Policy management in trusted mode: refused, nothing mutated
+
+Admission has two modes. **PDP mode** serves QE's REST and in-process API. **Trusted mode** serves only the quota
+resolver plugin path (`cpt-cf-quota-enforcement-adr-resolver-plugin-path`): it checks the target's shape, calls no
+PDP, and returns an access scope that names the request's tenant only. The gear builds its operations once over each
+mode; the trusted ones are reachable only through the plugin client. The trust boundary is the process: any module in
+the same process can obtain the plugin client and is trusted like a caller of the quota resolver's platform plane (the
+resolver API for trusted platform services). A trusted request never spans tenants; its caller names the tenant.
+
+Rollback is admitted as a debit is: it carries the attribution of the charged operation, the PDP admits that
+attribution for the action rollback, and QE then checks that it is the attribution of the charge
+(`cpt-cf-quota-enforcement-flow-rollback`).
 
 **Steps**:
-1. [x] - `p1` - Caller sends an operation request with a platform bearer token - `inst-adm-request`
+1. [x] - `p1` - Caller sends an operation request with a platform bearer token; a call on the resolver plugin path carries no token, skips step 2, and enters at step 3 without a `SecurityContext` - `inst-adm-request`
 2. [x] - `p1` - Platform `api-gateway` authenticates and populates the service principal in `SecurityContext`; target attribution remains untrusted request data - `inst-adm-authn`
-3. [x] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
+3. [ ] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
+   1. [ ] - `p1` - **IF** the operation runs in trusted mode: refuse policy management; otherwise **RETURN** control to the handler with an `AccessScope` naming the request's tenant only, without a PDP call - `inst-adm-trusted`
 4. [x] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver` and compiles the response itself within the configured `pdp_deadline_ms` (default 250 ms, at least 1 ms, and 0 fails startup; an overrun is a PDP-unreachable `EnforcerError`), returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and keeps no PDP decision cache of its own - `inst-adm-pdp`
 5. [x] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
    1. [x] - `p1` - **RETURN** the canonical error (`PermissionDenied` / `ServiceUnavailable`); no handler runs - `inst-adm-deny`
 6. [x] - `p1` - Carry the returned `AccessScope` unmodified to the operation handler for `SecureConn` consumption - `inst-adm-scope`
-7. [x] - `p1` - **RETURN** control to the operation handler with `SecurityContext` and `AccessScope` attached; the in-process SDK client enters at this same admission step, so both transports share one authorization boundary - `inst-adm-forward`
+7. [x] - `p1` - **RETURN** control to the operation handler with the `AccessScope` and the actor of the operation: the authenticated caller in PDP mode, the platform identity that the resolver request carries in trusted mode; the handler and every call below it take these two values and no `SecurityContext` (DESIGN, SecurityContext propagation); the in-process SDK client enters at this same admission step, so both transports share one authorization boundary - `inst-adm-forward`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -150,7 +175,7 @@ consumption-operations feature)
 **Output**: Storage operation executed under the caller's tenant and PDP scope, or a canonical error
 
 **Steps**:
-1. [ ] - `p1` - Accept `tenant_id` only after PDP authorizes the complete explicit target against the authenticated principal - `inst-pdp-derive`
+1. [ ] - `p1` - Accept `tenant_id` only after PDP authorizes the complete explicit target against the authenticated principal, or in trusted mode as the request's tenant - `inst-pdp-derive`
 2. [ ] - `p1` - Bind the authorized `tenant_id` into the storage query as a mandatory filter (storage-layer half of defense-in-depth) - `inst-pdp-bind-tenant`
 3. [ ] - `p1` - Pass the `AccessScope` to `SecureConn` unmodified; QE never interprets, widens, or re-compiles scope constraints itself - `inst-pdp-scope`
 4. [ ] - `p1` - DB: `SecureConn` compiles the scope into query filters; rows outside tenant or scope are unreachable by construction - `inst-pdp-execute`
@@ -167,7 +192,7 @@ consumption-operations feature)
 **Steps**:
 1. [x] - `p1` - Emit metrics from the owning component through the `QeMetrics` domain port, whose `OpenTelemetry` adapter records on a scoped `Meter` from the ToolKit meter provider (no runtime filtering layer); logs and spans use `tracing` - `inst-tel-emit`
 2. [x] - `p1` - Emission sites use only the fixed PRD §5.16 instrument catalogue and the deployment-bounded labels declared there; canonical registered `metric` is permitted only on instruments that declare it - `inst-tel-closed`
-3. [x] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, projection type, caller attribution, and raw/unregistered metric input never appear as label values; a declared `metric` label is populated only after registry/catalogue validation with the canonical registered identity; conformance is enforced by the typed label parameters of the metrics port and by the label-catalogue tests - `inst-tel-highcard`
+3. [x] - `p1` - `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`, subject type, caller attribution, and raw/unregistered metric input never appear as label values; a declared `metric` label is populated only after registry/catalogue validation with the canonical registered identity; conformance is enforced by the typed label parameters of the metrics port and by the label-catalogue tests - `inst-tel-highcard`
 4. [x] - `p1` - **RETURN** the observation to the platform OTLP export when the `otel` feature is enabled - `inst-tel-export`
 
 ## 4. States (CDSL)
@@ -222,12 +247,14 @@ the trait names exists — no placeholder or `unimplemented!` method ever ships.
 
 ### Gateway Admission and Tenant Isolation
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-gateway-admission`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-gateway-admission`
 
 The system **MUST** mount the Gateway into the platform `api-gateway`, reject unauthenticated requests before any
 handler, run phase-1 PDP admission via `authz-resolver-sdk::PolicyEnforcer` with fail-closed posture and no QE-side
 decision cache, pass the returned `AccessScope` unmodified to `SecureConn`, apply the same admission boundary to the
-in-process SDK entry, and stamp the PDP-authorized target `tenant_id` on every persisted tenant row.
+in-process SDK entry, and stamp the admitted target `tenant_id` on every persisted tenant row. It **MUST** provide the
+trusted admission mode for the quota resolver plugin path only: no PDP call, a tenant-only `AccessScope`, policy
+management refused. This is the plugin-path exception to `cpt-cf-quota-enforcement-fr-authorization`.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-authorized-admission`
@@ -296,11 +323,12 @@ coordination contract, plugin crate, or bootstrap probe ships.
 
 ### Telemetry Conventions
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
 
 The system **MUST** emit gear-specific instruments through the `QeMetrics` port and its `OpenTelemetry` adapter, exported over OTLP by the platform under the `otel` feature, enforcing
 the bounded-cardinality label discipline through the type system: every label value is a static token of a closed
-enum or an admitted-metric label that only the catalogue frozen at bootstrap can construct, so no high-cardinality
+enum or an admitted-metric label that only an entry of `MetricCatalog` (the process-local catalogue of metric types
+of the projection-contracts feature, ADR-0012) can construct, so no high-cardinality
 identifier can reach a label value. Export queueing, batching, and drop behaviour under backend saturation belong to
 the platform OTLP pipeline, not to this gear.
 
@@ -316,13 +344,17 @@ the platform OTLP pipeline, not to this gear.
 ## 6. Acceptance Criteria
 
 - [ ] An anonymous request to any QE route is rejected by the platform `api-gateway` with `401` before a QE handler runs
-- [ ] With the PDP unreachable, every write is denied with canonical `ServiceUnavailable` and no row is mutated
-  (fail-closed verified by chaos test)
+- [ ] With the PDP unreachable, every write through QE's API is denied with canonical `ServiceUnavailable` and no row
+  is mutated (fail-closed verified by chaos test)
 - [ ] A service supplying a tenant or subject outside its authorized scope receives canonical `PermissionDenied`; no
   storage operation runs (adversarial integration test)
+- [ ] In trusted mode no PDP call is made, storage reaches only the tenant the request names, and policy management
+  is refused; QE's API still calls the PDP
 - [ ] Bootstrap fails readiness on: incompatible schema version, missing storage plugin, unbound `quota-enforcement`
   cluster profile or unmet linearizable-election requirement, or unreachable PDP — and serves no operation in that
-  state
+  state; a wrong metric type does not fail bootstrap or change readiness; while `types-registry` does not answer the
+  catalogue read at start the gear becomes ready, serves every operation that needs no catalogue entry, and answers
+  `ServiceUnavailable` to a request for a metric it has not read (ADR-0012)
 - [ ] Binding the `quota-enforcement` profile to an eventually consistent cache double fails startup with
   `CapabilityNotMet` naming the primitive, the capability, and the provider
 - [ ] The three config-table default rows exist after first bootstrap and are not duplicated by repeated bootstraps
@@ -336,7 +368,7 @@ the platform OTLP pipeline, not to this gear.
   restart with zero data loss — the durable-commit contract input consumed by the consumption-operations end-to-end
   RPO drill
 - [ ] Metrics scrape shows no `tenant_id`, `subject_id`, `quota_id`, `policy_id`, `idempotency_key`, `lease_token`,
-  projection-type, caller, or raw/unregistered metric label on any gear-specific instrument; a canonical registered
+  subject-type, caller, or raw/unregistered metric label on any gear-specific instrument; a canonical registered
   `metric` label appears only on instruments that declare it in PRD §5.16
 - [ ] Chaos test kills gateway pods during sustained readiness/health traffic: requests fail over to surviving
   replicas with no readiness flap — the gateway-failover input consumed by the consumption-operations feature, which

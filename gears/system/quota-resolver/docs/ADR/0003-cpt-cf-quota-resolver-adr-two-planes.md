@@ -72,7 +72,8 @@ neither forwarded to the resolver nor synthesized by it. The resolver maps the p
 
 On the tenant plane the subject is the caller's principal, mapped the same way, and the tenant is the caller's tenant.
 
-The resolver performs no policy check and passes no caller identity to the plugin. It trusts platform-plane callers
+The resolver performs no policy check. It passes the platform identity that it receives from the caller to the plugin, only
+for the backend's record of operations. It trusts platform-plane callers
 for the target data they provide and trusts the backend to decide which quotas apply to the fixed tenant and subjects.
 
 This is an exception to the toolkit's two-plane rule (`cpt-cf-adr-two-plane-auth`, "Which plane?"), which puts
@@ -89,10 +90,16 @@ own charge. The resolver then adopts that check without changing its contracts.
 * The resolver cannot check that a principal passed as data is the user of the module's request; it trusts the
   platform-plane caller, as for any other subject.
 * Until the exception ends, any service with a platform credential can charge, return, or read quotas of any subject
-  in any tenant. No component checks which service may do so, and the backend cannot record which service made a
-  charge.
+  in any tenant. No component checks which service may do so.
+* The backend records the platform identity with every charge, but this is not an audit log. The identity names the
+  calling service only when the caller runs in another process. In one process, which is the default deployment, the
+  platform gives a caller no identity of its own: the resolver receives a marker that names no module
+  ([gears-rust#6036](https://github.com/constructorfabric/gears-rust/issues/6036)). The record names the charging
+  module in every deployment when the platform closes that gap; the resolver's contracts do not change then.
 * A backend that also has its own API gains a second entry into its operations: the in-process plugin. The backend's
-  own policy check covers only its API; the plugin is reachable only through the resolver and is not authorized.
+  own policy check covers only its API; the plugin is reachable by any module of the same process and is not
+  authorized. This adds no access: a module of the process can already call the resolver's platform plane, which
+  reaches the same operations. The platform does not treat the process as a security boundary.
 * An authenticated user receives the state of the quotas that the backend applies to the mapped subject and requested
   metrics, including quotas of the tenant. The resolver returns the backend's page unchanged.
 

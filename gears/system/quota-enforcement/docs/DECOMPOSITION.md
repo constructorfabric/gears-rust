@@ -11,7 +11,7 @@
 - [1. Overview](#1-overview)
 - [2. Entries](#2-entries)
   - [2.1 Gear Foundation, Storage & Coordination (HIGH)](#21-gear-foundation-storage--coordination-high)
-  - [2.2 Projection Contracts & Subject Attribution (HIGH)](#22-projection-contracts--subject-attribution-high)
+  - [2.2 Metric Types & Subject Admission (HIGH)](#22-metric-types--subject-admission-high)
   - [2.3 Quota Lifecycle & Metadata (HIGH)](#23-quota-lifecycle--metadata-high)
   - [2.4 Resolution Policy & Engine (HIGH)](#24-resolution-policy--engine-high)
   - [2.5 Consumption Operations & Idempotency (HIGH)](#25-consumption-operations--idempotency-high)
@@ -21,23 +21,26 @@
   - [2.9 Notification Outbox & Dispatch (MEDIUM)](#29-notification-outbox--dispatch-medium)
   - [2.10 Bulk Quota CRUD (MEDIUM)](#210-bulk-quota-crud-medium)
   - [2.11 Rate Quotas (LOW)](#211-rate-quotas-low)
-  - [2.12 Deliberate Omissions & Shared Elements](#212-deliberate-omissions--shared-elements)
+  - [2.12 Quota Resolver Plugin (HIGH)](#212-quota-resolver-plugin-high)
+  - [2.13 Deliberate Omissions & Shared Elements](#213-deliberate-omissions--shared-elements)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
 
 ## 1. Overview
 
-The DESIGN is decomposed into eleven features along its plugin seams and evaluation pipeline. The strategy is
-dependency-ordered vertical slices: the foundation feature stands up the gear skeleton, the storage plugin
-contract, the coordination adapter over the platform `cluster` gear, authorization, and tenant isolation; the projection-contracts feature adds the declarative GTS
-request surface those operations validate against; lifecycle, policy/engine, and the operation features then build the
-evaluation pipeline in the order the `EvaluationOrchestrator` executes it. Read surfaces, notifications, and the
-deferred P2/P3 capabilities close the list. Every P1 functional requirement, NFR, design principle, constraint,
-component, sequence, and the database schema is covered by exactly the features that implement it; deferred
-requirements (`p2`/`p3`) are carried by dedicated features so no P1 feature depends on deferred work. Each feature is
-a single implementation phase; sub-decomposition below the feature level happens in the per-feature FEATURE documents,
-not here.
+The DESIGN is decomposed into twelve features along its plugin seams and evaluation pipeline. The strategy is
+dependency-ordered vertical slices: the foundation feature stands up the gear skeleton, the storage plugin contract,
+the coordination adapter over the platform `cluster` gear, authorization, and tenant isolation; the
+projection-contracts feature (Metric Types & Subject Admission) adds the catalogue of metric types that requests and
+Quota and Policy writes are checked against. A **metric type** is the GTS type that the owner of a metric registers in
+`types-registry` (ADR-0013). Policy/engine, lifecycle, and the operation features then build the evaluation pipeline
+in the order the `EvaluationOrchestrator` executes it. Read surfaces, notifications, and the deferred P2/P3
+capabilities follow; the quota resolver plugin, which exposes the finished operations to the quota resolver, closes the list. Every P1 functional requirement, NFR,
+design principle, constraint, component, sequence, and the database schema is covered by exactly the features that
+implement it; deferred requirements (`p2`/`p3`) are carried by dedicated features so no P1 feature depends on deferred
+work. Each feature is a single implementation phase; sub-decomposition below the feature level happens in the
+per-feature FEATURE documents, not here.
 
 ## 2. Entries
 
@@ -50,8 +53,8 @@ not here.
 - **Purpose**: Stand up the `quota-enforcement` gear and SDK crates, the `QuotaEnforcementStoragePluginV1` contract
   with its `toolkit-db` reference plugin, the coordination adapter over the platform `cluster` gear's leader election, gear
   bootstrap (schema check, config-table defaults, and the bootstrap hook later features extend),
-  two-phase PDP authorization, tenant isolation, and the gear-specific telemetry conventions. Every later feature
-  builds on these seams.
+  two-phase PDP authorization with the trusted admission mode of the quota resolver plugin path, tenant isolation, and
+  the gear-specific telemetry conventions. Every later feature builds on these seams.
 
 - **Depends On**: None
 
@@ -62,13 +65,15 @@ not here.
     coordination adapter (one leader election per sweeper scope, linearizable requirement validated at startup)
   - Gateway REST registration into the platform `api-gateway`, DTO validation shell, phase-1 PDP admission via
     `PolicyEnforcer` (fail-closed, no QE-side decision cache), phase-2 `AccessScope` pass-through to `SecureConn`
+  - Trusted admission mode for the quota resolver plugin path: no PDP call, a tenant-only `AccessScope`, policy
+    management refused (ADR-0009)
   - Tenant isolation filters at gateway and storage layers
   - Bootstrap: schema-version check, default config-table rows, fail-fast posture, and the extension hook later
     features add their bootstrap steps to
   - Telemetry emission conventions with bounded label cardinality
 
 - **Out of scope**:
-  - Projection contracts and their bootstrap consistency checks (feature `projection-contracts`)
+  - Metric types and the catalogue that holds them (feature `projection-contracts`)
   - Any evaluation, lease, or notification behavior (later features)
 
 - **Requirements Covered**:
@@ -117,35 +122,44 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.2 Projection Contracts & Subject Attribution (HIGH)
+### 2.2 Metric Types & Subject Admission (HIGH)
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-projection-contracts`
 
 - **Feature**: [features/projection-contracts.md](features/projection-contracts.md)
 
-- **Purpose**: Register the abstract QE subject/resource/request/constraint bases and the scope-discriminator type,
-  resolve owner projections into the immutable `ProjectionContractCatalog`, validate every evaluation request at
-  Gateway ingress, authorize caller-supplied attribution through PDP, and map scope kinds to owner projections. This is
-  the declarative contract surface the whole evaluation pipeline trusts.
+- **Purpose**: Read metric types from `types-registry` by their ids into `MetricCatalog`, the process-local catalogue
+  with one entry per metric type that QE has read (ADR-0012), validate the metric object `{type, id?, metadata}` of
+  every evaluation request at Gateway ingress against the schema of its metric type (ADR-0013), and check each named
+  quota subject against the subject types the metric admits (ADR-0008). The whole evaluation pipeline trusts this
+  validation.
 
 - **Depends On**: `cpt-cf-quota-enforcement-feature-foundation`
 
 - **Scope**:
-  - Bootstrap registration of the abstract bases and the P1 `user`/`tenant` scope well-known instances
-  - Bootstrap consistency for admitted metric registration/derivation, `(metric, scope)` uniqueness, exactly one
-    request contract per metric, and its attached constraint contract
-  - `ProjectionContractCatalog` build and publication, including the authoritative reverse index from each metric
-    to its complete configured subject-projection set; catalogue-membership checks on Quota and Policy writes
-  - PDP authorization of the complete caller-supplied tenant/subject/metric/resource tuple, followed by server-side
-    `(metric, kind)` projection mapping from the reverse index
-  - Ingress validation: required operation-level `metadata`, valid `{kind,id}` refs, admitted metric, and optional
-    resource projection; no `caller_type` or caller-selected subject projection
-  - Contract-validation telemetry counters
+  - `MetricCatalog` reads: at start for the metric types of the active Quotas and Policies; once, with a time limit,
+    when a request or a Quota or Policy write names a metric type the catalogue does not hold; and on a bounded
+    schedule, which rebuilds changed entries and removes the entry of a deleted metric type
+  - Checks of an entry: the type is a valid metric type (not abstract, derived from the metric base of the quota
+    resolver SDK, an own version of major 1 or higher, valid traits `kind`, `admitted_subjects`, `enforcement`); an
+    entry that fails a check is unavailable (its requests fail with `FailedPrecondition`) and bootstrap does not
+    fail; an entry is built from the registry content only, and stored Quotas and Policies are not checked
+  - A metric type that is not registered: `InvalidArgument`, remembered for a short time; a registry read that fails
+    or reaches its time limit: `ServiceUnavailable`
+  - Admission checks on Quota and Policy writes: a served entry, and a subject type that the metric admits
+  - Ingress validation: the metric object against the resolved schema of its metric type, at least one `{type, id}`
+    subject, no two subjects of one type, a tenant subject naming the request's tenant, and admitted subject types
+  - The `enforcement` trait of the metric type (`quota_gated` or `direct`) as the source of the metric's
+    classification
+  - Validation telemetry counters
 
 - **Out of scope**:
   - Quota records themselves (feature `quota-lifecycle`)
-  - Engine consumption of request/resource/arbitration data (feature `resolution-policy-engine`)
-  - Breaking projection-version activation (out of P1 per PRD §5.2)
+  - Engine consumption of the metric's metadata and of Quota metadata (feature `resolution-policy-engine`)
+  - The trusted admission mode (feature `foundation`)
+  - Registration of GTS types: the quota resolver SDK owns the subject base, the tenant subject type, and the metric
+    base; the owner of a metric registers its metric type; QE registers none
+  - Moving Quotas or counters to another major version of a metric type, which is another metric (ADR-0013)
 
 - **Requirements Covered**:
 
@@ -164,12 +178,7 @@ not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 - **Domain Model Entities**:
-  - `SubjectScope`
-  - `SubjectProjectionContract`
-  - `ResourceProjectionContract`
-  - `MetricRequestContract`
-  - `ConstraintContract`
-  - `ProjectionContractCatalog`
+  - `MetricCatalog`
 
 - **Design Components**:
 
@@ -177,9 +186,9 @@ not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-evaluation-orchestrator`
 
 - **API**:
-  - Consumer request fields (`tenant_id`, `subjects: Vec<SubjectRef>`, `metadata`, optional `resource`) on debit,
-    reserve, preview, and every batch item
-  - No registration endpoint: contracts are published through `types-registry`
+  - Consumer request fields (`tenant_id`, `subjects: [{type, id}]`, `metric: {type, id?, metadata}`) on debit, lease
+    acquisition, preview, and every batch item
+  - No registration endpoint: owners register metric types in `types-registry`
 
 - **Sequences**:
 
@@ -187,7 +196,7 @@ not here.
 
 - **Data**:
 
-  - None (contracts are registry-resident; no QE-side table)
+  - None (metric types are registry-resident; no QE-side table)
 
 ### 2.3 Quota Lifecycle & Metadata (HIGH)
 
@@ -196,18 +205,22 @@ not here.
 - **Feature**: [features/quota-lifecycle.md](features/quota-lifecycle.md)
 
 - **Purpose**: Implement the Quota entity and its lifecycle — create, update, deactivate, read — with metric
-  validation against `types-registry`, cap and validity-window semantics, opaque size-capped metadata, the closed
-  `enforcement_mode` and `source` enums, rate-type rejection, and the deactivation cascade that resolves active
-  leases atomically.
+  validation against the metric type, cap and validity-window semantics, size-capped metadata that the Engine of the
+  active Policy checks when it is written, the closed `enforcement_mode` and `source` enums, rate-type rejection, and
+  the deactivation cascade that resolves active leases atomically.
 
 - **Depends On**: `cpt-cf-quota-enforcement-feature-foundation`,
-  `cpt-cf-quota-enforcement-feature-projection-contracts`
+  `cpt-cf-quota-enforcement-feature-projection-contracts`,
+  `cpt-cf-quota-enforcement-feature-resolution-policy-engine`
 
 - **Scope**:
   - `QuotaManagementService` with transactional CRUD via the storage plugin
-  - Metric existence/kind/mode validation through `TypesRegistryClient` with LRU cache, fail-closed
+  - Metric validation through the `MetricCatalog` entry of the Quota's metric type: the type is registered, its entry
+    is served, and it admits the Quota's subject type; fail-closed
   - Cap semantics (`CAP_MUST_BE_NON_NEGATIVE`, `cap = 0`, `cap = null`, `CAP_BELOW_CONSUMED` at commit time)
-  - Quota Metadata validation against the owner's constraint contract at write time only
+  - Quota metadata: a JSON object of at most 4 KB; on create and on a change of the metadata, the Engine of the
+    Policy that is active for the Quota's metric checks it (`validate_quota_metadata`), and a rejection is
+    `QUOTA_METADATA_REJECTED` with the Engine's list of what is wrong; stored metadata is never checked again
   - Validity-window storage and `currently_within_window` computation
   - Deactivation cascade marking leases resolved-by-deactivation
   - `rate` quota-type rejection with canonical `Unimplemented`
@@ -226,7 +239,7 @@ not here.
 
 - **Design Principles Covered**:
 
-  - None (applies the foundation and projection principles; introduces none of its own)
+  - None (applies the principles of the foundation and projection-contracts features; introduces none of its own)
 
 - **Design Constraints Covered**:
 
@@ -276,10 +289,18 @@ not here.
   - `EngineRegistry` with fail-fast bootstrap registration; seeding of the `global` Policy
     (`most-restrictive-wins`, version 1) as this feature's bootstrap extension, so no active Policy ever references an
     unregistered Engine
-  - Engine contract: `id`/`validate_config`/`evaluate`, `ValidatedConfig` cache keyed by `(policy_id, policy_version)`
-  - Debit-Plan invariant enforcement at the Engine boundary with violation telemetry
-  - `most-restrictive-wins` binding-Quota selection and validity-window prefilter; sandboxed cost-bounded `cel`
-  - Static CEL checking against snapshotted request and constraint schemas, including pair compatibility
+  - Engine contract: `id`/`validate_config`/`validate_quota_metadata`/`evaluate`, `ValidatedConfig` cache keyed by
+    `(policy_id, policy_version)`
+  - Check of Quota metadata by the Engine for the quota-lifecycle feature; `most-restrictive-wins` accepts only an
+    empty object, and the `cel` Engine accepts any JSON object
+  - Debit Plan as a list of chains (ADR-0010) and its invariant enforcement at the Engine boundary with violation
+    telemetry
+  - `most-restrictive-wins` binding-Quota selection over the `Subject` and `Tenant` tiers and validity-window
+    prefilter; sandboxed cost-bounded `cel`
+  - Check of a `cel` Policy against the schema of its metric type, which describes `request`, the metadata of the
+    request's metric; `arbitration`, the Quota metadata, has no registered schema
+  - No check of existing Quotas when a Policy is created, changed, or replaced; the preview operation is the
+    operator's tool for that
   - Operator-only Policy surface (`QuotaOperatorApi`)
 
 - **Out of scope**:
@@ -341,9 +362,10 @@ not here.
 - **Feature**: [features/consumption-operations.md](features/consumption-operations.md)
 
 - **Purpose**: Implement the `EvaluationOrchestrator` pipeline and the single-shot counter operations — debit,
-  credit, rollback, and read-only preview — over allocation and consumption counters, with calendar-aligned UTC
-  periods, deterministic rollover and settlement semantics, and the four-component idempotency scope that makes
-  every write replay-safe.
+  credit, return, rollback, and read-only preview — over allocation and consumption counters, the charge ledger that
+  makes part of a charge returnable (ADR-0011), with calendar-aligned UTC
+  periods, deterministic rollover and settlement semantics, and the idempotency scope `(tenant, operation, key)` that
+  makes every write replay-safe.
 
 - **Depends On**: `cpt-cf-quota-enforcement-feature-quota-lifecycle`,
   `cpt-cf-quota-enforcement-feature-resolution-policy-engine`
@@ -352,10 +374,11 @@ not here.
   - `QuotaEnforcementService` entry points and the canonical orchestrator pipeline (resolution → idempotency lookup →
     locked read → Policy lookup → Engine → invariant check → mutation → persist → outbox → commit)
   - Allocation and consumption counter shapes with lazy period-row materialization and threshold-marker reset
-  - Debit applying Engine Debit Plans atomically; credit against a named Quota; rollback by original idempotency key
-    with settlement-keyed closure; preview with no persisted state
+  - Debit applying Engine Debit Plans atomically; credit against a named Quota; preview with no persisted state
+  - Charge ledger written by every allowed debit and lease commit; unwinding of a chain plan; return of part of a
+    charge, and rollback as the return of its remainder; deletion of charges that can no longer be returned
   - `INVALID_AMOUNT` fail-fast ordering; `IDEMPOTENCY_PAYLOAD_MISMATCH`; retention via `RetentionSweeper`
-  - Period rollover event ordering and the credit/rollback closure asymmetry
+  - Period rollover event ordering and the calendar-keyed credit closure
 
 - **Out of scope**:
   - Two-phase holds (feature `lease-operations`)
@@ -365,6 +388,7 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-debit`
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-credit`
+  - [ ] `p1` - `cpt-cf-quota-enforcement-fr-return`
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-rollback`
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-evaluate-preview`
   - [ ] `p1` - `cpt-cf-quota-enforcement-fr-idempotency`
@@ -393,6 +417,7 @@ not here.
   - `Counter` (consumption)
   - `IdempotencyRecord`
   - `OperationLog`
+  - `Charge`
 
 - **Design Components**:
 
@@ -408,6 +433,7 @@ not here.
   - POST /v1/quota-enforcement/operations/preview
   - `QuotaEnforcementApi` (`debit`, `rollback`, `evaluate_preview`)
   - `QuotaManagerApi` (`credit`)
+  - Return: reached only through the quota resolver plugin (feature `resolver-plugin`)
 
 - **Sequences**:
 
@@ -428,10 +454,10 @@ not here.
 
 - **Feature**: [features/lease-operations.md](features/lease-operations.md)
 
-- **Purpose**: Implement the two-phase lease protocol — atomic multi-Quota acquisition, commit with unused-capacity
-  return, release, and TTL auto-release — under the lazy-expiry semantic that keeps correctness independent of
-  sweeper liveness, with acquisition-period attribution, contention timeouts, and the per-`(tenant, metric)`
-  active-lease cap.
+- **Purpose**: Implement the two-phase lease protocol — atomic multi-Quota acquisition, commit that unwinds the unused
+  part from the holds and writes a charge, release, and TTL auto-release — under the lazy-expiry semantic that keeps
+  correctness independent of sweeper liveness, with acquisition-period attribution, contention timeouts, and the
+  per-`(tenant, metric)` active-lease cap.
 
 - **Depends On**: `cpt-cf-quota-enforcement-feature-consumption-operations`
 
@@ -502,7 +528,7 @@ not here.
 - **Depends On**: `cpt-cf-quota-enforcement-feature-consumption-operations`
 
 - **Scope**:
-  - `apply_batch_debit` storage primitive and envelope/per-item idempotency keys
+  - `apply_batch_debit` storage primitive, the envelope idempotency key, and each item as a debit under its own key
   - `mode = atomic` semantics with per-item Decisions reported in submission order
   - Batch-level timeout superseding per-Policy timeouts; maximum batch size enforcement
   - `mode = independent` rejected with `NOT_YET_IMPLEMENTED`
@@ -556,7 +582,8 @@ not here.
 
 - **Scope**:
   - `POST /v1/quota-enforcement/snapshot` for `1..N` `(subject, metric)` filters with cursor pagination
-  - End-user restriction to the forwarded context's own user/tenant projections, returning every applicable Quota
+  - Consumer-backed self-service reads for a `{type, id}` user subject and its tenant, returning every applicable
+    Quota
   - The read-only guarantee (I3): a consumption Quota without a current period row reads as zero, and no read creates one
 
 - **Out of scope**:
@@ -753,7 +780,62 @@ not here.
 
   - [ ] `p1` - `cpt-cf-quota-enforcement-db-schema`
 
-### 2.12 Deliberate Omissions & Shared Elements
+### 2.12 Quota Resolver Plugin (HIGH)
+
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-feature-resolver-plugin`
+
+- **Feature**: [features/resolver-plugin.md](features/resolver-plugin.md)
+
+- **Purpose**: Make QE the quota resolver's backend: implement `QuotaResolverPluginClient` inside the gear, register
+  it as a quota resolver plugin instance, and run debit, lease, return, and quota state through the QE operations
+  built over trusted admission (ADR-0009).
+
+- **Depends On**: `cpt-cf-quota-enforcement-feature-lease-operations`,
+  `cpt-cf-quota-enforcement-feature-snapshot-reads`
+
+- **Scope**:
+  - Plugin registration in ClientHub and types-registry under the quota resolver plugin type
+  - Conversion of resolver requests to QE requests and of QE results and errors to resolver results
+  - Operations without a `SecurityContext`; the platform identity of the resolver's caller recorded as the
+    operation-log actor
+  - Quota state served from the snapshot read without the fields only operators see (metadata, enforcement mode,
+    validity window)
+
+- **Out of scope**:
+  - Trusted admission itself (feature `foundation`); return and the charge ledger (feature `consumption-operations`)
+  - Several metrics in one operation (a P2 quota resolver requirement)
+
+- **Requirements Covered**:
+
+  - [ ] `p1` - `cpt-cf-quota-enforcement-fr-resolver-plugin`
+
+- **Design Principles Covered**:
+
+  - None (applies the foundation admission and the operation features unchanged)
+
+- **Design Constraints Covered**:
+
+  - None (constraints are owned by the features that introduce them)
+
+- **Domain Model Entities**:
+  - None (converts quota resolver SDK types to the entities of earlier features)
+
+- **Design Components**:
+
+  - [ ] `p1` - `cpt-cf-quota-enforcement-component-resolver-plugin`
+
+- **API**:
+  - `QuotaResolverPluginClient` (quota resolver SDK), implemented in process; no QE route
+
+- **Sequences**:
+
+  - None (the plugin path runs the debit, lease, return, and snapshot flows of earlier features)
+
+- **Data**:
+
+  - None (no table of its own)
+
+### 2.13 Deliberate Omissions & Shared Elements
 
 The following defined IDs are intentionally not carried as feature coverage entries, and the listed shared references
 are intentional:
@@ -775,8 +857,8 @@ are intentional:
   feature that adds tables to the one versioned schema; `cpt-cf-quota-enforcement-component-gateway` is stood up by
   `cpt-cf-quota-enforcement-feature-foundation` and extended with ingress validation by
   `cpt-cf-quota-enforcement-feature-projection-contracts`; `cpt-cf-quota-enforcement-component-evaluation-orchestrator`
-  is established by `cpt-cf-quota-enforcement-feature-consumption-operations`, consumes the subject-resolution
-  extension that `cpt-cf-quota-enforcement-feature-projection-contracts` defines, and is extended by
+  is established by `cpt-cf-quota-enforcement-feature-consumption-operations`, consumes the subject admission
+  that `cpt-cf-quota-enforcement-feature-projection-contracts` defines, and is extended by
   `cpt-cf-quota-enforcement-feature-batch-debit` and `cpt-cf-quota-enforcement-feature-rate-quotas`;
   `cpt-cf-quota-enforcement-component-quota-enforcement-service` is shared by
   `cpt-cf-quota-enforcement-feature-consumption-operations` and `cpt-cf-quota-enforcement-feature-snapshot-reads`;
@@ -793,13 +875,15 @@ cpt-cf-quota-enforcement-feature-foundation
     ↓
     ├─→ cpt-cf-quota-enforcement-feature-projection-contracts
     │       ↓
-    │       ├─→ cpt-cf-quota-enforcement-feature-quota-lifecycle
-    │       └─→ cpt-cf-quota-enforcement-feature-resolution-policy-engine
-    │               ↓ (joined with quota-lifecycle)
+    │   cpt-cf-quota-enforcement-feature-resolution-policy-engine
+    │       ↓
+    │   cpt-cf-quota-enforcement-feature-quota-lifecycle (also needs projection-contracts)
+    │       ↓ (joined with resolution-policy-engine)
     │           cpt-cf-quota-enforcement-feature-consumption-operations
     │               ↓
     │               ├─→ cpt-cf-quota-enforcement-feature-lease-operations
-    │               │       └─→ cpt-cf-quota-enforcement-feature-bulk-quota-crud (also needs quota-lifecycle)
+    │               │       ├─→ cpt-cf-quota-enforcement-feature-bulk-quota-crud (also needs quota-lifecycle)
+    │               │       └─→ cpt-cf-quota-enforcement-feature-resolver-plugin (also needs snapshot-reads)
     │               ├─→ cpt-cf-quota-enforcement-feature-batch-debit
     │               ├─→ cpt-cf-quota-enforcement-feature-snapshot-reads (also needs quota-lifecycle)
     │               └─→ cpt-cf-quota-enforcement-feature-rate-quotas
@@ -809,15 +893,15 @@ cpt-cf-quota-enforcement-feature-foundation
 **Dependency Rationale**:
 
 - `cpt-cf-quota-enforcement-feature-projection-contracts` requires
-  `cpt-cf-quota-enforcement-feature-foundation`: projection-contracts publishes the catalogue and runs its
-  consistency checks inside the bootstrap hook foundation provides, and its ingress validation lives in the
-  Gateway that foundation registers.
-- `cpt-cf-quota-enforcement-feature-quota-lifecycle` requires the foundation storage plugin for transactional CRUD
-  and `cpt-cf-quota-enforcement-feature-projection-contracts` because Quota creation validates its owner projection,
-  scope, and admitted metric.
+  `cpt-cf-quota-enforcement-feature-foundation`: projection-contracts starts its catalogue reads inside the bootstrap
+  hook foundation provides, and its ingress validation lives in the Gateway that foundation registers.
 - `cpt-cf-quota-enforcement-feature-resolution-policy-engine` requires
-  `cpt-cf-quota-enforcement-feature-projection-contracts` because Policy validation type-checks CEL against the
-  snapshotted contract schemas.
+  `cpt-cf-quota-enforcement-feature-projection-contracts` because a Policy write needs a served catalogue entry of
+  its metric and checks a `cel` Policy against the schema of the metric type.
+- `cpt-cf-quota-enforcement-feature-quota-lifecycle` requires the foundation storage plugin for transactional CRUD,
+  `cpt-cf-quota-enforcement-feature-projection-contracts` because Quota creation checks that the metric admits the
+  Quota's subject type, and `cpt-cf-quota-enforcement-feature-resolution-policy-engine` because a Quota write gives
+  the Quota metadata to the Engine of the active Policy.
 - `cpt-cf-quota-enforcement-feature-consumption-operations` joins
   `cpt-cf-quota-enforcement-feature-quota-lifecycle` (Quotas and counters to mutate) with
   `cpt-cf-quota-enforcement-feature-resolution-policy-engine` (the Decision it applies).
@@ -831,12 +915,16 @@ cpt-cf-quota-enforcement-feature-foundation
   `cpt-cf-quota-enforcement-feature-quota-lifecycle` for the single-item CRUD it wraps and
   `cpt-cf-quota-enforcement-feature-lease-operations` because bulk deactivation atomically resolves the active leases
   of every Quota in the batch.
+- `cpt-cf-quota-enforcement-feature-resolver-plugin` requires
+  `cpt-cf-quota-enforcement-feature-lease-operations` (debit, lease, and return, with the consumption-operations
+  feature beneath it) and `cpt-cf-quota-enforcement-feature-snapshot-reads` (quota state); it runs them over the
+  foundation's trusted admission.
 - `cpt-cf-quota-enforcement-feature-notifications` requires only the foundation outbox integration; the dispatcher is fenced by the Outbox lease itself, and it is
   independent of the evaluation pipeline and can proceed in parallel with
   `cpt-cf-quota-enforcement-feature-projection-contracts` and everything downstream.
 - Parallelization: after foundation, `cpt-cf-quota-enforcement-feature-notifications` and
   `cpt-cf-quota-enforcement-feature-projection-contracts` proceed in parallel; after projection-contracts,
-  `cpt-cf-quota-enforcement-feature-quota-lifecycle` and
-  `cpt-cf-quota-enforcement-feature-resolution-policy-engine` proceed in parallel; after consumption-operations,
-  `cpt-cf-quota-enforcement-feature-lease-operations`, `cpt-cf-quota-enforcement-feature-batch-debit`, and
-  `cpt-cf-quota-enforcement-feature-snapshot-reads` proceed in parallel.
+  `cpt-cf-quota-enforcement-feature-resolution-policy-engine` and then
+  `cpt-cf-quota-enforcement-feature-quota-lifecycle` follow in that order; after consumption-operations, `cpt-cf-quota-enforcement-feature-lease-operations`,
+  `cpt-cf-quota-enforcement-feature-batch-debit`, and `cpt-cf-quota-enforcement-feature-snapshot-reads` proceed in
+  parallel; `cpt-cf-quota-enforcement-feature-resolver-plugin` follows lease-operations and snapshot-reads.

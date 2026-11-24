@@ -1,6 +1,6 @@
 <!-- Created: 2026-08-26 by Constructor Tech -->
 
-# Feature: Projection Contracts & Subject Attribution
+# Feature: Metric Types & Subject Admission
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-featstatus-projection-contracts-implemented`
 
@@ -15,20 +15,20 @@
   - [1.3 Actors](#13-actors)
   - [1.4 References](#14-references)
 - [2. Actor Flows (CDSL)](#2-actor-flows-cdsl)
-  - [Owner Projection Publication and Catalogue Activation](#owner-projection-publication-and-catalogue-activation)
+  - [Owner Metric Type Publication](#owner-metric-type-publication)
   - [Evaluation Request Ingress Validation](#evaluation-request-ingress-validation)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
-  - [Catalogue Bootstrap and Consistency Set](#catalogue-bootstrap-and-consistency-set)
-  - [PDP-Authorized Subject Mapping](#pdp-authorized-subject-mapping)
-  - [Catalogue-Membership Check for Quota and Policy Writes](#catalogue-membership-check-for-quota-and-policy-writes)
+  - [Catalogue Read and Checks](#catalogue-read-and-checks)
+  - [Subject Admission](#subject-admission)
+  - [Admission Check for Quota and Policy Writes](#admission-check-for-quota-and-policy-writes)
 - [4. States (CDSL)](#4-states-cdsl)
-  - [ProjectionContractCatalog State Machine](#projectioncontractcatalog-state-machine)
+  - [MetricCatalog State Machine](#metriccatalog-state-machine)
 - [5. Definitions of Done](#5-definitions-of-done)
-  - [Abstract Base and Scope Registration](#abstract-base-and-scope-registration)
-  - [Projection Contract Catalogue](#projection-contract-catalogue)
-  - [Gateway Ingress Contract Validation](#gateway-ingress-contract-validation)
-  - [Subject Attribution Mapping](#subject-attribution-mapping)
-  - [Catalogue-Membership Check for Writes](#catalogue-membership-check-for-writes)
+  - [Resolver-Owned Base Types](#resolver-owned-base-types)
+  - [Metric Catalogue](#metric-catalogue)
+  - [Gateway Ingress Validation](#gateway-ingress-validation)
+  - [Subject Admission at Ingress](#subject-admission-at-ingress)
+  - [Admission Check for Writes](#admission-check-for-writes)
   - [Contract-Validation Telemetry](#contract-validation-telemetry)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Additional Context (optional)](#7-additional-context-optional)
@@ -39,33 +39,51 @@
 
 ### 1.1 Overview
 
-Registers the abstract QE subject/resource/request/constraint bases and the scope-discriminator type, resolves the
-deployment's owner projections into the immutable `ProjectionContractCatalog` at bootstrap, validates every evaluation
-request's public shape at Gateway ingress, authorizes caller-supplied attribution through PDP, and then validates
-contracts and maps scope kinds to owner
-projections. This is the declarative contract surface the whole evaluation pipeline trusts.
+A **metric type** is a GTS type derived from the quota resolver's metric base `gts.cf.core.quota.metric.v1~`
+([ADR-0013](../ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md)). The module that owns a metric registers its
+type in `types-registry`. The type has three traits: `kind` (`counter` or `gauge`), `admitted_subjects` (the subject
+types the metric's quotas may count), and `enforcement` (`quota_gated` or `direct`, default `quota_gated`). Its schema
+refines the `metadata` of the metric object.
+
+A **metric object** is how a request names its metric: `metric: {type, id?, metadata}`. `type` is the metric type.
+`id` is optional and names the one thing the amount is counted for, for example a model or a virtual machine.
+`metadata` holds the attributes of the operation that policies read.
+
+This feature reads metric types into `MetricCatalog` while QE runs, validates the public shape of every evaluation
+request at Gateway ingress, admits the request through the admission mode of its path, validates the metric object
+against its metric type, and checks each named subject against the metric's admitted subject types. The whole
+evaluation pipeline trusts this validation.
+
+`MetricCatalog` is the process-local catalogue of the metric types that QE has read
+([ADR-0012](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)). A **catalogue entry** holds, for one
+metric type, the resolved schema and the traits. An entry is **served**, and QE evaluates requests for its metric, or
+**unavailable**, when the type fails a check: requests for that metric then fail with canonical `FailedPrecondition`,
+other metrics are served, and bootstrap does not fail. QE reads a metric type from `types-registry` by the id that a
+request, a Quota, or a Policy names.
 
 ### 1.2 Purpose
 
-Without enforced contracts, a Policy expression can silently miss because a request key is absent, misspelled, or of the
-wrong type, and per-caller projection taxonomies would fragment one shared counter into many. This feature turns those
-failures into save-time, bootstrap-time, or ingress-time errors: the metric owner declares the projection, the caller
-supplies logical attribution, QE checks its public shape, PDP authorizes it, and QE performs deterministic catalogue
-mapping and contract validation. It also defines the
-mapped-subject set that the consumption-operations feature consumes inside its `EvaluationOrchestrator` pipeline.
+Without an enforced metric type, a Policy expression can silently miss because a request key is absent, misspelled, or
+of the wrong type, and a quota can count a kind of subject its metric was never meant to count. This feature turns
+those failures into save-time or ingress-time errors, or into an unavailable metric: the metric owner registers one
+metric type with its admitted subject types, the caller names subjects as quota subjects, QE checks the public shape,
+the admission mode authorizes the request, and QE checks admission and validates the metric object against the local
+catalogue ([ADR-0008](../ADR/0008-cpt-cf-quota-enforcement-adr-quota-resolver-subjects.md)). It also defines the
+subject set that the consumption-operations feature consumes inside its `EvaluationOrchestrator` pipeline.
 
-**Scope**: bootstrap registration of the abstract bases and the P1 `user`/`tenant` scope well-known instances;
-bootstrap consistency checks; `ProjectionContractCatalog` build and
-publication with the authoritative metric-to-projection reverse index; catalogue-membership checks on Quota and Policy
-writes; PDP authorization and server-side `(metric, kind)` mapping; ingress validation of caller-supplied attribution,
-one operation-level `metadata` object, admitted metric, and optional resource projection;
-contract-validation telemetry counters.
+A **quota subject** is `{type, id}`: `type` is a GTS type id derived from the quota resolver's subject base
+`gts.cf.core.quota.subj.v1~`, `id` an opaque non-empty string. The quota resolver SDK owns that base, the final tenant
+subject type `gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~` (its id is the tenant id), and the metric base. QE
+owns no GTS type for subjects or metrics; the period type `gts.cf.core.qe.period_type.v1~` and the quota type
+`gts.cf.core.qe.quota_type.v1~`, with their instances, stay QE's own.
 
-**Out of scope**: Quota records themselves (quota-lifecycle feature), Engine consumption of request/resource/arbitration data
-(resolution-policy-engine feature), the evaluation pipeline that consumes the resolved subject set
-(consumption-operations feature), and breaking projection-version activation (out of P1 per PRD §4.2: writes that
-reference a non-configured projection get `PROJECTION_NOT_RESOLVABLE`, and bootstrap fails on a catalogue incompatible
-with active Quotas or Policies; no activation procedure is specified here).
+**Scope**: `MetricCatalog` reads with the checks of each metric type; admission checks on Quota and Policy writes;
+ingress validation of the subjects and of the metric object; contract-validation telemetry counters.
+
+**Out of scope**: Quota records themselves (quota-lifecycle feature), Quota metadata and its check by the Engine
+(quota-lifecycle and resolution-policy-engine features), Engine consumption of request and arbitration data
+(resolution-policy-engine feature), the evaluation pipeline that consumes the subject set (consumption-operations
+feature), and the trusted admission mode itself (foundation feature).
 
 **Requirements**: `cpt-cf-quota-enforcement-fr-projection-contracts`,
 `cpt-cf-quota-enforcement-fr-contract-validation`, `cpt-cf-quota-enforcement-fr-subject-type-registry`,
@@ -80,197 +98,232 @@ with active Quotas or Policies; no activation procedure is specified here).
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-quota-enforcement-actor-metric-owner` | Publishes concrete subject/resource projections, one request contract per metric, and its attached constraint contract in `types-registry` |
-| `cpt-cf-quota-enforcement-actor-quota-consumer` | Sends subject-based evaluation requests carrying `tenant_id`, additional `{kind,id}` subjects, and one conforming operation-level `metadata` object |
-| `cpt-cf-quota-enforcement-actor-types-registry` | Authoritative catalogue of bases, projections, scope instances, and metrics; answers bootstrap resolution requests |
-| `cpt-cf-quota-enforcement-actor-platform-operator` | Configures which owner projections the deployment resolves for evaluation |
+| `cpt-cf-quota-enforcement-actor-metric-owner` | Registers one metric type per metric in `types-registry`, with its traits and the schema of its `metadata` |
+| `cpt-cf-quota-enforcement-actor-quota-consumer` | Sends evaluation requests through QE's API carrying `tenant_id`, quota subjects, and a conforming metric object |
+| `cpt-cf-quota-enforcement-actor-quota-resolver` | Sends the same requests through the resolver plugin, admitted in trusted mode |
+| `cpt-cf-quota-enforcement-actor-types-registry` | Authoritative store of the bases, metric types, and subject types; answers QE's reads by type id |
+| `cpt-cf-quota-enforcement-actor-platform-operator` | Registers the subject types of principals; learns of an unavailable metric from telemetry |
 
 ### 1.4 References
 
-- **PRD**: [PRD.md](../PRD.md) (§5.1 projection contracts, contract validation, subject registry, subject attribution)
-- **Design**: [DESIGN.md](../DESIGN.md) (Gateway, EvaluationOrchestrator subject resolution, bootstrap seeded state,
-  contract entities)
+- **PRD**: [PRD.md](../PRD.md) (§5.1 metric types, request validation, subject registry, subject attribution)
+- **Design**: [DESIGN.md](../DESIGN.md) (Gateway, EvaluationOrchestrator subject resolution, `MetricCatalog`)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.2)
-- **ADR**: [ADR-0007 Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
-  (`cpt-cf-quota-enforcement-adr-projection-contracts`, status: accepted; this feature's contract shapes follow that
-  ADR)
-- **Dependencies**: `cpt-cf-quota-enforcement-feature-foundation` (bootstrap hook, Gateway admission, telemetry
+- **ADR**: [ADR-0013 Metric types](../ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md)
+  (`cpt-cf-quota-enforcement-adr-metric-types`; the metric type, the metric object, Quota metadata), [ADR-0012 Metric
+  catalogue, filled while running](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)
+  (`cpt-cf-quota-enforcement-adr-contract-catalogue`; catalogue reads, served and unavailable entries), [ADR-0008
+  Quota subjects are quota resolver subject
+  types](../ADR/0008-cpt-cf-quota-enforcement-adr-quota-resolver-subjects.md)
+  (`cpt-cf-quota-enforcement-adr-quota-resolver-subjects`; subjects, admission, resolver-owned types), [ADR-0007
+  Declarative GTS projection contracts](../ADR/0007-cpt-cf-quota-enforcement-adr-projection-contracts.md)
+  (`cpt-cf-quota-enforcement-adr-projection-contracts`; validation of a whole document against the resolved schema of
+  its type, evaluation against the process-local catalogue), [quota resolver ADR-0004 Metric
+  types](../../../quota-resolver/docs/ADR/0004-cpt-cf-quota-resolver-adr-metric-types.md)
+  (`cpt-cf-quota-resolver-adr-metric-types`; the metric base and its traits)
+- **Dependencies**: `cpt-cf-quota-enforcement-feature-foundation` (bootstrap hook, Gateway admission modes, telemetry
   conventions)
 
 ## 2. Actor Flows (CDSL)
 
 **Use cases**: `cpt-cf-quota-enforcement-usecase-debit` (ingress-validation prefix only; the debit body is owned by the
-consumption-operations feature), `cpt-cf-quota-enforcement-usecase-create-quota` (projection-membership validation step
-only; the Quota write itself is owned by the quota-lifecycle feature)
+consumption-operations feature), `cpt-cf-quota-enforcement-usecase-create-quota` (admission step only; the Quota write
+itself is owned by the quota-lifecycle feature)
 
-### Owner Projection Publication and Catalogue Activation
+### Owner Metric Type Publication
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-owner-projection-publication`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-owner-projection-publication`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-metric-owner`
 
 **Success Scenarios**:
-- The owner's projections are published, configured, validated at bootstrap, and served from the immutable catalogue;
-  every authorized caller debits the same shared counter through them
+- The owner's metric type is registered, read and checked by QE with no restart, and served from the catalogue; every
+  caller charges the same quotas through it
 
 **Error Scenarios**:
-- A configured projection is unregistered, abstract, or not derived from the QE base: bootstrap fails
-- Two configured projections admit the same `(metric, scope)` pair: bootstrap fails rather than picking a winner
-- The configured catalogue is incompatible with an active Quota or Policy: bootstrap fails
+- The metric type is abstract, is not derived from the metric base, has an own version of major 0, or has a wrong
+  trait: the metric is unavailable; bootstrap does not fail
+- The metric type is not registered: it has no entry, and its requests are `InvalidArgument`
 
 **Steps**:
-1. [x] - `p1` - Owner authors one concrete derived subject projection per supported scope under `gts.cf.core.qe.subj.v1~`, declaring a required `scope` trait whose value is a `GtsInstanceId` narrowed to `gts.cf.core.qe.scope.v1~*`, and declaring admitted metrics through a typed `x-gts-traits` value narrowed by `x-gts-instance-ref` (per `cpt-cf-quota-enforcement-fr-projection-contracts`) - `inst-pub-author`
-2. [x] - `p1` - Owner publishes one concrete request contract per metric under `gts.cf.core.qe.request.v1~`; its traits name the metric and attach one constraint contract derived from `gts.cf.core.qe.constraint.v1~`; the request schema is never reused for arbitration constraints - `inst-pub-attrs`
-3. [x] - `p1` - Owner optionally publishes a resource projection derived from `gts.cf.core.qe.res.v1~`; it carries identity plus schematized properties only and does not enter the P1 counter key - `inst-pub-res`
-4. [x] - `p1` - API: publication happens in `types-registry`; QE exposes no registration endpoint (`cpt-cf-quota-enforcement-constraint-types-registry-delegation`) - `inst-pub-registry`
-5. [x] - `p1` - Operator configures the deployment's evaluation catalogue to include the owner's projections - `inst-pub-config`
-6. [x] - `p1` - QE bootstrap resolves and validates the configured set (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`) and publishes the immutable `ProjectionContractCatalog` - `inst-pub-boot`
-7. [x] - `p1` - **RETURN** any authorized caller supplies logical attribution and QE maps it to the owner's projection; per-caller projections for the same metric are forbidden, so one shared counter stays intact - `inst-pub-return`
+1. [ ] - `p1` - The module that charges a kind of subject, or the operator for principals, registers a quota subject type derived from `gts.cf.core.quota.subj.v1~` - `inst-pub-author`
+2. [ ] - `p1` - Owner registers one concrete metric type per metric, derived from `gts.cf.core.quota.metric.v1~` and named under the owning module; its traits set `kind`, `enforcement`, and `admitted_subjects` (default empty: tenant quotas only; an owner that does not know the metric's kinds of subject admits the subject base `gts.cf.core.quota.subj.v1~`, which admits every subject type); its schema refines `metadata` - `inst-pub-attrs`
+3. [x] - `p1` - API: registration happens in `types-registry`; QE exposes no registration endpoint (`cpt-cf-quota-enforcement-constraint-types-registry-delegation`) - `inst-pub-registry`
+4. [ ] - `p1` - QE reads and checks the metric type by its id (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`): at start when an active Quota or Policy names it, otherwise when a request or a Quota or Policy write names it for the first time, and again on a bounded schedule; QE serves the metric from its `MetricCatalog` entry - `inst-pub-boot`
+5. [ ] - `p1` - **RETURN** any caller names quota subjects of admitted types and the metric type; a Quota is bound to a subject and a metric type, so every caller charges one shared set of quotas; another major version of the metric type is another metric with its own Quotas - `inst-pub-return`
 
 ### Evaluation Request Ingress Validation
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-ingress-validation`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-ingress-validation`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-consumer`
 
 **Success Scenarios**:
-- A conforming S2S request passes public request-shape checks, is authorized by PDP, is mapped through the
-  catalogue, and proceeds with one validated metadata object
+- A conforming request passes public shape checks, is admitted, passes the admission check of every subject, and
+  proceeds with one validated metric object
 
 **Error Scenarios**:
-- Missing required fields, wrong public container types, missing or empty ids, duplicate kinds, or repeated tenant scope:
-  canonical `InvalidArgument` before PDP
-- PDP denies a structurally valid supplied attribution tuple: canonical `PermissionDenied` before catalogue or
-  contract lookup
-- Authorized request with an unknown/unadmitted subject kind, contract-schema mismatch, or inadmissible metric: canonical
-  `InvalidArgument` with a stable field-level reason, never `Decision::Denied`
+- Missing required fields, wrong public container types, no subject, an empty id, two subjects of one type, or a
+  tenant subject whose id is not `tenant_id`: canonical `InvalidArgument` before admission
+- PDP denies a structurally valid request on QE's API: canonical `PermissionDenied` before any catalogue lookup
+- Admitted request with a subject type that is not registered or that the metric does not admit, a metric object that
+  does not fit its metric type, or a metric type that is not registered: canonical `InvalidArgument` with a stable
+  field-level reason, never `Decision::Denied`
+- Admitted request with a subject type whose registry lookup fails: canonical `ServiceUnavailable`
+- Admitted request for a metric whose catalogue entry is unavailable: canonical `FailedPrecondition`; nothing changes
+  and no Decision is produced
+- Admitted request for a metric the catalogue does not hold, when the registry read of the metric type fails or
+  reaches its time limit: canonical `ServiceUnavailable`
 
 **Steps**:
-1. [x] - `p1` - Caller sends a subject-based evaluation operation carrying `tenant_id`, additional `subjects: [{kind,id}]`, one operation-level `metadata`, and optional `resource`; platform admission has authenticated the service principal and deserialized the DTO - `inst-ing-request`
-2. [x] - `p1` - Validate public request shape: require all required top-level fields and their declared container types, require non-empty `tenant_id` and subject ids, reject duplicate kinds, and reject tenant scope repeated in `subjects`; return canonical `InvalidArgument` before PDP on failure - `inst-ing-shape`
-3. [x] - `p1` - Send the complete untrusted tenant/subject/metric/resource tuple to PDP and attach the returned `AccessScope`; fail closed on denial or PDP unavailability - `inst-ing-authz`
-4. [x] - `p1` - Map each authorized `(metric, kind)` through the process-local `ProjectionContractCatalog`; no registry call occurs on this path - `inst-ing-lookup`
-5. [x] - `p1` - Validate operation-level `metadata` against the metric request contract by wrapping the wire object into the contract envelope `{type, metadata}` and validating the whole document (never the inner subschema alone); when an optional resource is present, validate its already-complete `{type, id?, metadata}` projection directly; absent operation `metadata` was rejected before PDP and is never defaulted to `{}` - `inst-ing-metadata`
-6. [x] - `p1` - **IF** any kind is unknown or does not admit the request metric - `inst-ing-metric-if`
-   1. [x] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` by closed validation surface - `inst-ing-metric`
-7. [x] - `p1` - Materialize tenant scope from `tenant_id`, combine it with the mapped additional subjects, and exclude attribution and authenticated principal data from Policy input `{request, resource, arbitration}` - `inst-ing-map`
-8. [x] - `p1` - **RETURN** the validated, authorized, catalogue-mapped request to the evaluation pipeline; this validation runs at ingress of every debit, reserve, preview, and each batch item, and its failures are canonical errors, never `Decision::Denied` (`cpt-cf-quota-enforcement-fr-contract-validation`) - `inst-ing-forward`
+1. [ ] - `p1` - Caller sends an evaluation operation carrying `tenant_id`, `subjects: [{type, id}]` (at least one), and `metric: {type, id?, metadata}`; platform authentication has attached the caller's `SecurityContext` and the DTO is deserialized - `inst-ing-request`
+2. [ ] - `p1` - Validate public request shape: required fields and container types, non-empty `tenant_id` and subject ids, at least one subject, no two subjects of one type, a subject of the tenant type only with `id == tenant_id`, and a metric object with `type` and `metadata`; return canonical `InvalidArgument` before admission on failure - `inst-ing-shape`
+3. [ ] - `p1` - Admit the request in the mode of its path (`cpt-cf-quota-enforcement-flow-authorized-admission`): on QE's API, send the complete attribution (the tenant, the subjects, and the metric with its type and optional id) to PDP and fail closed on denial or PDP unavailability; on the resolver plugin path, trusted mode calls no PDP and scopes storage to `tenant_id` - `inst-ing-authz`
+4. [ ] - `p1` - Look up the entry of `metric.type` in the process-local `MetricCatalog`; a metric the catalogue holds needs no registry call; for a metric it does not hold, read the metric type by its id once, with a time limit, and build its entry (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`) - `inst-ing-lookup`
+5. [ ] - `p1` - **IF** the entry is unavailable - `inst-ing-unavail-if`
+   1. [ ] - `p1` - **RETURN** canonical `FailedPrecondition`; nothing changes and no Decision is produced - `inst-ing-unavail`
+6. [ ] - `p1` - **IF** the read of a metric type the catalogue does not hold fails or reaches its time limit - `inst-ing-registry-if`
+   1. [ ] - `p1` - **RETURN** canonical `ServiceUnavailable`; the caller may repeat the request - `inst-ing-registry`
+7. [ ] - `p1` - **IF** the metric type is not registered (an answer the catalogue remembers for a short time), or a subject type is not admitted (`cpt-cf-quota-enforcement-algo-subject-resolution`) - `inst-ing-metric-if`
+   1. [ ] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` by closed validation surface - `inst-ing-metric`
+8. [ ] - `p1` - Validate the whole metric object `{type, id?, metadata}` against the resolved schema of its metric type (never the `metadata` subschema alone); absent `metadata` was rejected before admission and is never defaulted to `{}`; a metric object that does not fit is canonical `InvalidArgument` - `inst-ing-metadata`
+9. [ ] - `p1` - Add the implicit tenant subject from `tenant_id` unless the request names it, and exclude the caller's identity from Policy input `{request, arbitration}`, where `request` is the `metadata` of the metric object and `arbitration` is the metadata of a Quota - `inst-ing-map`
+10. [x] - `p1` - **RETURN** the validated, admitted request to the evaluation pipeline; this validation runs at ingress of every debit, lease acquisition, preview, and each batch item, and its failures are canonical errors, never `Decision::Denied` (`cpt-cf-quota-enforcement-fr-contract-validation`) - `inst-ing-forward`
 
 ## 3. Processes / Business Logic (CDSL)
 
-### Catalogue Bootstrap and Consistency Set
+### Catalogue Read and Checks
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-bootstrap`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-bootstrap`
 
-**Input**: deployment configuration naming the projections configured for evaluation, `TypesRegistryClient`
+**Input**: the `types-registry` client, the current `MetricCatalog`, and, at start only, the metric types that the stored active Quotas and Policies name
 
-**Output**: the published immutable `ProjectionContractCatalog`, or failed gear bootstrap
+**Output**: `MetricCatalog` with a served or unavailable entry for each metric type that QE has read
 
 **Steps**:
-1. [x] - `p1` - API: register missing QE-owned definitions idempotently through `TypesRegistryClient`: the abstract bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`, `gts.cf.core.qe.request.v1~`, `gts.cf.core.qe.constraint.v1~`, the scope-discriminator type `gts.cf.core.qe.scope.v1~`, and its P1 well-known instances `gts.cf.core.qe.scope.v1~cf.core.qe.user.v1` and `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1`; registration touches only QE-owned definitions, and QE seeds no platform-wide subject instances - `inst-cat-bases`
-2. [x] - `p1` - API: resolve every configured subject/resource projection and metric request contract from `types-registry` into a candidate catalogue; `types-registry` remains authoritative and the catalogue is only a validated local snapshot - `inst-cat-resolve`
-3. [x] - `p1` - Verify each configured projection/request contract is concrete and genuinely derived from its QE base - `inst-cat-concrete`
-4. [x] - `p1` - Verify every admitted metric reference resolves to a registered instance of the metric base; a narrowed `x-gts-instance-ref` is a pattern-level prefix match only, so QE owns both checks - `inst-cat-metric`
-5. [x] - `p1` - Read each projection's registry-validated effective `scope` trait, compare the `GtsInstanceId` values directly, and reject any `(metric, scope)` pair admitted by two configured projections; scope is never inferred from the type-id name segment - `inst-cat-unique`
-6. [x] - `p1` - Resolve exactly one request contract per admitted metric and verify its attached constraint contract is registered, concrete, and derived from the constraint base - `inst-cat-contract-pair`
-7. [x] - `p1` - **IF** the configured catalogue is incompatible with any active Quota, read as the distinct `(metric, projection_type)` pairs the storage contract reports (`read_active_projection_bindings`) - `inst-cat-compat-if`
-   1. [x] - `p1` - Fail gear bootstrap; increment `contract_validation_failures_total` with the `bootstrap` surface where emission completes before process exit; the current projection version stays active and no activation procedure exists in P1 - `inst-cat-compat`
-8. [x] - `p1` - **IF** any consistency check fails - `inst-cat-fail-if`
-   1. [x] - `p1` - Fail gear bootstrap and serve nothing; increment `contract_validation_failures_total` with the `bootstrap` surface where emission completes before process exit; this step extends `cpt-cf-quota-enforcement-flow-gear-bootstrap` from the foundation feature - `inst-cat-fail`
-9. [x] - `p1` - Build the authoritative reverse index from each `(metric, scope)` to its configured subject projection set out of the admitted-metric declarations - `inst-cat-index`
-10. [x] - `p1` - **RETURN** publish the immutable catalogue to the Gateway only after all checks pass; it is immutable for the process lifetime, with no runtime refresh or breaking-version activation in P1; registered projections outside the configured catalogue remain discoverable but are rejected by Quota and Policy writes - `inst-cat-publish`
+1. [ ] - `p1` - API: at start, read by id from `types-registry` the metric types that the active Quotas and the active Policies name; `types-registry` remains authoritative and the catalogue is only a checked local copy; no catalogue read changes readiness: a type whose read at start fails or reaches its time limit gets no entry and is read when a request or a write names it - `inst-cat-start`
+2. [ ] - `p1` - API: when a request or a Quota or Policy write names a metric type the catalogue does not hold, check the form of the id first (an id that does not start with `gts.cf.core.quota.metric.v1~` is canonical `InvalidArgument` with no registry call), then read that type by its id, once and with a time limit, through `PlatformTypesRegistryApi`, asking the registry itself and not the client's cached copy; a type with the deleted status is treated as deleted; the memory of unknown ids has a size limit and drops the entry that was used least recently, and the catalogue has none, because it holds only registered types - `inst-cat-resolve`
+3. [ ] - `p1` - **IF** the registry does not know the type - `inst-cat-unknown-if`
+   1. [ ] - `p1` - **RETURN** canonical `InvalidArgument` and remember the answer for a short time, so repeated requests for an unknown metric do not call the registry each time; no entry is built - `inst-cat-unknown`
+4. [ ] - `p1` - **IF** the read fails or reaches its time limit - `inst-cat-read-failed-if`
+   1. [ ] - `p1` - **RETURN** canonical `ServiceUnavailable`; no entry is built and nothing is remembered - `inst-cat-read-failed`
+5. [ ] - `p1` - Check the type: it is concrete; it is derived from `gts.cf.core.quota.metric.v1~`; its own version is major 1 or higher, because `types-registry` admits any change of a type of major 0 (ADR-0012); its traits are valid against the traits schema of the metric base; each `admitted_subjects` entry is `gts.cf.core.quota.subj.v1~` or a type id derived from it (whether a subject type is registered is checked when a request names it, `inst-res-registered`) - `inst-cat-concrete`
+6. [ ] - `p1` - Make no check against stored Quotas or Policies: a type that stops admitting the subject type of a stored Quota, or that an active Policy does not fit, stays served; the first is found when a request names the subject type, the second at evaluation (ADR-0012) - `inst-cat-compat`
+7. [ ] - `p1` - **IF** the checks of step 5 pass - `inst-cat-served-if`
+   1. [ ] - `p1` - Build a served entry with the resolved schema and the traits `kind`, `admitted_subjects`, and `enforcement` - `inst-cat-index`
+8. [ ] - `p1` - **ELSE** - `inst-cat-unavail-if`
+   1. [ ] - `p1` - Build an unavailable entry; write a log entry with the metric and the reason and increment `contract_validation_failures_total` with the `bootstrap` surface, which covers every catalogue read, and the reason; bootstrap does not fail and readiness does not change - `inst-cat-unavail`
+9. [ ] - `p1` - An entry is built from the current registry content only, never from stored state and never from the entry it replaces, so a running and a restarted replica build the same entry - `inst-cat-source`
+10. [ ] - `p1` - On a bounded schedule, read each metric type the catalogue holds and each subject type in the cache of registered subject types with a conditional registry read, which returns a document only when it changed since QE read it; build again, through steps 5 to 9, each entry whose type changed; remove the entry of a deleted metric type; drop a deleted subject type from the cache; the scheduled read reads nothing from storage; a scheduled read that fails or reaches its time limit changes no entry (a served entry stays served) and increments `catalog_read_failures_total` with the phase `scheduled`; a read that succeeds sets `catalog_last_scheduled_read_timestamp_seconds`; a failed read at start and a failed read on first use increment the same counter with the phases `start` and `first_use`; `catalog_unavailable_metrics` reports the number of unavailable entries the replica holds - `inst-cat-refresh`
+11. [ ] - `p1` - **RETURN** the catalogue; a wrong metric type never fails gear bootstrap, which fails only on QE's own state and configuration (`cpt-cf-quota-enforcement-flow-gear-bootstrap`, foundation feature) - `inst-cat-publish`
 
-### PDP-Authorized Subject Mapping
+### Subject Admission
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-subject-resolution`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-subject-resolution`
 
-**Input**: authenticated service principal, caller-supplied `tenant_id`, additional `subjects[{kind,id}]`, metric,
-optional resource, and the published `ProjectionContractCatalog`
+**Input**: the shape-checked and admitted request (`tenant_id`, `subjects[{type, id}]`, metric) and the served
+`MetricCatalog` entry of the metric
 
-**Output**: the complete set of `(projection_type, subject_id)` pairs for the request, or a canonical error before
+**Output**: the complete set of `(subject_type, subject_id)` pairs for the request, or a canonical error before
 evaluation
 
 **Steps**:
-1. [x] - `p1` - Reject an unauthenticated service principal, empty `tenant_id`, empty subject id, duplicate kind, or a tenant kind repeated in `subjects` - `inst-res-shape`
-2. [x] - `p1` - Send the complete supplied tenant/subject/metric/resource tuple to PDP and fail closed unless it is authorized for the authenticated service principal - `inst-res-authz`
-3. [x] - `p1` - Materialize the tenant-scope subject from `tenant_id` - `inst-res-tenant`
-4. [x] - `p1` - **FOR EACH** materialized or additional subject - `inst-res-each`
-   1. [x] - `p1` - Resolve `(metric, kind)` through the catalogue's unique reverse index - `inst-res-map`
-   2. [x] - `p1` - **IF** the kind is unknown or does not admit the metric - `inst-res-invalid-if`
+1. [ ] - `p1` - Reject an empty subject list, an empty subject id, two subjects of one type, or a tenant subject whose id is not `tenant_id` - `inst-res-shape`
+2. [ ] - `p1` - Require admission of the request in the mode of its path before any catalogue lookup (`cpt-cf-quota-enforcement-flow-authorized-admission`) - `inst-res-authz`
+3. [ ] - `p1` - Add the tenant subject `(gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~, tenant_id)` unless the request names it; it is the same subject either way - `inst-res-tenant`
+4. [ ] - `p1` - **FOR EACH** subject - `inst-res-each`
+   1. [ ] - `p1` - Check the form of the subject type id first: an id that does not start with `gts.cf.core.quota.subj.v1~` is canonical `InvalidArgument` with no registry call. Then check the subject type against the `admitted_subjects` trait of the metric type: the tenant type is always admitted, and a type is admitted when it equals an admitted type or derives from one (the admitted type id is a prefix of its chained GTS type id) - `inst-res-map`
+   2. [ ] - `p1` - For a type that step 4.1 admits, check that the type is registered and that the subject fits its schema, through the process-local cache of registered subject types: a type the cache does not hold is looked up in `types-registry` once, a registered type stays cached until a scheduled catalogue read finds it deleted (`inst-cat-refresh`), an unknown type is cached for a short time and is `InvalidArgument`, and a failed lookup is `ServiceUnavailable` - `inst-res-registered`
+   3. [ ] - `p1` - **IF** the type is not admitted - `inst-res-invalid-if`
       1. [x] - `p1` - **RETURN** canonical `InvalidArgument` before evaluation - `inst-res-invalid`
-   3. [x] - `p1` - Append `(projection_type, id)`; the caller cannot select the concrete projection - `inst-res-append`
-5. [x] - `p1` - **RETURN** the complete mapped set for applicable-Quota lookup - `inst-res-return`
+   4. [ ] - `p1` - Append `(subject_type, id)` - `inst-res-append`
+5. [x] - `p1` - **RETURN** the complete subject set for applicable-Quota lookup - `inst-res-return`
 
-### Catalogue-Membership Check for Quota and Policy Writes
+### Admission Check for Quota and Policy Writes
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-membership`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-membership`
 
-**Input**: a projection reference carried by a Quota or Policy write, the published `ProjectionContractCatalog`, and
-for Quota writes the Quota's metric
+**Input**: the subject type and metric type of a Quota write, or the metric type that a Policy write names in its
+scope, and `MetricCatalog`
 
 **Output**: pass, or a canonical rejection before persistence
 
 **Steps**:
-1. [x] - `p1` - Resolve the referenced projection against the published catalogue and the registry snapshot taken by the write path; the evaluation hot path never runs this check - `inst-mem-lookup`
-2. [x] - `p1` - **IF** the reference is unregistered, abstract, non-subject, of unknown scope, or not derived from the QE base - `inst-mem-invalid-if`
-   1. [x] - `p1` - **RETURN** canonical rejection per `cpt-cf-quota-enforcement-fr-subject-type-registry`; increment `contract_validation_failures_total` with the closed write surface (`arbitration` or `policy_pair`) - `inst-mem-invalid`
-3. [x] - `p1` - **IF** the reference is registered but outside the configured catalogue, including a registered replacement version - `inst-mem-nonconf-if`
-   1. [x] - `p1` - **RETURN** rejection with `PROJECTION_NOT_RESOLVABLE`; increment `contract_validation_failures_total` with the closed write surface; P1 provides no projection alias or Quota/counter migration operation - `inst-mem-nonconf`
-4. [x] - `p1` - **IF** a Quota write names a metric the referenced projection does not admit - `inst-mem-metric-if`
-   1. [x] - `p1` - **RETURN** canonical rejection; increment `admitted_metric_violations_total` with the closed write surface - `inst-mem-metric`
+1. [ ] - `p1` - Look up the metric's entry in `MetricCatalog`; for a metric the catalogue does not hold the write reads the metric type as a request does (`inst-ing-lookup`), with the same errors: a type that is not registered is canonical `InvalidArgument`, and a read that fails or reaches its time limit is `ServiceUnavailable`; the evaluation hot path never runs this check - `inst-mem-lookup`
+2. [ ] - `p1` - **IF** the metric's entry is unavailable; a Quota deactivation, a Policy rollback, and a Policy delete do not run this check - `inst-mem-entry-if`
+   1. [ ] - `p1` - **RETURN** rejection with `PROJECTION_NOT_RESOLVABLE`; increment `contract_validation_failures_total` with the closed write surface - `inst-mem-entry`
+3. [ ] - `p1` - **IF** the subject type of a Quota write is unregistered or not derived from `gts.cf.core.quota.subj.v1~` - `inst-mem-invalid-if`
+   1. [ ] - `p1` - **RETURN** canonical rejection per `cpt-cf-quota-enforcement-fr-subject-type-registry`; increment `contract_validation_failures_total` with the closed write surface - `inst-mem-invalid`
+4. [ ] - `p1` - **IF** a Quota write names a subject type that the `admitted_subjects` trait of its metric type does not admit - `inst-mem-metric-if`
+   1. [ ] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` with the closed write surface - `inst-mem-metric`
 5. [x] - `p1` - **RETURN** pass; the quota-lifecycle and resolution-policy-engine features invoke this check inside their write paths, which own the writes themselves - `inst-mem-pass`
 
 ## 4. States (CDSL)
 
-### ProjectionContractCatalog State Machine
+### MetricCatalog State Machine
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-state-projection-catalog`
 
-**States**: Candidate, Published, Rejected
+The states are those of one metric type's entry. A metric type that QE has not read, or that is not registered, has no
+entry.
 
-**Initial State**: Candidate
+**States**: Absent, Served, Unavailable
+
+**Initial State**: Absent
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Candidate **TO** Published **WHEN** the full bootstrap consistency set of `cpt-cf-quota-enforcement-algo-catalog-bootstrap` passes and the catalogue is compatible with every active Quota and Policy - `inst-catst-publish`
-2. [ ] - `p1` - **FROM** Candidate **TO** Rejected **WHEN** any consistency check of `cpt-cf-quota-enforcement-algo-catalog-bootstrap` fails or the catalogue is incompatible with an active Quota or Policy; gear bootstrap fails and serves nothing (`cpt-cf-quota-enforcement-fr-contract-validation`) - `inst-catst-reject`
+1. [ ] - `p1` - **FROM** Absent **TO** Served **WHEN** QE reads the metric type and every check of `cpt-cf-quota-enforcement-algo-catalog-bootstrap` passes - `inst-catst-publish`
+2. [ ] - `p1` - **FROM** Absent **TO** Unavailable **WHEN** QE reads the metric type and a check of `cpt-cf-quota-enforcement-algo-catalog-bootstrap` fails; gear bootstrap does not fail (`cpt-cf-quota-enforcement-fr-contract-validation`) - `inst-catst-reject`
+3. [ ] - `p1` - **FROM** Unavailable **TO** Served **WHEN** a scheduled catalogue read finds that the metric type changed, builds the entry again, and every check passes - `inst-catst-recover`
+4. [ ] - `p1` - **FROM** Served **TO** Served or Unavailable **WHEN** a scheduled catalogue read finds that the metric type changed in `types-registry` and builds the entry again: Served when every check passes, Unavailable when one fails - `inst-catst-revised`
+5. [ ] - `p1` - **FROM** Served or Unavailable **TO** Absent **WHEN** a scheduled catalogue read finds that the metric type was deleted - `inst-catst-deleted`
 
-Published is terminal for the process lifetime: the catalogue is immutable, P1 has no runtime refresh, and changing the
-configured projection set means a new bootstrap of a new process. Individual contracts have no QE-side lifecycle;
-`types-registry` owns their versions.
+An entry has no other transition. `types-registry` lets an owner replace the content of a registered type under the
+same id, or delete the type (ADR-0012). Transitions 4 and 5 bring such a change to every replica within one read
+interval. Another major version of a metric type has another type id, so it is another metric with its own entry and
+its own Quotas. A metric type has no QE-side lifecycle; `types-registry` owns its versions.
 
 ## 5. Definitions of Done
 
-### Abstract Base and Scope Registration
+### Resolver-Owned Base Types
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-base-registration`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-base-registration`
 
-The system **MUST** register the abstract bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`,
-`gts.cf.core.qe.request.v1~`, and `gts.cf.core.qe.constraint.v1~`, the scope-discriminator type
-`gts.cf.core.qe.scope.v1~`, and its P1
-well-known instances `user` and `tenant` idempotently through `TypesRegistryClient` at bootstrap, touching only
-QE-owned definitions, seeding no platform-wide subject instances, and exposing no QE registration endpoint.
+The system **MUST NOT** define or register a GTS type for subjects or metrics, at bootstrap or later, and **MUST NOT**
+expose a registration endpoint. The period type `gts.cf.core.qe.period_type.v1~` and the quota type
+`gts.cf.core.qe.quota_type.v1~`, with their instances, stay QE's own. The metric base `gts.cf.core.quota.metric.v1~`
+with its traits `kind`, `admitted_subjects`, and `enforcement`, the subject base `gts.cf.core.quota.subj.v1~`, and the
+tenant subject type belong to the quota resolver SDK. The quota resolver gear publishes them through the ToolKit GTS publication of its gear attribute, and the
+runtime waits for their admission before any application `init` runs; QE registers none of them and needs no start
+order with the quota resolver. The module that owns a metric registers its metric type.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-owner-projection-publication`
-- `cpt-cf-quota-enforcement-algo-catalog-bootstrap`
 
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (platform `types-registry-sdk`, obtained from ClientHub)
-- Entities: `SubjectScope`
+- API: `PlatformTypesRegistryApi` (platform `types-registry-sdk`, obtained from ClientHub; reads of metric and subject
+  types only)
+- Entities: `MetricCatalog`
 
-### Projection Contract Catalogue
+### Metric Catalogue
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-projection-catalog`
 
-The system **MUST** build the immutable process-local `ProjectionContractCatalog` at bootstrap, enforce the complete
-consistency set (concreteness and base derivation, admitted-metric registration and derivation, `(metric, scope)`
-uniqueness via the effective `scope` trait, exactly one request contract per metric and its attached constraint
-contract, compatibility with active Quotas and Policies), build the authoritative `(metric, scope)` and metric-request
-indexes, fail gear bootstrap on
-any mismatch, and publish the catalogue to the Gateway only after all checks pass. Contracts are registry-resident;
-no QE-side table exists.
+The system **MUST** keep the process-local `MetricCatalog` with one entry per metric type that QE has read. It
+**MUST** read a metric type from `types-registry` by its id: at start for the metric types of the active Quotas and
+Policies, and once, with a time limit, when a request or a Quota or Policy write names a metric type the catalogue
+does not hold. A type that is not registered **MUST** be `InvalidArgument`, remembered for a short time; a read that
+fails or reaches its time limit **MUST** be `ServiceUnavailable`. The system **MUST** check each type it reads
+(concrete, derived from the metric base, an own version of major 1 or higher, valid traits, admitted subject types
+derived from the subject base), serve an entry that passes, and make an entry that
+fails unavailable without failing bootstrap or changing readiness. A scheduled read **MUST** ask the registry, with a
+conditional read, whether each held metric type and each cached subject type changed; it **MUST** build again each
+changed entry, remove the entry of a deleted metric type, and drop a deleted subject type,
+so that a running replica holds the same entry as a restarted one within one read interval. An entry **MUST** be built
+from the registry content only; a read **MUST NOT** check stored Quotas or Policies. Metric types are
+registry-resident; no QE-side table exists.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-catalog-bootstrap`
@@ -279,21 +332,24 @@ no QE-side table exists.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (bootstrap only; never on the request path)
-- Entities: `ProjectionContractCatalog`, `SubjectProjectionContract`, `ResourceProjectionContract`,
-  `MetricRequestContract`, `ConstraintContract`
+- API: `PlatformTypesRegistryApi` (catalogue reads; never for a request whose metric the catalogue holds)
+- Entities: `MetricCatalog`
 
-### Gateway Ingress Contract Validation
+### Gateway Ingress Validation
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-ingress-validation`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-ingress-validation`
 
-The system **MUST** extend the foundation Gateway with fail-closed validation of debit, reserve, preview, and each batch
-item: explicit `tenant_id`, additional `{kind,id}` subjects, one operation-level `metadata` object
-never defaulted to `{}`, admitted metric, and optional resource projection. It **MUST** reject malformed public request
-shape before PDP, authorize the complete supplied tuple through PDP, and only then map each `(metric, kind)`
-and validate request/resource contracts through the process-local catalogue. Failures **MUST** map
-to the appropriate canonical error and **MUST NOT** be encoded as `Decision::Denied`. Consumer DTOs contain no
-`caller_type` or concrete subject projection type.
+The system **MUST** extend the foundation Gateway with fail-closed validation of debit, lease acquisition, preview,
+and each batch item: explicit `tenant_id`, at least one `{type, id}` subject, and a metric object
+`{type, id?, metadata}` whose `metadata` is never defaulted to `{}`. It **MUST** reject malformed public request shape
+before admission, admit the request in the mode of its path, and only then check subject admission and validate the
+whole metric object against the resolved schema of its metric type through the process-local catalogue. A request for
+a metric whose entry is unavailable **MUST** receive canonical `FailedPrecondition` and change nothing; credit, lease
+commit, lease release, return, and rollback do not pass this validation and **MUST** run while the entry is
+unavailable. A request for a metric the catalogue does not hold **MUST** receive `InvalidArgument` when the metric
+type is not registered, and `ServiceUnavailable` when the registry read fails or reaches its time limit. Failures
+**MUST** map to the appropriate canonical error and **MUST NOT** be encoded as `Decision::Denied`. Consumer DTOs
+contain no `caller_type`, a field that names the kind of the caller.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-ingress-validation`
@@ -301,18 +357,18 @@ to the appropriate canonical error and **MUST NOT** be encoded as `Decision::Den
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: evaluation request contract fields on debit, reserve, preview, and batch-item DTOs (no new endpoint)
-- Entities: `ProjectionContractCatalog`
+- API: the subject and metric fields on debit, lease acquisition, preview, and batch-item DTOs (no new endpoint)
+- Entities: `MetricCatalog`
 
-### Subject Attribution Mapping
+### Subject Admission at Ingress
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-subject-resolution`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-subject-resolution`
 
-The system **MUST** shape-check caller-supplied `tenant_id` and additional `{kind,id}` subjects, PDP-authorize the
-complete tenant/subject/metric/resource tuple, materialize tenant scope from `tenant_id`, and then map every
-`(metric, kind)` through the catalogue's unique index. It rejects duplicate, unknown, or unadmitted kinds and returns the complete
-`(projection_type, subject_id)` set consumed by `EvaluationOrchestrator`. The caller cannot select a concrete
-projection; no resolver trait exists.
+The system **MUST** shape-check `tenant_id` and the `{type, id}` subjects, require admission of the request, add the
+implicit tenant subject, and check every subject type against the `admitted_subjects` trait of the metric type (exact
+or derived type; the tenant type always admitted). The admission check makes no registry call; whether a type is
+registered comes from the process-local cache of registered subject types, which calls the registry once for a type it
+does not hold. It returns the complete `(subject_type, subject_id)` set consumed by `EvaluationOrchestrator`.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-subject-resolution`
@@ -320,19 +376,21 @@ projection; no resolver trait exists.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: consumer attribution fields on every subject-based evaluation DTO
-- Entities: `SecurityContext` authenticated service principal, `ProjectionContractCatalog`
+- API: subject fields on every evaluation and snapshot DTO
+- Entities: `MetricCatalog`
 
-### Catalogue-Membership Check for Writes
+### Admission Check for Writes
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-catalog-membership`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-catalog-membership`
 
-The system **MUST** validate every projection reference carried by a Quota or Policy write against the published
-catalogue and the registry snapshot taken by the write path, before persistence: a reference that is unregistered,
-abstract, non-subject, of unknown scope, or not derived from the QE base **MUST** receive a canonical rejection per
-`cpt-cf-quota-enforcement-fr-subject-type-registry`; a reference that is registered but outside the configured
-catalogue **MUST** receive `PROJECTION_NOT_RESOLVABLE`; a Quota write naming a metric the referenced projection does
-not admit **MUST** be rejected. The evaluation hot path **MUST NOT** run this check.
+The system **MUST** check every Quota or Policy write against the metric's `MetricCatalog` entry before persistence.
+A write for a metric the catalogue does not hold **MUST** read the metric type as a request does, with the same
+errors. A Quota create or change and a Policy create or change for a metric whose entry is unavailable **MUST**
+receive `PROJECTION_NOT_RESOLVABLE`. A Quota deactivation, a Policy rollback, and a Policy delete **MUST NOT** run
+this check. A subject
+type that is unregistered or not derived from the subject base **MUST** receive a canonical rejection per
+`cpt-cf-quota-enforcement-fr-subject-type-registry`; a Quota whose subject type its metric does not admit **MUST** be
+rejected with `InvalidArgument`. The evaluation hot path **MUST NOT** run this check.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-catalog-membership`
@@ -341,19 +399,20 @@ not admit **MUST** be rejected. The evaluation hot path **MUST NOT** run this ch
 
 **Touches**:
 - API: no new endpoint (the quota-lifecycle and resolution-policy-engine write paths invoke this check)
-- Entities: `ProjectionContractCatalog`
+- Entities: `MetricCatalog`
 
 ### Contract-Validation Telemetry
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-contract-validation-telemetry`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-contract-validation-telemetry`
 
-The system **MUST** emit `contract_validation_failures_total` (rejected contract instances by closed validation
-surface/reason) and `admitted_metric_violations_total` (projection/metric incompatibilities by closed validation
-surface) through the foundation telemetry conventions. The ingress surface increments in
-`cpt-cf-quota-enforcement-flow-ingress-validation`; the Quota/Policy write and bootstrap surfaces increment in the
-rejection and failure steps of `cpt-cf-quota-enforcement-algo-catalog-membership` and
-`cpt-cf-quota-enforcement-algo-catalog-bootstrap`. Metric names, projection types, and caller attribution **MUST
-NOT** appear as label values; permitted dimensions are the closed `surface` and `reason` enums from PRD §5.16.
+The system **MUST** emit `contract_validation_failures_total` (rejected metric objects, rejected writes, and
+unavailable metric types, by closed validation surface/reason) and `admitted_metric_violations_total` (subject types a
+metric does not admit, by closed validation surface) through the foundation telemetry conventions. The ingress surface
+increments in `cpt-cf-quota-enforcement-flow-ingress-validation`; the Quota/Policy write and catalogue-read surfaces
+increment in the rejection steps of `cpt-cf-quota-enforcement-algo-catalog-membership` and in the unavailable-entry
+step of `cpt-cf-quota-enforcement-algo-catalog-bootstrap`. Each unavailable metric **MUST** be counted there with its
+reason and named with that reason in a log entry. Metric names, subject types, and caller attribution **MUST NOT**
+appear as label values; permitted dimensions are the closed `surface` and `reason` enums from PRD §5.16.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-ingress-validation`
@@ -368,58 +427,62 @@ NOT** appear as label values; permitted dimensions are the closed `surface` and 
 
 ## 6. Acceptance Criteria
 
-- [ ] Repeated bootstraps register the abstract bases, the scope-discriminator type, and its `user`/`tenant` instances
-  exactly once; registration is idempotent and touches only QE-owned definitions
-- [ ] Bootstrap fails, and the gear serves nothing, when a configured projection is unregistered, abstract, or not
-  derived from the QE base; when an admitted metric reference is unregistered or is not an instance of the metric base;
-  when two configured projections admit the same `(metric, scope)` pair; or when an admitted metric lacks exactly one
-  concrete request contract with a valid attached constraint contract
-- [ ] Bootstrap fails when the configured catalogue is incompatible with any active Quota or Policy; no activation of a
-  breaking projection version occurs in P1
-- [ ] Two distinct scopes of one owner admitting the same metric pass bootstrap (scope cascade stays expressible)
-- [ ] A write or preview request with a duplicate, unknown, or unadmitted subject kind, omitted `metadata`, contract
-  violation, or inadmissible metric receives canonical `InvalidArgument` with a stable field-level reason,
-  never `Decision::Denied`, and increments `contract_validation_failures_total` or
-  `admitted_metric_violations_total` accordingly; absent `metadata` is never defaulted to `{}`
-- [ ] With `types-registry` unreachable, ingress validation still succeeds against the process-local catalogue: no
-  evaluation write or preview request path performs a registry call (verified by fault injection on the registry
-  dependency); Quota and Policy write paths, which snapshot contracts from the registry, are outside this claim
-- [ ] Consumer DTOs contain no `caller_type`; the authenticated service principal comes from `SecurityContext`, while
-  CEL input is limited to `{request, resource, arbitration}`
-- [ ] With caller-supplied `tenant_id=T`, subject `{kind=user,id=U}`, and both owner scopes configured, mapping yields
-  exactly `{(owner-tenant-projection, T), (owner-user-projection, U)}` without a caller-selected projection
-- [ ] The complete supplied attribution tuple is sent to PDP; changing `tenant_id`, subjects, metric, or resource to an
-  unauthorized target produces `PermissionDenied` before evaluation and no storage mutation
-- [ ] Error precedence is stable: malformed public request shape returns `InvalidArgument` before PDP; a
-  structurally valid unauthorized tuple returns `PermissionDenied` before catalogue or contract lookup; an authorized
-  tuple with an unknown/unadmitted kind or invalid contract payload returns `InvalidArgument`
-- [ ] The catalogue-membership check rejects a Quota or Policy reference to a registered but non-configured projection
-  with `PROJECTION_NOT_RESOLVABLE`, and rejects a Quota reference whose projection does not admit the Quota's metric
-- [ ] Metrics scrape shows no metric name, projection type, or caller attribution as a label value on
+- [ ] QE registers no GTS type for subjects or metrics: after bootstrap, `types-registry` holds no subject type,
+  metric base, or metric type that QE wrote
+- [ ] Bootstrap succeeds, and readiness does not change, when a metric type of an active Quota is wrong; bootstrap
+  fails only on QE's own state and configuration
+- [ ] A metric is unavailable, while other metrics are served and bootstrap succeeds, when its metric type is
+  abstract, is not derived from `gts.cf.core.quota.metric.v1~`, has a wrong trait (for example an admitted subject
+  type that is not a quota subject type), or has an own version of major 0; its requests receive canonical `FailedPrecondition` and change nothing
+- [ ] A metric whose type is registered after QE started is served on its first request with no restart; an
+  unavailable metric is served after its type becomes valid; a metric type changed under the same id in
+  `types-registry` is served from its new content by a running replica within one read interval, with the same entry
+  as on a restarted replica, and stays served when the new content stops admitting the subject type of a stored Quota or when an active Policy
+  does not fit it; a
+  deleted metric type removes its metric from the catalogue; each unavailable metric is reported with its reason in a
+  log entry and in `contract_validation_failures_total`
+- [ ] A request for a metric type that is not registered receives `InvalidArgument`; a second such request inside the
+  short time QE remembers the answer makes no registry call; when the registry read of a metric type the catalogue
+  does not hold fails or reaches its time limit, the request receives `ServiceUnavailable` and succeeds when repeated
+  after the registry answers; commit, release, return, and rollback of a lease or charge whose metric is unavailable
+  succeed
+- [ ] A registration by another module that names an existing metric type in any of its fields changes nothing in how
+  that metric is served
+- [ ] A request with no subject, two subjects of one type, a tenant subject of another tenant, a subject type the
+  metric does not admit, a metric object with no `metadata`, a metric object that does not fit its metric type, or a
+  metric type that is not registered receives canonical `InvalidArgument` with a stable field-level reason, never
+  `Decision::Denied`, and increments `contract_validation_failures_total` or `admitted_metric_violations_total`
+  accordingly; absent `metadata` is never defaulted to `{}`
+- [ ] A subject type derived from an admitted type is admitted; a metric type that admits the subject base
+  `gts.cf.core.quota.subj.v1~` admits every registered subject type; the tenant type is admitted for a metric with
+  empty `admitted_subjects`
+- [ ] With `types-registry` unreachable, ingress validation of a metric the catalogue holds still succeeds against the
+  process-local catalogue: no evaluation write or preview request path performs a registry call for the metric type
+  (verified by fault injection on the registry dependency), and a request for a metric the catalogue does not hold
+  receives `ServiceUnavailable`
+- [ ] With `tenant_id=T` and subject `{type=U_t, id=U}` for an admitted user type `U_t`, the subject set is exactly
+  `{(tenant type, T), (U_t, U)}`; naming `{type=tenant type, id=T}` as well yields the same set
+- [ ] On QE's API the complete attribution is sent to PDP; changing `tenant_id`, a subject, the metric type, or the
+  metric id to an unauthorized target produces `PermissionDenied` before evaluation and no storage mutation
+- [ ] Error precedence is stable: malformed public request shape returns `InvalidArgument` before admission; a
+  structurally valid unauthorized request returns `PermissionDenied` before any catalogue lookup; an admitted request
+  with a subject type that is not admitted or a metric object that does not fit its metric type returns
+  `InvalidArgument`
+- [ ] The write check rejects, with `PROJECTION_NOT_RESOLVABLE`, a Quota create or change and a Policy create or
+  change for a metric whose entry is unavailable; a Quota deactivation, a Policy rollback, and a Policy delete for
+  such a metric run; and it rejects a Quota whose subject type its metric does not admit with `InvalidArgument`
+- [ ] Metrics scrape shows no metric name, subject type, or caller attribution as a label value on
   `contract_validation_failures_total` or `admitted_metric_violations_total`
 
 ## 7. Additional Context (optional)
 
-- **Compatibility is split**: the active-Quota check is complete against the storage contract
-  (`QuotaEnforcementStoragePluginV1::read_active_projection_bindings()`, the distinct `(metric, projection_type)`
-  pairs of active Quotas) and verified against the in-memory storage double; the storage plugin's database query and
-  its integration tests are tracked by the quota-lifecycle feature. Policy compatibility is tracked by the
-  resolution-policy-engine feature, since a Policy version carries no contract reference yet. Until both land, the
-  `ProjectionContractCatalog` state machine, `cpt-cf-quota-enforcement-dod-projection-catalog`, and the feature
-  status stay open.
-- **ADR dependency**: the primary decision record, `cpt-cf-quota-enforcement-adr-projection-contracts` (ADR-0007), has
-  status accepted. This document restates only what the feature needs; the ADR stays the authority on the
-  contract shapes.
-- **Rollout / rollback**: the catalogue is built per process at bootstrap and is immutable; changing the configured
-  projection set is a redeploy. A failed consistency set keeps the previous healthy replicas serving (the new process
-  never becomes ready). Runtime catalogue refresh is a P2 item in DESIGN §4.3 and is not specified here.
-- **Test layering**: consistency-set and catalogue-mapping checks get unit tests against catalogue fixtures; ingress
-  validation, PDP authorization, and registry-fault behavior get integration tests; attribution spoofing is an
-  adversarial integration test.
-- **Bootstrap compatibility query (2026-09-09)**: the storage half of `cpt-cf-quota-enforcement-dod-projection-catalog`
-  landed with the quota-lifecycle feature: `read_active_projection_bindings()` is a distinct query over the reference
-  plugin's `qe_quotas` table, tested on SQLite and PostgreSQL. The Policy half still lands with the
-  resolution-policy-engine feature, so the Definition of Done stays open.
+- **ADR dependency**: ADR-0013 decides the metric type and the metric object; ADR-0008 decides subjects, admission,
+  and the types the quota resolver SDK owns; ADR-0012 decides when QE reads a metric type and what a wrong metric type
+  stops. This document restates only what the feature needs.
+- **Rollout / rollback**: every replica builds an entry from the same registry content, so replicas reach the same entries, also after a restart, and a new metric type needs no redeploy and no
+  QE configuration.
+- **Test layering**: the checks of a metric type and the admission checks get unit tests against catalogue fixtures;
+  ingress validation, PDP authorization, and registry-fault behavior get integration tests; attribution spoofing on
+  QE's API is an adversarial integration test.
 - **Non-applicable review domains**: UX/accessibility is not applicable; there is no user-facing surface. No QE-side
-  persistence is added, so no schema or retention concerns arise here. Contract documents must not carry secrets, per
-  the ADR shape-only rule.
+  persistence is added, so no schema or retention concerns arise here. A metric type must not carry secrets.
