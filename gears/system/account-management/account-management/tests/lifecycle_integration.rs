@@ -33,6 +33,8 @@ use account_management::domain::tenant::TenantRepo;
 use account_management::domain::tenant::closure::build_activation_rows;
 use account_management::domain::tenant::model::{NewTenant, TenantStatus};
 use account_management::domain::tenant::retention::{HardDeleteEligibility, HardDeleteOutcome};
+use account_management::domain::user::pending_deprovision::PendingDeprovisionRepo;
+use account_management::infra::storage::repo_impl::PendingDeprovisionRepoImpl;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -620,6 +622,14 @@ async fn hard_delete_one_cleans_tenant_and_closure_rows() {
         .await
         .expect("stamp retention claim");
 
+    // An unfinished user deletion in the leaf, and one in the root that
+    // must survive: the teardown removes the leaf's records explicitly
+    // because SQLite does not enforce the cascade.
+    let pending = PendingDeprovisionRepoImpl::new(std::sync::Arc::clone(&h.provider));
+    let (leaf_user, root_user) = (Uuid::new_v4(), Uuid::new_v4());
+    pending.record(leaf, leaf_user).await.expect("record leaf");
+    pending.record(root, root_user).await.expect("record root");
+
     let eligibility = h
         .repo
         .check_hard_delete_eligibility(&allow_all(), leaf, worker_id)
@@ -633,6 +643,15 @@ async fn hard_delete_one_cleans_tenant_and_closure_rows() {
         .await
         .expect("hard_delete_one");
     assert_eq!(outcome, HardDeleteOutcome::Cleaned);
+
+    assert!(
+        !pending.is_recorded(leaf, leaf_user).await.unwrap(),
+        "the hard-deleted tenant's unfinished user deletions must be gone"
+    );
+    assert!(
+        pending.is_recorded(root, root_user).await.unwrap(),
+        "another tenant's unfinished user deletions must survive"
+    );
 
     assert!(
         fetch_tenant(&h.provider, leaf).await.unwrap().is_none(),

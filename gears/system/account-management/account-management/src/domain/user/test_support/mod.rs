@@ -10,9 +10,11 @@
 //! production binaries do not ship these types.
 
 pub mod idp;
+pub mod pending;
 
 #[allow(
     unused_imports,
     reason = "Fake re-export anchors the public surface for service-level tests"
 )]
 pub use idp::{FakeIdpUserProvisioner, FakeUserOutcome};
+pub use pending::FakePendingDeprovisions;

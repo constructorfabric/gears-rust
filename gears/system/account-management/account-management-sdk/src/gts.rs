@@ -248,6 +248,35 @@ pub struct UserV1 {
 pub struct IdpPluginSpecV1;
 
 // ---------------------------------------------------------------------------
+// Principal-lifecycle hook plugin spec
+// ---------------------------------------------------------------------------
+
+/// GTS type definition for principal-lifecycle hook instances.
+///
+/// A gear that wants AM to tell it about user and tenant deletions
+/// registers an instance of this type and a scoped
+/// [`crate::PrincipalLifecycleHookV1`] client under the same instance id.
+/// Unlike [`IdpPluginSpecV1`], which AM narrows to one plugin by vendor and
+/// priority, every registered instance receives every event; `vendor` and
+/// `priority` are recorded but play no part in delivery. See
+/// [`crate::principal_lifecycle`] for the full contract.
+///
+/// # Instance ID Format
+///
+/// ```text
+/// gts.cf.toolkit.plugins.plugin.v1~cf.core.am.principal_lifecycle_hook.v1~<vendor>.<package>.<namespace>.<type>.v<MAJOR>
+/// ```
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = PluginV1,
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.am.principal_lifecycle_hook.v1~"),
+    description = "Account Management principal-lifecycle hook specification",
+    properties = "",
+)]
+pub struct PrincipalLifecycleHookSpecV1;
+
+// ---------------------------------------------------------------------------
 // PEP resource-type registrations (RBAC target_type authorizability)
 // ---------------------------------------------------------------------------
 

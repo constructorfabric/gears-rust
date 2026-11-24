@@ -34,10 +34,13 @@
 //! endpoint stays retry-safe per
 //! `cpt-cf-account-management-fr-idp-user-deprovision`.
 //!
-//! The service holds NO storage handles. Per
-//! `cpt-cf-account-management-constraint-no-user-storage` AM persists
-//! no user table, projection cache, or membership cache; every read
-//! and write is a live pass-through to the `IdP`.
+//! Per `cpt-cf-account-management-constraint-no-user-storage` AM
+//! persists no user table, projection cache, or membership cache; every
+//! read and write of a user is a live pass-through to the `IdP`. The one
+//! storage handle the service holds is the record of unfinished
+//! deletions ([`crate::domain::user::pending_deprovision`]): an operation
+//! marker of two ids, kept only while a deletion is in flight, not user
+//! data.
 // @cpt-begin:cpt-cf-account-management-dod-idp-user-operations-contract-no-local-user-storage:p1:inst-dod-idp-user-operations-contract-no-local-user-storage-service
 
 use std::sync::Arc;
@@ -46,7 +49,7 @@ use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RESOURCE_TYPE};
 use account_management_sdk::{
     IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser, IdpPluginClient,
     IdpProvisionUserRequest, IdpTenantContext, IdpUpdateUserRequest, IdpUser, IdpUserFilterField,
-    IdpUserOperationFailure, IdpUserPatch, ListUsersQuery,
+    IdpUserOperationFailure, IdpUserPatch, ListUsersQuery, PrincipalLifecycleEvent,
 };
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::ResourceType;
@@ -65,8 +68,10 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::idp::UserOperationFailureExt;
 use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
+use crate::domain::principal_lifecycle::{self, PrincipalLifecycleNotifier};
 use crate::domain::tenant::TenantContext;
 use crate::domain::tenant::repo::TenantRepo;
+use crate::domain::user::pending_deprovision::PendingDeprovisionRepo;
 
 /// AM username whitespace policy, applied after authorization/tenant guards.
 /// Trim in place so oversized input is not cloned before DTO length validation.
@@ -165,6 +170,17 @@ pub struct UserService {
     /// tests that don't exercise the cleanup path; production wiring
     /// always sets it.
     rg_client: Option<Arc<dyn ResourceGroupClient + Send + Sync>>,
+    /// Delivers [`PrincipalLifecycleEvent::UserDeprovisioned`] to the
+    /// hooks other gears register, so their state keyed by the deleted
+    /// user goes with it. `None` in tests that don't exercise delivery;
+    /// production wiring always sets it.
+    lifecycle: Option<Arc<dyn PrincipalLifecycleNotifier>>,
+    /// Record of user deletions that have started but not finished, so a
+    /// retried DELETE can finish one after the `IdP` no longer has the
+    /// user (see [`crate::domain::user::pending_deprovision`]). `None` in
+    /// tests that don't exercise retries; production wiring always sets
+    /// it. Without it a retry after the `IdP` delete does nothing.
+    pending: Option<Arc<dyn PendingDeprovisionRepo>>,
     /// Per-deployment listing cap. Defaults to
     /// [`account_management_sdk::IdpUserPagination::MAX_TOP`];
     /// production wiring overrides via [`Self::with_listing_max_top`]
@@ -231,6 +247,8 @@ impl UserService {
             types_registry,
             enforcer,
             rg_client: None,
+            lifecycle: None,
+            pending: None,
             max_listing_top: account_management_sdk::IdpUserPagination::MAX_TOP,
         }
     }
@@ -311,6 +329,33 @@ impl UserService {
         rg_client: Arc<dyn ResourceGroupClient + Send + Sync>,
     ) -> Self {
         self.rg_client = Some(rg_client);
+        self
+    }
+
+    /// Wire the [`PrincipalLifecycleNotifier`] [`Self::delete_user`] uses to
+    /// tell other gears a user is gone. Without it, state other gears keep
+    /// for the user — access grants naming them, for instance — outlives
+    /// the user as orphans.
+    ///
+    /// Production wiring in `gear.rs` always invokes this builder; tests
+    /// that don't exercise delivery skip it.
+    #[must_use]
+    pub fn with_principal_lifecycle(
+        mut self,
+        notifier: Arc<dyn PrincipalLifecycleNotifier>,
+    ) -> Self {
+        self.lifecycle = Some(notifier);
+        self
+    }
+
+    /// Wire the record of unfinished user deletions
+    /// [`Self::delete_user`] uses to finish a deletion on retry.
+    ///
+    /// Production wiring in `gear.rs` always invokes this builder; tests
+    /// that don't exercise retries skip it.
+    #[must_use]
+    pub fn with_pending_deprovisions(mut self, pending: Arc<dyn PendingDeprovisionRepo>) -> Self {
+        self.pending = Some(pending);
         self
     }
 
@@ -491,6 +536,16 @@ impl UserService {
     /// per
     /// `cpt-cf-account-management-dod-idp-user-operations-contract-deprovision-idempotency`.
     ///
+    /// Before deleting, AM confirms the user belongs to `tenant_id` and
+    /// records the deletion (see
+    /// [`crate::domain::user::pending_deprovision`]). A user the tenant does
+    /// not have — one from another tenant, or one already fully deleted —
+    /// returns the same `Ok(())`, so the response reveals nothing, but
+    /// nothing else happens: no `IdP` call, no membership cleanup, and no
+    /// principal-lifecycle event, which would otherwise tell other gears to
+    /// drop the state of a user that still exists. A retry that finds the
+    /// user gone while the deletion is still recorded finishes it.
+    ///
     /// # Errors
     ///
     /// * [`DomainError::NotFound`] -- `tenant_id` does not resolve.
@@ -523,6 +578,16 @@ impl UserService {
         let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation:p1:inst-dod-authenticated-tenant-scoped-invocation-duser
         // @cpt-end:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-resolve-tenant
+
+        // Membership gate: see `admit_deletion`. A user this tenant does
+        // not have gets the same `Ok(())` as a real deletion, and nothing
+        // else happens.
+        if !self
+            .admit_deletion(ctx, &tenant_context, tenant_id, user_id)
+            .await?
+        {
+            return Ok(());
+        }
 
         // @cpt-begin:cpt-cf-account-management-flow-idp-user-operations-contract-deprovision-user:p1:inst-flow-duser-invoke-contract
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-package-request-duser
@@ -557,6 +622,13 @@ impl UserService {
             Ok(()) => {
                 self.cleanup_user_group_memberships(ctx, tenant_id, user_id)
                     .await?;
+                // Other gears' cleanup, after AM's own: the user is gone
+                // from the IdP, so no hook ever strips a live user. A
+                // failure returns Err like the RG cleanup does, and the
+                // retried delete delivers the event to every hook again.
+                self.notify_user_deprovisioned(ctx, tenant_id, user_id)
+                    .await?;
+                self.clear_recorded_deletion(tenant_id, user_id).await;
                 tracing::info!(
                     target: "am.events",
                     event = "user_deprovisioned",
@@ -979,6 +1051,136 @@ impl UserService {
             tenant_id,
         )
         .await
+    }
+
+    // ----------------------------------------------------------------
+    // Principal-lifecycle delivery post user-deprovision
+    // ----------------------------------------------------------------
+
+    /// Decide whether `delete_user` may delete `user_id`, recording the
+    /// deletion when it may and the user is still in the tenant.
+    ///
+    /// The caller is authorized on `tenant_id`, not on the user, and an
+    /// `IdP` answers `Ok(())` both for a user it removed and for one this
+    /// tenant never had (a user of another tenant is skipped, and in a
+    /// dedicated realm it is simply absent). Deciding after the delete is
+    /// therefore impossible, so decide first: a user present in the tenant
+    /// gets its deletion recorded before the `IdP` is asked to delete it;
+    /// an absent user proceeds only while an earlier attempt's record says
+    /// its deletion is unfinished. Users do not move between tenants, so
+    /// the answer cannot change between this check and the delete.
+    ///
+    /// `false` means: nothing to do. The caller must still answer exactly
+    /// as for a real deletion, so the response does not tell whether a user
+    /// id exists in some other tenant.
+    async fn admit_deletion(
+        &self,
+        ctx: &SecurityContext,
+        tenant_context: &TenantContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        if self
+            .user_in_tenant(ctx, tenant_context, tenant_id, user_id)
+            .await?
+        {
+            if let Some(pending) = self.pending.as_ref() {
+                pending.record(tenant_id, user_id).await?;
+            }
+            return Ok(true);
+        }
+        if self.deletion_recorded(tenant_id, user_id).await? {
+            return Ok(true);
+        }
+        tracing::info!(
+            target: "am.events",
+            event = "user_deprovision_skipped",
+            tenant_id = %tenant_id,
+            user_id = %user_id,
+            actor_uuid = %ctx.subject_id(),
+            "user is not in this tenant and no deletion of it is unfinished; nothing to do"
+        );
+        Ok(false)
+    }
+
+    /// Whether `user_id` is a user of `tenant_id`, asked of the `IdP` with
+    /// the same authoritative `id eq` point lookup `get_user` uses. Calls
+    /// the `IdP` directly rather than through [`Self::list_users`]: the
+    /// caller was authorized to delete, which need not imply being
+    /// authorized to list.
+    async fn user_in_tenant(
+        &self,
+        ctx: &SecurityContext,
+        tenant_context: &TenantContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        let ListUsersQuery {
+            pagination, filter, ..
+        } = ListUsersQuery::with_id(user_id);
+        let mut req = IdpListUsersRequest::new(IdpTenantContext::from(tenant_context), pagination);
+        if let Some(filter) = filter {
+            req = req.with_filter(filter);
+        }
+        // The same deterministic order `list_users` hands plugins.
+        let req = req.with_order(
+            ODataOrderBy(vec![OrderKey {
+                field: "username".into(),
+                dir: SortDir::Asc,
+            }])
+            .ensure_tiebreaker("id", SortDir::Asc),
+        );
+        match self.idp_user.list_users(ctx, &req).await {
+            // Matching on the id, not just a non-empty page, so a provider
+            // that ignores the filter cannot make a stranger look present.
+            Ok(page) => Ok(page.items.iter().any(|user| user.id == user_id)),
+            Err(failure) => Err(failure.into_domain_error(tenant_id)),
+        }
+    }
+
+    /// Whether an earlier attempt recorded an unfinished deletion of
+    /// `user_id` from `tenant_id`. `false` when no record is wired.
+    async fn deletion_recorded(&self, tenant_id: Uuid, user_id: Uuid) -> Result<bool, DomainError> {
+        match self.pending.as_ref() {
+            Some(pending) => pending.is_recorded(tenant_id, user_id).await,
+            None => Ok(false),
+        }
+    }
+
+    /// Forget a finished deletion. A failure only logs: the deletion is
+    /// complete, and a record left behind costs at most one more round of
+    /// idempotent cleanup if the same DELETE is sent again.
+    async fn clear_recorded_deletion(&self, tenant_id: Uuid, user_id: Uuid) {
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        if let Err(err) = pending.clear(tenant_id, user_id).await {
+            tracing::warn!(
+                target: "am.events",
+                tenant_id = %tenant_id,
+                user_id = %user_id,
+                error = %err,
+                "could not clear the record of a finished user deletion"
+            );
+        }
+    }
+
+    /// Deliver [`PrincipalLifecycleEvent::UserDeprovisioned`] to the
+    /// registered hooks. A no-op when no notifier is wired.
+    async fn notify_user_deprovisioned(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), DomainError> {
+        let Some(lifecycle) = self.lifecycle.as_ref() else {
+            return Ok(());
+        };
+        let event = PrincipalLifecycleEvent::UserDeprovisioned { tenant_id, user_id };
+        lifecycle
+            .notify(ctx, &event)
+            .await
+            .map_err(|err| principal_lifecycle::into_domain_error(&event, err))
     }
 
     // ----------------------------------------------------------------

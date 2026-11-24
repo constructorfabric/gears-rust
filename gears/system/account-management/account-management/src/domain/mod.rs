@@ -25,6 +25,7 @@ pub mod integrity_check;
 pub mod metadata;
 pub mod metrics;
 pub mod ports;
+pub mod principal_lifecycle;
 pub mod root_type;
 pub mod service_account;
 pub mod system_actor;

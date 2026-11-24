@@ -6,6 +6,7 @@
 
 pub mod am_leases;
 pub mod conversion_requests;
+pub mod pending_user_deprovisions;
 pub mod tenant_closure;
 pub mod tenant_idp_metadata;
 pub mod tenant_metadata;

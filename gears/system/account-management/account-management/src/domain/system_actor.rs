@@ -50,6 +50,8 @@
 //!   hard-delete retention sweep on rows past their retention window.
 //! * [`for_user_groups_cascade`] — RG cascade-cleanup hook fired
 //!   when a tenant is hard-deleted.
+//! * [`for_principal_lifecycle_tenant_hook`] — delivery of the tenant
+//!   hard-delete event to other gears' principal-lifecycle hooks.
 //!
 //! `delete_user`'s RG membership cleanup used to mint a `for_user_cleanup`
 //! system actor here; VHP-190 moved it to run under the caller's context
@@ -159,6 +161,26 @@ pub(crate) fn for_user_groups_cascade(tenant_id: Uuid) -> SecurityContext {
     build_inner(None)
 }
 
+/// Principal-lifecycle tenant hook — delivers the tenant hard-delete event
+/// to the principal-lifecycle hooks other gears register. `tenant_id` is
+/// the tenant being deleted; it rides the audit log line only.
+///
+/// Platform-scoped for the same reason as [`for_user_groups_cascade`]: the
+/// tenant is a `Deleted` row mid-purge, so a context rooted at it would
+/// resolve to an empty subtree. Hooks treat the context as audit identity
+/// only and never authorize against it (see
+/// [`account_management_sdk::principal_lifecycle`]).
+#[must_use]
+pub(crate) fn for_principal_lifecycle_tenant_hook(tenant_id: Uuid) -> SecurityContext {
+    tracing::info!(
+        target: "am.system_actor",
+        site = "principal_lifecycle_tenant_hook",
+        tenant_id = %tenant_id,
+        "am system actor constructed",
+    );
+    build_inner(None)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -214,5 +236,15 @@ mod tests {
             Uuid::nil(),
             "cascade context must be platform-scoped, not scoped to the deleted tenant"
         );
+    }
+
+    // Same reasoning as the cascade: the tenant is a `Deleted` row
+    // mid-purge, so the context MUST be platform-scoped.
+    #[test]
+    fn principal_lifecycle_tenant_hook_is_platform_scoped() {
+        let ctx = for_principal_lifecycle_tenant_hook(Uuid::from_u128(0xDEAD_BEEF_FACE_CAFE));
+        assert_eq!(ctx.subject_id(), AM_SYSTEM_ACTOR_UUID);
+        assert_eq!(ctx.subject_type(), Some(AM_SYSTEM_SUBJECT_TYPE));
+        assert_eq!(ctx.subject_tenant_id(), Uuid::nil());
     }
 }
