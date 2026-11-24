@@ -95,3 +95,4 @@ toolkit-canonical-errors.workspace = true
 mockall.workspace = true
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+toolkit = { workspace = true, features = ["test-support"] }

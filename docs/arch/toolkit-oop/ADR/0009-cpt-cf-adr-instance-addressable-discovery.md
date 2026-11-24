@@ -659,6 +659,13 @@ For the implementing change (reconcile against the landed edge directory rework 
     gear's document from the instance's `/.well-known/openapi.json` and verify it against that hash, rather than
     calling `GetOpenApiSpec`.
 
+> **Amendment (2026-11-23; endpoint-less listing):** The service-discovery-owned
+> implementation preserves endpoint-less records (`endpoint = None`) in per-gear
+> `list_instances` and `resolve_by_labels` results, leaving fallback to the caller.
+> The cross-gear `ListAllInstances` snapshot includes all routable records,
+> including REST-only instances, and omits records with neither a gRPC nor REST
+> endpoint.
+
 ## Traceability
 
 - **PRD**: [PRD.md](../PRD.md)

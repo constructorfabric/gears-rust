@@ -2,26 +2,33 @@
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures_util::StreamExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
-use toolkit::DirectoryClient;
 use toolkit::context::GearCtx;
 use toolkit::contracts::{
     GrpcServiceCapability, OpenApiRegistry, RegisterGrpcServiceFn, RestApiCapability,
     RunnableCapability, SystemCapability,
 };
-use toolkit::directory::LocalDirectoryClient;
 use toolkit::registry::GearRegistry;
 use toolkit::runtime::GearManager;
+use toolkit::{DirectoryClient, Healthcheck, HealthcheckResult};
 
 use cf_system_sdks::directory::DIRECTORY_SERVICE_NAME;
 use cf_system_sdks::directory::labels::is_valid_label_segment;
 
 use crate::config::ServiceDiscoveryConfig;
+use crate::directory_backend::{
+    DirectoryBackend, DirectoryBackendError, DirectoryChange, DirectoryChangeStream,
+};
+use crate::directory_client::ReplicatedDirectoryClient;
 use crate::domain::authz::RegistrationPolicy;
 use crate::domain::service::GearsService;
+use crate::local_directory_client::LocalDirectoryClient;
+use crate::replica::DirectoryReplica;
 use crate::server;
 
 /// Service Discovery - system gear for service discovery
@@ -31,20 +38,11 @@ use crate::server;
 /// - Exposes `DirectoryService` gRPC service via `grpc-hub`
 /// - Tracks gear instances and provides service resolution
 /// - Exposes REST API to list all registered gears
-// `one_per_installation`: the directory is this process's own instance map --
-// a `DashMap` in `GearManager`, with no store, no replication and no quorum --
-// and every worker is handed one endpoint with no way to find another.
-//
-// Two of these in one installation are two disjoint maps that never meet, and
-// every consequence is silent: the edge prunes the other half's public routes
-// to 404 because its safety valve only covers an *empty* snapshot, readiness
-// stays at 503 forever because re-registration never gives up, and instance
-// targeting answers with a complete-looking ownership map over half the shards.
-//
-// The registry cannot refuse this the way it refuses a second `rest_host`: that
-// check works because a process can see its own gears, and no process can see
-// another. Composition tooling refuses it instead, which is why the fact is
-// stated here rather than merely known.
+// `one_per_installation`: only one application owns the logical service
+// directory. Replicas of that application may share a configured backend, but
+// a second application would create a separate directory and discovery
+// authority. Composition tooling refuses that duplicate; this gear cannot
+// detect it from its local read model.
 #[toolkit::gear(
     name = "service-discovery",
     capabilities = [grpc, system, rest, stateful],
@@ -53,10 +51,16 @@ use crate::server;
 )]
 pub struct ServiceDiscoveryGear {
     directory_api: OnceLock<Arc<dyn DirectoryClient>>,
+    directory_backend: OnceLock<Arc<dyn DirectoryBackend>>,
+    /// Read model plus backend versions, with a directory backend.
+    replica: OnceLock<Arc<DirectoryReplica>>,
+    /// Set once the backend snapshot has first loaded; gates `/readyz`.
+    /// Never cleared: see [`SnapshotLoaded`].
+    snapshot_loaded: Arc<AtomicBool>,
     gear_manager: OnceLock<Arc<GearManager>>,
     gears_service: OnceLock<Arc<GearsService>>,
     policy: OnceLock<RegistrationPolicy>,
-    /// How often the memory-mode sweeper reclaims records whose lease expired
+    /// How often the lease sweeper reclaims records whose lease expired
     /// past grace. Set from the configured `lease.grace` in `init`.
     sweep_interval: OnceLock<Duration>,
 }
@@ -65,11 +69,34 @@ impl Default for ServiceDiscoveryGear {
     fn default() -> Self {
         Self {
             directory_api: OnceLock::new(),
+            directory_backend: OnceLock::new(),
+            replica: OnceLock::new(),
+            snapshot_loaded: Arc::new(AtomicBool::new(false)),
             gear_manager: OnceLock::new(),
             gears_service: OnceLock::new(),
             policy: OnceLock::new(),
             sweep_interval: OnceLock::new(),
         }
+    }
+}
+
+impl ServiceDiscoveryGear {
+    /// Install a shared directory backend before `init`. Test-only until the
+    /// shared-storage backend (#5875) is selected from configuration.
+    ///
+    /// # Errors
+    /// Fails if a backend is already installed or `init` has already run.
+    #[cfg(test)]
+    pub(crate) fn install_directory_backend(
+        &self,
+        backend: Arc<dyn DirectoryBackend>,
+    ) -> anyhow::Result<()> {
+        if self.directory_api.get().is_some() {
+            anyhow::bail!("DirectoryBackend must be installed before init");
+        }
+        self.directory_backend
+            .set(backend)
+            .map_err(|_| anyhow::anyhow!("DirectoryBackend already installed"))
     }
 }
 
@@ -144,8 +171,16 @@ impl toolkit::Gear for ServiceDiscoveryGear {
         }
         manager.set_grpc_service_owners(cfg.grpc_service_owners);
 
-        let api_impl: Arc<dyn DirectoryClient> =
-            Arc::new(LocalDirectoryClient::new(manager.clone()));
+        let api_impl: Arc<dyn DirectoryClient> = match self.directory_backend.get() {
+            Some(backend) => {
+                let replica = Arc::new(DirectoryReplica::new(Arc::clone(&manager)));
+                self.replica.set(Arc::clone(&replica)).map_err(|_| {
+                    anyhow::anyhow!("DirectoryReplica already set (init called twice?)")
+                })?;
+                Arc::new(ReplicatedDirectoryClient::new(replica, Arc::clone(backend)))
+            }
+            None => Arc::new(LocalDirectoryClient::new(Arc::clone(&manager))),
+        };
 
         // Register in ClientHub directly
         ctx.client_hub()
@@ -185,6 +220,37 @@ impl RestApiCapability for ServiceDiscoveryGear {
         tracing::info!("ServiceDiscoveryGear REST routes registered");
         Ok(router)
     }
+
+    /// With a directory backend, keep `/readyz` at 503 until the feed task
+    /// has loaded the snapshot, so a new replica is not routed traffic
+    /// before it knows the directory.
+    fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
+        self.directory_backend.get()?;
+        Some(Arc::new(SnapshotLoaded(Arc::clone(&self.snapshot_loaded))))
+    }
+}
+
+/// Readiness check that passes once the backend snapshot has loaded.
+///
+/// Gated only on the *first* load: when the backend later goes down, every
+/// replica would fail readiness at once, so each keeps serving its last
+/// snapshot while it resyncs.
+struct SnapshotLoaded(Arc<AtomicBool>);
+
+#[async_trait]
+impl Healthcheck for SnapshotLoaded {
+    fn name(&self) -> &'static str {
+        "directory-snapshot"
+    }
+
+    async fn check(&self) -> HealthcheckResult {
+        if self.0.load(Ordering::Acquire) {
+            HealthcheckResult::healthy()
+        } else {
+            HealthcheckResult::unhealthy("directory snapshot not loaded yet")
+                .with_code("directory_snapshot_loading")
+        }
+    }
 }
 
 /// Export gRPC services to `grpc-hub`
@@ -219,27 +285,209 @@ impl GrpcServiceCapability for ServiceDiscoveryGear {
 const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const MIN_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
-/// The memory-mode lease sweeper.
+/// The lease sweeper. It runs with or without a directory backend: each
+/// replica stamps its own leases, so each reclaims its own expired records.
 ///
 /// Reads already hide records whose lease expired past grace, so this task only
 /// reclaims their memory (and frees the gRPC service names and round-robin
-/// counters of a gear whose last instance expired). It runs until `cancel`.
-async fn sweeper_loop(manager: Arc<GearManager>, interval: Duration, cancel: CancellationToken) {
+/// counters of a gear whose last instance expired, and, with a backend, the
+/// replica's lapsed tombstones). It runs until `cancel`.
+async fn sweeper_loop(
+    sweep: impl Fn(Instant) + Send + 'static,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
     let mut tick = tokio::time::interval(interval.max(MIN_SWEEP_INTERVAL));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // consume the immediate first tick
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
-            _ = tick.tick() => manager.sweep_expired(Instant::now()),
+            _ = tick.tick() => sweep(Instant::now()),
         }
     }
     tracing::debug!("service-discovery lease sweeper stopped");
 }
 
+/// First delay before retrying a failed snapshot load or resubscribing after
+/// the backend change feed fails.
+const RESYNC_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+/// Cap on the resubscribe delay while the backend stays unavailable.
+const RESYNC_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+fn next_resync_delay(delay: Duration) -> Duration {
+    (delay * 2).min(RESYNC_MAX_BACKOFF)
+}
+
+async fn load_backend_snapshot(
+    replica: &DirectoryReplica,
+    backend: &dyn DirectoryBackend,
+) -> Result<(), DirectoryBackendError> {
+    let started = Instant::now();
+    let records = backend.load_all(replica.manager().lease_grace()).await?;
+    replica.replace_snapshot(records, started);
+    Ok(())
+}
+
+/// Load the backend snapshot, mark it loaded, then apply the change feed to
+/// `replica` until `cancel` fires.
+///
+/// The subscription is established before the snapshot is loaded; the replica
+/// orders both by record version. This runs in the background because `init`
+/// and `start` must not wait on a remote service; readiness waits on `loaded`.
+/// When the feed fails or ends, resubscribe and reload with backoff. The
+/// backoff resets once a feed delivers a change, so a feed that fails at once
+/// keeps backing off.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "tokio::select! and tracing macros inflate the measured complexity"
+)]
+async fn backend_feed_loop(
+    replica: Arc<DirectoryReplica>,
+    backend: Arc<dyn DirectoryBackend>,
+    loaded: Arc<AtomicBool>,
+    cancel: CancellationToken,
+) {
+    let mut retry_delay = RESYNC_INITIAL_BACKOFF;
+    let Some(mut changes) =
+        sync_backend(&replica, backend.as_ref(), &cancel, &mut retry_delay).await
+    else {
+        return;
+    };
+    loaded.store(true, Ordering::Release);
+    tracing::info!("service-discovery backend snapshot loaded");
+    loop {
+        let change = tokio::select! {
+            () = cancel.cancelled() => break,
+            change = changes.next() => change,
+        };
+        if apply_feed_item(&replica, change) {
+            retry_delay = RESYNC_INITIAL_BACKOFF;
+            continue;
+        }
+        match resync_backend(&replica, backend.as_ref(), &cancel, &mut retry_delay).await {
+            Some(next) => changes = next,
+            None => break,
+        }
+    }
+    tracing::debug!("service-discovery backend change feed stopped");
+}
+
+/// Apply one item from the change feed. Returns `false` when the feed failed
+/// or ended and the caller must resync.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "tracing macros inflate the measured complexity"
+)]
+fn apply_feed_item(
+    replica: &DirectoryReplica,
+    item: Option<Result<DirectoryChange, DirectoryBackendError>>,
+) -> bool {
+    match item {
+        Some(Ok(change)) => {
+            let result = match change {
+                DirectoryChange::Upsert(record) | DirectoryChange::Renew(record) => {
+                    replica.apply_change(record)
+                }
+                DirectoryChange::Remove {
+                    gear,
+                    instance_id,
+                    generation,
+                } => {
+                    replica.apply_removal(&gear, instance_id, generation);
+                    Ok(())
+                }
+            };
+            if let Err(conflict) = result {
+                tracing::warn!(%conflict, "skipping directory backend change that violates pinned gRPC service ownership");
+            }
+            true
+        }
+        Some(Err(err)) => {
+            tracing::warn!(error = %err, "directory backend change feed failed; resyncing");
+            false
+        }
+        None => {
+            tracing::warn!("directory backend change feed ended; resyncing");
+            false
+        }
+    }
+}
+
+/// Pause, then [`sync_backend`]; the pause keeps a feed that fails at once
+/// from spinning. Returns `None` if `cancel` fires first.
+async fn resync_backend(
+    replica: &DirectoryReplica,
+    backend: &dyn DirectoryBackend,
+    cancel: &CancellationToken,
+    retry_delay: &mut Duration,
+) -> Option<DirectoryChangeStream> {
+    wait_before_retry(cancel, retry_delay).await?;
+    sync_backend(replica, backend, cancel, retry_delay).await
+}
+
+async fn await_or_cancel<T>(
+    cancel: &CancellationToken,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        () = cancel.cancelled() => None,
+        output = future => Some(output),
+    }
+}
+
+async fn wait_before_retry(cancel: &CancellationToken, delay: &mut Duration) -> Option<()> {
+    await_or_cancel(cancel, tokio::time::sleep(*delay)).await?;
+    *delay = next_resync_delay(*delay);
+    Some(())
+}
+
+/// Subscribe to the change feed and load the snapshot, retrying with backoff
+/// until both succeed. Returns `None` if `cancel` fires first.
+async fn sync_backend(
+    replica: &DirectoryReplica,
+    backend: &dyn DirectoryBackend,
+    cancel: &CancellationToken,
+    delay: &mut Duration,
+) -> Option<DirectoryChangeStream> {
+    loop {
+        if let Some(changes) = try_sync_backend(replica, backend, cancel).await {
+            return Some(changes);
+        }
+        wait_before_retry(cancel, delay).await?;
+    }
+}
+
+async fn try_sync_backend(
+    replica: &DirectoryReplica,
+    backend: &dyn DirectoryBackend,
+    cancel: &CancellationToken,
+) -> Option<DirectoryChangeStream> {
+    // Establish the subscription before scanning so concurrent changes are buffered.
+    let changes = await_or_cancel(cancel, backend.changes())
+        .await?
+        .inspect_err(|err| {
+            tracing::error!(
+                error = format!("{err:#}"),
+                "failed to establish directory backend change feed; retrying"
+            );
+        })
+        .ok()?;
+    if let Err(err) = await_or_cancel(cancel, load_backend_snapshot(replica, backend)).await? {
+        tracing::error!(
+            error = format!("{err:#}"),
+            "failed to load directory backend snapshot; retrying"
+        );
+        return None;
+    }
+    Some(changes)
+}
+
 #[async_trait]
 impl RunnableCapability for ServiceDiscoveryGear {
-    /// Start the memory-mode lease sweeper. The task self-stops when `cancel`
+    /// Start the lease sweeper and, with a directory backend, the task that
+    /// loads its snapshot and follows its change feed. Neither is awaited:
+    /// readiness waits on the snapshot instead. The tasks self-stop when `cancel`
     /// (a child of the runtime root token) fires, so [`Self::stop`] is a no-op.
     async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()> {
         let manager = self.gear_manager.get().cloned().ok_or_else(|| {
@@ -250,7 +498,31 @@ impl RunnableCapability for ServiceDiscoveryGear {
             .get()
             .copied()
             .unwrap_or(DEFAULT_SWEEP_INTERVAL);
-        tokio::spawn(sweeper_loop(manager, interval, cancel));
+        if let Some(backend) = self.directory_backend.get().cloned() {
+            let replica = self.replica.get().cloned().ok_or_else(|| {
+                anyhow::anyhow!("DirectoryReplica not set; init() must run before start()")
+            })?;
+            tokio::spawn(backend_feed_loop(
+                Arc::clone(&replica),
+                backend,
+                Arc::clone(&self.snapshot_loaded),
+                cancel.clone(),
+            ));
+            tracing::info!("service-discovery backend feed task started");
+            tokio::spawn(sweeper_loop(
+                move |now| replica.sweep(now),
+                interval,
+                cancel,
+            ));
+        } else {
+            tokio::spawn(sweeper_loop(
+                move |now| {
+                    manager.sweep_expired(now);
+                },
+                interval,
+                cancel,
+            ));
+        }
         tracing::info!(
             sweep_interval_secs = interval.as_secs(),
             "service-discovery lease sweeper started"
@@ -269,9 +541,14 @@ impl RunnableCapability for ServiceDiscoveryGear {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
+    use crate::directory_backend::{DirectoryRecord, MemoryDirectoryBackend};
+    use crate::replica::DirectoryReplica;
+    use std::sync::atomic::AtomicUsize;
     use tokio_util::sync::CancellationToken;
+    use toolkit::HealthcheckStatus;
     use toolkit::client_hub::ClientHub;
     use toolkit::config::ConfigProvider;
+    use toolkit::runtime::{Endpoint, GearInstance, ReportedState};
     use uuid::Uuid;
 
     struct StaticConfigProvider(serde_json::Value);
@@ -311,6 +588,589 @@ mod tests {
         init_with_config(serde_json::json!({}))
             .await
             .expect("init with an empty config section (all defaults) must succeed");
+    }
+
+    #[tokio::test]
+    async fn start_loads_snapshot_in_background_and_gates_readiness() {
+        let memory = MemoryDirectoryBackend::default();
+        memory
+            .register(
+                Arc::new(
+                    GearInstance::new("preexisting-gear", Uuid::new_v4())
+                        .with_rest_endpoint(Endpoint::http("127.0.0.1", 8080))
+                        .with_reported_state(ReportedState::Serving),
+                ),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        // The first load fails: startup must neither wait on nor fail because
+        // of the backend.
+        let backend = Arc::new(FlakyBackend::new(memory.clone(), 0, 0));
+
+        let mut wrapped = serde_json::Map::new();
+        wrapped.insert("config".to_owned(), serde_json::json!({}));
+        let ctx = GearCtx::new(
+            "service-discovery",
+            Uuid::new_v4(),
+            Arc::new(StaticConfigProvider(serde_json::Value::Object(wrapped))),
+            Arc::new(ClientHub::default()),
+            CancellationToken::new(),
+        );
+        let gear = ServiceDiscoveryGear::default();
+        let manager = Arc::new(GearManager::new());
+        gear.gear_manager
+            .set(Arc::clone(&manager))
+            .map_err(|_| anyhow::anyhow!("gear_manager already set"))
+            .unwrap();
+        gear.install_directory_backend(backend.clone()).unwrap();
+        toolkit::Gear::init(&gear, &ctx).await.unwrap();
+
+        let readiness =
+            RestApiCapability::healthcheck(&gear, &ctx).expect("a backend must gate readiness");
+        assert_eq!(readiness.check().await.status, HealthcheckStatus::Unhealthy);
+        assert!(manager.instances_of("preexisting-gear").is_empty());
+
+        let cancel = CancellationToken::new();
+        RunnableCapability::start(&gear, cancel.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while readiness.check().await.status != HealthcheckStatus::Healthy {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("readiness must pass once a snapshot load succeeds");
+        assert!(backend.loads.load(Ordering::SeqCst) >= 2);
+        let instances = manager.instances_of("preexisting-gear");
+        assert_eq!(instances.len(), 1);
+        assert_eq!(
+            instances[0].state(),
+            toolkit::runtime::InstanceState::Healthy
+        );
+
+        memory
+            .register(
+                Arc::new(GearInstance::new("late-gear", Uuid::new_v4())),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        wait_for("the feed task must follow the feed after loading", || {
+            !manager.instances_of("late-gear").is_empty()
+        })
+        .await;
+        cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn replicas_receive_registration_heartbeat_and_deregistration_from_feed() {
+        let backend = Arc::new(MemoryDirectoryBackend::default());
+        let manager_a = Arc::new(GearManager::new());
+        let manager_b = Arc::new(GearManager::new());
+        let loaded_a = Arc::new(AtomicBool::new(false));
+        let loaded_b = Arc::new(AtomicBool::new(false));
+        let cancel_a = CancellationToken::new();
+        let cancel_b = CancellationToken::new();
+        let replica_a = Arc::new(DirectoryReplica::new(Arc::clone(&manager_a)));
+        let replica_b = Arc::new(DirectoryReplica::new(Arc::clone(&manager_b)));
+        let task_a = tokio::spawn(backend_feed_loop(
+            Arc::clone(&replica_a),
+            backend.clone(),
+            Arc::clone(&loaded_a),
+            cancel_a.clone(),
+        ));
+        let task_b = tokio::spawn(backend_feed_loop(
+            replica_b,
+            backend.clone(),
+            Arc::clone(&loaded_b),
+            cancel_b.clone(),
+        ));
+
+        wait_for("both replicas must load the initial snapshot", || {
+            loaded_a.load(std::sync::atomic::Ordering::Acquire)
+                && loaded_b.load(std::sync::atomic::Ordering::Acquire)
+        })
+        .await;
+
+        let client_a = ReplicatedDirectoryClient::new(replica_a, backend);
+        let gear = "replicated-gear";
+        let instance_id = Uuid::new_v4();
+        client_a
+            .register_instance(
+                cf_system_sdks::directory::RegisterInstanceInfo::new(gear, instance_id.to_string())
+                    .with_reported_state(cf_system_sdks::directory::ReportedState::Starting),
+            )
+            .await
+            .unwrap();
+        wait_for("registration must reach the other replica", || {
+            manager_b
+                .instances_of(gear)
+                .iter()
+                .any(|instance| instance.instance_id == instance_id)
+        })
+        .await;
+        assert_eq!(
+            manager_b.instances_of(gear)[0].state(),
+            toolkit::runtime::InstanceState::Registered
+        );
+
+        client_a
+            .heartbeat(
+                gear,
+                &instance_id.to_string(),
+                Some(cf_system_sdks::directory::ReportedState::Serving),
+            )
+            .await
+            .unwrap();
+        wait_for("serving heartbeat must reach the other replica", || {
+            manager_b.instances_of(gear).iter().any(|instance| {
+                instance.instance_id == instance_id
+                    && instance.state() == toolkit::runtime::InstanceState::Healthy
+            })
+        })
+        .await;
+
+        client_a
+            .heartbeat(
+                gear,
+                &instance_id.to_string(),
+                Some(cf_system_sdks::directory::ReportedState::Draining),
+            )
+            .await
+            .unwrap();
+        wait_for("draining heartbeat must reach the other replica", || {
+            manager_b.instances_of(gear).iter().any(|instance| {
+                instance.instance_id == instance_id
+                    && instance.state() == toolkit::runtime::InstanceState::Draining
+            })
+        })
+        .await;
+
+        client_a
+            .deregister_instance(gear, &instance_id.to_string())
+            .await
+            .unwrap();
+        wait_for("deregistration must reach the other replica", || {
+            manager_b.instances_of(gear).is_empty()
+        })
+        .await;
+
+        cancel_a.cancel();
+        cancel_b.cancel();
+        task_a.await.unwrap();
+        task_b.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_during_lease_grace_restores_quarantined_state() {
+        let backend = MemoryDirectoryBackend::default();
+        let id = Uuid::new_v4();
+        backend
+            .register(
+                Arc::new(
+                    GearInstance::new("grace-gear", id).with_reported_state(ReportedState::Serving),
+                ),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        backend.set_lease_age("grace-gear", id, Duration::from_secs(10));
+
+        let replica = DirectoryReplica::new(Arc::new(
+            GearManager::new().with_lease_policy(Duration::from_secs(30), Duration::from_secs(30)),
+        ));
+        load_backend_snapshot(&replica, &backend).await.unwrap();
+
+        assert_eq!(
+            replica.manager().instances_of("grace-gear")[0].state(),
+            toolkit::runtime::InstanceState::Quarantined
+        );
+    }
+
+    #[tokio::test]
+    async fn reregister_after_lease_grace_starts_a_new_generation() {
+        let backend = MemoryDirectoryBackend::default();
+        let id = Uuid::new_v4();
+        let ttl = Duration::from_secs(30);
+        let grace = Duration::from_secs(30);
+        let first = backend
+            .register(
+                Arc::new(
+                    GearInstance::new("grace-gear", id).with_reported_state(ReportedState::Serving),
+                ),
+                ttl,
+                grace,
+            )
+            .await
+            .unwrap();
+        backend.set_lease_age("grace-gear", id, Duration::from_secs(61));
+
+        let second = backend
+            .register(
+                Arc::new(
+                    GearInstance::new("grace-gear", id)
+                        .with_reported_state(ReportedState::Starting),
+                ),
+                ttl,
+                grace,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(second.generation, first.generation + 1);
+        assert_eq!(
+            second.instance.reported_state,
+            Some(ReportedState::Starting)
+        );
+    }
+
+    /// Poll `done` until it holds, failing with `msg` after five seconds.
+    async fn wait_for(msg: &str, done: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect(msg);
+    }
+
+    /// Delegates to a [`MemoryDirectoryBackend`], but its `load_all` call
+    /// number `fail_load` fails, its first `end_feeds` change feeds end
+    /// immediately, and later feeds end after `feed_items` changes.
+    struct FlakyBackend {
+        inner: MemoryDirectoryBackend,
+        fail_load: usize,
+        end_feeds: usize,
+        feed_items: usize,
+        subscriptions: AtomicUsize,
+        loads: AtomicUsize,
+    }
+
+    impl FlakyBackend {
+        fn new(inner: MemoryDirectoryBackend, fail_load: usize, end_feeds: usize) -> Self {
+            Self {
+                inner,
+                fail_load,
+                end_feeds,
+                feed_items: usize::MAX,
+                subscriptions: AtomicUsize::new(0),
+                loads: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_feed_items(mut self, feed_items: usize) -> Self {
+            self.feed_items = feed_items;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl DirectoryBackend for FlakyBackend {
+        async fn register(
+            &self,
+            instance: Arc<GearInstance>,
+            ttl: Duration,
+            grace: Duration,
+        ) -> Result<DirectoryRecord, DirectoryBackendError> {
+            self.inner.register(instance, ttl, grace).await
+        }
+        async fn heartbeat(
+            &self,
+            gear: &str,
+            id: Uuid,
+            reported: ReportedState,
+            ttl: Duration,
+            grace: Duration,
+        ) -> Result<Option<DirectoryRecord>, DirectoryBackendError> {
+            self.inner.heartbeat(gear, id, reported, ttl, grace).await
+        }
+        async fn deregister(
+            &self,
+            gear: &str,
+            id: Uuid,
+        ) -> Result<Option<DirectoryRecord>, DirectoryBackendError> {
+            self.inner.deregister(gear, id).await
+        }
+        async fn load_all(
+            &self,
+            grace: Duration,
+        ) -> Result<Vec<DirectoryRecord>, DirectoryBackendError> {
+            if self.loads.fetch_add(1, Ordering::SeqCst) == self.fail_load {
+                return Err(DirectoryBackendError::Unavailable(anyhow::anyhow!(
+                    "backend unavailable"
+                )));
+            }
+            self.inner.load_all(grace).await
+        }
+        async fn changes(&self) -> Result<DirectoryChangeStream, DirectoryBackendError> {
+            if self.subscriptions.fetch_add(1, Ordering::SeqCst) < self.end_feeds {
+                // `unfold` panics if polled again after it ends.
+                Ok(Box::pin(futures_util::stream::unfold((), |()| async {
+                    None
+                })))
+            } else {
+                Ok(Box::pin(self.inner.changes().await?.take(self.feed_items)))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_loop_resyncs_after_feed_ends_and_load_fails() {
+        let memory = MemoryDirectoryBackend::default();
+        let backend = Arc::new(FlakyBackend::new(memory.clone(), 1, 1));
+        let manager = Arc::new(GearManager::new());
+        let loaded = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(backend_feed_loop(
+            Arc::new(DirectoryReplica::new(Arc::clone(&manager))),
+            backend.clone(),
+            Arc::clone(&loaded),
+            cancel.clone(),
+        ));
+
+        // Wait until the loop has resubscribed after the failed reload.
+        wait_for("feed loop must retry the failed snapshot load", || {
+            backend.loads.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+        assert!(loaded.load(Ordering::Acquire));
+
+        memory
+            .register(
+                Arc::new(GearInstance::new("late-gear", Uuid::new_v4())),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        wait_for("feed loop must follow the new feed after resyncing", || {
+            !manager.instances_of("late-gear").is_empty()
+        })
+        .await;
+
+        cancel.cancel();
+        task.await.expect("feed loop must stop cleanly on cancel");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_watch_closures_back_off_between_snapshot_reloads() {
+        let memory = MemoryDirectoryBackend::default();
+        let backend = Arc::new(FlakyBackend::new(memory, usize::MAX, 2));
+        let manager = Arc::new(GearManager::new());
+        let loaded = Arc::new(AtomicBool::new(false));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(backend_feed_loop(
+            Arc::new(DirectoryReplica::new(manager)),
+            backend.clone(),
+            loaded,
+            cancel.clone(),
+        ));
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.subscriptions.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(RESYNC_INITIAL_BACKOFF.saturating_sub(Duration::from_millis(1))).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.subscriptions.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_millis(499)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 2);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 3);
+        assert_eq!(backend.subscriptions.load(Ordering::SeqCst), 3);
+
+        cancel.cancel();
+        task.await.expect("feed loop must stop cleanly on cancel");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backoff_resets_once_a_feed_delivers_a_change() {
+        let memory = MemoryDirectoryBackend::default();
+        let backend = Arc::new(FlakyBackend::new(memory.clone(), usize::MAX, 2).with_feed_items(1));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(backend_feed_loop(
+            Arc::new(DirectoryReplica::new(Arc::new(GearManager::new()))),
+            backend.clone(),
+            Arc::new(AtomicBool::new(false)),
+            cancel.clone(),
+        ));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+
+        // Two feeds end at once: the delay grows to 250 ms, then 500 ms.
+        settle().await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        settle().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        settle().await;
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 3);
+
+        // The third feed delivers one change and then ends.
+        memory
+            .register(
+                Arc::new(GearInstance::new("gear", Uuid::new_v4())),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        settle().await;
+        tokio::time::advance(RESYNC_INITIAL_BACKOFF.saturating_sub(Duration::from_millis(1))).await;
+        settle().await;
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 3);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        settle().await;
+        assert_eq!(
+            backend.loads.load(Ordering::SeqCst),
+            4,
+            "a feed that delivered a change must resync after the initial backoff"
+        );
+
+        cancel.cancel();
+        task.await.expect("feed loop must stop cleanly on cancel");
+    }
+
+    #[test]
+    fn repeated_watch_failures_carry_capped_backoff() {
+        let mut delay = RESYNC_INITIAL_BACKOFF;
+        let mut observed = vec![delay];
+        for _ in 0..8 {
+            delay = next_resync_delay(delay);
+            observed.push(delay);
+        }
+        assert_eq!(
+            observed,
+            [
+                Duration::from_millis(250),
+                Duration::from_millis(500),
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    struct SnapshotBarrierBackend {
+        inner: MemoryDirectoryBackend,
+        snapshot_taken: Arc<tokio::sync::Notify>,
+        release_snapshot: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl DirectoryBackend for SnapshotBarrierBackend {
+        async fn register(
+            &self,
+            instance: Arc<GearInstance>,
+            ttl: Duration,
+            grace: Duration,
+        ) -> Result<DirectoryRecord, DirectoryBackendError> {
+            self.inner.register(instance, ttl, grace).await
+        }
+
+        async fn heartbeat(
+            &self,
+            gear: &str,
+            id: Uuid,
+            reported: ReportedState,
+            ttl: Duration,
+            grace: Duration,
+        ) -> Result<Option<DirectoryRecord>, DirectoryBackendError> {
+            self.inner.heartbeat(gear, id, reported, ttl, grace).await
+        }
+
+        async fn deregister(
+            &self,
+            gear: &str,
+            id: Uuid,
+        ) -> Result<Option<DirectoryRecord>, DirectoryBackendError> {
+            self.inner.deregister(gear, id).await
+        }
+
+        async fn load_all(
+            &self,
+            grace: Duration,
+        ) -> Result<Vec<DirectoryRecord>, DirectoryBackendError> {
+            let snapshot = self.inner.load_all(grace).await?;
+            self.snapshot_taken.notify_one();
+            self.release_snapshot.notified().await;
+            Ok(snapshot)
+        }
+
+        async fn changes(&self) -> Result<DirectoryChangeStream, DirectoryBackendError> {
+            self.inner.changes().await
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_buffers_a_write_during_initial_snapshot_scan() {
+        let backend = Arc::new(SnapshotBarrierBackend {
+            inner: MemoryDirectoryBackend::default(),
+            snapshot_taken: Arc::new(tokio::sync::Notify::new()),
+            release_snapshot: Arc::new(tokio::sync::Notify::new()),
+        });
+        let manager = Arc::new(GearManager::new());
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(backend_feed_loop(
+            Arc::new(DirectoryReplica::new(Arc::clone(&manager))),
+            backend.clone(),
+            Arc::new(AtomicBool::new(false)),
+            cancel.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), backend.snapshot_taken.notified())
+            .await
+            .expect("snapshot scan must start after subscription");
+        backend
+            .inner
+            .register(
+                Arc::new(GearInstance::new("racing-gear", Uuid::new_v4())),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        backend.release_snapshot.notify_one();
+
+        wait_for(
+            "the write during the scan must arrive on the established feed",
+            || !manager.instances_of("racing-gear").is_empty(),
+        )
+        .await;
+
+        cancel.cancel();
+        task.await.expect("feed loop must stop cleanly on cancel");
     }
 
     #[tokio::test]

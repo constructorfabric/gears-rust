@@ -1145,7 +1145,7 @@ mod directory_client_bootstrap {
 mod auth_disabled {
     use super::*;
     use crate::bootstrap::config::OopHttpConfig;
-    use crate::directory::LocalDirectoryClient;
+    use crate::directory::test_support::ManagerDirectoryClient;
     use crate::runtime::GearManager;
 
     async fn serve_auth_disabled(extra: serde_json::Value) -> bool {
@@ -1158,7 +1158,7 @@ mod auth_disabled {
         }
         let cfg: OopHttpConfig = serde_json::from_value(raw).expect("valid oop_http");
         let directory: Arc<dyn DirectoryClient> =
-            Arc::new(LocalDirectoryClient::new(Arc::new(GearManager::new())));
+            Arc::new(ManagerDirectoryClient::new(Arc::new(GearManager::new())));
         build_oop_serve_options(
             &cfg,
             "gear",

@@ -34,9 +34,10 @@ use api_contracts_sdk::models::{ChargeRequest, PaymentStatus};
 use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl};
 use toolkit::config::ConfigProvider;
 use toolkit::contracts::{ApiGatewayCapability, Gear, RestApiCapability, RunnableCapability};
+use toolkit::directory::test_support::ManagerDirectoryClient;
 use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::HostRuntime;
-use toolkit::{ClientHub, DbOptions, DirectoryClient, GearCtx, GearManager, LocalDirectoryClient};
+use toolkit::{ClientHub, DbOptions, DirectoryClient, GearCtx, GearManager};
 use toolkit_security::SecurityContext;
 
 use cf_api_contracts::ApiContracts;
@@ -236,7 +237,7 @@ async fn consumer_resolves_provider_local_impl_through_the_hub() {
     // A directory must be in the hub for the proxy-wiring phase to replay the
     // consumer registration (which then short-circuits on the local impl).
     let gear_mgr = Arc::new(GearManager::new());
-    let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(gear_mgr));
+    let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(gear_mgr));
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn DirectoryClient>(dir);
     hub.register::<dyn cluster_sdk::ClusterClient>(Arc::new(NoCluster));
@@ -348,7 +349,7 @@ async fn consumer_resolves_provider_via_generated_rest_client() {
     let registry = builder.build_topo_sorted().expect("registry build");
 
     let gear_mgr = Arc::new(GearManager::new());
-    let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(gear_mgr));
+    let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(gear_mgr));
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn DirectoryClient>(dir);
     hub.register::<dyn cluster_sdk::ClusterClient>(Arc::new(NoCluster));

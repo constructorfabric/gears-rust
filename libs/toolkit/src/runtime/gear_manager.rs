@@ -1,7 +1,7 @@
 //! Gear Manager - tracks and manages all live gear instances in the runtime
 
 use dashmap::DashMap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -132,6 +132,33 @@ struct InstanceRuntimeState {
     reported: ReportedState,
 }
 
+impl InstanceRuntimeState {
+    /// Placeholder lease: already expired, so an instance that is never
+    /// registered is never observable. Storing the record in a `GearManager`
+    /// stamps the real lease (`now + ttl`) and grace from the manager policy.
+    fn placeholder(reported: ReportedState) -> Arc<parking_lot::RwLock<Self>> {
+        Arc::new(parking_lot::RwLock::new(Self {
+            lease_expires_at: Instant::now(),
+            grace: Duration::ZERO,
+            reported,
+        }))
+    }
+}
+
+/// How [`GearManager::store_instance`] combines an incoming record with a
+/// stored one for the same instance.
+#[derive(Clone, Copy)]
+enum StoreMode {
+    /// Partial registration: absent fields keep their stored values and the
+    /// lease is renewed to `now + ttl`.
+    Merge,
+    /// Complete record: replaces the stored metadata and takes the given
+    /// absolute lease deadline.
+    Replace {
+        lease_expires_at: std::time::SystemTime,
+    },
+}
+
 /// Represents a single instance of a gear
 #[derive(Debug)]
 #[must_use]
@@ -232,14 +259,7 @@ impl GearInstance {
             openapi_spec_hash: None,
             labels: BTreeMap::new(),
             reported_state: None,
-            // Placeholder lease: already expired, so an instance that is never
-            // registered is never observable. `register_instance` stamps the
-            // real lease (`now + ttl`) and grace from the manager policy.
-            inner: Arc::new(parking_lot::RwLock::new(InstanceRuntimeState {
-                lease_expires_at: Instant::now(),
-                grace: Duration::ZERO,
-                reported: ReportedState::Starting,
-            })),
+            inner: InstanceRuntimeState::placeholder(ReportedState::Starting),
         }
     }
 
@@ -277,6 +297,22 @@ impl GearInstance {
     pub fn with_reported_state(mut self, reported: ReportedState) -> Self {
         self.reported_state = Some(reported);
         self
+    }
+
+    /// Copy of this record's metadata bound to `inner` as its runtime state.
+    fn with_runtime(&self, inner: Arc<parking_lot::RwLock<InstanceRuntimeState>>) -> Self {
+        Self {
+            gear: self.gear.clone(),
+            instance_id: self.instance_id,
+            control: self.control.clone(),
+            grpc_services: self.grpc_services.clone(),
+            version: self.version.clone(),
+            rest_endpoint: self.rest_endpoint.clone(),
+            openapi_spec_hash: self.openapi_spec_hash.clone(),
+            labels: self.labels.clone(),
+            reported_state: self.reported_state,
+            inner,
+        }
     }
 
     /// The observable [`InstanceState`] derived from the lease and reported
@@ -341,11 +377,11 @@ pub struct GearManager {
     /// it.
     ///
     /// Contract: every operation that *creates* a name→gear binding must hold
-    /// this lock — today `register_instance`, `set_grpc_service_owners`, and
-    /// `merge_authoritative_grpc_service_owners`. `deregister` / `sweep_expired`
-    /// only *free* names and `heartbeat` only renews a lease, so they cannot
-    /// create a second owner and need not take it. Any future mutator that can
-    /// bind a name must.
+    /// this lock — today `register_instance`, `upsert_record`, `replace_all`,
+    /// `set_grpc_service_owners`, and `merge_authoritative_grpc_service_owners`.
+    /// `deregister` / `sweep_expired` only *free* names and `heartbeat` only
+    /// renews a lease, so they cannot create a second owner and need not take
+    /// it. Any future mutator that can bind a name must.
     reg_lock: parking_lot::Mutex<()>,
     /// Authoritative gRPC-service-name -> owning-gear map. When a name appears
     /// here, ownership is fixed to the named gear: only that gear may advertise
@@ -441,6 +477,13 @@ impl GearManager {
         self.lease.read().ttl
     }
 
+    /// Grace interval, used by the service-discovery store when loading live
+    /// and quarantined records.
+    #[must_use]
+    pub fn lease_grace(&self) -> Duration {
+        self.lease.read().grace
+    }
+
     /// Install the authoritative gRPC-service-name -> owning-gear map.
     ///
     /// A listed name may be advertised only by its owner (enforced in
@@ -519,47 +562,174 @@ impl GearManager {
     ) -> Result<(), GrpcServiceNameConflict> {
         let _gate = self.reg_lock.lock();
         self.check_grpc_service_ownership(&instance)?;
+        self.store_instance(instance, StoreMode::Merge);
+        Ok(())
+    }
 
+    /// Reject `instance` if it advertises a gRPC service name pinned to a
+    /// different gear by the configured ownership map. The conflict is
+    /// permanent: waiting cannot clear it.
+    ///
+    /// With a shared store, this checks the configured pins before the store
+    /// enforces first-registration claims across replicas.
+    ///
+    /// # Errors
+    /// Returns a non-recoverable [`GrpcServiceNameConflict`] for a pinned name.
+    pub fn check_pinned_grpc_service_ownership(
+        &self,
+        instance: &GearInstance,
+    ) -> Result<(), GrpcServiceNameConflict> {
+        let declared = self.service_owners.read();
+        for service_name in instance.grpc_services.keys() {
+            if let Some(owner) = declared.get(service_name)
+                && owner != &instance.gear
+            {
+                return Err(GrpcServiceNameConflict {
+                    service_name: service_name.clone(),
+                    owner: owner.clone(),
+                    recoverable: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Store a complete record from an external authority (e.g. a replicated
+    /// backend) with an absolute lease deadline. Unlike
+    /// [`register_instance`](Self::register_instance), absent fields clear the
+    /// stored ones and only pinned ownership is checked. Ordering against the
+    /// stored copy is the caller's job.
+    ///
+    /// # Errors
+    /// Returns [`GrpcServiceNameConflict`] if the record advertises a gRPC
+    /// service name pinned to a different gear; the store is unchanged.
+    pub fn upsert_record(
+        &self,
+        instance: Arc<GearInstance>,
+        lease_expires_at: std::time::SystemTime,
+    ) -> Result<(), GrpcServiceNameConflict> {
+        let _gate = self.reg_lock.lock();
+        self.check_pinned_grpc_service_ownership(&instance)?;
+        self.store_instance(instance, StoreMode::Replace { lease_expires_at });
+        Ok(())
+    }
+
+    /// Replace the whole store in one critical section: remove every instance
+    /// neither in `records` nor kept by `retain(gear, instance_id)`, then
+    /// store each record as by [`upsert_record`](Self::upsert_record).
+    ///
+    /// Records violating pinned ownership are skipped and logged, and treated
+    /// as absent; their `(gear, instance_id)` keys are returned.
+    pub fn replace_all(
+        &self,
+        records: Vec<(Arc<GearInstance>, std::time::SystemTime)>,
+        retain: impl Fn(&str, Uuid) -> bool,
+    ) -> Vec<(String, Uuid)> {
+        let _gate = self.reg_lock.lock();
+        let mut rejected = Vec::new();
+        let mut accepted = Vec::with_capacity(records.len());
+        for (instance, lease_expires_at) in records {
+            match self.check_pinned_grpc_service_ownership(&instance) {
+                Ok(()) => accepted.push((instance, lease_expires_at)),
+                Err(conflict) => {
+                    tracing::warn!(
+                        gear = %instance.gear,
+                        instance_id = %instance.instance_id,
+                        %conflict,
+                        "skipping record that violates pinned gRPC service ownership"
+                    );
+                    rejected.push((instance.gear.clone(), instance.instance_id));
+                }
+            }
+        }
+
+        let incoming: HashSet<(String, Uuid)> = accepted
+            .iter()
+            .map(|(instance, _)| (instance.gear.clone(), instance.instance_id))
+            .collect();
+        let mut stale = Vec::new();
+        for entry in &self.inner {
+            for instance in entry.value() {
+                let key = (entry.key().clone(), instance.instance_id);
+                if !incoming.contains(&key) && !retain(&key.0, key.1) {
+                    stale.push(key);
+                }
+            }
+        }
+        for (gear, instance_id) in stale {
+            self.deregister(&gear, instance_id);
+        }
+        for (instance, lease_expires_at) in accepted {
+            self.store_instance(instance, StoreMode::Replace { lease_expires_at });
+        }
+        rejected
+    }
+
+    /// Insert or update `instance` and renew its lease. Must be called with
+    /// `reg_lock` held, after the caller's ownership check.
+    fn store_instance(&self, instance: Arc<GearInstance>, mode: StoreMode) {
         let now = Instant::now();
         let declared = instance.reported_state;
         let gear = instance.gear.clone();
         let mut vec = self.inner.entry(gear).or_default();
-        // replace by instance_id if it already exists
-        let record = if let Some(pos) = vec
+        let pos = vec
             .iter()
-            .position(|i| i.instance_id == instance.instance_id)
-        {
-            // A record whose lease has lapsed past its grace window is
-            // unobservable and may already have had its gRPC service names
-            // reclaimed by another gear (`check_grpc_service_ownership` skips
-            // dead records). Merging would restore those names from the stored
-            // half — names the ownership check above never saw, as it only
-            // validates `instance`'s own services — and revive the dead lease,
-            // leaving two gears advertising one name. Treat it as a fresh
-            // registration so only the just-validated half survives.
-            if vec[pos].observed_state_at(now).is_none() {
-                vec[pos] = Arc::clone(&instance);
-                instance
-            } else {
-                let merged = Arc::new(vec[pos].with_metadata_of(&instance));
-                vec[pos] = Arc::clone(&merged);
-                merged
-            }
+            .position(|i| i.instance_id == instance.instance_id);
+        // A record whose lease has lapsed past its grace window is unobservable
+        // and may already have had its gRPC service names reclaimed by another
+        // gear (`check_grpc_service_ownership` skips dead records). Merging
+        // would restore those names from the stored half — names the ownership
+        // check never saw, as it only validates `instance`'s own services — and
+        // revive the dead lease, leaving two gears advertising one name. Treat
+        // it as a fresh registration so only the just-validated half survives.
+        let live = pos.filter(|&pos| vec[pos].observed_state_at(now).is_some());
+        let record = if let Some(pos) = live {
+            // Keep the stored runtime-state lock so a concurrent `heartbeat`
+            // keeps writing the same lease.
+            let updated = Arc::new(match mode {
+                StoreMode::Merge => vec[pos].with_metadata_of(&instance),
+                StoreMode::Replace { .. } => instance.with_runtime(Arc::clone(&vec[pos].inner)),
+            });
+            vec[pos] = Arc::clone(&updated);
+            updated
         } else {
-            vec.push(Arc::clone(&instance));
-            instance
+            let fresh = match mode {
+                StoreMode::Merge => instance,
+                // A complete record may be shared with other managers (e.g.
+                // replicas applying the same feed); never adopt its runtime
+                // state.
+                StoreMode::Replace { .. } => Arc::new(
+                    instance
+                        .with_runtime(InstanceRuntimeState::placeholder(ReportedState::Starting)),
+                ),
+            };
+            match pos {
+                Some(pos) => vec[pos] = Arc::clone(&fresh),
+                None => vec.push(Arc::clone(&fresh)),
+            }
+            fresh
         };
 
         // Renew the lease and apply the declared state. On a re-register that
         // omits the state, keep the stored one (see the doc above).
         let policy = *self.lease.read();
         let mut s = record.inner.write();
-        s.lease_expires_at = now + policy.ttl;
+        s.lease_expires_at = match mode {
+            StoreMode::Merge => now + policy.ttl,
+            // Map the absolute deadline onto this process's clock, keeping a
+            // lapsed one in the past so the grace window runs from the real
+            // deadline and an already-dead record stays unobservable.
+            StoreMode::Replace { lease_expires_at } => {
+                match lease_expires_at.duration_since(std::time::SystemTime::now()) {
+                    Ok(remaining) => now + remaining,
+                    Err(lapsed) => now.checked_sub(lapsed.duration()).unwrap_or(now),
+                }
+            }
+        };
         s.grace = policy.grace;
         if let Some(reported) = declared {
             s.reported = reported;
         }
-        Ok(())
     }
 
     /// Authorize every gRPC service name `instance` advertises, resolving
@@ -590,26 +760,11 @@ impl GearManager {
         &self,
         instance: &GearInstance,
     ) -> Result<(), GrpcServiceNameConflict> {
-        // Tier 1: reject a declared name claimed by a non-owner; the rest (the
-        // declared owner, and undeclared names) still need the tier-2 scan.
-        let declared = self.service_owners.read();
-        let mut to_scan: Vec<&str> = Vec::new();
-        for service_name in instance.grpc_services.keys() {
-            match declared.get(service_name) {
-                Some(owner) if *owner != instance.gear => {
-                    // Tier 1: the name is pinned to another gear by the
-                    // authoritative map — permanent, waiting cannot clear it.
-                    return Err(GrpcServiceNameConflict {
-                        service_name: service_name.clone(),
-                        owner: owner.clone(),
-                        recoverable: false,
-                    });
-                }
-                _ => to_scan.push(service_name),
-            }
-        }
-        drop(declared);
-        if to_scan.is_empty() {
+        // Tier 1: reject a declared name claimed by a non-owner; every name
+        // that passes (the declared owner's, and undeclared ones) still needs
+        // the tier-2 scan.
+        self.check_pinned_grpc_service_ownership(instance)?;
+        if instance.grpc_services.is_empty() {
             return Ok(());
         }
 
@@ -628,14 +783,15 @@ impl GearManager {
                 if existing.observed_state_at(now).is_none() {
                     continue; // dead record: releases its gRPC names
                 }
-                if let Some(&name) = to_scan
-                    .iter()
-                    .find(|&&n| existing.grpc_services.contains_key(n))
+                if let Some(name) = instance
+                    .grpc_services
+                    .keys()
+                    .find(|name| existing.grpc_services.contains_key(*name))
                 {
                     // Tier 2: a *different* gear currently advertises the name —
                     // recoverable, it clears when that holder deregisters/expires.
                     return Err(GrpcServiceNameConflict {
-                        service_name: name.to_owned(),
+                        service_name: name.clone(),
                         owner: entry.key().clone(),
                         recoverable: true,
                     });
@@ -753,19 +909,27 @@ impl GearManager {
             .collect()
     }
 
-    /// Remove records whose lease expired more than `grace` ago.
+    /// Remove records whose lease expired more than `grace` ago, returning the
+    /// `(gear, instance_id)` of each removed record.
     ///
-    /// This is the `memory`-mode sweeper: a record is no longer observable once
-    /// its lease lapses past the grace window, so this only garbage-collects —
-    /// reads already hide such records. Removing a gear's last instance also
-    /// frees its round-robin counters and the gRPC service names it held.
-    pub fn sweep_expired(&self, now: Instant) {
+    /// A record is no longer observable once its lease lapses past the grace
+    /// window, so this only garbage-collects — reads already hide such
+    /// records. Removing a gear's last instance also frees its round-robin
+    /// counters and the gRPC service names it held.
+    pub fn sweep_expired(&self, now: Instant) -> Vec<(String, Uuid)> {
         let mut empty_gears = Vec::new();
+        let mut removed = Vec::new();
 
         for mut entry in self.inner.iter_mut() {
             let gear = entry.key().clone();
             let vec = entry.value_mut();
-            vec.retain(|inst| inst.observed_state_at(now).is_some());
+            vec.retain(|inst| {
+                let live = inst.observed_state_at(now).is_some();
+                if !live {
+                    removed.push((gear.clone(), inst.instance_id));
+                }
+                live
+            });
             if vec.is_empty() {
                 empty_gears.push(gear);
             }
@@ -786,6 +950,7 @@ impl GearManager {
                 self.rr_counters.remove(&format!("rest:{gear}"));
             }
         }
+        removed
     }
 
     /// From a candidate set, return the serving subset (`Healthy`/`Ready`); if
@@ -1001,6 +1166,170 @@ mod tests {
             .checked_sub(ago)
             .expect("test lease subtraction should not underflow");
         s.grace = grace;
+    }
+
+    fn complete_record(gear: &str, id: Uuid, reported: ReportedState) -> Arc<GearInstance> {
+        Arc::new(
+            GearInstance::new(gear, id)
+                .with_rest_endpoint(Endpoint::http("127.0.0.1", 8080))
+                .with_reported_state(reported),
+        )
+    }
+
+    fn lease_in(secs: u64) -> std::time::SystemTime {
+        std::time::SystemTime::now() + Duration::from_secs(secs)
+    }
+
+    fn state_of(mgr: &GearManager, gear: &str) -> Option<InstanceState> {
+        mgr.instances_of(gear).first().map(|i| i.state())
+    }
+
+    #[test]
+    fn upserted_records_do_not_share_runtime_state_across_managers() {
+        let record = complete_record("shared", Uuid::new_v4(), ReportedState::Serving);
+        let mgr_a = GearManager::new();
+        let mgr_b = GearManager::new();
+        mgr_a
+            .upsert_record(Arc::clone(&record), lease_in(60))
+            .unwrap();
+        mgr_b.upsert_record(record, lease_in(60)).unwrap();
+
+        expire_lease(
+            &mgr_a.all_instances()[0],
+            Duration::from_secs(10),
+            Duration::ZERO,
+        );
+
+        assert_eq!(state_of(&mgr_a, "shared"), None);
+        assert_eq!(state_of(&mgr_b, "shared"), Some(InstanceState::Healthy));
+    }
+
+    #[test]
+    fn upsert_takes_the_absolute_deadline_instead_of_a_fresh_ttl() {
+        let mgr = GearManager::new();
+        let record = complete_record("gear", Uuid::new_v4(), ReportedState::Serving);
+
+        mgr.upsert_record(
+            record,
+            std::time::SystemTime::now() - Duration::from_secs(10),
+        )
+        .unwrap();
+
+        assert_eq!(state_of(&mgr, "gear"), Some(InstanceState::Quarantined));
+    }
+
+    #[test]
+    fn upsert_of_a_record_lapsed_past_grace_is_not_observable() {
+        let mgr =
+            GearManager::new().with_lease_policy(Duration::from_secs(30), Duration::from_secs(5));
+        let record = complete_record("gear", Uuid::new_v4(), ReportedState::Serving);
+
+        mgr.upsert_record(
+            record,
+            std::time::SystemTime::now() - Duration::from_secs(10),
+        )
+        .unwrap();
+
+        assert_eq!(state_of(&mgr, "gear"), None);
+    }
+
+    #[test]
+    fn upsert_replaces_absent_fields_instead_of_merging() {
+        let mgr = GearManager::new();
+        let id = Uuid::new_v4();
+        mgr.upsert_record(
+            complete_record("gear", id, ReportedState::Serving),
+            lease_in(60),
+        )
+        .unwrap();
+
+        mgr.upsert_record(
+            Arc::new(GearInstance::new("gear", id).with_reported_state(ReportedState::Draining)),
+            lease_in(60),
+        )
+        .unwrap();
+
+        let instances = mgr.instances_of("gear");
+        assert_eq!(instances[0].rest_endpoint, None);
+        assert_eq!(instances[0].state(), InstanceState::Draining);
+    }
+
+    #[test]
+    fn replace_all_removes_unlisted_keeps_retained_and_skips_pinned_violations() {
+        let mgr = GearManager::new();
+        mgr.set_grpc_service_owners(HashMap::from([(
+            "pinned.Service".to_owned(),
+            "owner".to_owned(),
+        )]));
+        let reloaded = Uuid::new_v4();
+        let retained = Uuid::new_v4();
+        let stale = Uuid::new_v4();
+        let squatter = Uuid::new_v4();
+        for id in [reloaded, retained, stale] {
+            mgr.upsert_record(
+                complete_record("gear", id, ReportedState::Serving),
+                lease_in(60),
+            )
+            .unwrap();
+        }
+
+        let rejected = mgr.replace_all(
+            vec![
+                (
+                    Arc::new(
+                        GearInstance::new("gear", reloaded)
+                            .with_reported_state(ReportedState::Draining),
+                    ),
+                    lease_in(60),
+                ),
+                (
+                    Arc::new(
+                        GearInstance::new("squatter", squatter)
+                            .with_grpc_service("pinned.Service", Endpoint::http("127.0.0.1", 9000))
+                            .with_reported_state(ReportedState::Serving),
+                    ),
+                    lease_in(60),
+                ),
+            ],
+            |gear, id| gear == "gear" && id == retained,
+        );
+
+        assert_eq!(rejected, vec![("squatter".to_owned(), squatter)]);
+        let mut ids: Vec<_> = mgr
+            .instances_of("gear")
+            .iter()
+            .map(|instance| (instance.instance_id, instance.state()))
+            .collect();
+        ids.sort_by_key(|(id, _)| *id);
+        let mut expected = vec![
+            (reloaded, InstanceState::Draining),
+            (retained, InstanceState::Healthy),
+        ];
+        expected.sort_by_key(|(id, _)| *id);
+        assert_eq!(ids, expected);
+        assert!(mgr.instances_of("squatter").is_empty());
+    }
+
+    #[test]
+    fn sweep_expired_reports_removed_records() {
+        let mgr = GearManager::new();
+        let expired = Uuid::new_v4();
+        let live = Uuid::new_v4();
+        seed(&mgr, Arc::new(GearInstance::new("gear", expired)));
+        seed(&mgr, Arc::new(GearInstance::new("gear", live)));
+        expire_lease(
+            &mgr.instances_of("gear")
+                .into_iter()
+                .find(|instance| instance.instance_id == expired)
+                .unwrap(),
+            Duration::from_secs(10),
+            Duration::ZERO,
+        );
+
+        assert_eq!(
+            mgr.sweep_expired(Instant::now()),
+            vec![("gear".to_owned(), expired)]
+        );
     }
 
     fn labels(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

@@ -17,7 +17,7 @@ use api_contracts_sdk::grpc::{
 };
 use api_contracts_sdk::models::ChargeRequest;
 use tokio::sync::oneshot;
-use toolkit::directory::LocalDirectoryClient;
+use toolkit::directory::test_support::ManagerDirectoryClient;
 use toolkit::discovery::{DirectoryEndpointResolver, EndpointResolver};
 use toolkit::runtime::{Endpoint, GearInstance, GearManager};
 use toolkit_canonical_errors::CanonicalError;
@@ -105,7 +105,7 @@ fn consumer(
     breaker: CircuitBreakerConfig,
 ) -> PaymentApiGrpcResolvingClient {
     let resolver =
-        DirectoryEndpointResolver::new(Arc::new(LocalDirectoryClient::new(Arc::clone(gears))));
+        DirectoryEndpointResolver::new(Arc::new(ManagerDirectoryClient::new(Arc::clone(gears))));
     PaymentApiGrpcResolvingClient::new(Arc::new(resolver), PROVIDER, tuning(breaker))
 }
 
@@ -217,7 +217,7 @@ async fn each_major_version_resolves_to_its_own_provider() {
             ))
             .unwrap();
     }
-    let resolver = DirectoryEndpointResolver::new(Arc::new(LocalDirectoryClient::new(gears)));
+    let resolver = DirectoryEndpointResolver::new(Arc::new(ManagerDirectoryClient::new(gears)));
 
     assert_eq!(
         resolver

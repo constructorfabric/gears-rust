@@ -3575,7 +3575,7 @@ mod tests {
         runtime
             .client_hub
             .register::<dyn crate::DirectoryClient>(Arc::new(
-                crate::directory::LocalDirectoryClient::new(Arc::clone(&gears)),
+                crate::directory::test_support::ManagerDirectoryClient::new(Arc::clone(&gears)),
             ));
         let (reg_a, reg_b) = (shipping_registration("a"), shipping_registration("b"));
         runtime
@@ -3679,7 +3679,7 @@ mod tests {
         runtime
             .client_hub
             .register::<dyn crate::DirectoryClient>(Arc::new(
-                crate::directory::LocalDirectoryClient::new(Arc::clone(&gears)),
+                crate::directory::test_support::ManagerDirectoryClient::new(Arc::clone(&gears)),
             ));
         (runtime, gears)
     }
