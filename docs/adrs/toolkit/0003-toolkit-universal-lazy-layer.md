@@ -1322,6 +1322,14 @@ run(run_options).await
 7. First API call triggers lazy resolution — DirectoryClient guaranteed present
 ```
 
+> **Amendment (2026-11-23; implementation ownership, see
+> [ADR-0011](../../arch/toolkit-oop/ADR/0011-cpt-cf-adr-directory-persistence-and-replication.md)):**
+> The Toolkit location and in-process bootstrap description above are historical.
+> The service-discovery gear now owns the local/replicated adapters and registers
+> the selected SDK `DirectoryClient` in `ClientHub` during `init`
+> (`gears/system/service-discovery/src/gear.rs`). The current SDK uses
+> `ServiceEndpoint`; the `RestEndpoint` code sample above is the original sketch.
+
 ##### Why Lazy Clients Never Fail on Missing DirectoryClient
 
 Lazy clients don't resolve during `init()` or `start()`. Resolution happens on **first use**:

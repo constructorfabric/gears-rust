@@ -157,8 +157,7 @@ pub use domain::{DomainErrorMarker, DomainModel};
 // Directory API for service discovery
 pub mod directory;
 pub use directory::{
-    DirectoryClient, GrpcServiceInfo, LocalDirectoryClient, RegisterInstanceInfo, ServiceEndpoint,
-    ServiceInstanceInfo,
+    DirectoryClient, GrpcServiceInfo, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
 };
 
 // REST healthcheck infrastructure. Module private so types have one public path

@@ -11,7 +11,11 @@ pub use gear::ServiceDiscoveryGear;
 // === INTERNAL MODULES (pub for integration tests) ===
 pub mod api;
 mod config;
+mod directory_backend;
+mod directory_client;
 pub mod domain;
+mod local_directory_client;
+mod replica;
 mod server;
 
 // === RE-EXPORTS ===

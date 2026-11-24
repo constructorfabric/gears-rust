@@ -63,6 +63,7 @@ static-authn-plugin = { package = "cf-gears-static-authn-plugin", path = "../../
 types-registry = { package = "cf-gears-types-registry", path = "../../../../gears/system/types-registry/types-registry", optional = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 # The status probe's round trip: a standalone cache bound through the SDK's
 # stub client, so no cluster gear is linked into the tests.
 cluster-sdk = { workspace = true, features = ["test-util"] }

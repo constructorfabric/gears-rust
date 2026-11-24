@@ -36,12 +36,10 @@ use api_contracts_sdk::models::{ChargeRequest, PaymentStatus};
 use toolkit::api::{OpenApiRegistry, OpenApiRegistryImpl};
 use toolkit::config::ConfigProvider;
 use toolkit::contracts::{ApiGatewayCapability, Gear, RestApiCapability, RunnableCapability};
+use toolkit::directory::test_support::ManagerDirectoryClient;
 use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::HostRuntime;
-use toolkit::{
-    ClientHub, DbOptions, DependencyChecker, DirectoryClient, GearCtx, GearManager,
-    LocalDirectoryClient,
-};
+use toolkit::{ClientHub, DbOptions, DependencyChecker, DirectoryClient, GearCtx, GearManager};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::policy::PolicyStack;
 use toolkit_security::SecurityContext;
@@ -218,7 +216,7 @@ async fn consumer_resolves_provider_through_runtime_phases() {
 
     // Directory backed by a GearManager, wired into the hub before phases run.
     let gear_mgr = Arc::new(GearManager::new());
-    let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(gear_mgr));
+    let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(gear_mgr));
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn DirectoryClient>(dir);
 

@@ -11,6 +11,15 @@ It:
 - Registers `DirectoryClient` in `ClientHub` for in-process gears
 - Exposes the `DirectoryService` gRPC service (via `grpc-hub`)
 - Uses the runtime `GearManager` for instance tracking and service resolution
+- Owns both local and replicated `DirectoryClient` adapters, the storage
+  contract, the change-feed lifecycle and replication ordering (record
+  versions and tombstones, in `DirectoryReplica`)
+
+The gear installs the selected adapter as the existing SDK `DirectoryClient`
+for both in-process and gRPC callers. Toolkit's `GearManager` remains the local
+read model and compiled gRPC ownership-pin authority; directory adapter
+selection, storage and replication are gear-owned. `GearManager` only exposes
+cluster-agnostic writes for complete records (upsert, remove, replace-all).
 
 ## Registration authorization
 
@@ -93,9 +102,10 @@ instance's observable state from the lease and the state the instance reports:
 
 `RegisterInstance` returns the granted `ttl` so a worker heartbeats every
 `ttl / 3`. A crashed instance stops being preferred for new traffic within
-`ttl` and becomes unobservable within `ttl + grace`; a memory-mode sweeper then
-reclaims it. A heartbeat for an instance the directory does not know returns
-`NOT_FOUND`, so the worker re-registers within one heartbeat.
+`ttl` and becomes unobservable within `ttl + grace`; the lease sweeper then
+reclaims it from the local snapshot. A heartbeat for an instance the directory
+does not know returns `NOT_FOUND`, so the worker re-registers within one
+heartbeat.
 
 Both `ttl` and `grace` are humantime durations and default to `30s`:
 

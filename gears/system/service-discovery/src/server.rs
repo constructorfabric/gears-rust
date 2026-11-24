@@ -598,11 +598,11 @@ pub fn make_directory_service(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    use crate::local_directory_client::LocalDirectoryClient;
     use cf_system_sdks::directory::GrpcServiceEndpoint;
     use cf_system_sdks::directory::labels::{
         MAX_LABEL_KEY_LEN, MAX_LABEL_VALUE_LEN, MAX_LABELS, is_valid_label_segment,
     };
-    use toolkit::directory::LocalDirectoryClient;
     use toolkit::runtime::GearManager;
     use toolkit_security::PlatformIdentity;
     use uuid::Uuid;

@@ -19,9 +19,11 @@ That has three consequences.
 
 **The registry does not survive a restart.** After a Flight Control restart the directory is empty until every worker
 re-registers. Workers re-register on a 30 s timer (`RE_REGISTER_INTERVAL`,
-`libs/toolkit/src/runtime/oop_registration.rs:36`): a heartbeat for an unknown instance returns `Ok`
-(`libs/toolkit/src/directory.rs:266-272`), so heartbeat failure does not trigger it. Until then the edge serves 404
-for those gears and dependents stay at `503 starting`. DESIGN.md §3.7 defers persistence to "a future ADR".
+`libs/toolkit/src/runtime/oop_registration.rs:36`). Before this decision, a heartbeat for an unknown instance
+returned `Ok`, so heartbeat failure did not trigger re-registration. This decision changes that behavior: an
+unknown heartbeat returns `NOT_FOUND`, which the service-discovery adapter surfaces as `DirectoryNotFound`, so the
+worker re-registers on its next heartbeat. Until the record is restored, the edge serves 404 for those gears and
+dependents stay at `503 starting`. DESIGN.md §3.7 defers persistence to "a future ADR".
 
 **Flight Control cannot run more than one pod.** Each replica would own a separate map. DESIGN.md §"One directory per
 installation" lists what goes wrong (partial edge snapshots that prune live routes, readiness that never arrives,
@@ -77,7 +79,8 @@ how reads stay as cheap as they are today, and how instance liveness and drain a
 * **Dead instances must stop receiving traffic** within a bounded time, without relying on k8s.
 * **Graceful drain must be visible** to the edge and to consumers before the instance deregisters.
 * **Wire changes are additive.** Old workers keep working against a new directory.
-* **No gear code changes.** Everything lives in the toolkit runtime, the directory gear and the edge.
+* **Keep ownership with the gear.** Storage and replication belong to `service-discovery`; toolkit supplies the local
+  read model and the existing SDK `DirectoryClient` contract.
 
 ## Considered Options
 
@@ -145,10 +148,33 @@ With a shared backend:
 * **Other replicas' writes** arrive through `watch_prefix("directory/")`. A watch event carries only the key, so the
   replica reads the value with `get` when it needs it (see [Key layout](#key-layout)).
 * **Initial load and resync**: `scan_prefix` plus `get`. A replica runs it at start, after its watch stream breaks,
-  and periodically as a safety net. `service-discovery` reports ready only after the initial load, so a new replica
-  never serves an empty registry.
-* **Snapshot miss on heartbeat**: before answering `NOT_FOUND`, the replica reads the instance key from the backend.
-  This covers a heartbeat that reaches a replica before the registration's watch event does.
+  and periodically as a safety net. Lifecycle phases must not wait on a remote service, so `service-discovery` runs
+  the initial load in a background task spawned from `start`, retrying with backoff while the backend is unavailable.
+  Until the first load succeeds, its readiness healthcheck keeps `/readyz` at 503, so a new replica is not routed
+  traffic before it holds the registry. In-process readers may see a partial registry in that window: a provider not
+  loaded yet resolves as `NotFound`, which consumers already treat as "not ready yet" (ADR-0005). Readiness is gated
+  only on that first load: if the watch later breaks and the backend stays down, the replica stays ready and serves
+  its last snapshot while it resyncs. Every replica shares the backend, so failing readiness then would take the whole
+  directory out of rotation at once.
+* **Snapshot miss on heartbeat**: a replica that has not observed the registration reads its authoritative
+  registration generation before attempting the atomic heartbeat. A missing backend registration returns
+  `NOT_FOUND`; a live registration is recovered from the complete record returned by the heartbeat.
+* **Reported state on heartbeat**: every successful heartbeat atomically updates the lease deadline and reported state
+  for the same registration generation. An acknowledgement guarantees both updates committed together; the replica
+  never elides the state update based on its potentially stale local snapshot. The reported state is the state in the
+  last successful atomic heartbeat; no monotonic transition ordering is imposed.
+* **Ordering**: a replica applies its own writes directly and again when the watch delivers them, so the two can
+  interleave. Every record carries a registration generation and a revision. The generation strictly increases each
+  time an instance key is registered afresh (after deregistration or a lapsed lease) and is never reused, even though
+  the `CacheEntry` version can restart once a key is deleted; the revision strictly increases with every write within
+  one generation, and revisions are only compared within a generation. `service-discovery` keeps the last applied
+  version of each instance and drops a watch, write-through or snapshot record older than it, then applies the rest to
+  `GearManager`. A removal leaves a tombstone that drops every record of the removed generation, plus this replica's
+  own write-through results issued before the removal or local expiry, so a racing heartbeat or re-registration
+  never undoes a deregistration or expiry. A tombstone is evicted once nothing has touched it for one lease cycle
+  (`ttl + grace`): any record it could still fence carries a lease that has lapsed past grace. Watch events for one
+  key apply in order. A full load replaces local records, except one the replica holds at a newer version or wrote
+  after the scan started, and removes local records missing from it.
 
 Staleness between replicas is the watch delivery delay, normally well under a second. Consumers already accept 1.5 s
 (`DirectoryEndpointResolver::TTL`, `libs/toolkit/src/discovery.rs:53`).
@@ -157,15 +183,20 @@ Staleness between replicas is the watch delivery delay, normally well under a se
 
 | Key | Value | Written on | TTL |
 |---|---|---|---|
-| `directory/inst/<gear>/<instance>` | endpoints, version, labels, gRPC services, `openapi_spec_hash`, `reported_state` | register, state change | none |
-| `directory/lease/<gear>/<instance>` | `expires_at` (epoch ms) | register, every heartbeat | `ttl + grace` |
+| `directory/inst/<gear>/<instance>` | endpoints, version, labels, gRPC services, `openapi_spec_hash` | register | none |
+| `directory/lease/<gear>/<instance>` | `expires_at` (epoch ms), `reported_state`, registration generation | register, every heartbeat | `ttl + grace` |
 | `directory/claim/<service>` | owning gear | first registration of a gRPC service name | none |
 
 * Segments are encoded into the cache key grammar (`[a-zA-Z0-9_-]`, `cluster-sdk` `CACHE_KEY_RULE`). gRPC service names
   contain `.`, so service and instance segments are always encoded, for example as unpadded lowercase base32.
-* A heartbeat writes only the small lease key. A replica that sees `Changed` on a lease key sets the local expiry to
-  `now + ttl` without reading the value. Only `Changed` on an instance key, which is rare, triggers a `get`. Heartbeats
-  therefore cost one backend write and no backend reads.
+* A heartbeat uses one atomic conditional mutation of the lease key. The mutation checks the registration generation
+  and writes both `expires_at` and `reported_state`; this prevents an old operation from changing a later registration.
+  A replica with a current local generation performs one backend write. A replica missing the local registration first
+  reads the authoritative instance/lease pair, then performs one backend write. A reported-state change is still one
+  write because state and deadline share the lease value. Adapters must use an atomic compare-and-swap/upsert primitive
+  or a backend transaction; a cache without that guarantee is not a valid shared directory backend.
+* A replica that sees a lease-key `Changed` event applies the event's absolute `expires_at` and state, not `now + ttl`.
+  Only `Changed` on an instance key triggers a `get`.
 * The backend removes an expired lease key itself (read-path expiry and sweeper in each plugin). `Expired` or `Deleted`
   on a lease key makes the instance invisible on every replica.
 
@@ -173,9 +204,10 @@ Staleness between replicas is the watch delivery delay, normally well under a se
 
 Each instance record carries a lease instead of `last_heartbeat: Instant`:
 
-* `lease_expires_at` — set to `now + ttl` by `RegisterInstance` (including re-registration of an existing record) and
-  by `Heartbeat`.
-* `reported_state` — what the instance says about itself: `Starting`, `Serving` or `Draining`.
+* `lease_expires_at` — backend-authoritative absolute deadline, set to `now + ttl` by `RegisterInstance` (including
+  re-registration of an existing record) and by `Heartbeat`.
+* `reported_state` — what the instance says about itself: `Starting`, `Serving` or `Draining`; stored with the lease
+  so heartbeat updates are atomic.
 
 The state a reader sees is derived at read time, never written by a background task:
 
@@ -203,7 +235,9 @@ plugin's rules.
 
 **Cleanup.**
 
-* **memory**: a sweeper task in `service-discovery` removes records past `ttl + grace` from `GearManager`.
+* **Both modes**: a sweeper task in `service-discovery` removes records past `ttl + grace` from the local
+  `GearManager` snapshot. With a shared backend this is only local garbage collection, for records whose removal the
+  replica missed; the backend and the janitor own the shared keys.
 * **Shared backend**: the backend expires lease keys. A janitor on every replica deletes instance keys whose lease key
   is gone, lease keys whose instance key is gone, and claims that no visible instance backs. It uses
   `compare_and_delete`, so replicas racing on the same key are harmless and no leader election is needed. It runs on
@@ -272,9 +306,9 @@ already serves the document unauthenticated at `/.well-known/openapi.json`
 (`cpt-cf-binding-constraint-openapi-well-known`, `libs/toolkit/src/runtime/oop_serve.rs:338-351`).
 
 * The worker sends `openapi_spec_hash` (lowercase hex SHA-256 of the served document) in `RegisterInstance`. The
-  directory stores the hash and returns it in `InstanceInfo.openapi_spec_hash`, as today. The hash the directory
-  currently computes with `DefaultHasher` (`libs/toolkit/src/directory.rs:11-31`) is not stable across binaries and
-  goes away.
+  directory stores the hash and returns it in `InstanceInfo.openapi_spec_hash`. The former server-side
+  `DefaultHasher` hash was not stable across binaries; this design replaces it with the worker-provided SHA-256
+  hash.
 * The edge fetches the document from the instance's REST endpoint when it sees a hash it has not cached, verifies its
   SHA-256 against the advertised hash, and caches it by hash. In Profile 3 the endpoint is a Service VIP, so during a
   rolling upgrade the fetch may land on a pod with a different document; on mismatch the edge keeps the gear's
@@ -310,18 +344,26 @@ With `memory`, the existing mutex-based logic stays.
 
 ### Store abstraction
 
-* An async `DirectoryBackend` trait in `libs/toolkit/src/runtime/directory_backend.rs`, with no dependency on cluster
-  crates:
-  * `register` (claims, instance and lease), `renew`, `set_state`, `deregister`;
-  * `load_all`, for the initial load and resync;
-  * `changes`, a stream of changed, removed and renewed records.
-* The write path (`LocalDirectoryClient`, used by the `service-discovery` gRPC server and by in-process registrars)
-  writes through the backend when one is installed, then applies the change to `GearManager`. A task in
-  `service-discovery` applies `changes` from other replicas to `GearManager`.
-* `GearManager` keeps the snapshot, round-robin and the memory-mode ownership logic. Its dead `mark_ready`,
-  `mark_quarantined`, `mark_draining` and `evict_stale` are replaced by the lease model.
+* An async `DirectoryBackend` contract in `gears/system/service-discovery/src/directory_backend.rs`, with no
+  dependency on cluster crates:
+  * `register`, which must merge partial registrations, enforce first-registration gRPC service-name claims
+    atomically across keys, and assign versions; atomic `heartbeat`; `deregister`;
+  * `load_all`, for the initial load and resync; it must reflect at least every change committed before the call;
+  * `changes`, an established subscription that streams changed, removed and renewed records in per-key order.
+  * Records include the revision, monotonic registration generation and backend-authoritative lease deadline, so
+    delayed results cannot cross deletion/re-registration or restart grace.
+  * Errors are typed: a claim conflict is distinct from an unavailable backend.
+* The local and replicated `DirectoryClient` adapters are owned by `service-discovery`. The gear constructs either
+  adapter, then registers the same SDK `DirectoryClient` with the in-process
+  `ClientHub` and the gRPC service. The replicated adapter writes through the backend, then applies the result
+  through the gear's `DirectoryReplica`, which also applies the feed and snapshots. `DirectoryReplica` owns the
+  per-instance versions and tombstones.
+* Toolkit `GearManager` remains the in-memory read model, round-robin resolver and compiled ownership-pin authority;
+  it does not own the storage contract, backend selection, replication ordering or replicated client. It exposes
+  only cluster-agnostic writes for complete records: upsert with an absolute lease deadline, remove, and replace-all.
+  Its obsolete `mark_ready`, `mark_quarantined`, `mark_draining` and `evict_stale` are replaced by the lease model.
 * The implementation over `ClusterCacheBackend` lives in `gears/system/service-discovery/src/infra/storage/`.
-  `service-discovery` gains the `stateful` capability for the change feed, the janitor and the memory-mode sweeper.
+  `service-discovery` gains the `stateful` capability for the change feed, the janitor and the lease sweeper.
 
 ### Replicas and composition
 
@@ -385,8 +427,10 @@ retries, push updates) is a separate edge decision.
 * `service-discovery` gains the `stateful` capability and a `storage` setting.
 * The directory proto gains fields and one response message; `GetOpenApiSpec` and `RegisterInstanceRequest.openapi_spec`
   are removed (field 6 reserved against reuse).
-* `GearManager`'s public API changes: the `mark_*` methods and `evict_stale` go away and writes go through
-  `DirectoryBackend` when one is installed. This is a breaking change to the `toolkit` crate surface.
+* `GearManager`'s public API changes: the `mark_*` methods and `evict_stale` go away. The backend contract, both
+  `DirectoryClient` adapters (`LocalDirectoryClient` moves out of toolkit) and replication ordering live in
+  `service-discovery`. Toolkit keeps the read model, the registration/projection conversions the adapters share, and
+  a test-only `test_support::ManagerDirectoryClient` for tests that cannot depend on `service-discovery`.
 * event-broker's own presence code is replaced by `PresenceManager`.
 * The edge fetches OpenAPI documents from instances, so it needs network access to every proxied instance's REST
   endpoint. It already needs that to proxy requests.

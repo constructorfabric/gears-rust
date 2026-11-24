@@ -653,13 +653,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_directory_client_not_found_reaches_the_resolver_as_ok_none() {
-        // End-to-end over the real in-process client rather than a stub: this
-        // is the pairing that was broken (the client returned a bare `anyhow`,
-        // so the resolver could never produce `Ok(None)`).
-        let dir = Arc::new(crate::directory::LocalDirectoryClient::new(Arc::new(
-            crate::runtime::GearManager::new(),
-        )));
+    async fn typed_not_found_reaches_the_resolver_as_ok_none() {
+        let dir = Arc::new(crate::directory::test_support::ManagerDirectoryClient::new(
+            Arc::new(crate::runtime::GearManager::new()),
+        ));
         let resolver = DirectoryEndpointResolver::new(dir);
 
         assert_eq!(

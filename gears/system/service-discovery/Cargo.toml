@@ -27,7 +27,10 @@ tokio-util = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
 http = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 humantime-serde = { workspace = true }
@@ -37,8 +40,9 @@ uuid = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+toolkit = { workspace = true, features = ["test-support"] }
 tower = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-util = { workspace = true }
 api_gateway = { path = "../api-gateway", package = "cf-gears-api-gateway" }
 serde_json = { workspace = true }

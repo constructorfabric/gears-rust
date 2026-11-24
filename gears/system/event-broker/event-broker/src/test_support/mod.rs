@@ -117,27 +117,23 @@ use cluster_sdk::test_support::{StubClusterClient, unbound_leader_election, unbo
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientHub;
+use toolkit::directory::test_support::ManagerDirectoryClient;
 use toolkit::directory::{DirectoryClient, RegisterInstanceInfo, ServiceEndpoint};
 use toolkit::runtime::GearManager;
 use uuid::Uuid;
 
 use crate::domain::cluster::EventBrokerCluster;
 
-/// `standalone_event_broker_cluster()` wires the toolkit's own real,
-/// production `LocalDirectoryClient` (backed by a fresh `GearManager`, the
-/// same in-memory store `service-discovery` itself runs standalone mode on -
-/// no DB, no network) into the same `ClientHub` production code paths
-/// (`module::EventBrokerModule::register_self`, `infra::dispatcher::forward`)
-/// resolve their `Arc<dyn DirectoryClient>` from, so dispatcher tests
-/// exercise the real directory-client behavior (round-robin, instance
-/// state) rather than a second, independently-maintained mock of it.
+/// `standalone_event_broker_cluster()` registers a test-only `DirectoryClient`
+/// backed by a fresh `GearManager` into the same `ClientHub` production code
+/// paths (`module::EventBrokerModule::register_self`, `infra::dispatcher::forward`)
+/// resolve their `Arc<dyn DirectoryClient>` from.
 ///
-/// Fetches the `LocalDirectoryClient` `standalone_event_broker_cluster()`
-/// registered into `hub`, typed as the trait object production code
-/// resolves.
+/// Fetches the client `standalone_event_broker_cluster()` registered into
+/// `hub`, typed as the trait object production code resolves.
 pub fn test_directory_client(hub: &ClientHub) -> Arc<dyn DirectoryClient> {
     hub.get::<dyn DirectoryClient>()
-        .expect("standalone_event_broker_cluster() registers a LocalDirectoryClient")
+        .expect("standalone_event_broker_cluster() registers a DirectoryClient")
 }
 
 /// The cluster profile the broker binds to, matching the private
@@ -177,9 +173,9 @@ pub async fn register_standalone_cluster_stub(hub: &ClientHub) {
 /// same underlying state.
 pub async fn standalone_event_broker_cluster() -> (Arc<ClientHub>, EventBrokerCluster) {
     let hub = Arc::new(ClientHub::default());
-    hub.register::<dyn DirectoryClient>(Arc::new(toolkit::directory::LocalDirectoryClient::new(
-        Arc::new(GearManager::new()),
-    )));
+    hub.register::<dyn DirectoryClient>(Arc::new(ManagerDirectoryClient::new(Arc::new(
+        GearManager::new(),
+    ))));
     register_standalone_cluster_stub(&hub).await;
 
     let cluster = EventBrokerCluster::resolve(&hub)

@@ -200,7 +200,9 @@ async fn a_grpc_consumer_finds_its_provider_through_the_runtime() {
     let registry = builder.build_topo_sorted().expect("registry build");
 
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn DirectoryClient>(Arc::new(toolkit::LocalDirectoryClient::new(directory)));
+    hub.register::<dyn DirectoryClient>(Arc::new(
+        toolkit::directory::test_support::ManagerDirectoryClient::new(directory),
+    ));
     let cancel = CancellationToken::new();
     let runtime = HostRuntime::new(
         registry,

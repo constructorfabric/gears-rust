@@ -275,6 +275,12 @@ system still converges, but every unresolved dependency is reported as a
 directory outage, and the resolving client warns on *every* business call to a
 provider that has simply not started yet.
 
+> **Amendment (2026-11-23; implementation ownership):** The local client is now
+> the service-discovery-owned adapter in
+> `gears/system/service-discovery/src/local_directory_client.rs` (see
+> [ADR-0011](../../toolkit-oop/ADR/0011-cpt-cf-adr-directory-persistence-and-replication.md)).
+> This changes its ownership, not the typed `DirectoryNotFound` contract.
+
 **Endpoint resolution is memoized** for `DirectoryEndpointResolver::TTL` (1500 ms).
 Only successes are cached; REST answers are keyed by gear name and gRPC answers by
 service name, apart. An attempt that the client's circuit breaker classifies as an

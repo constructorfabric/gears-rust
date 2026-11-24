@@ -597,7 +597,7 @@ mod tests {
     };
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
-    use toolkit::directory::LocalDirectoryClient;
+    use toolkit::directory::test_support::ManagerDirectoryClient;
     use toolkit::runtime::GearManager;
 
     /// A REST-proxyable instance (a REST endpoint and a published spec hash),
@@ -911,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn fetches_are_concurrent_and_failed_instances_do_not_block_route_updates() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let initial_fetcher = MapFetcher::new();
         register(
             dir.as_ref(),
@@ -1011,7 +1011,7 @@ mod tests {
     #[tokio::test]
     async fn sync_registers_public_routes_then_prunes_removed_gears() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let calc_instance = register(
@@ -1059,7 +1059,7 @@ mod tests {
     #[tokio::test]
     async fn sync_picks_up_spec_change_on_resync() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         // Initial spec exposes /calc/v1/add.
@@ -1105,7 +1105,7 @@ mod tests {
     #[tokio::test]
     async fn sync_retains_routes_when_new_instance_fails_but_gear_still_present() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let good = register(
@@ -1148,7 +1148,7 @@ mod tests {
     #[tokio::test]
     async fn sync_skips_instances_without_rest_or_spec() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         // gRPC-only gear: no REST endpoint / spec -> not proxied.
@@ -1174,7 +1174,7 @@ mod tests {
     #[tokio::test]
     async fn sync_skips_gear_with_rest_but_no_published_spec() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         // The gear advertises a REST endpoint but never published an OpenAPI
@@ -1203,7 +1203,7 @@ mod tests {
         // `/.well-known/openapi.json` and verifying it against the advertised
         // hash on first discovery.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         register(
@@ -1232,7 +1232,7 @@ mod tests {
     #[tokio::test]
     async fn sync_deregisters_only_one_instance_of_same_gear() {
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let calc_a = register(
@@ -1306,7 +1306,7 @@ mod tests {
         // is treated as a transient directory hiccup: the poll must NOT prune
         // every route at once. The next non-empty poll reconciles normally.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let calc = register(
@@ -1346,7 +1346,7 @@ mod tests {
         // forever. Uses a persistent `SyncState` so the empty-poll count carries
         // across polls as it does in the real loop.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let calc = register(
@@ -1401,7 +1401,7 @@ mod tests {
         // the directory did report an instance, so the empty-snapshot safety
         // valve must NOT fire and preserve a route to a draining instance.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let calc = register(
@@ -1442,7 +1442,7 @@ mod tests {
         // snapshot that no longer lists a previously registered instance still
         // prunes it.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let calc = register(
@@ -1487,7 +1487,7 @@ mod tests {
         // fires immediately and reconciles the directory into the registry;
         // cancelling then drives the loop to a clean stop.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
         register(
             dir.as_ref(),
@@ -1531,7 +1531,7 @@ mod tests {
         // (apply_snapshot runs); the second must be skipped via the spec-hash
         // fingerprint — no re-fetch, no router rebuild — while routes remain.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
         register(
             dir.as_ref(),
@@ -1568,7 +1568,7 @@ mod tests {
         // A spec change flips the directory's content hash, so the fingerprint
         // differs and the next poll reconciles rather than skipping.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
         let id = register(
             dir.as_ref(),
@@ -1617,7 +1617,7 @@ mod tests {
         // endpoint), the fingerprint must NOT be cached, so an unchanged next
         // poll still reconciles rather than skipping the never-applied instance.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
         register(
             dir.as_ref(),
@@ -1681,7 +1681,7 @@ mod tests {
         // A worker advertises only the hash; the edge fetches the document from
         // the instance, verifies it, and builds the gear's public routes.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
         register(
             dir.as_ref(),
@@ -1711,7 +1711,7 @@ mod tests {
         // One persistent fetcher + state across polls: a newly-seen hash is
         // fetched exactly once; an unchanged hash is never fetched again.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
         register(
             dir.as_ref(),
@@ -1767,7 +1767,7 @@ mod tests {
         // serving a different document than the advertised hash. On mismatch the
         // edge keeps the gear's previous routes and retries next poll.
         let mgr = Arc::new(GearManager::new());
-        let dir: Arc<dyn DirectoryClient> = Arc::new(LocalDirectoryClient::new(Arc::clone(&mgr)));
+        let dir: Arc<dyn DirectoryClient> = Arc::new(ManagerDirectoryClient::new(Arc::clone(&mgr)));
         let fetcher = MapFetcher::new();
 
         let instance_id = register(

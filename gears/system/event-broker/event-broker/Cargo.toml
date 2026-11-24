@@ -30,6 +30,7 @@ test-utils = [
     "dep:tower",
     "dep:schemars",
     "dep:standalone-cluster-plugin",
+    "toolkit/test-support",
     "types-registry-sdk/test-util",
     "event-broker-sdk/test-util",
     "cluster-sdk/test-util",
