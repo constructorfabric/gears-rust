@@ -33,14 +33,15 @@ use toolkit_db::{Db, DbError};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
+use super::config_cache::{ConfigCache, ConfigSnapshot, DEFAULT_REFRESH};
 use super::entity::quota_consumption_counter;
 use super::locking::{ContentionBudget, lock_scopes, with_budget};
 use super::policy_store::{decode_version, scope_key};
 use super::quota_mapping::{self, MappingError};
 use super::repo::operation_log_repo::Entry;
 use super::repo::{
-    RowWait, config_repo, consumption_counter_repo as counter_repo, idempotency_repo as idem_repo,
-    lease_repo, operation_log_repo, policy_repo, quota_repo,
+    RowWait, consumption_counter_repo as counter_repo, idempotency_repo as idem_repo, lease_repo,
+    operation_log_repo, policy_repo, quota_repo,
 };
 use crate::domain::ports::Actor;
 use crate::infra::outbox::{
@@ -48,9 +49,6 @@ use crate::infra::outbox::{
 };
 
 const LOG_TARGET: &str = "qe.storage";
-
-/// Fallback retention when no configuration row exists: 24 hours (PRD 5.8).
-pub(super) const DEFAULT_RETENTION_SECS: i64 = 86_400;
 
 /// How many times a transaction that lost the record's primary key is retried.
 /// Two: one to observe the winner, and the original attempt.
@@ -78,6 +76,7 @@ pub struct SqlConsumptionStore {
     pub(super) db: Db,
     pub(super) enqueuer: Arc<dyn NotificationOutbox>,
     pub(super) clock: Clock,
+    pub(super) config: Arc<ConfigCache>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -678,18 +677,13 @@ pub(super) async fn replay_of(
 }
 
 /// Retention deadline of a record written now for `(tenant, metric)`.
-pub(super) async fn expires_at(
-    tx: &impl DBRunner,
+pub(super) fn expires_at(
+    config: &ConfigSnapshot,
     tenant: TenantId,
     metric: &str,
     now: OffsetDateTime,
-) -> Result<OffsetDateTime, TxError> {
-    let seconds =
-        config_repo::read_idempotency_retention(tx, &tenant.as_uuid().to_string(), metric)
-            .await?
-            .unwrap_or(DEFAULT_RETENTION_SECS)
-            .max(0);
-    Ok(now + time::Duration::seconds(seconds))
+) -> OffsetDateTime {
+    now + config.idempotency_retention(tenant, metric)
 }
 
 /// Everything a record write needs beyond its scope.
@@ -805,11 +799,7 @@ impl SqlConsumptionStore {
     /// Bind the database and the same-transaction event enqueuer.
     #[must_use]
     pub fn new(db: Db, enqueuer: Arc<dyn NotificationOutbox>) -> Self {
-        Self {
-            db,
-            enqueuer,
-            clock: Arc::new(OffsetDateTime::now_utc),
-        }
+        Self::with_clock(db, enqueuer, Arc::new(OffsetDateTime::now_utc))
     }
 
     /// The same store on a caller-driven clock. Tests move period boundaries
@@ -820,11 +810,24 @@ impl SqlConsumptionStore {
             db,
             enqueuer,
             clock,
+            config: Arc::new(ConfigCache::new(DEFAULT_REFRESH)),
         }
+    }
+
+    /// The same store, reading the configuration through `config`.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<ConfigCache>) -> Self {
+        self.config = config;
+        self
     }
 
     fn now(&self) -> OffsetDateTime {
         (self.clock)()
+    }
+
+    /// The configuration snapshot, reloaded once the refresh interval passed.
+    pub(super) async fn config(&self) -> Result<Arc<ConfigSnapshot>, StorageError> {
+        self.config.read(&self.db, self.now()).await
     }
 
     /// The Quotas of an applicable set, locked ascending by id (ADR-0002).
@@ -1220,10 +1223,14 @@ impl SqlConsumptionStore {
         scope: &AccessScope,
         mutation: &OwnedMutation,
         events: &[NotificationEvent],
-        actor: &Actor,
-        clock: &Clock,
-        enqueuer: &Arc<dyn NotificationEnqueuer>,
+        env: &TxEnv<'_>,
     ) -> Result<TransitionOutcome<EvaluatedDebit>, TxError> {
+        let TxEnv {
+            actor,
+            clock,
+            enqueuer,
+            config,
+        } = *env;
         let quotas =
             Self::lock_applicable(tx, scope, &mutation.applicable, RowWait::Nowait).await?;
         // Rank 2: the scope's stripe keeps out a writer of the
@@ -1263,12 +1270,11 @@ impl SqlConsumptionStore {
             }
         };
         let expires_at = expires_at(
-            tx,
+            config,
             mutation.applicable.tenant_id,
             mutation.applicable.metric.as_str(),
             now,
-        )
-        .await?;
+        );
         write_record(
             tx,
             scope,
@@ -1325,12 +1331,14 @@ struct Discovered {
     identity: Option<(OffsetDateTime, Vec<u8>)>,
 }
 
-/// Who a rollback transaction acts as, and what it reads the time from and
-/// enqueues into.
-struct RollbackEnv<'a> {
+/// Who a transaction acts as, and what it reads the time and configuration
+/// from and enqueues into.
+#[derive(Clone, Copy)]
+struct TxEnv<'a> {
     actor: &'a Actor,
     clock: &'a Clock,
     enqueuer: &'a Arc<dyn NotificationEnqueuer>,
+    config: &'a ConfigSnapshot,
 }
 
 impl SqlConsumptionStore {
@@ -1342,7 +1350,7 @@ impl SqlConsumptionStore {
         idempotency: &IdempotencyWrite,
         events: &[NotificationEvent],
         discovered: &Discovered,
-        env: &RollbackEnv<'_>,
+        env: &TxEnv<'_>,
     ) -> Result<TransitionOutcome<AppliedMutation>, TxError> {
         // Rank 1: the Quotas the original moved, ascending, so
         // a concurrent debit replaying the same key — which
@@ -1401,7 +1409,7 @@ impl SqlConsumptionStore {
         let metric = quotas
             .first()
             .map_or_else(String::new, |quota| quota.metric.as_str().to_owned());
-        let expires_at = expires_at(tx, idempotency.scope.tenant_id, &metric, now).await?;
+        let expires_at = expires_at(env.config, idempotency.scope.tenant_id, &metric, now);
         write_record(
             tx,
             scope,
@@ -1612,9 +1620,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         const OPERATION: &str = "apply debit plan";
         let actor = actor_of(ctx);
-        let budget = self
-            .contention_budget(Some(mutation.applicable.metric.as_str()))
-            .await?;
+        let config = self.config().await?;
+        let budget = ContentionBudget::of(&config, [mutation.applicable.metric.as_str()]);
         // Each retry is a complete transaction.
         for attempt in 0..RACE_ATTEMPTS {
             // A refused lock rolls this transaction back and runs it
@@ -1627,14 +1634,18 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let mutation = OwnedMutation::of(mutation);
+                let config = Arc::clone(&config);
                 settling(
                     wakes,
                     self.db.transaction_ref_mapped(move |tx| {
                         Box::pin(async move {
-                            Self::debit_in_tx(
-                                tx, &scope, &mutation, &events, &actor, &clock, &enqueuer,
-                            )
-                            .await
+                            let env = TxEnv {
+                                actor: &actor,
+                                clock: &clock,
+                                enqueuer: &enqueuer,
+                                config: &config,
+                            };
+                            Self::debit_in_tx(tx, &scope, &mutation, &events, &env).await
                         })
                     }),
                 )
@@ -1693,7 +1704,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             .metric_of(scope, quota_id.as_uuid())
             .await
             .map_err(|error| lift(OPERATION, error))?;
-        let budget = self.contention_budget(metric.as_deref()).await?;
+        let config = self.config().await?;
+        let budget = ContentionBudget::of(&config, metric.as_deref());
         // The Quota row lock normally serializes credits; the arbiter is a
         // defensive fallback.
         for attempt in 0..RACE_ATTEMPTS {
@@ -1707,6 +1719,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let idempotency = idempotency.clone();
+                let config = Arc::clone(&config);
                 settling(
                     wakes,
                     self.db.transaction_ref_mapped(move |tx| {
@@ -1807,7 +1820,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                     .collect(),
                             );
                             let expires_at =
-                                expires_at(tx, quota.tenant_id, quota.metric.as_str(), now).await?;
+                                expires_at(&config, quota.tenant_id, quota.metric.as_str(), now);
                             // A credit evaluates no policy, so its record carries
                             // neither engine attribution nor a reversible movement.
                             write_record(
@@ -1902,8 +1915,9 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
         let actor = actor_of(ctx);
         // One budget for the whole call, rediscoveries included, named by the
         // metric of the first Quota the original moved.
+        let config = self.config().await?;
         let budget = self
-            .rollback_budget(scope, target)
+            .rollback_budget(&config, scope, target)
             .await
             .map_err(|error| lift(OPERATION, error))?;
         // The original row lock normally serializes rollbacks; the arbiter also
@@ -1948,14 +1962,16 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                 let idempotency = idempotency.clone();
                 let target = target.clone();
                 let discovered = discovered.clone();
+                let config = Arc::clone(&config);
                 settling(
                     wakes,
                     self.db.transaction_ref_mapped(move |tx| {
                         Box::pin(async move {
-                            let env = RollbackEnv {
+                            let env = TxEnv {
                                 actor: &actor,
                                 clock: &clock,
                                 enqueuer: &enqueuer,
+                                config: &config,
                             };
                             Self::rollback_in_tx(
                                 tx,
@@ -2112,6 +2128,7 @@ impl SqlConsumptionStore {
     /// original is absent or moved nothing.
     async fn rollback_budget(
         &self,
+        config: &ConfigSnapshot,
         scope: &AccessScope,
         target: &RollbackTarget,
     ) -> Result<ContentionBudget, TxError> {
@@ -2136,7 +2153,7 @@ impl SqlConsumptionStore {
             Some(quota_id) => self.metric_of(scope, quota_id).await?,
             None => None,
         };
-        Ok(self.contention_budget(metric.as_deref()).await?)
+        Ok(ContentionBudget::of(config, metric.as_deref()))
     }
 
     /// The metric of a Quota, read without a lock: it names the contention

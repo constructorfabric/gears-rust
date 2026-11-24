@@ -1,10 +1,11 @@
 //! `qe_leases`, `qe_lease_holds`, and `qe_lease_capacity_counters`.
 //!
 //! Lock rank (ADR-0002, extended to every row kind this plugin takes): Quota
-//! rows, then idempotency records, then lease rows, then capacity rows, then
-//! counter rows, then hold rows under their counter. Every function here says
-//! which rank it belongs to, because a caller that takes them out of order can
-//! deadlock against one that does not.
+//! rows, then idempotency records, then lease rows, then capacity rows (taken by
+//! acquisitions only), then counter rows (the waiting paths ascending by
+//! `(quota_id, period_id)`), then hold rows under their counter. Every function
+//! here says which rank it belongs to, because a caller that takes them out of
+//! order can deadlock against one that does not.
 //!
 //! Holds are immutable once written, apart from `returned_at`. That is what
 //! lets a settlement read them unlocked to learn the metric and the plan, and
@@ -237,9 +238,10 @@ pub async fn mark_hold_returned(
 /// How many leases on `(tenant, metric)` are live at `now`: active, and not
 /// yet past their expiry.
 ///
-/// This is what admits an acquisition, rather than the maintained
-/// `active_count`, so an expired lease frees the cap the instant its TTL
-/// passes and without any sweep (I4, I7).
+/// This is what admits an acquisition, so an expired lease frees the cap the
+/// instant its TTL passes and without any sweep (I4, I7). On Postgres, Read
+/// Committed makes it see every lease an earlier holder of the capacity row
+/// committed; on SQLite the single writer does.
 ///
 /// # Errors
 ///
@@ -538,33 +540,6 @@ pub async fn lock_capacity_row(
     .scope_with(scope)
     .one(runner)
     .await
-}
-
-/// Move the diagnostic active-lease count by `delta`, flooring at zero.
-///
-/// # Errors
-///
-/// The scope or database error of the update.
-pub async fn bump_active_count(
-    runner: &impl DBRunner,
-    scope: &AccessScope,
-    tenant_id: Uuid,
-    metric: &str,
-    current: i32,
-    delta: i32,
-    now: OffsetDateTime,
-) -> Result<(), ScopeError> {
-    let next = current.saturating_add(delta).max(0);
-    lease_capacity_counter::Entity::update_many()
-        .col_expr(lease_capacity_counter::Column::ActiveCount, next.into())
-        .col_expr(lease_capacity_counter::Column::UpdatedAt, now.into())
-        .filter(lease_capacity_counter::Column::TenantId.eq(tenant_id))
-        .filter(lease_capacity_counter::Column::Metric.eq(metric))
-        .secure()
-        .scope_with(scope)
-        .exec(runner)
-        .await?;
-    Ok(())
 }
 
 /// Whether any live lease still holds capacity against `period_id`.

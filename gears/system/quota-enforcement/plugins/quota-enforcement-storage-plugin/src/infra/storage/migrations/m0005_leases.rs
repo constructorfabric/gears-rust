@@ -20,9 +20,9 @@
 //! row still owe?
 //!
 //! `qe_lease_capacity_counters` is the serialization point of the
-//! per-`(tenant, metric)` cap (I7), not its source of truth: `active_count` is
-//! maintained for diagnostics, while admission counts live leases under the
-//! row lock, so an expired lease never occupies the cap. A pair's row is created
+//! per-`(tenant, metric)` cap (I7), not its source of truth: admission counts
+//! live leases under the row lock, so an expired lease never occupies the cap.
+//! `active_count` is no longer written. A pair's row is created
 //! with its first Quota, so an acquisition only ever locks it; the backfill here
 //! gives every pair that already has a Quota its row. It copies the earliest
 //! `created_at` rather than taking `now()`, so the stored timestamp has exactly

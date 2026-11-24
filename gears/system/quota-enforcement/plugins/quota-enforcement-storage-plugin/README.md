@@ -94,7 +94,16 @@ gears:
     config:
       vendor: "constructorfabric"   # must match gears.quota-enforcement.config.storage_vendor
       priority: 100
+      config_refresh_secs: 30   # an edit of the *_config tables applies within this many seconds
 ```
+
+Each replica keeps its own copy of the `*_config` tables and reloads it on its
+own schedule, so after an edit replicas can disagree for up to
+`config_refresh_secs`. If you lower a lease cap, a replica that has not
+reloaded yet keeps admitting leases of that `(tenant, metric)` up to the old
+cap. A failed reload keeps the last good copy and logs a warning with its age,
+so the lag can be longer while reloads fail. See "Configuration freshness" in
+`docs/DESIGN.md`.
 
 ## SQLite and concurrent writes
 

@@ -46,6 +46,8 @@ sea-orm-migration = { workspace = true }
 time = { workspace = true }
 
 anyhow = { workspace = true }
+# Lock-free reads of the configuration snapshot.
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 gts = { workspace = true }
@@ -61,6 +63,8 @@ tokio = { workspace = true, features = ["time"] }
 inventory = { workspace = true }
 
 [dev-dependencies]
+# The SQL recorder that proves a warm acquisition reads no configuration table.
+toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # Cargo unifies this edge with the lib under test into one `test-util = on`
 # build, so the integration suites reach the test-only outbox starter.
 cf-gears-quota-enforcement-storage-plugin = { path = ".", features = ["test-util"] }

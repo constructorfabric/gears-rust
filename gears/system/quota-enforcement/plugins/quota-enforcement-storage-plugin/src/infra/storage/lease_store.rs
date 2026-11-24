@@ -28,9 +28,10 @@
 //!
 //! One order for every primitive in this plugin (ADR-0002, extended past
 //! Quota rows): Quota rows ascending by id, then idempotency records, then
-//! lease rows ascending by token, then capacity rows, then counter rows, then
-//! the hold rows under their counter, then inserts. A primitive may skip a
-//! rank and never goes back; anything it must know before locking — a lease's
+//! lease rows ascending by token, then capacity rows (acquisitions only), then
+//! counter rows (the waiting paths ascending by `(quota_id, period_id)`), then
+//! the hold rows under their counter, then inserts. A primitive may skip a rank
+//! and never goes back; anything it must know before locking — a lease's
 //! metric and holds, both immutable once written — is read unscoped of rank
 //! first and re-read under the lock.
 //!
@@ -39,6 +40,7 @@
 //! until the budget is spent ([`super::locking`]). The sweeper has no budget and
 //! queues.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,9 +59,10 @@ use uuid::Uuid;
 use super::consumption_store::{
     AppliedEntry, OwnedMutation, RACE_ATTEMPTS, RecordBlob, RecordWrite, Replay,
     SqlConsumptionStore, TxError, actor_of, counters_of, credit_counter, debit_counter,
-    decision_of, expires_at, lift, replay_of, settle_elapsed_rows, write_record,
+    decision_of, lift, replay_of, settle_elapsed_rows, write_record,
 };
-use super::locking::{lock_scopes, with_budget};
+use super::entity::lease_hold;
+use super::locking::{ContentionBudget, lock_scopes, with_budget};
 use super::repo::lease_repo;
 use super::repo::lease_repo::RowWait;
 use super::repo::operation_log_repo::{self, Entry};
@@ -96,7 +99,10 @@ impl SqlConsumptionStore {
         let actor = actor_of(ctx);
         let tenant = mutation.applicable.tenant_id;
         let metric = mutation.applicable.metric.clone();
-        let budget = self.contention_budget(Some(metric.as_str())).await?;
+        let config = self.config().await?;
+        let budget = ContentionBudget::of(&config, [metric.as_str()]);
+        let cap = config.lease_cap(tenant, metric.as_str());
+        let retention = config.idempotency_retention(tenant, metric.as_str());
         for attempt in 0..RACE_ATTEMPTS {
             // A refused lock rolls this transaction back and runs it
             // again under the budget; a race goes to the arbiter below.
@@ -155,7 +161,7 @@ impl SqlConsumptionStore {
                                 // The cap is consulted only now: a verdict the
                                 // engine refused is the caller's answer whether or
                                 // not the cap is full.
-                                let row = lease_repo::lock_capacity_row(
+                                lease_repo::lock_capacity_row(
                                 tx,
                                 scope,
                                 tenant.as_uuid(),
@@ -182,9 +188,6 @@ impl SqlConsumptionStore {
                                 )
                                 .await?;
                                 // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-cap
-                                let cap =
-                                    SqlConsumptionStore::lease_cap(tx, tenant, metric.as_str())
-                                        .await?;
                                 if live >= cap {
                                     return Err(TxError::Storage(
                                         StorageError::LeaseInflightLimitExceeded,
@@ -252,16 +255,6 @@ impl SqlConsumptionStore {
                                     )
                                     .await?;
                                 }
-                                lease_repo::bump_active_count(
-                                    tx,
-                                    scope,
-                                    tenant.as_uuid(),
-                                    metric.as_str(),
-                                    row.active_count,
-                                    1,
-                                    now,
-                                )
-                                .await?;
                                 (Some(token), Some(expiry))
                                 // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-insert
                             } else {
@@ -278,7 +271,7 @@ impl SqlConsumptionStore {
                             let blob = serde_json::to_string(&acquired).map_err(|error| {
                                 TxError::Storage(StorageError::Internal(error.to_string()))
                             })?;
-                            let deadline = expires_at(tx, tenant, metric.as_str(), now).await?;
+                            let deadline = now + retention;
                             // The blob is the whole outcome, not only the decision,
                             // so a replay returns the token this call issued.
                             write_record(
@@ -352,8 +345,10 @@ impl SqlConsumptionStore {
         }
         let subject_key = subject_key_of(&preview.subject_key)?;
         let write = idempotency.clone().complete(subject_key, operation);
-        let budget = self.contention_budget(Some(&preview.metric)).await?;
+        let config = self.config().await?;
+        let budget = ContentionBudget::of(&config, [preview.metric.as_str()]);
         let tenant = idempotency.tenant_id;
+        let retention = config.idempotency_retention(tenant, &preview.metric);
         // A refused lock rolls this transaction back and runs it again under
         // the budget.
         with_budget(budget, || {
@@ -363,7 +358,6 @@ impl SqlConsumptionStore {
             let scope_owned = scope.clone();
             let events = events.to_vec();
             let write_owned = write.clone();
-            let metric = preview.metric.clone();
             let actor = actor.clone();
             settling(
                 wakes,
@@ -426,15 +420,6 @@ impl SqlConsumptionStore {
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
-                        // Rank 4.
-                        let capacity = lease_repo::lock_capacity_row(
-                            tx,
-                            scope,
-                            tenant.as_uuid(),
-                            &metric,
-                            RowWait::Nowait,
-                        )
-                        .await?;
                         // Rank 5 and 5b, ascending by `quota_id` as `holds_of`
                         // returns them.
                         let mut entries = Vec::new();
@@ -514,20 +499,6 @@ impl SqlConsumptionStore {
                         }
                         // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-release
                         // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
-                        // Diagnostic only, so a missing row costs the count, not the
-                        // transition.
-                        if let Some(capacity) = &capacity {
-                            lease_repo::bump_active_count(
-                                tx,
-                                scope,
-                                tenant.as_uuid(),
-                                &metric,
-                                capacity.active_count,
-                                -1,
-                                now,
-                            )
-                            .await?;
-                        }
                         // Settling evaluates nothing: the plan was fixed at
                         // acquisition, so the recorded decision is what it kept.
                         let decision = Decision::allowed_with_plan(
@@ -543,7 +514,7 @@ impl SqlConsumptionStore {
                                 })
                                 .collect(),
                         );
-                        let deadline = expires_at(tx, tenant, &metric, now).await?;
+                        let deadline = now + retention;
                         // A commit produces a debit its own key can reverse, so it
                         // records what it kept and the attribution it was
                         // authorized under. A release reverses nothing.
@@ -612,30 +583,24 @@ impl SqlConsumptionStore {
                     // @cpt-begin:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-reclaim
                     let leases =
                         lease_repo::expired_for_update(tx, &scope, batch_size, before).await?;
-                    let mut reclaimed = Vec::with_capacity(leases.len());
+                    let mut held = Vec::with_capacity(leases.len());
                     for lease in leases {
-                        let token = LeaseToken::from(lease.token);
                         let holds = lease_repo::holds_of(tx, &scope, lease.token).await?;
-                        let capacity = lease_repo::lock_capacity_row(
-                            tx,
-                            &scope,
-                            lease.tenant_id,
-                            &lease.metric,
-                            RowWait::Wait,
-                        )
-                        .await?;
+                        held.push((lease, holds));
+                    }
+                    lock_hold_counters(
+                        tx,
+                        &scope,
+                        held.iter().flat_map(|(_, holds)| holds),
+                        RowWait::Wait,
+                    )
+                    .await?;
+                    let mut reclaimed = Vec::with_capacity(held.len());
+                    for (lease, holds) in held {
+                        let token = LeaseToken::from(lease.token);
                         let mut returned = Vec::with_capacity(holds.len());
                         for hold in &holds {
                             let amount = u64::try_from(hold.held_amount).unwrap_or(0);
-                            // Rank 5 before 5b, as every writer takes them.
-                            counter_value_of(
-                                tx,
-                                &scope,
-                                hold.quota_id,
-                                hold.period_id,
-                                RowWait::Wait,
-                            )
-                            .await?;
                             // Only what nobody has given back: a writer that met
                             // this hold first already returned it.
                             if lease_repo::mark_hold_returned(
@@ -682,20 +647,6 @@ impl SqlConsumptionStore {
                             continue;
                         }
                         // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-autorelease
-                        // Diagnostic only, so a missing row costs the count, not the
-                        // transition.
-                        if let Some(capacity) = &capacity {
-                            lease_repo::bump_active_count(
-                                tx,
-                                &scope,
-                                lease.tenant_id,
-                                &lease.metric,
-                                capacity.active_count,
-                                -1,
-                                before,
-                            )
-                            .await?;
-                        }
                         operation_log_repo::append(
                             tx,
                             &scope,
@@ -793,17 +744,6 @@ impl SqlConsumptionStore {
             .collect()
     }
 
-    /// The `(tenant, metric)` cap, most specific configured row first.
-    async fn lease_cap(tx: &impl DBRunner, tenant: TenantId, metric: &str) -> Result<u64, TxError> {
-        let configured = super::repo::config_repo::read_lease_capacity(
-            tx,
-            &tenant.as_uuid().to_string(),
-            metric,
-        )
-        .await?;
-        Ok(u64::try_from(configured.unwrap_or(1000)).unwrap_or(1000))
-    }
-
     /// Apply an acquisition's plan: the same counter movement a debit makes,
     /// returning what each Quota now holds.
     async fn hold_plan(
@@ -836,6 +776,23 @@ impl SqlConsumptionStore {
         }
         Ok(entries)
     }
+}
+
+/// Rank 5 for a whole waiting transaction: each counter under `holds` once, ascending, so two never cross.
+pub(super) async fn lock_hold_counters<'a>(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    holds: impl IntoIterator<Item = &'a lease_hold::Model>,
+    wait: RowWait,
+) -> Result<(), TxError> {
+    let counters: BTreeSet<(Uuid, Option<Uuid>)> = holds
+        .into_iter()
+        .map(|hold| (hold.quota_id, hold.period_id))
+        .collect();
+    for (quota_id, period_id) in counters {
+        counter_value_of(tx, scope, quota_id, period_id, wait).await?;
+    }
+    Ok(())
 }
 
 /// The counter value of one row, read under its rank-5 lock, which a hold stamp must follow.

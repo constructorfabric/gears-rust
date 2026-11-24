@@ -14,13 +14,20 @@
 //! - two overlapping sweeps partition the expired leases, so each is
 //!   reclaimed, and its capacity returned, once;
 //! - acquisitions over overlapping sets of Quotas hold on every Quota of their
-//!   plan or on none, and never deadlock (ADR-0002).
+//!   plan or on none, and never deadlock (ADR-0002);
+//! - settlement, the sweeper and the deactivation cascade never touch the
+//!   capacity row, which only acquisitions lock, and the cap stays exact,
+//!   also across distinct Quotas that share only that row;
+//! - a sweep and a cascade crossing leases on the same Quotas take their
+//!   counters in one order and never deadlock.
 //!
 //! Requires Docker. Run with
 //! `cargo test -p cf-gears-quota-enforcement-storage-plugin --features postgres --test lease_store_integration_pg`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Barrier;
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::engine::{
@@ -29,10 +36,11 @@ use quota_enforcement_sdk::engine::{
 };
 use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
-    ApplicableQuotas, AppliedMutation, AttributionDigest, Decision, DecisionResult, EvaluatedLease,
-    EvaluatedMutation, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseToken,
-    MetricId, OperationType, PartialIdempotencyWrite, PayloadHash, PolicyDraft, PolicyScope,
-    QuotaDebitPlan, QuotaDraft, QuotaId, StorageError, SubjectRef, TenantId, TransitionOutcome,
+    ApplicableQuotas, AppliedMutation, AttributionDigest, BulkDeactivateEntry,
+    BulkDeactivateEnvelope, Decision, DecisionResult, EvaluatedLease, EvaluatedMutation,
+    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseToken, MetricId, OperationType,
+    PartialIdempotencyWrite, PayloadHash, PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft,
+    QuotaId, StorageError, SubjectRef, TenantId, TransitionOutcome,
 };
 use sea_orm_migration::MigratorTrait;
 use testcontainers::core::ExecCommand;
@@ -48,6 +56,9 @@ use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::domain::ports::LeaseStore;
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
+use quota_enforcement_storage_plugin::infra::storage::config_cache::{
+    ConfigCache, DEFAULT_REFRESH,
+};
 use quota_enforcement_storage_plugin::infra::storage::repo::lease_repo;
 use quota_enforcement_storage_plugin::{
     Actor, ConsumptionStore, NotificationOutbox, QeOutbox, QuotaStore, SqlConsumptionStore,
@@ -242,18 +253,24 @@ impl PgHarness {
         let clock = Arc::new(Mutex::new(OffsetDateTime::now_utc()));
         let store_reader = Arc::clone(&clock);
         let quota_reader = Arc::clone(&clock);
+        // One configuration cache for both stores, as the gear wires them.
+        let config = Arc::new(ConfigCache::new(DEFAULT_REFRESH));
         Self {
             db: db.clone(),
-            store: Arc::new(SqlConsumptionStore::with_clock(
-                db.clone(),
-                Arc::clone(&enqueuer),
-                Arc::new(move || *store_reader.lock().expect("clock")),
-            )),
+            store: Arc::new(
+                SqlConsumptionStore::with_clock(
+                    db.clone(),
+                    Arc::clone(&enqueuer),
+                    Arc::new(move || *store_reader.lock().expect("clock")),
+                )
+                .with_config(Arc::clone(&config)),
+            ),
             quotas: SqlQuotaStore::with_clock(
                 db.clone(),
                 Arc::clone(&enqueuer),
                 Arc::new(move || *quota_reader.lock().expect("clock")),
-            ),
+            )
+            .with_config(config),
             clock,
             outbox,
             container,
@@ -289,6 +306,8 @@ impl PgHarness {
         )
         .await
         .expect("configure the contention budget");
+        // The edit applies once the configuration snapshot refreshes.
+        self.advance(DEFAULT_REFRESH);
     }
 
     /// The active-lease cap of this tenant and metric (I7).
@@ -308,6 +327,8 @@ impl PgHarness {
         )
         .await
         .expect("configure the lease cap");
+        // The edit applies once the configuration snapshot refreshes.
+        self.advance(DEFAULT_REFRESH);
     }
 
     async fn quota(&self, subject_id: &str, cap: Option<u64>) -> QuotaId {
@@ -336,10 +357,35 @@ impl PgHarness {
         key: &str,
         evaluate: Arc<TransactionEvaluator>,
     ) -> tokio::task::JoinHandle<Acquired> {
+        self.spawn_acquire(holders, amount, key, evaluate, None)
+    }
+
+    /// [`Self::acquire`], started once every racer reaches `start`.
+    fn acquire_at(
+        &self,
+        holders: &[&str],
+        amount: u64,
+        key: &str,
+        start: Arc<Barrier>,
+    ) -> tokio::task::JoinHandle<Acquired> {
+        self.spawn_acquire(holders, amount, key, evaluator(), Some(start))
+    }
+
+    fn spawn_acquire(
+        &self,
+        holders: &[&str],
+        amount: u64,
+        key: &str,
+        evaluate: Arc<TransactionEvaluator>,
+        start: Option<Arc<Barrier>>,
+    ) -> tokio::task::JoinHandle<Acquired> {
         let store = Arc::clone(&self.store);
         let subjects = subjects(holders);
         let key = key.to_owned();
         tokio::spawn(async move {
+            if let Some(start) = start {
+                start.wait().await;
+            }
             let applicable = applicable(subjects.clone());
             let idempotency = IdempotencyWrite {
                 scope: IdempotencyScope {
@@ -407,7 +453,8 @@ impl PgHarness {
             "{period_sql}WITH leases AS (INSERT INTO qe_leases (token, tenant_id, metric, \
              subject_key, attribution_hash, idem_key, state, reserved_amount, acquired_at, \
              expiry_at, record_version, created_at, updated_at) \
-             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', '\\x00', '\\x00', \
+             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', \
+             decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), \
              'backlog-' || n, 'active', 1, now() - interval '2 hours', \
              now() - interval '1 hour', 1, now(), now() \
              FROM generate_series(1, {count}) AS n RETURNING token) \
@@ -475,6 +522,121 @@ impl PgHarness {
         })
     }
 
+    fn release(&self, token: LeaseToken, key: &str) -> tokio::task::JoinHandle<Settled> {
+        tokio::spawn(release_on(Arc::clone(&self.store), token, key.to_owned()))
+    }
+
+    /// Lock the pair's capacity row in an open transaction until the sender fires.
+    async fn hold_capacity_row(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), toolkit_db::DbError>>,
+    ) {
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let db = self.db.clone();
+        let holder = tokio::spawn(async move {
+            db.transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    let row = lease_repo::lock_capacity_row(
+                        tx,
+                        &AccessScope::allow_all(),
+                        tenant().as_uuid(),
+                        METRIC_TOKENS,
+                        lease_repo::RowWait::Wait,
+                    )
+                    .await?;
+                    assert!(row.is_some(), "the pair has its capacity row");
+                    _ = locked_tx.send(());
+                    _ = release_rx.await;
+                    Ok::<_, toolkit_db::DbError>(())
+                })
+            })
+            .await
+        });
+        locked_rx.await.expect("the capacity row is locked");
+        (release_tx, holder)
+    }
+
+    /// Stamp one hold in an open transaction, rolled back when the sender fires.
+    async fn hold_hold_row(
+        &self,
+        token: Uuid,
+        quota: QuotaId,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<(), toolkit_db::DbError>>,
+    ) {
+        let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let db = self.db.clone();
+        let now = self.now();
+        let holder = tokio::spawn(async move {
+            db.transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    let stamped = lease_repo::mark_hold_returned(
+                        tx,
+                        &AccessScope::allow_all(),
+                        token,
+                        quota.as_uuid(),
+                        now,
+                    )
+                    .await?;
+                    assert!(stamped, "the hold is unreturned");
+                    _ = locked_tx.send(());
+                    _ = release_rx.await;
+                    Err::<(), _>(toolkit_db::DbError::InvalidParameter(
+                        "roll the stamp back".to_owned(),
+                    ))
+                })
+            })
+            .await
+        });
+        locked_rx.await.expect("the hold row is locked");
+        (release_tx, holder)
+    }
+
+    /// Wait until exactly `count` backends queue on a row lock.
+    async fn lock_waiters(&self, count: u32) {
+        let args = [
+            "psql",
+            "-tA",
+            "-U",
+            "user",
+            "-d",
+            "app",
+            "-c",
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'",
+        ];
+        for _ in 0..200 {
+            let mut output = self
+                .container
+                .exec(ExecCommand::new(args.map(str::to_owned)))
+                .await
+                .expect("psql runs in the container");
+            let stdout = output.stdout_to_vec().await.expect("psql output");
+            if String::from_utf8_lossy(&stdout).trim() == count.to_string() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{count} lock waiters never appeared");
+    }
+
+    async fn live_leases(&self) -> u64 {
+        let conn = self.db.conn().expect("conn");
+        lease_repo::count_live(
+            &conn,
+            &AccessScope::allow_all(),
+            tenant().as_uuid(),
+            METRIC_TOKENS,
+            self.now(),
+        )
+        .await
+        .expect("count live leases")
+    }
+
     async fn consumed(&self, holder: &str, id: QuotaId) -> u64 {
         self.store
             .read_quota_snapshot(&ctx(), &scope(), &applicable(subjects(&[holder])))
@@ -501,6 +663,37 @@ impl PgHarness {
             .expect("read holds")
             .len()
     }
+}
+
+async fn release_on(store: Arc<SqlConsumptionStore>, token: LeaseToken, key: String) -> Settled {
+    store
+        .release_lease(
+            &ctx(),
+            &scope(),
+            token,
+            &PartialIdempotencyWrite {
+                tenant_id: tenant(),
+                key,
+                payload_hash: PayloadHash::from_bytes([8; 32]),
+            },
+            &[],
+        )
+        .await
+}
+
+/// [`release_on`], retried past contention refusals so every admitted lease is released.
+async fn release_settled(
+    store: Arc<SqlConsumptionStore>,
+    token: LeaseToken,
+    key: String,
+) -> Settled {
+    for _ in 0..10 {
+        let settled = release_on(Arc::clone(&store), token, key.clone()).await;
+        if !matches!(settled, Err(StorageError::LeaseContentionTimeout)) {
+            return settled;
+        }
+    }
+    release_on(store, token, key).await
 }
 
 fn token_of(outcome: &Acquired) -> Option<LeaseToken> {
@@ -613,6 +806,309 @@ async fn concurrent_acquisitions_admit_exactly_the_lease_cap() {
         "the capacity row serializes the count"
     );
     assert_eq!(h.consumed("u1", id).await, 3);
+    h.down().await;
+}
+
+/// Long enough for a transition that does not queue on the held row.
+const UNBLOCKED: Duration = Duration::from_secs(5);
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_an_acquisition_waits_on_a_held_capacity_row() {
+    let h = PgHarness::up().await;
+    h.quota("u1", Some(1_000)).await;
+    let deactivated = h.quota("u2", Some(1_000)).await;
+    let bulk_deactivated = h.quota("u3", Some(1_000)).await;
+    let expired = h.held(&["u1"], 10, "a1").await;
+    h.advance(Duration::from_secs(61));
+    let before = h.now();
+    let committed = h.held(&["u1"], 10, "a2").await;
+    let released = h.held(&["u1"], 10, "a3").await;
+    let cascaded = h.held(&["u2"], 10, "a4").await;
+    let bulk_cascaded = h.held(&["u3"], 10, "a7").await;
+
+    let (unlock, holder) = h.hold_capacity_row().await;
+    let commit = tokio::time::timeout(UNBLOCKED, h.commit(committed, 5, "c1"))
+        .await
+        .expect("the commit does not wait on the capacity row")
+        .expect("join");
+    assert!(
+        matches!(commit, Ok(TransitionOutcome::Applied(_))),
+        "{commit:?}"
+    );
+    let release = tokio::time::timeout(UNBLOCKED, h.release(released, "r1"))
+        .await
+        .expect("the release does not wait on the capacity row")
+        .expect("join");
+    assert!(
+        matches!(release, Ok(TransitionOutcome::Applied(_))),
+        "{release:?}"
+    );
+    let swept = tokio::time::timeout(UNBLOCKED, h.store.reclaim_expired_leases(10, before))
+        .await
+        .expect("the sweeper does not wait on the capacity row")
+        .expect("reclaim");
+    assert_eq!(
+        swept.iter().map(|lease| lease.token).collect::<Vec<_>>(),
+        vec![expired]
+    );
+    let cascade = tokio::time::timeout(
+        UNBLOCKED,
+        h.quotas
+            .deactivate_quota(&actor(), &scope(), deactivated, &[]),
+    )
+    .await
+    .expect("the cascade does not wait on the capacity row")
+    .expect("the deactivation commits");
+    assert_eq!(cascade.resolved_leases, vec![cascaded]);
+    let bulk = BulkDeactivateEnvelope {
+        tenant_id: tenant(),
+        idempotency: IdempotencyWrite {
+            scope: IdempotencyScope {
+                tenant_id: tenant(),
+                subject_key: IdempotencySubjectKey::of(&[]),
+                operation_type: OperationType::BulkDeactivateQuotas,
+                key: "b1".to_owned(),
+            },
+            payload_hash: PayloadHash::from_bytes([9; 32]),
+        },
+        items: vec![BulkDeactivateEntry {
+            idempotency_key: None,
+            scope: scope(),
+            quota_id: bulk_deactivated,
+            events: Vec::new(),
+        }],
+    };
+    let bulk = tokio::time::timeout(UNBLOCKED, h.quotas.bulk_deactivate_quotas(&actor(), &bulk))
+        .await
+        .expect("the bulk cascade does not wait on the capacity row")
+        .expect("the bulk deactivation commits");
+    let TransitionOutcome::Applied(bulk) = bulk else {
+        panic!("a fresh envelope applies: {bulk:?}");
+    };
+    assert_eq!(bulk.items[0].resolved_leases, vec![bulk_cascaded]);
+    // The row still guards admission.
+    let refused = tokio::time::timeout(UNBLOCKED, h.acquire(&["u1"], 1, "a5"))
+        .await
+        .expect("a NOWAIT acquisition gives up at once")
+        .expect("join");
+    assert!(
+        matches!(refused, Err(StorageError::LeaseContentionTimeout)),
+        "refused by the lock, not the cap: {refused:?}"
+    );
+
+    _ = unlock.send(());
+    holder.await.expect("join").expect("the holder commits");
+    assert!(token_of(&h.acquire(&["u1"], 1, "a6").await.expect("join")).is_some());
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_cap_stays_exact_while_releases_interleave_with_acquisitions() {
+    const CAP: u64 = 3;
+    let h = Arc::new(PgHarness::up().await);
+    h.queue_writers().await;
+    h.cap_leases(i32::try_from(CAP).unwrap()).await;
+    h.quota("u1", Some(1_000_000)).await;
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor = {
+        let h = Arc::clone(&h);
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            let mut most = 0;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                most = most.max(h.live_leases().await);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            most
+        })
+    };
+    let start = Arc::new(Barrier::new(40));
+    let racers: Vec<_> = (0..40_u64)
+        .map(|n| {
+            let acquired = h.acquire_at(&["u1"], 1, &format!("k{n}"), Arc::clone(&start));
+            let store = Arc::clone(&h.store);
+            tokio::spawn(async move {
+                let outcome = acquired.await.expect("join");
+                if let Some(token) = token_of(&outcome) {
+                    tokio::time::sleep(Duration::from_millis(n % 7)).await;
+                    let settled = release_settled(store, token, format!("r{n}")).await;
+                    assert!(
+                        matches!(settled, Ok(TransitionOutcome::Applied(_))),
+                        "{settled:?}"
+                    );
+                }
+                outcome
+            })
+        })
+        .collect();
+    let mut admitted = 0;
+    for racer in racers {
+        match tokio::time::timeout(NO_DEADLOCK, racer)
+            .await
+            .expect("no deadlock")
+            .expect("join")
+        {
+            Ok(outcome) if outcome.get().token.is_some() => admitted += 1,
+            Err(
+                StorageError::LeaseInflightLimitExceeded | StorageError::LeaseContentionTimeout,
+            ) => {}
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let most = monitor.await.expect("join");
+    assert!(admitted > CAP, "released slots are reused: {admitted}");
+    assert!(most <= CAP, "{most} live leases against a cap of {CAP}");
+    assert_eq!(
+        h.live_leases().await,
+        0,
+        "every admitted lease was released"
+    );
+    Arc::into_inner(h)
+        .expect("the harness is no longer shared")
+        .down()
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_capacity_row_alone_holds_the_cap_across_distinct_quotas() {
+    const CAP: u64 = 3;
+    let h = Arc::new(PgHarness::up().await);
+    h.queue_writers().await;
+    h.cap_leases(i32::try_from(CAP).unwrap()).await;
+    // One Quota per racer pair: no Quota row is shared, only the capacity row.
+    let holders: Vec<String> = (0..12).map(|n| format!("q{n}")).collect();
+    for holder in &holders {
+        h.quota(holder, Some(1_000_000)).await;
+    }
+
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let monitor = {
+        let h = Arc::clone(&h);
+        let done = Arc::clone(&done);
+        tokio::spawn(async move {
+            let mut most = 0;
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                most = most.max(h.live_leases().await);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            most
+        })
+    };
+    let start = Arc::new(Barrier::new(48));
+    let racers: Vec<_> = (0..48_u64)
+        .map(|n| {
+            let holder = &holders[usize::try_from(n).unwrap() % holders.len()];
+            let acquired =
+                h.acquire_at(&[holder.as_str()], 1, &format!("k{n}"), Arc::clone(&start));
+            let h = Arc::clone(&h);
+            tokio::spawn(async move {
+                let outcome = acquired.await.expect("join");
+                let mut seen = 0;
+                if let Some(token) = token_of(&outcome) {
+                    seen = h.live_leases().await;
+                    tokio::time::sleep(Duration::from_millis(5 + n % 11)).await;
+                    let settled =
+                        release_settled(Arc::clone(&h.store), token, format!("r{n}")).await;
+                    assert!(
+                        matches!(settled, Ok(TransitionOutcome::Applied(_))),
+                        "{settled:?}"
+                    );
+                }
+                (outcome, seen)
+            })
+        })
+        .collect();
+    let (mut admitted, mut capped, mut refused, mut most_seen) = (0, 0, 0, 0);
+    for racer in racers {
+        let (outcome, seen) = tokio::time::timeout(NO_DEADLOCK, racer)
+            .await
+            .expect("no deadlock")
+            .expect("join");
+        most_seen = most_seen.max(seen);
+        match outcome {
+            Ok(outcome) if outcome.get().token.is_some() => admitted += 1,
+            Err(StorageError::LeaseInflightLimitExceeded) => capped += 1,
+            // NOWAIT refusals past the budget are an allowed answer here.
+            Err(StorageError::LeaseContentionTimeout) => refused += 1,
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let most = monitor.await.expect("join").max(most_seen);
+    eprintln!("admitted {admitted}, capped {capped}, refused {refused}, most live {most}");
+    assert!(admitted > CAP, "released slots are reused: {admitted}");
+    assert!(most <= CAP, "{most} live leases against a cap of {CAP}");
+    assert_eq!(
+        h.live_leases().await,
+        0,
+        "every admitted lease was released"
+    );
+    Arc::into_inner(h)
+        .expect("the harness is no longer shared")
+        .down()
+        .await;
+}
+
+/// The sweep meets the high counter first, the cascade's spanning lease the low one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sweep_and_a_cascade_over_two_quotas_of_one_pair_do_not_deadlock() {
+    let h = PgHarness::up().await;
+    let first = h.quota("u1", Some(1_000)).await;
+    let second = h.quota("u2", Some(1_000)).await;
+    let ((low, low_holder), (high, high_holder)) = if first.as_uuid() < second.as_uuid() {
+        ((first, "u1"), (second, "u2"))
+    } else {
+        ((second, "u2"), (first, "u1"))
+    };
+    // Live first: acquiring later would return the expired holds itself (I4).
+    let spanning = h.held(&[low_holder, high_holder], 10, "l1").await;
+    h.seed_unreturned_holds(high, None, 1).await;
+    h.seed_unreturned_holds(low, None, 1).await;
+    let before = h.now();
+    let conn = h.db.conn().expect("conn");
+    let on_high = lease_repo::unreturned_expired_holds(
+        &conn,
+        &AccessScope::allow_all(),
+        high.as_uuid(),
+        None,
+        before,
+    )
+    .await
+    .expect("expired holds")
+    .first()
+    .expect("the seeded hold")
+    .lease_token;
+
+    // The sweep stops on its first hold, holding whatever counters it took so far.
+    let (unblock, side) = h.hold_hold_row(on_high, high).await;
+    let store = Arc::clone(&h.store);
+    let sweep = tokio::spawn(async move { store.reclaim_expired_leases(10, before).await });
+    h.lock_waiters(1).await;
+    let quotas = h.quotas.clone();
+    let cascade =
+        tokio::spawn(async move { quotas.deactivate_quota(&actor(), &scope(), low, &[]).await });
+    h.lock_waiters(2).await;
+    _ = unblock.send(());
+    assert!(side.await.expect("join").is_err(), "the stamp rolls back");
+
+    let (sweep, cascade) = tokio::time::timeout(NO_DEADLOCK, async {
+        (sweep.await.expect("join"), cascade.await.expect("join"))
+    })
+    .await
+    .expect("no hang");
+    let swept = sweep.expect("the sweep commits");
+    assert_eq!(
+        swept
+            .iter()
+            .map(|lease| lease.holds.iter().map(|hold| hold.quota_id).collect())
+            .collect::<Vec<Vec<_>>>(),
+        vec![vec![high], vec![low]],
+        "the high hold's lease expired first"
+    );
+    let cascade = cascade.expect("the deactivation commits");
+    assert_eq!(cascade.resolved_leases, vec![spanning]);
     h.down().await;
 }
 

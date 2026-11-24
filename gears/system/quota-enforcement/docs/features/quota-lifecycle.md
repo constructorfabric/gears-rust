@@ -189,7 +189,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 
 **Steps**:
 1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas/{id}/deactivate` - `inst-qde-request`
-2. [x] - `p1` - DB: `deactivate_quota(quota_id, events)` in a single transaction: lock the `quotas` row while its status is still `active`, mark the Quota deactivated, lock the active leases on this quota, mark each such lease resolved-by-deactivation, decrement `lease_capacity_counters`, return held capacity to the acquisition-period counters, and append the `operation_log` entry (I1) - `inst-qde-cascade`
+2. [x] - `p1` - DB: `deactivate_quota(quota_id, events)` in a single transaction: lock the `quotas` row while its status is still `active`, mark the Quota deactivated, lock the active leases on this quota, lock every counter their holds name once in ascending order, mark each such lease resolved-by-deactivation, return held capacity to the acquisition-period counters, and append the `operation_log` entry (I1) - `inst-qde-cascade`
 3. [x] - `p1` - Enqueue `quota-changed (change_kind='deactivated')` plus one `lease-resolved-by-deactivation` event per affected lease, carrying the lease ID, owning subject context, held amount, and the deactivated `quota_id`, all in the same transaction (I11); commit the transaction - `inst-qde-events`
 4. [x] - `p1` - The cascade never partially completes: either every active lease for the Quota is resolved or none is; subsequent `commit` or `release` calls against a resolved lease return `LEASE_NOT_ACTIVE` (lease operations are owned by the lease-operations feature); the deactivation timestamp serves as the implicit lease-resolve event - `inst-qde-atomic`
 5. [x] - `p1` - **RETURN** `200` with the `DeactivateOutcome { resolved_leases }` summary so the gateway can attribute telemetry - `inst-qde-return`
@@ -394,7 +394,7 @@ stable while emitting a `quota-changed` event.
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-deactivation-cascade`
 
 The system **MUST** implement `deactivate_quota` as one atomic transaction that marks the Quota deactivated, marks
-every active lease against it resolved-by-deactivation, decrements the active-lease counters, returns held capacity
+every active lease against it resolved-by-deactivation, returns held capacity
 to the acquisition-period counters, and enqueues the `quota-changed (deactivated)` event plus one
 `lease-resolved-by-deactivation` event per affected lease (I11), returning
 `DeactivateOutcome { resolved_leases }`. The record stays readable; new debits and leases against it are rejected by
@@ -408,8 +408,7 @@ the evaluation paths.
 
 **Touches**:
 - API: `POST /v1/quota-enforcement/quotas/{id}/deactivate`; `QuotaManagerApi::deactivate_quota`
-- DB: `cpt-cf-quota-enforcement-db-schema` (`quotas`, `leases`, `lease_holds`, `lease_capacity_counters`,
-  `notification_outbox`)
+- DB: `cpt-cf-quota-enforcement-db-schema` (`quotas`, `leases`, `lease_holds`, `notification_outbox`)
 - Entities: `DeactivateOutcome`
 
 ### Rate Quota-Type Rejection
@@ -479,10 +478,9 @@ respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, p
   persistence and increments `contract_validation_failures_total` with the `arbitration` surface; an accepted
   write snapshots the contract id/version, and a metadata-only update keeps the quota ID stable while emitting
   `quota-changed`
-- [ ] Deactivating a Quota with N active leases marks all N resolved-by-deactivation, decrements the lease-capacity
-  counters, returns held capacity to the acquisition-period counters, enqueues one
-  `lease-resolved-by-deactivation` event per lease plus `quota-changed (deactivated)`, and appends the operation-log
-  entry (I1), all in one transaction;
+- [ ] Deactivating a Quota with N active leases marks all N resolved-by-deactivation, returns held capacity to the
+  acquisition-period counters, enqueues one `lease-resolved-by-deactivation` event per lease plus
+  `quota-changed (deactivated)`, and appends the operation-log entry (I1), all in one transaction;
   `DeactivateOutcome.resolved_leases` lists the N leases; a failure mid-cascade resolves none
 - [ ] A deactivated Quota remains readable through both read endpoints; reads return the full metadata object, the
   `validity_window`, and a `currently_within_window` value consistent with the server clock; list reads are

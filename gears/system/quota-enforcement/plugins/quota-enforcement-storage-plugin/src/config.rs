@@ -1,5 +1,7 @@
 //! Configuration for `[quota-enforcement-storage-plugin]`.
 
+use std::time::Duration;
+
 use serde::Deserialize;
 
 /// Plugin configuration. Read once at `Gear::init`.
@@ -11,6 +13,8 @@ pub struct StoragePluginConfig {
     pub vendor: String,
     /// Selection priority among plugins of the same vendor. Lower wins.
     pub priority: i16,
+    /// Seconds an operator edit of the configuration tables may take to apply.
+    pub config_refresh_secs: u64,
 }
 
 impl Default for StoragePluginConfig {
@@ -18,6 +22,7 @@ impl Default for StoragePluginConfig {
         Self {
             vendor: "constructorfabric".to_owned(),
             priority: 100,
+            config_refresh_secs: 30,
         }
     }
 }
@@ -27,14 +32,25 @@ impl StoragePluginConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error when `vendor` is empty or whitespace only.
+    /// Returns an error when `vendor` is blank or `config_refresh_secs` is zero.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.vendor.trim().is_empty() {
             anyhow::bail!(
                 "[quota-enforcement-storage-plugin].vendor must not be empty or whitespace-only"
             );
         }
+        if self.config_refresh_secs == 0 {
+            anyhow::bail!(
+                "[quota-enforcement-storage-plugin].config_refresh_secs must be at least 1"
+            );
+        }
         Ok(())
+    }
+
+    /// How long a snapshot of the configuration tables serves.
+    #[must_use]
+    pub const fn config_refresh(&self) -> Duration {
+        Duration::from_secs(self.config_refresh_secs)
     }
 }
 

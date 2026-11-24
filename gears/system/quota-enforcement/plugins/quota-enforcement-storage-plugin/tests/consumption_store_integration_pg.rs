@@ -301,6 +301,11 @@ impl PgHarness {
         )
         .await
         .expect("configure the contention budget");
+        // The edit applies once the configuration snapshot refreshes.
+        let now = *self.clock.lock().expect("clock");
+        self.set_now(
+            now + quota_enforcement_storage_plugin::infra::storage::config_cache::DEFAULT_REFRESH,
+        );
     }
 
     fn set_update_now(&self, now: OffsetDateTime) {

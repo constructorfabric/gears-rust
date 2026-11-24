@@ -70,7 +70,8 @@ use quota_enforcement_sdk::{BatchTimer, IdempotencyScope, StorageError};
 use sea_orm::{DbErr, RuntimeErr};
 use toolkit_db::secure::{DBRunner, ScopeError};
 
-use super::consumption_store::{SqlConsumptionStore, TxError};
+use super::config_cache::ConfigSnapshot;
+use super::consumption_store::TxError;
 
 /// `PostgreSQL`'s `lock_not_available`: what a `NOWAIT` read on a held row gets.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
@@ -101,14 +102,12 @@ impl ContentionBudget {
         }
     }
 
-    /// The budget with the earlier deadline: a primitive spanning several
-    /// metrics waits no longer than the strictest of them allows.
-    pub(super) fn stricter(self, other: Self) -> Self {
-        if other.deadline < self.deadline {
-            other
-        } else {
-            self
-        }
+    /// The strictest budget of `metrics` in `config`, else the `*` default, starting now.
+    pub(super) fn of<'a>(
+        config: &ConfigSnapshot,
+        metrics: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        Self::starting_now(config.strictest_contention_timeout(metrics))
     }
 
     fn remaining(self) -> Duration {
@@ -282,45 +281,6 @@ pub(super) async fn lock_scopes<E: ContentionError>(
         }
     }
     Ok(())
-}
-
-impl SqlConsumptionStore {
-    /// The contention budget configured for `metric` — its own row, else the
-    /// platform default — starting now. `None` reads the platform default,
-    /// for a primitive that cannot learn its metric before it locks.
-    pub(super) async fn contention_budget(
-        &self,
-        metric: Option<&str>,
-    ) -> Result<ContentionBudget, StorageError> {
-        contention_budget_of(&self.db, metric).await
-    }
-}
-
-/// The contention budget configured for `metric` over `db`, starting now; the
-/// read every store with a stripe shares.
-///
-/// # Errors
-///
-/// `Unavailable` when the configuration cannot be read.
-pub(super) async fn contention_budget_of(
-    db: &toolkit_db::Db,
-    metric: Option<&str>,
-) -> Result<ContentionBudget, StorageError> {
-    let conn = db.conn().map_err(|error| {
-        super::consumption_store::unavailable("read contention timeout", "config", &error)
-    })?;
-    let configured = super::repo::config_repo::read_contention_timeout(
-        &conn,
-        metric.unwrap_or(crate::infra::storage::entity::DEFAULT_KEY),
-    )
-    .await
-    .map_err(|error| {
-        super::consumption_store::unavailable("read contention timeout", "config", &error)
-    })?;
-    let millis = u64::try_from(configured.unwrap_or(0)).unwrap_or(0);
-    Ok(ContentionBudget::starting_now(Duration::from_millis(
-        millis,
-    )))
 }
 
 #[cfg(test)]

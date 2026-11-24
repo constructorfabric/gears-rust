@@ -15,6 +15,7 @@ use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use crate::config::StoragePluginConfig;
 use crate::domain::StoragePlugin;
 use crate::infra::outbox::{NotificationOutbox, QeOutbox, SqlNotificationPipeline};
+use crate::infra::storage::config_cache::ConfigCache;
 use crate::infra::storage::{
     SqlConsumptionStore, SqlFoundationStore, SqlPolicyStore, SqlQuotaStore,
 };
@@ -82,27 +83,21 @@ impl Gear for StoragePluginGear {
         cfg.validate()?;
 
         let db = ctx.db_required()?;
+        // One configuration cache for every store; one adapter serves both consumption ports.
+        let config = Arc::new(ConfigCache::new(cfg.config_refresh()));
+        let consumption = Arc::new(
+            SqlConsumptionStore::new(db.db(), self.notification_enqueuer())
+                .with_config(Arc::clone(&config)),
+        );
         let plugin = Arc::new(
             StoragePlugin::new(
                 Arc::new(SqlFoundationStore::new(db.db())),
-                Arc::new(SqlQuotaStore::new(db.db(), self.notification_enqueuer())),
+                Arc::new(
+                    SqlQuotaStore::new(db.db(), self.notification_enqueuer()).with_config(config),
+                ),
                 Arc::new(SqlPolicyStore::new(db.db(), self.notification_enqueuer())),
-                {
-                    // Leases settle against the counters and records the
-                    // consumption store owns, so one adapter serves both ports.
-                    let consumption = Arc::new(SqlConsumptionStore::new(
-                        db.db(),
-                        self.notification_enqueuer(),
-                    ));
-                    Arc::clone(&consumption) as Arc<dyn crate::domain::ports::ConsumptionStore>
-                },
-                {
-                    let leases = Arc::new(SqlConsumptionStore::new(
-                        db.db(),
-                        self.notification_enqueuer(),
-                    ));
-                    leases as Arc<dyn crate::domain::ports::LeaseStore>
-                },
+                Arc::clone(&consumption) as Arc<dyn crate::domain::ports::ConsumptionStore>,
+                consumption as Arc<dyn crate::domain::ports::LeaseStore>,
             )
             .with_notifications(Arc::new(SqlNotificationPipeline::new(
                 db.db(),

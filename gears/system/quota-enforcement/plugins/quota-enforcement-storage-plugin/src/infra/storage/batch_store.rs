@@ -47,10 +47,11 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
+use super::config_cache::ConfigSnapshot;
 use super::consumption_store::{
     Applied, Clock, LockedCounter, OwnedMutation, RACE_ATTEMPTS, RecordBlob, RecordWrite, Replay,
-    SqlConsumptionStore, TxError, actor_of, counters_of, expires_at, lift, lock_counters_of,
-    replay_of, snapshot_of_locked, write_record,
+    SqlConsumptionStore, TxError, actor_of, counters_of, lift, lock_counters_of, replay_of,
+    snapshot_of_locked, write_record,
 };
 use super::locking::{ContentionBudget, lock_scopes, with_budget_within};
 use super::quota_mapping;
@@ -123,6 +124,7 @@ struct BatchTx<'a> {
     actor: &'a Actor,
     clock: &'a Clock,
     enqueuer: &'a Arc<dyn NotificationEnqueuer>,
+    config: &'a ConfigSnapshot,
 }
 
 /// Every applicable Quota of the batch, locked once.
@@ -171,7 +173,13 @@ impl SqlConsumptionStore {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
         let actor = actor_of(ctx);
-        let budget = self.batch_budget(batch).await?;
+        let config = self.config().await?;
+        // A batch waits on a row no longer than any of its metrics allows (I8).
+        let metrics = batch
+            .items
+            .iter()
+            .map(|entry| entry.item.applicable.metric.as_str());
+        let budget = ContentionBudget::of(&config, metrics);
         for attempt in 0..RACE_ATTEMPTS {
             // A refused lock rolls the transaction back and runs it again,
             // within the contention budget and, once armed, the batch timer.
@@ -183,6 +191,7 @@ impl SqlConsumptionStore {
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let owned = OwnedBatch::of(batch);
+                let config = Arc::clone(&config);
                 settling(
                     wakes,
                     self.db.transaction_ref_mapped(move |tx| {
@@ -196,6 +205,7 @@ impl SqlConsumptionStore {
                                 actor: &actor,
                                 clock: &clock,
                                 enqueuer: &enqueuer,
+                                config: &config,
                             };
                             Self::batch_in_tx(tx, &env, &owned).await
                         })
@@ -223,30 +233,6 @@ impl SqlConsumptionStore {
             OPERATION,
             TxError::Raced(Box::new(batch.envelope.clone())),
         ))
-    }
-
-    /// The strictest contention budget of the batch's metrics: a batch waits
-    /// on a row no longer than any of its metrics allows (I8).
-    async fn batch_budget(
-        &self,
-        batch: &EvaluatedBatch<'_>,
-    ) -> Result<ContentionBudget, StorageError> {
-        let mut metrics: Vec<&str> = batch
-            .items
-            .iter()
-            .map(|entry| entry.item.applicable.metric.as_str())
-            .collect();
-        metrics.sort_unstable();
-        metrics.dedup();
-        let mut strictest: Option<ContentionBudget> = None;
-        for metric in metrics {
-            let budget = self.contention_budget(Some(metric)).await?;
-            strictest = Some(strictest.map_or(budget, |current| current.stricter(budget)));
-        }
-        match strictest {
-            Some(budget) => Ok(budget),
-            None => self.contention_budget(None).await,
-        }
     }
 
     /// One attempt, in the caller's transaction.
@@ -332,7 +318,7 @@ impl SqlConsumptionStore {
         {
             return Ok(TransitionOutcome::Applied(unrecorded(evaluated.decisions)));
         }
-        let deadline = longest_retention(tx, batch, now).await?;
+        let deadline = longest_retention(env.config, batch, now);
         let blob = serde_json::to_string(&BatchRecord::new(evaluated.decisions.clone()))?;
         write_record(
             tx,
@@ -560,23 +546,15 @@ fn owner_scope<'a>(batch: &'a OwnedBatch, union: &LockedUnion, id: Uuid) -> &'a 
 
 /// Now plus the longest idempotency retention of any item's metric, so the
 /// envelope replays for as long as any of its metrics promises.
-async fn longest_retention(
-    tx: &impl DBRunner,
+fn longest_retention(
+    config: &ConfigSnapshot,
     batch: &OwnedBatch,
     now: OffsetDateTime,
-) -> Result<OffsetDateTime, TxError> {
-    let mut longest = now;
-    let mut seen: Vec<&str> = Vec::new();
-    for item in &batch.items {
+) -> OffsetDateTime {
+    now + config.longest_retention(batch.items.iter().map(|item| {
         let applicable = &item.mutation.applicable;
-        let metric = applicable.metric.as_str();
-        if seen.contains(&metric) {
-            continue;
-        }
-        seen.push(metric);
-        longest = longest.max(expires_at(tx, applicable.tenant_id, metric, now).await?);
-    }
-    Ok(longest)
+        (applicable.tenant_id, applicable.metric.as_str())
+    }))
 }
 
 /// An engine that ran out of the batch's time is the batch timing out.

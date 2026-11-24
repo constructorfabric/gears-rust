@@ -205,7 +205,7 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
 **Steps**:
 1. [x] - `p2` - Caller sends `POST /v1/quota-enforcement/quotas/bulk-deactivate` with an envelope carrying its one `tenant_id`, the envelope idempotency key, and the list of quota IDs, each with an optional item key (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbd-request`
 2. [x] - `p2` - Run `cpt-cf-quota-enforcement-algo-bulk-envelope` with the deactivate items; an exact replay short-circuits to the stored outcome - `inst-qbd-envelope`
-3. [x] - `p2` - DB: apply every deactivation inside the single envelope transaction of `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item runs the single-item cascade semantics unchanged (`cpt-cf-quota-enforcement-flow-quota-deactivate`): mark the Quota deactivated, mark every active lease against it resolved-by-deactivation, decrement the lease-capacity counters, return held capacity to the acquisition-period counters, and append the operation-log entry (I1) - `inst-qbd-cascade`
+3. [x] - `p2` - DB: apply every deactivation inside the single envelope transaction of `cpt-cf-quota-enforcement-algo-bulk-envelope`; each item runs the single-item cascade semantics unchanged (`cpt-cf-quota-enforcement-flow-quota-deactivate`): mark the Quota deactivated, mark every active lease against it resolved-by-deactivation, return held capacity to the acquisition-period counters, and append the operation-log entry (I1) - `inst-qbd-cascade`
 4. [x] - `p2` - Enqueue `quota-changed (change_kind='deactivated')` per Quota plus one `lease-resolved-by-deactivation` event per affected lease, for every Quota in the batch, in the same transaction (I11); the entire batch's lease-resolution events are emitted atomically with the deactivation transaction (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`) - `inst-qbd-events`
 5. [x] - `p2` - The batch-level cascade never partially completes: either every listed Quota is deactivated with every one of its active leases resolved, or none is; the resolved leases follow the `cpt-cf-quota-enforcement-state-lease` transition to `ResolvedByDeactivation` recorded by the lease-operations feature - `inst-qbd-atomic`
 6. [x] - `p2` - **RETURN** the outcome carrying the per-Quota resolved-lease summaries (the single-item `DeactivateOutcome { resolved_leases }` information for each item) so the gateway can attribute telemetry exactly as for the single-item deactivation - `inst-qbd-return`
@@ -346,8 +346,7 @@ no lease semantics are re-specified here.
 
 **Touches**:
 - API: `POST /v1/quota-enforcement/quotas/bulk-deactivate`
-- DB: `cpt-cf-quota-enforcement-db-schema` (`quotas`, `leases`, `lease_holds`, `lease_capacity_counters`,
-  `notification_outbox`)
+- DB: `cpt-cf-quota-enforcement-db-schema` (`quotas`, `leases`, `lease_holds`, `notification_outbox`)
 - Entities: `DeactivateOutcome` (per item), `Lease` (lease-operations entity, transitioned only)
 
 ## 6. Acceptance Criteria
@@ -370,10 +369,9 @@ no lease semantics are re-specified here.
   breaking-change gate; an item referencing `type = rate` fails the envelope with canonical `Unimplemented` (501); in
   both cases no patch from the batch is applied
 - [ ] A bulk-deactivate of K Quotas with active leases marks all K deactivated and every active lease against them
-  resolved-by-deactivation in one transaction, decrements the lease-capacity counters, returns held capacity to the
-  acquisition-period counters, and enqueues one `quota-changed (deactivated)` event per Quota plus one
-  `lease-resolved-by-deactivation` event per lease in the same transaction; an injected failure mid-cascade leaves
-  every Quota active and every lease untouched
+  resolved-by-deactivation in one transaction, returns held capacity to the acquisition-period counters, and enqueues
+  one `quota-changed (deactivated)` event per Quota plus one `lease-resolved-by-deactivation` event per lease in the
+  same transaction; an injected failure mid-cascade leaves every Quota active and every lease untouched
 - [ ] A bulk-deactivate containing one unknown quota ID fails the envelope with canonical `NotFound` attributed by
   index; one containing an already-deactivated Quota fails with `QUOTA_DEACTIVATED` attributed by index; in both
   cases the remaining Quotas stay active

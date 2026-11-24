@@ -163,7 +163,10 @@ struct Harness {
 
 impl Harness {
     async fn up() -> Self {
-        let db = test_db().await;
+        Self::on(test_db().await).await
+    }
+
+    async fn on(db: Db) -> Self {
         let (outbox, enqueuer) = bound_outbox(&db).await;
         let clock = Arc::new(Mutex::new(DAY_ONE));
         let reader = Arc::clone(&clock);
@@ -2168,6 +2171,111 @@ async fn a_full_commit_refuses_a_hold_whose_counter_row_is_missing() {
     assert!(
         matches!(committed, Err(StorageError::Internal(_))),
         "{committed:?}"
+    );
+    h.down().await;
+}
+
+/// The in-memory database of `test_db`, with every statement recorded.
+async fn recorded_test_db() -> (Db, toolkit_db::test_support::QueryRecorder) {
+    use sea_orm_migration::MigratorTrait;
+    let opts = toolkit_db::ConnectOpts {
+        max_conns: Some(1),
+        min_conns: Some(1),
+        ..toolkit_db::ConnectOpts::default()
+    };
+    let (db, recorder) = toolkit_db::test_support::connect_with_recorder("sqlite::memory:", opts)
+        .await
+        .expect("connect in-memory sqlite");
+    toolkit_db::migration_runner::run_migrations_for_testing(
+        &db,
+        crate::infra::storage::Migrator::migrations(),
+    )
+    .await
+    .expect("apply storage migrations");
+    (db, recorder)
+}
+
+/// Write the `(tenant, METRIC_TOKENS)` lease cap the way an operator does.
+async fn set_lease_cap(db: &Db, max: i32) {
+    use crate::infra::storage::entity::lease_capacity_config as cap;
+    use sea_orm::ActiveValue::Set;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    cap::Entity::delete_many()
+        .filter(cap::Column::TenantKey.eq(tenant().as_uuid().to_string()))
+        .secure()
+        .scope_with(&scope)
+        .exec(&conn)
+        .await
+        .expect("clear the cap");
+    toolkit_db::secure::secure_insert::<cap::Entity>(
+        cap::ActiveModel {
+            tenant_key: Set(tenant().as_uuid().to_string()),
+            metric_key: Set(METRIC_TOKENS.to_owned()),
+            max_active_leases: Set(max),
+            updated_at: Set(DAY_ONE),
+        },
+        &scope,
+        &conn,
+    )
+    .await
+    .expect("set the cap");
+}
+
+#[tokio::test]
+async fn an_operator_config_edit_takes_effect_within_the_refresh_interval() {
+    let h = Harness::up().await;
+    h.allocation_quota("u1", Some(100)).await;
+    set_lease_cap(&h.db, 1).await;
+    h.acquire("u1", 1, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the first lease fits the cap");
+
+    set_lease_cap(&h.db, 2).await;
+    h.set_now(DAY_ONE + time::Duration::seconds(29));
+    let early = h
+        .acquire("u1", 1, TTL, &write(OperationType::Reserve, "r2", 2))
+        .await;
+    assert!(
+        matches!(early, Err(StorageError::LeaseInflightLimitExceeded)),
+        "the old cap holds until the refresh: {early:?}"
+    );
+
+    h.set_now(DAY_ONE + time::Duration::seconds(30));
+    h.acquire("u1", 1, TTL, &write(OperationType::Reserve, "r3", 3))
+        .await
+        .expect("the edited cap applies after the refresh");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_warm_acquisition_reads_no_configuration_table() {
+    let (db, recorder) = recorded_test_db().await;
+    let h = Harness::on(db).await;
+    h.allocation_quota("u1", Some(100)).await;
+    h.acquire("u1", 1, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("warm-up lease");
+
+    recorder.clear();
+    h.acquire("u1", 1, TTL, &write(OperationType::Reserve, "r2", 2))
+        .await
+        .expect("warm lease");
+
+    let config_reads: Vec<_> = recorder
+        .events()
+        .into_iter()
+        .filter(|query| {
+            query
+                .table
+                .as_deref()
+                .is_some_and(|t| t.ends_with("_config"))
+        })
+        .collect();
+    assert!(
+        config_reads.is_empty(),
+        "{}",
+        toolkit_db::test_support::format_trace(&config_reads)
     );
     h.down().await;
 }

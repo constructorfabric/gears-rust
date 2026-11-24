@@ -402,6 +402,15 @@ impl PgHarness {
         )
         .await
         .expect("configure the contention budget");
+        // The edit applies once the configuration snapshot refreshes.
+        let now = self
+            .pinned
+            .lock()
+            .expect("clock")
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        self.set_now(
+            now + quota_enforcement_storage_plugin::infra::storage::config_cache::DEFAULT_REFRESH,
+        );
     }
 
     /// Hold `held` in a transaction of its own until the returned sender fires.
@@ -776,11 +785,11 @@ async fn a_bulk_deactivate_and_a_deactivation_over_a_shared_quota_queue_instead_
     let shared = h.quota("t", 100).await;
     let one = h.lease(&["u1", "t"], "l1").await;
     let two = h.lease(&["u2", "t"], "l2").await;
-    // The envelope stops on the shared counter, past its leases and capacity row.
+    // The envelope stops on the shared counter, past its leases.
     let (holder, release) = h.hold(Held::Counter(shared)).await;
     let bulk = h.spawn_bulk_deactivate(deactivation("off", &[first, shared]));
     h.until_lock_waiters(1).await;
-    // It queues on the capacity row, or on the second lease once the envelope locks every lease first.
+    // It queues on the second lease, which the envelope locked first.
     let single = h.spawn_deactivate(second);
     h.until_lock_waiters(2).await;
     let (bulk, single) = release_and_join(holder, release, bulk, single).await;

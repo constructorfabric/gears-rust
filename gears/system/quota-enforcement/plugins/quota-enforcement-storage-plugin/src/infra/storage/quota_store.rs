@@ -33,6 +33,7 @@ use crate::domain::ports::{Actor, QuotaStore, StoreError};
 use crate::infra::outbox::{
     AttemptWakes, EnqueueError, NotificationEnqueuer, NotificationOutbox, settling,
 };
+use crate::infra::storage::config_cache::{ConfigCache, DEFAULT_REFRESH};
 use crate::infra::storage::consumption_store::{TxError as CounterTxError, credit_counter};
 use crate::infra::storage::cursor::{self, MAX_FILTER_IDS};
 use crate::infra::storage::entity::quota;
@@ -55,6 +56,7 @@ pub struct SqlQuotaStore {
     db: Db,
     enqueuer: Arc<dyn NotificationOutbox>,
     clock: crate::infra::storage::consumption_store::Clock,
+    config: Arc<ConfigCache>,
 }
 
 /// Every way a transaction body can fail, before the lift to [`StoreError`].
@@ -196,11 +198,7 @@ impl SqlQuotaStore {
     /// Bind the store to the plugin's database and its notification outbox.
     #[must_use]
     pub fn new(db: Db, enqueuer: Arc<dyn NotificationOutbox>) -> Self {
-        Self {
-            db,
-            enqueuer,
-            clock: Arc::new(OffsetDateTime::now_utc),
-        }
+        Self::with_clock(db, enqueuer, Arc::new(OffsetDateTime::now_utc))
     }
 
     /// The same store on a caller-driven clock. The cap guard compares the
@@ -216,7 +214,15 @@ impl SqlQuotaStore {
             db,
             enqueuer,
             clock,
+            config: Arc::new(ConfigCache::new(DEFAULT_REFRESH)),
         }
+    }
+
+    /// The same store, reading the configuration through `config`.
+    #[must_use]
+    pub fn with_config(mut self, config: Arc<ConfigCache>) -> Self {
+        self.config = config;
+        self
     }
 
     fn now(&self) -> OffsetDateTime {
@@ -410,11 +416,11 @@ impl SqlQuotaStore {
     }
 
     /// Lock what the cascades of `targets` write past their Quota rows, rank by
-    /// rank: the live leases holding any of them, ascending by token, then
-    /// those leases' capacity rows, then the counter of every hold of those
-    /// leases, whichever Quota it is on, ascending. Each cascade then finds its
-    /// rows held, so neither one deactivation nor an envelope of them goes back
-    /// a rank. The targets' Quota rows are held, so no lease joins them.
+    /// rank: the live leases holding any of them, ascending by token, then the
+    /// counter of every hold of those leases, whichever Quota it is on,
+    /// ascending. Each cascade then finds its rows held, so neither one
+    /// deactivation nor an envelope of them goes back a rank. The targets'
+    /// Quota rows are held, so no lease joins them.
     async fn lock_cascades(
         tx: &impl DBRunner,
         targets: &[(Uuid, &AccessScope)],
@@ -427,22 +433,14 @@ impl SqlQuotaStore {
                 leases.entry(lease.token).or_insert(*scope);
             }
         }
-        let mut capacity: BTreeMap<(Uuid, String), &AccessScope> = BTreeMap::new();
         let mut counters: BTreeMap<(Uuid, Option<Uuid>), &AccessScope> = BTreeMap::new();
         for (token, scope) in leases {
-            if let Some(lease) = lease_repo::find_for_update(tx, scope, token, wait).await? {
-                capacity
-                    .entry((lease.tenant_id, lease.metric))
-                    .or_insert(scope);
-            }
+            lease_repo::find_for_update(tx, scope, token, wait).await?;
             for hold in lease_repo::holds_of(tx, scope, token).await? {
                 counters
                     .entry((hold.quota_id, hold.period_id))
                     .or_insert(scope);
             }
-        }
-        for ((tenant_id, metric), scope) in capacity {
-            lease_repo::lock_capacity_row(tx, scope, tenant_id, &metric, wait).await?;
         }
         for ((quota_id, period_id), scope) in counters {
             counter_value_of(tx, scope, quota_id, period_id, wait)
@@ -491,16 +489,8 @@ impl SqlQuotaStore {
         let mut resolved = Vec::with_capacity(holders.len());
         let mut lease_events = Vec::new();
         for lease in holders {
-            // Rank 4, then 5 and 5b: every hold of this lease, on
-            // this Quota and on any other it spans, ascending.
-            let capacity = lease_repo::lock_capacity_row(
-                tx,
-                scope,
-                lease.tenant_id,
-                &lease.metric,
-                lease_repo::RowWait::Wait,
-            )
-            .await?;
+            // Rank 5 and 5b: every hold of this lease, on this Quota and on
+            // any other it spans, ascending.
             let holds = lease_repo::holds_of(tx, scope, lease.token).await?;
             let mut released = 0_u64;
             for hold in &holds {
@@ -547,20 +537,6 @@ impl SqlQuotaStore {
                 continue;
             }
             // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-deactivate
-            // Diagnostic only, so a missing row costs the count, not the
-            // transition.
-            if let Some(capacity) = &capacity {
-                lease_repo::bump_active_count(
-                    tx,
-                    scope,
-                    lease.tenant_id,
-                    &lease.metric,
-                    capacity.active_count,
-                    -1,
-                    now,
-                )
-                .await?;
-            }
             resolved.push(LeaseToken::from(lease.token));
             // Only the transaction knows which leases it resolved,
             // so it builds their events itself (I11).
