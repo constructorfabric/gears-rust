@@ -10,33 +10,35 @@
 //!
 //! # Environment
 //!
-//! An expression sees four variables, typed at save time from the metric's
+//! An expression sees three variables, typed at save time from the policy's
 //! persisted schema snapshot and bound at evaluation from the
 //! [`EvaluationContext`]:
 //!
-//! | Variable   | Type                                   | Source                          |
-//! |------------|----------------------------------------|---------------------------------|
-//! | `request`  | the metric's request metadata schema   | validated request projection    |
-//! | `resource` | the resource projection schema, or null | validated resource projection  |
-//! | `amount`   | `int`                                  | the requested debit             |
-//! | `quotas`   | `list<Quota>`                          | every applicable Quota          |
+//! | Variable   | Type                                         | Source                     |
+//! |------------|----------------------------------------------|----------------------------|
+//! | `request`  | the `metadata` schema of the metric type     | the request's metric metadata |
+//! | `amount`   | `int`                                        | the requested debit        |
+//! | `metric_id`| `string`                                     | the `id` of the request's metric object, `""` when it has none |
+//! | `quotas`   | `list<Quota>`                                | every applicable Quota     |
 //!
-//! `Quota` is `{ id: string, tier: "user" | "tenant", cap, consumed: int,
-//! remaining, arbitration }`, where `arbitration` carries the metric's
-//! constraint-contract metadata schema, so ADR-0007's paired-field checks apply
-//! to `request.region in q.arbitration.regions` inside any comprehension over
-//! `quotas`. `cap` and `remaining` are `null` for an unbounded Quota. Principal
-//! and attribution fields are absent from the environment and therefore rejected
-//! as unknown variables at save time.
+//! `Quota` is `{ id: string, subject_type: string, tier: "subject" | "tenant",
+//! cap, consumed: int, remaining }`. A Quota carries no metadata: QE core has
+//! already left out the Quotas whose conditions do not hold on the request
+//! (ADR-0013). A snapshot with no metric type schema leaves `request` untyped,
+//! so every operation on it is checked at evaluation.
+//! `cap` and `remaining` are `null` for an unbounded Quota. Principal and
+//! attribution are absent from the environment and therefore rejected as
+//! unknown variables at save time.
 //!
 //! # Decision record
 //!
 //! The expression returns exactly one of:
 //!
-//! * `{ "debit_plan": [ { "id": string, "amount": int }, ... ] }` — `Allowed`
-//!   with that plan. A plan that selects no Quota is `Denied` with reason
-//!   `NO_QUOTA_SELECTED`, never `Allowed` with an empty plan. Negative amounts
-//!   and duplicate ids are rejected before any conversion.
+//! * `{ "debit_plan": [ [ { "id": string, "amount": int }, ... ], ... ] }` —
+//!   `Allowed` with that plan, one inner list per chain, primary pool first. A
+//!   plan that selects no Quota is `Denied` with reason `NO_QUOTA_SELECTED`,
+//!   never `Allowed` with an empty plan. Negative amounts are rejected before
+//!   any conversion.
 //! * `{ "deny": { "reason": string, "violated_quota_ids": [string, ...] } }` —
 //!   `Denied`; `violated_quota_ids` may be omitted.
 //!
@@ -52,9 +54,9 @@ use std::sync::Arc;
 
 use cel_core::types::SpannedExpr;
 use quota_enforcement_sdk::{
-    Decision, DecisionResult, EngineConfigError, EngineError, EngineValidationInput,
-    EvaluationContext, MetricId, PolicySchemaSnapshot, QuotaDebitPlan, QuotaId,
-    QuotaResolutionEngineV1, QuotaScopeTier, ValidatedConfig,
+    DebitPlan, Decision, DecisionResult, EngineConfigError, EngineError, EngineValidationInput,
+    EvaluationContext, PolicySchemaSnapshot, QuotaDebitPlan, QuotaId, QuotaResolutionEngineV1,
+    QuotaScopeTier, ValidatedConfig,
 };
 use serde_json::{Map, Value, json};
 
@@ -91,14 +93,14 @@ pub struct CelEngine;
 
 quota_enforcement_sdk::register_engine!(|| Arc::new(CelEngine));
 
-/// The immutable compiled artifact: the expanded AST and the metrics whose
-/// environments it was checked against. Persisted policies keep the source and
-/// schemas, never this struct; a cache miss rebuilds it through
-/// [`QuotaResolutionEngineV1::validate_config`].
+/// The immutable compiled artifact: the expanded AST and the metric types it
+/// was checked against, empty when it applies to any metric. Persisted policies
+/// keep the source and schemas, never this struct; a cache miss rebuilds it
+/// through [`QuotaResolutionEngineV1::validate_config`].
 struct Artifact {
     source: Arc<str>,
     expr: SpannedExpr,
-    metrics: Vec<MetricId>,
+    metrics: Vec<String>,
     inputs: EnvironmentInputs,
 }
 
@@ -136,7 +138,12 @@ impl QuotaResolutionEngineV1 for CelEngine {
         let artifact = config.as_any().downcast_ref::<Artifact>().ok_or_else(|| {
             EngineError::InvalidConfig("artifact belongs to another engine".into())
         })?;
-        if !artifact.metrics.contains(context.metric) {
+        if !artifact.metrics.is_empty()
+            && !artifact
+                .metrics
+                .iter()
+                .any(|m| m == context.metric.as_str())
+        {
             // No fallback to another engine or a looser environment: the
             // expression was never type-checked for this metric.
             return Err(EngineError::InvalidConfig(format!(
@@ -187,27 +194,16 @@ fn expression_source(raw: &Value) -> Result<&str, EngineConfigError> {
     Ok(source)
 }
 
-/// The typed variables of one metric's environment, from the persisted
-/// `{request, resource, arbitration}` schema triple.
-fn environment_variables(schema: &Value) -> Result<BTreeMap<String, Shape>, EngineConfigError> {
-    let Kind::Object(fields) = check::schema(schema, 0)?.kind else {
-        return Err(check::config_error(
-            "environment schema must be an object of request, resource and arbitration",
-        ));
-    };
-    let field = |name: &str| {
-        fields
-            .get(name)
-            .cloned()
-            .ok_or_else(|| check::config_error(&format!("environment schema lacks `{name}`")))
-    };
+/// The typed variables of an environment whose `request` has `request` shape.
+fn environment_variables(request: Shape) -> BTreeMap<String, Shape> {
     let mut quota = BTreeMap::new();
     quota.insert("id".to_owned(), Shape::new(Kind::String));
+    quota.insert("subject_type".to_owned(), Shape::new(Kind::String));
     quota.insert(
         "tier".to_owned(),
         Shape {
             kind: Kind::String,
-            domain: Some(vec![json!("user"), json!("tenant")]),
+            domain: Some(vec![json!("subject"), json!("tenant")]),
         },
     );
     quota.insert("consumed".to_owned(), Shape::new(Kind::Int));
@@ -215,17 +211,28 @@ fn environment_variables(schema: &Value) -> Result<BTreeMap<String, Shape>, Engi
     // comparison against one is checked at evaluation instead.
     quota.insert("cap".to_owned(), Shape::new(Kind::OptionalInt));
     quota.insert("remaining".to_owned(), Shape::new(Kind::OptionalInt));
-    quota.insert("arbitration".to_owned(), field("arbitration")?);
 
     let mut variables = BTreeMap::new();
-    variables.insert("request".to_owned(), field("request")?);
-    variables.insert("resource".to_owned(), field("resource")?);
+    variables.insert("request".to_owned(), request);
     variables.insert("amount".to_owned(), Shape::new(Kind::Int));
+    variables.insert("metric_id".to_owned(), Shape::new(Kind::String));
     variables.insert(
         "quotas".to_owned(),
         Shape::list(Shape::new(Kind::Object(quota))),
     );
-    Ok(variables)
+    variables
+}
+
+/// The shape of the `metadata` property of a resolved metric type schema.
+fn request_shape(metric_type: &Value) -> Result<Shape, EngineConfigError> {
+    match check::schema(metric_type, 0)?.kind {
+        Kind::Object(mut fields) => fields
+            .remove("metadata")
+            .ok_or_else(|| check::config_error("metric type schema declares no `metadata`")),
+        _ => Err(check::config_error(
+            "metric type schema must describe an object",
+        )),
+    }
 }
 
 /// Refuse bracket nesting deeper than [`MAX_NESTING`] before the recursive
@@ -284,7 +291,8 @@ fn compile_on_parser_stack(
     })
 }
 
-/// Parse `source` and type-check it under every admitted metric environment.
+/// Parse `source` and type-check it under the schema of every metric type in
+/// `schemas`, or with an untyped `request` when there is none.
 fn compile(source: &str, schemas: &PolicySchemaSnapshot) -> Result<Artifact, EngineConfigError> {
     // @cpt-begin:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-parse
     let parsed = cel_core::parse(source);
@@ -299,31 +307,28 @@ fn compile(source: &str, schemas: &PolicySchemaSnapshot) -> Result<Artifact, Eng
         .ast
         .ok_or_else(|| check::config_error("expression is empty"))?;
     // @cpt-end:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-parse
-    if schemas.environments.is_empty() {
-        return Err(check::config_error(
-            "a cel policy needs at least one admitted metric environment",
-        ));
-    }
-    // Checked against every admitted metric, so a global policy is only
-    // accepted when it type-checks under each environment it may be
-    // selected for. A metric outside this set is refused at evaluation.
     // @cpt-begin:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-static
-    let mut metrics = Vec::with_capacity(schemas.environments.len());
+    let requests = if schemas.schemas.is_empty() {
+        vec![Shape::new(Kind::Dyn)]
+    } else {
+        schemas
+            .schemas
+            .values()
+            .map(request_shape)
+            .collect::<Result<_, _>>()?
+    };
     let mut inputs = EnvironmentInputs::NONE;
-    for environment in &schemas.environments {
-        let variables = environment_variables(&environment.schema)?;
+    for request in requests {
         let mut checker = Checker {
             source,
-            variables,
+            variables: environment_variables(request),
             nodes: 0,
             inputs: EnvironmentInputs::NONE,
         };
         checker.check_decision(&expr, 0)?;
         inputs.request |= checker.inputs.request;
-        inputs.resource |= checker.inputs.resource;
-        inputs.arbitration |= checker.inputs.arbitration;
-        metrics.push(environment.metric.clone());
     }
+    let metrics = schemas.schemas.keys().cloned().collect();
     // @cpt-end:cpt-cf-quota-enforcement-algo-cel-engine:p1:inst-cel-static
     Ok(Artifact {
         source: Arc::from(source),
@@ -345,6 +350,10 @@ fn bind_environment(
         let snapshot = quota.snapshot;
         let mut value = Map::new();
         value.insert("id".into(), json!(snapshot.quota_id.to_string()));
+        value.insert(
+            "subject_type".into(),
+            json!(snapshot.subject.subject_type.as_ref()),
+        );
         value.insert("tier".into(), json!(tier_name(quota.tier)));
         value.insert("cap".into(), optional_int(snapshot.cap)?);
         value.insert("consumed".into(), json!(int(snapshot.consumed)?));
@@ -356,15 +365,14 @@ fn bind_environment(
                     .map(|cap| cap.saturating_sub(snapshot.consumed)),
             )?,
         );
-        value.insert("arbitration".into(), quota.arbitration.clone());
         let value = Value::Object(value);
         runtime::measure(&value)?;
         quotas.push(value);
     }
     let bindings = [
         ("request", context.request.clone()),
-        ("resource", context.resource.clone()),
         ("amount", json!(int(context.amount)?)),
+        ("metric_id", json!(context.metric_id.unwrap_or_default())),
         ("quotas", Value::Array(quotas)),
     ];
     for (name, value) in bindings {
@@ -387,7 +395,7 @@ fn optional_int(value: Option<u64>) -> Result<Value, EngineError> {
 
 fn tier_name(tier: QuotaScopeTier) -> &'static str {
     match tier {
-        QuotaScopeTier::User => "user",
+        QuotaScopeTier::Subject => "subject",
         QuotaScopeTier::Tenant => "tenant",
     }
 }
@@ -397,8 +405,8 @@ fn type_error(message: &str) -> EngineError {
 }
 
 /// Interpret the returned record as a [`Decision`]. Everything here is a
-/// checked conversion: a negative or non-integer amount, an id that is not a
-/// UUID, or a duplicate id is an engine type error, never a cast.
+/// checked conversion: a negative or non-integer amount or an id that is not a
+/// UUID is an engine type error, never a cast.
 fn decode(record: Value, context: &EvaluationContext<'_>) -> Result<Decision, EngineError> {
     let Value::Object(mut record) = record else {
         return Err(type_error("expression must return a decision record"));
@@ -412,7 +420,7 @@ fn decode(record: Value, context: &EvaluationContext<'_>) -> Result<Decision, En
     }
     let (result, debit_plan) = match (plan, deny) {
         (Some(plan), None) => decode_plan(&plan)?,
-        (None, Some(deny)) => (decode_deny(&deny)?, BTreeMap::new()),
+        (None, Some(deny)) => (decode_deny(&deny)?, DebitPlan::new()),
         (Some(_), Some(_)) => {
             return Err(type_error(
                 "decision record carries both `debit_plan` and `deny`",
@@ -427,32 +435,26 @@ fn decode(record: Value, context: &EvaluationContext<'_>) -> Result<Decision, En
     })
 }
 
-fn decode_plan(
-    plan: &Value,
-) -> Result<(DecisionResult, BTreeMap<QuotaId, QuotaDebitPlan>), EngineError> {
-    let entries = plan
-        .as_array()
-        .ok_or_else(|| type_error("`debit_plan` must be a list"))?;
-    let mut debit_plan = BTreeMap::new();
-    for entry in entries {
-        let entry = entry
-            .as_object()
-            .ok_or_else(|| type_error("`debit_plan` entries must be `{id, amount}` records"))?;
-        let id = quota_id(entry.get("id"))?;
-        let amount = entry
-            .get("amount")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| type_error("`debit_plan` amount must be an integer"))?;
-        if amount < 0 {
-            return Err(type_error("`debit_plan` amount is negative"));
+fn decode_plan(plan: &Value) -> Result<(DecisionResult, DebitPlan), EngineError> {
+    let not_chains =
+        || type_error("`debit_plan` must be a list of chains of `{id, amount}` records");
+    let mut debit_plan = DebitPlan::new();
+    for chain in plan.as_array().ok_or_else(not_chains)? {
+        let mut entries = Vec::new();
+        for entry in chain.as_array().ok_or_else(not_chains)? {
+            let entry = entry.as_object().ok_or_else(not_chains)?;
+            let quota_id = quota_id(entry.get("id"))?;
+            let amount = entry
+                .get("amount")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| type_error("`debit_plan` amount must be an integer"))?;
+            let amount =
+                u64::try_from(amount).map_err(|_| type_error("`debit_plan` amount is negative"))?;
+            entries.push(QuotaDebitPlan { quota_id, amount });
         }
-        let amount =
-            u64::try_from(amount).map_err(|_| type_error("`debit_plan` amount is negative"))?;
-        if debit_plan.insert(id, QuotaDebitPlan { amount }).is_some() {
-            return Err(type_error("`debit_plan` names the same quota twice"));
-        }
+        debit_plan.push(entries);
     }
-    if debit_plan.is_empty() {
+    if debit_plan.iter().all(Vec::is_empty) {
         // A predicate that filtered out every Quota is a denial the operator
         // can act on, never an `Allowed` with nothing to debit.
         return Ok((
@@ -460,7 +462,7 @@ fn decode_plan(
                 violated_quota_ids: Vec::new(),
                 reason: NO_QUOTA_SELECTED.to_owned(),
             },
-            debit_plan,
+            DebitPlan::new(),
         ));
     }
     Ok((DecisionResult::Allowed, debit_plan))
@@ -502,18 +504,17 @@ fn quota_id(value: Option<&Value>) -> Result<QuotaId, EngineError> {
 /// The per-Quota detail the feature requires alongside the policy identity.
 /// The boundary re-stamps `engine_id`, `policy_id` and `policy_version`; they
 /// are set here too so a Decision read straight off the engine is complete.
-fn diagnostics(
-    context: &EvaluationContext<'_>,
-    debit_plan: &BTreeMap<QuotaId, QuotaDebitPlan>,
-) -> BTreeMap<String, Value> {
+fn diagnostics(context: &EvaluationContext<'_>, debit_plan: &DebitPlan) -> BTreeMap<String, Value> {
     let quotas: Map<String, Value> = context
         .quotas
         .iter()
         .map(|quota| {
             let snapshot = quota.snapshot;
-            let contribution = debit_plan
-                .get(&snapshot.quota_id)
-                .map_or(0, |debit| debit.amount);
+            let contribution: u64 = debit_plan
+                .iter()
+                .flatten()
+                .filter(|debit| debit.quota_id == snapshot.quota_id)
+                .fold(0, |sum, debit| sum.saturating_add(debit.amount));
             (
                 snapshot.quota_id.to_string(),
                 json!({

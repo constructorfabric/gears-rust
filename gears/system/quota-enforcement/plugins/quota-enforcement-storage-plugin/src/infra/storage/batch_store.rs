@@ -6,8 +6,10 @@
 //! Every item's applicable Quotas are discovered under that item's own scope,
 //! merged into one set, and locked once in ascending `quota_id` order (rank
 //! 1); locking per item would sort each item's set on its own, and two
-//! batches could then take the same rows in opposite orders. The envelope's
-//! stripe follows (rank 2), then every counter row a write can touch (rank 5):
+//! batches could then take the same rows in opposite orders. The stripes of
+//! the envelope and of every item key follow (rank 2), so no single debit
+//! under an item key commits beside the batch, then every counter row a write
+//! can touch (rank 5):
 //! elapsed unsettled periods, the latest period, or the allocation row, the
 //! rows settlement, materialization and the debit itself would lock later.
 //!
@@ -20,8 +22,17 @@
 //! snapshots, each allowed item's plan added in memory for the items after
 //! it. A denial does not stop the loop: every item gets its own decision.
 //! Nothing is written until the loop ends. When every item is allowed the
-//! union of the plans is applied through the single debit's own write path;
-//! otherwise only the envelope's record is written.
+//! union of the plans is applied through the single debit's own write path
+//! and every item writes a `debit` charge under its own key; otherwise only
+//! the envelope's record is written.
+//!
+//! # Item keys
+//!
+//! Items share the key space of single debits. Under the item keys' stripes,
+//! and after the envelope's record has had its chance to replay, an item key
+//! that already names a `debit` charge or the record of a denied debit fails
+//! the whole batch as a payload mismatch: a batch is replayed only by its
+//! envelope key, never from a single debit's result.
 //!
 //! # Batch timeout
 //!
@@ -39,25 +50,26 @@ use quota_enforcement_sdk::engine::{EngineError, EvaluationBudget};
 use quota_enforcement_sdk::{
     BatchRecord, BatchTimer, Decision, DecisionResult, EvaluatedBatch, EvaluatedDebit,
     EvaluatedMutation, EvaluationFailure, IdempotencyWrite, MutationResult, NO_APPLICABLE_QUOTA,
-    NotificationEvent, PolicyVersion, Quota, QuotaSnapshot, QuotaStatus, Retention, StorageError,
-    TransitionOutcome,
+    NotificationEvent, OperationType, PolicyVersion, Quota, QuotaSnapshot, QuotaStatus, QuotaType,
+    Retention, StorageError, TransitionOutcome, conditions_hold,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::DBRunner;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::config_cache::ConfigSnapshot;
 use super::consumption_store::{
-    Applied, Clock, LockedCounter, OwnedMutation, RACE_ATTEMPTS, RecordBlob, RecordWrite, Replay,
-    SqlConsumptionStore, TxError, actor_of, counters_of, lift, lock_counters_of, replay_of,
-    snapshot_of_locked, write_record,
+    Applied, ChargeWrite, Clock, LockedCounter, OwnedMutation, RACE_ATTEMPTS, RecordBlob,
+    RecordWrite, Replay, SqlConsumptionStore, TxError, charge_rows, counters_of, expires_at, lift,
+    lock_counters_of, replay_of, snapshot_of_locked, write_record,
 };
 use super::locking::{ContentionBudget, lock_scopes, with_budget_within};
 use super::quota_mapping;
 use super::repo::RowWait;
+use super::repo::idempotency_repo::{self as idem_repo, Inserted};
 use super::repo::operation_log_repo::{self, Entry, OP_BATCH_DEBIT};
-use super::repo::quota_repo;
+use super::repo::{charge_repo, quota_repo};
 use crate::domain::ports::Actor;
 use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, settling};
 
@@ -84,22 +96,14 @@ impl OwnedBatch {
             .iter()
             .map(|entry| {
                 let item = entry.item;
-                let idempotency = IdempotencyWrite {
-                    scope: item
-                        .item_scope
-                        .clone()
-                        .unwrap_or_else(|| batch.envelope.scope.clone()),
-                    payload_hash: batch.envelope.payload_hash,
-                };
                 OwnedItem {
                     mutation: OwnedMutation::of(&EvaluatedMutation {
                         applicable: &item.applicable,
                         amount: item.amount,
                         request: &item.request,
-                        resource: &item.resource,
-                        user_projection: entry.user_projection,
+                        metric_id: item.metric_id.as_deref(),
                         limits: batch.limits,
-                        idempotency: &idempotency,
+                        idempotency: &item.idempotency,
                         authorized: item.authorized,
                         evaluate: Arc::clone(&batch.evaluate),
                     }),
@@ -150,10 +154,11 @@ impl LockedUnion {
     }
 }
 
-/// Every item's decision, and the policy the record names.
+/// Every item's decision and the policy it selected; the envelope's record
+/// names the first item's.
 struct Evaluated {
     decisions: Vec<Decision>,
-    policy: Option<PolicyVersion>,
+    policies: Vec<PolicyVersion>,
 }
 
 // @cpt-algo:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1
@@ -167,12 +172,12 @@ impl SqlConsumptionStore {
     /// As the contract documents for `apply_batch_debit`.
     pub async fn apply_batch_debit_impl(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         batch: &EvaluatedBatch<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
-        let actor = actor_of(ctx);
+        let actor = actor.clone();
         let config = self.config().await?;
         // A batch waits on a row no longer than any of its metrics allows (I8).
         let metrics = batch
@@ -218,7 +223,7 @@ impl SqlConsumptionStore {
                 Err(TxError::Raced(lost)) => {
                     // The winner's record answers; if it has gone, run again.
                     if let Some(record) = self.winner_of(&lost).await? {
-                        return replayed(&record.decision_blob, record.expires_at)
+                        return replayed(&record.blob, record.expires_at)
                             .map(TransitionOutcome::NoOp)
                             .map_err(|error| lift(OPERATION, error));
                     }
@@ -244,9 +249,18 @@ impl SqlConsumptionStore {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-resolve
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-union
         let union = lock_union(tx, batch).await?;
-        lock_scopes::<TxError>(tx, &[&batch.envelope.scope]).await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-union
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-resolve
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-keylocks
+        let keys: Vec<_> = std::iter::once(&batch.envelope.scope)
+            .chain(
+                batch
+                    .items
+                    .iter()
+                    .map(|item| &item.mutation.idempotency.scope),
+            )
+            .collect();
+        lock_scopes::<TxError>(tx, &keys).await?;
         let now = (env.clock)();
         // @cpt-begin:cpt-cf-quota-enforcement-state-batch-envelope:p1:inst-best-enter
         // A record committed since the gear's lookup short-circuits here;
@@ -255,11 +269,17 @@ impl SqlConsumptionStore {
             replay_of(tx, env.scope, &batch.envelope, now, Some(RowWait::Nowait)).await?
         {
             return Ok(TransitionOutcome::NoOp(replayed(
-                &row.decision_blob,
+                &row.blob,
                 row.expires_at,
             )?));
         }
         // @cpt-end:cpt-cf-quota-enforcement-state-batch-envelope:p1:inst-best-enter
+        // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-keylocks
+        if let Some(index) = first_taken_item(tx, batch, now).await? {
+            return Err(StorageError::IdempotencyPayloadMismatch
+                .at_item(index)
+                .into());
+        }
         let counters = lock_union_counters(tx, batch, &union, now).await?;
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-timeout
         let remaining = batch.timer.arm();
@@ -326,15 +346,15 @@ impl SqlConsumptionStore {
             &RecordWrite {
                 write: &batch.envelope,
                 blob: RecordBlob::Verbatim(&blob),
-                // Not reversible by a rollback in P1, so no entries.
-                entries: None,
-                authorized: None,
-                policy: evaluated.policy.as_ref(),
+                policy: evaluated.policies.first(),
                 expires_at: deadline,
                 now,
             },
         )
         .await?;
+        if allowed {
+            Self::charge_items(tx, env, union, batch, &evaluated, &applied, now).await?;
+        }
         // @cpt-end:cpt-cf-quota-enforcement-state-batch-envelope:p1:inst-best-denied
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-denied
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-denied-if
@@ -371,6 +391,62 @@ impl SqlConsumptionStore {
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-return
     }
 
+    /// Write one `debit` charge per item under the item's key, all of them in
+    /// two inserts under the envelope's scope: the batch is of one tenant, and
+    /// a charge carries no other scope. The item keys were found free under
+    /// their stripes, so a charge already under one is a writer that took no
+    /// stripe, and the batch fails as a payload mismatch rather than answering
+    /// with that charge.
+    async fn charge_items(
+        tx: &impl DBRunner,
+        env: &BatchTx<'_>,
+        union: &LockedUnion,
+        batch: &OwnedBatch,
+        evaluated: &Evaluated,
+        applied: &[Applied],
+        now: OffsetDateTime,
+    ) -> Result<(), TxError> {
+        let mut charges = Vec::with_capacity(batch.items.len());
+        for (((item, decision), policy), moved) in batch
+            .items
+            .iter()
+            .zip(&evaluated.decisions)
+            .zip(&evaluated.policies)
+            .zip(applied)
+        {
+            let mutation = &item.mutation;
+            charges.push(charge_rows(&ChargeWrite {
+                write: &mutation.idempotency,
+                decision,
+                policy: Some(policy),
+                authorized: mutation.authorized,
+                metric: mutation.applicable.metric.as_str(),
+                amount: mutation.amount,
+                entries: &moved.entries,
+                return_window_end: expires_at(
+                    env.config,
+                    mutation.applicable.tenant_id,
+                    mutation.applicable.metric.as_str(),
+                    now,
+                ),
+                now,
+            })?);
+        }
+        let (tenant_id, operation, keys) = item_keys(batch);
+        charge_repo::delete_deleted_at_keys(tx, tenant_id, operation, &keys, now).await?;
+        // Every Quota of an entry is one of the union's locked, active rows.
+        let allocation = |quota_id| {
+            union
+                .quotas
+                .get(&quota_id)
+                .is_some_and(|quota| quota.quota_type == QuotaType::Allocation)
+        };
+        match charge_repo::insert_all(tx, env.scope, charges, allocation).await? {
+            Inserted::Yes => Ok(()),
+            Inserted::Raced => Err(StorageError::IdempotencyPayloadMismatch.into()),
+        }
+    }
+
     /// Apply every item's plan in submission order through the single
     /// debit's write path, logging each counter movement.
     async fn apply_items(
@@ -384,8 +460,16 @@ impl SqlConsumptionStore {
         let mut applied = Vec::with_capacity(decisions.len());
         for (index, (item, decision)) in batch.items.iter().zip(decisions).enumerate() {
             let quotas = union.quotas_of(index);
-            let moved =
-                Self::apply_plan(tx, &item.scope, &quotas, decision, now, env.enqueuer).await?;
+            let moved = Self::apply_plan(
+                tx,
+                &item.scope,
+                env.actor,
+                &quotas,
+                decision,
+                now,
+                env.enqueuer,
+            )
+            .await?;
             for entry in &moved.entries {
                 operation_log_repo::append(
                     tx,
@@ -418,7 +502,7 @@ async fn lock_union(tx: &impl DBRunner, batch: &OwnedBatch) -> Result<LockedUnio
         let subjects: Vec<(String, String)> = applicable
             .subjects
             .iter()
-            .map(|s| (s.projection_type.to_string(), s.subject_id.clone()))
+            .map(|s| (s.subject_type.to_string(), s.subject_id.clone()))
             .collect();
         let ids = quota_repo::find_applicable_ids(
             tx,
@@ -443,11 +527,48 @@ async fn lock_union(tx: &impl DBRunner, batch: &OwnedBatch) -> Result<LockedUnio
             }
         }
     }
+    // Each item keeps only the Quotas whose conditions hold on its own
+    // request (I15), judged on the locked rows.
+    for (ids, item) in members.iter_mut().zip(&batch.items) {
+        ids.retain(|id| {
+            quotas
+                .get(id)
+                .is_some_and(|quota| conditions_hold(&quota.metadata, &item.mutation.request))
+        });
+    }
     Ok(LockedUnion {
         quotas,
         owner,
         members,
     })
+}
+
+/// The tenant, the operation and the keys of the batch's items. A batch is of
+/// one tenant, and every item is a debit.
+fn item_keys(batch: &OwnedBatch) -> (Uuid, &'static str, Vec<&str>) {
+    let keys = batch
+        .items
+        .iter()
+        .map(|item| item.mutation.idempotency.scope.key.as_str())
+        .collect();
+    (
+        batch.envelope.scope.tenant_id.as_uuid(),
+        OperationType::Debit.as_str(),
+        keys,
+    )
+}
+
+/// The index of the first item whose key is taken: by a live charge or by an
+/// unexpired record. Two reads for the whole batch, under the items' stripes.
+async fn first_taken_item(
+    tx: &impl DBRunner,
+    batch: &OwnedBatch,
+    now: OffsetDateTime,
+) -> Result<Option<usize>, TxError> {
+    let (tenant_id, operation, keys) = item_keys(batch);
+    let mut taken = charge_repo::live_keys(tx, tenant_id, operation, &keys, now).await?;
+    taken.extend(idem_repo::unexpired_keys(tx, tenant_id, operation, &keys, now).await?);
+    Ok(keys.iter().position(|key| taken.iter().any(|t| t == key)))
 }
 
 /// Lock the counter rows of the union, ascending by Quota, each Quota's rows
@@ -489,7 +610,7 @@ async fn evaluate_items(
         }
     }
     let mut decisions = Vec::with_capacity(batch.items.len());
-    let mut policy = None;
+    let mut policies = Vec::with_capacity(batch.items.len());
     // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-loop
     for (index, item) in batch.items.iter().enumerate() {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-deadline
@@ -515,12 +636,10 @@ async fn evaluate_items(
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-error
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-error-if
         // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-record
-        // The record names the first item's policy; each decision carries its
-        // own attribution.
-        policy.get_or_insert(selected);
+        policies.push(selected);
         if matches!(decision.result, DecisionResult::Allowed) {
-            for (quota_id, plan) in &decision.debit_plan {
-                if let Some(snapshot) = snapshots.get_mut(&quota_id.as_uuid()) {
+            for plan in decision.debit_plan.iter().flatten() {
+                if let Some(snapshot) = snapshots.get_mut(&plan.quota_id.as_uuid()) {
                     snapshot.consumed = snapshot.consumed.saturating_add(plan.amount);
                     snapshot.remaining = snapshot
                         .cap
@@ -532,7 +651,10 @@ async fn evaluate_items(
         // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-record
     }
     // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-loop
-    Ok(Evaluated { decisions, policy })
+    Ok(Evaluated {
+        decisions,
+        policies,
+    })
 }
 
 /// The scope a union Quota's rows are read under: the first item that found it.

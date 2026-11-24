@@ -3,28 +3,28 @@
 //!
 //! The elected replica runs [`LifecycleGaugeRefresher::run`] as leader work.
 //! Every `refresh` interval it reads the active-Quota counts from storage,
-//! classifies each metric through the registry, and publishes one sample to
-//! the sink; the observable gauges read that sample without any I/O. A sample
-//! is published only after a refresh that succeeded in the current leadership
-//! term. Failures keep the last sample until `stale_after` has passed without a
-//! success, then withdraw it; a stale classification counts as a failure, so
-//! it never renews the sample. Cancellation, an abort, or a drop of the future
-//! withdraws the sample through a guard, and a refresh that completes after
-//! cancellation is discarded.
+//! takes each metric's `enforcement` from its catalogue entry, and publishes
+//! one sample to the sink; the observable gauges read that sample without any
+//! I/O. A sample is published only after a refresh that succeeded in the
+//! current leadership term. Failures keep the last sample until `stale_after`
+//! has passed without a success, then withdraw it. Cancellation, an abort, or
+//! a drop of the future withdraws the sample through a guard, and a refresh
+//! that completes after cancellation is discarded.
 
 use std::future::{Future, pending};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use quota_enforcement_sdk::{MetricId, QuotaEnforcementStoragePluginV1};
+use quota_enforcement_sdk::{MetricId, QuotaEnforcementStoragePluginV1, QuotaMetadataViolation};
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
 
+use crate::domain::catalog::{CatalogEntry, MetricCatalog, MetricMode};
 use crate::domain::error::DomainError;
 use crate::domain::ports::coordination::{LeaderWork, LeaderWorkFuture};
 use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
-use crate::domain::ports::metric_registry::{Classified, Freshness, MetricMode, MetricRegistry};
+use crate::domain::ports::metrics::ValidationReason;
 
 const LOG_TARGET: &str = "qe.lifecycle_gauges";
 
@@ -34,7 +34,7 @@ const LOG_TARGET: &str = "qe.lifecycle_gauges";
 pub struct GaugeTiming {
     /// Interval between two refreshes.
     pub refresh: Duration,
-    /// Budget of one refresh, storage read and classification together.
+    /// Budget of one refresh, storage read and catalogue reads together.
     pub refresh_deadline: Duration,
     /// Time without a successful refresh after which the sample is withdrawn.
     pub stale_after: Duration,
@@ -47,16 +47,6 @@ pub enum RefreshError {
     /// Storage did not answer.
     #[error("storage read failed: {0}")]
     Storage(DomainError),
-    /// The registry did not answer or rejected a metric.
-    #[error("metric classification failed: {0}")]
-    Registry(DomainError),
-    /// A classification came from the cache after a registry failure. Good
-    /// enough for a write, not for a fresh sample.
-    #[error("classification of {metric} is stale")]
-    StaleClassification {
-        /// The metric.
-        metric: String,
-    },
     /// The refresh exceeded its deadline.
     #[error("refresh exceeded {0:?}")]
     TimedOut(Duration),
@@ -69,7 +59,7 @@ pub enum RefreshError {
 #[domain_model]
 pub struct LifecycleGaugeRefresher {
     storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
-    metric_registry: Arc<dyn MetricRegistry>,
+    catalog: Arc<MetricCatalog>,
     sink: Arc<dyn LifecycleGaugeSink>,
     timing: GaugeTiming,
 }
@@ -96,19 +86,19 @@ impl LifecycleGaugeRefresher {
     #[must_use]
     pub fn new(
         storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
-        metric_registry: Arc<dyn MetricRegistry>,
+        catalog: Arc<MetricCatalog>,
         sink: Arc<dyn LifecycleGaugeSink>,
         timing: GaugeTiming,
     ) -> Arc<Self> {
         Arc::new(Self {
             storage,
-            metric_registry,
+            catalog,
             sink,
             timing,
         })
     }
 
-    /// One refresh: the storage read and one classification per metric,
+    /// One refresh: the storage read and the catalogue entry of each metric,
     /// bounded by the deadline and raced against `cancel`. Publishes nothing.
     ///
     /// # Errors
@@ -133,33 +123,55 @@ impl LifecycleGaugeRefresher {
             .read_active_quota_counts()
             .await
             .map_err(|e| RefreshError::Storage(DomainError::from(e)))?;
+        // The cap gauges need no metric type, so a registry failure does not
+        // cost the sample: a metric this replica does not hold is left out of
+        // the two gauges that read its type.
+        let loaded = self
+            .catalog
+            .load(counts.by_metric.keys().map(MetricId::as_gts))
+            .await;
+        if let Err(error) = &loaded {
+            tracing::warn!(
+                target: LOG_TARGET,
+                error = %error,
+                "could not read the metric types of the active Quotas; metrics this replica \
+                 does not hold are left out of the sample"
+            );
+        }
         let mut for_direct_metric = 0u64;
         for (metric, active) in &counts.by_metric {
-            match self.metric_registry.describe(metric).await {
-                Ok(Some(Classified {
-                    descriptor,
-                    freshness: Freshness::Fresh,
-                })) => {
-                    if descriptor.mode == MetricMode::Direct {
+            match self.catalog.peek(metric) {
+                Some(CatalogEntry::Served(served)) => {
+                    if served.mode() == MetricMode::Direct {
                         for_direct_metric = for_direct_metric.saturating_add(*active);
                     }
                 }
-                Ok(Some(Classified {
-                    freshness: Freshness::Stale,
-                    ..
-                })) => {
-                    return Err(RefreshError::StaleClassification {
-                        metric: metric.as_str().to_owned(),
-                    });
+                // Its mode is unknown, so `for_direct_metric` cannot count
+                // these Quotas; the sample says so in the log.
+                Some(CatalogEntry::Unavailable { reason }) => {
+                    warn_unavailable(metric, *active, reason);
                 }
-                Ok(None) => warn_removed(metric, *active),
-                Err(err) => return Err(RefreshError::Registry(err)),
+                None if loaded.is_ok() => warn_removed(metric, *active),
+                None => {}
+            }
+        }
+        // The owner may have revised a type since a Quota was written: its
+        // conditions are checked again against the type as it is now.
+        let mut conditions_unfit = 0u64;
+        for set in &counts.conditions {
+            if let Some(CatalogEntry::Served(served)) = self.catalog.peek(&set.metric) {
+                let unfit = super::metadata::violations(served.schema(), &set.metadata);
+                if let Some(first) = unfit.first() {
+                    conditions_unfit = conditions_unfit.saturating_add(set.quotas);
+                    warn_unfit(&set.metric, set.quotas, first);
+                }
             }
         }
         Ok(LifecycleCounts {
             cap_zero: counts.cap_zero,
             cap_unbounded: counts.cap_unbounded,
             for_direct_metric,
+            conditions_unfit,
         })
     }
 
@@ -237,6 +249,28 @@ impl LifecycleGaugeRefresher {
             Box::pin(this.run(cancel))
         })
     }
+}
+
+fn warn_unavailable(metric: &MetricId, active: u64, reason: ValidationReason) {
+    tracing::warn!(
+        target: LOG_TARGET,
+        metric = %metric,
+        active_quotas = active,
+        %reason,
+        "active Quotas reference an unavailable metric; the direct-metric gauge leaves them out"
+    );
+}
+
+fn warn_unfit(metric: &MetricId, active: u64, first: &QuotaMetadataViolation) {
+    tracing::warn!(
+        target: LOG_TARGET,
+        metric = %metric,
+        active_quotas = active,
+        path = %first.path,
+        reason = %first.reason,
+        "the conditions of active quotas no longer fit the metric type: \
+         these quotas may not apply to requests"
+    );
 }
 
 /// The runtime half of "a persisted Quota whose metric was later removed is

@@ -7,9 +7,9 @@ use quota_enforcement_sdk::engine::{EvaluationContext, EvaluationLimits, Evaluat
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, BulkCreateEntry, BulkCreateEnvelope, BulkDeactivateEntry,
     BulkDeactivateEnvelope, BulkUpdateEntry, BulkUpdateEnvelope, CapPatch, Decision,
-    EvaluatedMutation, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, MetricId,
-    OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyScope, Quota, QuotaDebitPlan,
-    QuotaFilter, QuotaId, QuotaPatch, QuotaStatus, TransitionOutcome,
+    EvaluatedMutation, IdempotencyScope, IdempotencyWrite, MetricId, OperationType, PageRequest,
+    PayloadHash, PolicyDraft, PolicyScope, Quota, QuotaDebitPlan, QuotaFilter, QuotaId, QuotaPatch,
+    QuotaStatus, TransitionOutcome,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use time::OffsetDateTime;
@@ -17,9 +17,7 @@ use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt;
-use toolkit_security::{
-    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
-};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 
 use crate::domain::ports::{LeaseStore, QuotaStore, StoreError};
 use crate::infra::storage::entity::{
@@ -32,19 +30,10 @@ use crate::test_support::{
     other_tenant, quota_changed, scope_for, tenant, test_db, user,
 };
 
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(uuid::Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("context")
-}
-
 fn envelope_write(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::of(&[]),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -91,12 +80,10 @@ fn allow_all(context: &EvaluationContext<'_>) -> EvaluationOutcome {
                 .quotas
                 .iter()
                 .map(|quota| {
-                    (
-                        quota.snapshot.quota_id,
-                        QuotaDebitPlan {
-                            amount: context.amount,
-                        },
-                    )
+                    vec![QuotaDebitPlan {
+                        quota_id: quota.snapshot.quota_id,
+                        amount: context.amount,
+                    }]
                 })
                 .collect(),
         ),
@@ -119,7 +106,7 @@ impl Harness {
         let (outbox, enqueuer) = bound_outbox(&db).await;
         SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer) as _)
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     engine_id: "cel".into(),
@@ -203,7 +190,6 @@ impl Harness {
         let idempotency = IdempotencyWrite {
             scope: IdempotencyScope {
                 tenant_id: tenant(),
-                subject_key: IdempotencySubjectKey::of(&[user(subject)]),
                 operation_type: OperationType::Reserve,
                 key: key.to_owned(),
             },
@@ -213,14 +199,13 @@ impl Harness {
         let outcome = self
             .leases
             .acquire_lease(
-                &ctx(),
+                &actor(),
                 &scope_for(tenant()),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount,
                     request: &null,
-                    resource: &null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: EvaluationLimits {
                         upper_timeout_ms: std::num::NonZeroU64::new(50).expect("nonzero"),
                         cost_limit: std::num::NonZeroU64::new(10_000).expect("nonzero"),

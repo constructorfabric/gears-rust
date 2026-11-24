@@ -17,8 +17,8 @@ use axum::response::IntoResponse;
 use axum::{Extension, Json, Router};
 use quota_enforcement_sdk::{
     CreditRequest, DebitRequest, Decision, DecisionPreview, DecisionResult, EvaluationAttribution,
-    PreviewRequest, QuotaId, ResourceProjection, RollbackRequest, RollbackableOperation,
-    SubjectClaim, TenantId,
+    MetricRef, PreviewRequest, QuotaId, RollbackRequest, RollbackableOperation, SubjectClaim,
+    TenantId,
 };
 use serde_json::{Map, Value};
 use toolkit::api::OpenApiRegistry;
@@ -29,27 +29,29 @@ use toolkit_security::SecurityContext;
 use super::error::ApiResult;
 use crate::domain::Service;
 
-/// One caller-supplied subject: a scope kind and an opaque identifier.
+/// One subject a request names: a quota subject type and an opaque id.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectClaimDto {
-    /// Scope instance id of the subject.
-    pub kind: String,
+    /// Quota subject type id, derived from `gts.cf.core.quota.subj.v1~`.
+    #[serde(rename = "type")]
+    pub subject_type: String,
     /// Opaque subject identifier.
     pub id: String,
 }
 
-/// The optional resource projection of a request.
+/// The metric object of a request.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
-pub struct ResourceProjectionDto {
-    /// Registered resource projection type.
-    pub r#type: String,
-    /// Opaque resource identifier.
+pub struct MetricRefDto {
+    /// Metric type id, derived from `gts.cf.core.quota.metric.v1~`.
+    #[serde(rename = "type")]
+    pub metric_type: String,
+    /// The one thing the amount is counted for, for example a model.
     pub id: Option<String>,
-    /// Resource metadata, validated against the owner's contract.
+    /// Attributes of the operation, required even when empty.
     pub metadata: Option<Map<String, Value>>,
 }
 
@@ -60,35 +62,29 @@ pub struct ResourceProjectionDto {
 pub struct EvaluationAttributionDto {
     /// Authorized target tenant.
     pub tenant_id: uuid::Uuid,
-    /// Registered metric instance id.
-    pub metric: String,
-    /// Additional subjects beyond the tenant.
+    /// At least one subject; QE adds the tenant subject.
     pub subjects: Vec<SubjectClaimDto>,
-    /// Operation-level metadata, required even when empty.
-    pub metadata: Option<Map<String, Value>>,
-    /// Optional resource projection.
-    pub resource: Option<ResourceProjectionDto>,
+    /// The metric object.
+    pub metric: MetricRefDto,
 }
 
 impl From<EvaluationAttributionDto> for EvaluationAttribution {
     fn from(value: EvaluationAttributionDto) -> Self {
         Self {
             tenant_id: TenantId::new(value.tenant_id),
-            metric: value.metric,
             subjects: value
                 .subjects
                 .into_iter()
                 .map(|claim| SubjectClaim {
-                    kind: claim.kind,
+                    subject_type: claim.subject_type,
                     id: claim.id,
                 })
                 .collect(),
-            metadata: value.metadata,
-            resource: value.resource.map(|resource| ResourceProjection {
-                r#type: resource.r#type,
-                id: resource.id,
-                metadata: resource.metadata,
-            }),
+            metric: MetricRef {
+                metric_type: value.metric.metric_type,
+                id: value.metric.id,
+                metadata: value.metric.metadata,
+            },
         }
     }
 }
@@ -123,7 +119,7 @@ pub struct CreditRequestDto {
     pub idempotency_key: String,
 }
 
-/// Which kind of operation a rollback reverses.
+/// Which kind of operation wrote the charge a rollback names.
 ///
 /// A direct debit and a lease commit are separate idempotency namespaces, so
 /// one caller can hold both under the same key; this says which is meant.
@@ -147,21 +143,20 @@ impl From<RollbackableOperationDto> for RollbackableOperation {
     }
 }
 
-/// Reverse a committed debit.
+/// Give back everything that remains of a charge.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct RollbackRequestDto {
-    /// Attribution of the debit being reversed.
+    /// Attribution of the charged operation: its subjects and its metric
+    /// type and optional id. `metadata` is not part of it.
     pub attribution: EvaluationAttributionDto,
-    /// Which kind of operation the original key names: a direct `debit`, or a
+    /// Which kind of operation the key names: a direct `debit`, or a
     /// `lease_commit`. They are separate idempotency namespaces, so the same
     /// key may address one of each. Defaults to `debit`.
     #[serde(default)]
     pub original_operation: RollbackableOperationDto,
-    /// Key the original debit was committed under.
+    /// Key the charged operation was committed under.
     pub original_idempotency_key: String,
-    /// Client-supplied key of this rollback.
-    pub idempotency_key: String,
 }
 
 /// Evaluate without mutating anything.
@@ -190,7 +185,7 @@ pub enum DecisionResultDto {
     },
 }
 
-/// One Quota's share of a decision's plan.
+/// One entry of a chain of a decision's plan.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct QuotaDebitPlanDto {
@@ -203,11 +198,12 @@ pub struct QuotaDebitPlanDto {
 /// A decision as the API renders it.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = QuotaDecisionDto)]
 pub struct DecisionDto {
     /// The verdict.
     pub result: DecisionResultDto,
-    /// What the plan charged. Empty on a denial.
-    pub debit_plan: Vec<QuotaDebitPlanDto>,
+    /// What the plan charged, one list per chain. Empty on a denial.
+    pub debit_plan: Vec<Vec<QuotaDebitPlanDto>>,
     /// Engine-supplied detail.
     pub diagnostics: Map<String, Value>,
 }
@@ -231,9 +227,14 @@ impl From<Decision> for DecisionDto {
             debit_plan: value
                 .debit_plan
                 .into_iter()
-                .map(|(quota_id, plan)| QuotaDebitPlanDto {
-                    quota_id: quota_id.as_uuid(),
-                    amount: plan.amount,
+                .map(|chain| {
+                    chain
+                        .into_iter()
+                        .map(|entry| QuotaDebitPlanDto {
+                            quota_id: entry.quota_id.as_uuid(),
+                            amount: entry.amount,
+                        })
+                        .collect()
                 })
                 .collect(),
             diagnostics: value.diagnostics.into_iter().collect(),
@@ -247,8 +248,8 @@ impl From<Decision> for DecisionDto {
 pub struct DecisionPreviewDto {
     /// The verdict.
     pub result: DecisionResultDto,
-    /// What the plan would have charged.
-    pub debit_plan: Vec<QuotaDebitPlanDto>,
+    /// What the plan would have charged, one list per chain.
+    pub debit_plan: Vec<Vec<QuotaDebitPlanDto>>,
     /// Engine-supplied detail.
     pub diagnostics: Map<String, Value>,
     /// Always `true`; a dry run can never be mistaken for a commit.
@@ -273,15 +274,12 @@ async fn debit(
     JsonBody(body): JsonBody<DebitRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = service
-        .operations()?
-        .debit(
-            &ctx,
-            DebitRequest {
-                attribution: body.attribution.into(),
-                amount: body.amount,
-                idempotency_key: body.idempotency_key,
-            },
-        )
+        .operations(&ctx)?
+        .debit(DebitRequest {
+            attribution: body.attribution.into(),
+            amount: body.amount,
+            idempotency_key: body.idempotency_key,
+        })
         .await?;
     Ok(Json(DecisionDto::from(decision)))
 }
@@ -292,16 +290,13 @@ async fn credit(
     JsonBody(body): JsonBody<CreditRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = service
-        .operations()?
-        .credit(
-            &ctx,
-            CreditRequest {
-                tenant_id: TenantId::new(body.tenant_id),
-                quota_id: QuotaId::new(body.quota_id),
-                amount: body.amount,
-                idempotency_key: body.idempotency_key,
-            },
-        )
+        .operations(&ctx)?
+        .credit(CreditRequest {
+            tenant_id: TenantId::new(body.tenant_id),
+            quota_id: QuotaId::new(body.quota_id),
+            amount: body.amount,
+            idempotency_key: body.idempotency_key,
+        })
         .await?;
     Ok(Json(DecisionDto::from(decision)))
 }
@@ -312,16 +307,12 @@ async fn rollback(
     JsonBody(body): JsonBody<RollbackRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = service
-        .operations()?
-        .rollback(
-            &ctx,
-            RollbackRequest {
-                attribution: body.attribution.into(),
-                original_operation: body.original_operation.into(),
-                original_idempotency_key: body.original_idempotency_key,
-                idempotency_key: body.idempotency_key,
-            },
-        )
+        .operations(&ctx)?
+        .rollback(RollbackRequest {
+            attribution: body.attribution.into(),
+            original_operation: body.original_operation.into(),
+            original_idempotency_key: body.original_idempotency_key,
+        })
         .await?;
     Ok(Json(DecisionDto::from(decision)))
 }
@@ -332,14 +323,11 @@ async fn preview(
     JsonBody(body): JsonBody<PreviewRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = service
-        .operations()?
-        .preview(
-            &ctx,
-            PreviewRequest {
-                attribution: body.attribution.into(),
-                amount: body.amount,
-            },
-        )
+        .operations(&ctx)?
+        .preview(PreviewRequest {
+            attribution: body.attribution.into(),
+            amount: body.amount,
+        })
         .await?;
     Ok(Json(DecisionPreviewDto::from(decision)))
 }
@@ -378,16 +366,18 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .register(router, openapi);
     router = OperationBuilder::post(format!("{prefix}/operations/rollback"))
         .operation_id("quota_enforcement.rollback")
-        .summary("Reverse a committed debit")
+        .summary("Give back everything that remains of a charge")
         .description(
-            "Restores the counters to what they would have been had the debit never happened, \
-             against its own attribution period. The request carries the reversed debit's \
-             attribution, which the server re-authorizes.",
+            "Gives back what remains of the charge of a debit or a lease commit, each part \
+             against the charge's own period. The request carries the charged operation's \
+             attribution, which the server authorizes for the action rollback and compares \
+             with the charge's. It has no amount and no key of its own: on a charge with \
+             nothing left it succeeds and changes nothing.",
         )
         .tag(TAG)
         .authenticated()
         .no_license_required()
-        .json_request::<RollbackRequestDto>(openapi, "The operation to reverse")
+        .json_request::<RollbackRequestDto>(openapi, "The charge to give back")
         .handler(rollback)
         .json_response_with_schema::<DecisionDto>(openapi, StatusCode::OK, "The decision")
         .standard_errors(openapi)

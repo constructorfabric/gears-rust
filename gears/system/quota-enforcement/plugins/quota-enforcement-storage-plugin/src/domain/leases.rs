@@ -5,11 +5,11 @@
 //! implementation delegates to them.
 
 use quota_enforcement_sdk::{
-    AppliedMutation, EvaluatedLease, EvaluatedMutation, ExpiredLease, LeaseToken, MetricId,
+    Actor, AppliedMutation, EvaluatedLease, EvaluatedMutation, ExpiredLease, LeaseToken, MetricId,
     NotificationEvent, PartialIdempotencyWrite, StorageError, TransitionOutcome,
 };
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use super::bootstrap::StoragePlugin;
 use super::ports::LeaseStore;
@@ -28,12 +28,12 @@ impl StoragePlugin {
     /// As the contract documents for `acquire_lease`.
     pub async fn acquire_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         ttl: std::time::Duration,
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
-        self.leases.acquire_lease(ctx, scope, mutation, ttl).await
+        self.leases.acquire_lease(actor, scope, mutation, ttl).await
     }
 
     /// Convert an active lease into a debit for what was used.
@@ -41,17 +41,30 @@ impl StoragePlugin {
     /// # Errors
     ///
     /// As the contract documents for `commit_lease`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the settlement names its lease, amount, metric, key and events"
+    )]
     pub async fn commit_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
+        metric: Option<&MetricId>,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         self.leases
-            .commit_lease(ctx, scope, token, actual_amount, idempotency, events)
+            .commit_lease(
+                actor,
+                scope,
+                token,
+                actual_amount,
+                metric,
+                idempotency,
+                events,
+            )
             .await
     }
 
@@ -62,14 +75,14 @@ impl StoragePlugin {
     /// As the contract documents for `release_lease`.
     pub async fn release_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         self.leases
-            .release_lease(ctx, scope, token, idempotency, events)
+            .release_lease(actor, scope, token, idempotency, events)
             .await
     }
 

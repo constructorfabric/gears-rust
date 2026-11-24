@@ -14,11 +14,11 @@ pub enum QuotaFilterField {
     Id,
     /// The owning tenant.
     TenantId,
-    /// The subject's projection type; comes with `subject_id`.
-    ProjectionType,
-    /// The subject identifier; comes with `projection_type`.
+    /// The subject type; comes with `subject_id`.
+    SubjectType,
+    /// The subject identifier; comes with `subject_type`.
     SubjectId,
-    /// The metric instance id.
+    /// The metric type id.
     Metric,
     /// `active` or `deactivated`.
     Status,
@@ -28,7 +28,7 @@ impl FilterField for QuotaFilterField {
     const FIELDS: &'static [Self] = &[
         Self::Id,
         Self::TenantId,
-        Self::ProjectionType,
+        Self::SubjectType,
         Self::SubjectId,
         Self::Metric,
         Self::Status,
@@ -38,7 +38,7 @@ impl FilterField for QuotaFilterField {
         match self {
             Self::Id => "id",
             Self::TenantId => "tenant_id",
-            Self::ProjectionType => "projection_type",
+            Self::SubjectType => "subject_type",
             Self::SubjectId => "subject_id",
             Self::Metric => "metric",
             Self::Status => "status",
@@ -48,9 +48,7 @@ impl FilterField for QuotaFilterField {
     fn kind(&self) -> FieldKind {
         match self {
             Self::Id | Self::TenantId => FieldKind::Uuid,
-            Self::ProjectionType | Self::SubjectId | Self::Metric | Self::Status => {
-                FieldKind::String
-            }
+            Self::SubjectType | Self::SubjectId | Self::Metric | Self::Status => FieldKind::String,
         }
     }
 

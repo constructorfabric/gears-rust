@@ -35,8 +35,8 @@ date: 2026-08-12
 >   and its instances, the resource base, and the metric base: subjects are quota resolver subject types that the
 >   metric admits.
 > - ADR-0013 (`cpt-cf-quota-enforcement-adr-metric-types`) removes the request contract, the constraint contract, and
->   the resource projection: a metric is a type with traits and a metadata schema, and the Engine checks Quota
->   metadata.
+>   the resource projection: a metric is a type with traits and a metadata schema, and Quota metadata are
+>   conditions over that metadata.
 > - ADR-0012 (`cpt-cf-quota-enforcement-adr-contract-catalogue`) replaces the catalogue that is built once at
 >   bootstrap and the bootstrap failure on an inconsistency. It also replaces two statements below: that evaluation
 >   never calls the registry (the first request for a metric reads its type), and that the metric mode on the hot path

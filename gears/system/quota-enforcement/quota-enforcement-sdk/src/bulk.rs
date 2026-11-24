@@ -216,7 +216,7 @@ pub struct BulkUpdateEntry {
     pub scope: AccessScope,
     /// The Quota to patch.
     pub quota_id: QuotaId,
-    /// The validated patch, `constraint_contract` set with `metadata`.
+    /// The validated patch.
     pub patch: QuotaPatch,
     /// Its `quota-changed` event.
     pub events: Vec<NotificationEvent>,

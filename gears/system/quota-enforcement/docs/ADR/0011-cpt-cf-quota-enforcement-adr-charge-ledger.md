@@ -97,7 +97,8 @@ Chosen option: (a).
   amount. It is unique per tenant and key, and it is deleted with its charge. Two returns with one key never run at
   the same time: the second starts after the first has ended and finds its record (DESIGN, lock rank). A repeated
   return with the same charge and amount changes nothing and gets the first result; the same key with another charge
-  or amount fails as a payload mismatch.
+  or amount fails as a payload mismatch. A repeated return whose metric type is not the metric type of the charge
+  fails with `METRIC_TYPE_MISMATCH`, as a first call does.
 * Rollback returns everything that remains of a charge. It has no amount and no idempotency key of its own: on a
   charge with nothing left it succeeds and changes nothing.
 * Rollback is an operation of QE's own API, where the PDP limits what a caller may charge. So a rollback names the
@@ -126,12 +127,18 @@ Chosen option: (a).
   are all deactivated, are deleted by the rule above.
 * An allocation charge on an active quota has no time limit. An allocation lasts as long as its resource, and QE does
   not know when a resource is gone. So QE never frees a held amount because time has passed.
+* A rollback returns what remains of the charge and records it in the charge, so a return of the same charge after
+  it fails with `RETURN_EXCEEDS_CHARGE`, or with `UNKNOWN_OPERATION` after the charge is deleted, and changes no
+  counter.
 * QE does not compare held amounts with the resources that exist. When a module loses a return, for example because
-  it deleted a resource and did not return its charge, the held amount stays. The operator then rolls the charge
-  back on QE's API. A rollback returns what remains of the charge and records it in the charge, so a late return of
-  the same charge fails with `RETURN_EXCEEDS_CHARGE`, or with `UNKNOWN_OPERATION` after the charge is deleted, and
-  changes no counter. The operator does not use a credit for a lost return: a credit changes the counter and no
-  charge, so a late return would lower the counter a second time.
+  it deleted a resource and did not return its charge, the held amount stays until that module sends the return. A
+  return is idempotent by its key and an allocation charge has no time limit, so the module can send it at any later
+  time. QE offers no operation by which an operator returns the charge of another caller: a rollback needs the
+  attribution of the charged operation, which only its caller has. Comparing held amounts with the resources that
+  exist is the task of a component above QE that reads the Usage Collector's records and the quota state. The
+  operator does not use a credit for a lost return: a credit changes the counter and no charge, so the return, when
+  it arrives, would lower the counter a second time. Until the module returns the charge, the operator can raise the
+  cap of the quota.
 * QE reports, per metric, the number of allocation charges that hold an amount on an active quota and are older than
   the replay window, and the age of the oldest one. A lost return shows there as a charge that never goes away.
 * A background sweeper removes deleted charges in batches. Its delete carries the deletion rule itself, in the same
@@ -144,8 +151,8 @@ Chosen option: (a).
   capacity.
 * A return of a charge whose allocation quotas are all deactivated fails as a return of an unknown charge once the
   replay window has passed. Nothing is lost: those quotas admit nothing.
-* A lost return on an active quota is corrected by the operator, not by QE. Held capacity that no resource uses stays
-  held until then.
+* A lost return on an active quota is corrected by the module that made the charge, not by QE or the operator. Held
+  capacity that no resource uses stays held until then.
 * A consumption charge cannot be returned after the return window. Work whose result comes later holds a lease.
 * A payload mismatch tells a caller that a key is in use in the tenant.
 * A key is taken for the whole tenant. A caller that sends a key first takes it: another caller of the same tenant
@@ -177,7 +184,7 @@ quota and one on an active quota, and a return after a credit that was given for
 * Good, because a return needs only the charge's name, and an allocation charge lives as long as it holds an amount on
   an active quota.
 * Bad, because every allowed debit and commit writes one more record.
-* Bad, because the charge of a lost return stays until the operator corrects it.
+* Bad, because the charge of a lost return stays until the module that made the charge returns it.
 
 ### (b) Longer idempotency retention
 

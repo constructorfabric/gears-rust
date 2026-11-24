@@ -25,9 +25,9 @@ use quota_enforcement_sdk::engine::{
 use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, AttributionDigest, Decision, DecisionResult, EvaluatedLease,
-    EvaluatedMutation, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseToken,
-    MetricId, OperationType, PartialIdempotencyWrite, PayloadHash, PolicyDraft, PolicyScope,
-    QuotaDebitPlan, QuotaDraft, QuotaId, StorageError, SubjectRef, TenantId, TransitionOutcome,
+    EvaluatedMutation, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, OperationType,
+    PartialIdempotencyWrite, PayloadHash, PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft,
+    QuotaId, StorageError, SubjectRef, TenantId, TransitionOutcome,
 };
 use quota_enforcement_sdk::{
     BatchDebitItem, BatchEntry, BatchTimer, EvaluatedBatch, EvaluatedDebit,
@@ -40,7 +40,7 @@ use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::domain::ports::LeaseStore;
@@ -50,8 +50,8 @@ use quota_enforcement_storage_plugin::{
     SqlPolicyStore, SqlQuotaStore, start_undelivered_outbox,
 };
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 
 fn tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(0x00ac_ce55))
@@ -62,23 +62,14 @@ fn scope() -> AccessScope {
 }
 
 fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: None,
     }
-}
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
 }
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -110,9 +101,21 @@ fn limits() -> EvaluationLimits {
 }
 
 /// Allow the requested amount against every applicable Quota with room, deny
-/// otherwise. Deterministic, so a race's outcome is the backend's doing.
+/// otherwise, and deny with `NO_APPLICABLE_QUOTA` when none applies, as the
+/// gear does. Deterministic, so a race's outcome is the backend's doing.
 fn evaluator() -> Arc<TransactionEvaluator> {
     Arc::new(move |context: &EvaluationContext<'_>| {
+        if context.quotas.is_empty() {
+            let none = Decision {
+                result: DecisionResult::Denied {
+                    violated_quota_ids: Vec::new(),
+                    reason: quota_enforcement_sdk::NO_APPLICABLE_QUOTA.to_owned(),
+                },
+                debit_plan: Vec::new(),
+                diagnostics: std::collections::BTreeMap::new(),
+            };
+            return Ok(EvaluationOutcome::validate(none, context)?);
+        }
         let exceeded: Vec<QuotaId> = context
             .quotas
             .iter()
@@ -130,12 +133,10 @@ fn evaluator() -> Arc<TransactionEvaluator> {
                     .quotas
                     .iter()
                     .map(|quota| {
-                        (
-                            quota.snapshot.quota_id,
-                            QuotaDebitPlan {
-                                amount: context.amount,
-                            },
-                        )
+                        vec![QuotaDebitPlan {
+                            quota_id: quota.snapshot.quota_id,
+                            amount: context.amount,
+                        }]
                     })
                     .collect(),
             )
@@ -145,7 +146,7 @@ fn evaluator() -> Arc<TransactionEvaluator> {
                     violated_quota_ids: exceeded,
                     reason: "QUOTA_EXCEEDED".to_owned(),
                 },
-                debit_plan: std::collections::BTreeMap::new(),
+                debit_plan: Vec::new(),
                 diagnostics: std::collections::BTreeMap::new(),
             }
         };
@@ -214,7 +215,7 @@ impl PgHarness {
         let policies = SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer));
         policies
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     // Not the built-in engine, whose plans name one Quota only:
@@ -298,7 +299,6 @@ impl PgHarness {
             let idempotency = IdempotencyWrite {
                 scope: IdempotencyScope {
                     tenant_id: tenant(),
-                    subject_key: IdempotencySubjectKey::of(&subjects),
                     operation_type: OperationType::Reserve,
                     key,
                 },
@@ -309,14 +309,13 @@ impl PgHarness {
             let null = serde_json::Value::Null;
             store
                 .acquire_lease(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     &EvaluatedMutation {
                         applicable: &applicable,
                         amount,
                         request: &null,
-                        resource: &null,
-                        user_projection: None,
+                        metric_id: None,
                         limits: limits(),
                         idempotency: &idempotency,
                         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -336,7 +335,7 @@ impl PgHarness {
 
     async fn consumed(&self, holder: &str, id: QuotaId) -> u64 {
         self.store
-            .read_quota_snapshot(&ctx(), &scope(), &applicable(subjects(&[holder])))
+            .read_quota_snapshot(&scope(), &applicable(subjects(&[holder])))
             .await
             .expect("snapshot")
             .into_iter()
@@ -359,10 +358,26 @@ fn item(holder: &str, amount: u64) -> BatchDebitItem {
         applicable: applicable(subjects(&[holder])),
         amount,
         request: serde_json::Value::Null,
-        resource: serde_json::Value::Null,
+        metric_id: None,
         authorized: AttributionDigest::from_bytes([7; 32]),
-        item_scope: None,
+        idempotency: IdempotencyWrite {
+            scope: IdempotencyScope {
+                tenant_id: tenant(),
+                operation_type: OperationType::Debit,
+                key: next_item_key(),
+            },
+            payload_hash: PayloadHash::from_bytes([1; 32]),
+        },
     }
+}
+
+/// A key no other item of this process uses.
+fn next_item_key() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "item-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 impl PgHarness {
@@ -375,21 +390,27 @@ impl PgHarness {
         evaluate: Arc<TransactionEvaluator>,
         timeout: Duration,
     ) -> tokio::task::JoinHandle<Batched> {
-        let store = Arc::clone(&self.store);
-        let items: Vec<BatchDebitItem> = items
+        let items = items
             .iter()
             .map(|(holder, amount)| item(holder, *amount))
             .collect();
+        self.batch_of(items, key, evaluate, timeout)
+    }
+
+    /// [`Self::batch_with`] over items built by the caller.
+    fn batch_of(
+        &self,
+        items: Vec<BatchDebitItem>,
+        key: &str,
+        evaluate: Arc<TransactionEvaluator>,
+        timeout: Duration,
+    ) -> tokio::task::JoinHandle<Batched> {
+        let store = Arc::clone(&self.store);
         let key = key.to_owned();
         tokio::spawn(async move {
-            let holders: Vec<SubjectRef> = items
-                .iter()
-                .flat_map(|item| item.applicable.subjects.clone())
-                .collect();
             let envelope = IdempotencyWrite {
                 scope: IdempotencyScope {
                     tenant_id: tenant(),
-                    subject_key: IdempotencySubjectKey::of(&holders),
                     operation_type: OperationType::BatchDebit,
                     key,
                 },
@@ -401,12 +422,11 @@ impl PgHarness {
                 .map(|item| BatchEntry {
                     item,
                     scope: &item_scope,
-                    user_projection: None,
                 })
                 .collect();
             store
                 .apply_batch_debit(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     &EvaluatedBatch {
                         envelope: &envelope,
@@ -431,7 +451,7 @@ impl PgHarness {
         tokio::spawn(async move {
             store
                 .release_lease(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     token,
                     &PartialIdempotencyWrite {
@@ -626,7 +646,6 @@ async fn an_evaluation_that_outlasts_the_batch_timer_writes_nothing() {
         h.store
             .lookup_idempotency(&IdempotencyScope {
                 tenant_id: tenant(),
-                subject_key: IdempotencySubjectKey::of(&subjects(&["u1"])),
                 operation_type: OperationType::BatchDebit,
                 key: "slow".to_owned(),
             })
@@ -653,19 +672,17 @@ async fn a_lease_release_cannot_change_a_counter_while_a_debit_evaluates_it() {
         let null = serde_json::Value::Null;
         store
             .apply_debit_plan(
-                &ctx(),
+                &actor(),
                 &scope(),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount: 10,
                     request: &null,
-                    resource: &null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: limits(),
                     idempotency: &IdempotencyWrite {
                         scope: IdempotencyScope {
                             tenant_id: tenant(),
-                            subject_key: IdempotencySubjectKey::of(&subjects(&["u1"])),
                             operation_type: OperationType::Debit,
                             key: "d1".to_owned(),
                         },
@@ -694,12 +711,10 @@ async fn a_lease_release_cannot_change_a_counter_while_a_debit_evaluates_it() {
     h.down().await;
 }
 
-/// Commit a batch envelope record under the scope `holders` batch with,
-/// without the scope lock: the writer a batch can still lose the record's key
-/// to.
+/// Commit a batch envelope record under `key` without the scope lock: the
+/// writer a batch can still lose the record's key to.
 async fn commit_envelope_out_of_band(
     h: &PgHarness,
-    holders: &[&str],
     key: &str,
     payload: u8,
     record: &quota_enforcement_sdk::BatchRecord,
@@ -714,16 +729,10 @@ async fn commit_envelope_out_of_band(
     let insert = toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
         idempotency_record::ActiveModel {
             tenant_id: Set(tenant().as_uuid()),
-            subject_key: Set(IdempotencySubjectKey::of(&subjects(holders))
-                .as_bytes()
-                .to_vec()),
             operation_type: Set(OperationType::BatchDebit.as_str().to_owned()),
             idem_key: Set(key.to_owned()),
             payload_hash: Set(vec![payload; 32]),
             decision_blob: Set(serde_json::to_string(record).expect("record")),
-            applied_entries: Set(None),
-            attribution_hash: Set(None),
-            reversed_by_key: Set(None),
             engine_id: Set(None),
             policy_id: Set(None),
             policy_version: Set(None),
@@ -745,7 +754,7 @@ fn winners_batch() -> quota_enforcement_sdk::BatchRecord {
             violated_quota_ids: Vec::new(),
             reason: "WINNER".to_owned(),
         },
-        debit_plan: std::collections::BTreeMap::new(),
+        debit_plan: Vec::new(),
         diagnostics: std::collections::BTreeMap::new(),
     }])
 }
@@ -779,7 +788,7 @@ async fn a_batch_that_loses_the_envelope_key_replays_the_winner_and_applies_noth
     let id = h.quota("u1", Some(100)).await;
     let (batch, release) = hold_a_batch(&h, "raced");
     // The harness envelope payload is `[1; 32]`.
-    commit_envelope_out_of_band(&h, &["u1"], "raced", 1, &winners_batch()).await;
+    commit_envelope_out_of_band(&h, "raced", 1, &winners_batch()).await;
     release.send(()).expect("release");
 
     match batch.await.expect("join") {
@@ -806,7 +815,7 @@ async fn a_batch_that_loses_the_envelope_key_to_another_payload_is_a_mismatch() 
     let h = PgHarness::up().await;
     let id = h.quota("u1", Some(100)).await;
     let (batch, release) = hold_a_batch(&h, "raced");
-    commit_envelope_out_of_band(&h, &["u1"], "raced", 2, &winners_batch()).await;
+    commit_envelope_out_of_band(&h, "raced", 2, &winners_batch()).await;
     release.send(()).expect("release");
 
     assert!(
@@ -817,5 +826,187 @@ async fn a_batch_that_loses_the_envelope_key_to_another_payload_is_a_mismatch() 
         "the same key under another payload is the caller's conflict"
     );
     assert_eq!(h.consumed("u1", id).await, 0);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_single_debit_that_commits_first_under_an_item_key_refuses_the_batch() {
+    let h = PgHarness::up().await;
+    h.queue_writers().await;
+    let debited = h.quota("u1", Some(100)).await;
+    let batched = h.quota("u2", Some(100)).await;
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let store = Arc::clone(&h.store);
+    let evaluate = held_evaluator(locked_tx, release_rx);
+    let debit = tokio::spawn(async move {
+        let applicable = applicable(subjects(&["u1"]));
+        let null = serde_json::Value::Null;
+        store
+            .apply_debit_plan(
+                &actor(),
+                &scope(),
+                &EvaluatedMutation {
+                    applicable: &applicable,
+                    amount: 10,
+                    request: &null,
+                    metric_id: None,
+                    limits: limits(),
+                    idempotency: &IdempotencyWrite {
+                        scope: IdempotencyScope {
+                            tenant_id: tenant(),
+                            operation_type: OperationType::Debit,
+                            key: "shared".to_owned(),
+                        },
+                        payload_hash: PayloadHash::from_bytes([4; 32]),
+                    },
+                    authorized: AttributionDigest::from_bytes([7; 32]),
+                    evaluate,
+                },
+                &[],
+            )
+            .await
+    });
+    locked_rx
+        .recv_timeout(NO_DEADLOCK)
+        .expect("the debit holds the key lock of `shared`");
+
+    // The batch's Quota is another one: only the item key's lock is shared.
+    let mut shared = item("u2", 5);
+    shared.idempotency.scope.key = "shared".to_owned();
+    let batch = h.batch_of(
+        vec![item("u2", 1), shared],
+        "b1",
+        evaluator(),
+        Duration::from_secs(30),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release_tx.send(()).expect("release");
+    debit.await.expect("join").expect("the debit commits first");
+
+    let outcome = tokio::time::timeout(NO_DEADLOCK, batch)
+        .await
+        .expect("no deadlock")
+        .expect("join");
+    assert!(
+        outcome == Err(StorageError::IdempotencyPayloadMismatch.at_item(1)),
+        "a batch never answers with a single debit's result, and names the item: {outcome:?}"
+    );
+    assert_eq!(h.consumed("u1", debited).await, 10);
+    assert_eq!(
+        h.consumed("u2", batched).await,
+        0,
+        "the batch changed nothing"
+    );
+    assert!(
+        h.store
+            .lookup_idempotency(&IdempotencyScope {
+                tenant_id: tenant(),
+                operation_type: OperationType::BatchDebit,
+                key: "b1".to_owned(),
+            })
+            .await
+            .expect("lookup")
+            .is_none(),
+        "no envelope record"
+    );
+    h.down().await;
+}
+
+// ---------------------------------------------------------------------------
+// Quota conditions (I15): matched on the locked rows, per item
+// ---------------------------------------------------------------------------
+
+impl PgHarness {
+    /// A Quota of `holder` whose metadata limits it to `region`.
+    async fn regional_quota(&self, holder: &str, region: &str) -> QuotaId {
+        let mut quota = draft(holder, Some(100));
+        quota.metadata = serde_json::json!({ "region": [region] })
+            .as_object()
+            .cloned()
+            .expect("object");
+        self.quotas
+            .create_quota(&actor(), &scope(), quota, &[])
+            .await
+            .expect("quota")
+    }
+}
+
+fn regional_item(holder: &str, amount: u64, region: &str) -> BatchDebitItem {
+    BatchDebitItem {
+        request: serde_json::json!({ "region": region }),
+        metric_id: None,
+        ..item(holder, amount)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_batch_item_and_each_debit_reach_only_the_quotas_whose_conditions_hold() {
+    let h = PgHarness::up().await;
+    let eu = h.regional_quota("u1", "eu").await;
+    let us = h.regional_quota("u1", "us").await;
+
+    let batch = h
+        .batch_of(
+            vec![regional_item("u1", 3, "eu"), regional_item("u1", 5, "us")],
+            "b1",
+            evaluator(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("join");
+    assert!(admitted(&batch), "{batch:?}");
+    assert_eq!(h.consumed("u1", eu).await, 3);
+    assert_eq!(h.consumed("u1", us).await, 5);
+
+    let debit = |region: Option<&str>, key: &str| {
+        let store = Arc::clone(&h.store);
+        let request = region.map_or(
+            serde_json::json!({}),
+            |region| serde_json::json!({ "region": region }),
+        );
+        let key = key.to_owned();
+        async move {
+            let applicable = applicable(subjects(&["u1"]));
+            store
+                .apply_debit_plan(
+                    &actor(),
+                    &scope(),
+                    &EvaluatedMutation {
+                        applicable: &applicable,
+                        amount: 1,
+                        request: &request,
+                        metric_id: None,
+                        limits: limits(),
+                        idempotency: &IdempotencyWrite {
+                            scope: IdempotencyScope {
+                                tenant_id: tenant(),
+                                operation_type: OperationType::Debit,
+                                key,
+                            },
+                            payload_hash: PayloadHash::from_bytes([4; 32]),
+                        },
+                        authorized: AttributionDigest::from_bytes([7; 32]),
+                        evaluate: evaluator(),
+                    },
+                    &[],
+                )
+                .await
+                .expect("debit")
+        }
+    };
+    debit(Some("eu"), "d1").await;
+    assert_eq!(h.consumed("u1", eu).await, 4);
+    assert_eq!(h.consumed("u1", us).await, 5);
+    for (region, key) in [(Some("ap"), "d2"), (None, "d3")] {
+        let outcome = debit(region, key).await;
+        assert_eq!(
+            outcome.get().decision.denied_reason(),
+            Some(quota_enforcement_sdk::NO_APPLICABLE_QUOTA),
+            "{region:?}"
+        );
+    }
+    assert_eq!(h.consumed("u1", eu).await, 4);
+    assert_eq!(h.consumed("u1", us).await, 5);
     h.down().await;
 }

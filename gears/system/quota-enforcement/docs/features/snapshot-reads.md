@@ -35,7 +35,7 @@
 
 ### 1.1 Overview
 
-Implements the engine-agnostic per-Quota state read: the unified S2S `POST /v1/quota-enforcement/snapshot` endpoint
+Implements the engine-agnostic per-Quota state read: the unified S2S `POST /quota-enforcement/v1/snapshot` endpoint
 serving consumer and manager/operator cases from one PDP-scoped request shape. Returns, for every
 applicable Quota, its current per-Quota state (cap, consumed or in-flight, remaining, period boundary, metadata,
 validity window, `currently_within_window`), with PDP-scoped filtering, cursor pagination, and no Policy attribution
@@ -51,14 +51,14 @@ single number is universally meaningful. Callers that need an admission verdict 
 read-only Decision Preview of the consumption-operations feature instead
 (`cpt-cf-quota-enforcement-fr-evaluate-preview`).
 
-**Scope**: `POST /v1/quota-enforcement/snapshot` for explicit caller-supplied tenant/subject/metric filters with cursor pagination
+**Scope**: `POST /quota-enforcement/v1/snapshot` for explicit caller-supplied tenant/subject/metric filters with cursor pagination
 (operator-configured page size, default 100 entries per page); the per-Quota state contract shared by all three
 cases; S2S consumer reads used by product backends to render self-service views; manager/operator reads with explicit
 targets; the read-only guarantee (I3), under which a consumption Quota without a row for its current window reads as
 zero; the `QuotaEnforcementApi::snapshot` SDK method.
 
 **Out of scope**: admission verdicts (served by `evaluate_preview` in the consumption-operations feature), the Quota
-CRUD read endpoints (`GET /v1/quota-enforcement/quotas*`, owned by the quota-lifecycle feature), Policy attribution
+CRUD read endpoints (`GET /quota-enforcement/v1/quotas*`, owned by the quota-lifecycle feature), Policy attribution
 reads (the Policy-read API of the resolution-policy-engine feature), end-user access to QE (products expose views
 through their backend), subject admission (projection-contracts feature), the quota resolver's quota state read
 (resolver-plugin feature, which serves it from this read), and period-rollover semantics
@@ -139,12 +139,12 @@ reads are PRD requirement surfaces without a dedicated use case)
 - Every error is a `Problem` envelope; a snapshot read never produces a Decision shape
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/snapshot` with a `SnapshotRequest` carrying target `tenant_id`, `1..N` `{type, id, metric}` filters, and page parameters; in a filter, `type` and `id` name the subject, and `metric` is the id of a **metric type**, the GTS type that the metric's owner registers (ADR-0013); platform authentication has attached `SecurityContext` - `inst-snp-request`
+1. [ ] - `p1` - Caller sends `POST /quota-enforcement/v1/snapshot` with a `SnapshotRequest` carrying target `tenant_id`, `1..N` `{type, id, metric, metadata?}` filters, and page parameters; in a filter, `type` and `id` name the subject, `metric` is the id of a **metric type**, the GTS type that the metric's owner registers (ADR-0013), and the optional `metadata` is the `metadata` of a request's metric object: it must fit the metric type (`InvalidArgument` naming the filter otherwise), and the filter then selects only the Quotas whose conditions hold on it; platform authentication has attached `SecurityContext` - `inst-snp-request`
 2. [x] - `p1` - Treat single and bulk as degenerate cases of the one request shape: `subjects.len() == 1` realises `cpt-cf-quota-enforcement-fr-quota-snapshot-read`, `subjects.len() >= 1` realises `cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`; reject malformed public target/filter shape before PDP; there is no separate REST path - `inst-snp-shape`
 3. [ ] - `p1` - Admission authorizes the target: on QE's API the PDP authorizes the complete structurally valid explicit target against the authenticated principal; on the resolver plugin path trusted mode scopes storage to `tenant_id` (`cpt-cf-quota-enforcement-flow-authorized-admission`) - `inst-snp-authz`
 4. [ ] - `p1` - QE looks up the catalogue entry of each metric as `cpt-cf-quota-enforcement-flow-ingress-validation` does, with one batch read of the metric types the catalogue does not hold: one unavailable entry fails the whole read with canonical `FailedPrecondition`. QE then checks each subject type against the `admitted_subjects` trait of the metric type (`cpt-cf-quota-enforcement-algo-subject-resolution`); on the resolver plugin path a type that is not admitted narrows the filter to the tenant's Quotas instead of failing, and Quotas outside their validity window are left out; QE then calls `bulk_read_quota_snapshot(pairs, page)` under the returned `AccessScope` per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation), reading the `quotas` rows and their counter rows; the read is read-only (I3) - `inst-snp-read`
 5. [x] - `p1` - Assemble each returned Quota's state per `cpt-cf-quota-enforcement-algo-snapshot-state`; a consumption Quota with no row for its current window (the row is missing, or `now() >= period_end`) reads as zero over that window, and the read creates no row: opening the new period, settling the elapsed one and emitting its `period-rollover` event belong to the next mutating operation per `cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations feature) - `inst-snp-assemble`
-6. [x] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set - `inst-snp-page`
+6. [x] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set; when a filter carries `metadata`, the gear then drops from the page the Quotas that no filter selects, so a page may hold fewer Quotas than its limit and the cursor says whether more follow - `inst-snp-page`
 7. [x] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty page; the SDK path is `QuotaEnforcementApi::snapshot(req)` returning `PageResult<QuotaSnapshot>` - `inst-snp-return`
 
 ### Consumer-Backed Self-Service Snapshot
@@ -166,7 +166,7 @@ calls Quota Enforcement directly)
 - The backend supplies a tenant or user outside its service principal's PDP scope: canonical `PermissionDenied`
 
 **Steps**:
-1. [ ] - `p1` - The consuming backend calls `POST /v1/quota-enforcement/snapshot` with its authenticated service principal plus explicit target `tenant_id` and user `{type, id}` - `inst-eus-request`
+1. [ ] - `p1` - The consuming backend calls `POST /quota-enforcement/v1/snapshot` with its authenticated service principal plus explicit target `tenant_id` and user `{type, id}` - `inst-eus-request`
 2. [x] - `p1` - Reject malformed public target shape before PDP - `inst-eus-target-shape`
 3. [ ] - `p1` - PDP authorizes the complete structurally valid target tuple; QE then checks admission of the user's subject type - `inst-eus-fix`
 4. [x] - `p1` - **IF** any target lies outside the backend's authorized scope - `inst-eus-broaden-if`
@@ -229,7 +229,7 @@ elsewhere. The Quota lifecycle states it reads are defined by `cpt-cf-quota-enfo
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-snapshot-endpoint`
 
-The system **MUST** deliver the unified `POST /v1/quota-enforcement/snapshot` endpoint on `QuotaEnforcementService`
+The system **MUST** deliver the unified `POST /quota-enforcement/v1/snapshot` endpoint on `QuotaEnforcementService`
 (`cpt-cf-quota-enforcement-component-quota-enforcement-service`, shared with the consumption-operations feature per
 DECOMPOSITION §2.13) and the SDK method `QuotaEnforcementApi::snapshot(req: SnapshotRequest)` returning
 `PageResult<QuotaSnapshot>`. The endpoint **MUST** accept `1..N` `(subject, metric)` filter pairs, treating single
@@ -251,7 +251,7 @@ surface it **MUST** return a `Problem` envelope on every error and never a Decis
 `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/snapshot`; `QuotaEnforcementApi::snapshot`;
+- API: `POST /quota-enforcement/v1/snapshot`; `QuotaEnforcementApi::snapshot`;
   storage `bulk_read_quota_snapshot(pairs, page)`
 - DB: reads `quotas`, `quota_allocation_counters`, and `quota_consumption_counters`; no new tables
   (DECOMPOSITION §2.8)
@@ -301,7 +301,7 @@ targets are rejected. End-user authentication, presentation, and rate limiting s
 **Constraints**: `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/snapshot` (no separate REST path)
+- API: `POST /quota-enforcement/v1/snapshot` (no separate REST path)
 - DB: the same read-only tables as the unified endpoint
 - Entities: `QuotaSnapshot`, `SecurityContext` service principal, `AccessScope`
 

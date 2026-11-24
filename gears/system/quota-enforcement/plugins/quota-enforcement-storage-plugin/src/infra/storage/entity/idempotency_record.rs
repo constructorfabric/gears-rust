@@ -1,12 +1,12 @@
-//! `qe_idempotency_records`: one row per write operation, keyed by the full
-//! four-component scope `(tenant_id, subject_key, operation_type, idem_key)`
-//! (PRD section 5.8).
+//! `qe_idempotency_records`: one row per write operation other than an allowed
+//! debit or a lease commit, whose charge is its record, keyed by the scope
+//! `(tenant_id, operation_type, idem_key)` (PRD section 5.8).
 //!
 //! The primary key is load-bearing twice over. It keeps the same key string
-//! independent across tenants, subject sets, and operation kinds, and it is
-//! the backstop behind the scope's stripe lock: a writer that inserts under a
-//! scope without holding that lock makes the other's insert violate the key,
-//! and the loser's whole transaction rolls back.
+//! independent across tenants and operation kinds, and it is the backstop
+//! behind the scope's stripe lock: a writer that inserts under a scope without
+//! holding that lock makes the other's insert violate the key, and the loser's
+//! whole transaction rolls back.
 //!
 //! The row has no resource column. Records are addressed by their scope, never
 //! by a Quota, and one record can span several Quotas.
@@ -22,9 +22,6 @@ pub struct Model {
     /// Authorized target tenant.
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_id: Uuid,
-    /// SHA-256 fingerprint of the applicable subject set.
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub subject_key: Vec<u8>,
     /// Operation kind, as its serialized name.
     #[sea_orm(primary_key, auto_increment = false)]
     pub operation_type: String,
@@ -35,16 +32,6 @@ pub struct Model {
     pub payload_hash: Vec<u8>,
     /// The recorded decision, with its top-level schema version.
     pub decision_blob: String,
-    /// Plugin-private movements of a committed debit: the per-Quota amounts and
-    /// the periods they were attributed to, which is what a rollback reverses.
-    /// `NULL` for an operation that moved no counter.
-    pub applied_entries: Option<String>,
-    /// Digest of the authorized attribution a debit was admitted under. A
-    /// rollback must present the same one. `NULL` on credit and rollback rows.
-    pub attribution_hash: Option<Vec<u8>>,
-    /// Key of the rollback that reversed this debit, if any. The reverse-once
-    /// arbiter.
-    pub reversed_by_key: Option<String>,
     /// Engine that produced the decision, when one was invoked.
     pub engine_id: Option<String>,
     /// Policy that produced it, when one was selected.

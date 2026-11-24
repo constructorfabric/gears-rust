@@ -2,10 +2,10 @@
 //! `QuotaManagementService`; `features/quota-lifecycle.md`).
 //!
 //! Every operation runs in the same order: the request shape, the PDP, then
-//! the catalogue and the registry, then storage. Nothing before the storage
-//! call opens a transaction, and nothing after it touches the registry. REST
-//! and the in-process client both enter here, so both transports share one
-//! authorization boundary.
+//! the metric catalogue and the check of the metadata against it, then storage.
+//! Nothing before the storage call opens a transaction, and nothing after it
+//! touches the registry. REST and the in-process client both enter here, so
+//! both transports share one authorization boundary.
 
 use crate::domain::admission::admission_span;
 use std::collections::HashMap;
@@ -14,26 +14,23 @@ use tracing::Instrument as _;
 use quota_enforcement_sdk::{
     DeactivateOutcome, MetricId, MetricKind, NotificationEvent, PageRequest, PageResult, Quota,
     QuotaDraft, QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaId, QuotaPatch, QuotaStatus,
-    QuotaView, TenantId,
+    QuotaType, QuotaView, TenantId,
 };
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use super::events::{ChangeKind, quota_changed};
-use super::metadata::validate_metadata;
 use super::request::{CreateQuotaRequest, ListQuotasRequest, UpdateQuotaRequest};
 use super::validation::{
     QuotaLimits, validate_create_shape, validate_list, validate_patched_shape,
     validate_subject_scope, validate_update_shape,
 };
 use super::window::{view, view_page};
-use crate::domain::admission::{Admission, AdmissionTarget, Admitted};
-use crate::domain::catalog::{ProjectionContractCatalog, check_projection_reference};
+use crate::domain::admission::{AdmissionTarget, Admitted, Gate};
+use crate::domain::catalog::{CatalogEntry, MetricCatalog, MetricMode};
 use crate::domain::error::{DomainError, ResourceKind};
 use crate::domain::pep::{actions, resources};
-use crate::domain::ports::contracts::ContractRegistry;
-use crate::domain::ports::metric_registry::{Classified, MetricMode, MetricRegistry};
 use crate::domain::ports::metrics::{DenialReason, QeMetrics, ValidationSurface};
 use crate::domain::tokens;
 
@@ -43,11 +40,9 @@ const LOG_TARGET: &str = "qe.quotas";
 // @cpt-dod:cpt-cf-quota-enforcement-dod-quota-crud:p1
 #[domain_model]
 pub struct QuotaManagement<'a> {
-    pub(super) admission: &'a Admission,
-    catalog: &'a ProjectionContractCatalog,
+    pub(super) admission: Gate<'a>,
+    catalog: &'a MetricCatalog,
     pub(super) storage: &'a dyn QuotaEnforcementStoragePluginV1,
-    registry: &'a dyn ContractRegistry,
-    metric_registry: &'a dyn MetricRegistry,
     pub(super) metrics: &'a dyn QeMetrics,
     pub(super) limits: QuotaLimits,
 }
@@ -56,11 +51,9 @@ impl<'a> QuotaManagement<'a> {
     /// Assemble the component over the bound dependencies.
     #[must_use]
     pub fn new(
-        admission: &'a Admission,
-        catalog: &'a ProjectionContractCatalog,
+        admission: Gate<'a>,
+        catalog: &'a MetricCatalog,
         storage: &'a dyn QuotaEnforcementStoragePluginV1,
-        registry: &'a dyn ContractRegistry,
-        metric_registry: &'a dyn MetricRegistry,
         metrics: &'a dyn QeMetrics,
         limits: QuotaLimits,
     ) -> Self {
@@ -68,8 +61,6 @@ impl<'a> QuotaManagement<'a> {
             admission,
             catalog,
             storage,
-            registry,
-            metric_registry,
             metrics,
             limits,
         }
@@ -85,27 +76,21 @@ impl<'a> QuotaManagement<'a> {
     ///
     /// # Errors
     ///
-    /// In order: the shape violation, the PDP outcome,
-    /// [`DomainError::MetricNotRegistered`] or the registry's availability,
-    /// the catalogue membership error, the subject-scope violation, the
-    /// metadata violation, then the storage error.
+    /// In order: the shape violation, the PDP outcome, the catalogue's error
+    /// for the metric type, the subject admission error, the subject-scope
+    /// violation, the metadata rejection, then the storage error.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-create:p1
     #[tracing::instrument(name = "quota_enforcement.quotas.create", skip_all, fields(tenant_id = %request.tenant_id, metric = %request.metric))]
-    pub async fn create(
-        &self,
-        ctx: &SecurityContext,
-        request: CreateQuotaRequest,
-    ) -> Result<QuotaView, DomainError> {
+    pub async fn create(&self, request: CreateQuotaRequest) -> Result<QuotaView, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-request
-        // The request names its target `(projection_type, subject_id)` and
-        // tenant explicitly; the PDP authorizes that target below.
+        // The request names its target `(subject_type, subject_id)` and tenant
+        // explicitly; the PDP authorizes that target below.
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-validate
         let draft = validate_create_shape(request).map_err(|e| self.shape_rejected(e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-validate
         let admitted = self
             .admission
             .admit(
-                ctx,
                 &resources::QUOTA,
                 actions::CREATE,
                 AdmissionTarget::tenant(draft.tenant_id),
@@ -129,19 +114,25 @@ impl<'a> QuotaManagement<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-persist
         let id = self
             .storage
-            .create_quota(ctx, &admitted.access_scope, storage_draft, &events)
+            .create_quota(
+                &admitted.actor,
+                &admitted.access_scope,
+                storage_draft,
+                &events,
+            )
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-persist
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-direct-if
         if mode == MetricMode::Direct {
             // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-direct
-            // Accepted: a metric's mode can flip. The Quota is inert until then
-            // and counted by the `quota_for_direct_metric_total` gauge.
+            // Accepted: a revision of the metric type can change its mode. The
+            // Quota is inert until then and counted by the
+            // `quota_for_direct_metric_total` gauge.
             tracing::info!(
                 target: LOG_TARGET,
                 quota_id = %id,
-                "quota created on a metric currently classified Direct; inert until the mode flips"
+                "quota created on a metric whose enforcement is direct; inert while it is"
             );
             // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-direct
         }
@@ -149,74 +140,86 @@ impl<'a> QuotaManagement<'a> {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-return
         let quota = self
-            .read_one(ctx, &admitted.access_scope, id)
+            .read_one(&admitted.access_scope, id)
             .await?
             .ok_or_else(|| DomainError::Internal("created quota is not readable".to_owned()))?;
         Ok(view(quota, Some(kind), OffsetDateTime::now_utc()))
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-return
     }
 
-    /// The checks of a create after its shape and the PDP: the metric, the
-    /// catalogue membership, the subject scope and the metadata, then the
-    /// storage draft and its `quota-changed` event. No storage call.
+    /// The checks of a create after its shape and the PDP: the metric type,
+    /// the subject's admission, the subject scope and the metadata, then the
+    /// storage draft and its `quota-changed` event. No storage write.
     ///
     /// # Errors
     ///
-    /// In order: [`DomainError::MetricNotRegistered`] or the registry's
-    /// availability, the catalogue membership error, the subject-scope
-    /// violation, the metadata violation.
+    /// In order: the catalogue's error for the metric type, the subject
+    /// admission error, the subject-scope violation, the metadata rejection.
+    // @cpt-algo:cpt-cf-quota-enforcement-algo-catalog-membership:p1
     pub(super) async fn prepare_create(
         &self,
         draft: super::validation::ShapedDraft,
     ) -> Result<PreparedCreate, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-metric
-        let classified = self.describe_metric(&draft.metric).await?;
+        let served = self
+            .catalog
+            .served(&draft.metric, ValidationSurface::QuotaWrite)
+            .await?;
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-metric-validation:p1:inst-qmv-classify
+        let taken = match served.kind() {
+            MetricKind::Counter => {
+                matches!(draft.quota_type, QuotaType::Consumption | QuotaType::Rate)
+            }
+            MetricKind::Gauge => draft.quota_type == QuotaType::Allocation,
+        };
+        if !taken {
+            return Err(DomainError::InvalidArgument {
+                field: "quota_type",
+                reason: tokens::QUOTA_TYPE_KIND_MISMATCH,
+            });
+        }
+        // @cpt-end:cpt-cf-quota-enforcement-algo-metric-validation:p1:inst-qmv-classify
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-metric
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-membership
-        // The registry snapshot tells an unregistered projection from a
-        // registered one outside the catalogue; the catalogue alone cannot.
-        let snapshot = self
-            .registry
-            .type_schema(&draft.subject.projection_type)
-            .await?;
-        check_projection_reference(
-            self.catalog,
-            self.metrics,
-            ValidationSurface::Arbitration,
-            snapshot.as_ref(),
-            &draft.subject.projection_type,
-            Some(&draft.metric),
-        )?;
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-metric-if
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-metric
+        if !served.admits(&draft.subject.subject_type) {
+            self.metrics
+                .record_admitted_metric_violation(ValidationSurface::QuotaWrite);
+            tracing::warn!(
+                target: LOG_TARGET,
+                metric = %draft.metric,
+                subject_type = %draft.subject.subject_type,
+                "the metric type does not admit the subject type"
+            );
+            return Err(DomainError::InvalidArgument {
+                field: "subject.type",
+                reason: tokens::METRIC_NOT_ADMITTED,
+            });
+        }
+        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-metric
+        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-metric-if
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid-if
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid
+        if !draft.subject.is_tenant() {
+            self.catalog
+                .check_subject(&draft.subject, ValidationSurface::QuotaWrite)
+                .await?;
+        }
+        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid
+        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid-if
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-membership
 
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-subject-scope
-        let projection = self
-            .catalog
-            .subject_projection(&draft.subject.projection_type)
-            .ok_or_else(|| {
-                DomainError::Internal("membership passed for an unconfigured projection".to_owned())
-            })?;
-        validate_subject_scope(
-            &projection.scope,
-            draft.tenant_id,
-            &draft.subject.subject_id,
-        )
-        .map_err(|e| self.shape_rejected(e))?;
-        // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-subject-scope
+        validate_subject_scope(&draft.subject, draft.tenant_id)
+            .map_err(|e| self.shape_rejected(e))?;
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-metadata
-        let request_contract = self
-            .catalog
-            .request_contract(&draft.metric)
-            .ok_or_else(|| {
-                DomainError::Internal("admitted metric without a request contract".to_owned())
-            })?;
-        let constraint_contract = validate_metadata(
-            &draft.metadata,
-            &request_contract.constraint,
-            self.limits.metadata_max_bytes,
+        super::metadata::check(
             self.metrics,
+            &served,
+            &draft.metadata,
+            self.limits.metadata_max_bytes,
         )?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-metadata
 
@@ -224,6 +227,7 @@ impl<'a> QuotaManagement<'a> {
         let tenant_id = draft.tenant_id;
         let subject = draft.subject.clone();
         let events = [quota_changed(
+            self.admission.actor(),
             tenant_id,
             None,
             Some(subject),
@@ -243,13 +247,12 @@ impl<'a> QuotaManagement<'a> {
             fail_open_hint: draft.fail_open_hint,
             metadata: draft.metadata,
             source: draft.source,
-            constraint_contract,
         };
         Ok(PreparedCreate {
             draft: storage_draft,
             events: events.to_vec(),
-            mode: classified.descriptor.mode,
-            kind: classified.descriptor.kind,
+            mode: served.mode(),
+            kind: served.kind(),
         })
     }
 
@@ -260,21 +263,21 @@ impl<'a> QuotaManagement<'a> {
     /// In order: the shape violation (`rate` first, then the immutable
     /// fields), the PDP outcome, [`DomainError::NotFound`],
     /// [`DomainError::QuotaDeactivated`], the patched-shape violation, the
-    /// registry's answer, the metadata violation, then the storage error
+    /// catalogue's error for the metric type, the metadata rejection, then the
+    /// storage error
     /// ([`DomainError::CapBelowConsumed`] and
     /// [`DomainError::ThresholdsRequireBoundedCap`] decided under the row lock).
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-update:p1
     #[tracing::instrument(name = "quota_enforcement.quotas.update", skip_all, fields(quota_id = %quota_id))]
     pub async fn update(
         &self,
-        ctx: &SecurityContext,
         quota_id: QuotaId,
         request: UpdateQuotaRequest,
     ) -> Result<QuotaView, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
         let patch = validate_update_shape(request).map_err(|e| self.shape_rejected(e))?;
         let admitted = self
-            .admit_resource(ctx, actions::UPDATE, quota_id)
+            .admit_resource(actions::UPDATE, quota_id)
             .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
@@ -285,7 +288,7 @@ impl<'a> QuotaManagement<'a> {
             kind,
             ..
         } = self
-            .prepare_update(ctx, &admitted.access_scope, quota_id, patch)
+            .prepare_update(&admitted.access_scope, quota_id, patch)
             .await?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-persist
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-guard-if
@@ -294,7 +297,13 @@ impl<'a> QuotaManagement<'a> {
         // on the row read above.
         let updated = self
             .storage
-            .update_quota(ctx, &admitted.access_scope, quota_id, patch, &events)
+            .update_quota(
+                &admitted.actor,
+                &admitted.access_scope,
+                quota_id,
+                patch,
+                &events,
+            )
             .await
             // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-guard
             .map_err(DomainError::from)?;
@@ -315,17 +324,17 @@ impl<'a> QuotaManagement<'a> {
     /// # Errors
     ///
     /// [`DomainError::NotFound`], [`DomainError::QuotaDeactivated`], the
-    /// patched-shape violation, the registry's answer, the metadata violation.
+    /// patched-shape violation, the catalogue's error for the metric type, the
+    /// metadata rejection.
     pub(super) async fn prepare_update(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         quota_id: QuotaId,
-        mut patch: QuotaPatch,
+        patch: QuotaPatch,
     ) -> Result<PreparedUpdate, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-validate
         let current = self
-            .read_one(ctx, scope, quota_id)
+            .read_one(scope, quota_id)
             .await?
             .ok_or_else(|| not_found(quota_id))?;
         if current.status == QuotaStatus::Deactivated {
@@ -334,35 +343,23 @@ impl<'a> QuotaManagement<'a> {
             });
         }
         validate_patched_shape(&current, &patch).map_err(|e| self.shape_rejected(e))?;
-        // Metric identity is revalidated at update time.
-        let classified = self.describe_metric(&current.metric).await?;
+        // Metric identity is revalidated at update time; the subject's
+        // admission is not, it was checked at create.
+        let served = self
+            .catalog
+            .served(&current.metric, ValidationSurface::QuotaWrite)
+            .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-validate
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-meta-if
         if let Some(metadata) = &patch.metadata {
             // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-meta
-            let request_contract =
-                self.catalog
-                    .request_contract(&current.metric)
-                    .ok_or_else(|| {
-                        self.metrics
-                            .record_admitted_metric_violation(ValidationSurface::Arbitration);
-                        DomainError::InvalidArgument {
-                            field: "metric",
-                            reason: tokens::METRIC_NOT_ADMITTED,
-                        }
-                    })?;
-            // The new object is validated against the contract this process's
-            // catalogue holds, and the accepted reference travels with it so
-            // storage writes both in one row update: a catalogue that moved
-            // since creation moves the stored reference too.
-            let accepted = validate_metadata(
-                metadata,
-                &request_contract.constraint,
-                self.limits.metadata_max_bytes,
+            super::metadata::check(
                 self.metrics,
+                &served,
+                metadata,
+                self.limits.metadata_max_bytes,
             )?;
-            patch.constraint_contract = Some(accepted);
             // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-meta
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-meta-if
@@ -370,6 +367,7 @@ impl<'a> QuotaManagement<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-event
         let now = OffsetDateTime::now_utc();
         let events = [quota_changed(
+            self.admission.actor(),
             current.tenant_id,
             Some(quota_id),
             Some(current.subject.clone()),
@@ -380,7 +378,7 @@ impl<'a> QuotaManagement<'a> {
         Ok(PreparedUpdate {
             patch,
             events: events.to_vec(),
-            kind: classified.descriptor.kind,
+            kind: served.kind(),
             tenant_id: current.tenant_id,
         })
     }
@@ -395,22 +393,18 @@ impl<'a> QuotaManagement<'a> {
     /// storage error.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-deactivate:p1
     #[tracing::instrument(name = "quota_enforcement.quotas.deactivate", skip_all, fields(quota_id = %quota_id))]
-    pub async fn deactivate(
-        &self,
-        ctx: &SecurityContext,
-        quota_id: QuotaId,
-    ) -> Result<DeactivateOutcome, DomainError> {
+    pub async fn deactivate(&self, quota_id: QuotaId) -> Result<DeactivateOutcome, DomainError> {
         let admitted = self
-            .admit_resource(ctx, actions::DEACTIVATE, quota_id)
+            .admit_resource(actions::DEACTIVATE, quota_id)
             .instrument(admission_span(1))
             .await?;
         let (_, events) = self
-            .prepare_deactivate(ctx, &admitted.access_scope, quota_id)
+            .prepare_deactivate(&admitted.access_scope, quota_id)
             .await?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-return
         Ok(self
             .storage
-            .deactivate_quota(ctx, &admitted.access_scope, quota_id, &events)
+            .deactivate_quota(&admitted.actor, &admitted.access_scope, quota_id, &events)
             .await?)
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-deactivate:p1:inst-qde-return
     }
@@ -423,15 +417,15 @@ impl<'a> QuotaManagement<'a> {
     /// [`DomainError::NotFound`] for an unknown or out-of-scope id.
     pub(super) async fn prepare_deactivate(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         quota_id: QuotaId,
     ) -> Result<(TenantId, Vec<NotificationEvent>), DomainError> {
         let current = self
-            .read_one(ctx, scope, quota_id)
+            .read_one(scope, quota_id)
             .await?
             .ok_or_else(|| not_found(quota_id))?;
         let events = vec![quota_changed(
+            self.admission.actor(),
             current.tenant_id,
             Some(quota_id),
             Some(current.subject),
@@ -446,17 +440,14 @@ impl<'a> QuotaManagement<'a> {
     /// # Errors
     ///
     /// The PDP outcome, [`DomainError::NotFound`] for an unknown or
-    /// out-of-scope id, or the registry's availability on a cold cache.
+    /// out-of-scope id, or the registry's availability for a metric the
+    /// catalogue does not hold.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-quota-read:p1
     #[tracing::instrument(name = "quota_enforcement.quotas.get", skip_all, fields(quota_id = %quota_id))]
-    pub async fn get(
-        &self,
-        ctx: &SecurityContext,
-        quota_id: QuotaId,
-    ) -> Result<QuotaView, DomainError> {
+    pub async fn get(&self, quota_id: QuotaId) -> Result<QuotaView, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
         let admitted = self
-            .admit_resource(ctx, actions::GET, quota_id)
+            .admit_resource(actions::GET, quota_id)
             .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
@@ -464,13 +455,13 @@ impl<'a> QuotaManagement<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-deactivated
         // No status filter: a deactivated Quota is read like any other.
         let quota = self
-            .read_one(ctx, &admitted.access_scope, quota_id)
+            .read_one(&admitted.access_scope, quota_id)
             .await?
             .ok_or_else(|| not_found(quota_id))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-deactivated
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-read
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-window
-        let kinds = self.kinds_of(std::slice::from_ref(&quota.metric)).await?;
+        let kinds = self.kinds_of(std::slice::from_ref(&quota.metric)).await;
         let kind = kinds.get(&quota.metric).copied();
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-window
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-return
@@ -483,25 +474,21 @@ impl<'a> QuotaManagement<'a> {
     /// # Errors
     ///
     /// The list-shape violation, the PDP outcome, the storage error, or the
-    /// registry's availability on a cold cache.
+    /// registry's availability for a metric the catalogue does not hold.
     #[tracing::instrument(name = "quota_enforcement.quotas.list", skip_all, fields(tenant_id = tracing::field::Empty))]
     pub async fn list(
         &self,
-        ctx: &SecurityContext,
         request: ListQuotasRequest,
     ) -> Result<PageResult<QuotaView>, DomainError> {
         let (mut filter, page) =
             validate_list(request, &self.limits).map_err(|e| self.shape_rejected(e))?;
-        let target = filter
-            .tenant_id
-            .unwrap_or_else(|| TenantId::new(ctx.subject_tenant_id()));
+        let target = self.target_tenant(filter.tenant_id)?;
         tracing::Span::current().record("tenant_id", tracing::field::display(target));
         // A wider grant must not widen an absent tenant to every tenant it covers.
         filter.tenant_id = Some(target);
         let admitted = self
             .admission
             .admit(
-                ctx,
                 &resources::QUOTA,
                 actions::LIST,
                 AdmissionTarget::tenant(target),
@@ -512,10 +499,10 @@ impl<'a> QuotaManagement<'a> {
         // position only and the scope is re-applied on every page.
         let page = self
             .storage
-            .read_quotas(ctx, &admitted.access_scope, filter, page)
+            .read_quotas(&admitted.access_scope, filter, page)
             .await?;
         let metrics: Vec<MetricId> = page.items.iter().map(|q| q.metric.clone()).collect();
-        let kinds = self.kinds_of(&metrics).await?;
+        let kinds = self.kinds_of(&metrics).await;
         Ok(view_page(page, &kinds, OffsetDateTime::now_utc()))
     }
 
@@ -524,60 +511,60 @@ impl<'a> QuotaManagement<'a> {
     /// tenant is visible at all.
     pub(super) async fn admit_resource(
         &self,
-        ctx: &SecurityContext,
         action: &str,
         quota_id: QuotaId,
     ) -> Result<Admitted, DomainError> {
         self.admission
             .admit(
-                ctx,
                 &resources::QUOTA,
                 action,
-                AdmissionTarget::resource(
-                    TenantId::new(ctx.subject_tenant_id()),
-                    quota_id.as_uuid(),
-                ),
+                AdmissionTarget::resource(self.target_tenant(None)?, quota_id.as_uuid()),
             )
             .await
     }
 
-    /// The metric must be a registered, classified instance of the metric
-    /// base; a stale classification is good enough to admit a write.
-    async fn describe_metric(&self, metric: &MetricId) -> Result<Classified, DomainError> {
-        self.metric_registry.describe(metric).await?.ok_or_else(|| {
-            DomainError::MetricNotRegistered {
-                metric: metric.as_str().to_owned(),
-            }
-        })
+    /// The named tenant, or else the caller's home tenant. Trusted admission
+    /// has no caller tenant, so a target without a tenant is refused there.
+    fn target_tenant(&self, named: Option<TenantId>) -> Result<TenantId, DomainError> {
+        named
+            .or_else(|| self.admission.caller_tenant())
+            .ok_or_else(|| {
+                self.shape_rejected(DomainError::InvalidArgument {
+                    field: "tenant_id",
+                    reason: tokens::TENANT_ID_REQUIRED,
+                })
+            })
     }
 
-    /// The kinds of the distinct metrics of a read. A metric the registry no
-    /// longer knows is logged and left out; the Quota stays readable.
-    async fn kinds_of(
-        &self,
-        metrics: &[MetricId],
-    ) -> Result<HashMap<MetricId, MetricKind>, DomainError> {
+    /// The kinds of the distinct metrics of a read, from their served
+    /// catalogue entries. A metric with no served entry is logged and left
+    /// out; the Quota stays readable.
+    async fn kinds_of(&self, metrics: &[MetricId]) -> HashMap<MetricId, MetricKind> {
+        // `kind` is a display field: a registry outage must not fail the read.
+        let loaded = self
+            .catalog
+            .load(metrics.iter().map(MetricId::as_gts))
+            .await;
         let mut kinds = HashMap::new();
         for metric in metrics {
-            if kinds.contains_key(metric) {
-                continue;
-            }
-            if let Some(classified) = self.metric_registry.describe(metric).await? {
-                kinds.insert(metric.clone(), classified.descriptor.kind);
-            } else {
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    metric = %metric,
-                    "quota references a metric the types registry no longer knows"
-                );
+            if let Some(CatalogEntry::Served(served)) = self.catalog.peek(metric) {
+                kinds.insert(metric.clone(), served.kind());
             }
         }
-        Ok(kinds)
+        // A metric type that is removed or unavailable is reported by the
+        // lifecycle gauges; only the outage is reported here.
+        if let Err(error) = loaded {
+            tracing::warn!(
+                target: LOG_TARGET,
+                error = %error,
+                "a quota read leaves out the kind of the metrics this replica does not hold"
+            );
+        }
+        kinds
     }
 
     pub(super) async fn read_one(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         quota_id: QuotaId,
     ) -> Result<Option<Quota>, DomainError> {
@@ -587,7 +574,7 @@ impl<'a> QuotaManagement<'a> {
         };
         let page = self
             .storage
-            .read_quotas(ctx, scope, filter, PageRequest::first(1))
+            .read_quotas(scope, filter, PageRequest::first(1))
             .await?;
         Ok(page.items.into_iter().next())
     }
@@ -605,7 +592,7 @@ impl<'a> QuotaManagement<'a> {
 /// A create that passed every check before storage.
 #[domain_model]
 pub(super) struct PreparedCreate {
-    /// The draft as storage takes it, constraint contract included.
+    /// The draft as storage takes it.
     pub(super) draft: QuotaDraft,
     /// Its `quota-changed` event; storage fills in the id.
     pub(super) events: Vec<NotificationEvent>,

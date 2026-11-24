@@ -1,84 +1,89 @@
 //! Ingress attribution of a subject-based evaluation request
 //! (`features/projection-contracts.md`, "Evaluation Request Ingress Validation"
-//! and "PDP-Authorized Subject Mapping").
+//! and "Subject Admission").
 //!
-//! Every debit, reserve, preview, and batch item enters here once those
-//! operations exist. The order is fixed and each stage has its own error
-//! class, so precedence is observable: the public shape is checked before the
-//! PDP is called, the PDP authorizes the complete caller-supplied tuple, and
-//! only then does the process-local catalogue map kinds to projections and
-//! validate the metadata envelopes. No registry call happens on this path, and
-//! no failure is ever a `Decision::Denied`.
+//! Every debit, lease acquisition, preview, and batch item enters here. The
+//! order is fixed and each stage has its own error class, so precedence is
+//! observable: the public shape is checked before the PDP is called, the PDP
+//! authorizes the complete caller-supplied tuple, and only then does the
+//! metric catalogue admit the subjects and validate the metric object. A
+//! metric the catalogue holds needs no registry call, and no failure is ever a
+//! `Decision::Denied`.
+
+use std::sync::Arc;
 
 use authz_resolver_sdk::pep::ResourceType;
-use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    AttributionDigest, EvaluationAttribution, MetricId, ResourceProjection, SubjectRef,
-    SubjectScope, TenantId,
+    Actor, AttributionDigest, EvaluationAttribution, MetricId, SubjectClaim, SubjectRef, TenantId,
 };
 use serde_json::{Map, Value, json};
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
+use uuid::Uuid;
 
-use super::admission::{Admission, AdmissionTarget};
-use super::catalog::{CatalogMiss, ProjectionContractCatalog, parse_metric_under_base};
+use super::admission::{AdmissionTarget, Gate};
+use super::catalog::{MetricCatalog, ServedMetric};
 use super::error::DomainError;
 use super::pep::properties;
 use super::ports::metrics::{DenialReason, QeMetrics, ValidationReason, ValidationSurface};
+use super::quotas::validation::{METRIC_ID_MAX_LEN, SUBJECT_ID_MAX_LEN, SUBJECTS_MAX};
 use super::tokens;
 
 const LOG_TARGET: &str = "qe.attribution";
 
-/// What a Policy expression may see: `{request, resource}`; `arbitration` is
-/// added per Quota inside the evaluation transaction. Attribution and the
-/// authenticated principal are kept out by construction.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PolicyInput {
-    /// The validated operation-level metadata object.
-    pub request: Map<String, Value>,
-    /// The validated optional resource projection.
-    pub resource: Option<ResourceProjection>,
-}
-
-/// The authorized, catalogue-mapped attribution of one request.
+/// The admitted attribution of one request.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MappedAttribution {
-    /// The PDP-authorized target tenant.
+    /// The admitted target tenant.
     pub tenant_id: TenantId,
-    /// The complete `(projection_type, subject_id)` set: the tenant-scope
-    /// subject materialized from `tenant_id` first, then the mapped claims.
+    /// The complete subject set: the tenant subject first, then the other
+    /// named subjects ordered by type.
     pub subjects: Vec<SubjectRef>,
-    /// The `AccessScope` exactly as the PDP returned it.
+    /// The scope exactly as admission returned it.
     pub access_scope: AccessScope,
+    /// The cause of the operation, as admission returned it.
+    pub actor: Actor,
 }
 
 /// A request that passed ingress: what the evaluation pipeline consumes.
 #[domain_model]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AdmittedEvaluation {
     /// Who and what is being charged.
     pub attribution: MappedAttribution,
-    /// The admitted metric.
-    pub metric: MetricId,
-    /// The Policy-visible input.
-    pub input: PolicyInput,
-    /// Digest of exactly what the PDP authorized: metric, mapped subjects, and
-    /// the resource document. A debit records it so that a later rollback can
-    /// prove it reverses an operation it was itself admitted for; the
-    /// idempotency scope covers tenant and subjects, but neither the metric nor
-    /// the resource.
+    /// The served catalogue entry of the request's metric type.
+    pub metric: Arc<ServedMetric>,
+    /// The `id` of the request's metric object.
+    pub metric_id: Option<String>,
+    /// The validated `metadata` of the metric object: what a Policy reads as
+    /// `request`.
+    pub request: Map<String, Value>,
+    /// The attribution digest of what the PDP authorized: the tenant, the
+    /// subjects, and the metric type and id. The charge of a debit keeps it,
+    /// so that a later rollback can prove it names an operation it was itself
+    /// admitted for.
     pub authorized: AttributionDigest,
 }
 
-/// The ingress step over the PEP boundary and the published catalogue.
+/// A rollback's attribution after admission. It names an existing charge, so
+/// it makes no catalogue check.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdmittedReversal {
+    /// Who the reversed operation charged.
+    pub attribution: MappedAttribution,
+    /// As [`AdmittedEvaluation::authorized`].
+    pub authorized: AttributionDigest,
+}
+
+/// The ingress step over the PEP boundary and the metric catalogue.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-ingress-validation:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-subject-resolution:p1
 #[domain_model]
 pub struct Attribution<'a> {
-    admission: &'a Admission,
-    catalog: &'a ProjectionContractCatalog,
+    admission: &'a Gate<'a>,
+    catalog: &'a MetricCatalog,
     metrics: &'a dyn QeMetrics,
 }
 
@@ -86,23 +91,17 @@ pub struct Attribution<'a> {
 struct Shaped {
     tenant_id: TenantId,
     metric: MetricId,
-    claims: Vec<(SubjectScope, String)>,
-    metadata: Map<String, Value>,
-    resource: Option<ShapedResource>,
-}
-
-struct ShapedResource {
-    type_id: GtsTypeId,
-    projection: ResourceProjection,
-    metadata: Map<String, Value>,
+    metric_id: Option<String>,
+    subjects: Vec<SubjectRef>,
+    metadata: Option<Map<String, Value>>,
 }
 
 impl<'a> Attribution<'a> {
-    /// The step over `admission` and the published `catalog`.
+    /// The step over `admission` and `catalog`.
     #[must_use]
     pub fn new(
-        admission: &'a Admission,
-        catalog: &'a ProjectionContractCatalog,
+        admission: &'a Gate<'a>,
+        catalog: &'a MetricCatalog,
         metrics: &'a dyn QeMetrics,
     ) -> Self {
         Self {
@@ -117,22 +116,22 @@ impl<'a> Attribution<'a> {
     /// # Errors
     ///
     /// - [`DomainError::InvalidArgument`] with a closed reason token on a
-    ///   malformed public shape (before the PDP), on an unknown or unadmitted
-    ///   kind, or on a contract violation (after the PDP).
+    ///   malformed public shape (before the PDP), on a subject type the metric
+    ///   does not admit, or on a metric object that does not fit its type.
     /// - [`DomainError::PdpDenied`] / [`DomainError::PdpUnavailable`] from the
     ///   PDP, before any catalogue lookup.
+    /// - The catalogue's errors for the metric type and the subject types.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-ingress-validation:p1
     // @cpt-algo:cpt-cf-quota-enforcement-algo-subject-resolution:p1
     pub async fn admit_evaluation(
         &self,
-        ctx: &SecurityContext,
         resource_type: &ResourceType,
         action: &str,
         attribution: EvaluationAttribution,
     ) -> Result<AdmittedEvaluation, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-request
         let site = Site {
-            ctx,
+            actor: self.admission.actor(),
             resource: resource_type.name(),
             action,
         };
@@ -141,110 +140,117 @@ impl<'a> Attribution<'a> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-shape
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-shape
         let shaped = self.shape(&site, attribution)?;
+        let Some(metadata) = shaped.metadata.clone().map(canonical) else {
+            return Err(self.record_shape(
+                &site,
+                "metric.metadata",
+                tokens::METADATA_REQUIRED,
+                "",
+                ValidationReason::MetadataMissing,
+            ));
+        };
         // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-shape
         // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-shape
 
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-authz
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
-        let pdp_properties = shaped.pdp_properties();
-        let admitted = self
-            .admission
-            .admit_with_properties(
-                ctx,
-                resource_type,
-                action,
-                AdmissionTarget::tenant(shaped.tenant_id),
-                pdp_properties.clone(),
-            )
-            .await?;
-        // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
-        // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-authz
+        let (attribution, authorized) = self.authorize(resource_type, action, &shaped).await?;
+        let Shaped {
+            metric, metric_id, ..
+        } = shaped;
 
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-lookup
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-tenant
+        let mut served = self
+            .catalog
+            .served(&metric, ValidationSurface::RequestMetric)
+            .await?;
+
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-each
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-map
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-append
-        let mut subjects = Vec::with_capacity(shaped.claims.len() + 1);
-        let tenant_projection = self.map_kind(
-            &site,
-            &shaped.metric,
-            &SubjectScope::tenant(),
-            "tenant_id",
-            tokens::METRIC_NOT_ADMITTED,
-        )?;
-        subjects.push(SubjectRef {
-            projection_type: tenant_projection,
-            subject_id: shaped.tenant_id.to_string(),
-        });
-        for (scope, id) in &shaped.claims {
-            let projection = self.map_kind(
-                &site,
-                &shaped.metric,
-                scope,
-                "subjects",
-                tokens::SUBJECT_KIND_NOT_ADMITTED,
-            )?;
-            subjects.push(SubjectRef {
-                projection_type: projection,
-                subject_id: id.clone(),
-            });
+        let admitted = |served: &ServedMetric| {
+            for subject in &attribution.subjects {
+                // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-map
+                // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric-if
+                // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric
+                // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid-if
+                // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid
+                if !served.admits(&subject.subject_type) {
+                    self.metrics
+                        .record_admitted_metric_violation(ValidationSurface::RequestSubject);
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        actor = %site.actor,
+                        resource = site.resource,
+                        action = site.action,
+                        metric = %metric,
+                        subject_type = %subject.subject_type,
+                        "the metric type does not admit the subject type"
+                    );
+                    return Err(DomainError::InvalidArgument {
+                        field: "subjects",
+                        reason: tokens::METRIC_NOT_ADMITTED,
+                    });
+                }
+                // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid
+                // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid-if
+                // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric
+                // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric-if
+                // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-map
+            }
+            Ok(())
+        };
+        admitted(&served)?;
+        let registered = attribution
+            .subjects
+            .iter()
+            .filter(|subject| !subject.is_tenant());
+        self.catalog
+            .load(registered.clone().map(|subject| &subject.subject_type))
+            .await?;
+        for subject in registered {
+            self.catalog
+                .check_subject(subject, ValidationSurface::RequestSubject)
+                .await?;
         }
-        // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-append
-        // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-map
         // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-each
-        // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-tenant
-        // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-lookup
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metadata
-        let request_contract = self
-            .catalog
-            .request_contract(&shaped.metric)
-            .ok_or_else(|| {
-                // Every admitted metric has a request contract.
-                self.metrics
-                    .record_admitted_metric_violation(ValidationSurface::RequestSubject);
-                DomainError::InvalidArgument {
-                    field: "metric",
-                    reason: tokens::METRIC_NOT_ADMITTED,
-                }
-            })?;
-        let envelope = json!({
-            "type": request_contract.type_id.as_ref(),
-            "metadata": Value::Object(shaped.metadata.clone()),
-        });
-        self.validate_envelope(
-            &site,
-            ValidationSurface::RequestSubject,
-            "metadata",
-            &request_contract.contract,
-            &envelope,
-        )?;
-        let resource = match shaped.resource {
-            None => None,
-            Some(shaped_resource) => Some(self.validate_resource(&site, shaped_resource)?),
-        };
+        let document = metric_document(&metric, metric_id.as_deref(), Some(&metadata));
+        let mut fit = served.validate(&document);
+        // The owner may have revised the type since the last scheduled read.
+        if fit.is_err()
+            && let Some(revised) = self.catalog.reread(&metric).await
+        {
+            served = revised;
+            admitted(&served)?;
+            fit = served.validate(&document);
+        }
+        fit.map_err(|violations| {
+            self.metrics.record_contract_validation_failure(
+                ValidationSurface::RequestMetric,
+                ValidationReason::SchemaViolation,
+            );
+            tracing::warn!(
+                target: LOG_TARGET,
+                actor = %site.actor,
+                resource = site.resource,
+                action = site.action,
+                metric = %metric,
+                ?violations,
+                "the metric object does not fit its metric type"
+            );
+            DomainError::InvalidArgument {
+                field: "metric",
+                reason: tokens::CONTRACT_VIOLATION,
+            }
+        })?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metadata
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-map
         // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-forward
         // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-return
         // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
-        // Bind rollback authorization to the catalogue-mapped document seen by
-        // the PDP, including resource metadata.
-        let authorized = AttributionDigest::of_canonical(&pdp_properties)
-            .map_err(|error| DomainError::Internal(error.to_string()))?;
         Ok(AdmittedEvaluation {
-            attribution: MappedAttribution {
-                tenant_id: shaped.tenant_id,
-                subjects,
-                access_scope: admitted.access_scope,
-            },
-            metric: shaped.metric,
-            input: PolicyInput {
-                request: shaped.metadata,
-                resource,
-            },
+            attribution,
+            metric: served,
+            metric_id,
+            request: metadata,
             authorized,
         })
         // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-return
@@ -253,209 +259,185 @@ impl<'a> Attribution<'a> {
         // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-map
     }
 
+    /// Admit the attribution of an operation a rollback reverses: the public
+    /// shape and the PDP, with no catalogue check and no `metadata`.
+    ///
+    /// # Errors
+    ///
+    /// As the shape and PDP stages of [`Self::admit_evaluation`].
+    pub async fn admit_reversal(
+        &self,
+        resource_type: &ResourceType,
+        action: &str,
+        attribution: EvaluationAttribution,
+    ) -> Result<AdmittedReversal, DomainError> {
+        let site = Site {
+            actor: self.admission.actor(),
+            resource: resource_type.name(),
+            action,
+        };
+        let shaped = self.shape(&site, attribution)?;
+        let (attribution, authorized) = self.authorize(resource_type, action, &shaped).await?;
+        Ok(AdmittedReversal {
+            attribution,
+            authorized,
+        })
+    }
+
+    /// The admission stage: admit the complete tuple, then digest what was
+    /// admitted.
+    async fn authorize(
+        &self,
+        resource_type: &ResourceType,
+        action: &str,
+        shaped: &Shaped,
+    ) -> Result<(MappedAttribution, AttributionDigest), DomainError> {
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-authz
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
+        let pdp_properties = shaped.pdp_properties();
+        let admitted = self
+            .admission
+            .admit_with_properties(
+                resource_type,
+                action,
+                AdmissionTarget::tenant(shaped.tenant_id),
+                pdp_properties,
+            )
+            .await?;
+        // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-authz
+        // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-authz
+        let authorized = AttributionDigest::of(
+            shaped.tenant_id,
+            &shaped.subjects,
+            &shaped.metric,
+            shaped.metric_id.as_deref(),
+        );
+        Ok((
+            MappedAttribution {
+                tenant_id: shaped.tenant_id,
+                subjects: shaped.subjects.clone(),
+                access_scope: admitted.access_scope,
+                actor: admitted.actor,
+            },
+            authorized,
+        ))
+    }
+
     /// Stage 1: the public request shape, before any PDP call.
     fn shape(
         &self,
         site: &Site<'_>,
         attribution: EvaluationAttribution,
     ) -> Result<Shaped, DomainError> {
-        if attribution.tenant_id.as_uuid().is_nil() {
+        let tenant_id = attribution.tenant_id;
+        if tenant_id.as_uuid().is_nil() {
             return Err(self.reject_shape(site, "tenant_id", tokens::TENANT_ID_REQUIRED, ""));
         }
-        let metric = parse_metric_under_base(&attribution.metric).ok_or_else(|| {
-            self.reject_shape(site, "metric", tokens::METRIC_INVALID, &attribution.metric)
+        let metric_ref = attribution.metric;
+        let metric = MetricCatalog::parse_metric(&metric_ref.metric_type).ok_or_else(|| {
+            self.reject_shape(
+                site,
+                "metric.type",
+                tokens::METRIC_INVALID,
+                &metric_ref.metric_type,
+            )
         })?;
+        if metric_ref.id.as_deref().is_some_and(str::is_empty) {
+            return Err(self.reject_shape(site, "metric.id", tokens::METRIC_ID_INVALID, ""));
+        }
+        if metric_ref
+            .id
+            .as_deref()
+            .is_some_and(|id| id.chars().count() > METRIC_ID_MAX_LEN)
+        {
+            return Err(self.reject_shape(site, "metric.id", tokens::METRIC_ID_TOO_LONG, ""));
+        }
+        let subjects = self.shape_subjects(site, tenant_id, &attribution.subjects)?;
+        Ok(Shaped {
+            tenant_id,
+            metric,
+            metric_id: metric_ref.id,
+            subjects,
+            metadata: metric_ref.metadata,
+        })
+    }
 
-        let mut claims = Vec::with_capacity(attribution.subjects.len());
-        for claim in &attribution.subjects {
+    /// The subject set: at least one named subject, no two of one type, a
+    /// tenant-type subject only for the request's tenant. The tenant subject
+    /// comes first, whether named or not.
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-tenant
+    fn shape_subjects(
+        &self,
+        site: &Site<'_>,
+        tenant_id: TenantId,
+        claims: &[SubjectClaim],
+    ) -> Result<Vec<SubjectRef>, DomainError> {
+        if claims.is_empty() {
+            return Err(self.reject_shape(site, "subjects", tokens::SUBJECTS_REQUIRED, ""));
+        }
+        if claims.len() > SUBJECTS_MAX {
+            return Err(self.reject_shape(site, "subjects", tokens::SUBJECTS_TOO_MANY, ""));
+        }
+        let mut subjects = vec![SubjectRef::tenant(tenant_id)];
+        let mut named = Vec::with_capacity(claims.len());
+        for claim in claims {
             if claim.id.trim().is_empty() {
                 return Err(self.reject_shape(
                     site,
                     "subjects",
                     tokens::SUBJECT_ID_REQUIRED,
-                    &claim.kind,
+                    &claim.subject_type,
                 ));
             }
-            let scope = SubjectScope::parse(&claim.kind).map_err(|_| {
-                self.reject_shape(site, "subjects", tokens::SUBJECT_KIND_INVALID, &claim.kind)
-            })?;
-            if scope.is_tenant() {
+            if claim.id.chars().count() > SUBJECT_ID_MAX_LEN {
                 return Err(self.reject_shape(
                     site,
                     "subjects",
-                    tokens::TENANT_SCOPE_REPEATED,
-                    &claim.kind,
+                    tokens::SUBJECT_ID_TOO_LONG,
+                    &claim.subject_type,
                 ));
             }
-            if claims.iter().any(|(seen, _)| *seen == scope) {
-                return Err(self.reject_shape(
-                    site,
-                    "subjects",
-                    tokens::SUBJECT_KIND_DUPLICATE,
-                    &claim.kind,
-                ));
-            }
-            claims.push((scope, claim.id.clone()));
-        }
-
-        // Required on the wire, `{}` included; never defaulted.
-        let Some(metadata) = attribution.metadata else {
-            return Err(self.reject_missing(site, "metadata", tokens::METADATA_REQUIRED));
-        };
-
-        let resource = match attribution.resource {
-            None => None,
-            Some(projection) => {
-                let type_id = GtsTypeId::try_new(&projection.r#type).map_err(|_| {
+            let subject_type =
+                MetricCatalog::parse_subject_type(&claim.subject_type).ok_or_else(|| {
                     self.reject_shape(
                         site,
-                        "resource.type",
-                        tokens::RESOURCE_TYPE_INVALID,
-                        &projection.r#type,
+                        "subjects",
+                        tokens::SUBJECT_TYPE_INVALID,
+                        &claim.subject_type,
                     )
                 })?;
-                let Some(metadata) = projection.metadata.clone() else {
-                    return Err(self.reject_missing(
+            if named.contains(&subject_type) {
+                return Err(self.reject_shape(
+                    site,
+                    "subjects",
+                    tokens::SUBJECT_TYPE_DUPLICATE,
+                    &claim.subject_type,
+                ));
+            }
+            named.push(subject_type.clone());
+            let subject = SubjectRef {
+                subject_type,
+                subject_id: claim.id.clone(),
+            };
+            if subject.is_tenant() {
+                if Uuid::parse_str(&claim.id).ok() != Some(tenant_id.as_uuid()) {
+                    return Err(self.reject_shape(
                         site,
-                        "resource.metadata",
-                        tokens::RESOURCE_METADATA_REQUIRED,
+                        "subjects",
+                        tokens::TENANT_SUBJECT_MISMATCH,
+                        &claim.subject_type,
                     ));
-                };
-                Some(ShapedResource {
-                    type_id,
-                    projection,
-                    metadata,
-                })
+                }
+                continue;
             }
-        };
-
-        Ok(Shaped {
-            tenant_id: attribution.tenant_id,
-            metric,
-            claims,
-            metadata,
-            resource,
-        })
-    }
-
-    /// Stage 3a: `(metric, kind)` through the catalogue's unique index.
-    fn map_kind(
-        &self,
-        site: &Site<'_>,
-        metric: &MetricId,
-        scope: &SubjectScope,
-        field: &'static str,
-        reason: &'static str,
-    ) -> Result<GtsTypeId, DomainError> {
-        match self.catalog.map_subject(metric, scope) {
-            Ok(projection) => Ok(projection.clone()),
-            // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric-if
-            // @cpt-begin:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric
-            // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid-if
-            // @cpt-begin:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid
-            Err(miss) => {
-                self.metrics
-                    .record_admitted_metric_violation(ValidationSurface::RequestSubject);
-                let reason = match miss {
-                    CatalogMiss::MetricNotAdmitted => tokens::METRIC_NOT_ADMITTED,
-                    CatalogMiss::KindUnknown | CatalogMiss::KindNotAdmitted => reason,
-                };
-                let field = if miss == CatalogMiss::MetricNotAdmitted {
-                    "metric"
-                } else {
-                    field
-                };
-                tracing::warn!(
-                    target: LOG_TARGET,
-                    subject_id = %site.ctx.subject_id(),
-                    resource = site.resource,
-                    action = site.action,
-                    metric = %metric,
-                    scope = %scope,
-                    ?miss,
-                    "no configured projection admits the metric at this scope"
-                );
-                Err(DomainError::InvalidArgument { field, reason })
-            } // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid
-              // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-invalid-if
-              // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric
-              // @cpt-end:cpt-cf-quota-enforcement-flow-ingress-validation:p1:inst-ing-metric-if
+            subjects.push(subject);
         }
+        subjects[1..].sort_by(|a, b| a.subject_type.as_ref().cmp(b.subject_type.as_ref()));
+        Ok(subjects)
     }
+    // @cpt-end:cpt-cf-quota-enforcement-algo-subject-resolution:p1:inst-res-tenant
 
-    /// Stage 3b: the resource projection against its configured contract.
-    fn validate_resource(
-        &self,
-        site: &Site<'_>,
-        resource: ShapedResource,
-    ) -> Result<ResourceProjection, DomainError> {
-        let Some(contract) = self.catalog.resource_projection(&resource.type_id) else {
-            self.metrics.record_contract_validation_failure(
-                ValidationSurface::RequestResource,
-                ValidationReason::ProjectionNotResolvable,
-            );
-            tracing::warn!(
-                target: LOG_TARGET,
-                subject_id = %site.ctx.subject_id(),
-                resource_type = %resource.type_id,
-                "the resource projection is not in the configured catalogue"
-            );
-            return Err(DomainError::InvalidArgument {
-                field: "resource.type",
-                reason: tokens::RESOURCE_TYPE_UNKNOWN,
-            });
-        };
-        // Preserve an omitted resource id instead of serializing it as `null`.
-        let mut document = Map::new();
-        document.insert(
-            "type".to_owned(),
-            Value::String(resource.type_id.as_ref().to_owned()),
-        );
-        if let Some(id) = &resource.projection.id {
-            document.insert("id".to_owned(), Value::String(id.clone()));
-        }
-        document.insert("metadata".to_owned(), Value::Object(resource.metadata));
-        self.validate_envelope(
-            site,
-            ValidationSurface::RequestResource,
-            "resource",
-            &contract.contract,
-            &Value::Object(document),
-        )?;
-        Ok(resource.projection)
-    }
-
-    /// Validate `document` against `contract`, recording and logging a violation.
-    fn validate_envelope(
-        &self,
-        site: &Site<'_>,
-        surface: ValidationSurface,
-        field: &'static str,
-        contract: &super::catalog::CompiledContract,
-        document: &Value,
-    ) -> Result<(), DomainError> {
-        contract.validate(document).map_err(|violations| {
-            self.metrics
-                .record_contract_validation_failure(surface, ValidationReason::SchemaViolation);
-            tracing::warn!(
-                target: LOG_TARGET,
-                subject_id = %site.ctx.subject_id(),
-                resource = site.resource,
-                action = site.action,
-                contract = %contract.type_id(),
-                field,
-                violations = ?violations,
-                "contract violation at ingress"
-            );
-            DomainError::InvalidArgument {
-                field,
-                reason: tokens::CONTRACT_VIOLATION,
-            }
-        })
-    }
-
-    /// A malformed public shape: a denial before the PDP, recorded on both
-    /// the denial counter and the caller-attribution validation surface.
+    /// A malformed public shape: a denial before the PDP.
     fn reject_shape(
         &self,
         site: &Site<'_>,
@@ -472,16 +454,6 @@ impl<'a> Attribution<'a> {
         )
     }
 
-    /// Reject an absent required object before the PDP.
-    fn reject_missing(
-        &self,
-        site: &Site<'_>,
-        field: &'static str,
-        reason: &'static str,
-    ) -> DomainError {
-        self.record_shape(site, field, reason, "", ValidationReason::MetadataMissing)
-    }
-
     /// Record, log and build a malformed-attribution rejection.
     fn record_shape(
         &self,
@@ -496,7 +468,7 @@ impl<'a> Attribution<'a> {
             .record_contract_validation_failure(ValidationSurface::CallerAttribution, validation);
         tracing::warn!(
             target: LOG_TARGET,
-            subject_id = %site.ctx.subject_id(),
+            actor = %site.actor,
             resource = site.resource,
             action = site.action,
             field,
@@ -515,39 +487,84 @@ impl Shaped {
         let mut properties = Map::new();
         properties.insert(
             properties::METRIC.to_owned(),
-            Value::String(self.metric.as_gts().as_ref().to_owned()),
+            Value::String(self.metric.as_str().to_owned()),
         );
+        if let Some(id) = &self.metric_id {
+            properties.insert(properties::METRIC_ID.to_owned(), Value::String(id.clone()));
+        }
         properties.insert(
             properties::SUBJECTS.to_owned(),
             Value::Array(
-                self.claims
+                self.subjects
                     .iter()
-                    .map(|(scope, id)| json!({ "kind": scope.as_str(), "id": id }))
+                    .map(|subject| json!({ "type": subject.subject_type.as_ref(), "id": subject.subject_id }))
                     .collect(),
             ),
         );
-        if let Some(resource) = &self.resource {
-            let mut document = Map::new();
-            document.insert(
-                "type".to_owned(),
-                Value::String(resource.type_id.as_ref().to_owned()),
-            );
-            if let Some(id) = &resource.projection.id {
-                document.insert("id".to_owned(), Value::String(id.clone()));
-            }
-            document.insert(
-                "metadata".to_owned(),
-                Value::Object(resource.metadata.clone()),
-            );
-            properties.insert(properties::RESOURCE.to_owned(), Value::Object(document));
-        }
         properties
     }
 }
 
+/// The canonical form of a request's `metadata`: a number with no fractional
+/// part is an integer, however it was written. JSON Schema already reads `5.0`
+/// as the integer 5; this makes the value itself say so, for the conditions of
+/// a Quota, for a Policy, and for the request fingerprint.
+pub(crate) fn canonical(mut metadata: Map<String, Value>) -> Map<String, Value> {
+    fn settle(value: &mut Value) {
+        match value {
+            Value::Number(number) if number.is_f64() => {
+                if let Some(integer) = number.as_f64().and_then(integral) {
+                    *number = integer;
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(settle),
+            Value::Object(fields) => fields.values_mut().for_each(settle),
+            _ => {}
+        }
+    }
+    metadata.values_mut().for_each(settle);
+    metadata
+}
+
+/// `float` as an integer, when it has no fractional part and fits one.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn integral(float: f64) -> Option<serde_json::Number> {
+    if float.fract() != 0.0 {
+        return None;
+    }
+    if float >= i64::MIN as f64 && float < i64::MAX as f64 {
+        Some((float as i64).into())
+    } else if float >= 0.0 && float < u64::MAX as f64 {
+        Some((float as u64).into())
+    } else {
+        None
+    }
+}
+
+/// The whole metric object as its metric type's schema validates it.
+pub(crate) fn metric_document(
+    metric: &MetricId,
+    id: Option<&str>,
+    metadata: Option<&Map<String, Value>>,
+) -> Value {
+    let mut document = Map::new();
+    document.insert("type".to_owned(), Value::String(metric.as_str().to_owned()));
+    if let Some(id) = id {
+        document.insert("id".to_owned(), Value::String(id.to_owned()));
+    }
+    if let Some(metadata) = metadata {
+        document.insert("metadata".to_owned(), Value::Object(metadata.clone()));
+    }
+    Value::Object(document)
+}
+
 /// Log context of one ingress call.
 struct Site<'c> {
-    ctx: &'c SecurityContext,
+    actor: Actor,
     resource: &'c str,
     action: &'c str,
 }

@@ -10,12 +10,14 @@
 //! replica's refresh published into a [`LifecycleGaugeCell`]; a callback never
 //! computes anything and observes nothing while no sample is published. The
 //! `lease_unreclaimed_expired` gauge reads the lease sweeper's
-//! [`LeaseBacklogCell`] the same way.
+//! [`LeaseBacklogCell`] the same way, and the two held-allocation-charge
+//! gauges the retention sweeper's [`ChargeBacklogCell`].
 //!
 //! The lease instruments carry a `metric` label whose values are
 //! [`MetricLabel`]s: the metrics the catalogue admitted at bootstrap.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 use opentelemetry::{KeyValue, StringValue};
@@ -23,14 +25,17 @@ use opentelemetry::{KeyValue, StringValue};
 use crate::config::MetricsConfig;
 use crate::domain::ports::lifecycle_gauges::LifecycleCounts;
 use crate::domain::ports::metrics::{
-    DenialReason, EngineLabel, METRIC_LABEL, MetricLabel, OperationKind, PolicyTransition,
-    QeMetrics, REASON_LABEL, RetentionTable, SURFACE_LABEL, SinkLabel, ValidationReason,
-    ValidationSurface,
+    CatalogReadPhase, DenialReason, EngineLabel, METRIC_LABEL, MetricLabel, OperationKind,
+    PolicyTransition, QeMetrics, REASON_LABEL, RetentionTable, SURFACE_LABEL, SinkLabel,
+    ValidationReason, ValidationSurface,
+};
+use crate::infra::charge_backlog::{
+    ALLOCATION_CHARGE_MAX_AGE_SECONDS, ALLOCATION_CHARGES_PAST_REPLAY_WINDOW, ChargeBacklogCell,
 };
 use crate::infra::lease_backlog::{LEASE_UNRECLAIMED_EXPIRED, LeaseBacklogCell};
 use crate::infra::lifecycle_gauges::{
     LifecycleGaugeCell, QUOTA_CAP_UNBOUNDED_TOTAL, QUOTA_CAP_ZERO_TOTAL,
-    QUOTA_FOR_DIRECT_METRIC_TOTAL,
+    QUOTA_CONDITIONS_UNFIT_TOTAL, QUOTA_FOR_DIRECT_METRIC_TOTAL,
 };
 
 /// Catalogue name of the admission-denial counter.
@@ -39,7 +44,7 @@ pub const DENIAL_TOTAL: &str = "denial_total";
 /// Catalogue name of the contract-validation failure counter.
 pub const CONTRACT_VALIDATION_FAILURES_TOTAL: &str = "contract_validation_failures_total";
 
-/// Catalogue name of the projection/metric incompatibility counter.
+/// Catalogue name of the counter of subject types a metric does not admit.
 pub const ADMITTED_METRIC_VIOLATIONS_TOTAL: &str = "admitted_metric_violations_total";
 
 /// Catalogue name of the hot-path latency histogram.
@@ -60,6 +65,9 @@ pub const LEASE_ACQUISITION_WAIT_SECONDS: &str = "lease_acquisition_wait_seconds
 /// Catalogue name of the lease contention-rejection counter.
 pub const LEASE_CONTENTION_REJECTED_TOTAL: &str = "lease_contention_rejected_total";
 
+/// Catalogue name of the per-operation contention-rejection counter.
+pub const CONTENTION_REJECTED_TOTAL: &str = "contention_rejected_total";
+
 /// Catalogue name of the lease cap-rejection counter.
 pub const LEASE_INFLIGHT_LIMIT_EXCEEDED_TOTAL: &str = "lease_inflight_limit_exceeded_total";
 
@@ -68,6 +76,23 @@ pub const NOTIFICATION_DISPATCH_FAILURES_TOTAL: &str = "notification_dispatch_fa
 
 /// Catalogue name of the handler rejection counter.
 pub const OUTBOX_REJECTIONS_TOTAL: &str = "outbox_rejections_total";
+
+/// Catalogue name of the counter of Policies that cannot evaluate a request.
+pub const POLICY_EVALUATION_FAILURES_TOTAL: &str = "policy_evaluation_failures_total";
+
+/// Catalogue name of the counter of failed registry reads.
+pub const CATALOG_READ_FAILURES_TOTAL: &str = "catalog_read_failures_total";
+
+/// Catalogue name of the time of the last scheduled catalogue read that
+/// succeeded.
+pub const CATALOG_LAST_SCHEDULED_READ_TIMESTAMP_SECONDS: &str =
+    "catalog_last_scheduled_read_timestamp_seconds";
+
+/// Catalogue name of the number of unavailable catalogue entries.
+pub const CATALOG_UNAVAILABLE_METRICS: &str = "catalog_unavailable_metrics";
+
+/// Label carrying a closed catalogue read phase.
+pub const PHASE_LABEL: &str = "phase";
 
 /// Label carrying the id of a sink resolved at bootstrap.
 pub const SINK_ID_LABEL: &str = "sink_id";
@@ -112,13 +137,23 @@ pub struct QeMetricsMeter {
     retention_failures: Counter<u64>,
     lease_acquisition_wait: Histogram<f64>,
     lease_contention_rejected: Counter<u64>,
+    contention_rejected: Counter<u64>,
     lease_inflight_limit_exceeded: Counter<u64>,
     notification_dispatch_failures: Counter<u64>,
     outbox_rejections: Counter<u64>,
+    policy_evaluation_failures: Counter<u64>,
+    catalog_read_failures: Counter<u64>,
+    /// Unix seconds of the last scheduled read that succeeded; 0 before one.
+    catalog_last_read: Arc<AtomicU64>,
+    catalog_unavailable: Arc<AtomicU64>,
+    /// Held so the catalogue gauges stay registered.
+    _catalog_gauges: [ObservableGauge<u64>; 2],
     /// Held so the observable gauges stay registered for the meter's life.
-    _lifecycle_gauges: [ObservableGauge<u64>; 3],
+    _lifecycle_gauges: [ObservableGauge<u64>; 4],
     /// Held for the same reason.
     _lease_backlog: ObservableGauge<u64>,
+    /// Held for the same reason.
+    _charge_backlog: [ObservableGauge<u64>; 2],
 }
 
 // @cpt-algo:cpt-cf-quota-enforcement-algo-telemetry-emission:p1
@@ -128,17 +163,19 @@ impl QeMetricsMeter {
     /// the lease backlog gauge observes a cell of its own that nothing feeds.
     #[must_use]
     pub fn new(meter: &Meter, config: &MetricsConfig, gauges: Arc<LifecycleGaugeCell>) -> Self {
-        Self::with_lease_backlog(meter, config, gauges, Arc::default())
+        Self::with_backlogs(meter, config, gauges, Arc::default(), Arc::default())
     }
 
     /// [`Self::new`], with the lease backlog gauge observing `backlog`, the
-    /// cell the elected lease sweeper publishes to.
+    /// cell the elected lease sweeper publishes to, and the held-charge
+    /// gauges observing `charges`, the retention sweeper's.
     #[must_use]
-    pub fn with_lease_backlog(
+    pub fn with_backlogs(
         meter: &Meter,
         config: &MetricsConfig,
         gauges: Arc<LifecycleGaugeCell>,
         backlog: Arc<LeaseBacklogCell>,
+        charges: Arc<ChargeBacklogCell>,
     ) -> Self {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-telemetry-emission:p1:inst-tel-closed
         // Only PRD 5.16 catalogue instruments are declared here.
@@ -152,7 +189,7 @@ impl QeMetricsMeter {
             .build();
         let admitted_metric_violations = meter
             .u64_counter(config.instrument_name(ADMITTED_METRIC_VIOLATIONS_TOTAL))
-            .with_description("Projection/metric incompatibilities by closed validation surface")
+            .with_description("Subject types a metric does not admit, by closed validation surface")
             .build();
         let evaluation_seconds = meter
             .f64_histogram(config.instrument_name(EVALUATION_SECONDS))
@@ -171,32 +208,7 @@ impl QeMetricsMeter {
             .u64_counter(config.instrument_name(RETENTION_SWEEP_FAILURES_TOTAL))
             .with_description("Retention sweeps that failed, by table")
             .build();
-        // Label-free gauges over the published sample. Each callback reads the
-        // cell and observes only when a sample is published: a withdrawn
-        // sample (stale, not leader) yields no data point rather than zero.
-        let lifecycle_gauges = [
-            lifecycle_gauge(
-                meter,
-                &config.instrument_name(QUOTA_CAP_ZERO_TOTAL),
-                "Active cap = 0 Quotas",
-                gauges.clone(),
-                |c| c.cap_zero,
-            ),
-            lifecycle_gauge(
-                meter,
-                &config.instrument_name(QUOTA_CAP_UNBOUNDED_TOTAL),
-                "Active unbounded-cap Quotas",
-                gauges.clone(),
-                |c| c.cap_unbounded,
-            ),
-            lifecycle_gauge(
-                meter,
-                &config.instrument_name(QUOTA_FOR_DIRECT_METRIC_TOTAL),
-                "Active Quotas declared on metrics currently classified Direct",
-                gauges,
-                |c| c.for_direct_metric,
-            ),
-        ];
+        let lifecycle_gauges = lifecycle_gauges(meter, config, gauges);
         let lease_acquisition_wait = meter
             .f64_histogram(config.instrument_name(LEASE_ACQUISITION_WAIT_SECONDS))
             .with_description("Lease acquisition latency, lock wait included, by metric")
@@ -205,7 +217,9 @@ impl QeMetricsMeter {
             .build();
         let lease_contention_rejected = meter
             .u64_counter(config.instrument_name(LEASE_CONTENTION_REJECTED_TOTAL))
-            .with_description("Lease operations refused on the contention timeout, by metric")
+            .with_description(
+                "Debits and lease acquisitions refused on the contention timeout, by metric",
+            )
             .build();
         let lease_inflight_limit_exceeded = meter
             .u64_counter(config.instrument_name(LEASE_INFLIGHT_LIMIT_EXCEEDED_TOTAL))
@@ -230,6 +244,61 @@ impl QeMetricsMeter {
                 }
             })
             .build();
+        let held = Arc::clone(&charges);
+        let charge_backlog = [
+            meter
+                .u64_observable_gauge(config.instrument_name(ALLOCATION_CHARGES_PAST_REPLAY_WINDOW))
+                .with_description(
+                    "Allocation charges that hold an amount on an active Quota and are older \
+                     than the replay window, by metric",
+                )
+                .with_callback(move |observer| {
+                    if let Some(backlog) = held.load() {
+                        for (metric, charges) in backlog.iter() {
+                            observer.observe(charges.count, &[metric_key(metric)]);
+                        }
+                    }
+                })
+                .build(),
+            meter
+                .u64_observable_gauge(config.instrument_name(ALLOCATION_CHARGE_MAX_AGE_SECONDS))
+                .with_description("Age of the oldest such allocation charge, by metric")
+                .with_unit("s")
+                .with_callback(move |observer| {
+                    if let Some(backlog) = charges.load() {
+                        for (metric, charges) in backlog.iter() {
+                            observer.observe(charges.oldest_age_secs, &[metric_key(metric)]);
+                        }
+                    }
+                })
+                .build(),
+        ];
+        let catalog_last_read = Arc::new(AtomicU64::new(0));
+        let catalog_unavailable = Arc::new(AtomicU64::new(0));
+        let last_read = Arc::clone(&catalog_last_read);
+        let unavailable = Arc::clone(&catalog_unavailable);
+        let catalog_gauges = [
+            meter
+                .u64_observable_gauge(
+                    config.instrument_name(CATALOG_LAST_SCHEDULED_READ_TIMESTAMP_SECONDS),
+                )
+                .with_description("Time of the last scheduled catalogue read that succeeded")
+                .with_unit("s")
+                .with_callback(move |observer| {
+                    let at = last_read.load(Ordering::Relaxed);
+                    if at > 0 {
+                        observer.observe(at, &[]);
+                    }
+                })
+                .build(),
+            meter
+                .u64_observable_gauge(config.instrument_name(CATALOG_UNAVAILABLE_METRICS))
+                .with_description("Unavailable metric catalogue entries this replica holds")
+                .with_callback(move |observer| {
+                    observer.observe(unavailable.load(Ordering::Relaxed), &[]);
+                })
+                .build(),
+        ];
         // @cpt-end:cpt-cf-quota-enforcement-algo-telemetry-emission:p1:inst-tel-closed
         Self {
             engine_bootstrap_failures: meter
@@ -257,11 +326,31 @@ impl QeMetricsMeter {
             retention_failures,
             lease_acquisition_wait,
             lease_contention_rejected,
+            contention_rejected: meter
+                .u64_counter(config.instrument_name(CONTENTION_REJECTED_TOTAL))
+                .with_description("Operations refused on the contention timeout, by operation kind")
+                .build(),
             lease_inflight_limit_exceeded,
             notification_dispatch_failures,
             outbox_rejections,
+            policy_evaluation_failures: meter
+                .u64_counter(config.instrument_name(POLICY_EVALUATION_FAILURES_TOTAL))
+                .with_description(
+                    "Requests the active Policy could not evaluate, by engine and metric",
+                )
+                .build(),
+            catalog_read_failures: meter
+                .u64_counter(config.instrument_name(CATALOG_READ_FAILURES_TOTAL))
+                .with_description(
+                    "types-registry reads that failed or reached their time limit, by phase",
+                )
+                .build(),
+            catalog_last_read,
+            catalog_unavailable,
+            _catalog_gauges: catalog_gauges,
             _lifecycle_gauges: lifecycle_gauges,
             _lease_backlog: lease_backlog,
+            _charge_backlog: charge_backlog,
         }
     }
 
@@ -274,12 +363,15 @@ impl QeMetricsMeter {
         config: &MetricsConfig,
         gauges: Arc<LifecycleGaugeCell>,
         backlog: Arc<LeaseBacklogCell>,
+        charges: Arc<ChargeBacklogCell>,
     ) -> Arc<Self> {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-telemetry-emission:p1:inst-tel-export
         let scope = opentelemetry::InstrumentationScope::builder("quota-enforcement").build();
         let meter = opentelemetry::global::meter_with_scope(scope);
         // @cpt-end:cpt-cf-quota-enforcement-algo-telemetry-emission:p1:inst-tel-export
-        Arc::new(Self::with_lease_backlog(&meter, config, gauges, backlog))
+        Arc::new(Self::with_backlogs(
+            &meter, config, gauges, backlog, charges,
+        ))
     }
 
     /// Count one denial under its closed reason label.
@@ -337,7 +429,7 @@ impl QeMetrics for QeMetricsMeter {
         surface: ValidationSurface,
         reason: ValidationReason,
     ) {
-        // Both labels are closed-enum values; metric names, projection types,
+        // Both labels are closed-enum values; metric names, subject types,
         // and caller attribution never enter (PRD section 5.16).
         self.contract_validation_failures.add(
             1,
@@ -362,6 +454,11 @@ impl QeMetrics for QeMetricsMeter {
 
     fn record_idempotency_replay(&self, operation: OperationKind) {
         self.idempotency_replays
+            .add(1, &[KeyValue::new(OPERATION_LABEL, operation.as_label())]);
+    }
+
+    fn record_contention_rejected(&self, operation: OperationKind) {
+        self.contention_rejected
             .add(1, &[KeyValue::new(OPERATION_LABEL, operation.as_label())]);
     }
 
@@ -409,12 +506,78 @@ impl QeMetrics for QeMetricsMeter {
         self.outbox_rejections
             .add(1, &[KeyValue::new(QUEUE_LABEL, NOTIFICATION_QUEUE)]);
     }
+
+    fn record_policy_evaluation_failure(&self, engine: EngineLabel, metric: &MetricLabel) {
+        self.policy_evaluation_failures.add(
+            1,
+            &[
+                KeyValue::new("engine_id", engine.as_label()),
+                metric_key(metric),
+            ],
+        );
+    }
+
+    fn record_catalog_read_failure(&self, phase: CatalogReadPhase) {
+        self.catalog_read_failures
+            .add(1, &[KeyValue::new(PHASE_LABEL, phase.as_label())]);
+    }
+
+    fn record_catalog_scheduled_read(&self) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        self.catalog_last_read
+            .store(u64::try_from(now).unwrap_or(0), Ordering::Relaxed);
+    }
+
+    fn set_catalog_unavailable_metrics(&self, count: u64) {
+        self.catalog_unavailable.store(count, Ordering::Relaxed);
+    }
 }
 
 /// The `metric` attribute of a lease instrument: an admitted metric's id,
 /// shared rather than copied.
 fn metric_key(metric: &MetricLabel) -> KeyValue {
     KeyValue::new(METRIC_LABEL, StringValue::from(metric.shared()))
+}
+
+/// The label-free lifecycle gauges over the published sample.
+fn lifecycle_gauges(
+    meter: &Meter,
+    config: &MetricsConfig,
+    gauges: Arc<LifecycleGaugeCell>,
+) -> [ObservableGauge<u64>; 4] {
+    // Each callback reads the cell and observes only when a sample is
+    // published: a withdrawn sample (stale, not leader) yields no data point
+    // rather than zero.
+    [
+        lifecycle_gauge(
+            meter,
+            &config.instrument_name(QUOTA_CAP_ZERO_TOTAL),
+            "Active cap = 0 Quotas",
+            gauges.clone(),
+            |c| c.cap_zero,
+        ),
+        lifecycle_gauge(
+            meter,
+            &config.instrument_name(QUOTA_CAP_UNBOUNDED_TOTAL),
+            "Active unbounded-cap Quotas",
+            gauges.clone(),
+            |c| c.cap_unbounded,
+        ),
+        lifecycle_gauge(
+            meter,
+            &config.instrument_name(QUOTA_FOR_DIRECT_METRIC_TOTAL),
+            "Active Quotas declared on metrics whose enforcement is direct",
+            gauges.clone(),
+            |c| c.for_direct_metric,
+        ),
+        lifecycle_gauge(
+            meter,
+            &config.instrument_name(QUOTA_CONDITIONS_UNFIT_TOTAL),
+            "Active Quotas whose conditions do not fit their metric type",
+            gauges,
+            |c| c.conditions_unfit,
+        ),
+    ]
 }
 
 /// One label-free observable gauge over the published lifecycle sample.
@@ -442,8 +605,9 @@ pub fn build_default_adapter(
     config: &MetricsConfig,
     gauges: Arc<LifecycleGaugeCell>,
     backlog: Arc<LeaseBacklogCell>,
+    charges: Arc<ChargeBacklogCell>,
 ) -> Arc<QeMetricsMeter> {
-    QeMetricsMeter::on_global_meter(config, gauges, backlog)
+    QeMetricsMeter::on_global_meter(config, gauges, backlog, charges)
 }
 
 #[cfg(test)]

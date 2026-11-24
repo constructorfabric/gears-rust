@@ -28,8 +28,9 @@ pub type QuotaEnforcementError = CanonicalError;
 /// Manages Quotas within the caller's PDP scope.
 #[toolkit::contract(gear = "quota-enforcement", version = "v1")]
 pub trait QuotaManagerApi: Send + Sync {
-    /// Create a Quota. The gear validates `spec`, resolves the metric owner's
-    /// constraint contract, and returns the server-assigned identifier.
+    /// Create a Quota. The gear validates `spec`, checks its subject and its
+    /// metadata, the Quota's conditions, against the metric type, and returns
+    /// the server-assigned identifier.
     ///
     /// # Errors
     ///
@@ -97,7 +98,7 @@ pub trait QuotaManagerApi: Send + Sync {
     /// two are indistinguishable); `PermissionDenied` when the caller may not
     /// credit, or for a Quota the scope shows but that belongs to another
     /// tenant; `FailedPrecondition` for a deactivated Quota or a closed period;
-    /// `Aborted` on a payload mismatch, and `Aborted`
+    /// `AlreadyExists` (`IDEMPOTENCY_PAYLOAD_MISMATCH`) on a payload mismatch, and `Aborted`
     /// (`LEASE_CONTENTION_TIMEOUT`) as for [`QuotaEnforcementApi::debit`].
     #[idempotency(IdempotentWrite)]
     async fn credit(
@@ -112,7 +113,7 @@ pub trait QuotaManagerApi: Send + Sync {
     /// # Errors
     ///
     /// `InvalidArgument` (`BULK_TOO_LARGE`) for too many items; the canonical
-    /// error of the first failing item, pointing at `items[index]`; `Aborted`
+    /// error of the first failing item, pointing at `items[index]`; `AlreadyExists`
     /// (`IDEMPOTENCY_PAYLOAD_MISMATCH`) when the key was used for other items.
     #[idempotency(IdempotentWrite)]
     async fn bulk_create_quotas(
@@ -166,10 +167,10 @@ pub trait QuotaEnforcementApi: Send + Sync {
     ///
     /// `InvalidArgument` for a non-positive amount, a missing idempotency key,
     /// or a metric that is not quota-gated; `PermissionDenied` when the PDP
-    /// refuses the attribution; `Aborted` (`IDEMPOTENCY_PAYLOAD_MISMATCH`)
+    /// refuses the attribution; `AlreadyExists` (`IDEMPOTENCY_PAYLOAD_MISMATCH`)
     /// when the key was used for a different payload; `Aborted`
     /// (`LEASE_CONTENTION_TIMEOUT`) when another writer held a needed row past
-    /// the metric's contention budget, 0 ms by default; nothing was written,
+    /// the metric's contention budget, 50 ms by default; nothing was written,
     /// so the call is safe to retry; the canonical error of any failed
     /// evaluation or storage step.
     #[idempotency(IdempotentWrite)]
@@ -179,19 +180,20 @@ pub trait QuotaEnforcementApi: Send + Sync {
         request: DebitRequest,
     ) -> Result<Decision, QuotaEnforcementError>;
 
-    /// Reverse a committed debit, restoring the counters to what they would
-    /// have been had it never happened.
+    /// Give back everything that remains of the charge of a debit or a lease
+    /// commit (ADR-0011).
     ///
-    /// The request carries the reversed debit's own attribution, which the
-    /// server re-authorizes: a caller can only reverse what it could have
-    /// debited. Reversal happens at most once per original operation.
+    /// The request carries the charged operation's own attribution, which the
+    /// server authorizes for the action `rollback`: a caller can only roll
+    /// back what it could have charged. It has no key of its own; on a charge
+    /// with nothing left it succeeds and changes nothing.
     ///
     /// # Errors
     ///
-    /// `NotFound` (`UNKNOWN_OPERATION`) when no committed debit answers the
-    /// original key under the recomputed scope and authorized attribution;
-    /// `FailedPrecondition` (`PERIOD_CLOSED`) once the attribution period has
-    /// settled; `Aborted` on a payload mismatch, and `Aborted`
+    /// `NotFound` (`UNKNOWN_OPERATION`) when no live charge answers the key
+    /// under its scope and authorized attribution digest;
+    /// `FailedPrecondition` (`RETURN_NOT_APPLICABLE`) when no Quota of the
+    /// charge can take what remains, and `Aborted`
     /// (`LEASE_CONTENTION_TIMEOUT`) as for [`Self::debit`].
     #[idempotency(IdempotentWrite)]
     async fn rollback(
@@ -246,7 +248,7 @@ pub trait QuotaEnforcementApi: Send + Sync {
     /// `NotFound` for a token outside the caller's tenant; `FailedPrecondition`
     /// (`LEASE_NOT_ACTIVE`) for an expired or resolved lease, and
     /// (`OVER_COMMIT_NOT_AUTHORIZED`) when more than the reserved amount is
-    /// committed; `Aborted` on a payload mismatch, and `Aborted`
+    /// committed; `AlreadyExists` (`IDEMPOTENCY_PAYLOAD_MISMATCH`) on a payload mismatch, and `Aborted`
     /// (`LEASE_CONTENTION_TIMEOUT`) as for [`Self::debit`].
     #[idempotency(IdempotentWrite)]
     async fn commit_lease(

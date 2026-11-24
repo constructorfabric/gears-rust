@@ -12,16 +12,15 @@
 //! Seams for later features are marked `2.5` (consumption counters in the cap
 //! guard) and `2.6` (the lease cascade in deactivation).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    ActiveQuotaCounts, BulkCreateEnvelope, BulkCreated, BulkDeactivateEnvelope, BulkDeactivated,
-    BulkUpdateEnvelope, BulkUpdated, DeactivateOutcome, EventId, LeaseToken, MetricId,
-    NotificationEvent, NotificationEventKind, NotificationScope, PageRequest, PageResult,
-    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaType, TenantId,
-    TransitionOutcome,
+    ActiveConditions, ActiveQuotaCounts, BulkCreateEnvelope, BulkCreated, BulkDeactivateEnvelope,
+    BulkDeactivated, BulkUpdateEnvelope, BulkUpdated, DeactivateOutcome, EventId, LeaseToken,
+    MetricId, NotificationEvent, NotificationEventKind, NotificationScope, PageRequest, PageResult,
+    Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaType, TenantId, TransitionOutcome,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError, validate_tenant_in_scope};
@@ -97,15 +96,6 @@ fn lift(operation: &'static str, err: TxError) -> StoreError {
         TxError::Map(MappingError::CapOutOfRange { cap }) => StoreError::ValueOutOfRange {
             field: "cap",
             value: cap.to_string(),
-        },
-        TxError::Map(MappingError::VersionOutOfRange { field, value }) => {
-            StoreError::ValueOutOfRange {
-                field,
-                value: value.to_string(),
-            }
-        }
-        TxError::Map(err @ MappingError::MetadataWithoutContract) => StoreError::InvalidPatch {
-            detail: err.to_string(),
         },
         TxError::Map(err @ MappingError::Column { .. }) => corrupt(operation, &err),
         TxError::Enqueue(EnqueueError::NotBound) => {
@@ -439,15 +429,24 @@ impl SqlQuotaStore {
         now: OffsetDateTime,
     ) -> Result<(), TxError> {
         let wait = lease_repo::RowWait::Wait;
-        let mut leases: BTreeMap<Uuid, &AccessScope> = BTreeMap::new();
+        // Every lease that still holds the Quota, expired ones too, with
+        // whether it is live. An expired lease is not resolved here, but its
+        // row is locked: a commit on a clock still before its expiry holds that
+        // row, so the two run one after the other, and the commit either sees
+        // the deactivation or is seen by the sweeper that releases the holds.
+        let mut leases: BTreeMap<Uuid, (&AccessScope, bool)> = BTreeMap::new();
         for (quota_id, scope) in targets {
-            for lease in lease_repo::active_on_quota(tx, scope, *quota_id, now).await? {
-                leases.entry(lease.token).or_insert(*scope);
+            for lease in lease_repo::unsettled_on_quota(tx, scope, *quota_id).await? {
+                let live = lease.expiry_at > now;
+                leases.entry(lease.token).or_insert((*scope, live));
             }
         }
         let mut counters: BTreeMap<(Uuid, Option<Uuid>), &AccessScope> = BTreeMap::new();
-        for (token, scope) in leases {
+        for (token, (scope, live)) in leases {
             lease_repo::find_for_update(tx, scope, token, wait).await?;
+            if !live {
+                continue;
+            }
             for hold in lease_repo::holds_of(tx, scope, token).await? {
                 counters
                     .entry((hold.quota_id, hold.period_id))
@@ -554,6 +553,7 @@ impl SqlQuotaStore {
             // Only the transaction knows which leases it resolved,
             // so it builds their events itself (I11).
             lease_events.push(NotificationEvent {
+                actor: actor.clone(),
                 event_id: EventId::generate(),
                 kind: NotificationEventKind::LeaseResolvedByDeactivation,
                 scope: NotificationScope::Tenant {
@@ -747,7 +747,7 @@ impl QuotaStore for SqlQuotaStore {
             subject: filter
                 .subject
                 .as_ref()
-                .map(|s| (s.projection_type.as_ref(), s.subject_id.as_str())),
+                .map(|s| (s.subject_type.as_ref(), s.subject_id.as_str())),
             metric: filter.metric.as_ref().map(MetricId::as_str),
             status,
             ids: &ids,
@@ -771,33 +771,6 @@ impl QuotaStore for SqlQuotaStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| lift(OPERATION, e.into()))?;
         Ok(PageResult { items, next_cursor })
-    }
-
-    async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StoreError> {
-        const OPERATION: &str = "read active projection bindings";
-        let conn = self.conn(OPERATION)?;
-        let rows = quota_repo::active_bindings(&conn)
-            .await
-            .map_err(|e| lift(OPERATION, e.into()))?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(ProjectionBinding {
-                    metric: MetricId::parse(&row.metric).map_err(|e| MappingError::Column {
-                        column: "metric",
-                        detail: e.to_string(),
-                    })?,
-                    projection_type: gts::GtsTypeId::try_new(&row.projection_type).map_err(
-                        |e| MappingError::Column {
-                            column: "projection_type",
-                            detail: e.to_string(),
-                        },
-                    )?,
-                })
-            })
-            .collect::<Result<HashSet<_>, MappingError>>()
-            .map_err(|e| lift(OPERATION, e.into()))
     }
 
     async fn bulk_create_quotas(
@@ -847,16 +820,34 @@ impl QuotaStore for SqlQuotaStore {
             })
             .collect::<Result<HashMap<_, _>, MappingError>>()
             .map_err(|e| lift(OPERATION, e.into()))?;
+        let conditions =
+            quota_repo::active_conditions(&conn, ActiveQuotaCounts::MAX_CONDITION_SETS)
+                .await
+                .map_err(|e| lift(OPERATION, e.into()))?
+                .into_iter()
+                .map(|row| {
+                    let column = |column, detail: String| MappingError::Column { column, detail };
+                    Ok(ActiveConditions {
+                        metric: MetricId::parse(&row.metric)
+                            .map_err(|e| column("metric", e.to_string()))?,
+                        metadata: serde_json::from_str(&row.metadata)
+                            .map_err(|e| column("metadata", e.to_string()))?,
+                        quotas: u64::try_from(row.total).unwrap_or(0),
+                    })
+                })
+                .collect::<Result<Vec<_>, MappingError>>()
+                .map_err(|e| lift(OPERATION, e.into()))?;
         Ok(ActiveQuotaCounts {
             cap_zero,
             cap_unbounded,
             by_metric,
+            conditions,
         })
     }
 }
 
 /// The names of the columns a patch sets, for the operation log. Names only,
-/// never values: metadata is opaque to QE.
+/// never values.
 fn patched_fields(update: &QuotaUpdate) -> String {
     let mut fields = Vec::new();
     if update.cap.is_some() {
@@ -869,7 +860,7 @@ fn patched_fields(update: &QuotaUpdate) -> String {
         fields.push("validity_window");
     }
     if update.metadata.is_some() {
-        fields.push("metadata,constraint_contract");
+        fields.push("metadata");
     }
     if update.enforcement_mode.is_some() {
         fields.push("enforcement_mode");

@@ -6,6 +6,11 @@ gdl_version = "1.0"
 #
 # Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (rest,
 # stateful) and lifecycle; deps below is an exact checked mirror (GBX0214).
+#
+# **Both a host and a plugin.** It selects its storage plugin by
+# `storage_vendor`, and it registers itself as the quota-resolver's backend,
+# the `implements` below; its `resolver_plugin` config holds the vendor and
+# priority that registration carries.
 
 gear(
     deps = ["authz-resolver", "types-registry"],
@@ -28,6 +33,9 @@ gear(
         lib = "quota_enforcement_sdk",
         path = "../quota-enforcement-sdk",
     ),
+
+    # The quota-resolver's point, which this gear implements.
+    implements = "cf.core.quota_resolver.plugin.v1~",
 
     # The storage point, selected by `storage_vendor`.
     extension_points = [

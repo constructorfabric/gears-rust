@@ -23,8 +23,7 @@ use tower::ServiceExt as _;
 use super::super::routes::{PATH_PREFIX, register_routes};
 use crate::domain::Service;
 use crate::test_support::{
-    LLM_TOKEN_CONSTRAINT, LLM_USER_PROJECTION, METRIC_TOKENS, PermitTenantsPdp, bound_service_over,
-    ctx, tenant,
+    METRIC_TOKENS, PermitTenantsPdp, USER_SUBJECT_TYPE, bound_service_over, ctx, tenant,
 };
 
 async fn seeded() -> (Router, Arc<InMemoryStorage>, QuotaId) {
@@ -43,12 +42,12 @@ async fn seeded_service() -> (Arc<Service>, Arc<InMemoryStorage>, QuotaId) {
     storage.bootstrap(&bundle).await.expect("bootstrap");
     let quota = storage
         .create_quota(
-            &ctx(),
+            &crate::test_support::actor(),
             &AccessScope::allow_all(),
             QuotaDraft {
                 tenant_id: tenant(),
                 subject: SubjectRef {
-                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
                     subject_id: "u-1".to_owned(),
                 },
                 metric: quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
@@ -61,10 +60,6 @@ async fn seeded_service() -> (Arc<Service>, Arc<InMemoryStorage>, QuotaId) {
                 fail_open_hint: false,
                 metadata: serde_json::Map::new(),
                 source: QuotaSource::Operator,
-                constraint_contract: quota_enforcement_sdk::ContractRef {
-                    type_id: gts::GtsTypeId::new(LLM_TOKEN_CONSTRAINT),
-                    version: 1,
-                },
             },
             &[],
         )
@@ -100,9 +95,8 @@ fn item(amount: i64, key: &str) -> Value {
     json!({
         "attribution": {
             "tenant_id": tenant().as_uuid(),
-            "metric": METRIC_TOKENS,
-            "subjects": [{ "kind": quota_enforcement_sdk::SCOPE_USER, "id": "u-1" }],
-            "metadata": { "region": "eu-west-1" }
+            "subjects": [{ "type": USER_SUBJECT_TYPE, "id": "u-1" }],
+            "metric": { "type": METRIC_TOKENS, "metadata": { "region": "eu-west-1" } }
         },
         "amount": amount,
         "idempotency_key": key
@@ -182,13 +176,15 @@ async fn the_in_process_client_answers_through_the_same_domain_path() {
     let item = |amount: i64, key: &str| BatchItemRequest {
         attribution: EvaluationAttribution {
             tenant_id: tenant(),
-            metric: METRIC_TOKENS.to_owned(),
             subjects: vec![SubjectClaim {
-                kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+                subject_type: USER_SUBJECT_TYPE.to_owned(),
                 id: "u-1".to_owned(),
             }],
-            metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
-            resource: None,
+            metric: quota_enforcement_sdk::MetricRef {
+                metric_type: METRIC_TOKENS.to_owned(),
+                id: None,
+                metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
+            },
         },
         amount,
         idempotency_key: key.to_owned(),
@@ -210,7 +206,7 @@ async fn the_in_process_client_answers_through_the_same_domain_path() {
             &ctx(),
             BatchDebitRequest {
                 mode: BatchMode::Independent,
-                items: vec![item(5, "i1")],
+                items: vec![item(5, "i3")],
                 idempotency_key: "b2".to_owned(),
             },
         )
@@ -227,7 +223,7 @@ async fn decision_shaped_fields_in_the_batch_or_its_items_are_ignored() {
     let (app, storage, quota) = seeded().await;
     let mut forged = item(60, "i2");
     forged["decision"] = json!({ "result": { "outcome": "allowed" } });
-    forged["debit_plan"] = json!([{ "quota_id": quota.as_uuid(), "amount": 0 }]);
+    forged["debit_plan"] = json!([[{ "quota_id": quota.as_uuid(), "amount": 0 }]]);
     let mut request = body("atomic", &[item(60, "i1"), forged]);
     request["result"] = json!("allowed");
 

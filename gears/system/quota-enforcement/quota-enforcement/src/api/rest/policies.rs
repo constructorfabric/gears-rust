@@ -151,6 +151,7 @@ pub struct ReadQuery {
 /// Public version view; persisted validation snapshots remain server-owned.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = QuotaPolicyDto)]
 pub struct PolicyDto {
     /// Stable opaque ID.
     pub policy_id: String,
@@ -229,7 +230,7 @@ async fn create(
     Extension(service): Extension<Arc<Service>>,
     JsonBody(body): JsonBody<CreatePolicyDto>,
 ) -> ApiResult<impl IntoResponse> {
-    let version = service.policies()?.create(&ctx, body.try_into()?).await?;
+    let version = service.policies(&ctx)?.create(body.try_into()?).await?;
     let id = version.policy_id.to_string();
     Ok(created_json(PolicyDto::from(version), &uri, &id).into_response())
 }
@@ -243,8 +244,8 @@ async fn update(
 ) -> ApiResult<axum::Json<PolicyDto>> {
     Ok(axum::Json(
         service
-            .policies()?
-            .update(&ctx, PolicyId::new(id), body.into())
+            .policies(&ctx)?
+            .update(PolicyId::new(id), body.into())
             .await?
             .into(),
     ))
@@ -258,8 +259,8 @@ async fn read(
 ) -> ApiResult<axum::Json<PolicyDto>> {
     Ok(axum::Json(
         service
-            .policies()?
-            .read(&ctx, &PolicyId::new(id), query.version)
+            .policies(&ctx)?
+            .read(&PolicyId::new(id), query.version)
             .await?
             .into(),
     ))
@@ -273,8 +274,8 @@ async fn rollback(
 ) -> ApiResult<axum::Json<PolicyDto>> {
     Ok(axum::Json(
         service
-            .policies()?
-            .rollback(&ctx, PolicyId::new(id), body.target_version, body.comment)
+            .policies(&ctx)?
+            .rollback(PolicyId::new(id), body.target_version, body.comment)
             .await?
             .into(),
     ))
@@ -288,8 +289,8 @@ async fn delete(
     QueryParamsExtractor(query): QueryParamsExtractor<DeleteQuery>,
 ) -> ApiResult<StatusCode> {
     service
-        .policies()?
-        .delete(&ctx, PolicyId::new(id), query.comment)
+        .policies(&ctx)?
+        .delete(PolicyId::new(id), query.comment)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -305,7 +306,7 @@ async fn history(
     reject_select(query.select.as_ref())?;
     reject_filter(query.filter.as_deref())?;
     require_order(&query.order, "version")?;
-    let policies = service.policies()?;
+    let policies = service.policies(&ctx)?;
     let limit = page_size(
         query.limit,
         PageRequest::DEFAULT_LIMIT,
@@ -314,7 +315,7 @@ async fn history(
     let binding = policy_binding(&id);
     let cursor = continuation(query.cursor.as_ref(), VERSION_ORDER, &binding)?;
     let page = policies
-        .list(&ctx, &PolicyId::new(id), Some(limit), cursor)
+        .list(&PolicyId::new(id), Some(limit), cursor)
         .await?;
     Ok(axum::Json(Page {
         items: page.items.into_iter().map(Into::into).collect(),

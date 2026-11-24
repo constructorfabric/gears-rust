@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use quota_enforcement_sdk::{
-    Decision, DecisionResult, IdempotencyScope, IdempotencySubjectKey, OperationType, PayloadHash,
-    TenantId,
+    Decision, DecisionResult, IdempotencyScope, OperationType, PayloadHash, TenantId,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -17,7 +16,6 @@ fn at(seconds: i64) -> OffsetDateTime {
 fn scope(key: &str) -> IdempotencyScope {
     IdempotencyScope {
         tenant_id: TenantId::new(Uuid::from_u128(1)),
-        subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
         operation_type: OperationType::Debit,
         key: key.to_owned(),
     }
@@ -28,7 +26,7 @@ fn record(expires_at: OffsetDateTime) -> ReplayRecord {
         payload_hash: PayloadHash::from_bytes([2; 32]),
         decision: Decision {
             result: DecisionResult::Allowed,
-            debit_plan: BTreeMap::new(),
+            debit_plan: Vec::new(),
             diagnostics: BTreeMap::new(),
         },
         expires_at,
@@ -114,13 +112,12 @@ fn a_versioned_blob_decodes_into_a_replay_record() {
         decision_blob: serde_json::json!({
             "__version": 1,
             "result": {"outcome": "allowed"},
-            "debit_plan": {},
+            "debit_plan": [],
             "diagnostics": {}
         }),
         engine_id: None,
         policy_id: None,
         policy_version: None,
-        attribution_hash: None,
         created_at: at(0),
         expires_at: at(1_000),
     };

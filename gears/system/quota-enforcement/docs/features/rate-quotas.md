@@ -110,10 +110,10 @@ a P3 DESIGN concern per DECOMPOSITION §2.11)
   `InvalidArgument`)
 - A period field on a rate draft: rejected; the period specification is consumption-only per the PRD Quota definition
 - Every other lifecycle error (a metric that is not registered or is unavailable, a subject type the metric does not
-  admit, Quota metadata that the Engine rejects) fires unchanged per the quota-lifecycle feature
+  admit, Quota metadata that does not fit the metric type) fires unchanged per the quota-lifecycle feature
 
 **Steps**:
-1. [ ] - `p3` - Caller sends `POST /v1/quota-enforcement/quotas` (or `PATCH /v1/quota-enforcement/quotas/{id}`) with
+1. [ ] - `p3` - Caller sends `POST /quota-enforcement/v1/quotas` (or `PATCH /quota-enforcement/v1/quotas/{id}`) with
    `quota_type = gts.cf.core.qe.quota_type.v1~cf.core.qe.rate.v1` and a `rate_spec` object; DECOMPOSITION §2.11 activates
    the existing endpoints for `type = rate`, adding no new route - `inst-rqc-request`
 2. [ ] - `p3` - Run `cpt-cf-quota-enforcement-algo-rate-draft-validation` in place of the P1 rejection arms
@@ -145,8 +145,8 @@ a P3 DESIGN concern per DECOMPOSITION §2.11)
   consumption-operations feature
 
 **Steps**:
-1. [ ] - `p3` - Caller sends `POST /v1/quota-enforcement/operations/debit` (the existing endpoint; preview rides
-   `POST /v1/quota-enforcement/operations/preview` read-only, both activated for rate Quotas per DECOMPOSITION
+1. [ ] - `p3` - Caller sends `POST /quota-enforcement/v1/operations/debit` (the existing endpoint; preview rides
+   `POST /quota-enforcement/v1/operations/preview` read-only, both activated for rate Quotas per DECOMPOSITION
    §2.11) - `inst-rda-request`
 2. [ ] - `p3` - Run the canonical pipeline `cpt-cf-quota-enforcement-algo-evaluation-pipeline` unchanged: subject
    resolution, idempotency lookup, applicable-Quotas locked read, Policy lookup, Engine boundary, invariant check,
@@ -190,7 +190,7 @@ a P3 DESIGN concern per DECOMPOSITION §2.11)
    1. [ ] - `p3` - **RETURN** rejection; the period specification belongs to consumption types only per the PRD
       Quota definition, and rate smoothing is expressed by `rate_spec`, not by a period - `inst-rdv-period`
 5. [ ] - `p3` - Run the remainder of `cpt-cf-quota-enforcement-algo-quota-draft-validation` and the rest of the
-   lifecycle chain (the metric check, subject admission, the Engine's check of Quota metadata) unchanged; this
+   lifecycle chain (the metric check, subject admission, the check of Quota metadata) unchanged; this
    algorithm adds the rate-spec and period validation branches and replaces the two P1 rejection arms
    (`inst-qdv-rate`, `inst-qup-rate`), nothing else - `inst-rdv-chain`
 6. [ ] - `p3` - Existing persisted Quotas with `type` in `allocation` / `consumption` require no migration when
@@ -258,7 +258,7 @@ batch-debit feature's `mode = independent` rejection untouched.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-toolkit`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/quotas`, `PATCH /v1/quota-enforcement/quotas/{id}` (acceptance of `type = rate`;
+- API: `POST /quota-enforcement/v1/quotas`, `PATCH /quota-enforcement/v1/quotas/{id}` (acceptance of `type = rate`;
   no new route)
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` optional `rate_spec` field)
 - Entities: `Quota`, `QuotaDraft`, `QuotaUpdate`, `QuotaPatch`
@@ -284,14 +284,14 @@ existing `denial_total` instrument by the closed `reason` kind. No instrument is
 `cpt-cf-quota-enforcement-constraint-bounded-cardinality`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/operations/debit`, `POST /v1/quota-enforcement/operations/preview` (acceptance of
+- API: `POST /quota-enforcement/v1/operations/debit`, `POST /quota-enforcement/v1/operations/preview` (acceptance of
   rate Quotas; no new route)
 - DB: `cpt-cf-quota-enforcement-db-schema` (the `Counter` extension for rate windows; shape gated on PRD §13)
 - Entities: `Quota` (with `rate_spec`), `Counter` (rate extension), `Decision`
 
 ## 6. Acceptance Criteria
 
-- [ ] After activation, `POST /v1/quota-enforcement/quotas` with `type = rate` and a complete `rate_spec` returns
+- [ ] After activation, `POST /quota-enforcement/v1/quotas` with `type = rate` and a complete `rate_spec` returns
   `201`, persists the row with `rate_spec` stored, and enqueues `quota-changed (created)` plus the operation-log
   entry in the same transaction
 - [ ] The activation migration applies with zero updates to existing `allocation` / `consumption` rows; those Quotas

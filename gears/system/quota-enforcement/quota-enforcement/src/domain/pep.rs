@@ -40,15 +40,15 @@ pub mod resources {
 
 /// Resource properties of the PDP request beyond the platform-defined
 /// `owner_tenant_id`: the rest of the caller-supplied attribution tuple, so the
-/// PDP authorizes the complete tuple for the service principal (ADR-0007).
+/// PDP authorizes the complete tuple for the service principal.
 pub mod properties {
-    /// The metric, as its GTS instance id.
+    /// The metric type id.
     pub const METRIC: &str = "metric";
-    /// The additional `{kind, id}` subjects, as an array.
+    /// The `id` of the metric object, when the request names one.
+    pub const METRIC_ID: &str = "metric_id";
+    /// The `{type, id}` subjects, the tenant subject included, as an array.
     pub const SUBJECTS: &str = "subjects";
-    /// The optional resource projection, as its `{type, id?, metadata}` document.
-    pub const RESOURCE: &str = "resource";
-    /// Every target of a snapshot read, as an array of `{kind, id, metric}`.
+    /// Every target of a snapshot read, as an array of `{type, id, metric}`.
     /// The PDP policy must authorize each one.
     pub const FILTERS: &str = "filters";
 }
@@ -71,6 +71,8 @@ pub mod actions {
     pub const CREDIT: &str = "credit";
     /// Rollback.
     pub const ROLLBACK: &str = "rollback";
+    /// Return of part of a charge, through the resolver plugin only.
+    pub const RETURN: &str = "return";
     /// Read-only preview.
     pub const PREVIEW: &str = "preview";
     /// Batch debit.

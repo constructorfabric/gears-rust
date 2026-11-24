@@ -3,56 +3,41 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::AuthZResolverApi;
-use gts::GtsTypeId;
+use gts::{GtsSchema as _, GtsTypeId};
 use quota_enforcement_sdk::testing::{InMemoryStorage, RecordingSink, quota_draft};
 use quota_enforcement_sdk::{
     CONTRACT_MAJOR, MetricId, PageRequest, PolicyDraft, PolicyId, PolicySchemaSnapshot,
-    PolicyScope, QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_USER, StorageError,
-    SubjectRef, SubjectScope,
+    PolicyScope, QuotaEnforcementStoragePluginV1, StorageError, SubjectRef,
 };
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::ClientHub;
 use toolkit_security::AccessScope;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 
-use super::{Bootstrap, CatalogBinding};
-use crate::domain::catalog::CatalogConfig;
+use super::Bootstrap;
+use crate::domain::catalog::CatalogEntry;
 use crate::domain::error::{Dependency, DomainError, PluginKind};
 use crate::domain::plugins::PluginBinding;
-use crate::domain::ports::contracts::ContractRegistry;
 use crate::domain::ports::coordination::SingletonScope;
-use crate::domain::ports::metric_registry::MetricRegistry;
-use crate::domain::ports::metrics::EngineLabel;
-use crate::domain::ports::metrics::{ValidationReason, ValidationSurface};
+use crate::domain::ports::metrics::{CatalogReadPhase, EngineLabel, ValidationReason};
 use crate::domain::readiness::{Readiness, ReadinessState};
 use crate::infra::pdp_probe::PdpReachability;
-use crate::infra::types_registry::TypesRegistryContracts;
 use crate::test_support::{
-    DenyAllPdp, FailingPdp, FakeContractRegistry, FakeMetricRegistry, LLM_MODEL_RESOURCE,
-    LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_TOKEN_REQUEST, LLM_USER_PROJECTION,
-    METRIC_OTHER, METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, StaticCoordinatorBinding, ctx,
-    hub_with, idle_work, in_process_registry, llm_gateway_documents, metric_base_documents,
-    register_sink, register_storage, sink_instance, storage_instance, tenant,
+    DenyAllPdp, FailingPdp, METRIC_OTHER, METRIC_REQUESTS, METRIC_TOKENS, PermitTenantsPdp,
+    RecordingMetrics, StaticCoordinatorBinding, USER_SUBJECT_TYPE, actor, catalog_over,
+    fail_registry_reads, hub_with, idle_work, metric_type_document, platform_registry,
+    register_sink, register_storage, registry_reads, sink_instance, storage_instance, tenant,
 };
 
-fn type_id(raw: &str) -> GtsTypeId {
-    GtsTypeId::try_new(raw).expect("type id")
-}
-
-fn llm_config() -> CatalogConfig {
-    CatalogConfig {
-        subject_projections: vec![type_id(LLM_USER_PROJECTION), type_id(LLM_TENANT_PROJECTION)],
-        resource_projections: vec![type_id(LLM_MODEL_RESOURCE)],
-    }
-}
+const INVALID_METRIC: &str = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
 
 struct Harness {
     hub: Arc<ClientHub>,
     storage: Arc<InMemoryStorage>,
     coordinator: Arc<StaticCoordinatorBinding>,
     pdp: Arc<dyn AuthZResolverApi>,
-    registry: Arc<dyn ContractRegistry>,
-    metric_registry: Arc<FakeMetricRegistry>,
-    config: CatalogConfig,
+    registry: Arc<MockTypesRegistry>,
     metrics: Arc<RecordingMetrics>,
     readiness: Arc<Readiness>,
 }
@@ -61,25 +46,10 @@ fn permitting_pdp() -> Arc<PermitTenantsPdp> {
     Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))
 }
 
-/// A harness over the `llm_gateway` fake registry with both projections configured.
 fn harness(
     storage: Arc<InMemoryStorage>,
     register_client: bool,
     pdp: Arc<dyn AuthZResolverApi>,
-) -> Harness {
-    harness_with_registry(
-        storage,
-        register_client,
-        pdp,
-        Arc::new(FakeContractRegistry::llm_gateway()),
-    )
-}
-
-fn harness_with_registry(
-    storage: Arc<InMemoryStorage>,
-    register_client: bool,
-    pdp: Arc<dyn AuthZResolverApi>,
-    registry: Arc<dyn ContractRegistry>,
 ) -> Harness {
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
     let hub = hub_with(&[&storage_fixture]);
@@ -91,9 +61,7 @@ fn harness_with_registry(
         storage,
         coordinator: StaticCoordinatorBinding::ok(),
         pdp,
-        registry,
-        metric_registry: Arc::new(FakeMetricRegistry::classified()),
-        config: llm_config(),
+        registry: platform_registry(),
         metrics: Arc::new(RecordingMetrics::default()),
         readiness: Arc::new(Readiness::new()),
     }
@@ -104,11 +72,7 @@ fn bootstrap(h: &Harness) -> Bootstrap {
         PluginBinding::new(h.hub.clone(), "acme".to_owned()),
         h.coordinator.clone(),
         Arc::new(PdpReachability::new(h.pdp.clone())),
-        CatalogBinding {
-            registry: h.registry.clone(),
-            config: h.config.clone(),
-        },
-        h.metric_registry.clone() as Arc<dyn MetricRegistry>,
+        catalog_over(&h.registry, h.metrics.clone()),
         super::BootstrapReporting {
             metrics: h.metrics.clone(),
             readiness: h.readiness.clone(),
@@ -126,16 +90,29 @@ fn failed_on(h: &Harness, dependency: Dependency) {
     }
 }
 
+fn metric(id: &str) -> MetricId {
+    MetricId::parse(id).expect("metric")
+}
+
+async fn seed_active_quota(storage: &InMemoryStorage, metric_id: &str) {
+    let mut draft = quota_draft(
+        SubjectRef {
+            subject_type: GtsTypeId::new(USER_SUBJECT_TYPE),
+            subject_id: "u-1".to_owned(),
+        },
+        Some(5),
+    );
+    draft.metric = metric(metric_id);
+    storage
+        .create_quota(&actor(), &AccessScope::allow_all(), draft, &[])
+        .await
+        .expect("seeded");
+}
+
 #[tokio::test]
 async fn a_complete_environment_bootstraps_resolves_the_coordinator_and_becomes_ready() {
     let pdp = permitting_pdp();
-    let fake = Arc::new(FakeContractRegistry::llm_gateway());
-    let h = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        pdp.clone(),
-        fake.clone(),
-    );
+    let h = harness(Arc::new(InMemoryStorage::new()), true, pdp.clone());
     let bound = bootstrap(&h).run().await.expect("bootstrap succeeds");
 
     assert!(h.readiness.is_ready());
@@ -155,28 +132,12 @@ async fn a_complete_environment_bootstraps_resolves_the_coordinator_and_becomes_
         1,
         "the cluster binding resolved once"
     );
-
-    // The QE-owned definitions were asserted, and the catalogue is published.
-    assert_eq!(fake.ensure_registered_calls(), 1);
-    let registered = fake.last_registered();
-    assert_eq!(registered.len(), 7);
-    assert!(registered.contains(&SCOPE_USER) && registered.contains(&SCOPE_TENANT));
-    let tokens = MetricId::parse(METRIC_TOKENS).expect("metric");
     assert_eq!(
-        bound
-            .catalog
-            .map_subject(&tokens, &SubjectScope::user())
-            .expect("mapped")
-            .as_ref(),
-        LLM_USER_PROJECTION
+        registry_reads(&h.registry),
+        0,
+        "bootstrap reads no metric type"
     );
-    assert_eq!(
-        bound
-            .catalog
-            .request_contract(&tokens)
-            .map(|c| c.type_id.as_ref()),
-        Some(LLM_TOKEN_REQUEST)
-    );
+    assert!(bound.catalog.peek(&metric(METRIC_TOKENS)).is_none());
     assert!(h.metrics.contract_failures().is_empty());
 
     let shutdown = CancellationToken::new();
@@ -278,284 +239,185 @@ async fn a_denying_pdp_is_reachable_and_bootstrap_completes() {
 }
 
 #[tokio::test]
-async fn an_unreachable_registry_fails_bootstrap_on_the_registry_dependency() {
-    let fake = Arc::new(FakeContractRegistry::llm_gateway());
-    fake.fail_all();
-    let h = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        permitting_pdp(),
-        fake,
-    );
-    let err = bootstrap(&h).run().await.err().expect("registry down");
-    assert!(
-        matches!(err, DomainError::TypesRegistryUnavailable(_)),
-        "{err:?}"
-    );
-    failed_on(&h, Dependency::TypesRegistry);
-    assert_eq!(h.storage.bootstrap_calls(), 1, "storage came first");
-    assert_eq!(
-        h.coordinator.calls(),
-        0,
-        "the catalogue precedes the cluster resolve"
-    );
-}
-
-#[tokio::test]
-async fn a_conflicting_owned_definition_fails_bootstrap_on_the_catalogue_dependency() {
-    let fake = Arc::new(FakeContractRegistry::llm_gateway());
-    fake.fail_registration_with(DomainError::CatalogInvalid {
-        reason: ValidationReason::DefinitionConflict,
-        subject: "gts.cf.core.qe.scope.v1~".to_owned(),
-    });
-    let h = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        permitting_pdp(),
-        fake,
-    );
-    let err = bootstrap(&h).run().await.err().expect("conflict");
-    assert!(
-        matches!(
-            err,
-            DomainError::CatalogInvalid {
-                reason: ValidationReason::DefinitionConflict,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    failed_on(&h, Dependency::Catalog);
-    assert!(!h.readiness.is_ready());
-}
-
-#[tokio::test]
-async fn an_inconsistent_catalogue_fails_bootstrap_and_never_marks_ready() {
-    let fake = Arc::new(FakeContractRegistry::llm_gateway());
-    fake.remove_type(LLM_TOKEN_CONSTRAINT);
-    let h = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        permitting_pdp(),
-        fake,
-    );
-    let err = bootstrap(&h).run().await.err().expect("inconsistent");
-    assert!(
-        matches!(
-            err,
-            DomainError::CatalogInvalid {
-                reason: ValidationReason::ConstraintInvalid,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    failed_on(&h, Dependency::Catalog);
-    assert_eq!(
-        h.metrics.contract_failures(),
-        vec![(
-            ValidationSurface::Bootstrap,
-            ValidationReason::ConstraintInvalid
-        )]
-    );
-    assert_eq!(h.coordinator.calls(), 0);
-}
-
-#[tokio::test]
-async fn an_active_quota_the_catalogue_no_longer_admits_fails_bootstrap() {
+async fn a_wrong_or_unregistered_metric_type_of_active_quotas_and_policies_does_not_fail_bootstrap()
+{
     let storage = Arc::new(InMemoryStorage::new());
-    let mut stranded = quota_draft(
-        SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
-            subject_id: "u-1".to_owned(),
-        },
-        Some(5),
-    );
-    stranded.metric = MetricId::parse(METRIC_OTHER).expect("metric");
+    seed_active_quota(&storage, INVALID_METRIC).await;
+    seed_active_quota(&storage, METRIC_OTHER).await;
     storage
-        .create_quota(&ctx(), &AccessScope::allow_all(), stranded, &[])
+        .create_policy(
+            &actor(),
+            PolicyDraft {
+                scope: PolicyScope::Metric {
+                    metric: metric(INVALID_METRIC),
+                },
+                ..persisted_policy("most-restrictive-wins", json!({}))
+            },
+            &[],
+        )
         .await
-        .expect("seeded");
+        .expect("persisted");
     let h = harness(storage, true, permitting_pdp());
-    let err = bootstrap(&h).run().await.err().expect("stranded Quota");
-    assert!(
-        matches!(
-            err,
-            DomainError::CatalogInvalid {
-                reason: ValidationReason::IncompatibleState,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
-    failed_on(&h, Dependency::Catalog);
-    assert_eq!(h.coordinator.calls(), 0);
-}
+    let mut broken = metric_type_document(INVALID_METRIC, json!({ "kind": "counter" }), json!({}));
+    broken["x-gts-abstract"] = json!(true);
+    h.registry.seed(INVALID_METRIC, broken);
 
-#[tokio::test]
-async fn a_compatible_active_quota_passes_the_compatibility_check() {
-    let storage = Arc::new(InMemoryStorage::new());
-    let mut bound_quota = quota_draft(
-        SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
-            subject_id: "u-1".to_owned(),
-        },
-        Some(5),
-    );
-    bound_quota.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
-    storage
-        .create_quota(&ctx(), &AccessScope::allow_all(), bound_quota, &[])
-        .await
-        .expect("seeded");
-    let h = harness(storage, true, permitting_pdp());
-    bootstrap(&h)
+    let bound = bootstrap(&h)
         .run()
         .await
-        .expect("the catalogue admits the binding");
-    assert!(h.readiness.is_ready());
-}
-
-#[tokio::test]
-async fn an_active_quota_on_a_removed_metric_is_flagged_and_bootstrap_completes() {
-    let storage = Arc::new(InMemoryStorage::new());
-    let mut stranded = quota_draft(
-        SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
-            subject_id: "u-1".to_owned(),
-        },
-        Some(5),
-    );
-    stranded.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
-    storage
-        .create_quota(&ctx(), &AccessScope::allow_all(), stranded, &[])
-        .await
-        .expect("seeded");
-    let h = harness(storage, true, permitting_pdp());
-    h.metric_registry.remove(METRIC_TOKENS);
-    bootstrap(&h)
-        .run()
-        .await
-        .expect("a removed metric is flagged, never fatal");
-    assert!(h.readiness.is_ready());
-    assert_eq!(
-        h.metric_registry.calls(),
-        2,
-        "each distinct metric is looked up once: the one the catalogue admits, \
-         and the removed one an active Quota is still bound to"
-    );
-}
-
-#[tokio::test]
-async fn an_active_quota_on_a_misclassified_metric_is_flagged_and_bootstrap_completes() {
-    let storage = Arc::new(InMemoryStorage::new());
-    let mut stranded = quota_draft(
-        SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
-            subject_id: "u-1".to_owned(),
-        },
-        Some(5),
-    );
-    stranded.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
-    storage
-        .create_quota(&ctx(), &AccessScope::allow_all(), stranded, &[])
-        .await
-        .expect("seeded");
-    let h = harness(storage, true, permitting_pdp());
-    h.metric_registry.set_invalid(METRIC_TOKENS);
-    bootstrap(&h)
-        .run()
-        .await
-        .expect("a malformed metric is flagged, never a registry outage");
-    assert!(h.readiness.is_ready());
-}
-
-#[tokio::test]
-async fn a_registry_that_does_not_answer_the_metric_scan_fails_on_the_registry_dependency() {
-    let storage = Arc::new(InMemoryStorage::new());
-    let mut bound_quota = quota_draft(
-        SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
-            subject_id: "u-1".to_owned(),
-        },
-        Some(5),
-    );
-    bound_quota.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
-    storage
-        .create_quota(&ctx(), &AccessScope::allow_all(), bound_quota, &[])
-        .await
-        .expect("seeded");
-    let h = harness(storage, true, permitting_pdp());
-    h.metric_registry.fail_all();
-    let err = bootstrap(&h).run().await.err().expect("registry outage");
+        .expect("a wrong metric type never fails bootstrap");
+    assert_eq!(h.readiness.snapshot(), ReadinessState::Ready);
+    assert_eq!(registry_reads(&h.registry), 1, "one batch read at start");
+    assert!(matches!(
+        bound.catalog.peek(&metric(INVALID_METRIC)),
+        Some(CatalogEntry::Unavailable {
+            reason: ValidationReason::Abstract
+        })
+    ));
+    assert_eq!(h.metrics.catalog_unavailable(), Some(1));
     assert!(
-        matches!(err, DomainError::TypesRegistryUnavailable(_)),
-        "{err:?}"
-    );
-    failed_on(&h, Dependency::TypesRegistry);
-    assert_eq!(
-        h.coordinator.calls(),
-        0,
-        "the cluster resolve never ran after the failed scan"
-    );
-}
-
-/// The mandatory real-registry test: registration, discovery, resolution,
-/// compilation, and an idempotent restart, with nothing mocked between the
-/// gear and `types-registry`.
-#[tokio::test]
-async fn the_real_registry_bootstraps_registers_discovers_compiles_and_restarts_idempotently() {
-    let mut extra = llm_gateway_documents();
-    extra.extend(metric_base_documents());
-    let client = in_process_registry(extra);
-    let registry: Arc<dyn ContractRegistry> = Arc::new(TypesRegistryContracts::new(client.clone()));
-
-    let first = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        permitting_pdp(),
-        registry.clone(),
-    );
-    let bound = bootstrap(&first).run().await.expect("first bootstrap");
-    assert!(first.readiness.is_ready());
-    let tokens = MetricId::parse(METRIC_TOKENS).expect("metric");
-    assert_eq!(
         bound
             .catalog
-            .map_subject(&tokens, &SubjectScope::tenant())
-            .expect("discovered and mapped")
-            .as_ref(),
-        LLM_TENANT_PROJECTION
+            .entry(&metric(METRIC_OTHER))
+            .await
+            .expect("remembered")
+            .is_none()
     );
-    let request = bound
-        .catalog
-        .request_contract(&tokens)
-        .expect("discovered from the registry listing");
-    assert_eq!(request.type_id.as_ref(), LLM_TOKEN_REQUEST);
-    request
-        .contract
-        .validate(&serde_json::json!({ "type": LLM_TOKEN_REQUEST, "metadata": { "region": "eu" } }))
-        .expect("compiled from the resolved registry content");
-
-    // A restart against the same registry re-asserts the QE definitions
-    // (byte-identical: a silent success) and publishes an equivalent catalogue.
-    let second = harness_with_registry(
-        Arc::new(InMemoryStorage::new()),
-        true,
-        permitting_pdp(),
-        registry,
-    );
-    let again = bootstrap(&second).run().await.expect("second bootstrap");
-    assert!(second.readiness.is_ready());
     assert_eq!(
-        again
-            .catalog
-            .map_subject(&tokens, &SubjectScope::user())
-            .expect("mapped")
-            .as_ref(),
-        LLM_USER_PROJECTION
+        registry_reads(&h.registry),
+        1,
+        "the unregistered metric is remembered from the read at start"
     );
-    assert!(first.metrics.contract_failures().is_empty());
-    assert!(second.metrics.contract_failures().is_empty());
+}
+
+#[tokio::test]
+async fn the_metric_types_of_active_quotas_and_policies_are_read_at_start() {
+    let storage = Arc::new(InMemoryStorage::new());
+    seed_active_quota(&storage, METRIC_TOKENS).await;
+    storage
+        .create_policy(
+            &actor(),
+            PolicyDraft {
+                scope: PolicyScope::Metric {
+                    metric: metric(METRIC_REQUESTS),
+                },
+                ..persisted_policy("most-restrictive-wins", json!({}))
+            },
+            &[],
+        )
+        .await
+        .expect("persisted");
+    let h = harness(storage, true, permitting_pdp());
+
+    let bound = bootstrap(&h).run().await.expect("bootstrap");
+
+    for held in [METRIC_TOKENS, METRIC_REQUESTS] {
+        assert!(
+            matches!(
+                bound.catalog.peek(&metric(held)),
+                Some(CatalogEntry::Served(_))
+            ),
+            "{held}"
+        );
+    }
+    assert_eq!(registry_reads(&h.registry), 1);
+}
+
+#[tokio::test]
+async fn a_start_while_the_registry_does_not_answer_fails() {
+    let storage = Arc::new(InMemoryStorage::new());
+    seed_active_quota(&storage, METRIC_TOKENS).await;
+    let h = harness(storage, true, permitting_pdp());
+    fail_registry_reads(&h.registry);
+
+    let Err(err) = bootstrap(&h).run().await else {
+        panic!("a replica must not start with an empty catalogue");
+    };
+    assert!(format!("{err:?}").contains("TypesRegistry"), "{err:?}");
+    assert!(!h.readiness.is_ready());
+    assert_eq!(h.metrics.catalog_read_failures(), [CatalogReadPhase::Start]);
+}
+
+#[tokio::test]
+async fn an_active_policy_that_no_longer_fits_its_metric_type_is_not_a_bootstrap_failure() {
+    let storage = Arc::new(InMemoryStorage::new());
+    let snapshot = PolicySchemaSnapshot {
+        schemas: [(
+            METRIC_TOKENS.to_owned(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "metadata": { "type": "object", "properties": { "zone": { "type": "string" } } }
+                }
+            }),
+        )]
+        .into_iter()
+        .collect(),
+        ..PolicySchemaSnapshot::default()
+    };
+    let policy = storage
+        .create_policy(
+            &actor(),
+            PolicyDraft {
+                schema_snapshot: snapshot,
+                ..persisted_policy(
+                    "cel",
+                    json!({ "expr": r#"{"deny": {"reason": request.zone}}"# }),
+                )
+            },
+            &[],
+        )
+        .await
+        .expect("persisted");
+    let h = harness(storage, true, permitting_pdp());
+
+    let bound = bootstrap(&h)
+        .run()
+        .await
+        .expect("the mismatch is found at evaluation");
+    assert!(h.readiness.is_ready());
+    assert!(
+        bound
+            .artifacts
+            .get(&policy.policy_id, policy.version)
+            .is_some(),
+        "rebuilt from the snapshot it was checked against"
+    );
+}
+
+#[test]
+fn qe_registers_no_gts_type_for_subjects_or_metrics() {
+    let ids: Vec<String> = toolkit::gts::all_inventory_type_schemas()
+        .expect("inventory")
+        .into_iter()
+        .chain(toolkit::gts::all_inventory_instances().expect("inventory"))
+        .filter_map(|document| {
+            document["$id"]
+                .as_str()
+                .or_else(|| document["id"].as_str())
+                .map(|id| id.trim_start_matches("gts://").to_owned())
+        })
+        .collect();
+    for retired in [
+        "subj",
+        "scope",
+        "res",
+        "request",
+        "constraint",
+        "metric_type",
+    ] {
+        let prefix = format!("gts.cf.core.qe.{retired}.v1~");
+        assert!(
+            ids.iter().all(|id| !id.starts_with(&prefix)),
+            "{prefix} is defined"
+        );
+    }
+    for kept in [
+        quota_enforcement_sdk::QuotaEnforcementStoragePluginSpecV1::TYPE_ID,
+        quota_enforcement_sdk::QuotaNotificationSinkSpecV1::TYPE_ID,
+    ] {
+        assert!(ids.iter().any(|id| id == kept), "{kept} is defined");
+    }
 }
 
 /// A policy an operator persisted before this deployment was built.
@@ -617,7 +479,7 @@ async fn an_active_policy_naming_an_unregistered_engine_fails_readiness_on_engin
     let storage = Arc::new(InMemoryStorage::new());
     storage
         .create_policy(
-            &ctx(),
+            &actor(),
             persisted_policy("starlark", serde_json::json!({})),
             &[],
         )
@@ -651,7 +513,7 @@ async fn an_active_policy_whose_config_no_longer_compiles_fails_readiness_and_is
     let storage = Arc::new(InMemoryStorage::new());
     storage
         .create_policy(
-            &ctx(),
+            &actor(),
             persisted_policy(
                 "most-restrictive-wins",
                 serde_json::json!({ "weights": [1] }),
@@ -697,6 +559,7 @@ fn harness_with_sinks(
 /// Commit one Quota with one `quota-changed` event into the double's outbox.
 async fn commit_one_event(storage: &InMemoryStorage) -> quota_enforcement_sdk::NotificationEvent {
     let event = crate::domain::quotas::events::quota_changed(
+        crate::test_support::actor(),
         tenant(),
         None,
         None,
@@ -705,11 +568,11 @@ async fn commit_one_event(storage: &InMemoryStorage) -> quota_enforcement_sdk::N
     );
     storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &AccessScope::allow_all(),
             quota_draft(
                 SubjectRef {
-                    projection_type: type_id(LLM_USER_PROJECTION),
+                    subject_type: GtsTypeId::new(USER_SUBJECT_TYPE),
                     subject_id: "u-1".to_owned(),
                 },
                 Some(10),
@@ -738,8 +601,8 @@ async fn bootstrap_starts_delivery_to_every_sink_of_every_vendor() {
     for sink in [&a, &g] {
         let received = sink.received();
         assert_eq!(received.len(), 1, "every vendor's sink receives the event");
-        assert_eq!(received[0].1.event_id, event.event_id);
-        assert!(!received[0].0.is_anonymous());
+        assert_eq!(received[0].event_id, event.event_id);
+        assert_eq!(received[0].actor, event.actor);
     }
 
     bootstrap.delivery().stop().await;
@@ -850,7 +713,6 @@ async fn a_storage_that_refuses_delivery_fails_readiness_on_storage() {
         .start_notification_delivery(Arc::new(
             crate::domain::notifications::NotificationDispatcher::new(
                 Vec::new(),
-                crate::domain::notifications::dispatcher_context().expect("context"),
                 crate::domain::notifications::DispatchLimits::default(),
                 h.metrics.clone(),
             ),

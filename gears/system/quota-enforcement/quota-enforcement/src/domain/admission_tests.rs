@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use authz_resolver_sdk::PolicyEnforcer;
-use quota_enforcement_sdk::TenantId;
-use toolkit_security::pep_properties;
+use quota_enforcement_sdk::{Actor, TenantId};
+use toolkit_security::{AccessScope, PlatformIdentity, pep_properties};
 use uuid::Uuid;
 
 use serde_json::{Map, Value};
@@ -14,7 +14,7 @@ use crate::domain::pep::{actions, resources};
 use crate::domain::ports::metrics::DenialReason;
 use crate::test_support::{
     DenyAllPdp, FailingPdp, HangingPdp, PermitSubtreePdp, PermitTenantsPdp, PermitUnconstrainedPdp,
-    RecordingMetrics, ctx, tenant,
+    RecordingMetrics, UncallablePdp, actor, caller, tenant,
 };
 
 fn admission(
@@ -33,8 +33,8 @@ async fn a_permit_that_names_the_target_tenant_is_admitted_with_the_scope_unmodi
     let (admission, metrics) = admission(pdp.clone());
 
     let admitted = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::CREATE,
             AdmissionTarget::tenant(tenant()),
@@ -49,6 +49,11 @@ async fn a_permit_that_names_the_target_tenant_is_admitted_with_the_scope_unmodi
         "the scope is passed through with its tenant constraint"
     );
     assert!(!admitted.access_scope.is_unconstrained());
+    assert_eq!(
+        admitted.actor,
+        actor(),
+        "the actor is the authenticated caller"
+    );
     assert_eq!(pdp.calls(), 1, "exactly one PDP round trip");
     assert!(
         metrics.denials().is_empty(),
@@ -66,8 +71,8 @@ async fn a_subtree_permit_is_refused_because_the_tenant_hierarchy_is_never_adver
     let root = Uuid::from_u128(0xa11ce);
     let (admission, metrics) = admission(Arc::new(PermitSubtreePdp::new(root)));
     let err = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::CREATE,
             AdmissionTarget::tenant(tenant()),
@@ -89,8 +94,8 @@ async fn a_subtree_permit_is_refused_because_the_tenant_hierarchy_is_never_adver
 async fn an_unconstrained_permit_under_required_constraints_fails_closed() {
     let (admission, metrics) = admission(Arc::new(PermitUnconstrainedPdp));
     let err = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::OPERATION,
             actions::DEBIT,
             AdmissionTarget::tenant(tenant()),
@@ -105,8 +110,8 @@ async fn an_unconstrained_permit_under_required_constraints_fails_closed() {
 async fn an_explicit_denial_is_permission_denied() {
     let (admission, metrics) = admission(Arc::new(DenyAllPdp));
     let err = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::LEASE,
             actions::RESERVE,
             AdmissionTarget::tenant(tenant()),
@@ -121,8 +126,8 @@ async fn an_explicit_denial_is_permission_denied() {
 async fn an_unreachable_pdp_is_unavailable_never_a_permit() {
     let (admission, metrics) = admission(Arc::new(FailingPdp));
     let err = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::GET,
             AdmissionTarget::tenant(tenant()),
@@ -140,8 +145,8 @@ async fn a_pdp_that_overruns_the_deadline_is_unavailable_never_a_permit() {
         PolicyEnforcer::new(Arc::new(HangingPdp)).with_deadline(Duration::from_millis(20));
     let admission = Admission::new(enforcer, metrics.clone());
     let err = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::GET,
             AdmissionTarget::tenant(tenant()),
@@ -158,8 +163,8 @@ async fn malformed_targets_are_rejected_before_any_pdp_call() {
     let (admission, metrics) = admission(pdp.clone());
 
     let nil_tenant = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::CREATE,
             AdmissionTarget::tenant(TenantId::new(Uuid::nil())),
@@ -174,8 +179,8 @@ async fn malformed_targets_are_rejected_before_any_pdp_call() {
         }
     );
     let nil_resource = admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::GET,
             AdmissionTarget::resource(tenant(), Uuid::nil()),
@@ -202,8 +207,8 @@ async fn a_resource_target_forwards_the_resource_id_to_the_pdp() {
     let (admission, _) = admission(pdp.clone());
     let resource_id = Uuid::from_u128(0x77);
     admission
+        .pdp(caller())
         .admit(
-            &ctx(),
             &resources::QUOTA,
             actions::UPDATE,
             AdmissionTarget::resource(tenant(), resource_id),
@@ -225,8 +230,8 @@ async fn extra_properties_reach_the_pdp_and_never_override_the_target_tenant() {
         Value::String(other.to_string()),
     );
     admission
+        .pdp(caller())
         .admit_with_properties(
-            &ctx(),
             &resources::OPERATION,
             actions::DEBIT,
             AdmissionTarget::tenant(tenant()),
@@ -251,7 +256,8 @@ async fn extra_properties_reach_the_pdp_and_never_override_the_target_tenant() {
 async fn platform_operator_accepts_explicit_unconstrained_permit() {
     let (admission, metrics) = admission(Arc::new(PermitUnconstrainedPdp));
     let admitted = admission
-        .admit_operator(&ctx(), actions::CREATE)
+        .pdp(caller())
+        .admit_operator(actions::CREATE)
         .await
         .expect("operator permit");
     assert!(admitted.access_scope().is_unconstrained());
@@ -262,17 +268,120 @@ async fn platform_operator_accepts_explicit_unconstrained_permit() {
 async fn platform_operator_rejects_denial_unavailability_and_row_constraints() {
     let (denied, _) = admission(Arc::new(DenyAllPdp));
     assert!(matches!(
-        denied.admit_operator(&ctx(), actions::CREATE).await,
+        denied.pdp(caller()).admit_operator(actions::CREATE).await,
         Err(DomainError::PdpDenied { .. })
     ));
     let (unavailable, _) = admission(Arc::new(FailingPdp));
     assert!(matches!(
-        unavailable.admit_operator(&ctx(), actions::CREATE).await,
+        unavailable
+            .pdp(caller())
+            .admit_operator(actions::CREATE)
+            .await,
         Err(DomainError::PdpUnavailable { .. })
     ));
     let (constrained, _) = admission(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])));
     assert!(matches!(
-        constrained.admit_operator(&ctx(), actions::CREATE).await,
+        constrained
+            .pdp(caller())
+            .admit_operator(actions::CREATE)
+            .await,
         Err(DomainError::PdpDenied { .. })
     ));
+}
+
+fn resolver_caller() -> PlatformIdentity {
+    PlatformIdentity::Shared {
+        name: "billing".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn trusted_admission_names_the_request_tenant_only_and_records_the_platform_caller() {
+    let (admission, metrics) = admission(Arc::new(UncallablePdp));
+    let token = Uuid::from_u128(0x706b_656e);
+
+    let admitted = admission
+        .trusted(Some(resolver_caller()))
+        .admit(
+            &resources::LEASE,
+            actions::COMMIT,
+            AdmissionTarget::resource(tenant(), token),
+        )
+        .await
+        .expect("admitted without a PDP");
+
+    assert_eq!(admitted.tenant_id, tenant());
+    assert_eq!(
+        admitted.access_scope,
+        AccessScope::for_tenant(tenant().as_uuid())
+    );
+    assert_eq!(
+        admitted.actor,
+        Actor::Platform {
+            identity: Some(resolver_caller())
+        }
+    );
+    assert!(metrics.denials().is_empty());
+}
+
+#[tokio::test]
+async fn trusted_admission_without_a_platform_identity_names_no_module() {
+    let (admission, _) = admission(Arc::new(UncallablePdp));
+    let admitted = admission
+        .trusted(None)
+        .admit(
+            &resources::OPERATION,
+            actions::DEBIT,
+            AdmissionTarget::tenant(tenant()),
+        )
+        .await
+        .expect("admitted");
+    assert_eq!(admitted.actor, Actor::Platform { identity: None });
+    assert_eq!(admitted.actor.to_string(), "platform");
+}
+
+#[tokio::test]
+async fn trusted_admission_rejects_a_malformed_target() {
+    let (admission, metrics) = admission(Arc::new(UncallablePdp));
+    let gate = admission.trusted(None);
+    for target in [
+        AdmissionTarget::tenant(TenantId::new(Uuid::nil())),
+        AdmissionTarget::resource(tenant(), Uuid::nil()),
+    ] {
+        let err = gate
+            .admit(&resources::LEASE, actions::RELEASE, target)
+            .await
+            .expect_err("malformed");
+        assert!(
+            matches!(err, DomainError::InvalidArgument { .. }),
+            "{err:?}"
+        );
+    }
+    assert_eq!(
+        metrics.denials(),
+        vec![DenialReason::InvalidArgument, DenialReason::InvalidArgument]
+    );
+}
+
+#[tokio::test]
+async fn trusted_admission_refuses_policy_management() {
+    let (admission, metrics) = admission(Arc::new(UncallablePdp));
+    let gate = admission.trusted(Some(resolver_caller()));
+    for action in [
+        actions::CREATE,
+        actions::UPDATE,
+        actions::POLICY_ROLLBACK,
+        actions::DELETE,
+        actions::GET,
+        actions::LIST,
+    ] {
+        assert!(
+            matches!(
+                gate.admit_operator(action).await,
+                Err(DomainError::PdpDenied { .. })
+            ),
+            "{action}"
+        );
+    }
+    assert_eq!(metrics.denials(), vec![DenialReason::PermissionDenied; 6]);
 }

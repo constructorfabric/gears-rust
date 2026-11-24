@@ -21,8 +21,7 @@ use tower::ServiceExt as _;
 use super::super::routes::{PATH_PREFIX, register_routes};
 use crate::domain::Service;
 use crate::test_support::{
-    LLM_TOKEN_CONSTRAINT, LLM_USER_PROJECTION, METRIC_TOKENS, PermitTenantsPdp, bound_service_over,
-    ctx, tenant,
+    METRIC_TOKENS, PermitTenantsPdp, USER_SUBJECT_TYPE, bound_service_over, ctx, tenant,
 };
 
 async fn seeded() -> (Router, Arc<InMemoryStorage>, QuotaId) {
@@ -34,12 +33,12 @@ async fn seeded() -> (Router, Arc<InMemoryStorage>, QuotaId) {
     storage.bootstrap(&bundle).await.expect("bootstrap");
     let quota = storage
         .create_quota(
-            &ctx(),
+            &crate::test_support::actor(),
             &AccessScope::allow_all(),
             QuotaDraft {
                 tenant_id: tenant(),
                 subject: SubjectRef {
-                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
                     subject_id: "u-1".to_owned(),
                 },
                 metric: quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
@@ -52,10 +51,6 @@ async fn seeded() -> (Router, Arc<InMemoryStorage>, QuotaId) {
                 fail_open_hint: false,
                 metadata: serde_json::Map::new(),
                 source: QuotaSource::Operator,
-                constraint_contract: quota_enforcement_sdk::ContractRef {
-                    type_id: gts::GtsTypeId::new(LLM_TOKEN_CONSTRAINT),
-                    version: 1,
-                },
             },
             &[],
         )
@@ -94,9 +89,8 @@ async fn post(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
 fn attribution() -> Value {
     json!({
         "tenant_id": tenant().as_uuid(),
-        "metric": METRIC_TOKENS,
-        "subjects": [{ "kind": quota_enforcement_sdk::SCOPE_USER, "id": "u-1" }],
-        "metadata": { "region": "eu-west-1" }
+        "subjects": [{ "type": USER_SUBJECT_TYPE, "id": "u-1" }],
+        "metric": { "type": METRIC_TOKENS, "metadata": { "region": "eu-west-1" } }
     })
 }
 
@@ -113,7 +107,7 @@ async fn a_debit_answers_two_hundred_with_its_decision() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["outcome"], json!("allowed"));
-    assert_eq!(body["debit_plan"][0]["amount"], json!(10));
+    assert_eq!(body["debit_plan"][0][0]["amount"], json!(10));
     assert_eq!(storage.consumed(quota), 10);
 }
 
@@ -146,7 +140,7 @@ async fn decision_shaped_fields_a_caller_echoed_back_are_ignored() {
         "amount": 10,
         "idempotency_key": "k1",
         "result": { "outcome": "allowed" },
-        "debit_plan": [{ "quota_id": uuid::Uuid::nil(), "amount": 9999 }],
+        "debit_plan": [[{ "quota_id": uuid::Uuid::nil(), "amount": 9999 }]],
         "diagnostics": { "engine": "noise" }
     });
 
@@ -158,7 +152,7 @@ async fn decision_shaped_fields_a_caller_echoed_back_are_ignored() {
     let (replay_status, replayed) = post(&app, "/operations/debit", fresh).await;
     assert_eq!(replay_status, StatusCode::OK);
     assert_eq!(replayed, echoed);
-    assert_eq!(echoed["debit_plan"][0]["amount"], json!(10));
+    assert_eq!(echoed["debit_plan"][0][0]["amount"], json!(10));
     assert_eq!(echoed["diagnostics"].get("engine"), None);
 }
 
@@ -223,8 +217,7 @@ async fn a_rollback_of_an_unknown_operation_is_four_oh_four() {
         "/operations/rollback",
         json!({
             "attribution": attribution(),
-            "original_idempotency_key": "never-happened",
-            "idempotency_key": "r1"
+            "original_idempotency_key": "never-happened"
         }),
     )
     .await;
@@ -282,13 +275,12 @@ async fn a_credit_and_a_rollback_round_trip_over_http() {
         "/operations/rollback",
         json!({
             "attribution": attribution(),
-            "original_idempotency_key": "k1",
-            "idempotency_key": "r1"
+            "original_idempotency_key": "k1"
         }),
     )
     .await;
     assert_eq!(rollback_status, StatusCode::OK);
-    assert_eq!(storage.consumed(quota), 0, "the reversal floors at zero");
+    assert_eq!(storage.consumed(quota), 0, "the return floors at zero");
 }
 
 #[tokio::test]

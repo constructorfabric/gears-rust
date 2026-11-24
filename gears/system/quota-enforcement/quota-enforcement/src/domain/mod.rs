@@ -16,11 +16,12 @@ pub mod quotas;
 pub mod readiness;
 pub mod service;
 pub mod tokens;
+pub(crate) mod trusted;
 
 pub use admission::{Admission, AdmissionTarget, Admitted};
-pub use attribution::{AdmittedEvaluation, Attribution, MappedAttribution, PolicyInput};
-pub use bootstrap::{Bootstrap, BootstrapReporting, Bound, CatalogBinding};
-pub use catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
+pub use attribution::{AdmittedEvaluation, AdmittedReversal, Attribution, MappedAttribution};
+pub use bootstrap::{Bootstrap, BootstrapReporting, Bound};
+pub use catalog::MetricCatalog;
 pub use error::{Dependency, DomainError, PluginKind, ResourceKind};
 pub use plugins::PluginBinding;
 pub use ports::{CoordinatorBinding, LeaderWork, SingletonCoordinator, SingletonScope};

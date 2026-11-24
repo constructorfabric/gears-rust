@@ -25,7 +25,7 @@ use quota_enforcement_sdk::{PageRequest, QuotaId, TenantId};
 use toolkit::api::odata::OData;
 use toolkit_odata::{Page, PageInfo};
 
-/// `POST /v1/quota-enforcement/quotas`: 201 with the view and a `Location`.
+/// `POST /quota-enforcement/v1/quotas`: 201 with the view and a `Location`.
 ///
 /// # Errors
 ///
@@ -38,9 +38,9 @@ pub async fn create_quota(
     JsonBody(body): JsonBody<CreateQuotaDto>,
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-request
-    let quotas = service.quotas()?;
+    let quotas = service.quotas(&ctx)?;
     let request = CreateQuotaRequest::try_from(body)?;
-    let view = quotas.create(&ctx, request).await?;
+    let view = quotas.create(request).await?;
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-request
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-return
     let id = view.quota.id.to_string();
@@ -48,7 +48,7 @@ pub async fn create_quota(
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-return
 }
 
-/// `GET /v1/quota-enforcement/quotas/{id}`.
+/// `GET /quota-enforcement/v1/quotas/{id}`.
 ///
 /// # Errors
 ///
@@ -60,15 +60,15 @@ pub async fn get_quota(
     Path(id): Path<Uuid>,
 ) -> ApiResult<axum::Json<QuotaViewDto>> {
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
-    let quotas = service.quotas()?;
-    let view = quotas.get(&ctx, QuotaId::new(id)).await?;
+    let quotas = service.quotas(&ctx)?;
+    let view = quotas.get(QuotaId::new(id)).await?;
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-request
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-return
     Ok(axum::Json(QuotaViewDto::from(view)))
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-return
 }
 
-/// `GET /v1/quota-enforcement/quotas`: `$filter`, `$orderby=id asc`, `$top` and a forward cursor.
+/// `GET /quota-enforcement/v1/quotas`: `$filter`, `$orderby=id asc`, `$top` and a forward cursor.
 ///
 /// # Errors
 ///
@@ -82,7 +82,7 @@ pub async fn list_quotas(
     reject_unknown_params(&params)?;
     reject_select(query.select.as_ref())?;
     require_order(&query.order, "id")?;
-    let quotas = service.quotas()?;
+    let quotas = service.quotas(&ctx)?;
     let limit = page_size(
         query.limit,
         PageRequest::DEFAULT_LIMIT,
@@ -95,7 +95,7 @@ pub async fn list_quotas(
             .unwrap_or_else(|| TenantId::new(ctx.subject_tenant_id())),
     );
     let cursor = continuation(query.cursor.as_ref(), QUOTA_ORDER, &binding)?;
-    let page = quotas.list(&ctx, parts.into_request(limit, cursor)).await?;
+    let page = quotas.list(parts.into_request(limit, cursor)).await?;
     Ok(axum::Json(Page {
         items: page.items.into_iter().map(QuotaViewDto::from).collect(),
         page_info: PageInfo {
@@ -109,7 +109,7 @@ pub async fn list_quotas(
 /// The keyset order of the Quota list, as a cursor's signed sort token.
 const QUOTA_ORDER: &str = "+id";
 
-/// `PATCH /v1/quota-enforcement/quotas/{id}`.
+/// `PATCH /quota-enforcement/v1/quotas/{id}`.
 ///
 /// # Errors
 ///
@@ -122,9 +122,9 @@ pub async fn update_quota(
     JsonBody(body): JsonBody<UpdateQuotaDto>,
 ) -> ApiResult<axum::Json<QuotaViewDto>> {
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
-    let quotas = service.quotas()?;
+    let quotas = service.quotas(&ctx)?;
     let view = quotas
-        .update(&ctx, QuotaId::new(id), UpdateQuotaRequest::from(body))
+        .update(QuotaId::new(id), UpdateQuotaRequest::from(body))
         .await?;
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-request
     // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-return
@@ -132,7 +132,7 @@ pub async fn update_quota(
     // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-return
 }
 
-/// `POST /v1/quota-enforcement/quotas/{id}/deactivate`: 200 with the outcome.
+/// `POST /quota-enforcement/v1/quotas/{id}/deactivate`: 200 with the outcome.
 ///
 /// # Errors
 ///
@@ -142,7 +142,7 @@ pub async fn deactivate_quota(
     Extension(service): Extension<Arc<Service>>,
     Path(id): Path<Uuid>,
 ) -> ApiResult<axum::Json<DeactivateOutcomeDto>> {
-    let quotas = service.quotas()?;
-    let outcome = quotas.deactivate(&ctx, QuotaId::new(id)).await?;
+    let quotas = service.quotas(&ctx)?;
+    let outcome = quotas.deactivate(QuotaId::new(id)).await?;
     Ok(axum::Json(DeactivateOutcomeDto::from(outcome)))
 }

@@ -6,7 +6,7 @@
 //! hands it to the dispatcher (`domain::notifications`) once it commits.
 
 use quota_enforcement_sdk::{
-    EventId, NotificationEvent, NotificationEventKind, QuotaId, SubjectRef, TenantId,
+    Actor, EventId, NotificationEvent, NotificationEventKind, QuotaId, SubjectRef, TenantId,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -40,6 +40,7 @@ impl ChangeKind {
 /// assigns the id and fills it in.
 #[must_use]
 pub fn quota_changed(
+    actor: Actor,
     tenant_id: TenantId,
     quota_id: Option<QuotaId>,
     subject: Option<SubjectRef>,
@@ -49,6 +50,7 @@ pub fn quota_changed(
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
+        actor,
         scope: quota_enforcement_sdk::NotificationScope::Tenant { tenant_id },
         quota_id,
         policy_id: None,

@@ -45,28 +45,29 @@
 Implements the Quota Resolution Policy entity with immutable versioning and rollback, the `QuotaResolutionEngineV1`
 plugin contract with the `most-restrictive-wins` and `cel` built-ins, multi-Quota arbitration with strict Debit-Plan
 invariants enforced at the Engine boundary, cascade and attribute-based selection expressiveness, the hard-cap
-denial contract, and the Engine's check of Quota metadata when a Quota is written.
+denial contract.
 
 A **metric type** is a GTS type derived from the quota resolver's metric base `gts.cf.core.quota.metric.v1~`, which
 the module that owns the metric registers ([ADR-0013](../ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md)). A
 request names its metric as a **metric object** `{type, id?, metadata}`; the schema of the metric type refines
 `metadata`. `MetricCatalog` is the process-local catalogue of the metric types that QE has read; a **catalogue entry**
 holds the resolved schema and the traits of one metric type and is served or unavailable (projection-contracts
-feature). **Quota metadata** is the JSON object that an operator writes into a Quota; it has no registered schema, and
-its meaning belongs to the Policy that reads it.
+feature). **Quota metadata** is the JSON object that an operator writes into a Quota: its conditions over the
+`metadata` of the request. QE core leaves out the Quotas whose conditions do not hold before an Engine runs, so no
+Engine reads Quota metadata (quota-lifecycle feature).
 
 ### 1.2 Purpose
 
 Arbitration logic is not a property of QE-core: it is a `QuotaResolutionEngineV1` plugin selected per scope through an
 operator-managed, versioned Policy. This feature delivers that seam. QE-core enforces only the closed Debit-Plan
 invariant set at the Engine boundary, so operator-authored `cel` Policies and future Engines cannot corrupt counters,
-while cascade, split, and metadata-gated selection stay expressible without core changes. It also seeds the `global`
+while cascade and split stay expressible without core changes. It also seeds the `global`
 Policy at bootstrap, extending the foundation bootstrap flow, so evaluation never enters a "no Policy applies" state
 and no active Policy ever references an unregistered Engine.
 
 **Scope**: `PolicyService` with scope precedence (per-metric over `global`) and the four-state version lifecycle with
 optimistic `if_match_version` concurrency; `EngineRegistry` with fail-fast bootstrap registration and `global`-Policy
-seeding; the Engine contract (`id`/`validate_config`/`validate_quota_metadata`/`evaluate`) with the `ValidatedConfig`
+seeding; the Engine contract (`id`/`validate_config`/`evaluate`) with the `ValidatedConfig`
 cache keyed by `(policy_id, policy_version)`; Debit-Plan invariant enforcement at the Engine boundary with violation
 telemetry; the `most-restrictive-wins` binding-Quota selection with validity-window prefilter; the sandboxed
 cost-bounded `cel` Engine with static checking against the snapshotted schema of the metric type; the operator-only
@@ -109,8 +110,7 @@ DESIGN/consumption-operations alignment item).
 - **ADR**: [ADR-0005 Pluggable evaluation engine](../ADR/0005-cpt-cf-quota-enforcement-adr-evaluation-engine.md)
   (`cpt-cf-quota-enforcement-adr-evaluation-engine`, status: accepted); [ADR-0013 Metric
   types](../ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md) (`cpt-cf-quota-enforcement-adr-metric-types`; the
-  `{request, arbitration}` input, the Engine's check of Quota metadata, and the operator's responsibility for a Policy
-  change); [ADR-0012 Metric catalogue](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)
+  `request` input, and Quota metadata as conditions that no Engine reads); [ADR-0012 Metric catalogue](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)
   (`cpt-cf-quota-enforcement-adr-contract-catalogue`; Policy writes for a metric with no served entry, and a metric
   type that changes under an active Policy); [ADR-0008 Quota resolver
   subjects](../ADR/0008-cpt-cf-quota-enforcement-adr-quota-resolver-subjects.md) (`Tenant` and `Subject` tiers);
@@ -147,17 +147,17 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
 - Create at a scope that already has an active Policy: `POLICY_SCOPE_OCCUPIED` (canonical `AlreadyExists`, 409)
 
 **Steps**:
-1. [x] - `p1` - Operator sends `POST /v1/quota-enforcement/policies` (create) or `PATCH /v1/quota-enforcement/policies/{id}` (update, with `if_match_version`) carrying scope (`global` or `metric=<metric_name>`), `engine_id`, opaque `engine_config`, optional per-Policy timeout (default 5ms, clamped to the operator-configured upper bound), and optional `comment`; foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has already returned the actor and the `AccessScope` - `inst-pw-request`
+1. [x] - `p1` - Operator sends `POST /quota-enforcement/v1/policies` (create) or `PATCH /quota-enforcement/v1/policies/{id}` (update, with `if_match_version`) carrying scope (`global` or `metric=<metric_name>`), `engine_id`, opaque `engine_config`, optional per-Policy timeout (default 5ms, clamped to the operator-configured upper bound), and optional `comment`; foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has already returned the actor and the `AccessScope` - `inst-pw-request`
 2. [x] - `p1` - **IF** create targets a scope that already has an active Policy - `inst-pw-dup-if`
    1. [x] - `p1` - **RETURN** `POLICY_SCOPE_OCCUPIED` (canonical `AlreadyExists`, 409); one active Policy per exact scope - `inst-pw-dup`
 3. [x] - `p1` - Resolve `engine_id` against `EngineRegistry` - `inst-pw-engine-lookup`
 4. [x] - `p1` - **IF** the `engine_id` is not registered in the current deployment - `inst-pw-unknown-if`
    1. [x] - `p1` - **RETURN** `UNKNOWN_ENGINE` naming the registered Engines available in this deployment - `inst-pw-unknown`
 5. [ ] - `p1` - API: for a Policy of scope `metric=<metric_name>`, where the name is the id of a metric type, take the resolved schema of that metric type from the metric's `MetricCatalog` entry and snapshot it; the projection-contracts admission check (`cpt-cf-quota-enforcement-algo-catalog-membership`) runs first: for a metric the catalogue does not hold the write reads the metric type as a request does, with the same errors, and a metric whose entry is unavailable is rejected with `PROJECTION_NOT_RESOLVABLE`; the snapshot holds only the metric type schema that the Policy is checked against, and what a Policy of the `global` scope is checked against is defined with its Engine; resolution and snapshotting occur at Policy create/update, never on the evaluation hot path - `inst-pw-snapshot`
-6. [ ] - `p1` - Call the named Engine's `validate_config(raw)` with the schema snapshot: the `cel` validator parses, type-checks, and statically verifies references to `request` per `cpt-cf-quota-enforcement-algo-cel-engine`; the `most-restrictive-wins` validator rejects any non-empty config; validation work is bounded before it starts: the serialized `engine_config` by the operator-configured `config_max_bytes` (default 16 KiB, `POLICY_CONFIG_TOO_LARGE`), the schema snapshot by byte, schema-count, and depth limits (`POLICY_SCHEMA_TOO_LARGE`), and a `cel` expression by 8 KiB of source, 32 levels of bracket nesting, and 1024 AST nodes at depth 48 after macro expansion; write-path validation and cache-miss rebuilds share the `preparation_max_concurrency` cap (default 4) - `inst-pw-validate`
+6. [ ] - `p1` - Call the named Engine's `validate_config(raw)` with the schema snapshot: the `cel` validator parses, type-checks, and statically verifies references to `request` per `cpt-cf-quota-enforcement-algo-cel-engine`; the `most-restrictive-wins` validator rejects any non-empty config; validation work is bounded before it starts: the serialized `engine_config` by the operator-configured `config_max_bytes` (default 16 KiB, `POLICY_CONFIG_TOO_LARGE`), the schema snapshot by byte and schema-count limits (`POLICY_SCHEMA_TOO_LARGE`) and by a depth limit (`POLICY_SCHEMA_TOO_DEEP`), and a `cel` expression by 8 KiB of source, 32 levels of bracket nesting, and 1024 AST nodes at depth 48 after macro expansion; write-path validation and cache-miss rebuilds share the `preparation_max_concurrency` cap (default 4) - `inst-pw-validate`
 7. [x] - `p1` - **IF** validation fails - `inst-pw-invalid-if`
    1. [x] - `p1` - **RETURN** the Engine's structured error before persistence; persisted Policies always carry an Engine-validated config - `inst-pw-invalid`
-8. [ ] - `p1` - The write does not read or check existing Quotas: QE does not check Quota metadata against a Policy that is created, changed, or replaced, by an update, a rollback, or a delete alike; a Policy change is the operator's responsibility: the operator makes sure, before the change, that the metadata of the existing Quotas fits the new Policy, and can check after it with the preview operation, an evaluation that returns a Decision and changes no counter - `inst-pw-no-quota-check`
+8. [ ] - `p1` - The write does not read or check existing Quotas, by an update, a rollback, or a delete alike: a Policy reads no Quota metadata; a Policy change is the operator's responsibility, and the operator can check after it with the preview operation, an evaluation that returns a Decision and changes no counter - `inst-pw-no-quota-check`
 9. [x] - `p1` - DB: in one storage transaction (`cpt-cf-quota-enforcement-seq-policy-version-update`): insert the new `policy_versions` row with `version_state = active` (create: `policy_version = 1`; update: `N + 1`) carrying the step-5 schema snapshot narrowed to the inputs the config reads, transition the prior active version to `superseded` (update only), move the latest-pointer atomically, enqueue the `policy-changed` event (`change_kind = created` or `updated`) in the same transaction (invariant I11; dispatch is owned by the notifications feature). The compiled artifact from step 6 is retained and published into the `ValidatedConfig` cache keyed by `(policy_id, policy_version)` only after the transaction commits, per the Engine Plugin Trait compiled-artifact contract; a rolled-back transaction publishes nothing; the cache holds at most `artifact_cache_entries` artifacts (default 512) and evicts the oldest first, and a cache miss rebuilds from the persisted config - `inst-pw-persist`
 10. [x] - `p1` - **IF** `if_match_version` does not equal the current latest - `inst-pw-conflict-if`
    1. [x] - `p1` - **RETURN** `VERSION_CONFLICT` (409) with the current latest; increment `policy_version_conflict_rejections_total`; no version row is written - `inst-pw-conflict`
@@ -179,7 +179,7 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
   never re-activated
 
 **Steps**:
-1. [x] - `p1` - Operator sends `POST /v1/quota-enforcement/policies/{id}/rollback` with `target_version` and optional `comment` - `inst-prd-rollback-request`
+1. [x] - `p1` - Operator sends `POST /quota-enforcement/v1/policies/{id}/rollback` with `target_version` and optional `comment` - `inst-prd-rollback-request`
 2. [x] - `p1` - **IF** the Policy is deleted - `inst-prd-deleted-if`
    1. [x] - `p1` - **RETURN** `POLICY_DELETED` (400), whatever `target_version` names; a deleted Policy's versions are never re-activated - `inst-prd-deleted`
 3. [x] - `p1` - **IF** `target_version` does not exist - `inst-prd-unknown-if`
@@ -202,7 +202,7 @@ consumption-operations feature), `cpt-cf-quota-enforcement-usecase-region-gated-
 - Delete of the seeded `global` Policy: `CANNOT_DELETE_SEEDED_GLOBAL_POLICY` (canonical `FailedPrecondition`, HTTP 400)
 
 **Steps**:
-1. [x] - `p1` - Operator sends `DELETE /v1/quota-enforcement/policies/{id}` with optional `comment` - `inst-prd-delete-request`
+1. [x] - `p1` - Operator sends `DELETE /quota-enforcement/v1/policies/{id}` with optional `comment` - `inst-prd-delete-request`
 2. [x] - `p1` - **IF** the target is the seeded `global` Policy - `inst-prd-global-if`
    1. [x] - `p1` - **RETURN** canonical `FailedPrecondition` (HTTP 400, `reason = "CANNOT_DELETE_SEEDED_GLOBAL_POLICY"`); the seeded global Policy is never deletable - `inst-prd-global`
 3. [x] - `p1` - DB: atomically transition the currently-active version to `deleted` (terminal), clear the latest-pointer, and enqueue `policy-changed` with `change_kind = deleted`; historical versions keep their existing `superseded`/`rolled_back` state; subsequent evaluations in this scope fall through to the next-most-specific scope - `inst-prd-delete-apply`
@@ -234,7 +234,8 @@ plugin `bootstrap()` seeding step
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-engine-boundary`
 
 **Input**: the operation's metric, the materialized `EvaluationContext` (built by the consumption-operations pipeline;
-it carries the metric object of the request, its optional `id` included; CEL sees only `{request, arbitration}`),
+it carries the metric type, the optional `id`, and the metadata of the request's metric object; CEL sees only
+`{request, amount, metric_id, quotas}`),
 `EngineRegistry`, `PolicyService`
 
 **Output**: a validated `Decision`, or a platform-canonical error with no counter mutation
@@ -246,7 +247,7 @@ it carries the metric object of the request, its optional `id` included; CEL see
 4. [ ] - `p1` - **IF** the Engine reports the per-Policy evaluation timeout (default 5ms) as `EngineError::Timeout` - `inst-eb-timeout-if`
    1. [ ] - `p1` - **RETURN** canonical `DeadlineExceeded` (fail-closed); the bound is enforced inside the Engine per ADR-0005 cost-bounding, because a synchronous `evaluate()` call cannot be preempted from outside; no partial Decision is accepted and no counter is mutated - `inst-eb-timeout`
 5. [ ] - `p1` - **CATCH** `EngineError` - `inst-eb-error-catch`
-   1. [ ] - `p1` - Lift per the DESIGN §3.3 mapping: `Timeout` to `DeadlineExceeded`; `CostExceeded` to `ResourceExhausted`; `TypeError` to `FailedPrecondition` with the token `POLICY_EVALUATION_FAILED`, counted in `policy_evaluation_failures_total` and written to the log with the Policy id, the Policy version, and the metric; `Internal` to `Internal`; `InvalidConfig` is caught at Policy create/update and never reaches the evaluation hot path; an active Policy that cannot read the metadata of an applicable Quota is `EngineError::TypeError`, because QE does not check stored Quota metadata when a Policy changes; **RETURN** the canonical error with no counter mutation - `inst-eb-error`
+   1. [ ] - `p1` - Lift per the DESIGN §3.3 mapping: `Timeout` to `DeadlineExceeded`; `CostExceeded` to `ResourceExhausted`; `TypeError` to `FailedPrecondition` with the token `POLICY_EVALUATION_FAILED`, counted in `policy_evaluation_failures_total` and written to the log with the Policy id, the Policy version, and the metric; `Internal` to `Internal`; `InvalidConfig` is caught at Policy create/update and never reaches the evaluation hot path; an active Policy that cannot read the request's metadata is `EngineError::TypeError`; **RETURN** the canonical error with no counter mutation - `inst-eb-error`
 6. [ ] - `p1` - Validate the returned Decision against the closed Debit-Plan invariant set before any mutation (`cpt-cf-quota-enforcement-principle-strict-engine-boundary`): the `debit_plan` is a list of chains, each an ordered list of entries `{quota, amount}`, primary pool first (`cpt-cf-quota-enforcement-adr-debit-plan-chains`); every entry's quota is a member of `applicable_quotas`; per entry `amount >= 0`; the entries of each chain add up to exactly `request.amount`; a quota appears at most once in the plan; result-plan consistency (`Allowed` implies a non-empty `debit_plan`, `Denied` implies empty); several chains are an AND, each counting the whole operation; additionally enforce the `most-restrictive-wins` engine-specific invariant (exactly one chain of one entry with `amount = request.amount` on `Allowed`) - `inst-eb-invariants`
 7. [ ] - `p1` - **IF** any invariant is violated - `inst-eb-violation-if`
    1. [ ] - `p1` - **RETURN** canonical `Internal` carrying the `INVARIANT_VIOLATION` sub-token in `detail` (DESIGN §3.3); the Decision shape is not returned to the caller and no counter is mutated; increment `debit_plan_invariant_violations_total` by `(engine_id, invariant)` from the closed invariant set of PRD §5.16, which also covers the chain-sum and repeated-quota rules - `inst-eb-violation`
@@ -257,44 +258,40 @@ it carries the metric object of the request, its optional `id` included; CEL see
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-most-restrictive-wins`
 
-**Input**: `EvaluationContext` (applicable Quotas with type, `enforcement_mode`, cap, validity window, metadata,
-current usage; request metric and amount; time); an empty `ValidatedConfig` (any non-empty config is rejected at
-Policy write); at a Quota write, the Quota metadata
+**Input**: `EvaluationContext` (applicable Quotas with type, `enforcement_mode`, cap, validity window, current usage;
+request metric and amount; time); an empty `ValidatedConfig` (any non-empty config is rejected at Policy write)
 
-**Output**: a single-entry `Allowed` Debit Plan against the binding Quota, or `Denied`; at a Quota write, acceptance
-or a `QuotaMetadataRejection`
+**Output**: a single-entry `Allowed` Debit Plan against the binding Quota, or `Denied`
 
 **Steps**:
 1. [x] - `p1` - **IF** the applicable-Quotas set is empty - `inst-mrw-empty-if`
    1. [x] - `p1` - **RETURN** `Denied(violated_quota_ids = [], reason = "NO_APPLICABLE_QUOTA")` with an empty `debit_plan`; for a `QuotaGated` metric, absence of any applicable Quota is absence of authorization - `inst-mrw-empty`
 2. [x] - `p1` - Apply the validity-window prefilter: exclude Quotas whose `validity_window` is set and whose `time` falls outside `[validity_start, validity_end]`; Quotas without a validity window are always considered; if the prefilter empties the set, **RETURN** the same `NO_APPLICABLE_QUOTA` denial - `inst-mrw-window`
-3. [ ] - `p1` - Ignore `arbitration` and `request` entirely; metadata-driven selection requires a `cel` Policy per `cpt-cf-quota-enforcement-fr-attribute-based-quota-selection` - `inst-mrw-metadata`
+3. [ ] - `p1` - Ignore `request` entirely; the applicable set already holds only the Quotas whose conditions hold (`cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`) - `inst-mrw-metadata`
 4. [x] - `p1` - Compute the satisfiable set: a Quota is satisfiable if `remaining >= request.amount`; unbounded Quotas (`cap = null`) are trivially satisfiable - `inst-mrw-satisfiable`
 5. [x] - `p1` - **IF** no Quota is satisfiable (every applicable bounded Quota has remaining below `request.amount` and no applicable unbounded Quota exists) - `inst-mrw-deny-if`
    1. [x] - `p1` - **RETURN** `Denied(violated_quota_ids, reason)` naming every such bounded Quota with the requested amount, the current remaining capacity, and the violation amount (full enumeration, no short-circuit; unbounded Quotas are never violators); counters are not modified (`cpt-cf-quota-enforcement-fr-hard-quota-reject`; `hard` is the only P1 `enforcement_mode`) - `inst-mrw-deny`
 6. [ ] - `p1` - Select the binding Quota from the satisfiable set in priority order: (1) tier: the `Subject` tier (every subject type except the tenant type) before the `Tenant` tier, which is the built-in cascade of `cpt-cf-quota-enforcement-fr-quota-cascade`, so a subject whose quota is exhausted spills into the tenant quota (`cpt-cf-quota-enforcement-adr-quota-resolver-subjects`); (2) bounded over unbounded within the chosen tier; (3) smallest remaining capacity among bounded satisfiable Quotas of the tier, ties broken by ascending `quota_id` (UUIDv7); among unbounded Quotas (reached only when rule 2 falls through), ascending `quota_id` is the sole tiebreaker - `inst-mrw-binding`
 7. [ ] - `p1` - **RETURN** `Allowed` with `debit_plan` of exactly one chain of one entry against the binding Quota at `amount = request.amount`; non-binding applicable Quotas are absent from the plan and their counters are not mutated; this exact shape is enforced as the engine-specific invariant in `cpt-cf-quota-enforcement-algo-engine-boundary` - `inst-mrw-return`
-8. [ ] - `p1` - `validate_quota_metadata` accepts only the empty object, because this Engine reads no Quota metadata; for any other value it returns a `QuotaMetadataRejection` with one item whose `path` is the root of the metadata - `inst-mrw-quota-metadata`
 
 ### CEL Validation and Sandboxed Evaluation
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-cel-engine`
 
 **Input**: at Policy write: raw `engine_config = { expr: <CEL string> }` plus the snapshotted schema of the metric
-type; at a Quota write: the Quota metadata and the `ValidatedConfig`; at evaluation: `EvaluationContext` and the
-cached compiled `ValidatedConfig`
+type; at evaluation: `EvaluationContext` and the cached compiled `ValidatedConfig`
 
-**Output**: a compiled `ValidatedConfig` or a structured validation error; at a Quota write, acceptance or a
-`QuotaMetadataRejection`; at evaluation, a Decision or a canonical error
+**Output**: a compiled `ValidatedConfig` or a structured validation error; at evaluation, a Decision or a canonical
+error
 
 **Steps**:
-1. [ ] - `p1` - `validate_config` parses and type-checks the expression against the stable `{request, arbitration}` environment and the Decision return schema; `request` is the `metadata` of the request's metric object, typed by the snapshotted schema of the metric type; `arbitration` is the Quota metadata and has no registered schema; errors carry line/column diagnostics - `inst-cel-parse`
-2. [ ] - `p1` - Statically check references to `request` against the schema of the metric type; a reference to a property the schema does not declare is rejected at save time. The `cel` Engine gives `arbitration` no type: at Policy write a reference to any of its properties passes the static check, and `validate_quota_metadata` accepts any JSON object; a property that the metadata of a Quota lacks is found at evaluation, as an Engine error that rejects the request with no counter change. Attribution and authenticated principal fields are absent and therefore rejected as unknown - `inst-cel-static`
+1. [ ] - `p1` - `validate_config` parses and type-checks the expression against the stable `{request, amount, metric_id, quotas}` environment and the Decision return schema; `request` is the `metadata` of the request's metric object, typed by the snapshotted schema of the metric type; `amount` is the requested amount; `metric_id` is the `id` of the request's metric object, an empty string when it has none; each element of `quotas` is an applicable Quota with its id, subject type, tier, cap, consumed, and remaining, and no Quota metadata; errors carry line/column diagnostics - `inst-cel-parse`
+2. [ ] - `p1` - Statically check references to `request` against the schema of the metric type; a reference to a property the schema does not declare is rejected at save time. Attribution and authenticated principal fields are absent and therefore rejected as unknown - `inst-cel-static`
 3. [x] - `p1` - Cache the compiled representation by `(policy_id, policy_version)`; the artifact is compiled at every Policy create/update and published to the cache after the write transaction commits, per `cpt-cf-quota-enforcement-flow-policy-write` - `inst-cel-cache`
 4. [x] - `p1` - `evaluate` binds the `EvaluationContext` into the CEL environment and evaluates under sandbox: no I/O, deterministic, fixed step/cost cap tuned to the `EvaluationBudget` carried on the context - `inst-cel-evaluate`
 5. [x] - `p1` - **IF** a runtime error occurs (cost-cap exceeded, type error at evaluation, malformed return record) - `inst-cel-error-if`
    1. [x] - `p1` - **RETURN** the corresponding `EngineError`; the boundary lifts it to a platform-canonical error with no counter mutation per `cpt-cf-quota-enforcement-algo-engine-boundary` - `inst-cel-error`
-6. [ ] - `p1` - Interpret the returned record as a Decision; the standard Debit-Plan invariants apply uniformly: `cel` Policies return `{"debit_plan": [[{id, amount}, ...], ...]}` and may express a cascade or a split as one chain of several entries, an AND (for example both a user's and a device's cap) as one chain per quota, and their mix (`cpt-cf-quota-enforcement-fr-quota-cascade`); each applicable Quota exposes its subject type, and may match predicates over `request` and each applicable Quota's `arbitration` value to emit a sparse plan over the selected subset (`cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`); subject resolution stays metadata-agnostic, so `applicable_quotas` always carries every resolved Quota regardless of metadata - `inst-cel-decision`
+6. [ ] - `p1` - Interpret the returned record as a Decision; the standard Debit-Plan invariants apply uniformly: `cel` Policies return `{"debit_plan": [[{id, amount}, ...], ...]}` and may express a cascade or a split as one chain of several entries, an AND (for example both a user's and a device's cap) as one chain per quota, and their mix (`cpt-cf-quota-enforcement-fr-quota-cascade`); each applicable Quota exposes its subject type and tier, and the expression may match predicates over `request` to emit a sparse plan; `applicable_quotas` carries only the Quotas whose conditions hold (`cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`) - `inst-cel-decision`
 7. [x] - `p1` - **RETURN** the Decision; a Policy that filters out every applicable Quota returns `Denied` with an actionable `reason`, because `Allowed` with an empty `debit_plan` for a non-zero `request.amount` violates `result_plan_inconsistency` and surfaces a canonical `Internal` error - `inst-cel-return`
 
 ## 4. States (CDSL)
@@ -334,8 +331,8 @@ version-plus-latest-pointer transitions, most-specific-scope selection (per-metr
 storage per evaluation, Engine-delegated config validation with the snapshotted schema of the metric type, the
 projection-contracts membership check on every Policy write, and `policy-changed` events enqueued in the same
 transaction as the mutation. The schema snapshot of a Policy version **MUST** hold only the metric type schema that
-the Policy is checked against. A Policy create, update, rollback, or delete **MUST NOT** check existing Quotas or
-their metadata; a Policy change is the operator's responsibility. The surface is operator-only: the REST endpoints and the `QuotaOperatorApi` methods
+the Policy is checked against. A Policy create, update, rollback, or delete **MUST NOT** read existing Quotas; a Policy
+change is the operator's responsibility. The surface is operator-only: the REST endpoints and the `QuotaOperatorApi` methods
 (`create_policy`, `update_policy`, `rollback_policy`, `delete_policy`, `list_policy_versions`) are deliberately absent
 from `QuotaManagerApi` per PRD §2.3.
 
@@ -348,9 +345,9 @@ from `QuotaManagerApi` per PRD §2.3.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-in-process-engine-registration`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/policies`, `GET /v1/quota-enforcement/policies/{id}`,
-  `GET /v1/quota-enforcement/policies/{id}/versions` (`$top` and a forward-only cursor), `PATCH /v1/quota-enforcement/policies/{id}`,
-  `POST /v1/quota-enforcement/policies/{id}/rollback`, `DELETE /v1/quota-enforcement/policies/{id}`;
+- API: `POST /quota-enforcement/v1/policies`, `GET /quota-enforcement/v1/policies/{id}`,
+  `GET /quota-enforcement/v1/policies/{id}/versions` (`$top` and a forward-only cursor), `PATCH /quota-enforcement/v1/policies/{id}`,
+  `POST /quota-enforcement/v1/policies/{id}/rollback`, `DELETE /quota-enforcement/v1/policies/{id}`;
   `QuotaOperatorApi` Policy methods
 - DB: `cpt-cf-quota-enforcement-db-schema`
 - Entities: `QuotaResolutionPolicy`, `QuotaResolutionPolicyVersion`
@@ -379,17 +376,12 @@ active Policy ever references an unregistered Engine.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-engine-contract`
 
-The system **MUST** ship `QuotaResolutionEngineV1` in the `quota-enforcement-sdk` crate as a sync trait with four
+The system **MUST** ship `QuotaResolutionEngineV1` in the `quota-enforcement-sdk` crate as a sync trait with three
 methods: `id() -> &'static str`, `validate_config(input: EngineValidationInput) -> Result<Arc<dyn ValidatedConfig>,
-EngineConfigError>` (the raw config plus the Policy's schema snapshot), `validate_quota_metadata(metadata, config:
-&dyn ValidatedConfig) -> Result<(), QuotaMetadataRejection>`, and `evaluate(ctx: &EvaluationContext, config:
+EngineConfigError>` (the raw config plus the Policy's schema snapshot), and `evaluate(ctx: &EvaluationContext, config:
 &dyn ValidatedConfig) -> Result<Decision, EngineError>`, where `ValidatedConfig` (`Any + Send + Sync`) exposes
-`as_any()` for the Engine's downcast and `inputs()` for the environment inputs it reads, `QuotaMetadataRejection` is a
-list of `{path, reason}` (the place in the Quota metadata and the reason), and `EngineError` is the closed
-enum `{Timeout, CostExceeded, TypeError, InvalidConfig, Internal}`. QE calls `validate_quota_metadata` on the Engine
-of the Policy that is active for a Quota's metric when the Quota is created or its metadata changes (quota-lifecycle
-feature); the operation **MUST** be deterministic and **MUST NOT** perform I/O, and a rejection **MUST** name at least
-one item. `evaluate` **MUST** be deterministic given the
+`as_any()` for the Engine's downcast and `inputs()` for the environment inputs it reads, and `EngineError` is the
+closed enum `{Timeout, CostExceeded, TypeError, InvalidConfig, Internal}`. `evaluate` **MUST** be deterministic given the
 `EvaluationContext` and **MUST NOT** perform I/O; cost-bounding is the Engine implementation's responsibility. Engines
 whose evaluation requires a compiled artifact rely on the `ValidatedConfig` cache keyed by
 `(policy_id, policy_version)`, compiled at every Policy create/update and published after the write transaction
@@ -402,7 +394,7 @@ commits; a cache miss rebuilds from the persisted Engine-validated config.
 
 **Touches**:
 - API: `QuotaResolutionEngineV1` (SDK trait)
-- Entities: `EvaluationContext`, `Decision`, `QuotaDebitPlan`, `QuotaMetadataRejection`
+- Entities: `EvaluationContext`, `Decision`, `QuotaDebitPlan`
 
 ### Debit-Plan Invariant Boundary
 
@@ -433,12 +425,11 @@ consumption-operations `EvaluationOrchestrator` invokes it inside the pipeline i
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-mrw-engine`
 
 The system **MUST** ship the `most-restrictive-wins` built-in Engine: hardcoded, config-free (any non-empty
-`engine_config` rejected at validation), metadata-ignoring, with the validity-window prefilter, the
+`engine_config` rejected at validation), `request`-ignoring, with the validity-window prefilter, the
 `NO_APPLICABLE_QUOTA` denial for an empty (or fully prefiltered) applicable set, binding-Quota selection by
 tier (`Subject` over `Tenant`, the built-in cascade), bounded-over-unbounded, smallest remaining,
 and ascending-`quota_id` tiebreaks, full enumeration of `violated_quota_ids` with requested amount, current remaining,
-and violation amount on denial, and a single-entry `Allowed` plan at `amount = request.amount`. Its
-`validate_quota_metadata` **MUST** accept only the empty object.
+and violation amount on denial, and a single-entry `Allowed` plan at `amount = request.amount`.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-most-restrictive-wins`
@@ -454,13 +445,13 @@ and violation amount on denial, and a single-entry `Allowed` plan at `amount = r
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-cel-engine`
 
 The system **MUST** ship the `cel` built-in Engine: sandboxed, deterministic, cost-bounded evaluation with a
-pre-compiled artifact cache keyed by `(policy_id, policy_version)`; the `{request, arbitration}` environment with no
-other variable; save-time static validation of references to `request` against the snapshotted schema of the metric
+pre-compiled artifact cache keyed by `(policy_id, policy_version)`; the `{request, amount, metric_id, quotas}` environment with no
+other variable, where each element of `quotas` carries no Quota metadata; save-time static validation
+of references to `request` against the snapshotted schema of the metric
 type, and of the Decision return schema, with line/column diagnostics; exclusion of attribution and principal fields;
-and runtime errors surfaced as canonical errors with no counter mutation. The Engine gives `arbitration` no
-type and accepts any JSON object in `validate_quota_metadata` (`cpt-cf-quota-enforcement-algo-cel-engine`). The Engine **MUST** preserve the customizable cascade
-and attribute-based selection expressiveness: cascade and split chains, AND across chains, and sparse
-metadata-gated plans.
+and runtime errors surfaced as canonical errors with no counter mutation (`cpt-cf-quota-enforcement-algo-cel-engine`).
+The Engine **MUST** preserve the customizable cascade expressiveness: cascade and split chains, AND across chains, and
+sparse plans.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-cel-engine`
@@ -518,12 +509,7 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
   a request that the Policy cannot evaluate is rejected with the Engine's canonical error and no counter change; a
   Policy write for a metric type that is not registered is rejected
   with `InvalidArgument`
-- [ ] `validate_quota_metadata` of the `most-restrictive-wins` Engine accepts the empty object and rejects any other
-  value with a `QuotaMetadataRejection` of at least one `{path, reason}` item; a test Engine's rejection list reaches
-  the caller of the Quota write unchanged
-- [ ] A Policy create, update, rollback, or delete reads no Quota: with a stored Quota whose metadata the new Policy
-  cannot read, the Policy write succeeds, the Quota is unchanged, and the next evaluation that reads the Quota is
-  rejected with the Engine's canonical error and no counter change
+- [ ] A Policy create, update, rollback, or delete reads no Quota
 - [ ] The schema snapshot of a `cel` Policy version of a `metric` scope holds the schema of that metric type and
   nothing else; the snapshot of a `most-restrictive-wins` Policy version is empty
 - [ ] An update with a stale `if_match_version` returns `VERSION_CONFLICT` (409) with the current latest, writes no
@@ -551,9 +537,9 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
   Quota with quota ID, requested amount, current remaining, and violation amount, and no counter changes; an empty or
   fully validity-window-prefiltered applicable set yields
   `Denied(violated_quota_ids = [], reason = "NO_APPLICABLE_QUOTA")`
-- [ ] A `cel` Policy whose metadata predicate matches a subset debits only that subset
-  (the PRD §5.9 region-gating example); a predicate that filters out every Quota yields `Denied` with an actionable
-  reason, never `Allowed` with an empty plan
+- [ ] Under each built-in Engine, only the Quotas whose conditions hold reach the Engine (the PRD §5.9 region-gating
+  example); a `cel` predicate that filters out every Quota yields `Denied` with an actionable reason, never `Allowed`
+  with an empty plan
 - [ ] An Engine evaluation exceeding the per-Policy timeout surfaces `DeadlineExceeded`, discards any partial
   Decision, and mutates no counter; a `cel` cost-cap exhaustion surfaces `ResourceExhausted`; an Engine returning `TypeError`
   surfaces `FailedPrecondition` with `POLICY_EVALUATION_FAILED` and increments `policy_evaluation_failures_total`; an Engine returning
@@ -571,12 +557,11 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
   (ADR-0012). A Policy version keeps the schema it was checked against. When a changed metric type and an active
   Policy do not fit, the request is rejected at evaluation with `POLICY_EVALUATION_FAILED` and no counter change; the
   operator writes a Policy that fits the current schema.
-- **Policy change and stored Quotas**: QE never checks stored Quota metadata again. After a Policy change, a Quota
-  whose metadata the active Policy cannot read is found at evaluation, as a rejected request with no counter change
-  (ADR-0013).
+- **Policy change and stored Quotas**: no Engine reads Quota metadata, so a Policy change cannot leave a Quota that
+  the active Policy cannot read (ADR-0013).
 - **ADR dependencies**: `cpt-cf-quota-enforcement-adr-evaluation-engine` (ADR-0005, accepted) fixes the
   capability-based Engine contract this document restates; `cpt-cf-quota-enforcement-adr-metric-types` (ADR-0013)
-  adds the check of Quota metadata to that contract and fixes the CEL input `{request, arbitration}`;
+  fixes the CEL input `request` and makes Quota metadata conditions that QE core applies before the Engine;
   `cpt-cf-quota-enforcement-adr-contract-catalogue` (ADR-0012) fixes the catalogue entry that a Policy write uses; the
   projection-contracts feature owns the Policy-write membership check.
 - **Budget and freshness contracts**: the Engine receives its per-Policy evaluation budget as the typed
@@ -600,7 +585,7 @@ attribution **MUST NOT** appear as label values; Policy attribution belongs on t
   double `QuotaResolutionEngineV1`; bootstrap fail-fast uses fault injection on Engine registration.
 - **Secrets discipline**: `engine_config` carries arbitration logic only; PRD §5.9 forbids credentials, keys, rates,
   or customer identifiers inside it, and QE does not inspect config content for secrets. Sensitive values reach
-  Policies indirectly through the validated `request` or `arbitration` objects.
+  Policies indirectly through the validated `request` object.
 - **Non-applicable review domains**: UX/accessibility is not applicable; there is no user-facing surface. Data
   protection inherits the Platform Operational Data rules from PRD §6.2; Policy versions follow the 90-day retention
   window with no additional feature-specific requirement.

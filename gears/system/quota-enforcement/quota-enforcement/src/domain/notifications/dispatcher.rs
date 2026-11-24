@@ -11,7 +11,6 @@ use quota_enforcement_sdk::{
     QuotaNotificationSinkV1,
 };
 use toolkit_macros::domain_model;
-use toolkit_security::SecurityContext;
 
 use crate::domain::ports::metrics::{QeMetrics, SinkLabel};
 
@@ -40,18 +39,15 @@ impl Default for DispatchLimits {
 #[domain_model]
 pub struct NotificationDispatcher {
     sinks: Vec<(SinkLabel, Arc<dyn QuotaNotificationSinkV1>)>,
-    ctx: SecurityContext,
     limits: DispatchLimits,
     metrics: Arc<dyn QeMetrics>,
 }
 
 impl NotificationDispatcher {
-    /// Dispatch to `sinks` under `ctx`. Bootstrap has checked the sink ids
-    /// are unique.
+    /// Dispatch to `sinks`. Bootstrap has checked the sink ids are unique.
     #[must_use]
     pub fn new(
         sinks: Vec<Arc<dyn QuotaNotificationSinkV1>>,
-        ctx: SecurityContext,
         limits: DispatchLimits,
         metrics: Arc<dyn QeMetrics>,
     ) -> Self {
@@ -61,7 +57,6 @@ impl NotificationDispatcher {
             .collect();
         Self {
             sinks,
-            ctx,
             limits,
             metrics,
         }
@@ -74,7 +69,7 @@ impl NotificationDispatcher {
         event: NotificationEvent,
         timeout: Duration,
     ) -> Result<(), DispatchError> {
-        tokio::time::timeout(timeout, sink.dispatch(&self.ctx, event))
+        tokio::time::timeout(timeout, sink.dispatch(event))
             .await
             .unwrap_or(Err(DispatchError::Timeout))
     }

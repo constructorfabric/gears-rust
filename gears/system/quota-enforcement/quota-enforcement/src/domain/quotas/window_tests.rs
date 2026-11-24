@@ -4,14 +4,14 @@ use std::collections::HashMap;
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    ContractRef, EnforcementMode, MetricId, MetricKind, PageResult, PeriodType, Quota, QuotaId,
-    QuotaSource, QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow,
+    EnforcementMode, MetricId, MetricKind, PageResult, PeriodType, Quota, QuotaId, QuotaSource,
+    QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{view, view_page};
-use crate::test_support::{LLM_USER_PROJECTION, METRIC_REQUESTS, METRIC_TOKENS};
+use crate::test_support::{METRIC_REQUESTS, METRIC_TOKENS, USER_SUBJECT_TYPE};
 
 fn ts(secs: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(secs).expect("timestamp")
@@ -22,7 +22,7 @@ fn quota(metric: &str, window: Option<ValidityWindow>) -> Quota {
         id: QuotaId::generate(),
         tenant_id: TenantId::new(Uuid::from_u128(2)),
         subject: SubjectRef {
-            projection_type: GtsTypeId::try_new(LLM_USER_PROJECTION).expect("type"),
+            subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type"),
             subject_id: "u1".to_owned(),
         },
         metric: MetricId::parse(metric).expect("metric"),
@@ -36,10 +36,6 @@ fn quota(metric: &str, window: Option<ValidityWindow>) -> Quota {
         metadata: serde_json::Map::new(),
         source: QuotaSource::Operator,
         status: QuotaStatus::Active,
-        constraint_contract: ContractRef {
-            type_id: GtsTypeId::new("gts.cf.core.qe.constraint.v1~x.y.z.w.v1~"),
-            version: 1,
-        },
         record_version: 1,
         created_at: ts(0),
         updated_at: ts(0),

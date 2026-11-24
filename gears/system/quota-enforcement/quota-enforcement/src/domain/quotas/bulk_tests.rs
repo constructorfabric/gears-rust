@@ -12,7 +12,8 @@ use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    EnforcementMode, PeriodType, QuotaId, QuotaSource, QuotaStatus, QuotaType, SubjectRef,
+    BootstrapBundle, EnforcementMode, PeriodType, PolicyDraft, PolicySchemaSnapshot, PolicyScope,
+    QuotaEnforcementStoragePluginV1, QuotaId, QuotaSource, QuotaStatus, QuotaType, SubjectRef,
 };
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
@@ -24,15 +25,15 @@ use super::{
     BulkDeactivateRequest, BulkUpdateItem, BulkUpdateRequest,
 };
 use crate::domain::admission::Admission;
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
+use crate::domain::catalog::MetricCatalog;
 use crate::domain::error::{DomainError, ResourceKind};
 use crate::domain::quotas::QuotaManagement;
 use crate::domain::quotas::request::{CreateQuotaRequest, Presence, UpdateQuotaRequest};
 use crate::domain::quotas::validation::QuotaLimits;
 use crate::domain::tokens;
 use crate::test_support::{
-    DenyAllPdp, FakeContractRegistry, FakeMetricRegistry, LLM_TENANT_PROJECTION,
-    LLM_USER_PROJECTION, METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, ctx, tenant,
+    DenyAllPdp, METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, USER_SUBJECT_TYPE, caller,
+    tenant, test_catalog,
 };
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -48,7 +49,7 @@ fn limits(bulk_max_items: usize) -> QuotaLimits {
     }
 }
 
-/// Permits every call like [`PermitTenantsPdp`], except one resource id.
+// Permits every call like `PermitTenantsPdp`, except one resource id.
 struct DenyOnePdp {
     denied: Uuid,
     calls: AtomicUsize,
@@ -90,43 +91,41 @@ impl AuthZResolverApi for DenyOnePdp {
 }
 
 struct Harness {
-    catalog: ProjectionContractCatalog,
+    catalog: Arc<MetricCatalog>,
     admission: Admission,
     storage: Arc<InMemoryStorage>,
-    registry: Arc<FakeContractRegistry>,
-    metric_registry: Arc<FakeMetricRegistry>,
     metrics: Arc<RecordingMetrics>,
     limits: QuotaLimits,
 }
 
 impl Harness {
     async fn new(pdp: Arc<dyn AuthZResolverApi>) -> Self {
-        Self::over(pdp, Arc::new(InMemoryStorage::new()), limits(50)).await
+        let storage = Arc::new(InMemoryStorage::new());
+        let mut bundle = BootstrapBundle::foundation();
+        bundle.global_policy = Some(PolicyDraft {
+            schema_snapshot: PolicySchemaSnapshot::default(),
+            scope: PolicyScope::Global,
+            engine_id: "most-restrictive-wins".to_owned(),
+            engine_config: json!({}),
+            timeout_ms: None,
+            description: None,
+            comment: None,
+            created_by: "test".to_owned(),
+        });
+        storage.bootstrap(&bundle).await.expect("bootstrap");
+        Self::over(pdp, storage, limits(50))
     }
 
-    async fn over(
+    fn over(
         pdp: Arc<dyn AuthZResolverApi>,
         storage: Arc<InMemoryStorage>,
         limits: QuotaLimits,
     ) -> Self {
         let metrics = Arc::new(RecordingMetrics::default());
-        let registry = Arc::new(FakeContractRegistry::llm_gateway());
-        let catalog = CatalogBuilder::new(registry.as_ref(), metrics.as_ref())
-            .build(&CatalogConfig {
-                subject_projections: vec![
-                    type_id(LLM_USER_PROJECTION),
-                    type_id(LLM_TENANT_PROJECTION),
-                ],
-                resource_projections: Vec::new(),
-            })
-            .await
-            .expect("catalogue");
         Self {
-            catalog,
+            catalog: test_catalog().0,
             admission: Admission::new(PolicyEnforcer::new(pdp), metrics.clone()),
             storage,
-            registry,
-            metric_registry: Arc::new(FakeMetricRegistry::classified()),
             metrics,
             limits,
         }
@@ -134,11 +133,9 @@ impl Harness {
 
     fn quotas(&self) -> QuotaManagement<'_> {
         QuotaManagement::new(
-            &self.admission,
+            self.admission.pdp(caller()),
             &self.catalog,
             self.storage.as_ref(),
-            self.registry.as_ref(),
-            self.metric_registry.as_ref(),
             self.metrics.as_ref(),
             self.limits,
         )
@@ -146,7 +143,7 @@ impl Harness {
 
     async fn create_one(&self, subject: &str) -> QuotaId {
         self.quotas()
-            .create(&ctx(), draft(subject))
+            .create(draft(subject))
             .await
             .expect("create")
             .quota
@@ -154,12 +151,11 @@ impl Harness {
     }
 }
 
-/// A valid consumption draft on the user projection.
 fn draft(subject: &str) -> CreateQuotaRequest {
     CreateQuotaRequest {
         tenant_id: tenant(),
         subject: SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
+            subject_type: type_id(USER_SUBJECT_TYPE),
             subject_id: subject.to_owned(),
         },
         metric: METRIC_TOKENS.to_owned(),
@@ -170,12 +166,7 @@ fn draft(subject: &str) -> CreateQuotaRequest {
         notification_thresholds: vec![50],
         validity_window: None,
         fail_open_hint: false,
-        metadata: Some(
-            json!({ "regions": ["eu"], "weight": 5 })
-                .as_object()
-                .cloned()
-                .expect("object"),
-        ),
+        metadata: None,
         source: QuotaSource::Operator,
     }
 }
@@ -246,7 +237,7 @@ async fn an_envelope_over_the_ceiling_is_refused_before_any_pdp_call() {
         .collect();
     let err = h
         .quotas()
-        .bulk_deactivate(&ctx(), deactivations("off", &ids))
+        .bulk_deactivate(deactivations("off", &ids))
         .await
         .expect_err("too large");
     assert_eq!(
@@ -270,7 +261,7 @@ async fn a_bulk_create_commits_every_draft_and_a_lowered_limit_refuses_its_repla
     let request = creates("pack", vec![draft("u1"), draft("u2")]);
     let created = h
         .quotas()
-        .bulk_create(&ctx(), request.clone())
+        .bulk_create(request.clone())
         .await
         .expect("bulk create");
     assert_eq!(created.items.len(), 2);
@@ -280,16 +271,16 @@ async fn a_bulk_create_commits_every_draft_and_a_lowered_limit_refuses_its_repla
         assert_eq!(quota.status, QuotaStatus::Active);
     }
 
-    let lowered = Harness::over(pdp, Arc::clone(&h.storage), limits(1)).await;
+    let lowered = Harness::over(pdp, Arc::clone(&h.storage), limits(1));
     let replay = lowered
         .quotas()
-        .bulk_create(&ctx(), request)
+        .bulk_create(request)
         .await
         .expect_err("the limit comes before the replay");
     assert_eq!(replay, DomainError::BulkTooLarge { items: 2, max: 1 });
     let fresh = lowered
         .quotas()
-        .bulk_create(&ctx(), creates("pack-2", vec![draft("u3"), draft("u4")]))
+        .bulk_create(creates("pack-2", vec![draft("u3"), draft("u4")]))
         .await
         .expect_err("a new envelope meets the lowered limit");
     assert_eq!(fresh, DomainError::BulkTooLarge { items: 2, max: 1 });
@@ -301,22 +292,19 @@ async fn a_bulk_update_admits_every_item_under_one_admission_span() {
     let h = Harness::new(pdp).await;
     let created = h
         .quotas()
-        .bulk_create(
-            &ctx(),
-            creates("ten", (1..=10).map(|i| draft(&format!("u{i}"))).collect()),
-        )
+        .bulk_create(creates(
+            "ten",
+            (1..=10).map(|i| draft(&format!("u{i}"))).collect(),
+        ))
         .await
         .expect("ten drafts");
     let ids: Vec<QuotaId> = created.items.iter().map(|item| item.quota_id).collect();
     let capture = crate::test_support::SpanCapture::default();
     capture
-        .within(h.quotas().bulk_update(
-            &ctx(),
-            updates(
-                "u-ten",
-                ids.iter().map(|id| (*id, cap_patch(300))).collect(),
-            ),
-        ))
+        .within(h.quotas().bulk_update(updates(
+            "u-ten",
+            ids.iter().map(|id| (*id, cap_patch(300))).collect(),
+        )))
         .await
         .expect("ten patches");
     let admission = capture
@@ -340,26 +328,23 @@ async fn the_configured_limit_is_checked_before_any_pdp_call() {
     let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
     let h = Harness::new(pdp.clone()).await;
     let ids = [h.create_one("u1").await, h.create_one("u2").await];
-    let lowered = Harness::over(pdp.clone(), Arc::clone(&h.storage), limits(1)).await;
+    let lowered = Harness::over(pdp.clone(), Arc::clone(&h.storage), limits(1));
     let before = pdp.calls();
     let quotas = lowered.quotas();
     let errors = [
         quotas
-            .bulk_create(&ctx(), creates("pack", vec![draft("u3"), draft("u4")]))
+            .bulk_create(creates("pack", vec![draft("u3"), draft("u4")]))
             .await
             .expect_err("too large"),
         quotas
-            .bulk_update(
-                &ctx(),
-                updates(
-                    "raise",
-                    ids.iter().map(|id| (*id, cap_patch(200))).collect(),
-                ),
-            )
+            .bulk_update(updates(
+                "raise",
+                ids.iter().map(|id| (*id, cap_patch(200))).collect(),
+            ))
             .await
             .expect_err("too large"),
         quotas
-            .bulk_deactivate(&ctx(), deactivations("off", &ids))
+            .bulk_deactivate(deactivations("off", &ids))
             .await
             .expect_err("too large"),
     ];
@@ -379,13 +364,13 @@ async fn a_create_replay_reads_every_page_of_its_quotas() {
     let request = creates("pack", vec![draft("u1"), draft("u2")]);
     let created = h
         .quotas()
-        .bulk_create(&ctx(), request.clone())
+        .bulk_create(request.clone())
         .await
         .expect("bulk create");
     h.storage.cap_pages(1);
     let replay = h
         .quotas()
-        .bulk_create(&ctx(), request)
+        .bulk_create(request)
         .await
         .expect("the replay reads past the first page");
     assert_eq!(replay, created);
@@ -397,13 +382,13 @@ async fn a_create_replay_follows_a_cursor_past_an_empty_page() {
     let request = creates("pack", vec![draft("u1"), draft("u2")]);
     let created = h
         .quotas()
-        .bulk_create(&ctx(), request.clone())
+        .bulk_create(request.clone())
         .await
         .expect("bulk create");
     h.storage.empty_first_quota_page();
     let replay = h
         .quotas()
-        .bulk_create(&ctx(), request)
+        .bulk_create(request)
         .await
         .expect("the replay reads past the empty page");
     assert_eq!(replay, created);
@@ -415,13 +400,12 @@ async fn the_size_check_comes_before_any_item_check() {
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
         Arc::new(InMemoryStorage::new()),
         limits(1),
-    )
-    .await;
+    );
     let mut invalid = draft("u2");
     invalid.metric = "not a metric".to_owned();
     let err = h
         .quotas()
-        .bulk_create(&ctx(), creates("pack", vec![draft("u1"), invalid]))
+        .bulk_create(creates("pack", vec![draft("u1"), invalid]))
         .await
         .expect_err("too large");
     assert_eq!(err, DomainError::BulkTooLarge { items: 2, max: 1 });
@@ -431,12 +415,12 @@ async fn the_size_check_comes_before_any_item_check() {
 async fn the_first_failing_item_is_reported_and_nothing_is_created() {
     let h = Harness::new(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
     let mut unknown = draft("u2");
-    unknown.metric = "gts.cf.core.qe.metric_type.v1~cf.test.qe.unknown.v1".to_owned();
+    unknown.metric = "gts.cf.core.quota.metric.v1~cf.test.qe.unknown.v1~".to_owned();
     let mut foreign = draft("u3");
     foreign.tenant_id = quota_enforcement_sdk::TenantId::new(Uuid::from_u128(0xf0));
     let err = h
         .quotas()
-        .bulk_create(&ctx(), creates("pack", vec![draft("u1"), unknown, foreign]))
+        .bulk_create(creates("pack", vec![draft("u1"), unknown, foreign]))
         .await
         .expect_err("item 1 fails");
     let (index, cause) = item_error(&err);
@@ -449,17 +433,14 @@ async fn the_first_failing_item_is_reported_and_nothing_is_created() {
 
     let err = h
         .quotas()
-        .bulk_create(
-            &ctx(),
-            creates(
-                "pack-2",
-                vec![draft("u1"), draft("u2"), {
-                    let mut other = draft("u4");
-                    other.tenant_id = quota_enforcement_sdk::TenantId::new(Uuid::from_u128(0xf0));
-                    other
-                }],
-            ),
-        )
+        .bulk_create(creates(
+            "pack-2",
+            vec![draft("u1"), draft("u2"), {
+                let mut other = draft("u4");
+                other.tenant_id = quota_enforcement_sdk::TenantId::new(Uuid::from_u128(0xf0));
+                other
+            }],
+        ))
         .await
         .expect_err("item 2 names another tenant");
     assert_eq!(
@@ -479,17 +460,14 @@ async fn repeated_targets_and_item_keys_are_refused_at_the_second_occurrence() {
     let second = h.create_one("u2").await;
     let err = h
         .quotas()
-        .bulk_update(
-            &ctx(),
-            updates(
-                "raise",
-                vec![
-                    (first, cap_patch(200)),
-                    (second, cap_patch(200)),
-                    (first, cap_patch(300)),
-                ],
-            ),
-        )
+        .bulk_update(updates(
+            "raise",
+            vec![
+                (first, cap_patch(200)),
+                (second, cap_patch(200)),
+                (first, cap_patch(300)),
+            ],
+        ))
         .await
         .expect_err("a Quota named twice");
     assert_eq!(
@@ -507,7 +485,7 @@ async fn repeated_targets_and_item_keys_are_refused_at_the_second_occurrence() {
     }
     let err = h
         .quotas()
-        .bulk_deactivate(&ctx(), request)
+        .bulk_deactivate(request)
         .await
         .expect_err("an item key used twice");
     assert_eq!(
@@ -530,16 +508,13 @@ async fn each_update_item_is_authorized_as_a_single_update_is() {
         denied: denied.as_uuid(),
         calls: AtomicUsize::new(0),
     });
-    let restricted = Harness::over(pdp.clone(), Arc::clone(&h.storage), limits(50)).await;
+    let restricted = Harness::over(pdp.clone(), Arc::clone(&h.storage), limits(50));
     let err = restricted
         .quotas()
-        .bulk_update(
-            &ctx(),
-            updates(
-                "raise",
-                vec![(first, cap_patch(200)), (denied, cap_patch(200))],
-            ),
-        )
+        .bulk_update(updates(
+            "raise",
+            vec![(first, cap_patch(200)), (denied, cap_patch(200))],
+        ))
         .await
         .expect_err("item 1 is denied");
     let (index, cause) = item_error(&err);
@@ -559,18 +534,53 @@ async fn a_replay_is_answered_only_after_the_pdp_permits_it() {
     let id = h.create_one("u1").await;
     let request = deactivations("off", &[id]);
     h.quotas()
-        .bulk_deactivate(&ctx(), request.clone())
+        .bulk_deactivate(request.clone())
         .await
         .expect("bulk deactivate");
-    let denying = Harness::over(Arc::new(DenyAllPdp), Arc::clone(&h.storage), limits(50)).await;
+    let denying = Harness::over(Arc::new(DenyAllPdp), Arc::clone(&h.storage), limits(50));
     let err = denying
         .quotas()
-        .bulk_deactivate(&ctx(), request)
+        .bulk_deactivate(request)
         .await
         .expect_err("no replay without a permit");
     let (index, cause) = item_error(&err);
     assert_eq!(index, 0);
     assert!(matches!(cause, DomainError::PdpDenied { .. }), "{cause:?}");
+}
+
+#[tokio::test]
+async fn a_used_envelope_key_answers_nothing_to_a_caller_who_cannot_see_the_targets() {
+    let h = Harness::new(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
+    let known = h.create_one("u1").await;
+    h.quotas()
+        .bulk_update(updates("up", vec![(known, cap_patch(7))]))
+        .await
+        .expect("the key is now in use");
+    h.quotas()
+        .bulk_deactivate(deactivations("off", &[known]))
+        .await
+        .expect("the key is now in use");
+
+    let unseen = QuotaId::generate();
+    let hidden = DomainError::NotFound {
+        kind: ResourceKind::Quota,
+        id: unseen.to_string(),
+    }
+    .at_item(0);
+    assert_eq!(
+        h.quotas()
+            .bulk_deactivate(deactivations("off", &[unseen]))
+            .await
+            .expect_err("not a payload mismatch"),
+        hidden
+    );
+    assert_eq!(
+        h.quotas()
+            .bulk_update(updates("up", vec![(unseen, cap_patch(7))]))
+            .await
+            .expect_err("not a payload mismatch"),
+        hidden
+    );
 }
 
 #[tokio::test]
@@ -580,7 +590,7 @@ async fn a_bulk_deactivate_of_an_unknown_quota_names_it() {
     let unknown = QuotaId::generate();
     let err = h
         .quotas()
-        .bulk_deactivate(&ctx(), deactivations("off", &[known, unknown]))
+        .bulk_deactivate(deactivations("off", &[known, unknown]))
         .await
         .expect_err("unknown item");
     assert_eq!(
@@ -618,7 +628,7 @@ async fn item_checks_report_the_first_failing_item_in_submission_order() {
     request.items[1].idempotency_key = Some("  ".to_owned());
     let err = h
         .quotas()
-        .bulk_update(&ctx(), request)
+        .bulk_update(request)
         .await
         .expect_err("item 1 fails first");
     assert_eq!(
@@ -638,7 +648,7 @@ async fn item_checks_report_the_first_failing_item_in_submission_order() {
     request.items[2].idempotency_key = Some("same".to_owned());
     let err = h
         .quotas()
-        .bulk_create(&ctx(), request)
+        .bulk_create(request)
         .await
         .expect_err("item 0 fails first");
     let (index, _) = item_error(&err);
@@ -664,7 +674,7 @@ async fn an_item_the_transport_could_not_convert_fails_after_the_envelope_checks
     };
     assert_eq!(
         h.quotas()
-            .bulk_create(&ctx(), oversized)
+            .bulk_create(oversized)
             .await
             .expect_err("too large"),
         DomainError::BulkTooLarge {
@@ -682,7 +692,7 @@ async fn an_item_the_transport_could_not_convert_fails_after_the_envelope_checks
     });
     let err = h
         .quotas()
-        .bulk_create(&ctx(), request)
+        .bulk_create(request)
         .await
         .expect_err("item 1 did not convert");
     assert_eq!(
@@ -702,7 +712,7 @@ async fn an_empty_envelope_or_a_blank_envelope_key_is_refused_before_any_pdp_cal
 
     let empty = h
         .quotas()
-        .bulk_create(&ctx(), creates("pack", Vec::new()))
+        .bulk_create(creates("pack", Vec::new()))
         .await
         .expect_err("no items");
     assert_eq!(
@@ -715,7 +725,7 @@ async fn an_empty_envelope_or_a_blank_envelope_key_is_refused_before_any_pdp_cal
 
     let blank = h
         .quotas()
-        .bulk_create(&ctx(), creates("  ", vec![draft("u1")]))
+        .bulk_create(creates("  ", vec![draft("u1")]))
         .await
         .expect_err("blank envelope key");
     assert_eq!(
@@ -725,9 +735,37 @@ async fn an_empty_envelope_or_a_blank_envelope_key_is_refused_before_any_pdp_cal
             reason: tokens::IDEMPOTENCY_KEY_REQUIRED,
         }
     );
+    let long = h
+        .quotas()
+        .bulk_create(creates(&"k".repeat(257), vec![draft("u1")]))
+        .await
+        .expect_err("an envelope key above 256 characters");
+    assert_eq!(
+        long,
+        DomainError::InvalidArgument {
+            field: "idempotency_key",
+            reason: tokens::IDEMPOTENCY_KEY_TOO_LONG,
+        }
+    );
     assert_eq!(
         pdp.calls(),
         0,
         "envelope checks come before any authorization"
+    );
+
+    let mut request = creates("pack", vec![draft("u1")]);
+    request.items[0].idempotency_key = Some("k".repeat(257));
+    let long = h
+        .quotas()
+        .bulk_create(request)
+        .await
+        .expect_err("an item key above 256 characters");
+    assert_eq!(
+        long,
+        DomainError::InvalidArgument {
+            field: "idempotency_key",
+            reason: tokens::IDEMPOTENCY_KEY_TOO_LONG,
+        }
+        .at_item(0)
     );
 }

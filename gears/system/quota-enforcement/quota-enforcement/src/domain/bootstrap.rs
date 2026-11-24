@@ -4,40 +4,32 @@
 //! Runs in the lifecycle entry before the ready signal. Every step that fails
 //! records the failing dependency in [`Readiness`], so the health endpoint
 //! names it, and returns an error so the runtime never marks the gear ready.
-//! The projection-contracts feature adds the QE-owned GTS registration, the
-//! catalogue consistency set, and the compatibility check against active
-//! Quotas (`features/projection-contracts.md`). The quota-lifecycle feature
-//! adds the removed-metric scan over the bound metrics and binds the registries
-//! the write path needs. The notifications feature ends it by resolving the
-//! notification sinks and starting delivery, so events flow before the gear
-//! is ready. Later features extend [`Bootstrap::run`] with their own steps.
+//! The lifecycle entry runs it again while the error is a dependency that
+//! does not answer. It reads the metric types of the active Quotas and
+//! Policies into the catalogue: a registry that does not answer that read
+//! fails the run, a wrong metric type does not (ADR-0012). The notifications feature ends it by resolving
+//! the notification sinks and starting delivery, so events flow before the
+//! gear is ready.
 
 use std::sync::Arc;
 
 use quota_enforcement_sdk::{
-    BootstrapBundle, EnvironmentInputs, PolicyDraft, PolicySchemaSnapshot, PolicyScope,
-    QuotaEnforcementStoragePluginV1, StorageError, owned_definitions,
+    BootstrapBundle, EnvironmentInputs, MetricId, PolicyDraft, PolicySchemaSnapshot, PolicyScope,
+    QuotaEnforcementStoragePluginV1, StorageError,
 };
 use toolkit_macros::domain_model;
 
-use super::catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
+use super::catalog::MetricCatalog;
 use super::engines::{EngineRegistry, PolicyArtifactCache, linked_registry};
 use super::error::{Dependency, DomainError};
-use super::notifications::{
-    DeliveryLifecycle, DispatchLimits, NotificationDispatcher, dispatcher_context,
-};
+use super::notifications::{DeliveryLifecycle, DispatchLimits, NotificationDispatcher};
 use super::plugins::PluginBinding;
 use super::policies::PolicyRuntimeLimits;
-use super::policies::PolicySchemas;
-use super::policies::schemas::CatalogPolicySchemas;
-use super::ports::contracts::ContractRegistry;
 use super::ports::coordination::{CoordinatorBinding, SingletonCoordinator};
-use super::ports::metric_registry::MetricRegistry;
 use super::ports::metrics::EngineLabel;
 use super::ports::metrics::QeMetrics;
 use super::ports::pdp::PdpProbe;
 use super::readiness::Readiness;
-use quota_enforcement_sdk::MetricId;
 
 const LOG_TARGET: &str = "qe.bootstrap";
 
@@ -54,26 +46,8 @@ pub struct Bound {
     pub storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
     /// The sweeper coordinator over the platform `cluster` gear.
     pub coordinator: Arc<dyn SingletonCoordinator>,
-    /// The published projection contract catalogue. Immutable for the process.
-    pub catalog: Arc<ProjectionContractCatalog>,
-    /// The contract registry the write path snapshots projections from.
-    pub registry: Arc<dyn ContractRegistry>,
-    /// The metric identity and classification registry. The Quota and Policy
-    /// write paths read it; the evaluation path never does.
-    pub metric_registry: Arc<dyn MetricRegistry>,
-    /// Classification of every admitted metric, frozen here so the evaluation
-    /// path answers from process memory.
-    pub classifications: Arc<super::catalog::MetricClassifications>,
-}
-
-/// The registry the catalogue is built from and the projections to build it
-/// for.
-#[domain_model]
-pub struct CatalogBinding {
-    /// The contract registry (platform `types-registry`).
-    pub registry: Arc<dyn ContractRegistry>,
-    /// The configured projections.
-    pub config: CatalogConfig,
+    /// The metric catalogue, filled while the gear runs.
+    pub catalog: Arc<MetricCatalog>,
 }
 
 /// The engine side of a bootstrap: what was registered and where its compiled
@@ -99,8 +73,7 @@ pub struct Bootstrap {
     binding: PluginBinding,
     coordinator: Arc<dyn CoordinatorBinding>,
     pdp: Arc<dyn PdpProbe>,
-    catalog: CatalogBinding,
-    metric_registry: Arc<dyn MetricRegistry>,
+    catalog: Arc<MetricCatalog>,
     metrics: Arc<dyn QeMetrics>,
     readiness: Arc<Readiness>,
     limits: PolicyRuntimeLimits,
@@ -115,8 +88,7 @@ impl Bootstrap {
         binding: PluginBinding,
         coordinator: Arc<dyn CoordinatorBinding>,
         pdp: Arc<dyn PdpProbe>,
-        catalog: CatalogBinding,
-        metric_registry: Arc<dyn MetricRegistry>,
+        catalog: Arc<MetricCatalog>,
         reporting: BootstrapReporting,
         limits: PolicyRuntimeLimits,
     ) -> Self {
@@ -125,7 +97,6 @@ impl Bootstrap {
             coordinator,
             pdp,
             catalog,
-            metric_registry,
             metrics: reporting.metrics,
             readiness: reporting.readiness,
             limits,
@@ -211,50 +182,6 @@ impl Bootstrap {
         // @cpt-end:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-order
         // @cpt-end:cpt-cf-quota-enforcement-algo-engine-bootstrap-seed:p1:inst-ebs-seed
 
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
-        // Reasserting identical definitions is idempotent; conflicts fail.
-        let definitions = owned_definitions().map_err(|e| {
-            (
-                Dependency::Catalog,
-                DomainError::Internal(format!("embedded GTS definition does not parse: {e}")),
-            )
-        })?;
-        self.catalog
-            .registry
-            .ensure_registered(&definitions)
-            .await
-            .map_err(|e| (catalog_dependency(&e), e))?;
-        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-bases
-
-        // Publish only after the catalogue and stored bindings agree.
-        let builder = CatalogBuilder::new(self.catalog.registry.as_ref(), self.metrics.as_ref());
-        let catalog = builder
-            .build(&self.catalog.config)
-            .await
-            .map_err(|e| (catalog_dependency(&e), e))?;
-        let bindings = storage
-            .read_active_projection_bindings()
-            .await
-            .map_err(|e| (Dependency::Storage, DomainError::from(e)))?;
-        builder
-            .check_compatibility(&catalog, &bindings)
-            .map_err(|e| (Dependency::Catalog, e))?;
-        // @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-boot
-
-        // Resolve every admitted or stored metric once before serving traffic.
-        // Collect first to avoid borrowing the catalogue across an await.
-        let to_classify: Vec<MetricId> = catalog
-            .admitted_metrics()
-            .cloned()
-            .chain(bindings.iter().map(|binding| binding.metric.clone()))
-            .collect();
-        let classifications = Arc::new(
-            super::catalog::MetricClassifications::load(to_classify, self.metric_registry.as_ref())
-                .await
-                .map_err(|e| (Dependency::TypesRegistry, e))?,
-        );
-
         // @cpt-begin:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-cluster-resolve
         // Resolution validates the profile and linearizable-election support.
         let coordinator = self
@@ -269,9 +196,10 @@ impl Bootstrap {
         self.pdp.probe().await.map_err(|e| (Dependency::Pdp, e))?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-pdp-probe
 
-        let catalog = Arc::new(catalog);
-        let schemas = CatalogPolicySchemas::new(Arc::clone(&catalog), self.limits.snapshot);
-        self.publish_active_policies(storage.as_ref(), &engines, &artifacts, &schemas)
+        let policy_metrics = self
+            .publish_active_policies(storage.as_ref(), &engines, &artifacts)
+            .await?;
+        self.read_catalog_at_start(storage.as_ref(), policy_metrics)
             .await?;
         self.start_delivery(storage.as_ref()).await?;
 
@@ -280,10 +208,7 @@ impl Bootstrap {
             artifacts,
             storage,
             coordinator,
-            catalog,
-            registry: self.catalog.registry.clone(),
-            metric_registry: self.metric_registry.clone(),
-            classifications,
+            catalog: Arc::clone(&self.catalog),
         })
     }
 
@@ -340,9 +265,8 @@ impl Bootstrap {
             // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-nosink-warn
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-sink-delivery:p1:inst-del-nosink-if
-        let ctx = dispatcher_context().map_err(|e| (Dependency::NotificationSinks, e))?;
         let dispatcher =
-            NotificationDispatcher::new(sinks, ctx, self.dispatch, Arc::clone(&self.metrics));
+            NotificationDispatcher::new(sinks, self.dispatch, Arc::clone(&self.metrics));
         let handle = storage
             .start_notification_delivery(Arc::new(dispatcher))
             .await
@@ -358,18 +282,31 @@ impl Bootstrap {
     /// config and schema snapshot, refusing readiness for one this deployment
     /// cannot support. Nothing here falls back to another engine: a policy
     /// naming an engine that is not registered fails the gear, not the policy.
+    /// A policy is not checked against the current metric type: a mismatch is
+    /// found at evaluation (ADR-0012). Returns the metric types the active
+    /// policies name.
     async fn publish_active_policies(
         &self,
         storage: &dyn QuotaEnforcementStoragePluginV1,
         engines: &EngineRegistry,
         artifacts: &PolicyArtifactCache,
-        schemas: &CatalogPolicySchemas,
-    ) -> Result<(), (Dependency, DomainError)> {
+    ) -> Result<Vec<MetricId>, (Dependency, DomainError)> {
         let active = storage
             .read_active_policies()
             .await
             .map_err(|e| (Dependency::Storage, e.into()))?;
+        let mut metrics = Vec::new();
         for version in active {
+            if let PolicyScope::Metric { metric } = &version.scope {
+                metrics.push(metric.clone());
+            }
+            metrics.extend(
+                version
+                    .schema_snapshot
+                    .schemas
+                    .keys()
+                    .filter_map(|raw| MetricCatalog::parse_metric(raw)),
+            );
             let engine = engines.get(&version.engine_id).ok_or_else(|| {
                 tracing::error!(
                     target: LOG_TARGET,
@@ -386,9 +323,6 @@ impl Bootstrap {
                     },
                 )
             })?;
-            schemas
-                .check_activation(&version)
-                .map_err(|e| (Dependency::Catalog, e))?;
             let artifact = engine
                 .validate_config(quota_enforcement_sdk::EngineValidationInput {
                     raw: &version.engine_config,
@@ -401,7 +335,27 @@ impl Bootstrap {
                 })?;
             artifacts.publish(version.policy_id, version.version, artifact);
         }
-        Ok(())
+        Ok(metrics)
+    }
+
+    /// Fill the catalogue with the metric types of the active Quotas and of
+    /// `policy_metrics`. A failed read fails the run, so a replica does not
+    /// take traffic with an empty catalogue; a metric type that is not valid
+    /// does not.
+    async fn read_catalog_at_start(
+        &self,
+        storage: &dyn QuotaEnforcementStoragePluginV1,
+        mut metrics: Vec<MetricId>,
+    ) -> Result<(), (Dependency, DomainError)> {
+        let counts = storage
+            .read_active_quota_counts()
+            .await
+            .map_err(|e| (Dependency::Storage, DomainError::from(e)))?;
+        metrics.extend(counts.by_metric.into_keys());
+        self.catalog
+            .read_at_start(&metrics)
+            .await
+            .map_err(|e| (Dependency::TypesRegistry, e))
     }
 }
 
@@ -422,15 +376,6 @@ fn global_policy_seed() -> PolicyDraft {
             inputs: EnvironmentInputs::NONE,
             ..PolicySchemaSnapshot::default()
         },
-    }
-}
-
-/// A catalogue failure is the catalogue's fault when the registry answered
-/// and a consistency check failed, and the registry's when it did not answer.
-fn catalog_dependency(err: &DomainError) -> Dependency {
-    match err {
-        DomainError::CatalogInvalid { .. } => Dependency::Catalog,
-        _ => Dependency::TypesRegistry,
     }
 }
 

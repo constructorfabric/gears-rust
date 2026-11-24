@@ -4,7 +4,7 @@
 //!
 //! Every guarded operation in a consuming service becomes a debit here, and
 //! every retry of one must land exactly once. The orchestration in [`service`]
-//! is deliberately thin: admission and catalogue mapping happen above it, the
+//! is deliberately thin: admission and subject admission happen above it, the
 //! policy is selected and evaluated inside the storage transaction, and this
 //! layer only decides what to hash, what to look up, and what to record.
 
@@ -21,7 +21,7 @@ pub use idempotency::{IdempotencyCache, ReplayRecord};
 pub use lease_sweeper::{LeaseSweepReport, LeaseSweepTiming, LeaseSweeper};
 pub use leases::LeaseLimits;
 pub use retention::{RetentionSweeper, RetentionTiming, SweepReport};
-pub use service::Operations;
+pub use service::{Operations, ReturnRequest};
 pub use snapshot::SnapshotLimits;
 
 #[cfg(test)]

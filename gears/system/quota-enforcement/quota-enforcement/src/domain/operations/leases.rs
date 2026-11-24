@@ -1,16 +1,16 @@
 //! The three lease operations (`LeaseManager`): acquire, commit, and release.
 //!
 //! Acquisition is a debit that holds instead of charges: the same ingress, the
-//! same evaluation inside the storage transaction, the same idempotency scope
-//! derived from the authorized subject set, under the `reserve` operation kind.
-//! Commit and release name a lease by its token and an explicit tenant; they
-//! are admitted on the lease resource before storage is read, and storage
-//! completes their idempotency scope from the lease's own acquisition subject
-//! key, never from caller input.
+//! same evaluation inside the storage transaction, under the `reserve`
+//! operation kind. Commit and release name a lease by its token and an
+//! explicit tenant; they are admitted on the lease resource before storage is
+//! read, and storage fixes their operation kind. A commit writes a charge,
+//! which takes its attribution digest from the lease.
 //!
 //! None of the three uses the in-process replay cache: an acquisition's replay
-//! carries a token the cache's record cannot hold, and a settlement's scope is
-//! only known inside the transaction. Replays are answered by storage.
+//! carries a token the cache's record cannot hold, and a settlement's replay is
+//! checked under its key lock, before the lease's state. Replays are answered
+//! by storage.
 
 use crate::domain::admission::admission_span;
 use std::sync::Arc;
@@ -25,8 +25,9 @@ use quota_enforcement_sdk::{
 use serde::Serialize;
 use toolkit_macros::domain_model;
 
-use super::service::{Operations, applicable_of, digest, policy_values};
+use super::service::{DebitPayload, Operations, applicable_of, digest, ensure_quota_gated};
 use crate::domain::admission::AdmissionTarget;
+use crate::domain::catalog::MetricCatalog;
 use crate::domain::engines::PreparedEvaluation;
 use crate::domain::error::DomainError;
 use crate::domain::pep::{actions, resources};
@@ -58,17 +59,19 @@ impl Default for LeaseLimits {
 /// What an acquisition's payload digest covers.
 #[derive(Serialize)]
 struct AcquirePayload<'a> {
-    attribution: &'a quota_enforcement_sdk::EvaluationAttribution,
-    amount: i64,
+    #[serde(flatten)]
+    debit: DebitPayload<'a>,
     ttl_secs: Option<u64>,
 }
 
 /// What a commit's payload digest covers.
 #[derive(Serialize)]
-struct CommitPayload {
+struct CommitPayload<'a> {
     tenant_id: TenantId,
     token: LeaseToken,
     actual_amount: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metric_type: Option<&'a str>,
 }
 
 /// What a release's payload digest covers.
@@ -92,14 +95,13 @@ impl Operations<'_> {
     /// quota-gated; the admission error; `LeaseInflightLimitExceeded` at the
     /// active-lease cap; `LeaseContentionTimeout` when the contention budget
     /// runs out; the storage error of a failed evaluation or hold.
-    #[tracing::instrument(name = "quota_enforcement.operations.acquire_lease", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
+    #[tracing::instrument(name = "quota_enforcement.operations.acquire_lease", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric.metric_type))]
     pub async fn acquire_lease(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: AcquireLeaseRequest,
     ) -> Result<AcquireLeaseOutcome, DomainError> {
         let started = Instant::now();
-        let outcome = self.acquire_lease_inner(ctx, request).await;
+        let outcome = self.acquire_lease_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Reserve, started.elapsed());
         outcome
@@ -107,7 +109,6 @@ impl Operations<'_> {
 
     async fn acquire_lease_inner(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: AcquireLeaseRequest,
     ) -> Result<AcquireLeaseOutcome, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-amount-if
@@ -120,35 +121,32 @@ impl Operations<'_> {
         let ttl = self.validate_ttl(request.ttl_secs)?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-ttl
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-ttl-if
-        self.validate_key(&request.idempotency_key)?;
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-request
-        let payload_hash = digest(&AcquirePayload {
-            attribution: &request.attribution,
-            amount: request.amount,
-            ttl_secs: request.ttl_secs,
-        })?;
         let admitted = self
-            .attribution
-            .admit_evaluation(
-                ctx,
-                &resources::OPERATION,
-                actions::RESERVE,
-                request.attribution,
-            )
+            .attribution()
+            .admit_evaluation(&resources::OPERATION, actions::RESERVE, request.attribution)
             .instrument(admission_span(1))
             .await?;
+        let payload_hash = digest(&AcquirePayload {
+            debit: DebitPayload::of(&admitted, request.amount),
+            ttl_secs: request.ttl_secs,
+        })?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-pipeline
-        self.classifications.ensure_quota_gated(&admitted.metric)?;
-        let scope = Self::scope_of(&admitted, OperationType::Reserve, request.idempotency_key);
+        ensure_quota_gated(&admitted.metric)?;
+        let scope = Self::scope_of(
+            &admitted.attribution,
+            OperationType::Reserve,
+            request.idempotency_key,
+        );
         if let Some(outcome) = self.lease_replay(&scope, payload_hash).await? {
             return Ok(outcome);
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-pipeline
 
         let applicable = applicable_of(&admitted);
-        let user_projection = self.user_projection(&admitted.metric);
-        let (request_value, resource_value) = policy_values(&admitted);
+        let request_value = serde_json::Value::Object(admitted.request.clone());
         let write = IdempotencyWrite {
             scope,
             payload_hash,
@@ -165,8 +163,7 @@ impl Operations<'_> {
             applicable: &applicable,
             amount,
             request: &request_value,
-            resource: &resource_value,
-            user_projection: user_projection.as_ref(),
+            metric_id: admitted.metric_id.as_deref(),
             limits: self.evaluation,
             idempotency: &write,
             authorized: admitted.authorized,
@@ -178,27 +175,31 @@ impl Operations<'_> {
         let waited = Instant::now();
         let outcome = prepared
             .run(|| {
-                self.storage
-                    .acquire_lease(ctx, &admitted.attribution.access_scope, &mutation, ttl)
+                self.storage.acquire_lease(
+                    &admitted.attribution.actor,
+                    &admitted.attribution.access_scope,
+                    &mutation,
+                    ttl,
+                )
             })
             .await;
-        let label = self.classifications.label(&admitted.metric);
-        if let Some(label) = &label {
-            self.metrics
-                .record_lease_acquisition_wait(label, waited.elapsed());
-            match &outcome {
-                // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention-if
-                // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention
-                Err(DomainError::LeaseContentionTimeout) => {
-                    self.metrics.record_lease_contention_rejected(label);
-                }
-                // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention
-                // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention-if
-                Err(DomainError::LeaseInflightLimitExceeded) => {
-                    self.metrics.record_lease_inflight_limit_exceeded(label);
-                }
-                _ => {}
+        let label = admitted.metric.label();
+        self.metrics
+            .record_lease_acquisition_wait(label, waited.elapsed());
+        match &outcome {
+            // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention-if
+            // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention
+            Err(DomainError::LeaseContentionTimeout) => {
+                self.metrics.record_lease_contention_rejected(label);
+                self.metrics
+                    .record_contention_rejected(OperationKind::Reserve);
             }
+            // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention
+            // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-contention-if
+            Err(DomainError::LeaseInflightLimitExceeded) => {
+                self.metrics.record_lease_inflight_limit_exceeded(label);
+            }
+            _ => {}
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-wait
         let outcome = outcome?;
@@ -230,13 +231,9 @@ impl Operations<'_> {
     /// `OverCommitNotAuthorized` above the reserved amount;
     /// `LeaseContentionTimeout` when the contention budget runs out.
     #[tracing::instrument(name = "quota_enforcement.operations.commit_lease", skip_all, fields(tenant_id = %request.tenant_id))]
-    pub async fn commit_lease(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: CommitLeaseRequest,
-    ) -> Result<Decision, DomainError> {
+    pub async fn commit_lease(&self, request: CommitLeaseRequest) -> Result<Decision, DomainError> {
         let started = Instant::now();
-        let outcome = self.commit_lease_inner(ctx, request).await;
+        let outcome = self.commit_lease_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Commit, started.elapsed());
         outcome
@@ -244,21 +241,33 @@ impl Operations<'_> {
 
     async fn commit_lease_inner(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: CommitLeaseRequest,
     ) -> Result<Decision, DomainError> {
         let actual = self.validate_actual(request.actual_amount)?;
-        self.validate_key(&request.idempotency_key)?;
+        let metric = request
+            .metric_type
+            .as_deref()
+            .map(|metric| {
+                MetricCatalog::parse_metric(metric).ok_or_else(|| {
+                    self.metrics.record_denial(DenialReason::InvalidArgument);
+                    DomainError::InvalidArgument {
+                        field: "metric_type",
+                        reason: tokens::METRIC_INVALID,
+                    }
+                })
+            })
+            .transpose()?;
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-request
         let payload_hash = digest(&CommitPayload {
             tenant_id: request.tenant_id,
             token: request.token,
             actual_amount: request.actual_amount,
+            metric_type: request.metric_type.as_deref(),
         })?;
         let admitted = self
             .admission
             .admit(
-                ctx,
                 &resources::LEASE,
                 actions::COMMIT,
                 AdmissionTarget::resource(request.tenant_id, request.token.as_uuid()),
@@ -266,7 +275,6 @@ impl Operations<'_> {
             .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-request
-        // Storage completes the scope from the lease's acquisition subject key.
         let partial = PartialIdempotencyWrite {
             tenant_id: request.tenant_id,
             key: request.idempotency_key,
@@ -275,14 +283,17 @@ impl Operations<'_> {
         let outcome = self
             .storage
             .commit_lease(
-                ctx,
+                &admitted.actor,
                 &admitted.access_scope,
                 request.token,
                 actual,
+                metric.as_ref(),
                 &partial,
                 &[],
             )
-            .await?;
+            .await
+            .map_err(DomainError::from);
+        let outcome = self.contended(OperationKind::Commit, outcome)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-return
         Ok(self.applied(outcome, OperationKind::Commit))
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-return
@@ -299,11 +310,10 @@ impl Operations<'_> {
     #[tracing::instrument(name = "quota_enforcement.operations.release_lease", skip_all, fields(tenant_id = %request.tenant_id))]
     pub async fn release_lease(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: ReleaseLeaseRequest,
     ) -> Result<Decision, DomainError> {
         let started = Instant::now();
-        let outcome = self.release_lease_inner(ctx, request).await;
+        let outcome = self.release_lease_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Release, started.elapsed());
         outcome
@@ -311,10 +321,9 @@ impl Operations<'_> {
 
     async fn release_lease_inner(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: ReleaseLeaseRequest,
     ) -> Result<Decision, DomainError> {
-        self.validate_key(&request.idempotency_key)?;
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-request
         let payload_hash = digest(&ReleasePayload {
             tenant_id: request.tenant_id,
@@ -323,7 +332,6 @@ impl Operations<'_> {
         let admitted = self
             .admission
             .admit(
-                ctx,
                 &resources::LEASE,
                 actions::RELEASE,
                 AdmissionTarget::resource(request.tenant_id, request.token.as_uuid()),
@@ -338,8 +346,16 @@ impl Operations<'_> {
         };
         let outcome = self
             .storage
-            .release_lease(ctx, &admitted.access_scope, request.token, &partial, &[])
-            .await?;
+            .release_lease(
+                &admitted.actor,
+                &admitted.access_scope,
+                request.token,
+                &partial,
+                &[],
+            )
+            .await
+            .map_err(DomainError::from);
+        let outcome = self.contended(OperationKind::Release, outcome)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-return
         Ok(self.applied(outcome, OperationKind::Release))
         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-return

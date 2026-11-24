@@ -6,15 +6,15 @@ use crate::infra::outbox::{AttemptWakes, EnqueueError, NotificationOutbox, settl
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use quota_enforcement_sdk::{
-    NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, PolicyVersionState, StorageError, TransitionOutcome,
+    Actor, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, StorageError,
+    TransitionOutcome,
 };
 use sea_orm::Set;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError};
 use toolkit_db::{Db, DbError};
-use toolkit_security::SecurityContext;
 
 const LOG_TARGET: &str = "qe.storage";
 
@@ -237,11 +237,11 @@ impl SqlPolicyStore {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-write:p1
     pub async fn create_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         draft: PolicyDraft,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
-        let actor = ctx.subject_id().to_string();
+        let actor = actor.to_string();
         let wakes = AttemptWakes::begin(&self.enqueuer);
         let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
@@ -312,12 +312,12 @@ impl SqlPolicyStore {
     // @cpt-state:cpt-cf-quota-enforcement-state-policy-version:p1
     pub async fn update_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         id: PolicyId,
         update: PolicyUpdate,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
-        let actor = ctx.subject_id().to_string();
+        let actor = actor.to_string();
         let wakes = AttemptWakes::begin(&self.enqueuer);
         let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
@@ -392,13 +392,13 @@ impl SqlPolicyStore {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-rollback:p1
     pub async fn rollback_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         id: PolicyId,
         target: u32,
         comment: Option<String>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<PolicyVersion>, StorageError> {
-        let actor = ctx.subject_id().to_string();
+        let actor = actor.to_string();
         let wakes = AttemptWakes::begin(&self.enqueuer);
         let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
@@ -480,7 +480,7 @@ impl SqlPolicyStore {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-delete:p1
     pub async fn delete_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
@@ -492,7 +492,7 @@ impl SqlPolicyStore {
             // @cpt-end:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-global
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-global-if
-        let actor = ctx.subject_id().to_string();
+        let actor = actor.to_string();
         let wakes = AttemptWakes::begin(&self.enqueuer);
         let enqueuer = wakes.enqueuer();
         let events = events.to_vec();
@@ -595,7 +595,7 @@ impl SqlPolicyStore {
 
     /// Every active policy, for the bootstrap catalogue and engine
     /// compatibility scan. Caller-less by contract: this is an internal
-    /// platform read, not a public list API, so no `SecurityContext` narrows it.
+    /// platform read, not a public list API, so no `AccessScope` narrows it.
     ///
     /// # Errors
     /// Backend unavailability, or a corrupt payload.
@@ -706,42 +706,42 @@ impl SqlPolicyStore {
 impl crate::domain::ports::PolicyStore for SqlPolicyStore {
     async fn create_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         draft: PolicyDraft,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
-        Self::create_policy(self, ctx, draft, events).await
+        Self::create_policy(self, actor, draft, events).await
     }
 
     async fn update_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         update: PolicyUpdate,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
-        Self::update_policy(self, ctx, policy_id, update, events).await
+        Self::update_policy(self, actor, policy_id, update, events).await
     }
 
     async fn rollback_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         target_version: u32,
         comment: Option<String>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<PolicyVersion>, StorageError> {
-        Self::rollback_policy(self, ctx, policy_id, target_version, comment, events).await
+        Self::rollback_policy(self, actor, policy_id, target_version, comment, events).await
     }
 
     async fn delete_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<()>, StorageError> {
-        Self::delete_policy(self, ctx, policy_id, comment, events).await
+        Self::delete_policy(self, actor, policy_id, comment, events).await
     }
 
     async fn read_policy(

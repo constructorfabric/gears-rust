@@ -176,7 +176,7 @@ impl QuotaEnforcementApi for FakeEnforcement {
         request: DebitRequest,
     ) -> Result<Decision, CanonicalError> {
         self.0.record(ctx);
-        let mut decision = Decision::allowed_with_plan(std::collections::BTreeMap::new());
+        let mut decision = Decision::allowed_with_plan(Vec::new());
         decision
             .diagnostics
             .insert("key".to_owned(), serde_json::json!(request.idempotency_key));
@@ -355,10 +355,10 @@ fn spec() -> QuotaSpec {
     serde_json::from_value(serde_json::json!({
         "tenant_id": TENANT,
         "subject": {
-            "projection_type": gts_id!("cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
-            "subject_id": "u1"
+            "type": gts_id!("cf.core.quota.subj.v1~acme.core.quota.user.v1~"),
+            "id": "u1"
         },
-        "metric": gts_id!("cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1"),
+        "metric": gts_id!("cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~"),
         "quota_type": gts_id!("cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1"),
         "period": gts_id!("cf.core.qe.period_type.v1~cf.core.qe.month.v1"),
         "enforcement_mode": gts_id!("cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1"),
@@ -411,9 +411,11 @@ async fn each_contract_round_trips_as_the_caller_the_token_names() {
             serde_json::from_value(serde_json::json!({
                 "attribution": {
                     "tenant_id": TENANT,
-                    "metric": gts_id!("cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1"),
-                    "subjects": [],
-                    "metadata": {}
+                    "metric": {
+                        "type": gts_id!("cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~"),
+                        "metadata": {}
+                    },
+                    "subjects": []
                 },
                 "amount": 1,
                 "idempotency_key": "d1"

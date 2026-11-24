@@ -83,8 +83,8 @@ pub struct CreateQuotaRequest {
     pub validity_window: Option<ValidityWindow>,
     /// Informational fail-open hint.
     pub fail_open_hint: bool,
-    /// Metadata to validate against the owner's constraint contract; absent
-    /// means an empty object.
+    /// The Quota's conditions, checked against the metric type; absent means
+    /// an empty object.
     pub metadata: Option<Map<String, Value>>,
     /// Who imposes the Quota. Closed by the SDK enum.
     pub source: QuotaSource,
@@ -175,9 +175,9 @@ impl TryFrom<QuotaUpdate> for UpdateQuotaRequest {
 pub struct ListQuotasRequest {
     /// Owning tenant; the caller's own tenant when absent.
     pub tenant_id: Option<TenantId>,
-    /// Subject projection type; must come with `subject_id`.
-    pub projection_type: Option<GtsTypeId>,
-    /// Subject identifier; must come with `projection_type`.
+    /// Subject type; must come with `subject_id`.
+    pub subject_type: Option<GtsTypeId>,
+    /// Subject identifier; must come with `subject_type`.
     pub subject_id: Option<String>,
     /// Metric as written.
     pub metric: Option<String>,
@@ -193,13 +193,13 @@ pub struct ListQuotasRequest {
 
 impl From<(QuotaFilter, PageRequest)> for ListQuotasRequest {
     fn from((filter, page): (QuotaFilter, PageRequest)) -> Self {
-        let (projection_type, subject_id) = match filter.subject {
-            Some(subject) => (Some(subject.projection_type), Some(subject.subject_id)),
+        let (subject_type, subject_id) = match filter.subject {
+            Some(subject) => (Some(subject.subject_type), Some(subject.subject_id)),
             None => (None, None),
         };
         Self {
             tenant_id: filter.tenant_id,
-            projection_type,
+            subject_type,
             subject_id,
             metric: filter.metric.map(|m| m.as_str().to_owned()),
             status: filter.status,

@@ -2,7 +2,6 @@
 //! stores answer each call with an error naming the method that received it,
 //! and the contract must return exactly that error.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,15 +12,14 @@ use quota_enforcement_sdk::{
     BatchEntry, BatchTimer, BulkCreateEnvelope, BulkCreated, BulkDeactivateEnvelope,
     BulkDeactivated, BulkUpdateEnvelope, BulkUpdated, DeactivateOutcome, EvaluatedBatch,
     EvaluatedDebit, EvaluatedLease, EvaluatedMutation, EvaluationContext, EvaluationFailure,
-    ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite,
-    LeaseToken, MetricId, NotificationEvent, OperationType, PageRequest, PageResult,
-    PartialIdempotencyWrite, PayloadHash, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft,
-    QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
-    RollbackTarget, StorageError, TransitionOutcome,
+    ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId,
+    NotificationEvent, OperationType, PageRequest, PageResult, PartialIdempotencyWrite,
+    PayloadHash, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion,
+    PolicyVersionMeta, Quota, QuotaDraft, QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError, TransitionOutcome,
 };
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::StoragePlugin;
@@ -29,7 +27,7 @@ use crate::domain::ports::{
     Actor, ConsumptionStore, LeaseStore, PolicyStore, QuotaStore, StoreError,
 };
 use crate::infra::storage::SqlFoundationStore;
-use crate::test_support::{draft, global_policy_draft, scope_for, tenant, test_db, user};
+use crate::test_support::{actor, draft, global_policy_draft, scope_for, tenant, test_db, user};
 
 /// Answers every store call with an error naming the method.
 struct Tagging;
@@ -39,14 +37,14 @@ fn tag(method: &str) -> StorageError {
 }
 
 fn quota_tag(method: &str) -> StoreError {
-    StoreError::InvalidPatch {
+    StoreError::InvalidFilter {
         detail: method.to_owned(),
     }
 }
 
 /// What a [`quota_tag`] becomes once the plugin lifts it to the contract.
 fn lifted(method: &str) -> StorageError {
-    StorageError::Internal(format!("invalid patch: {method}"))
+    StorageError::Internal(format!("invalid filter: {method}"))
 }
 
 fn err<T>(result: Result<T, StorageError>) -> StorageError {
@@ -98,12 +96,6 @@ impl QuotaStore for Tagging {
         Err(quota_tag("read_quotas"))
     }
 
-    async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StoreError> {
-        Err(quota_tag("read_active_projection_bindings"))
-    }
-
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError> {
         Err(quota_tag("read_active_quota_counts"))
     }
@@ -137,7 +129,7 @@ impl QuotaStore for Tagging {
 impl ConsumptionStore for Tagging {
     async fn apply_debit_plan(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _mutation: &EvaluatedMutation<'_>,
         _events: &[NotificationEvent],
@@ -147,7 +139,7 @@ impl ConsumptionStore for Tagging {
 
     async fn apply_batch_debit(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _batch: &EvaluatedBatch<'_>,
         _events: &[NotificationEvent],
@@ -157,7 +149,7 @@ impl ConsumptionStore for Tagging {
 
     async fn apply_credit(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _quota_id: QuotaId,
         _amount: u64,
@@ -167,12 +159,21 @@ impl ConsumptionStore for Tagging {
         Err(tag("apply_credit"))
     }
 
+    async fn apply_return(
+        &self,
+        _actor: &quota_enforcement_sdk::Actor,
+        _scope: &AccessScope,
+        _ret: &quota_enforcement_sdk::ChargeReturn,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        Err(tag("apply_return"))
+    }
+
     async fn apply_rollback(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _target: &RollbackTarget,
-        _idempotency: &IdempotencyWrite,
         _events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         Err(tag("apply_rollback"))
@@ -180,7 +181,6 @@ impl ConsumptionStore for Tagging {
 
     async fn read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         _applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
@@ -189,10 +189,10 @@ impl ConsumptionStore for Tagging {
 
     async fn bulk_read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         _pairs: &[ApplicableQuotas],
         _page: PageRequest,
+        _in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
         Err(tag("bulk_read_quota_snapshot"))
     }
@@ -219,13 +219,28 @@ impl ConsumptionStore for Tagging {
     ) -> Result<u64, StorageError> {
         Err(tag("reclaim_operation_log"))
     }
+
+    async fn reclaim_expired_charges(
+        &self,
+        _batch_size: u32,
+        _now: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        Err(tag("reclaim_expired_charges"))
+    }
+
+    async fn read_held_allocation_charge_stats(
+        &self,
+        _before: OffsetDateTime,
+    ) -> Result<Vec<quota_enforcement_sdk::HeldAllocationCharges>, StorageError> {
+        Err(tag("read_held_allocation_charge_stats"))
+    }
 }
 
 #[async_trait]
 impl LeaseStore for Tagging {
     async fn acquire_lease(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _mutation: &EvaluatedMutation<'_>,
         _ttl: Duration,
@@ -235,10 +250,11 @@ impl LeaseStore for Tagging {
 
     async fn commit_lease(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _token: LeaseToken,
         _actual_amount: Option<u64>,
+        _metric: Option<&quota_enforcement_sdk::MetricId>,
         _idempotency: &PartialIdempotencyWrite,
         _events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
@@ -247,7 +263,7 @@ impl LeaseStore for Tagging {
 
     async fn release_lease(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _token: LeaseToken,
         _idempotency: &PartialIdempotencyWrite,
@@ -276,7 +292,7 @@ impl LeaseStore for Tagging {
 impl PolicyStore for Tagging {
     async fn create_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _draft: PolicyDraft,
         _events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
@@ -285,7 +301,7 @@ impl PolicyStore for Tagging {
 
     async fn update_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _policy_id: PolicyId,
         _update: PolicyUpdate,
         _events: &[NotificationEvent],
@@ -295,7 +311,7 @@ impl PolicyStore for Tagging {
 
     async fn rollback_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _policy_id: PolicyId,
         _target_version: u32,
         _comment: Option<String>,
@@ -306,7 +322,7 @@ impl PolicyStore for Tagging {
 
     async fn delete_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _policy_id: PolicyId,
         _comment: Option<String>,
         _events: &[NotificationEvent],
@@ -361,20 +377,10 @@ async fn contract() -> Arc<dyn QuotaEnforcementStoragePluginV1> {
     ))
 }
 
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_type("service")
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
-}
-
 fn write(operation_type: OperationType) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::of(&[user("u1")]),
             operation_type,
             key: "k1".to_owned(),
         },
@@ -418,7 +424,7 @@ fn evaluator() -> Arc<TransactionEvaluator> {
 #[tokio::test]
 async fn quota_primitives_reach_their_store_methods() {
     let plugin = contract().await;
-    let (ctx, scope, id) = (ctx(), scope_for(tenant()), QuotaId::generate());
+    let (actor, scope, id) = (actor(), scope_for(tenant()), QuotaId::generate());
     let deactivate = BulkDeactivateEnvelope {
         tenant_id: tenant(),
         idempotency: write(OperationType::BulkDeactivateQuotas),
@@ -438,44 +444,40 @@ async fn quota_primitives_reach_their_store_methods() {
     let answers = [
         (
             err(plugin
-                .create_quota(&ctx, &scope, draft(tenant(), "u1", Some(5)), &[])
+                .create_quota(&actor, &scope, draft(tenant(), "u1", Some(5)), &[])
                 .await),
             "create_quota",
         ),
         (
             err(plugin
-                .update_quota(&ctx, &scope, id, QuotaPatch::default(), &[])
+                .update_quota(&actor, &scope, id, QuotaPatch::default(), &[])
                 .await),
             "update_quota",
         ),
         (
-            err(plugin.deactivate_quota(&ctx, &scope, id, &[]).await),
+            err(plugin.deactivate_quota(&actor, &scope, id, &[]).await),
             "deactivate_quota",
         ),
         (
             err(plugin
-                .read_quotas(&ctx, &scope, QuotaFilter::default(), PageRequest::default())
+                .read_quotas(&scope, QuotaFilter::default(), PageRequest::default())
                 .await),
             "read_quotas",
-        ),
-        (
-            err(plugin.read_active_projection_bindings().await),
-            "read_active_projection_bindings",
         ),
         (
             err(plugin.read_active_quota_counts().await),
             "read_active_quota_counts",
         ),
         (
-            err(plugin.bulk_create_quotas(&ctx, &create).await),
+            err(plugin.bulk_create_quotas(&actor, &create).await),
             "bulk_create_quotas",
         ),
         (
-            err(plugin.bulk_update_quotas(&ctx, &update).await),
+            err(plugin.bulk_update_quotas(&actor, &update).await),
             "bulk_update_quotas",
         ),
         (
-            err(plugin.bulk_deactivate_quotas(&ctx, &deactivate).await),
+            err(plugin.bulk_deactivate_quotas(&actor, &deactivate).await),
             "bulk_deactivate_quotas",
         ),
     ];
@@ -487,7 +489,7 @@ async fn quota_primitives_reach_their_store_methods() {
 #[tokio::test]
 async fn consumption_and_lease_primitives_reach_their_store_methods() {
     let plugin = contract().await;
-    let (ctx, scope) = (ctx(), scope_for(tenant()));
+    let (actor, scope) = (actor(), scope_for(tenant()));
     let applicable = applicable();
     let null = serde_json::Value::Null;
     let debit = write(OperationType::Debit);
@@ -495,8 +497,7 @@ async fn consumption_and_lease_primitives_reach_their_store_methods() {
         applicable: &applicable,
         amount: 1,
         request: &null,
-        resource: &null,
-        user_projection: None,
+        metric_id: None,
         limits: limits(),
         idempotency: &debit,
         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -506,14 +507,13 @@ async fn consumption_and_lease_primitives_reach_their_store_methods() {
         applicable: applicable.clone(),
         amount: 1,
         request: null.clone(),
-        resource: null.clone(),
+        metric_id: None,
         authorized: AttributionDigest::from_bytes([7; 32]),
-        item_scope: None,
+        idempotency: debit.clone(),
     };
     let entries = [BatchEntry {
         item: &item,
         scope: &scope,
-        user_projection: None,
     }];
     let envelope = write(OperationType::BatchDebit);
     let batch = EvaluatedBatch {
@@ -532,42 +532,52 @@ async fn consumption_and_lease_primitives_reach_their_store_methods() {
 
     let answers = [
         (
-            err(plugin.apply_debit_plan(&ctx, &scope, &mutation, &[]).await),
+            err(plugin
+                .apply_debit_plan(&actor, &scope, &mutation, &[])
+                .await),
             "apply_debit_plan",
         ),
         (
-            err(plugin.apply_batch_debit(&ctx, &scope, &batch, &[]).await),
+            err(plugin.apply_batch_debit(&actor, &scope, &batch, &[]).await),
             "apply_batch_debit",
         ),
         (
             err(plugin
-                .apply_credit(&ctx, &scope, QuotaId::generate(), 1, &partial(), &[])
+                .apply_credit(&actor, &scope, QuotaId::generate(), 1, &partial(), &[])
                 .await),
             "apply_credit",
         ),
         (
             err(plugin
-                .apply_rollback(
-                    &ctx,
+                .apply_return(
+                    &actor,
                     &scope,
-                    &rollback,
-                    &write(OperationType::Rollback),
+                    &quota_enforcement_sdk::ChargeReturn {
+                        charge: debit.scope.clone(),
+                        metric: applicable.metric.clone(),
+                        amount: 1,
+                        key: "return-1".to_owned(),
+                    },
                     &[],
                 )
                 .await),
+            "apply_return",
+        ),
+        (
+            err(plugin.apply_rollback(&actor, &scope, &rollback, &[]).await),
             "apply_rollback",
         ),
         (
-            err(plugin.read_quota_snapshot(&ctx, &scope, &applicable).await),
+            err(plugin.read_quota_snapshot(&scope, &applicable).await),
             "read_quota_snapshot",
         ),
         (
             err(plugin
                 .bulk_read_quota_snapshot(
-                    &ctx,
                     &scope,
                     std::slice::from_ref(&applicable),
                     PageRequest::default(),
+                    false,
                 )
                 .await),
             "bulk_read_quota_snapshot",
@@ -581,24 +591,32 @@ async fn consumption_and_lease_primitives_reach_their_store_methods() {
             "reclaim_expired_idempotency",
         ),
         (
+            err(plugin.reclaim_expired_charges(10, now).await),
+            "reclaim_expired_charges",
+        ),
+        (
+            err(plugin.read_held_allocation_charge_stats(now).await),
+            "read_held_allocation_charge_stats",
+        ),
+        (
             err(plugin.reclaim_operation_log(10, now).await),
             "reclaim_operation_log",
         ),
         (
             err(plugin
-                .acquire_lease(&ctx, &scope, &mutation, Duration::from_secs(60))
+                .acquire_lease(&actor, &scope, &mutation, Duration::from_secs(60))
                 .await),
             "acquire_lease",
         ),
         (
             err(plugin
-                .commit_lease(&ctx, &scope, token, Some(1), &partial(), &[])
+                .commit_lease(&actor, &scope, token, Some(1), None, &partial(), &[])
                 .await),
             "commit_lease",
         ),
         (
             err(plugin
-                .release_lease(&ctx, &scope, token, &partial(), &[])
+                .release_lease(&actor, &scope, token, &partial(), &[])
                 .await),
             "release_lease",
         ),
@@ -619,7 +637,7 @@ async fn consumption_and_lease_primitives_reach_their_store_methods() {
 #[tokio::test]
 async fn policy_primitives_reach_their_store_methods() {
     let plugin = contract().await;
-    let ctx = ctx();
+    let actor = actor();
     let id = PolicyId::new("global");
     let update: PolicyUpdate = serde_json::from_value(serde_json::json!({
         "if_match_version": 1,
@@ -629,19 +647,23 @@ async fn policy_primitives_reach_their_store_methods() {
 
     let answers = [
         (
-            err(plugin.create_policy(&ctx, global_policy_draft(), &[]).await),
+            err(plugin
+                .create_policy(&actor, global_policy_draft(), &[])
+                .await),
             "create_policy",
         ),
         (
-            err(plugin.update_policy(&ctx, id.clone(), update, &[]).await),
+            err(plugin.update_policy(&actor, id.clone(), update, &[]).await),
             "update_policy",
         ),
         (
-            err(plugin.rollback_policy(&ctx, id.clone(), 1, None, &[]).await),
+            err(plugin
+                .rollback_policy(&actor, id.clone(), 1, None, &[])
+                .await),
             "rollback_policy",
         ),
         (
-            err(plugin.delete_policy(&ctx, id.clone(), None, &[]).await),
+            err(plugin.delete_policy(&actor, id.clone(), None, &[]).await),
             "delete_policy",
         ),
         (

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, OperationType, PayloadHash,
+    IdempotencyScope, IdempotencyWrite, OperationType, PayloadHash,
     QuotaEnforcementStoragePluginV1, StorageError, TenantId,
 };
 use time::OffsetDateTime;
@@ -10,7 +10,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{RetentionSweeper, RetentionTiming, SweepReport};
-use crate::domain::ports::metrics::RetentionTable;
+use crate::domain::ports::metrics::{
+    ChargeBacklog, ChargeBacklogSink, HeldCharges, NoopChargeBacklog, RetentionTable,
+};
 use crate::test_support::RecordingMetrics;
 
 fn timing(batch: u32) -> RetentionTiming {
@@ -29,7 +31,6 @@ fn write(key: &str) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: TenantId::new(Uuid::from_u128(1)),
-            subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
             operation_type: OperationType::Credit,
             key: key.to_owned(),
         },
@@ -45,15 +46,10 @@ async fn storage_with(count: usize) -> Arc<InMemoryStorage> {
         .bootstrap(&quota_enforcement_sdk::testing::bundle_with_global_policy())
         .await
         .expect("bootstrap");
-    let ctx = toolkit_security::SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(Uuid::from_u128(1))
-        .build()
-        .expect("context");
     let scope = toolkit_security::AccessScope::allow_all();
     let quota = storage
         .create_quota(
-            &ctx,
+            &crate::test_support::actor(),
             &scope,
             quota_enforcement_sdk::testing::quota_draft(
                 quota_enforcement_sdk::testing::test_subject("u1"),
@@ -66,7 +62,7 @@ async fn storage_with(count: usize) -> Arc<InMemoryStorage> {
     for index in 0..count {
         storage
             .apply_credit(
-                &ctx,
+                &crate::test_support::actor(),
                 &scope,
                 quota,
                 1,
@@ -89,7 +85,13 @@ fn sweeper(
     metrics: Arc<RecordingMetrics>,
     batch: u32,
 ) -> RetentionSweeper {
-    RetentionSweeper::new(storage, metrics, timing(batch))
+    RetentionSweeper::new(
+        storage,
+        metrics.clone(),
+        crate::test_support::catalog_over(&crate::test_support::platform_registry(), metrics),
+        Arc::new(NoopChargeBacklog),
+        timing(batch),
+    )
 }
 
 #[tokio::test]
@@ -129,7 +131,11 @@ async fn a_failing_table_is_recorded_and_left_for_the_next_tick() {
     assert_eq!(report, SweepReport::default(), "nothing was deleted");
     assert_eq!(
         metrics.retention_failures(),
-        vec![RetentionTable::Idempotency, RetentionTable::OperationLog],
+        vec![
+            RetentionTable::Idempotency,
+            RetentionTable::OperationLog,
+            RetentionTable::Charges
+        ],
         "each table reports its own failure"
     );
 
@@ -180,7 +186,16 @@ async fn a_retention_longer_than_the_calendar_reclaims_no_log_and_still_sweeps()
         operation_log_retention: time::Duration::days(i64::from(u32::MAX)),
         ..timing(10)
     };
-    let sweeper = RetentionSweeper::new(storage, Arc::<RecordingMetrics>::clone(&metrics), timing);
+    let sweeper = RetentionSweeper::new(
+        storage,
+        Arc::<RecordingMetrics>::clone(&metrics),
+        crate::test_support::catalog_over(
+            &crate::test_support::platform_registry(),
+            metrics.clone(),
+        ),
+        Arc::new(NoopChargeBacklog),
+        timing,
+    );
 
     let report = sweeper
         .sweep_once(&CancellationToken::new(), far_future())
@@ -189,4 +204,134 @@ async fn a_retention_longer_than_the_calendar_reclaims_no_log_and_still_sweeps()
     assert_eq!(report.idempotency, 3);
     assert_eq!(report.operation_log, 0, "no entry is that old");
     assert_eq!(metrics.retention_failures(), Vec::new());
+}
+
+#[derive(Default)]
+struct Samples(std::sync::Mutex<Vec<Option<ChargeBacklog>>>);
+
+impl ChargeBacklogSink for Samples {
+    fn publish(&self, backlog: Option<ChargeBacklog>) {
+        self.0.lock().expect("lock").push(backlog);
+    }
+}
+
+#[tokio::test]
+async fn a_sweep_removes_deleted_charges_and_publishes_the_held_allocation_charges() {
+    use super::super::harness_tests::{Harness, attribution, debit};
+    let h = Harness::new().await;
+    let id = h.quota(Some(100)).await;
+    let start = OffsetDateTime::from_unix_timestamp(1_773_741_600).expect("time");
+    h.storage.set_now(Some(start));
+    h.operations().debit(debit(30, "k1")).await.expect("debit");
+    let samples = Arc::new(Samples::default());
+    let sweeper = RetentionSweeper::new(
+        h.storage.clone(),
+        h.metrics.clone(),
+        Arc::clone(&h.catalog),
+        Arc::clone(&samples) as Arc<dyn ChargeBacklogSink>,
+        timing(10),
+    );
+    let label = {
+        let metric = quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric");
+        let Some(crate::domain::catalog::CatalogEntry::Served(served)) = h.catalog.peek(&metric)
+        else {
+            panic!("the debit served the metric");
+        };
+        served.label().clone()
+    };
+
+    let two_days = start + time::Duration::days(2);
+    let held = sweeper
+        .sweep_once(&CancellationToken::new(), two_days)
+        .await;
+    assert_eq!(held.charges, 0, "an allocation charge that holds stays");
+    assert_eq!(
+        samples.0.lock().expect("lock").last().cloned().flatten(),
+        Some(vec![(
+            label.clone(),
+            HeldCharges {
+                count: 1,
+                oldest_age_secs: 2 * 86_400
+            }
+        )])
+    );
+
+    h.storage.set_now(Some(two_days));
+    h.operations()
+        .rollback(quota_enforcement_sdk::RollbackRequest {
+            attribution: attribution(),
+            original_operation: quota_enforcement_sdk::RollbackableOperation::Debit,
+            original_idempotency_key: "k1".to_owned(),
+        })
+        .await
+        .expect("rollback");
+    assert_eq!(h.consumed(id), 0);
+    let kept = sweeper
+        .sweep_once(&CancellationToken::new(), two_days)
+        .await;
+    assert_eq!(
+        kept.charges, 0,
+        "a rollback keeps its charge one replay window"
+    );
+    let gone = sweeper
+        .sweep_once(&CancellationToken::new(), start + time::Duration::days(4))
+        .await;
+    assert_eq!(gone.charges, 1);
+    assert_eq!(
+        samples.0.lock().expect("lock").last().cloned().flatten(),
+        Some(vec![(label, HeldCharges::default())]),
+        "no held charge is a zero, not a missing point"
+    );
+}
+
+#[tokio::test]
+async fn a_replica_that_has_not_served_a_metric_still_reports_its_held_charges() {
+    use super::super::harness_tests::{Harness, debit};
+    let h = Harness::new().await;
+    h.quota(Some(100)).await;
+    let start = OffsetDateTime::from_unix_timestamp(1_773_741_600).expect("time");
+    h.storage.set_now(Some(start));
+    h.operations().debit(debit(30, "k1")).await.expect("debit");
+    let samples = Arc::new(Samples::default());
+    let cold = crate::test_support::catalog_over(&h.registry, h.metrics.clone());
+    let sweeper = RetentionSweeper::new(
+        h.storage.clone(),
+        h.metrics.clone(),
+        cold,
+        Arc::clone(&samples) as Arc<dyn ChargeBacklogSink>,
+        timing(10),
+    );
+
+    sweeper
+        .sweep_once(&CancellationToken::new(), start + time::Duration::days(2))
+        .await;
+
+    let sample = samples.0.lock().expect("lock").last().cloned().flatten();
+    let held: Vec<u64> = sample
+        .expect("a sample")
+        .into_iter()
+        .map(|(_, held)| held.count)
+        .collect();
+    assert_eq!(held, vec![1], "read from the registry, not left out");
+}
+
+#[tokio::test]
+async fn a_sweep_cancelled_by_lost_leadership_publishes_no_sample() {
+    use super::super::harness_tests::Harness;
+    let h = Harness::new().await;
+    let samples = Arc::new(Samples::default());
+    let sweeper = RetentionSweeper::new(
+        h.storage.clone(),
+        h.metrics.clone(),
+        Arc::clone(&h.catalog),
+        Arc::clone(&samples) as Arc<dyn ChargeBacklogSink>,
+        timing(10),
+    );
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    sweeper.sweep_once(&cancel, far_future()).await;
+
+    assert!(samples.0.lock().expect("lock").is_empty());
 }

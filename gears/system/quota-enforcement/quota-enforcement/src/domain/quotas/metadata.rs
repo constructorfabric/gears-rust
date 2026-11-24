@@ -1,49 +1,39 @@
-//! Quota metadata validation (`features/quota-lifecycle.md`, "Quota Metadata
-//! Validation"; ADR-0007).
-//!
-//! The operator's metadata object is validated once, at create or update,
-//! against the constraint contract attached to the metric's request contract,
-//! and never again during evaluation. The size bound applies to the compact
-//! JSON encoding, whose length is the same whatever order the keys are written
-//! in. The content stays opaque: it is validated for shape, stored and
-//! forwarded verbatim, and never logged.
+//! Quota metadata validation (`cpt-cf-quota-enforcement-algo-quota-metadata-validation`,
+//! ADR-0013): the metadata of a Quota holds its conditions over the `metadata`
+//! of the request's metric object, checked against the metric type.
 
-use quota_enforcement_sdk::ContractRef;
-use serde_json::{Map, Value, json};
+use quota_enforcement_sdk::QuotaMetadataViolation;
+use serde_json::{Map, Value};
 
-use crate::domain::catalog::ConstraintContract;
+use crate::domain::catalog::ServedMetric;
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::{QeMetrics, ValidationReason, ValidationSurface};
 use crate::domain::tokens;
 
 const LOG_TARGET: &str = "qe.quotas";
 
-/// Validate `metadata` against `constraint` and return the contract reference
-/// to snapshot with the row.
+/// The property types a condition may name.
+const SCALARS: [&str; 3] = ["string", "integer", "boolean"];
+
+/// Check `metadata` of a Quota on the metric `served`: the size limit, then
+/// each condition against the metric type's `metadata` schema.
 ///
 /// # Errors
 ///
-/// `InvalidArgument` with `METADATA_TOO_LARGE` when the compact JSON encoding
-/// exceeds `max_bytes`; `ConstraintContractMismatch` when the envelope
-/// violates the contract; `Internal` when the object does not serialize.
-///
-/// The measured size is independent of key order, so the bound is well
-/// defined. The encoding itself is not byte-canonical: key order follows
-/// whichever `serde_json` map implementation feature unification selects, so
-/// nothing may hash or compare these bytes.
-// @cpt-algo:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1
-// @cpt-dod:cpt-cf-quota-enforcement-dod-quota-metadata:p1
-pub fn validate_metadata(
-    metadata: &Map<String, Value>,
-    constraint: &ConstraintContract,
-    max_bytes: usize,
+/// - [`DomainError::InvalidArgument`] with `METADATA_TOO_LARGE`.
+/// - [`DomainError::QuotaMetadataRejected`] with one violation per condition
+///   that does not fit.
+pub fn check(
     metrics: &dyn QeMetrics,
-) -> Result<ContractRef, DomainError> {
+    served: &ServedMetric,
+    metadata: &Map<String, Value>,
+    max_bytes: usize,
+) -> Result<(), DomainError> {
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size-if
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size
     let encoded = serde_json::to_vec(metadata)
         .map_err(|e| DomainError::Internal(format!("metadata does not serialize: {e}")))?;
     if encoded.len() > max_bytes {
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size
         tracing::warn!(
             target: LOG_TARGET,
             size = encoded.len(),
@@ -54,57 +44,115 @@ pub fn validate_metadata(
             field: "metadata",
             reason: tokens::METADATA_TOO_LARGE,
         });
-        // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size
     }
+    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size
     // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-size-if
 
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-contract
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-envelope
-    // Validate the full envelope so base `required` and
-    // `additionalProperties` constraints apply.
-    let envelope = json!({
-        "type": constraint.reference.type_id.as_ref(),
-        "metadata": metadata,
-    });
-    let outcome = constraint.contract.validate(&envelope);
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-envelope
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-contract
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-conditions
+    let violations = violations(served.schema(), metadata);
+    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-conditions
 
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-mismatch-if
-    if let Err(violations) = outcome {
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-mismatch
-        metrics.record_contract_validation_failure(
-            ValidationSurface::Arbitration,
-            ValidationReason::SchemaViolation,
-        );
-        // The count, not the messages: the messages quote the values.
-        tracing::warn!(
-            target: LOG_TARGET,
-            contract = %constraint.reference.type_id,
-            violations = violations.len(),
-            "quota metadata violates its constraint contract"
-        );
-        return Err(DomainError::ConstraintContractMismatch {
-            contract: constraint.reference.type_id.as_ref().to_owned(),
-        });
-        // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-mismatch
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-rejected-if
+    if violations.is_empty() {
+        return Ok(());
     }
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-mismatch-if
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-rejected
+    metrics.record_contract_validation_failure(
+        ValidationSurface::QuotaWrite,
+        ValidationReason::SchemaViolation,
+    );
+    tracing::warn!(
+        target: LOG_TARGET,
+        metric = %served.id(),
+        violations = violations.len(),
+        "a condition of the quota metadata does not fit the metric type"
+    );
+    Err(DomainError::QuotaMetadataRejected { violations })
+    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-rejected
+    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-rejected-if
+}
 
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-snapshot
-    // Persist the accepted contract; evaluation does not revalidate metadata.
-    let snapshot = constraint.reference.clone();
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-snapshot
+/// What is wrong with each condition of `metadata` under the resolved metric
+/// type `schema`, in key order.
+pub(super) fn violations(
+    schema: &Value,
+    metadata: &Map<String, Value>,
+) -> Vec<QuotaMetadataViolation> {
+    let mut declared = Map::new();
+    metadata_properties(schema, &mut declared);
+    metadata
+        .iter()
+        .filter_map(|(name, condition)| {
+            let reason = reason(declared.get(name), condition)?;
+            Some(QuotaMetadataViolation {
+                path: format!("/{}", name.replace('~', "~0").replace('/', "~1")),
+                reason: reason.to_owned(),
+            })
+        })
+        .collect()
+}
 
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-opaque
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-pii
-    // Metadata is opaque to QE and forwarded as the engine's `arbitration` object.
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-pii
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-opaque
+/// Why `condition` does not fit the declared `property`, if it does not.
+fn reason(property: Option<&Value>, condition: &Value) -> Option<&'static str> {
+    let Some(property) = property else {
+        return Some("the metric type declares no such metadata property");
+    };
+    let Some(kind) = property
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| SCALARS.contains(kind))
+    else {
+        return Some("a condition names only a string, integer, or boolean property");
+    };
+    let fits = |value: &Value| {
+        let typed = match kind {
+            "string" => value.is_string(),
+            "integer" => value.is_i64() || value.is_u64(),
+            _ => value.is_boolean(),
+        };
+        typed
+            && property
+                .get("enum")
+                .and_then(Value::as_array)
+                .is_none_or(|admitted| admitted.contains(value))
+    };
+    match condition {
+        Value::Array(values) if values.is_empty() => Some("a list of values is empty"),
+        Value::Array(values) if values.iter().all(fits) => None,
+        Value::Array(_) => Some("a value does not fit the property's schema"),
+        value if fits(value) => None,
+        _ => Some("the value does not fit the property's schema"),
+    }
+}
 
-    // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-return
-    Ok(snapshot)
-    // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-return
+/// Collect the properties of `metadata` that `schema` declares, through every
+/// `allOf` part, at the root and inside `metadata` alike.
+fn metadata_properties(schema: &Value, into: &mut Map<String, Value>) {
+    if let Some(metadata) = schema.pointer("/properties/metadata") {
+        object_properties(metadata, into);
+    }
+    for part in schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        metadata_properties(part, into);
+    }
+}
+
+fn object_properties(schema: &Value, into: &mut Map<String, Value>) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        into.extend(properties.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    for part in schema
+        .get("allOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        object_properties(part, into);
+    }
 }
 
 #[cfg(test)]

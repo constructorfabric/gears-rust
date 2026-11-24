@@ -71,7 +71,8 @@ Chosen option: (a).
   authorizes its platform-plane callers, calls that come through the resolver are authorized there; the plugin client
   itself stays without a policy check. Until then no component checks which module may charge, return, or read the
   quotas of any tenant on this path. This is accepted: it is the exception that the resolver records for its
-  platform plane (`cpt-cf-quota-resolver-adr-two-planes`), and the plugin path adds no access to it.
+  platform plane (`cpt-cf-quota-resolver-adr-two-planes`), and the plugin path adds no access to it. Authorization
+  of platform-plane callers is tracked in [#6037](https://github.com/constructorfabric/gears-rust/issues/6037).
 * The trust boundary of the plugin path is the process. Any module in the process can get the plugin client from
   ClientHub and is trusted like a caller of the resolver's platform plane: it can act on any tenant it names. This
   adds no access, because the same module can call the resolver's platform plane, which reaches the same operations.

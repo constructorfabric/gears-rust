@@ -2,7 +2,6 @@
 
 #![allow(clippy::expect_used)]
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -11,9 +10,8 @@ use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ActiveQuotaCounts, DeactivateOutcome, EventId, NotificationEvent, NotificationEventKind,
     PageRequest, PageResult, PolicyDraft, PolicyId, PolicySchemaSnapshot, PolicyScope,
-    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, ProjectionBinding, Quota,
-    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError, SubjectRef, TenantId,
-    TransitionOutcome,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, Quota, QuotaDraft,
+    QuotaFilter, QuotaId, QuotaPatch, StorageError, SubjectRef, TenantId, TransitionOutcome,
 };
 use sea_orm::EntityTrait;
 use sea_orm_migration::MigratorTrait;
@@ -23,21 +21,21 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::{OutboxHandle, Wake};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db::{ConnectOpts, Db, connect_db};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::ports::{Actor, PolicyStore, QuotaStore, StoreError};
 use crate::infra::outbox::{EnqueueError, NotificationOutbox, QeOutbox, start_undelivered_outbox};
 use crate::infra::storage::Migrator;
 
-/// The `llm_gateway` user projection the gear's fixtures use.
-pub const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-/// A metric instance id.
+/// A user subject type derived from the quota subject base.
+pub const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+/// A metric type id.
 pub const METRIC_TOKENS: &str =
-    "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
-/// Another metric instance id.
+    "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
+/// Another metric type id.
 pub const METRIC_REQUESTS: &str =
-    "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
+    "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_requests.v1~";
 
 /// One in-memory `SQLite` database with every plugin migration applied. One
 /// connection: a second connection would be a second database.
@@ -84,16 +82,15 @@ pub fn scope_for(tenant: TenantId) -> AccessScope {
 
 /// The test actor.
 pub fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: Some("user".to_owned()),
     }
 }
 
 /// A user subject.
 pub fn user(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -111,6 +108,7 @@ pub fn quota_changed(tenant: TenantId) -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
+        actor: actor(),
         scope: quota_enforcement_sdk::NotificationScope::Tenant { tenant_id: tenant },
         quota_id: None,
         policy_id: None,
@@ -271,13 +269,6 @@ impl QuotaStore for FakeQuotaStore {
         Ok(PageResult::empty())
     }
 
-    async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StoreError> {
-        self.check(None)?;
-        Ok(HashSet::new())
-    }
-
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError> {
         self.check(None)?;
         Ok(ActiveQuotaCounts::default())
@@ -376,7 +367,7 @@ impl FakePolicyStore {
 impl PolicyStore for FakePolicyStore {
     async fn create_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         draft: PolicyDraft,
         _events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
@@ -389,7 +380,7 @@ impl PolicyStore for FakePolicyStore {
 
     async fn update_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         policy_id: PolicyId,
         _update: PolicyUpdate,
         _events: &[NotificationEvent],
@@ -399,7 +390,7 @@ impl PolicyStore for FakePolicyStore {
 
     async fn rollback_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         policy_id: PolicyId,
         _target_version: u32,
         _comment: Option<String>,
@@ -410,7 +401,7 @@ impl PolicyStore for FakePolicyStore {
 
     async fn delete_policy(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         policy_id: PolicyId,
         _comment: Option<String>,
         _events: &[NotificationEvent],
@@ -504,7 +495,7 @@ pub struct FakeConsumptionStore;
 impl crate::domain::ConsumptionStore for FakeConsumptionStore {
     async fn apply_debit_plan(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _mutation: &quota_enforcement_sdk::EvaluatedMutation<'_>,
         _events: &[NotificationEvent],
@@ -517,7 +508,7 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
 
     async fn apply_batch_debit(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
         _events: &[NotificationEvent],
@@ -530,7 +521,7 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
 
     async fn apply_credit(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _quota_id: quota_enforcement_sdk::QuotaId,
         _amount: u64,
@@ -543,12 +534,24 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         Err(unreached())
     }
 
+    async fn apply_return(
+        &self,
+        _actor: &quota_enforcement_sdk::Actor,
+        _scope: &AccessScope,
+        _ret: &quota_enforcement_sdk::ChargeReturn,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::AppliedMutation>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
     async fn apply_rollback(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _target: &quota_enforcement_sdk::RollbackTarget,
-        _idempotency: &quota_enforcement_sdk::IdempotencyWrite,
         _events: &[NotificationEvent],
     ) -> Result<
         quota_enforcement_sdk::TransitionOutcome<quota_enforcement_sdk::AppliedMutation>,
@@ -559,7 +562,6 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
 
     async fn read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         _applicable: &quota_enforcement_sdk::ApplicableQuotas,
     ) -> Result<Vec<quota_enforcement_sdk::QuotaSnapshot>, StorageError> {
@@ -568,10 +570,10 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
 
     async fn bulk_read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         _pairs: &[quota_enforcement_sdk::ApplicableQuotas],
         _page: quota_enforcement_sdk::PageRequest,
+        _in_window_only: bool,
     ) -> Result<quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>, StorageError>
     {
         Err(unreached())
@@ -599,6 +601,21 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
     ) -> Result<u64, StorageError> {
         Err(unreached())
     }
+
+    async fn reclaim_expired_charges(
+        &self,
+        _batch_size: u32,
+        _now: time::OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        Err(unreached())
+    }
+
+    async fn read_held_allocation_charge_stats(
+        &self,
+        _before: time::OffsetDateTime,
+    ) -> Result<Vec<quota_enforcement_sdk::HeldAllocationCharges>, StorageError> {
+        Err(unreached())
+    }
 }
 
 fn unreached() -> StorageError {
@@ -615,7 +632,7 @@ pub struct FakeLeaseStore;
 impl crate::domain::ports::LeaseStore for FakeLeaseStore {
     async fn acquire_lease(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _mutation: &quota_enforcement_sdk::EvaluatedMutation<'_>,
         _ttl: std::time::Duration,
@@ -627,10 +644,11 @@ impl crate::domain::ports::LeaseStore for FakeLeaseStore {
 
     async fn commit_lease(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         token: quota_enforcement_sdk::LeaseToken,
         _actual_amount: Option<u64>,
+        _metric: Option<&quota_enforcement_sdk::MetricId>,
         _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,
         _events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<quota_enforcement_sdk::AppliedMutation>, StorageError> {
@@ -639,7 +657,7 @@ impl crate::domain::ports::LeaseStore for FakeLeaseStore {
 
     async fn release_lease(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         token: quota_enforcement_sdk::LeaseToken,
         _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,

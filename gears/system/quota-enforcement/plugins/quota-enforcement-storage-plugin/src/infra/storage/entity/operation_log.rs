@@ -19,11 +19,8 @@ pub struct Model {
     pub quota_id: Option<Uuid>,
     /// One of the `OP_*` constants of the repository.
     pub operation: String,
-    /// The caller's subject id.
-    pub actor_subject_id: Uuid,
-    /// The caller's subject type, when known.
-    #[sea_orm(nullable)]
-    pub actor_subject_type: Option<String>,
+    /// The actor in its record form (`Actor`'s `Display`).
+    pub actor: String,
     /// The Quota's record version after the operation, when it has one.
     #[sea_orm(nullable)]
     pub record_version: Option<i32>,

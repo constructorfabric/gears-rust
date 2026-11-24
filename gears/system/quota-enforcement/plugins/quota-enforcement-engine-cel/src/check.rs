@@ -1,7 +1,7 @@
-//! Structural save-time checker over the persisted schema environments.
+//! Structural save-time checker over the persisted metric type schemas.
 //!
 //! Infers a [`Shape`] for every node of the expanded AST against the variables
-//! the metric's environment declares, so a reference to an absent property, a
+//! the environment declares, so a reference to an absent property, a
 //! scalar compared with a collection, or two fields whose declared domains
 //! cannot intersect is refused when the policy is saved, with a line and
 //! column into the operator's source. The decision record is checked on every
@@ -47,6 +47,9 @@ pub enum Kind {
     /// A map with computed keys, or a schema object without declared
     /// properties: decodable only at evaluation.
     Map,
+    /// A value with no schema, such as an untyped `request`: every operation on it
+    /// passes the save-time check and is checked at evaluation.
+    Dyn,
 }
 
 /// A kind plus, when the schema or a literal fixes it, the finite set of values
@@ -107,7 +110,7 @@ pub fn config_error(message: &str) -> EngineConfigError {
 /// The shape a JSON schema admits. `allOf` merges object properties,
 /// `anyOf`/`oneOf` keep what every non-null alternative agrees on, and a
 /// construct the profile cannot type becomes [`Kind::Unknown`] rather than
-/// refusing the contract: one exotic field must not block every policy on the
+/// refusing the schema: one exotic field must not block every policy on the
 /// metric, only the expressions that touch it.
 pub fn schema(raw: &Value, depth: usize) -> Result<Shape, EngineConfigError> {
     if depth > MAX_DEPTH {
@@ -135,7 +138,7 @@ pub fn schema(raw: &Value, depth: usize) -> Result<Shape, EngineConfigError> {
                 .map(|s| schema(s, depth + 1))
                 .collect::<Result<Vec<_>, _>>()?;
             // Optional absence does not make new properties available. At
-            // evaluation the expression must guard an absent resource itself.
+            // evaluation the expression must guard an absent value itself.
             shapes.retain(|s| s.kind != Kind::Null);
             let Some(first) = shapes.first().cloned() else {
                 return Ok(Shape::new(Kind::Null));
@@ -211,6 +214,7 @@ fn merge(a: Shape, b: Shape) -> Shape {
         (Kind::Int | Kind::OptionalInt, Kind::OptionalInt) | (Kind::OptionalInt, Kind::Int) => {
             Kind::OptionalInt
         }
+        (Kind::Dyn, _) | (_, Kind::Dyn) => Kind::Dyn,
         (Kind::Unknown, kind) | (kind, _) => kind,
     };
     Shape {
@@ -239,8 +243,8 @@ pub fn compatible(a: &Shape, b: &Shape) -> bool {
         (Kind::Object(left), Kind::Object(right)) => left
             .iter()
             .all(|(name, shape)| right.get(name).is_none_or(|other| compatible(shape, other))),
-        (Kind::Unknown, _)
-        | (_, Kind::Unknown)
+        (Kind::Unknown | Kind::Dyn, _)
+        | (_, Kind::Unknown | Kind::Dyn)
         | (Kind::Int | Kind::OptionalInt, Kind::Int | Kind::OptionalInt)
         | (Kind::Object(_) | Kind::Map, Kind::Object(_) | Kind::Map) => true,
         _ => a.kind == b.kind,
@@ -270,7 +274,15 @@ fn common(a: Shape, b: Shape) -> Result<Shape, EngineConfigError> {
 }
 
 fn is_int_like(shape: &Shape) -> bool {
-    matches!(shape.kind, Kind::Int | Kind::OptionalInt)
+    matches!(shape.kind, Kind::Int | Kind::OptionalInt | Kind::Dyn)
+}
+
+fn is_bool(shape: &Shape) -> bool {
+    matches!(shape.kind, Kind::Bool | Kind::Dyn)
+}
+
+fn is_string(shape: &Shape) -> bool {
+    matches!(shape.kind, Kind::String | Kind::Dyn)
 }
 
 /// An `Unknown` operand is a field the profile cannot type; using it is an
@@ -292,7 +304,7 @@ fn refuse_unknown(
 
 /// Equality and membership between two fields: the kinds must be able to hold
 /// the same value, and declared domains must intersect, or the comparison is
-/// permanently false and the Quota it guards permanently inert (ADR-0007).
+/// permanently false and the Quota it guards permanently inert.
 fn pair_check(
     source: &str,
     node: &SpannedExpr,
@@ -328,7 +340,8 @@ fn member_of<'s>(
 ) -> Result<&'s Shape, EngineConfigError> {
     match &b.kind {
         Kind::List(item) => Ok(item),
-        Kind::Object(_) | Kind::Map if a.kind == Kind::String => Ok(a),
+        Kind::Dyn => Ok(a),
+        Kind::Object(_) | Kind::Map if is_string(a) => Ok(a),
         _ => Err(diagnostic(
             source,
             node,
@@ -344,7 +357,12 @@ fn comparison(
     b: &Shape,
 ) -> Result<Shape, EngineConfigError> {
     refuse_unknown(source, node, &[a, b])?;
-    let comparable = |s: &Shape| matches!(s.kind, Kind::Int | Kind::OptionalInt | Kind::String);
+    let comparable = |s: &Shape| {
+        matches!(
+            s.kind,
+            Kind::Int | Kind::OptionalInt | Kind::String | Kind::Dyn
+        )
+    };
     if comparable(a) && comparable(b) && compatible(a, b) {
         Ok(Shape::new(Kind::Bool))
     } else {
@@ -377,19 +395,18 @@ fn arithmetic(
 /// The result of one function in the bounded profile, or `None` when the
 /// name or the argument kinds are outside it.
 fn overload(name: &str, shapes: &[Shape]) -> Option<Shape> {
-    let string = |s: &Shape| s.kind == Kind::String;
-    let scalar = |s: &Shape| matches!(s.kind, Kind::Int | Kind::String);
+    let scalar = |s: &Shape| matches!(s.kind, Kind::Int | Kind::String | Kind::Dyn);
     match (name, shapes) {
         ("size", [s])
             if matches!(
                 s.kind,
-                Kind::String | Kind::List(_) | Kind::Object(_) | Kind::Map
+                Kind::String | Kind::List(_) | Kind::Object(_) | Kind::Map | Kind::Dyn
             ) =>
         {
             Some(Shape::new(Kind::Int))
         }
-        ("@not_strictly_false", [s]) if s.kind == Kind::Bool => Some(Shape::new(Kind::Bool)),
-        ("contains" | "startsWith" | "endsWith", [a, b]) if string(a) && string(b) => {
+        ("@not_strictly_false", [s]) if is_bool(s) => Some(Shape::new(Kind::Bool)),
+        ("contains" | "startsWith" | "endsWith", [a, b]) if is_string(a) && is_string(b) => {
             Some(Shape::new(Kind::Bool))
         }
         ("int", [s]) if scalar(s) => Some(Shape::new(Kind::Int)),
@@ -411,7 +428,7 @@ fn decision_record(
 ) -> Result<(), EngineConfigError> {
     let fail = |message: &str| diagnostic(source, node, message);
     let fields = match &shape.kind {
-        Kind::Map => return Ok(()),
+        Kind::Map | Kind::Dyn => return Ok(()),
         Kind::Object(fields) => fields,
         _ => return Err(fail("expression must return a decision record")),
     };
@@ -435,21 +452,25 @@ fn debit_plan_record(
     plan: &Shape,
 ) -> Result<(), EngineConfigError> {
     let fail = |message: &str| diagnostic(source, node, message);
-    let Kind::List(item) = &plan.kind else {
-        return Err(fail(
-            "`debit_plan` must be a list of `{id, amount}` records",
-        ));
+    let not_chains = || fail("`debit_plan` must be a list of chains of `{id, amount}` records");
+    let chain = match &plan.kind {
+        Kind::Dyn => return Ok(()),
+        Kind::List(chain) => chain,
+        _ => return Err(not_chains()),
     };
-    match &item.kind {
+    let entry = match &chain.kind {
         // An empty literal list has no element type; it decodes to a denial.
-        Kind::Unknown | Kind::Map => Ok(()),
+        Kind::Unknown | Kind::Dyn => return Ok(()),
+        Kind::List(entry) => entry,
+        _ => return Err(not_chains()),
+    };
+    match &entry.kind {
+        Kind::Unknown | Kind::Map | Kind::Dyn => Ok(()),
         Kind::Object(fields) => {
-            let id = fields.get("id").is_some_and(|s| s.kind == Kind::String);
+            let id = fields.get("id").is_some_and(is_string);
             // A nullable integer is an integer operand everywhere else in the
             // profile; here too, and evaluation refuses an actual `null`.
-            let amount = fields
-                .get("amount")
-                .is_some_and(|s| matches!(s.kind, Kind::Int | Kind::OptionalInt));
+            let amount = fields.get("amount").is_some_and(is_int_like);
             if id && amount && fields.len() == 2 {
                 Ok(())
             } else {
@@ -458,20 +479,19 @@ fn debit_plan_record(
                 ))
             }
         }
-        _ => Err(fail(
-            "`debit_plan` must be a list of `{id, amount}` records",
-        )),
+        _ => Err(not_chains()),
     }
 }
 
 fn deny_record(source: &str, node: &SpannedExpr, deny: &Shape) -> Result<(), EngineConfigError> {
     let fail = |message: &str| diagnostic(source, node, message);
     match &deny.kind {
-        Kind::Map => Ok(()),
+        Kind::Map | Kind::Dyn => Ok(()),
         Kind::Object(fields) => {
-            let reason = fields.get("reason").is_some_and(|s| s.kind == Kind::String);
+            let reason = fields.get("reason").is_some_and(is_string);
             let ids = fields.get("violated_quota_ids").is_none_or(|s| {
-                matches!(&s.kind, Kind::List(item) if matches!(item.kind, Kind::String | Kind::Unknown))
+                matches!(&s.kind, Kind::Dyn)
+                    || matches!(&s.kind, Kind::List(item) if matches!(item.kind, Kind::String | Kind::Unknown | Kind::Dyn))
             });
             let known = fields
                 .keys()
@@ -490,7 +510,7 @@ fn deny_record(source: &str, node: &SpannedExpr, deny: &Shape) -> Result<(), Eng
     }
 }
 
-/// One pass over an expression against one metric's environment.
+/// One pass over an expression against one environment.
 pub struct Checker<'a> {
     /// The operator's expression source, for diagnostics.
     pub source: &'a str,
@@ -517,7 +537,7 @@ impl Checker<'_> {
                 then_expr,
                 else_expr,
             } => {
-                if self.infer(cond, depth + 1)?.kind != Kind::Bool {
+                if !is_bool(&self.infer(cond, depth + 1)?) {
                     return Err(self.fail(node, "condition must be boolean"));
                 }
                 self.check_decision(then_expr, depth + 1)?;
@@ -541,15 +561,12 @@ impl Checker<'_> {
         }
     }
 
-    /// Record the typed input a name reads, so the persisted snapshot keeps
-    /// every contract a later rebuild needs. Dot and bracket access are the
-    /// same dependency; only these three names select a contract.
+    /// Record the input a name reads, so the persisted snapshot keeps the
+    /// schema a later rebuild needs. Dot and bracket access are the same
+    /// dependency.
     fn note_input(&mut self, name: &str) {
-        match name {
-            "request" => self.inputs.request = true,
-            "resource" => self.inputs.resource = true,
-            "arbitration" => self.inputs.arbitration = true,
-            _ => {}
+        if name == "request" {
+            self.inputs.request = true;
         }
     }
 
@@ -649,7 +666,7 @@ impl Checker<'_> {
             if entry.optional {
                 return Err(self.fail(node, "optional map entries are unsupported"));
             }
-            if self.infer(&entry.key, depth)?.kind != Kind::String {
+            if !is_string(&self.infer(&entry.key, depth)?) {
                 return Err(self.fail(node, "map key must be a string"));
             }
             let shape = self.infer(&entry.value, depth)?;
@@ -681,14 +698,12 @@ impl Checker<'_> {
     ) -> Result<Shape, EngineConfigError> {
         let shape = self.infer(expr, depth)?;
         refuse_unknown(self.source, node, &[&shape])?;
-        let expected = if op == UnaryOp::Not {
-            Kind::Bool
+        let (expected, accepted) = if op == UnaryOp::Not {
+            (Kind::Bool, is_bool(&shape))
         } else {
-            Kind::Int
+            // Negating a nullable Quota field is checked at evaluation.
+            (Kind::Int, is_int_like(&shape))
         };
-        // Negating a nullable Quota field is checked at evaluation.
-        let accepted =
-            shape.kind == expected || (expected == Kind::Int && shape.kind == Kind::OptionalInt);
         if !accepted {
             return Err(self.fail(node, "unary operator type mismatch"));
         }
@@ -717,7 +732,7 @@ impl Checker<'_> {
             }
             BinaryOp::And | BinaryOp::Or => {
                 refuse_unknown(source, node, &[&a, &b])?;
-                if a.kind == Kind::Bool && b.kind == Kind::Bool {
+                if is_bool(&a) && is_bool(&b) {
                     Ok(Shape::new(Kind::Bool))
                 } else {
                     Err(self.fail(node, "logical operands must be boolean"))
@@ -747,7 +762,7 @@ impl Checker<'_> {
         else_expr: &SpannedExpr,
         depth: usize,
     ) -> Result<Shape, EngineConfigError> {
-        if self.infer(cond, depth)?.kind != Kind::Bool {
+        if !is_bool(&self.infer(cond, depth)?) {
             return Err(self.fail(node, "condition must be boolean"));
         }
         let a = self.infer(then_expr, depth)?;
@@ -780,6 +795,7 @@ impl Checker<'_> {
             }),
             // A free-form object's members are untyped until evaluation.
             Kind::Map => Ok(Shape::new(Kind::Unknown)),
+            Kind::Dyn => Ok(Shape::new(Kind::Dyn)),
             _ => Err(self.fail(node, "property access requires a typed object")),
         }
     }
@@ -793,7 +809,7 @@ impl Checker<'_> {
     ) -> Result<Shape, EngineConfigError> {
         match self.infer(expr, depth)?.kind {
             Kind::Object(fields) if fields.contains_key(field) => Ok(Shape::new(Kind::Bool)),
-            Kind::Map => Ok(Shape::new(Kind::Bool)),
+            Kind::Map | Kind::Dyn => Ok(Shape::new(Kind::Bool)),
             _ => Err(self.fail(node, "has() refers to an undeclared property")),
         }
     }
@@ -812,11 +828,11 @@ impl Checker<'_> {
         let shape = self.infer(expr, depth)?;
         let idx = self.infer(index, depth)?;
         if let Expr::String(key) = &index.node {
-            // `q['arbitration']` reads the same contract as `q.arbitration`.
+            // `x['request']` reads the same input as `x.request`.
             self.note_input(key);
         }
         match shape.kind {
-            Kind::List(item) if idx.kind == Kind::Int => Ok(*item),
+            Kind::List(item) if is_int_like(&idx) => Ok(*item),
             Kind::Object(fields) => match &index.node {
                 Expr::String(key) => fields
                     .get(key)
@@ -824,7 +840,8 @@ impl Checker<'_> {
                     .ok_or_else(|| self.fail(node, "unknown property")),
                 _ => Err(self.fail(node, "dynamic object indexing would bypass schema checks")),
             },
-            Kind::Map if idx.kind == Kind::String => Ok(Shape::new(Kind::Unknown)),
+            Kind::Map if is_string(&idx) => Ok(Shape::new(Kind::Unknown)),
+            Kind::Dyn => Ok(Shape::new(Kind::Dyn)),
             _ => Err(self.fail(node, "index type mismatch")),
         }
     }
@@ -879,6 +896,7 @@ impl Checker<'_> {
         let item = match self.infer(&c.iter_range, depth)?.kind {
             Kind::List(item) => *item,
             Kind::Object(_) | Kind::Map => Shape::new(Kind::String),
+            Kind::Dyn => Shape::new(Kind::Dyn),
             _ => return Err(self.fail(node, "comprehension requires collection")),
         };
         let initial = self.infer(&c.accu_init, depth)?;
@@ -896,7 +914,7 @@ impl Checker<'_> {
         c: &ComprehensionData,
         depth: usize,
     ) -> Result<Shape, EngineConfigError> {
-        if self.infer(&c.loop_condition, depth)?.kind != Kind::Bool {
+        if !is_bool(&self.infer(&c.loop_condition, depth)?) {
             return Err(self.fail(node, "comprehension condition must be boolean"));
         }
         let next = self.infer(&c.loop_step, depth)?;

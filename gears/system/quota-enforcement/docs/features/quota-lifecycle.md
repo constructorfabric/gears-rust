@@ -44,7 +44,7 @@
 
 Implements the Quota entity and its declarative lifecycle: create, update, deactivate, and read, through
 `QuotaManagementService` and the transactional storage primitives. Covers metric validation through the metric
-catalogue, cap and validity-window semantics, size-capped Quota Metadata that the Engine of the active Policy checks,
+catalogue, cap and validity-window semantics, size-capped Quota Metadata whose conditions are checked against the metric type,
 the closed `enforcement_mode` and `source` enums, `rate` quota-type rejection, and the deactivation cascade that
 resolves active leases atomically.
 
@@ -60,22 +60,22 @@ names (resolution-policy-engine feature).
 
 Every enforcement operation evaluates against Quota records; this feature is the write path that puts those records in
 place and keeps them consistent. It turns misconfiguration into actionable create-time or update-time errors: an
-unknown metric, a negative cap, thresholds on an unbounded cap, or metadata that the Engine of the active Policy
-rejects never reaches storage. It also guarantees that deactivation never strands held lease capacity: the cascade
+unknown metric, a negative cap, thresholds on an unbounded cap, or a condition that does not fit the metric type never
+reaches storage. It also guarantees that deactivation never strands held lease capacity: the cascade
 resolves every active lease in the same transaction.
 
 **Scope**: `QuotaManagementService` with transactional CRUD via the storage plugin; metric existence, kind, and mode
 validation through the metric's `MetricCatalog` entry, fail-closed; cap semantics
 (`CAP_MUST_BE_NON_NEGATIVE`, `cap = 0`, `cap = null`, commit-time `CAP_BELOW_CONSUMED`); the size limit of Quota
-Metadata and its check by the Engine of the active Policy, at write time only; validity-window storage and
+Metadata and the check of its conditions against the metric type, at write time only; validity-window storage and
 `currently_within_window` computation; the deactivation cascade marking leases resolved-by-deactivation; `rate`
 quota-type rejection with canonical `Unimplemented`.
 
 **Out of scope**: counter mutation of any kind (the consumption-operations and lease-operations features), bulk Quota
 CRUD (the bulk-quota-crud feature, P2), notification dispatch (the notifications feature; this feature only enqueues
 events in the same transaction as its state mutation, invariant I11), the subject admission check itself (defined
-by the projection-contracts feature and invoked here), and what an Engine checks in Quota Metadata (defined with each
-Engine, resolution-policy-engine feature).
+by the projection-contracts feature and invoked here), and the matching of conditions at evaluation (storage
+invariant I15, consumption-operations and lease-operations features).
 
 **Requirements**: `cpt-cf-quota-enforcement-fr-quota-lifecycle`, `cpt-cf-quota-enforcement-fr-quota-metadata`,
 `cpt-cf-quota-enforcement-fr-metric-identity-validation`, `cpt-cf-quota-enforcement-fr-enforcement-mode`,
@@ -99,15 +99,13 @@ Engine, resolution-policy-engine feature).
   group, error model, telemetry surface)
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.3)
 - **ADR**: [ADR-0013 Metric types](../ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md)
-  (`cpt-cf-quota-enforcement-adr-metric-types`; the metric type of a Quota, and the check of Quota Metadata by the
-  Engine);
+  (`cpt-cf-quota-enforcement-adr-metric-types`; the metric type of a Quota, and the conditions of Quota Metadata);
   [ADR-0012 Metric catalogue](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)
   (`cpt-cf-quota-enforcement-adr-contract-catalogue`; catalogue entries and writes for a metric with no served entry);
   [ADR-0008 Quota resolver subjects](../ADR/0008-cpt-cf-quota-enforcement-adr-quota-resolver-subjects.md)
   (`cpt-cf-quota-enforcement-adr-quota-resolver-subjects`; the Quota subject and its admission)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-foundation` (storage plugin, Gateway admission, telemetry
-  conventions), `cpt-cf-quota-enforcement-feature-projection-contracts` (`MetricCatalog`, subject admission check),
-  `cpt-cf-quota-enforcement-feature-resolution-policy-engine` (the Engine operation that checks Quota Metadata)
+  conventions), `cpt-cf-quota-enforcement-feature-projection-contracts` (`MetricCatalog`, subject admission check)
 
 ## 2. Actor Flows (CDSL)
 
@@ -139,12 +137,11 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 - Negative cap: `CAP_MUST_BE_NON_NEGATIVE`; thresholds on `cap = null`: `THRESHOLDS_REQUIRE_BOUNDED_CAP`
 - `type = rate`: canonical `Unimplemented` (`NOT_YET_IMPLEMENTED`)
 - Metadata that is not a JSON object or is over the size limit: rejected before persistence
-- Metadata that the Engine of the active Policy rejects: `QUOTA_METADATA_REJECTED`
-  (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with the Engine's list; nothing is
-  persisted
+- Metadata with a condition that does not fit the metric type: `QUOTA_METADATA_REJECTED`
+  (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with the violations; nothing is persisted
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas` with a `QuotaDraft` naming the explicit target `(subject_type, subject_id)`, `subject_type` derived from `gts.cf.core.quota.subj.v1~`, under PDP scope (management DTOs retain explicit target identity); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has returned the actor and the `AccessScope` - `inst-qcr-request`
+1. [ ] - `p1` - Caller sends `POST /quota-enforcement/v1/quotas` with a `QuotaDraft` naming the explicit target `(subject_type, subject_id)`, `subject_type` derived from `gts.cf.core.quota.subj.v1~`, under PDP scope (management DTOs retain explicit target identity); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has returned the actor and the `AccessScope` - `inst-qcr-request`
 2. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the draft - `inst-qcr-validate`
 3. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-metric-validation`; the metric's `kind`, `enforcement`, and admitted subject types come from the metric's `MetricCatalog` entry; for a metric the catalogue does not hold, the write reads the metric type as a request does (`cpt-cf-quota-enforcement-algo-catalog-membership`); a metric whose entry is unavailable is rejected with `PROJECTION_NOT_RESOLVABLE` - `inst-qcr-metric`
 4. [ ] - `p1` - Invoke `cpt-cf-quota-enforcement-algo-catalog-membership` (projection-contracts feature): the subject type must be registered, derived from `gts.cf.core.quota.subj.v1~`, and admitted by the `admitted_subjects` trait of the metric type (exact or derived type; the tenant type is always admitted) - `inst-qcr-membership`
@@ -176,10 +173,10 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 - Cap reduction below the current consumed or in-flight amount at commit time: `CAP_BELOW_CONSUMED`
 - Thresholds added while cap is or becomes `null`: `THRESHOLDS_REQUIRE_BOUNDED_CAP`
 - The Quota is already deactivated: `QUOTA_DEACTIVATED` (`DomainError::QuotaDeactivated`)
-- Patched metadata that the Engine of the active Policy rejects: `QUOTA_METADATA_REJECTED`; nothing is persisted
+- Patched metadata with a condition that does not fit the metric type: `QUOTA_METADATA_REJECTED`; nothing is persisted
 
 **Steps**:
-1. [x] - `p1` - Caller sends `PATCH /v1/quota-enforcement/quotas/{id}` with a `QuotaUpdate` - `inst-qup-request`
+1. [x] - `p1` - Caller sends `PATCH /quota-enforcement/v1/quotas/{id}` with a `QuotaUpdate` - `inst-qup-request`
 2. [x] - `p1` - **IF** the patch references `type = rate` - `inst-qup-rate-if`
    1. [x] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501, `NOT_YET_IMPLEMENTED`); the rate check runs before the breaking-change gate, so an update referencing `rate` returns `Unimplemented` per the DESIGN rejection rule (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qup-rate`
 3. [ ] - `p1` - **IF** the patch changes metric, type, period, enforcement mode, or subject - `inst-qup-breaking-if`
@@ -211,9 +208,9 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 - The Quota is already deactivated: `QUOTA_DEACTIVATED`; no second cascade runs
 
 **Steps**:
-1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas/{id}/deactivate` - `inst-qde-request`
+1. [x] - `p1` - Caller sends `POST /quota-enforcement/v1/quotas/{id}/deactivate` - `inst-qde-request`
 2. [x] - `p1` - DB: `deactivate_quota(quota_id, events)` in a single transaction: lock the `quotas` row while its status is still `active`, mark the Quota deactivated, lock the active leases on this quota, lock every counter their holds name once in ascending order, mark each such lease resolved-by-deactivation, return held capacity to the acquisition-period counters, and append the `operation_log` entry (I1) - `inst-qde-cascade`
-3. [x] - `p1` - Enqueue `quota-changed (change_kind='deactivated')` plus one `lease-resolved-by-deactivation` event per affected lease, carrying the lease ID, owning subject context, held amount, and the deactivated `quota_id`, all in the same transaction (I11); commit the transaction - `inst-qde-events`
+3. [x] - `p1` - Enqueue `quota-changed (change_kind='deactivated')` plus one `lease-resolved-by-deactivation` event per affected lease, carrying the lease ID, the tenant, held amount, and the deactivated `quota_id`, all in the same transaction (I11); commit the transaction - `inst-qde-events`
 4. [x] - `p1` - The cascade never partially completes: either every active lease for the Quota is resolved or none is; subsequent `commit` or `release` calls against a resolved lease return `LEASE_NOT_ACTIVE` (lease operations are owned by the lease-operations feature); the deactivation timestamp serves as the implicit lease-resolve event - `inst-qde-atomic`
 5. [x] - `p1` - **RETURN** `200` with the `DeactivateOutcome { resolved_leases }` summary so the gateway can attribute telemetry - `inst-qde-return`
 
@@ -233,7 +230,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 - Rows outside the caller's tenant or `AccessScope` are unreachable by construction; they are absent, not errors
 
 **Steps**:
-1. [x] - `p1` - Caller sends `GET /v1/quota-enforcement/quotas/{id}` or `GET /v1/quota-enforcement/quotas` with an OData `$filter`, `$orderby=id asc`, `$top` and a forward-only cursor - `inst-qrd-request`
+1. [x] - `p1` - Caller sends `GET /quota-enforcement/v1/quotas/{id}` or `GET /quota-enforcement/v1/quotas` with an OData `$filter`, `$orderby=id asc`, `$top` and a forward-only cursor - `inst-qrd-request`
 2. [x] - `p1` - DB: `read_quotas(filter, page)` under the caller's `AccessScope` per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation); reads are read-only (I3) - `inst-qrd-read`
 3. [x] - `p1` - Deactivated Quotas remain readable; deactivation retains the record for read access - `inst-qrd-deactivated`
 4. [x] - `p1` - Compute `currently_within_window` per `cpt-cf-quota-enforcement-algo-validity-window` for each returned Quota - `inst-qrd-window`
@@ -289,22 +286,20 @@ error
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-quota-metadata-validation`
 
-**Input**: the draft or patch `metadata`, the Quota's metric, `PolicyService` and `EngineRegistry`
-(resolution-policy-engine feature)
+**Input**: the draft or patch `metadata`, and the `MetricCatalog` entry of the Quota's metric
 
 **Output**: accepted metadata, or rejection before persistence
 
 **Steps**:
 1. [ ] - `p1` - **IF** `metadata` is not a JSON object, or its canonical JSON serialization exceeds the single operator-configurable size limit (default 4 KB per Quota) - `inst-qmd-size-if`
    1. [x] - `p1` - **RETURN** rejection at validation time (`cpt-cf-quota-enforcement-fr-quota-metadata`) - `inst-qmd-size`
-2. [ ] - `p1` - Select the Policy that is active for the Quota's metric (the `metric` Policy if one is defined, else the `global` Policy) and resolve its Engine and its `ValidatedConfig` - `inst-qmd-policy`
-3. [ ] - `p1` - Call the Engine's `validate_quota_metadata(metadata, config)`; the Engine answers that it accepts the metadata, or rejects it with a list of `{path, reason}`: the place in the metadata and the reason; the `most-restrictive-wins` Engine accepts only the empty object and the `cel` Engine any JSON object (`cpt-cf-quota-enforcement-algo-cel-engine`) - `inst-qmd-engine`
-4. [ ] - `p1` - **IF** the Engine rejects the metadata - `inst-qmd-rejected-if`
-   1. [ ] - `p1` - **RETURN** `QUOTA_METADATA_REJECTED` (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with the Engine's list as field violations; nothing is written; increment `contract_validation_failures_total` with the closed `arbitration` surface - `inst-qmd-rejected`
-5. [ ] - `p1` - Store the accepted metadata; a stored value is not checked again: not during evaluation, and not when a Policy is created, changed, or replaced. A Policy change is the operator's responsibility: when the active Policy cannot read a Quota's metadata, the request is rejected at evaluation with `POLICY_EVALUATION_FAILED` (`FailedPrecondition`), and no counter changes (resolution-policy-engine feature) - `inst-qmd-once`
-6. [ ] - `p1` - QE core treats the content as opaque: it never interprets business meaning and never indexes metadata for direct query; its meaning belongs to the Policy that reads it; stored metadata is forwarded verbatim to the active Engine as the Engine's `arbitration` object (Engine consumption is owned by the resolution-policy-engine feature) - `inst-qmd-opaque`
-7. [x] - `p1` - Metadata must not carry PII or other regulated data (Platform Operational Data per PRD §6.2); operators are responsible for the content respecting this classification - `inst-qmd-pii`
-8. [x] - `p1` - **RETURN** the accepted metadata; the full object is returned by every Quota read API subject to PDP scoping - `inst-qmd-return`
+2. [ ] - `p1` - **FOR EACH** key of `metadata`, check the condition against the `metadata` schema of the metric type: the key names a declared property whose type is a string, an integer, or a boolean, and the value is a value of that type or a non-empty array of such values (`cpt-cf-quota-enforcement-adr-metric-types`) - `inst-qmd-conditions`
+3. [ ] - `p1` - **IF** a condition does not fit - `inst-qmd-rejected-if`
+   1. [ ] - `p1` - **RETURN** `QUOTA_METADATA_REJECTED` (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with one field violation per condition that does not fit: the place in the metadata and the reason; nothing is written; increment `contract_validation_failures_total` with the closed `quota_write` surface - `inst-qmd-rejected`
+4. [ ] - `p1` - Store the accepted metadata; evaluation does not check a stored value against the schema, and a Policy does not read Quota metadata. The lifecycle gauge refresh checks the conditions of the active Quotas against the current metric type and counts those that no longer fit in `quota_conditions_unfit_total` - `inst-qmd-once`
+5. [ ] - `p1` - At evaluation the storage plugin keeps a Quota in the applicable set only when all its conditions hold on the request's metadata (storage invariant I15); QE core never indexes metadata for direct query - `inst-qmd-opaque`
+6. [x] - `p1` - Metadata must not carry PII or other regulated data (Platform Operational Data per PRD §6.2); operators are responsible for the content respecting this classification - `inst-qmd-pii`
+7. [x] - `p1` - **RETURN** the accepted metadata; the full object is returned by every Quota read API subject to PDP scoping - `inst-qmd-return`
 
 ### Validity-Window Computation
 
@@ -366,9 +361,9 @@ time in-tx (I6). Updates preserve the quota ID and the subject reference; breaki
 `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/quotas`, `GET /v1/quota-enforcement/quotas/{id}`,
-  `PATCH /v1/quota-enforcement/quotas/{id}`, `POST /v1/quota-enforcement/quotas/{id}/deactivate`,
-  `GET /v1/quota-enforcement/quotas` (OData `$filter`, `$top` and cursor); `QuotaManagerApi` Quota methods
+- API: `POST /quota-enforcement/v1/quotas`, `GET /quota-enforcement/v1/quotas/{id}`,
+  `PATCH /quota-enforcement/v1/quotas/{id}`, `POST /quota-enforcement/v1/quotas/{id}/deactivate`,
+  `GET /quota-enforcement/v1/quotas` (OData `$filter`, `$top` and cursor); `QuotaManagerApi` Quota methods
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` table plus the allocation-counter materialization)
 - Entities: `Quota`, `QuotaDraft`, `QuotaUpdate`, `QuotaPatch`, `QuotaFilter`, `QuotaId`, `DeactivateOutcome`
 
@@ -399,14 +394,13 @@ auto-deactivated.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-quota-metadata`
 
-The system **MUST** check the operator-authored `metadata` at Quota create and when an update changes it, and at no
-other time. QE core **MUST** check only that it is a JSON object within the operator-configurable canonical-JSON size
-limit (default 4 KB). The system **MUST** then give the metadata to the Engine of the Policy that is active for the
-Quota's metric, through `validate_quota_metadata`. When the Engine rejects it, the system **MUST** write nothing and
-return `QUOTA_METADATA_REJECTED` (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with the
-Engine's list of `{path, reason}` as field violations. The system **MUST NOT** check stored metadata again, during
-evaluation or when a Policy is created, changed, or replaced. QE core **MUST** treat metadata as opaque (no
-interpretation, no direct-query indexing), metadata **MUST** be returned in full by every Quota read API subject to
+The system **MUST** check the operator-authored `metadata` at Quota create and when an update changes it. QE core
+**MUST** check that it is a JSON object within the operator-configurable canonical-JSON size limit (default 4 KB),
+and then **MUST** check each condition of the metadata against the `metadata` schema of the metric type. When a condition does not fit, the system **MUST** write nothing and return `QUOTA_METADATA_REJECTED`
+(`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with one `{path, reason}` field violation per
+condition. An evaluation **MUST NOT** check stored metadata again; only the lifecycle gauge refresh re-checks the
+conditions of active Quotas, and it reports those that no longer fit without changing them. QE core **MUST NOT** index metadata for direct query,
+metadata **MUST** be returned in full by every Quota read API subject to
 PDP scoping, and metadata changes **MUST** keep the quota ID stable while emitting a `quota-changed` event.
 
 **Implements**:
@@ -417,7 +411,7 @@ PDP scoping, and metadata changes **MUST** keep the quota ID stable while emitti
 **Touches**:
 - API: no new endpoint (rides the create/update/read paths)
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas` metadata storage)
-- Entities: `Quota`; `QuotaResolutionEngineV1` (resolution-policy-engine feature)
+- Entities: `Quota`; the metric type's `MetadataSchema` (projection-contracts feature)
 
 ### Deactivation Cascade
 
@@ -437,7 +431,7 @@ the evaluation paths.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-toolkit`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/quotas/{id}/deactivate`; `QuotaManagerApi::deactivate_quota`
+- API: `POST /quota-enforcement/v1/quotas/{id}/deactivate`; `QuotaManagerApi::deactivate_quota`
 - DB: `cpt-cf-quota-enforcement-db-schema` (`quotas`, `leases`, `lease_holds`, `notification_outbox`)
 - Entities: `DeactivateOutcome`
 
@@ -463,10 +457,10 @@ breaking changes and without migrating persisted `allocation`/`consumption` Quot
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-lifecycle-gauges`
 
-The system **MUST** surface the label-free gauges `quota_cap_zero_total`, `quota_cap_unbounded_total`, and
-`quota_for_direct_metric_total` from the closed PRD §5.16 catalogue through the foundation telemetry conventions,
-counting active `cap = 0` Quotas, active `cap = null` Quotas, and Quotas declared on `Direct`-classified metrics
-respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, subject type)
+The system **MUST** surface the label-free gauges `quota_cap_zero_total`, `quota_cap_unbounded_total`,
+`quota_for_direct_metric_total`, and `quota_conditions_unfit_total` from the closed PRD §5.16 catalogue through the
+foundation telemetry conventions, counting active `cap = 0` Quotas, active `cap = null` Quotas, Quotas declared on
+`Direct`-classified metrics, and Quotas whose conditions do not fit their metric type as it is now, respectively. No high-cardinality identifier (`quota_id`, `tenant_id`, metric, subject type)
 appears as a label.
 
 **Implements**:
@@ -506,14 +500,11 @@ appears as a label.
 - [ ] An update touching metric, type, period, enforcement mode, or subject is rejected; the quota ID and subject
   reference survive every accepted update
 - [ ] Metadata that is not a JSON object or is over the configured size limit is rejected before persistence
-- [ ] A create, or an update that changes metadata, whose metadata the Engine of the active Policy rejects fails with
-  `QUOTA_METADATA_REJECTED` (400), carries the Engine's list of `{path, reason}` as field violations, persists
-  nothing, and increments `contract_validation_failures_total` with the `arbitration` surface; a write that the Engine
-  accepts is stored, and a metadata-only update keeps the quota ID stable while emitting `quota-changed`
-- [ ] Under a Policy of the `most-restrictive-wins` Engine, a Quota with non-empty metadata is rejected and a Quota
-  with the empty object is accepted
-- [ ] After a Policy change that leaves a stored Quota with metadata the new Policy cannot read, the Quota is
-  unchanged, no write is rejected for it, and an evaluation that reads it is rejected with no counter change
+- [ ] A create, or an update that changes metadata, whose condition names a property the metric type does not
+  declare, a property that is not a string, an integer, or a boolean, or a value of another type fails with
+  `QUOTA_METADATA_REJECTED` (400), carries one `{path, reason}` field violation per such condition, persists nothing,
+  and increments `contract_validation_failures_total` with the `quota_write` surface; metadata whose conditions fit is
+  stored, and a metadata-only update keeps the quota ID stable while emitting `quota-changed`
 - [ ] Deactivating a Quota with N active leases marks all N resolved-by-deactivation, returns held capacity to the acquisition-period counters, enqueues one
   `lease-resolved-by-deactivation` event per lease plus `quota-changed (deactivated)`, and appends the operation-log
   entry (I1), all in one transaction;
@@ -533,8 +524,8 @@ appears as a label.
   admitting the subject type of a stored Quota stays served (ADR-0012). Admission of a subject type is checked at
   Quota create only. A deactivation makes no catalogue check and runs while the metric is unavailable.
 - **Delivered surface and open items (2026-09-09)**: the create, update, and read flows, the draft and
-  validity-window algorithms, and the CRUD and rate-rejection Definitions of Done are implemented, and the metadata
-  algorithm and Definition of Done stay open until the Engine's check of Quota Metadata lands. Implemented are: the
+  validity-window algorithms, and the CRUD and rate-rejection Definitions of Done are implemented, and so is the metadata
+  algorithm: a Quota write checks the conditions of its metadata against the metric type. Implemented are: the
   `QuotaManagementService`, the five REST endpoints, the `QuotaManagerApi` in-process client registered on the
   ClientHub by the gear (the SDK trait; the public read shape is `QuotaView`, the create shape `QuotaSpec`), and the
   reference storage plugin's `qe_quotas`, `qe_quota_allocation_counters`, `qe_operation_log` tables with the four
@@ -554,7 +545,7 @@ appears as a label.
   and Definition of Done, the lifecycle-gauge Definition of Done, and the PRD requirements they realise stay open
   until that SDK publishes the metric base and the catalogue read is validated against the real registry; fixture
   tests alone do not close them.
-- **Lifecycle gauges decision**: the three gauges are storage-backed, refreshed on a bounded schedule by the replica
+- **Lifecycle gauges decision**: the four gauges are storage-backed, refreshed on a bounded schedule by the replica
   holding the `lifecycle-gauges` election, and observed without I/O; a sample exists only after a successful refresh
   in the current term, is kept through failures until the staleness bound, is withdrawn on leadership loss, a
   `Lagged`/`Reset` watch event, shutdown, or staleness, and followers publish nothing. All three count Quotas with
@@ -576,7 +567,7 @@ appears as a label.
   surface, so the boolean is surfaced there. PRD grants the field to the Quota Snapshot read APIs
   (`cpt-cf-quota-enforcement-fr-quota-snapshot-read`); the DESIGN Quota read response does not yet name the field,
   and that read-contract alignment is a tracked upstream prerequisite.
-- **ADR dependency**: the metric type of a Quota and the check of Quota Metadata by the Engine follow
+- **ADR dependency**: the metric type of a Quota and the conditions of Quota Metadata follow
   `cpt-cf-quota-enforcement-adr-metric-types` (ADR-0013); the catalogue entry follows
   `cpt-cf-quota-enforcement-adr-contract-catalogue` (ADR-0012); the Quota subject and its admission follow
   `cpt-cf-quota-enforcement-adr-quota-resolver-subjects` (ADR-0008).
@@ -591,8 +582,8 @@ appears as a label.
   the same schema major version. Deactivation is not reversible in P1, so operational runbooks treat it as
   deactivate-plus-create, matching the breaking-change rule.
 - **Test layering**: draft validation, cap semantics, and window computation get unit tests; metric validation
-  fail-closed gets integration tests with registry fault injection, and the Engine's check of metadata gets
-  integration tests with a test double `QuotaResolutionEngineV1`; the cascade
+  fail-closed gets integration tests with registry fault injection, and the check of metadata conditions gets unit
+  tests against fixture metric types; the cascade
   atomicity and the commit-time cap guard get concurrency integration tests (kill mid-transaction, concurrent
   counter mutation through the storage plugin).
 - **Non-applicable review domains**: UX/accessibility is not applicable; there is no user-facing surface. Data

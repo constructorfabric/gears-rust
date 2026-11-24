@@ -122,6 +122,8 @@ use cluster as _;
 use quota_enforcement as _;
 #[cfg(feature = "quota-enforcement")]
 use quota_enforcement_storage_plugin as _;
+#[cfg(feature = "quota-resolver")]
+use quota_resolver as _;
 
 #[cfg(feature = "bss-products")]
 use bss_products as _;

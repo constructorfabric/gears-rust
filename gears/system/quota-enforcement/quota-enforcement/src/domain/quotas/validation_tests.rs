@@ -2,9 +2,8 @@
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    CapPatch, ContractRef, EnforcementMode, MetricId, PeriodType, Quota, QuotaId, QuotaPatch,
-    QuotaSource, QuotaStatus, QuotaType, SubjectRef, SubjectScope, TenantId, ValidityWindow,
-    ValidityWindowPatch,
+    CapPatch, EnforcementMode, MetricId, PeriodType, Quota, QuotaId, QuotaPatch, QuotaSource,
+    QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow, ValidityWindowPatch,
 };
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -19,7 +18,7 @@ use crate::domain::quotas::request::{
     CreateQuotaRequest, ListQuotasRequest, Presence, UpdateQuotaRequest,
 };
 use crate::domain::tokens;
-use crate::test_support::{LLM_USER_PROJECTION, METRIC_TOKENS, tenant};
+use crate::test_support::{METRIC_TOKENS, TENANT_SUBJECT_TYPE, USER_SUBJECT_TYPE, tenant};
 
 fn ts(secs: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(secs).expect("timestamp")
@@ -27,7 +26,7 @@ fn ts(secs: i64) -> OffsetDateTime {
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(LLM_USER_PROJECTION).expect("type"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type"),
         subject_id: id.to_owned(),
     }
 }
@@ -205,16 +204,22 @@ fn windows_must_not_be_inverted_and_ids_and_metrics_must_parse() {
         ..consumption()
     })
     .expect_err("blank subject id");
-    assert_eq!(
-        err,
-        invalid("subject.subject_id", tokens::SUBJECT_ID_REQUIRED)
-    );
+    assert_eq!(err, invalid("subject.id", tokens::SUBJECT_ID_REQUIRED));
     let err = validate_create_shape(CreateQuotaRequest {
-        metric: "gts.cf.core.qe.metric_type.v1~".to_owned(),
+        metric: "gts.cf.core.quota.metric.v1~".to_owned(),
         ..consumption()
     })
-    .expect_err("a type id is not a metric");
+    .expect_err("the metric base is not a metric type");
     assert_eq!(err, invalid("metric", tokens::METRIC_INVALID));
+    let err = validate_create_shape(CreateQuotaRequest {
+        subject: SubjectRef {
+            subject_type: GtsTypeId::try_new(METRIC_TOKENS).expect("type"),
+            subject_id: "u1".to_owned(),
+        },
+        ..consumption()
+    })
+    .expect_err("a subject type derives from the subject base");
+    assert_eq!(err, invalid("subject.type", tokens::SUBJECT_TYPE_INVALID));
 }
 
 // --- update ------------------------------------------------------------------
@@ -263,7 +268,7 @@ fn every_present_immutable_field_is_rejected_null_included() {
         (
             "subject",
             UpdateQuotaRequest {
-                subject: Presence::Value(json!({ "subject_id": "u2" })),
+                subject: Presence::Value(json!({ "id": "u2" })),
                 ..UpdateQuotaRequest::default()
             },
         ),
@@ -344,10 +349,6 @@ fn stored(cap: Option<u64>, thresholds: Vec<u8>) -> Quota {
         metadata: serde_json::Map::new(),
         source: QuotaSource::Operator,
         status: QuotaStatus::Active,
-        constraint_contract: ContractRef {
-            type_id: GtsTypeId::new("gts.cf.core.qe.constraint.v1~x.y.z.w.v1~"),
-            version: 1,
-        },
         record_version: 1,
         created_at: ts(0),
         updated_at: ts(0),
@@ -385,37 +386,25 @@ fn the_patched_shape_check_sees_the_merged_row() {
 // --- subject scope and list ----------------------------------------------------
 
 #[test]
-fn the_subject_id_must_match_the_declared_scope() {
+fn a_tenant_subject_names_the_quota_tenant_and_other_ids_are_bounded() {
     let t = tenant();
+    let tenant_subject = |id: &str| SubjectRef {
+        subject_type: GtsTypeId::new(TENANT_SUBJECT_TYPE),
+        subject_id: id.to_owned(),
+    };
     assert_eq!(
-        validate_subject_scope(&SubjectScope::tenant(), t, &t.to_string()),
+        validate_subject_scope(&tenant_subject(&t.to_string()), t),
         Ok(())
     );
     assert_eq!(
-        validate_subject_scope(&SubjectScope::tenant(), t, "someone-else"),
-        Err(invalid(
-            "subject.subject_id",
-            tokens::SUBJECT_SCOPE_VIOLATION
-        ))
+        validate_subject_scope(&tenant_subject("someone-else"), t),
+        Err(invalid("subject.id", tokens::TENANT_SUBJECT_MISMATCH))
     );
-    assert_eq!(
-        validate_subject_scope(&SubjectScope::user(), t, "u1"),
-        Ok(())
-    );
-    assert_eq!(
-        validate_subject_scope(&SubjectScope::user(), t, "   "),
-        Err(invalid(
-            "subject.subject_id",
-            tokens::SUBJECT_SCOPE_VIOLATION
-        ))
-    );
+    assert_eq!(validate_subject_scope(&subject("u1"), t), Ok(()));
     let too_long = "x".repeat(SUBJECT_ID_MAX_LEN + 1);
     assert_eq!(
-        validate_subject_scope(&SubjectScope::user(), t, &too_long),
-        Err(invalid(
-            "subject.subject_id",
-            tokens::SUBJECT_SCOPE_VIOLATION
-        ))
+        validate_subject_scope(&subject(&too_long), t),
+        Err(invalid("subject.id", tokens::SUBJECT_ID_TOO_LONG))
     );
 }
 
@@ -427,7 +416,7 @@ fn list_requests_pair_the_subject_halves_and_respect_the_bounds() {
 
     let err = validate_list(
         ListQuotasRequest {
-            projection_type: Some(GtsTypeId::try_new(LLM_USER_PROJECTION).expect("type")),
+            subject_type: Some(GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type")),
             ..ListQuotasRequest::default()
         },
         &limits(),
@@ -444,12 +433,12 @@ fn list_requests_pair_the_subject_halves_and_respect_the_bounds() {
     .expect_err("the other half");
     assert_eq!(
         err,
-        invalid("projection_type", tokens::LIST_SUBJECT_INCOMPLETE)
+        invalid("subject_type", tokens::LIST_SUBJECT_INCOMPLETE)
     );
 
     let (filter, _) = validate_list(
         ListQuotasRequest {
-            projection_type: Some(GtsTypeId::try_new(LLM_USER_PROJECTION).expect("type")),
+            subject_type: Some(GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type")),
             subject_id: Some("u1".to_owned()),
             metric: Some(METRIC_TOKENS.to_owned()),
             ..ListQuotasRequest::default()

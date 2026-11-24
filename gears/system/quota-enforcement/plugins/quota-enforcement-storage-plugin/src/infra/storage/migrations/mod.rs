@@ -13,6 +13,7 @@ mod m0003_policies;
 mod m0004_consumption;
 mod m0005_leases;
 mod m0006_idempotency_stripes;
+mod m0007_charge_ledger;
 
 /// Prefix of the notification outbox tables (`qe_outbox_body`,
 /// `qe_outbox_incoming`, ...). The toolkit joins prefix and suffix with an
@@ -47,6 +48,7 @@ impl MigratorTrait for Migrator {
         migrations.push(Box::new(m0004_consumption::Migration));
         migrations.push(Box::new(m0005_leases::Migration));
         migrations.push(Box::new(m0006_idempotency_stripes::Migration));
+        migrations.push(Box::new(m0007_charge_ledger::Migration));
         migrations
     }
 }
@@ -72,6 +74,17 @@ mod migrations_tests {
     #[test]
     fn the_outbox_prefix_is_accepted_by_the_toolkit() {
         assert!(outbox_migrations_with_prefix(OUTBOX_TABLE_PREFIX).is_ok());
-        assert_eq!(Migrator::migrations().len(), 7);
+        assert_eq!(Migrator::migrations().len(), 8);
+    }
+
+    #[allow(clippy::expect_used)]
+    #[tokio::test]
+    async fn the_last_migration_goes_down_and_up_again() {
+        let conn = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("connect");
+        Migrator::up(&conn, None).await.expect("up");
+        Migrator::down(&conn, Some(1)).await.expect("down");
+        Migrator::up(&conn, None).await.expect("up again");
     }
 }

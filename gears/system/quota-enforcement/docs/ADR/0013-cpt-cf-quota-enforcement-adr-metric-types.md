@@ -16,7 +16,7 @@ date: 2026-11-23
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
-  - [(a) The metric is a type; the Engine checks Quota metadata](#a-the-metric-is-a-type-the-engine-checks-quota-metadata)
+  - [(a) The metric is a type; Quota metadata are conditions over its metadata](#a-the-metric-is-a-type-quota-metadata-are-conditions-over-its-metadata)
   - [(b) Keep the request contract, found by a name derived from the metric](#b-keep-the-request-contract-found-by-a-name-derived-from-the-metric)
   - [(c) Keep the request contract, found by listing, with an owner rule](#c-keep-the-request-contract-found-by-listing-with-an-owner-rule)
 - [More Information](#more-information)
@@ -48,14 +48,13 @@ The reasons for these objects have gone:
   counter is now keyed by subject type, subject id, and metric, and no contract is part of the key.
 * The request metadata and the resource properties are two sets of attributes of one operation. Both come from the
   metric owner, both are read only by policies, and neither is part of the counter key.
-* The metric owner publishes the constraint contract, but only the operator's Policy reads Quota metadata. The owner
-  does not know that Policy.
+* The constraint contract is a second schema of the same attributes: a Quota that limits one region names the region
+  that the request carries. The schema of the request's metadata can serve both.
 
 license-resolver has the same needs and no such objects: a request names a resource type, the resolver reads that
-type by its id, and the type holds the metadata schema and the admitted subjects. The evaluator of license-enforcement
-defines the form of the conditions of a grant and checks them when a grant is written.
+type by its id, and the type holds the metadata schema and the admitted subjects.
 
-Which registered objects does a metric need, and who checks Quota metadata?
+Which registered objects does a metric need, and what defines and checks Quota metadata?
 
 ## Decision Drivers
 
@@ -68,7 +67,7 @@ Which registered objects does a metric need, and who checks Quota metadata?
 ## Considered Options
 
 * (a) The metric is a type with traits and a metadata schema. There is no request contract, no constraint contract,
-  and no resource. The Engine checks Quota metadata.
+  and no resource. Quota metadata are conditions over the metadata of the request, checked against the metric type.
 * (b) Keep the request contract, and find it by a type id that is derived from the metric's id.
 * (c) Keep the request contract and the listing. Count only a contract of the metric's owner, and choose one contract
   by a fixed rule when the owner has several.
@@ -93,7 +92,8 @@ Chosen option: (a).
   request against the resolved schema of the type, checks each subject type against `admitted_subjects`, and takes
   `kind` and `enforcement` from the traits.
 * A Quota names a subject and a metric type. The counter key is the subject type, the subject id, and the metric type.
-  The metric `id` is not part of the key in P1; QE gives it to the Engine with the request.
+  The metric `id` is not part of the key in P1. The PDP and the Engine receive it, so a Policy can filter by it,
+  and the attribution of a charge includes it. No counter exists per `id`, so a limit per `id` is not expressible.
 * There is no request contract and no resource. An attribute that a resource carried goes into the metadata of the
   metric. QE has no `resource_projections` configuration.
 * Another major version of a metric type is another type id, so it is another metric with its own Quotas. The own
@@ -104,19 +104,35 @@ Chosen option: (a).
 
 ### Quota metadata
 
-* There is no constraint contract. QE core checks only that Quota metadata is a JSON object of at most 4 KB, and
-  stores it. Its meaning belongs to the Policy that reads it.
-* When a Quota is created or its metadata changes, QE gives the metadata to the Engine of the Policy that is active
-  for the Quota's metric. The Engine answers that it accepts the metadata, or that it rejects it, with a list of what
-  is wrong: for each item, the place in the metadata and the reason.
-* On a rejection QE writes nothing and answers `InvalidArgument` with the Engine's list.
-* The `most-restrictive-wins` Engine reads no Quota metadata and accepts only an empty object. What another Engine
-  checks is the decision of that Engine.
-* A change of a Policy is the operator's responsibility. QE does not check existing Quotas when a Policy is created,
-  changed, or replaced, and does not check their metadata again later. When the active Policy cannot read the metadata
-  of a Quota, the Engine reports an error at evaluation: QE rejects the request with `POLICY_EVALUATION_FAILED`
-  (`FailedPrecondition`) and changes no counter. The operator
-  makes sure, before it changes a Policy, that the metadata of the existing Quotas fits the new Policy.
+* There is no constraint contract. The metadata of a Quota is a set of **conditions** over the `metadata` of the
+  request's metric object. The metric type defines the attributes, so a Quota and a request use one schema.
+* The metadata is a JSON object of at most 4 KB. Each key names a property of the metric type's `metadata` whose type
+  is a string, an integer, or a boolean. Its value is a value of that type, or a non-empty array of such values. The
+  empty object has no conditions.
+* QE core supports only these conditions: equality, and membership in a list. Selecting the Quotas that apply is the
+  same kind of step as matching the subject and the metric, so it is the same for every Engine and runs on the locked
+  rows. A selection that needs more, for example a range, a negation, or a priority among Quotas, belongs to a Policy:
+  the `cel` Engine reads the same request metadata.
+* QE brings the `metadata` of a request to one canonical form when it admits the request: a number with no fractional
+  part is an integer. JSON Schema accepts `5.0` for an integer property, and without this step neither the condition
+  `5` nor a `cel` comparison would equal it. The conditions, the Engine, and the request fingerprint use this form.
+* A Quota applies to a request only when every condition holds: the request's `metadata` has the property, and its
+  value equals the condition's value or one of its values. When the request lacks the property, the Quota does not
+  apply. QE core decides this together with the subject and the metric, before the Engine runs, so every Engine gets
+  only the Quotas that apply.
+* When a Quota is created or its metadata changes, QE core checks the conditions against the metric type's schema from
+  the catalogue (ADR-0012). On a violation QE writes nothing and answers `InvalidArgument` with a list of what is
+  wrong: for each item, the place in the metadata and the reason.
+* The owner can revise a metric type after a Quota is written. types-registry admits a revision when the new schema
+  accepts every instance that the previous one accepted; such a revision can still widen the type of a property,
+  and a stored condition then no longer fits. QE does not fail evaluation for this. It checks the
+  conditions of the active Quotas against the current type on a schedule and reports the Quotas that no longer fit
+  through the `quota_conditions_unfit_total` gauge and a log entry. A change of a Policy does not touch Quota
+  metadata.
+* A snapshot read may carry the `metadata` of a request for a target. It then returns only the Quotas whose
+  conditions hold on it, so a caller can see which Quotas a request would meet.
+* An Engine does not check Quota metadata: QE core has already applied its conditions. The snapshot of a Quota that
+  the Engine receives still includes the metadata.
 
 ### Consequences
 
@@ -125,13 +141,11 @@ Chosen option: (a).
   type, and evaluation reads the process-local catalogue, not the registry.
 * The catalogue of ADR-0012 holds metric types that QE reads by id. It has no listing, no rule of one contract per
   metric, and no state for a metric with two contracts.
-* A policy no longer sees a `resource`. For the `cel` Engine, `request` is the metadata of the request's metric, and
-  `arbitration` is the Quota metadata, which has no registered schema. The `cel` Engine gives `arbitration` no type and accepts any
-  JSON object as Quota metadata; what it reads and a Quota lacks is found at evaluation.
-* The Engine contract of the SDK gets one more operation, the check of Quota metadata. This breaks existing Engine
-  implementations.
-* A mistake in Quota metadata is found when the Quota is written only as far as the Engine checks it. The rest is
-  found at evaluation, as a rejected request.
+* A policy no longer sees a `resource`. For the `cel` Engine, `request` is the metadata of the request's metric. A
+  Quota in the `cel` environment carries no metadata: the Quotas it sees already apply to the request.
+* Quota metadata hold only attributes of the request. An attribute that only a Policy knows, such as a priority among
+  Quotas, cannot be stored on a Quota; a Policy derives it from the Quota's subject type or from the request.
+* A mistake in Quota metadata is found when the Quota is written.
 * A request with several metrics repeats in each metric the attributes that one resource carried before.
 * The attribution of a charge (ADR-0011) is the tenant, the subjects, and the metric with its type and id.
 * The quota resolver's request loses the resource and the separate operation metadata of a metric item; the metric
@@ -141,22 +155,22 @@ Chosen option: (a).
 
 Tests: a request whose metric object does not fit the metric type; a metric type that is not registered, is abstract,
 or does not derive from the metric base; a subject type that the metric does not admit; a metric with `enforcement`
-`direct`; a Quota write whose metadata the Engine rejects, with the Engine's list in the answer, and one that it
-accepts; a Quota with non-empty metadata under the `most-restrictive-wins` Engine; a Policy change that leaves a Quota
-with metadata the new Policy cannot read, and the evaluation that follows; a registration by another module that names
+`direct`; a Quota write whose metadata names a property the metric type does not declare, a property that is not a
+scalar, or a value of another type, with the list in the answer, and one that passes; a request that a Quota's
+conditions admit, one they do not, and one that lacks the property, under each Engine; a registration by another module that names
 an existing metric in any of its fields and changes nothing.
 
 ## Pros and Cons of the Options
 
-### (a) The metric is a type; the Engine checks Quota metadata
+### (a) The metric is a type; Quota metadata are conditions over its metadata
 
 * Good, because QE reads every object by the id that the request or the Quota names.
 * Good, because only the owner of the metric's name can change the metric.
-* Good, because subjects and metrics follow the model of license-resolver, and the Engine has the role of its
-  evaluator.
+* Good, because subjects and metrics follow the model of license-resolver.
 * Good, because a metric needs one registered object.
-* Bad, because the form of Quota metadata is checked only by the Engine, and a Policy change can leave Quotas that the
-  new Policy cannot read.
+* Good, because Quota metadata are checked in full when they are written, and no change of a Policy or of a metric
+  type makes a stored Quota fail at evaluation.
+* Bad, because a Quota cannot carry an attribute that the request does not carry.
 * Bad, because the request shape, the Engine contract, and the stored metric ids change.
 
 ### (b) Keep the request contract, found by a name derived from the metric
@@ -174,8 +188,7 @@ an existing metric in any of its fields and changes nothing.
 ## More Information
 
 Subject and resource contracts in license-resolver:
-[README](../../../license-resolver/license-resolver-sdk/README.md). Conditions of a grant and their evaluator in
-license-enforcement: [DESIGN](../../../license-enforcement/docs/DESIGN.md).
+[README](../../../license-resolver/license-resolver-sdk/README.md).
 
 ## Traceability
 

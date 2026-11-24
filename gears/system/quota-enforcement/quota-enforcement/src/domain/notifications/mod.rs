@@ -10,11 +10,9 @@
 
 mod dispatcher;
 mod lifecycle;
-mod system;
 
 pub use dispatcher::{DispatchLimits, NotificationDispatcher};
 pub use lifecycle::DeliveryLifecycle;
-pub use system::{DISPATCHER_SUBJECT_ID, DISPATCHER_SUBJECT_TYPE, dispatcher_context};
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

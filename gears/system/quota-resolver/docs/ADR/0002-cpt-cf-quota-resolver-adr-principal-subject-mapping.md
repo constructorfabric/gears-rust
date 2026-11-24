@@ -81,7 +81,8 @@ empty; the plugin is not called. A registry failure during the lookup is `Servic
 * A mapping change takes effect on each replica as it restarts, so a call and its retry can be mapped differently. A
   retry after a change of the type carries another quota subject under the same key, so a backend that compares a
   repeat with the first request, as quota-enforcement does, rejects it with `AlreadyExists`, which a caller does not
-  retry; a new charge needs a new key. A retry after
+  retry; the first attempt may have charged, so the caller returns that charge by its key before it charges under a
+  new key. A retry after
   the removal of the entry is not mapped. An operator therefore adds entries for new principal types freely, and
   changes or removes an existing entry as a migration of its quotas, at a time with no charges of that type in flight.
 * The backend checks that the metric admits the mapped quota subject type. A type the metric does not admit fails in

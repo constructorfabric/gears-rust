@@ -1,18 +1,18 @@
-//! `qe_idempotency_records`: replay records addressed by their full
-//! four-component scope.
+//! `qe_idempotency_records`: replay records addressed by their scope
+//! `(tenant_id, operation_type, idem_key)`.
 //!
-//! Every read carries the whole scope, rollback's lookup of the original
-//! included, so no key-only index exists and a key can never cross-match
-//! another tenant's, another subject set's, or another operation kind's record.
-//! Reads also filter on `expires_at`, so a row the sweeper has not reclaimed
+//! A key never cross-matches another tenant's or another operation kind's
+//! record. Reads filter on `expires_at`, so a row the sweeper has not reclaimed
 //! yet is already invisible and the same key is a new operation.
 
+use std::collections::HashSet;
+
 use sea_orm::sea_query::{LockBehavior, LockType};
-use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QueryFilter, QuerySelect};
-use time::OffsetDateTime;
-use toolkit_db::secure::{
-    DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureUpdateExt, secure_insert,
+use sea_orm::{
+    ActiveValue, ColumnTrait, Condition, EntityTrait, Order, QueryFilter, QueryOrder, QuerySelect,
 };
+use time::OffsetDateTime;
+use toolkit_db::secure::{DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -20,12 +20,10 @@ use super::RowWait;
 use crate::infra::storage::entity::idempotency_record::{self, Column, Entity};
 use crate::infra::storage::entity::idempotency_stripe::{self, STRIPES};
 
-/// The four components that address a record.
+/// The three components that address a record, and a charge.
 pub struct ScopeKey<'a> {
     /// Authorized target tenant.
     pub tenant_id: Uuid,
-    /// Fingerprint of the applicable subject set.
-    pub subject_key: &'a [u8],
     /// Serialized operation kind.
     pub operation_type: &'a str,
     /// Client-supplied key.
@@ -35,7 +33,6 @@ pub struct ScopeKey<'a> {
 fn addressed(key: &ScopeKey<'_>) -> Condition {
     Condition::all()
         .add(Column::TenantId.eq(key.tenant_id))
-        .add(Column::SubjectKey.eq(key.subject_key.to_vec()))
         .add(Column::OperationType.eq(key.operation_type))
         .add(Column::IdemKey.eq(key.idem_key))
 }
@@ -71,10 +68,6 @@ pub struct NewRecord<'a> {
     pub payload_hash: &'a [u8],
     /// The decision blob, with its schema version.
     pub decision_blob: String,
-    /// Plugin-private movements a rollback reverses.
-    pub applied_entries: Option<String>,
-    /// The authorized attribution of a debit.
-    pub attribution_hash: Option<Vec<u8>>,
     /// Engine that produced the decision.
     pub engine_id: Option<String>,
     /// Policy that produced it.
@@ -110,14 +103,10 @@ pub async fn insert(
 ) -> Result<Inserted, ScopeError> {
     let row = idempotency_record::ActiveModel {
         tenant_id: ActiveValue::Set(record.key.tenant_id),
-        subject_key: ActiveValue::Set(record.key.subject_key.to_vec()),
         operation_type: ActiveValue::Set(record.key.operation_type.to_owned()),
         idem_key: ActiveValue::Set(record.key.idem_key.to_owned()),
         payload_hash: ActiveValue::Set(record.payload_hash.to_vec()),
         decision_blob: ActiveValue::Set(record.decision_blob.clone()),
-        applied_entries: ActiveValue::Set(record.applied_entries.clone()),
-        attribution_hash: ActiveValue::Set(record.attribution_hash.clone()),
-        reversed_by_key: ActiveValue::Set(None),
         engine_id: ActiveValue::Set(record.engine_id.clone()),
         policy_id: ActiveValue::Set(record.policy_id.clone()),
         policy_version: ActiveValue::Set(record.policy_version),
@@ -152,29 +141,6 @@ pub async fn delete_expired_at_key(
     Ok(affected.rows_affected)
 }
 
-/// Record which rollback reversed this debit. `false` when another one already
-/// did, which makes the second an idempotent no-op.
-///
-/// # Errors
-///
-/// The scope or database error of the update.
-pub async fn mark_reversed(
-    runner: &impl DBRunner,
-    scope: &AccessScope,
-    key: &ScopeKey<'_>,
-    by_key: &str,
-) -> Result<bool, ScopeError> {
-    let affected = Entity::update_many()
-        .col_expr(Column::ReversedByKey, by_key.into())
-        .filter(addressed(key))
-        .filter(Column::ReversedByKey.is_null())
-        .secure()
-        .scope_with(scope)
-        .exec(runner)
-        .await?;
-    Ok(affected.rows_affected == 1)
-}
-
 /// The stripe that serializes writers of `key` (I8): every field of the
 /// record's primary key, length-prefixed so no two keys feed the same bytes,
 /// through 64-bit FNV-1a. The hash is fixed by its definition rather than by a
@@ -187,7 +153,6 @@ pub fn stripe_of(key: &ScopeKey<'_>) -> i32 {
     for field in [
         key.tenant_id.as_bytes().as_slice(),
         key.operation_type.as_bytes(),
-        key.subject_key,
         key.idem_key.as_bytes(),
     ] {
         let length = u64::try_from(field.len()).unwrap_or(u64::MAX).to_le_bytes();
@@ -200,48 +165,94 @@ pub fn stripe_of(key: &ScopeKey<'_>) -> i32 {
     i32::try_from(hash % u64::from(STRIPES)).unwrap_or(0)
 }
 
-/// Lock the stripe `stripe` for update, refusing at once if another
-/// transaction holds it. `false` when the row does not exist, which only an
-/// unmigrated schema can produce.
+/// Lock `stripes` for update in one statement, in ascending order, refusing at
+/// once if another transaction holds one of them. Returns the stripes that
+/// exist; one that is missing is one only an unmigrated schema can lack.
 ///
 /// # Errors
 ///
 /// The scope or database error of the read; on `PostgreSQL` a held stripe is
 /// `lock_not_available`.
-pub async fn lock_stripe(runner: &impl DBRunner, stripe: i32) -> Result<bool, ScopeError> {
+pub async fn lock_stripes(runner: &impl DBRunner, stripes: &[i32]) -> Result<Vec<i32>, ScopeError> {
+    if stripes.is_empty() {
+        return Ok(Vec::new());
+    }
     let select = RowWait::Nowait.apply(
-        idempotency_stripe::Entity::find().filter(idempotency_stripe::Column::Stripe.eq(stripe)),
+        idempotency_stripe::Entity::find()
+            .filter(idempotency_stripe::Column::Stripe.is_in(stripes.iter().copied()))
+            .order_by(idempotency_stripe::Column::Stripe, Order::Asc),
     );
     Ok(select
         .secure()
         // A platform table: no tenant owns a stripe.
         .scope_with(&AccessScope::allow_all())
-        .one(runner)
+        .all(runner)
         .await?
-        .is_some())
+        .into_iter()
+        .map(|row| row.stripe)
+        .collect())
 }
 
-/// Lock the stripe `stripe` unless another transaction holds it: `false`
-/// when it is held (or absent), so a background pass skips the scope rather
-/// than wait on, or refuse, a writer.
+/// Those of `keys` under `(tenant_id, operation_type)` that hold an unexpired
+/// record. A platform read of existence only: the tenant is fixed by the
+/// predicate, and the caller holds the keys' stripes.
 ///
 /// # Errors
 ///
 /// The scope or database error of the read.
-pub async fn try_lock_stripe(runner: &impl DBRunner, stripe: i32) -> Result<bool, ScopeError> {
+pub async fn unexpired_keys(
+    runner: &impl DBRunner,
+    tenant_id: Uuid,
+    operation_type: &str,
+    keys: &[&str],
+    now: OffsetDateTime,
+) -> Result<Vec<String>, ScopeError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::OperationType.eq(operation_type))
+        .filter(Column::IdemKey.is_in(keys.iter().copied()))
+        .filter(Column::ExpiresAt.gt(now))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(runner)
+        .await?
+        .into_iter()
+        .map(|row| row.idem_key)
+        .collect())
+}
+
+/// Lock those of `stripes` that no other transaction holds, in one
+/// statement, and return them. A background pass skips the scopes of the
+/// others rather than wait on, or refuse, a writer.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn try_lock_stripes(
+    runner: &impl DBRunner,
+    stripes: &[i32],
+) -> Result<HashSet<i32>, ScopeError> {
+    if stripes.is_empty() {
+        return Ok(HashSet::new());
+    }
     Ok(idempotency_stripe::Entity::find()
-        .filter(idempotency_stripe::Column::Stripe.eq(stripe))
+        .filter(idempotency_stripe::Column::Stripe.is_in(stripes.iter().copied()))
         .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
         .secure()
         // A platform table: no tenant owns a stripe.
         .scope_with(&AccessScope::allow_all())
-        .one(runner)
+        .all(runner)
         .await?
-        .is_some())
+        .into_iter()
+        .map(|row| row.stripe)
+        .collect())
 }
 
 /// A primary key of a stored record, owned.
-pub type OwnedKey = (Uuid, Vec<u8>, String, String);
+pub type OwnedKey = (Uuid, String, String);
 
 /// Up to `batch_size` keys whose records expired before `before`.
 ///
@@ -262,21 +273,14 @@ pub async fn select_expired(
         .all(runner)
         .await?
         .into_iter()
-        .map(|row| {
-            (
-                row.tenant_id,
-                row.subject_key,
-                row.operation_type,
-                row.idem_key,
-            )
-        })
+        .map(|row| (row.tenant_id, row.operation_type, row.idem_key))
         .collect())
 }
 
-/// Delete the record under `key` if it is still expired before `before`.
+/// Delete the records under `keys` that are still expired before `before`.
 ///
 /// The expiry is part of the delete, not only of the selection that found the
-/// key: a writer may have replaced the expired record since, and its fresh
+/// keys: a writer may have replaced an expired record since, and its fresh
 /// record must survive, or a replay of it would run a second time.
 ///
 /// # Errors
@@ -285,15 +289,25 @@ pub async fn select_expired(
 pub async fn delete_if_expired(
     runner: &impl DBRunner,
     scope: &AccessScope,
-    key: &ScopeKey<'_>,
+    keys: &[ScopeKey<'_>],
     before: OffsetDateTime,
 ) -> Result<u64, ScopeError> {
-    let affected = Entity::delete_many()
-        .filter(addressed(key))
-        .filter(Column::ExpiresAt.lt(before))
-        .secure()
-        .scope_with(scope)
-        .exec(runner)
-        .await?;
-    Ok(affected.rows_affected)
+    // SQLite refuses an expression nested deeper than 1000, and each key adds
+    // one level to the OR chain.
+    const KEYS_PER_DELETE: usize = 500;
+    let mut deleted = 0;
+    for keys in keys.chunks(KEYS_PER_DELETE) {
+        deleted += Entity::delete_many()
+            .filter(
+                keys.iter()
+                    .fold(Condition::any(), |any, key| any.add(addressed(key))),
+            )
+            .filter(Column::ExpiresAt.lt(before))
+            .secure()
+            .scope_with(scope)
+            .exec(runner)
+            .await?
+            .rows_affected;
+    }
+    Ok(deleted)
 }

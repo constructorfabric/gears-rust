@@ -27,20 +27,24 @@ use super::dto::{SubjectRefDto, ValidityWindowDto};
 use super::error::ApiResult;
 use crate::domain::Service;
 
-/// One target: a subject scope, its id, and a metric.
+/// One target: a subject type, its id, and a metric type.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSubjectDto {
-    /// Scope kind: the full GTS id of a scope instance, for example
-    /// `gts.cf.core.qe.scope.v1~cf.core.qe.user.v1`. The tenant scope
-    /// `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1` selects the tenant's own
-    /// Quotas only, and its id must then be `tenant_id`.
-    pub kind: String,
+    /// Quota subject type id. The tenant subject type
+    /// `gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~` selects the
+    /// tenant's own Quotas only, and its id must then be `tenant_id`.
+    #[serde(rename = "type")]
+    pub subject_type: String,
     /// Subject identifier.
     pub id: String,
-    /// Metric instance id.
+    /// Metric type id.
     pub metric: String,
+    /// The `metadata` of a request's metric object. When present, only the
+    /// Quotas whose conditions hold on it are returned for this target.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Map<String, Value>>,
 }
 
 /// Read the per-Quota state of `1..N` targets in one tenant.
@@ -68,9 +72,10 @@ impl From<SnapshotRequestDto> for SnapshotRequest {
                 .subjects
                 .into_iter()
                 .map(|subject| SnapshotSubject {
-                    kind: subject.kind,
+                    subject_type: subject.subject_type,
                     id: subject.id,
                     metric: subject.metric,
+                    metadata: subject.metadata,
                 })
                 .collect(),
             limit: value.limit,
@@ -115,7 +120,7 @@ pub struct QuotaSnapshotDto {
     pub quota_id: Uuid,
     /// Bound subject.
     pub subject: SubjectRefDto,
-    /// Metric instance id.
+    /// Metric type id.
     pub metric: String,
     /// Quota type instance id.
     pub quota_type: String,
@@ -181,7 +186,7 @@ async fn snapshot(
     Extension(service): Extension<Arc<Service>>,
     JsonBody(body): JsonBody<SnapshotRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
-    let page = service.operations()?.snapshot(&ctx, body.into()).await?;
+    let page = service.operations(&ctx)?.snapshot(body.into()).await?;
     Ok(Json(SnapshotPageDto::from(page)))
 }
 

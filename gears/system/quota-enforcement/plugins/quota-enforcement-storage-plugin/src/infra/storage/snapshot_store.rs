@@ -67,7 +67,7 @@ impl SqlConsumptionStore {
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
         const OPERATION: &str = "read quota snapshot";
         let page = self
-            .read_page(scope, vec![pair_of(applicable)], None, None)
+            .read_page(scope, vec![pair_of(applicable)], None, None, false)
             .await
             .map_err(|error| lift(OPERATION, error))?;
         Ok(page.snapshots)
@@ -83,6 +83,7 @@ impl SqlConsumptionStore {
         scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
+        in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
         const OPERATION: &str = "bulk read quota snapshot";
         // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-pagination:p1:inst-spg-resume
@@ -100,6 +101,7 @@ impl SqlConsumptionStore {
                 pairs.iter().map(pair_of).collect(),
                 after.map(QuotaId::as_uuid),
                 Some(limit),
+                in_window_only,
             )
             .await
             .map_err(|error| lift(OPERATION, error))?;
@@ -134,6 +136,7 @@ impl SqlConsumptionStore {
         pairs: Vec<SnapshotPair>,
         after: Option<uuid::Uuid>,
         limit: Option<u32>,
+        in_window_only: bool,
     ) -> Result<Page, TxError> {
         let clock = std::sync::Arc::clone(&self.clock);
         let scope = scope.clone();
@@ -145,7 +148,8 @@ impl SqlConsumptionStore {
                 },
                 move |tx| {
                     Box::pin(async move {
-                        read_in_tx(tx, &scope, &pairs, after, limit, || clock()).await
+                        let window_at = in_window_only.then(|| clock());
+                        read_in_tx(tx, &scope, &pairs, after, limit, window_at, || clock()).await
                     })
                 },
             )
@@ -161,12 +165,7 @@ fn pair_of(applicable: &ApplicableQuotas) -> SnapshotPair {
         subjects: applicable
             .subjects
             .iter()
-            .map(|subject| {
-                (
-                    subject.projection_type.to_string(),
-                    subject.subject_id.clone(),
-                )
-            })
+            .map(|subject| (subject.subject_type.to_string(), subject.subject_id.clone()))
             .collect(),
     }
 }
@@ -178,6 +177,7 @@ async fn read_in_tx(
     pairs: &[SnapshotPair],
     after: Option<uuid::Uuid>,
     limit: Option<u32>,
+    window_at: Option<OffsetDateTime>,
     now_of: impl FnOnce() -> OffsetDateTime,
 ) -> Result<Page, TxError> {
     // One row past the page says whether another page follows.
@@ -187,6 +187,7 @@ async fn read_in_tx(
         pairs,
         after,
         limit.map(|limit| u64::from(limit) + 1),
+        window_at,
     )
     .await?;
     let more = limit.is_some_and(|limit| rows.len() > limit as usize);

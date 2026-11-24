@@ -165,6 +165,8 @@ members = [
     "gears/system/usage-collector/plugins/noop-usage-collector-plugin",
     "gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin",
     "gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin",
+    "gears/system/quota-resolver/quota-resolver-sdk",
+    "gears/system/quota-resolver/quota-resolver",
     "gears/system/quota-enforcement/quota-enforcement-sdk",
     "gears/system/quota-enforcement/quota-enforcement",
     "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin",
@@ -447,6 +449,8 @@ oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.7.0", path = "gears/sys
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.23", path = "gears/system/usage-collector/usage-collector-sdk" }
 quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.8", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.5.5", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
+quota-resolver-sdk = { package = "cf-gears-quota-resolver-sdk", version = "0.1.0", path = "gears/system/quota-resolver/quota-resolver-sdk" }
+quota-resolver = { package = "cf-gears-quota-resolver", version = "0.1.0", path = "gears/system/quota-resolver/quota-resolver" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.7.1", path = "gears/system/event-broker/event-broker-sdk" }
 event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
 memory-event-broker-plugin = { package = "cf-gears-memory-event-broker-plugin", version = "0.1.6", path = "gears/system/event-broker/plugins/memory-event-broker-plugin" }

@@ -7,8 +7,10 @@ use quota_enforcement_sdk::testing::test_metric;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::{SecureEntityExt, SecureUpdateExt};
 
-fn context() -> SecurityContext {
-    SecurityContext::anonymous()
+fn actor() -> quota_enforcement_sdk::Actor {
+    quota_enforcement_sdk::Actor::Caller {
+        subject_id: uuid::Uuid::nil(),
+    }
 }
 fn draft() -> PolicyDraft {
     PolicyDraft {
@@ -41,6 +43,7 @@ fn policy_changed(policy_id: Option<PolicyId>) -> NotificationEvent {
     NotificationEvent {
         event_id: quota_enforcement_sdk::EventId::generate(),
         kind: quota_enforcement_sdk::NotificationEventKind::PolicyChanged,
+        actor: actor(),
         scope: quota_enforcement_sdk::NotificationScope::Platform,
         quota_id: None,
         policy_id,
@@ -56,16 +59,16 @@ async fn a_deleted_policy_cannot_be_rolled_back_to_any_version() {
     let (handle, outbox) = bound_outbox(&db).await;
     let store = SqlPolicyStore::new(db, outbox);
     let id = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create")
         .policy_id;
     store
-        .update_policy(&context(), id.clone(), patch(1), &[])
+        .update_policy(&actor(), id.clone(), patch(1), &[])
         .await
         .expect("v2 supersedes v1");
     store
-        .delete_policy(&context(), id.clone(), None, &[])
+        .delete_policy(&actor(), id.clone(), None, &[])
         .await
         .expect("delete");
 
@@ -76,7 +79,7 @@ async fn a_deleted_policy_cannot_be_rolled_back_to_any_version() {
         (2, PolicyVersionState::Deleted),
     ] {
         let refused = store
-            .rollback_policy(&context(), id.clone(), target, None, &[])
+            .rollback_policy(&actor(), id.clone(), target, None, &[])
             .await;
         assert!(
             matches!(refused, Err(StorageError::PolicyDeleted { .. })),
@@ -102,33 +105,33 @@ async fn versions_rollback_recreate_and_noops_preserve_history() {
     let (handle, outbox) = bound_outbox(&db).await;
     let store = SqlPolicyStore::new(db, outbox);
     let first = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create");
     let id = first.policy_id.clone();
     assert_eq!(first.timeout_ms, Some(100));
-    assert_eq!(first.created_by, context().subject_id().to_string());
+    assert_eq!(first.created_by, actor().to_string());
     assert!(matches!(
-        store.create_policy(&context(), draft(), &[]).await,
+        store.create_policy(&actor(), draft(), &[]).await,
         Err(StorageError::PolicyScopeOccupied { .. })
     ));
     store
-        .update_policy(&context(), id.clone(), patch(1), &[])
+        .update_policy(&actor(), id.clone(), patch(1), &[])
         .await
         .expect("v2");
     store
-        .update_policy(&context(), id.clone(), patch(2), &[])
+        .update_policy(&actor(), id.clone(), patch(2), &[])
         .await
         .expect("v3");
     let back = store
-        .rollback_policy(&context(), id.clone(), 1, Some("rollback".into()), &[])
+        .rollback_policy(&actor(), id.clone(), 1, Some("rollback".into()), &[])
         .await
         .expect("rollback");
     assert!(back.is_applied());
     assert_eq!(back.into_inner().comment.as_deref(), Some("creation"));
     assert!(
         !store
-            .rollback_policy(&context(), id.clone(), 1, None, &[])
+            .rollback_policy(&actor(), id.clone(), 1, None, &[])
             .await
             .expect("replay")
             .is_applied(),
@@ -136,7 +139,7 @@ async fn versions_rollback_recreate_and_noops_preserve_history() {
     );
     assert_eq!(
         store
-            .update_policy(&context(), id.clone(), patch(1), &[])
+            .update_policy(&actor(), id.clone(), patch(1), &[])
             .await
             .expect("v4")
             .version,
@@ -144,21 +147,21 @@ async fn versions_rollback_recreate_and_noops_preserve_history() {
     );
     assert!(
         store
-            .delete_policy(&context(), id.clone(), None, &[])
+            .delete_policy(&actor(), id.clone(), None, &[])
             .await
             .expect("delete")
             .is_applied()
     );
     assert!(
         !store
-            .delete_policy(&context(), id.clone(), None, &[])
+            .delete_policy(&actor(), id.clone(), None, &[])
             .await
             .expect("replay")
             .is_applied(),
         "a repeated delete writes no second audit row or event"
     );
     let replacement = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("recreate");
     assert_ne!(replacement.policy_id, id);
@@ -173,7 +176,7 @@ async fn versions_rollback_recreate_and_noops_preserve_history() {
     );
     assert_eq!(
         store
-            .delete_policy(&context(), PolicyId::global(), None, &[])
+            .delete_policy(&actor(), PolicyId::global(), None, &[])
             .await,
         Err(StorageError::CannotDeleteSeededGlobalPolicy)
     );
@@ -184,12 +187,7 @@ async fn versions_rollback_recreate_and_noops_preserve_history() {
 async fn enqueue_failure_rolls_back_policy_header_and_version() {
     let db = test_db().await;
     let failed = SqlPolicyStore::new(db.clone(), Arc::new(FailingEnqueuer));
-    assert!(
-        failed
-            .create_policy(&context(), draft(), &[])
-            .await
-            .is_err()
-    );
+    assert!(failed.create_policy(&actor(), draft(), &[]).await.is_err());
     let conn = db.conn().expect("connection");
     assert!(
         repo::at_scope(&conn, &scope_key(&draft().scope))
@@ -233,7 +231,7 @@ async fn scope_and_id_reads_resolve_the_active_version_and_never_fall_back() {
 
     let global = store
         .create_policy(
-            &context(),
+            &actor(),
             PolicyDraft {
                 scope: PolicyScope::Global,
                 ..draft()
@@ -243,7 +241,7 @@ async fn scope_and_id_reads_resolve_the_active_version_and_never_fall_back() {
         .await
         .expect("seed global");
     let metric = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create metric");
 
@@ -267,7 +265,7 @@ async fn scope_and_id_reads_resolve_the_active_version_and_never_fall_back() {
     // also use this read to ask whether a scope is occupied.
     assert!(
         store
-            .delete_policy(&context(), metric.policy_id.clone(), None, &[])
+            .delete_policy(&actor(), metric.policy_id.clone(), None, &[])
             .await
             .expect("delete")
             .is_applied()
@@ -306,13 +304,13 @@ async fn history_pages_in_version_order_and_refuses_a_foreign_cursor() {
     let (_handle, outbox) = bound_outbox(&db).await;
     let store = SqlPolicyStore::new(db, outbox);
     let created = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create");
     let id = created.policy_id.clone();
     for version in 1..4 {
         store
-            .update_policy(&context(), id.clone(), patch(version), &[])
+            .update_policy(&actor(), id.clone(), patch(version), &[])
             .await
             .expect("update");
     }
@@ -377,7 +375,7 @@ async fn a_creation_event_carries_the_generated_policy_id() {
     // The caller composes the event before storage mints the id, so it has
     // nothing to put in `policy_id`.
     let created = store
-        .create_policy(&context(), draft(), &[policy_changed(None)])
+        .create_policy(&actor(), draft(), &[policy_changed(None)])
         .await
         .expect("create");
 
@@ -395,7 +393,7 @@ async fn a_creation_event_carries_the_generated_policy_id() {
     let other = PolicyId::new("caller-supplied");
     store
         .create_policy(
-            &context(),
+            &actor(),
             PolicyDraft {
                 scope: PolicyScope::Global,
                 ..draft()
@@ -416,7 +414,7 @@ async fn an_active_read_never_reports_a_retired_version() {
     let (_handle, outbox) = bound_outbox(&db).await;
     let store = SqlPolicyStore::new(db.clone(), outbox);
     let created = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create");
     let id = created.policy_id.clone();
@@ -425,7 +423,7 @@ async fn an_active_read_never_reports_a_retired_version() {
     };
 
     store
-        .update_policy(&context(), id.clone(), patch(1), &[])
+        .update_policy(&actor(), id.clone(), patch(1), &[])
         .await
         .expect("v2");
 
@@ -483,7 +481,7 @@ async fn an_outage_is_unavailable_and_a_corrupt_payload_is_internal() {
     // That is a reachability failure the gear lifts to 503, not a 500.
     let unbound = SqlPolicyStore::new(db.clone(), Arc::new(QeOutbox::new()));
     let error = unbound
-        .create_policy(&context(), draft(), &[policy_changed(None)])
+        .create_policy(&actor(), draft(), &[policy_changed(None)])
         .await
         .expect_err("an unbound outbox rolls the transition back");
     assert!(
@@ -493,7 +491,7 @@ async fn an_outage_is_unavailable_and_a_corrupt_payload_is_internal() {
 
     let failing = SqlPolicyStore::new(db.clone(), Arc::new(FailingEnqueuer));
     let error = failing
-        .create_policy(&context(), draft(), &[policy_changed(None)])
+        .create_policy(&actor(), draft(), &[policy_changed(None)])
         .await
         .expect_err("a payload the outbox cannot serialize");
     assert!(
@@ -505,7 +503,7 @@ async fn an_outage_is_unavailable_and_a_corrupt_payload_is_internal() {
     let (_handle, outbox) = bound_outbox(&db).await;
     let store = SqlPolicyStore::new(db.clone(), outbox);
     let created = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create");
     let conn = db.conn().expect("connection");
@@ -537,15 +535,15 @@ async fn scope_read_resolves_recreated_policy_without_old_history() {
     let store = SqlPolicyStore::new(db, outbox);
     let scope = draft().scope;
     let original = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create");
     store
-        .delete_policy(&context(), original.policy_id.clone(), None, &[])
+        .delete_policy(&actor(), original.policy_id.clone(), None, &[])
         .await
         .expect("delete");
     let replacement = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("recreate");
     let current = store
@@ -568,7 +566,7 @@ async fn transitions_on_an_unknown_policy_or_version_are_refused_and_write_nothi
 
     assert_eq!(
         store
-            .update_policy(&context(), unknown.clone(), patch(1), &[])
+            .update_policy(&actor(), unknown.clone(), patch(1), &[])
             .await
             .expect_err("unknown policy"),
         StorageError::PolicyNotFound {
@@ -577,7 +575,7 @@ async fn transitions_on_an_unknown_policy_or_version_are_refused_and_write_nothi
     );
     assert_eq!(
         store
-            .rollback_policy(&context(), unknown.clone(), 1, None, &[])
+            .rollback_policy(&actor(), unknown.clone(), 1, None, &[])
             .await
             .expect_err("unknown policy"),
         StorageError::PolicyNotFound {
@@ -586,14 +584,14 @@ async fn transitions_on_an_unknown_policy_or_version_are_refused_and_write_nothi
     );
 
     let id = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create")
         .policy_id;
     let before = enqueued_messages(&db).await.len();
     assert_eq!(
         store
-            .rollback_policy(&context(), id.clone(), 7, None, &[policy_changed(None)])
+            .rollback_policy(&actor(), id.clone(), 7, None, &[policy_changed(None)])
             .await
             .expect_err("no version 7"),
         StorageError::UnknownPolicyVersion {
@@ -620,7 +618,7 @@ async fn audit_rows_read_back_in_transition_order() {
     let (_handle, outbox) = bound_outbox(&db).await;
     let store = SqlPolicyStore::new(db.clone(), outbox);
     let id = store
-        .create_policy(&context(), draft(), &[])
+        .create_policy(&actor(), draft(), &[])
         .await
         .expect("create")
         .policy_id;

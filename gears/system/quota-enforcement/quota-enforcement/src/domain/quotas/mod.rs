@@ -4,8 +4,8 @@
 //! - [`request`]: the transport-agnostic, presence-aware request models.
 //! - [`validation`]: the draft validation algorithm and the update and list
 //!   gates.
-//! - [`metadata`]: metadata validation against the owner's constraint
-//!   contract.
+//! - [`metadata`]: the size limit of Quota metadata and the check of its
+//!   conditions against the metric type.
 //! - [`window`]: the validity-window view computed at read time.
 //! - [`events`]: the `quota-changed` event every mutation enqueues.
 //! - [`service`]: the component that orders the steps.
@@ -26,6 +26,7 @@ pub use bulk::{
 };
 pub use events::ChangeKind;
 pub use gauges::{GaugeTiming, LifecycleGaugeRefresher, RefreshError};
+
 pub use request::{CreateQuotaRequest, ListQuotasRequest, Presence, UpdateQuotaRequest};
 pub use service::QuotaManagement;
 pub use validation::QuotaLimits;

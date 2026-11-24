@@ -272,6 +272,21 @@ pub fn evaluate_prepared(
     let started = std::time::Instant::now();
     let decision = engine.evaluate(context, artifact.as_ref());
     metrics.record_engine_evaluation(label, started.elapsed());
+    if let Err(EngineError::TypeError(detail)) = &decision {
+        metrics.record_policy_evaluation_failure(
+            label,
+            &super::ports::metrics::MetricLabel::admitted(context.metric),
+        );
+        tracing::warn!(
+            target: "qe.engine",
+            engine_id = label.as_label(),
+            policy_id = %context.policy.policy_id,
+            policy_version = context.policy.version,
+            metric = %context.metric,
+            %detail,
+            "POLICY_EVALUATION_FAILED: the active policy cannot evaluate the request"
+        );
+    }
     let outcome = EvaluationOutcome::validate(decision?, context).map_err(|invariant| {
         metrics.record_plan_violation(label, invariant);
         // The canonical `Internal` envelope carries no detail on the wire, so
@@ -419,58 +434,80 @@ impl<'a> PreparedEvaluation<'a> {
     /// compilation kept running, and the artifact it paid for would be thrown
     /// away. Here the job publishes first and releases afterwards, so an
     /// abandoned caller still leaves the artifact behind it.
-    #[tracing::instrument(
-        name = "quota_enforcement.engine.prepare",
-        skip_all,
-        fields(policy_id = %policy_id, version)
-    )]
     async fn prepare(&self, policy_id: &PolicyId, version: u32) -> Result<(), DomainError> {
-        let key = (policy_id.clone(), version);
-        let gate = GateGuard::enter(&self.artifacts, key).await;
-        if self.artifacts.get(policy_id, version).is_some() {
-            // Someone else compiled it while this task waited.
-            return Ok(());
-        }
-        let persisted = self
-            .storage
-            .read_policy_version(policy_id, version)
-            .await?
-            .ok_or_else(|| {
-                DomainError::from(quota_enforcement_sdk::StorageError::UnknownPolicyVersion {
-                    policy_id: policy_id.clone(),
-                    version,
-                })
-            })?;
-        let engine = Arc::clone(self.engines.get(&persisted.engine_id).ok_or_else(|| {
-            DomainError::Internal(format!(
-                "active policy names unregistered engine `{}`",
-                persisted.engine_id
-            ))
-        })?);
-        let permit = self.artifacts.compile_permit().await?;
-        let engine_id = persisted.engine_id.clone();
-        let cache = Arc::clone(&self.artifacts);
-        // Compilation is unbounded CPU work: parsing alone runs on a thread of
-        // its own inside the engine. Keep it off the runtime's workers.
-        let compiled = tokio::task::spawn_blocking(move || {
-            let outcome = engine
-                .validate_config(quota_enforcement_sdk::EngineValidationInput {
-                    raw: &persisted.engine_config,
-                    schemas: &persisted.schema_snapshot,
-                })
-                .map(|artifact| cache.publish(persisted.policy_id, persisted.version, artifact));
-            // Published, so a waiter that takes the gate now finds the artifact.
-            drop(permit);
-            drop(gate);
-            outcome
-        })
+        prepare_artifact(
+            &self.engines,
+            &self.artifacts,
+            self.storage,
+            policy_id,
+            version,
+        )
         .await
-        .map_err(|e| DomainError::Internal(format!("artifact compilation did not run: {e}")))?;
-        compiled.map_err(|e| DomainError::EngineFailure {
-            engine_id,
-            detail: e.to_string(),
-        })
     }
+}
+
+/// Compile one persisted version outside any transaction and publish it; see
+/// [`PreparedEvaluation::prepare`].
+///
+/// # Errors
+/// The storage read's failure, an unknown version or engine, or the engine's
+/// refusal of the persisted config.
+#[tracing::instrument(
+    name = "quota_enforcement.engine.prepare",
+    skip_all,
+    fields(policy_id = %policy_id, version)
+)]
+async fn prepare_artifact(
+    engines: &EngineRegistry,
+    artifacts: &Arc<PolicyArtifactCache>,
+    storage: &dyn quota_enforcement_sdk::QuotaEnforcementStoragePluginV1,
+    policy_id: &PolicyId,
+    version: u32,
+) -> Result<(), DomainError> {
+    let key = (policy_id.clone(), version);
+    let gate = GateGuard::enter(artifacts, key).await;
+    if artifacts.get(policy_id, version).is_some() {
+        // Someone else compiled it while this task waited.
+        return Ok(());
+    }
+    let persisted = storage
+        .read_policy_version(policy_id, version)
+        .await?
+        .ok_or_else(|| {
+            DomainError::from(quota_enforcement_sdk::StorageError::UnknownPolicyVersion {
+                policy_id: policy_id.clone(),
+                version,
+            })
+        })?;
+    let engine = Arc::clone(engines.get(&persisted.engine_id).ok_or_else(|| {
+        DomainError::Internal(format!(
+            "active policy names unregistered engine `{}`",
+            persisted.engine_id
+        ))
+    })?);
+    let permit = artifacts.compile_permit().await?;
+    let engine_id = persisted.engine_id.clone();
+    let cache = Arc::clone(artifacts);
+    // Compilation is unbounded CPU work: parsing alone runs on a thread of
+    // its own inside the engine. Keep it off the runtime's workers.
+    let compiled = tokio::task::spawn_blocking(move || {
+        let outcome = engine
+            .validate_config(quota_enforcement_sdk::EngineValidationInput {
+                raw: &persisted.engine_config,
+                schemas: &persisted.schema_snapshot,
+            })
+            .map(|artifact| cache.publish(persisted.policy_id, persisted.version, artifact));
+        // Published, so a waiter that takes the gate now finds the artifact.
+        drop(permit);
+        drop(gate);
+        outcome
+    })
+    .await
+    .map_err(|e| DomainError::Internal(format!("artifact compilation did not run: {e}")))?;
+    compiled.map_err(|e| DomainError::EngineFailure {
+        engine_id,
+        detail: e.to_string(),
+    })
 }
 
 /// Build the registry from every engine linked into this binary, before
@@ -483,7 +520,8 @@ pub fn linked_registry() -> Result<EngineRegistry, DuplicateEngine> {
 
 /// Lift an evaluation failure into the domain error DESIGN section 3.3 maps:
 /// `Timeout` to `DeadlineExceeded`, `CostExceeded` to `ResourceExhausted`,
-/// an invariant violation and every other engine failure to `Internal`.
+/// `TypeError` to `POLICY_EVALUATION_FAILED`, an invariant violation and every
+/// other engine failure to `Internal`.
 /// `InvalidConfig` is caught at create or update and cannot legitimately reach
 /// the hot path, so here it is an internal failure too.
 ///
@@ -498,10 +536,11 @@ pub fn lift_evaluation(engine_id: &str, failure: EvaluationFailure) -> DomainErr
         EvaluationFailure::Engine(EngineError::CostExceeded) => {
             DomainError::EngineCostExceeded { engine_id }
         }
+        EvaluationFailure::Engine(EngineError::TypeError(detail)) => {
+            DomainError::PolicyEvaluationFailed { engine_id, detail }
+        }
         EvaluationFailure::Engine(
-            error @ (EngineError::TypeError(_)
-            | EngineError::InvalidConfig(_)
-            | EngineError::Internal(_)),
+            error @ (EngineError::InvalidConfig(_) | EngineError::Internal(_)),
         ) => DomainError::EngineFailure {
             engine_id,
             detail: error.to_string(),

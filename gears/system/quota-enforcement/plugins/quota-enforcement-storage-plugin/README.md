@@ -15,9 +15,8 @@ plugin:
   idempotent seeding of their platform-default rows,
 - the Quota tables `qe_quotas`, `qe_quota_allocation_counters`, and
   `qe_operation_log`, with the four lifecycle primitives (`create_quota`,
-  `update_quota`, `deactivate_quota`, `read_quotas`) and the two
-  platform-plane reads (`read_active_projection_bindings`,
-  `read_active_quota_counts`) of the contract,
+  `update_quota`, `deactivate_quota`, `read_quotas`) and the platform-plane
+  read `read_active_quota_counts` of the contract,
 - the notification outbox: the enqueue side (invariant I11) and the one
   pipeline that drains it into the gear's dispatcher,
 - the migrations for all of it.

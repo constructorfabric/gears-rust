@@ -3,17 +3,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use quota_enforcement_sdk::testing::{InMemoryStorage, quota_draft, test_metric, test_subject};
+use quota_enforcement_sdk::testing::{InMemoryStorage, quota_draft, test_subject};
 use quota_enforcement_sdk::{
-    CapPatch, QuotaEnforcementStoragePluginV1, QuotaId, QuotaPatch, StorageError,
+    CapPatch, MetricId, QuotaEnforcementStoragePluginV1, QuotaId, QuotaPatch, StorageError,
 };
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit_security::AccessScope;
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 
 use super::{GaugeTiming, LifecycleGaugeRefresher, RefreshError};
+use crate::domain::catalog::MetricCatalog;
 use crate::domain::ports::lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink};
-use crate::domain::ports::metric_registry::MetricMode;
-use crate::test_support::{FakeMetricRegistry, RecordingGaugeSink, ctx, gated_counter, tenant};
+use crate::infra::types_registry::PlatformTypeRegistry;
+use crate::test_support::{
+    METRIC_OTHER, METRIC_REQUESTS, METRIC_TOKENS, RecordingGaugeSink, RecordingMetrics, actor,
+    fail_registry_reads, metric_type_document, platform_registry, tenant,
+};
+
+const DIRECT_METRIC: &str = "gts.cf.core.quota.metric.v1~cf.qetest.metric.direct.v1~";
 
 const REFRESH: Duration = Duration::from_secs(10);
 const DEADLINE: Duration = Duration::from_secs(5);
@@ -29,7 +37,7 @@ fn timing() -> GaugeTiming {
 
 struct Harness {
     storage: Arc<InMemoryStorage>,
-    registry: Arc<FakeMetricRegistry>,
+    registry: Arc<MockTypesRegistry>,
     sink: Arc<RecordingGaugeSink>,
     refresher: Arc<LifecycleGaugeRefresher>,
 }
@@ -37,12 +45,27 @@ struct Harness {
 impl Harness {
     fn new() -> Self {
         let storage = Arc::new(InMemoryStorage::new());
-        let registry = Arc::new(FakeMetricRegistry::empty());
-        registry.add(test_metric().as_str(), gated_counter());
+        let registry = platform_registry();
+        registry.seed(
+            DIRECT_METRIC,
+            metric_type_document(
+                DIRECT_METRIC,
+                json!({ "kind": "counter", "enforcement": "direct" }),
+                json!({}),
+            ),
+        );
+        let catalog = Arc::new(MetricCatalog::new(
+            Arc::new(PlatformTypeRegistry::new(
+                registry.clone(),
+                Duration::from_secs(3600),
+            )),
+            Arc::new(RecordingMetrics::default()),
+            crate::config::CatalogSection::default().unknown_memory(),
+        ));
         let sink = Arc::new(RecordingGaugeSink::default());
         let refresher = LifecycleGaugeRefresher::new(
             storage.clone(),
-            registry.clone(),
+            catalog,
             sink.clone() as Arc<dyn LifecycleGaugeSink>,
             timing(),
         );
@@ -55,15 +78,30 @@ impl Harness {
     }
 
     async fn seed(&self, cap: Option<u64>) -> QuotaId {
+        self.seed_on(quota_enforcement_sdk::testing::test_metric(), cap)
+            .await
+    }
+
+    async fn seed_on(&self, metric: MetricId, cap: Option<u64>) -> QuotaId {
+        let mut draft = quota_draft(test_subject("u1"), cap);
+        draft.metric = metric;
         self.storage
             .create_quota(
-                &ctx(),
+                &actor(),
                 &AccessScope::for_tenant(tenant().as_uuid()),
-                quota_draft(test_subject("u1"), cap),
+                draft,
                 &[],
             )
             .await
             .expect("seed")
+    }
+
+    // A metric no refresh has read yet, whose first registry read never ends.
+    async fn hang(&self) {
+        self.registry
+            .inject(Fault::on(Call::BatchGet).delay(Duration::from_hours(24)));
+        self.seed_on(MetricId::parse(METRIC_REQUESTS).expect("metric"), Some(5))
+            .await;
     }
 
     async fn refresh(&self) -> Result<LifecycleCounts, RefreshError> {
@@ -76,6 +114,7 @@ fn counts(cap_zero: u64, cap_unbounded: u64, for_direct_metric: u64) -> Lifecycl
         cap_zero,
         cap_unbounded,
         for_direct_metric,
+        conditions_unfit: 0,
     }
 }
 
@@ -100,7 +139,7 @@ async fn deactivation_and_cap_changes_move_the_counts_at_the_next_refresh() {
     assert_eq!(h.refresh().await.expect("refresh"), counts(1, 1, 0));
     h.storage
         .deactivate_quota(
-            &ctx(),
+            &actor(),
             &AccessScope::for_tenant(tenant().as_uuid()),
             zero,
             &[],
@@ -110,7 +149,7 @@ async fn deactivation_and_cap_changes_move_the_counts_at_the_next_refresh() {
     assert_eq!(h.refresh().await.expect("refresh"), counts(0, 1, 0));
     h.storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &AccessScope::for_tenant(tenant().as_uuid()),
             unbounded,
             QuotaPatch {
@@ -125,39 +164,57 @@ async fn deactivation_and_cap_changes_move_the_counts_at_the_next_refresh() {
 }
 
 #[tokio::test]
-async fn the_direct_count_follows_the_current_classification_in_both_directions() {
+async fn the_direct_count_takes_the_enforcement_trait_of_each_metric() {
     let h = Harness::new();
     h.seed(Some(10)).await;
-    h.seed(Some(20)).await;
     assert_eq!(h.refresh().await.expect("gated").for_direct_metric, 0);
-    h.registry
-        .set_mode(test_metric().as_str(), MetricMode::Direct);
+    let direct = MetricId::parse(DIRECT_METRIC).expect("metric");
+    h.seed_on(direct.clone(), Some(10)).await;
+    h.seed_on(direct, Some(20)).await;
     assert_eq!(h.refresh().await.expect("direct").for_direct_metric, 2);
-    h.registry
-        .set_mode(test_metric().as_str(), MetricMode::QuotaGated);
-    assert_eq!(h.refresh().await.expect("gated again").for_direct_metric, 0);
-    h.registry.remove(test_metric().as_str());
+    h.seed_on(MetricId::parse(METRIC_OTHER).expect("metric"), Some(1))
+        .await;
     assert_eq!(
         h.refresh()
             .await
-            .expect("removed metric is flagged, not counted")
+            .expect("an unregistered metric is flagged, not counted")
             .for_direct_metric,
-        0
+        2
     );
 }
 
 #[tokio::test]
-async fn a_stale_classification_fails_the_refresh() {
+async fn quotas_whose_conditions_do_not_fit_the_metric_type_as_it_is_now_are_counted() {
     let h = Harness::new();
-    h.seed(Some(10)).await;
-    h.registry.set_stale(test_metric().as_str());
-    let err = h.refresh().await.expect_err("stale");
-    assert_eq!(
-        err,
-        RefreshError::StaleClassification {
-            metric: test_metric().as_str().to_owned()
-        }
-    );
+    // The tokens type declares `region`; `zone` is a property it does not
+    // have, as after an owner removes one.
+    for (property, subject) in [("region", "u1"), ("zone", "u2"), ("zone", "u3")] {
+        let mut draft = quota_draft(test_subject(subject), Some(10));
+        draft.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
+        draft.metadata.insert(property.into(), "eu".into());
+        h.storage
+            .create_quota(&actor(), &AccessScope::allow_all(), draft, &[])
+            .await
+            .expect("quota");
+    }
+    assert_eq!(h.refresh().await.expect("refresh").conditions_unfit, 2);
+}
+
+#[tokio::test]
+async fn a_registry_that_does_not_answer_costs_only_the_metrics_this_replica_does_not_hold() {
+    let h = Harness::new();
+    let direct = MetricId::parse(DIRECT_METRIC).expect("metric");
+    h.seed_on(direct, Some(0)).await;
+    assert_eq!(h.refresh().await.expect("held").for_direct_metric, 1);
+
+    h.seed_on(MetricId::parse(METRIC_OTHER).expect("metric"), None)
+        .await;
+    fail_registry_reads(&h.registry);
+
+    let sample = h.refresh().await.expect("the sample survives the outage");
+    assert_eq!(sample.cap_zero, 1);
+    assert_eq!(sample.cap_unbounded, 1);
+    assert_eq!(sample.for_direct_metric, 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -216,7 +273,7 @@ async fn a_hanging_dependency_trips_the_deadline_and_then_the_staleness_bound() 
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(h.sink.last(), Some(Some(counts(1, 0, 0))));
 
-    h.registry.hang();
+    h.hang().await;
     // Second refresh starts at REFRESH and times out at REFRESH + DEADLINE;
     // no cooperative cancel is involved.
     tokio::time::sleep(REFRESH + DEADLINE + Duration::from_millis(10)).await;
@@ -245,7 +302,7 @@ async fn an_abort_mid_refresh_withdraws_the_sample_and_discards_the_result() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(h.sink.publications().len(), 1);
 
-    h.registry.hang();
+    h.hang().await;
     tokio::time::sleep(REFRESH + Duration::from_millis(10)).await;
     task.abort();
     let outcome = task.await;
@@ -273,7 +330,7 @@ async fn a_cancelled_refresh_never_publishes_and_leadership_handover_moves_the_s
     assert_eq!(a.sink.last(), Some(Some(counts(1, 0, 0))));
 
     // Leadership lost while a refresh is in flight: the result is discarded.
-    a.registry.hang();
+    a.hang().await;
     tokio::time::sleep(REFRESH + Duration::from_millis(10)).await;
     cancel_a.cancel();
     task_a.await.expect("run returns");
@@ -295,7 +352,7 @@ async fn a_cancelled_refresh_never_publishes_and_leadership_handover_moves_the_s
 async fn refresh_once_answers_cancellation_at_once() {
     let h = Harness::new();
     h.seed(Some(0)).await;
-    h.registry.hang();
+    h.hang().await;
     let cancel = CancellationToken::new();
     cancel.cancel();
     assert_eq!(

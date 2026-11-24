@@ -8,10 +8,10 @@ use quota_enforcement_sdk::engine::{
 };
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, Decision, DecisionResult, EvaluatedMutation,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseToken, NO_APPLICABLE_QUOTA,
-    NotificationEventKind, OperationType, PartialIdempotencyWrite, PayloadHash, PeriodType,
-    PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaType, Retention,
-    RollbackTarget, StorageError, TransitionOutcome,
+    IdempotencyScope, IdempotencyWrite, LeaseToken, NO_APPLICABLE_QUOTA, NotificationEventKind,
+    OperationType, PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyDraft, PolicyScope,
+    QuotaDebitPlan, QuotaDraft, QuotaId, QuotaType, Retention, RollbackTarget, StorageError,
+    TransitionOutcome,
 };
 use sea_orm::sea_query::Expr;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -20,9 +20,7 @@ use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
-use toolkit_security::{
-    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
-};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 
 use super::SqlConsumptionStore;
 use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore, StoreError};
@@ -36,21 +34,13 @@ use crate::test_support::{
 };
 
 /// A Tuesday, inside an ordinary day period.
-const DAY_ONE: OffsetDateTime = datetime!(2026-03-17 10:00:00 UTC);
+pub(in crate::infra::storage) const DAY_ONE: OffsetDateTime = datetime!(2026-03-17 10:00:00 UTC);
 
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(uuid::Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("context")
-}
-
-fn authorized() -> AttributionDigest {
+pub(in crate::infra::storage) fn authorized() -> AttributionDigest {
     AttributionDigest::from_bytes([7; 32])
 }
 
-fn applicable(subject_id: &str) -> ApplicableQuotas {
+pub(in crate::infra::storage) fn applicable(subject_id: &str) -> ApplicableQuotas {
     ApplicableQuotas {
         tenant_id: tenant(),
         subjects: vec![user(subject_id)],
@@ -58,11 +48,14 @@ fn applicable(subject_id: &str) -> ApplicableQuotas {
     }
 }
 
-fn write(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
+pub(in crate::infra::storage) fn write(
+    op: OperationType,
+    key: &str,
+    payload: u8,
+) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::of(&[user("u1")]),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -70,7 +63,7 @@ fn write(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
     }
 }
 
-fn partial(key: &str, payload: u8) -> PartialIdempotencyWrite {
+pub(in crate::infra::storage) fn partial(key: &str, payload: u8) -> PartialIdempotencyWrite {
     PartialIdempotencyWrite {
         tenant_id: tenant(),
         key: key.to_owned(),
@@ -88,8 +81,9 @@ fn limits() -> EvaluationLimits {
 /// An evaluator that answers from a script instead of running an engine, and
 /// counts how often the transaction called it.
 #[derive(Default)]
-struct Canned {
+pub(in crate::infra::storage) struct Canned {
     calls: Mutex<u32>,
+    pub(in crate::infra::storage) cascade: std::sync::atomic::AtomicBool,
 }
 
 impl Canned {
@@ -108,9 +102,15 @@ impl Canned {
                         violated_quota_ids: Vec::new(),
                         reason: NO_APPLICABLE_QUOTA.to_owned(),
                     },
-                    debit_plan: std::collections::BTreeMap::new(),
+                    debit_plan: Vec::new(),
                     diagnostics: std::collections::BTreeMap::new(),
                 },
+                context,
+            )?);
+        }
+        if self.cascade.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(EvaluationOutcome::validate(
+                Decision::allowed_with_plan(vec![cascade(context)]),
                 context,
             )?);
         }
@@ -131,12 +131,10 @@ impl Canned {
                     .quotas
                     .iter()
                     .map(|quota| {
-                        (
-                            quota.snapshot.quota_id,
-                            QuotaDebitPlan {
-                                amount: context.amount,
-                            },
-                        )
+                        vec![QuotaDebitPlan {
+                            quota_id: quota.snapshot.quota_id,
+                            amount: context.amount,
+                        }]
                     })
                     .collect(),
             )
@@ -146,7 +144,7 @@ impl Canned {
                     violated_quota_ids: exceeded,
                     reason: "QUOTA_EXCEEDED".to_owned(),
                 },
-                debit_plan: std::collections::BTreeMap::new(),
+                debit_plan: Vec::new(),
                 diagnostics: std::collections::BTreeMap::new(),
             }
         };
@@ -154,21 +152,52 @@ impl Canned {
     }
 }
 
-struct Harness {
-    db: Db,
-    store: SqlConsumptionStore,
-    quotas: SqlQuotaStore,
+/// One chain over every applicable Quota, bounded Quotas first, each taking
+/// what it has left of the amount.
+fn cascade(context: &EvaluationContext<'_>) -> Vec<QuotaDebitPlan> {
+    let mut quotas: Vec<_> = context.quotas.iter().map(|quota| quota.snapshot).collect();
+    quotas.sort_by_key(|quota| (quota.remaining.is_none(), quota.quota_id));
+    let mut left = context.amount;
+    quotas
+        .into_iter()
+        .map(|quota| {
+            let amount = quota
+                .remaining
+                .map_or(left, |remaining| remaining.min(left));
+            left -= amount;
+            QuotaDebitPlan {
+                quota_id: quota.quota_id,
+                amount,
+            }
+        })
+        .collect()
+}
+
+pub(in crate::infra::storage) struct Harness {
+    pub(in crate::infra::storage) db: Db,
+    pub(in crate::infra::storage) store: SqlConsumptionStore,
+    pub(in crate::infra::storage) quotas: SqlQuotaStore,
     outbox: OutboxHandle,
     clock: Arc<Mutex<OffsetDateTime>>,
-    evaluator: Arc<Canned>,
+    pub(in crate::infra::storage) evaluator: Arc<Canned>,
 }
 
 impl Harness {
-    async fn up() -> Self {
-        Self::on(test_db().await).await
+    pub(in crate::infra::storage) async fn up() -> Self {
+        Self::under("most-restrictive-wins").await
+    }
+
+    /// A harness whose global policy names `engine_id`, which the boundary
+    /// checks the canned plans against.
+    pub(in crate::infra::storage) async fn under(engine_id: &str) -> Self {
+        Self::on_under(test_db().await, engine_id).await
     }
 
     async fn on(db: Db) -> Self {
+        Self::on_under(db, "most-restrictive-wins").await
+    }
+
+    async fn on_under(db: Db, engine_id: &str) -> Self {
         let (outbox, enqueuer) = bound_outbox(&db).await;
         let clock = Arc::new(Mutex::new(DAY_ONE));
         let reader = Arc::clone(&clock);
@@ -181,10 +210,10 @@ impl Harness {
         let quota_clock = Arc::clone(&clock);
         policies
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
-                    engine_id: "most-restrictive-wins".into(),
+                    engine_id: engine_id.into(),
                     engine_config: serde_json::json!({}),
                     timeout_ms: Some(25),
                     description: None,
@@ -211,24 +240,24 @@ impl Harness {
         }
     }
 
-    async fn down(self) {
+    pub(in crate::infra::storage) async fn down(self) {
         self.outbox.stop().await;
     }
 
-    fn set_now(&self, now: OffsetDateTime) {
+    pub(in crate::infra::storage) fn set_now(&self, now: OffsetDateTime) {
         *self.clock.lock().expect("clock") = now;
     }
 
-    fn callback(&self) -> Arc<TransactionEvaluator> {
+    pub(in crate::infra::storage) fn callback(&self) -> Arc<TransactionEvaluator> {
         let evaluator = Arc::clone(&self.evaluator);
         Arc::new(move |context: &EvaluationContext<'_>| evaluator.evaluate(context))
     }
 
-    fn calls(&self) -> u32 {
+    pub(in crate::infra::storage) fn calls(&self) -> u32 {
         *self.evaluator.calls.lock().expect("lock")
     }
 
-    async fn consumption_quota(
+    pub(in crate::infra::storage) async fn consumption_quota(
         &self,
         subject_id: &str,
         cap: Option<u64>,
@@ -244,7 +273,11 @@ impl Harness {
             .expect("create quota")
     }
 
-    async fn allocation_quota(&self, subject_id: &str, cap: Option<u64>) -> QuotaId {
+    pub(in crate::infra::storage) async fn allocation_quota(
+        &self,
+        subject_id: &str,
+        cap: Option<u64>,
+    ) -> QuotaId {
         self.quotas
             .create_quota(
                 &actor(),
@@ -256,7 +289,7 @@ impl Harness {
             .expect("create quota")
     }
 
-    async fn debit(
+    pub(in crate::infra::storage) async fn debit(
         &self,
         subject_id: &str,
         amount: u64,
@@ -266,14 +299,13 @@ impl Harness {
         let null = serde_json::Value::Null;
         self.store
             .apply_debit_plan(
-                &ctx(),
+                &actor(),
                 &scope_for(tenant()),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount,
                     request: &null,
-                    resource: &null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: limits(),
                     idempotency,
                     authorized: authorized(),
@@ -284,7 +316,7 @@ impl Harness {
             .await
     }
 
-    async fn acquire(
+    pub(in crate::infra::storage) async fn acquire(
         &self,
         subject_id: &str,
         amount: u64,
@@ -295,14 +327,13 @@ impl Harness {
         let null = serde_json::Value::Null;
         self.store
             .acquire_lease(
-                &ctx(),
+                &actor(),
                 &scope_for(tenant()),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount,
                     request: &null,
-                    resource: &null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: limits(),
                     idempotency,
                     authorized: authorized(),
@@ -313,9 +344,9 @@ impl Harness {
             .await
     }
 
-    async fn consumed(&self, subject_id: &str, id: QuotaId) -> u64 {
+    pub(in crate::infra::storage) async fn consumed(&self, subject_id: &str, id: QuotaId) -> u64 {
         self.store
-            .read_quota_snapshot(&ctx(), &scope_for(tenant()), &applicable(subject_id))
+            .read_quota_snapshot(&scope_for(tenant()), &applicable(subject_id))
             .await
             .expect("snapshot")
             .into_iter()
@@ -325,7 +356,7 @@ impl Harness {
 
     /// The current period row's counter, read directly: a snapshot skips a
     /// deactivated Quota.
-    async fn period_consumed(&self, id: QuotaId) -> i64 {
+    pub(in crate::infra::storage) async fn period_consumed(&self, id: QuotaId) -> i64 {
         let conn = self.db.conn().expect("conn");
         crate::infra::storage::repo::consumption_counter_repo::find_latest(
             &conn,
@@ -355,7 +386,7 @@ impl Harness {
             .consumed
     }
 
-    async fn pin_versions_at_max(&self, id: QuotaId) {
+    pub(in crate::infra::storage) async fn pin_versions_at_max(&self, id: QuotaId) {
         let conn = self.db.conn().expect("connection");
         let consumption = counter::Entity::update_many()
             .col_expr(counter::Column::RecordVersion, Expr::value(i32::MAX))
@@ -376,7 +407,44 @@ impl Harness {
         assert_eq!(consumption.rows_affected + allocation.rows_affected, 1);
     }
 
-    async fn events(&self) -> Vec<String> {
+    /// The charge under `of` and its entries, read from the tables.
+    pub(in crate::infra::storage) async fn charge(
+        &self,
+        of: &IdempotencyScope,
+    ) -> Option<(
+        crate::infra::storage::entity::charge::Model,
+        Vec<crate::infra::storage::entity::charge_entry::Model>,
+    )> {
+        use crate::infra::storage::repo::charge_repo;
+        let conn = self.db.conn().expect("conn");
+        let all = AccessScope::allow_all();
+        let now = *self.clock.lock().expect("clock");
+        let charge = charge_repo::find(&conn, &all, &super::scope_key_of(of), now)
+            .await
+            .expect("read the charge")?;
+        let entries = charge_repo::entries_of(&conn, &all, charge.id)
+            .await
+            .expect("read the entries");
+        Some((charge, entries))
+    }
+
+    /// Whether an idempotency record exists under `of`, expired or not.
+    pub(in crate::infra::storage) async fn has_record(&self, of: &IdempotencyScope) -> bool {
+        use crate::infra::storage::repo::idempotency_repo;
+        let conn = self.db.conn().expect("conn");
+        idempotency_repo::find(
+            &conn,
+            &AccessScope::allow_all(),
+            &super::scope_key_of(of),
+            datetime!(1970-01-01 00:00:00 UTC),
+            None,
+        )
+        .await
+        .expect("read the record")
+        .is_some()
+    }
+
+    pub(in crate::infra::storage) async fn events(&self) -> Vec<String> {
         enqueued_messages(&self.db)
             .await
             .into_iter()
@@ -388,30 +456,125 @@ impl Harness {
 // --- debit and replay -------------------------------------------------------
 
 #[tokio::test]
-async fn a_first_debit_materializes_the_period_and_records_its_attribution() {
+async fn an_allowed_debit_writes_its_charge_and_no_idempotency_record() {
     let h = Harness::up().await;
     let id = h.consumption_quota("u1", Some(100), vec![50, 80]).await;
+    let key = write(OperationType::Debit, "k1", 1);
 
-    let applied = h
-        .debit("u1", 10, &write(OperationType::Debit, "k1", 1))
-        .await
-        .expect("debit");
+    let applied = h.debit("u1", 10, &key).await.expect("debit");
 
     assert!(matches!(applied, TransitionOutcome::Applied(_)));
     let debit = applied.get();
     assert_eq!(debit.mutation.counters[0].value, 10);
-    assert!(debit.mutation.counters[0].period_id.is_some());
-    assert!(matches!(debit.retention, Retention::Recorded { .. }));
+    let period_id = debit.mutation.counters[0].period_id.expect("a period row");
+    assert_eq!(
+        debit.retention,
+        Retention::Recorded {
+            expires_at: DAY_ONE + time::Duration::days(1)
+        },
+        "the return window is the replay window from the charge's creation"
+    );
     assert_eq!(h.consumed("u1", id).await, 10);
+
+    let (charge, entries) = h.charge(&key.scope).await.expect("the debit's charge");
+    assert_eq!(charge.payload_hash, key.payload_hash.as_bytes());
+    assert_eq!(charge.attribution_digest, authorized().as_bytes());
+    assert_eq!(charge.metric, METRIC_TOKENS);
+    assert_eq!(charge.amount, 10);
+    assert_eq!(charge.created_at, DAY_ONE);
+    assert_eq!(charge.return_window_end, DAY_ONE + time::Duration::days(1));
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(
+        (entry.chain, entry.position, entry.quota_id),
+        (0, 0, id.as_uuid())
+    );
+    assert_eq!(entry.period_id, Some(period_id.as_uuid()));
+    assert_eq!((entry.charged, entry.returned), (10, 0));
+    assert!(
+        !h.has_record(&key.scope).await,
+        "the charge is the debit's record"
+    );
 
     let record = h
         .store
-        .lookup_idempotency(&write(OperationType::Debit, "k1", 1).scope)
+        .lookup_idempotency(&key.scope)
         .await
         .expect("lookup")
-        .expect("the debit recorded its outcome");
-    assert_eq!(record.attribution_hash, Some(authorized()));
+        .expect("the charge answers the lookup");
+    assert_eq!(record.payload_hash, key.payload_hash);
     assert_eq!(record.decision_blob["__version"], serde_json::json!(1));
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_charge_keeps_the_chain_and_position_of_every_plan_entry() {
+    let h = Harness::under("cel").await;
+    h.evaluator
+        .cascade
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let first = h.allocation_quota("u1", Some(6)).await;
+    let second = h.allocation_quota("u1", None).await;
+    let key = write(OperationType::Debit, "k1", 1);
+    h.debit("u1", 10, &key).await.expect("debit");
+
+    let (_, entries) = h.charge(&key.scope).await.expect("the charge");
+    let mut slots: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.chain,
+                entry.position,
+                entry.quota_id,
+                entry.charged,
+                entry.returned,
+            )
+        })
+        .collect();
+    slots.sort_unstable();
+    let mut expected = vec![
+        (0, 0, first.as_uuid(), 6, 0),
+        (0, 1, second.as_uuid(), 4, 0),
+    ];
+    expected.sort_unstable();
+    assert_eq!(slots, expected);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn one_key_names_one_operation_per_tenant_and_operation_type() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.allocation_quota("u2", Some(100)).await;
+    h.debit("u1", 10, &write(OperationType::Debit, "k1", 1))
+        .await
+        .expect("debit");
+
+    let err = h
+        .debit("u2", 10, &write(OperationType::Debit, "k1", 2))
+        .await
+        .expect_err("other subjects under the same key");
+    assert_eq!(err, StorageError::IdempotencyPayloadMismatch);
+
+    let acquired = h
+        .acquire("u1", 5, TTL, &write(OperationType::Reserve, "k1", 3))
+        .await
+        .expect("another operation type does not collide");
+    assert!(matches!(acquired, TransitionOutcome::Applied(_)));
+    let token = acquired.get().token.expect("held");
+    h.store
+        .commit_lease(
+            &actor(),
+            &scope_for(tenant()),
+            token,
+            None,
+            None,
+            &partial("k1", 4),
+            &[],
+        )
+        .await
+        .expect("a commit under the debit's key is its own operation");
+    assert_eq!(h.consumed("u1", id).await, 15);
     h.down().await;
 }
 
@@ -551,7 +714,14 @@ async fn thresholds_fire_upward_once_and_a_credit_does_not_rearm_them() {
     assert_eq!(crossed, 1, "one event carries every threshold crossed");
 
     h.store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 40, &partial("c1", 9), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            40,
+            &partial("c1", 9),
+            &[],
+        )
         .await
         .expect("credit");
     h.debit("u1", 40, &write(OperationType::Debit, "k2", 2))
@@ -613,7 +783,14 @@ async fn a_credit_lowers_the_counter_to_the_floor_and_emits_one_adjustment() {
 
     let applied = h
         .store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 40, &partial("c1", 9), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            40,
+            &partial("c1", 9),
+            &[],
+        )
         .await
         .expect("credit");
 
@@ -626,10 +803,8 @@ async fn a_credit_lowers_the_counter_to_the_floor_and_emits_one_adjustment() {
             .any(|kind| kind == NotificationEventKind::QuotaCounterAdjusted.as_str())
     );
 
-    // The scope the plugin derived is the Quota's own subject pair.
     let derived = IdempotencyScope {
         tenant_id: tenant(),
-        subject_key: IdempotencySubjectKey::of(&[user("u1")]),
         operation_type: OperationType::Credit,
         key: "c1".to_owned(),
     };
@@ -651,7 +826,7 @@ async fn an_unknown_quota_is_refused_before_anything_is_written() {
     let err = h
         .store
         .apply_credit(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             missing,
             1,
@@ -682,7 +857,7 @@ async fn a_quota_outside_the_scope_is_as_unknown_as_a_missing_one() {
     // an existing identifier answers exactly like a missing one.
     let err = h
         .store
-        .apply_credit(&ctx(), &scope_for(other_tenant()), id, 5, &foreign, &[])
+        .apply_credit(&actor(), &scope_for(other_tenant()), id, 5, &foreign, &[])
         .await
         .expect_err("another tenant's quota is invisible");
 
@@ -705,7 +880,7 @@ async fn a_quota_in_scope_but_of_another_tenant_is_out_of_scope() {
     // The caller may already see the row, so refusing it reveals nothing.
     let err = h
         .store
-        .apply_credit(&ctx(), &both, id, 5, &foreign, &[])
+        .apply_credit(&actor(), &both, id, 5, &foreign, &[])
         .await
         .expect_err("the request names another tenant");
 
@@ -721,7 +896,14 @@ async fn a_credit_replays_after_its_quota_was_deactivated() {
         .await
         .expect("debit");
     h.store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 4, &partial("c1", 9), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            4,
+            &partial("c1", 9),
+            &[],
+        )
         .await
         .expect("credit");
     h.quotas
@@ -731,14 +913,28 @@ async fn a_credit_replays_after_its_quota_was_deactivated() {
 
     let replay = h
         .store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 4, &partial("c1", 9), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            4,
+            &partial("c1", 9),
+            &[],
+        )
         .await
         .expect("a replay answers from the record, not from the guards");
     assert!(matches!(replay, TransitionOutcome::NoOp(_)));
 
     let fresh = h
         .store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 1, &partial("c2", 8), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            1,
+            &partial("c2", 8),
+            &[],
+        )
         .await
         .expect_err("a fresh credit is refused");
     assert_eq!(fresh, StorageError::QuotaDeactivated { id });
@@ -752,14 +948,28 @@ async fn a_credit_refuses_a_closed_period_but_opens_one_never_evaluated() {
 
     // Never evaluated: the current window is open, so the row is materialized.
     h.store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 5, &partial("c1", 9), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            5,
+            &partial("c1", 9),
+            &[],
+        )
         .await
         .expect("a quota with no row has an open current window");
 
     h.set_now(datetime!(2026-03-19 00:00:00 UTC));
     let err = h
         .store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 5, &partial("c2", 8), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            5,
+            &partial("c2", 8),
+            &[],
+        )
         .await
         .expect_err("the latest period has ended");
     assert_eq!(err, StorageError::PeriodClosed);
@@ -780,13 +990,12 @@ async fn a_rollback_reverses_the_acquisition_period_after_the_boundary() {
     h.set_now(datetime!(2026-03-18 00:00:00 UTC));
     h.store
         .apply_rollback(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             &RollbackTarget {
                 original: original.scope.clone(),
                 authorized: authorized(),
             },
-            &write(OperationType::Rollback, "r1", 2),
             &[],
         )
         .await
@@ -812,13 +1021,12 @@ async fn a_rollback_authorized_under_another_attribution_finds_nothing() {
     let err = h
         .store
         .apply_rollback(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             &RollbackTarget {
                 original: original.scope.clone(),
                 authorized: AttributionDigest::from_bytes([9; 32]),
             },
-            &write(OperationType::Rollback, "r1", 2),
             &[],
         )
         .await
@@ -846,13 +1054,12 @@ async fn a_rollback_of_an_unknown_or_denied_operation_finds_nothing() {
         let err = h
             .store
             .apply_rollback(
-                &ctx(),
+                &actor(),
                 &scope_for(tenant()),
                 &RollbackTarget {
                     original,
                     authorized: authorized(),
                 },
-                &write(OperationType::Rollback, label, 2),
                 &[],
             )
             .await
@@ -866,7 +1073,7 @@ async fn a_rollback_of_an_unknown_or_denied_operation_finds_nothing() {
 }
 
 #[tokio::test]
-async fn a_second_rollback_under_another_key_reverses_nothing_further() {
+async fn a_second_rollback_succeeds_and_changes_nothing() {
     let h = Harness::up().await;
     let id = h.allocation_quota("u1", Some(100)).await;
     let original = write(OperationType::Debit, "k1", 1);
@@ -876,33 +1083,19 @@ async fn a_second_rollback_under_another_key_reverses_nothing_further() {
         authorized: authorized(),
     };
     h.store
-        .apply_rollback(
-            &ctx(),
-            &scope_for(tenant()),
-            &target,
-            &write(OperationType::Rollback, "r1", 2),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope_for(tenant()), &target, &[])
         .await
         .expect("first rollback");
     assert_eq!(h.consumed("u1", id).await, 0);
 
     let again = h
         .store
-        .apply_rollback(
-            &ctx(),
-            &scope_for(tenant()),
-            &target,
-            &write(OperationType::Rollback, "r2", 3),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope_for(tenant()), &target, &[])
         .await
         .expect("a second rollback is accepted");
 
-    assert!(
-        again.get().decision.debit_plan.is_empty(),
-        "reversal happens once, so the second plan is empty"
-    );
+    assert!(matches!(again, TransitionOutcome::NoOp(_)));
+    assert!(again.get().decision.debit_plan.is_empty());
     assert_eq!(h.consumed("u1", id).await, 0);
     h.down().await;
 }
@@ -910,11 +1103,46 @@ async fn a_second_rollback_under_another_key_reverses_nothing_further() {
 // --- retention --------------------------------------------------------------
 
 #[tokio::test]
-async fn a_replay_after_the_retention_window_is_a_new_operation() {
+async fn a_held_allocation_charge_answers_its_debit_after_the_replay_window() {
     let h = Harness::up().await;
-    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    h.allocation_quota("u1", Some(100)).await;
     let key = write(OperationType::Debit, "k1", 1);
     h.debit("u1", 10, &key).await.expect("debit");
+
+    h.set_now(DAY_ONE + time::Duration::days(3));
+    let reclaimed = h
+        .store
+        .reclaim_expired_idempotency(10, datetime!(2999-01-01 00:00:00 UTC))
+        .await
+        .expect("reclaim");
+    assert_eq!(reclaimed, 0, "the sweep does not touch charges");
+
+    let calls = h.calls();
+    let replay = h.debit("u1", 10, &key).await.expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(h.calls(), calls, "the engine is never re-invoked");
+    assert_eq!(
+        h.debit("u1", 10, &write(OperationType::Debit, "k1", 2))
+            .await
+            .expect_err("another fingerprint"),
+        StorageError::IdempotencyPayloadMismatch
+    );
+    assert!(
+        h.store
+            .lookup_idempotency(&key.scope)
+            .await
+            .expect("lookup")
+            .is_some()
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_denied_debit_replays_only_for_the_replay_window() {
+    let h = Harness::up().await;
+    h.consumption_quota("u1", Some(5), Vec::new()).await;
+    let key = write(OperationType::Debit, "k1", 1);
+    h.debit("u1", 10, &key).await.expect("a denial succeeds");
 
     let reclaimed = h
         .store
@@ -923,10 +1151,32 @@ async fn a_replay_after_the_retention_window_is_a_new_operation() {
         .expect("reclaim");
     assert_eq!(reclaimed, 1);
 
-    h.debit("u1", 10, &key)
+    let calls = h.calls();
+    let again = h
+        .debit("u1", 10, &key)
         .await
         .expect("re-evaluated as a new operation");
-    assert_eq!(h.consumed("u1", id).await, 20);
+    assert!(matches!(again, TransitionOutcome::Applied(_)));
+    assert_eq!(h.calls(), calls + 1);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_full_default_batch_of_expired_records_is_reclaimed() {
+    let h = Harness::up().await;
+    h.consumption_quota("u1", Some(5), Vec::new()).await;
+    for n in 0..1000 {
+        let key = write(OperationType::Debit, &format!("k{n}"), 1);
+        h.debit("u1", 10, &key).await.expect("a denial succeeds");
+    }
+
+    let reclaimed = h
+        .store
+        .reclaim_expired_idempotency(1000, datetime!(2999-01-01 00:00:00 UTC))
+        .await
+        .expect("reclaim");
+
+    assert_eq!(reclaimed, 1000);
     h.down().await;
 }
 
@@ -934,14 +1184,14 @@ async fn a_replay_after_the_retention_window_is_a_new_operation() {
 async fn a_record_that_replaced_an_expired_one_survives_the_sweep_that_selected_its_key() {
     use crate::infra::storage::repo::idempotency_repo::{self as idem_repo, ScopeKey};
     let h = Harness::up().await;
-    h.consumption_quota("u1", Some(100), Vec::new()).await;
+    h.consumption_quota("u1", Some(5), Vec::new()).await;
     let key = write(OperationType::Debit, "k1", 1);
-    let first = h.debit("u1", 10, &key).await.expect("debit");
+    let first = h.debit("u1", 10, &key).await.expect("a denied debit");
     let Retention::Recorded {
         expires_at: first_expiry,
     } = first.get().retention
     else {
-        panic!("the debit is recorded");
+        panic!("the denial is recorded");
     };
 
     // A sweep selects the key once its record has expired...
@@ -958,16 +1208,15 @@ async fn a_record_that_replaced_an_expired_one_survives_the_sweep_that_selected_
     let second = h.debit("u1", 10, &key).await.expect("a new operation");
     assert!(matches!(second, TransitionOutcome::Applied(_)));
 
-    let (tenant_id, subject_key, operation_type, idem_key) = &doomed[0];
+    let (tenant_id, operation_type, idem_key) = &doomed[0];
     let deleted = idem_repo::delete_if_expired(
         &conn,
         &all,
-        &ScopeKey {
+        &[ScopeKey {
             tenant_id: *tenant_id,
-            subject_key,
             operation_type,
             idem_key,
-        },
+        }],
         sweep_at,
     )
     .await
@@ -1098,7 +1347,14 @@ async fn a_credit_event_names_the_principal_that_authorized_it() {
         .expect("debit");
 
     h.store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 4, &partial("c1", 9), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            4,
+            &partial("c1", 9),
+            &[],
+        )
         .await
         .expect("credit");
 
@@ -1113,7 +1369,7 @@ async fn a_credit_event_names_the_principal_that_authorized_it() {
         serde_json::from_slice(&adjusted.payload).expect("event payload");
     assert_eq!(
         payload["payload"]["principal"],
-        serde_json::json!(actor().subject_id),
+        serde_json::json!(actor().to_string()),
         "the consumer identity travels with the event, not only to the log"
     );
     h.down().await;
@@ -1128,13 +1384,12 @@ async fn a_rollback_event_names_the_principal_that_authorized_it() {
 
     h.store
         .apply_rollback(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             &RollbackTarget {
                 original: original.scope.clone(),
                 authorized: authorized(),
             },
-            &write(OperationType::Rollback, "r1", 2),
             &[],
         )
         .await
@@ -1151,12 +1406,15 @@ async fn a_rollback_event_names_the_principal_that_authorized_it() {
         serde_json::from_slice(&applied.payload).expect("event payload");
     assert_eq!(
         payload["payload"]["principal"],
-        serde_json::json!(actor().subject_id)
+        serde_json::json!(actor().to_string())
     );
     assert_eq!(
-        payload["payload"]["original_idempotency_key"],
+        payload["payload"]["idempotency_key"],
         serde_json::json!("k1")
     );
+    assert_eq!(payload["payload"]["operation"], serde_json::json!("debit"));
+    assert_eq!(payload["payload"]["returned_amount"], serde_json::json!(30));
+    assert_eq!(payload["payload"]["remaining_amount"], serde_json::json!(0));
     h.down().await;
 }
 
@@ -1186,7 +1444,7 @@ async fn a_debit_that_waits_out_a_boundary_charges_the_period_it_commits_in() {
 // --- lease accounting (I4, I5) ---------------------------------------------
 
 /// One hour, comfortably inside the platform's TTL window.
-const TTL: std::time::Duration = std::time::Duration::from_hours(1);
+pub(in crate::infra::storage) const TTL: std::time::Duration = std::time::Duration::from_hours(1);
 
 #[tokio::test]
 async fn an_expired_hold_stops_counting_against_capacity_before_any_sweep() {
@@ -1246,7 +1504,7 @@ async fn a_read_subtracts_only_expired_holds_from_both_kinds_of_quota() {
     };
     let page = h
         .store
-        .read_quota_snapshot(&ctx(), &scope_for(tenant()), &both)
+        .read_quota_snapshot(&scope_for(tenant()), &both)
         .await
         .expect("snapshot");
     let consumed = |id| {
@@ -1279,7 +1537,14 @@ async fn the_first_writer_returns_an_expired_hold_and_a_later_sweep_moves_nothin
     assert_eq!(h.consumed("u1", id).await, 20, "the hold expired");
 
     h.store
-        .apply_credit(&ctx(), &scope_for(tenant()), id, 50, &partial("c1", 3), &[])
+        .apply_credit(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            50,
+            &partial("c1", 3),
+            &[],
+        )
         .await
         .expect("credit");
     assert_eq!(h.consumed("u1", id).await, 0, "a credit floors at zero");
@@ -1420,10 +1685,11 @@ async fn a_zero_commit_reverses_as_a_no_op_while_a_denied_debit_stays_irreversib
 
     h.store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             token,
             Some(0),
+            None,
             &partial("c1", 2),
             &[],
         )
@@ -1432,28 +1698,26 @@ async fn a_zero_commit_reverses_as_a_no_op_while_a_denied_debit_stays_irreversib
     assert_eq!(h.consumed("u1", id).await, 0, "every hold came back");
 
     // The commit is a real operation, so its rollback succeeds with nothing to
-    // move. The subject key is the acquisition's, which the commit reused.
+    // move.
     let commit_scope = IdempotencyScope {
         tenant_id: tenant(),
-        subject_key: IdempotencySubjectKey::of(&[user("u1")]),
         operation_type: OperationType::Commit,
         key: "c1".to_owned(),
     };
     h.store
         .apply_rollback(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             &RollbackTarget {
                 original: commit_scope,
                 authorized: authorized(),
             },
-            &write(OperationType::Rollback, "rb", 3),
             &[],
         )
         .await
         .expect("a zero commit reverses as a no-op");
 
-    // A debit that moved nothing is not a committed debit.
+    // A denied debit writes no charge.
     let denied = h
         .debit("u1", 1_000, &write(OperationType::Debit, "d1", 4))
         .await
@@ -1465,13 +1729,12 @@ async fn a_zero_commit_reverses_as_a_no_op_while_a_denied_debit_stays_irreversib
     let refused = h
         .store
         .apply_rollback(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             &RollbackTarget {
                 original: write(OperationType::Debit, "d1", 4).scope,
                 authorized: authorized(),
             },
-            &write(OperationType::Rollback, "rb2", 5),
             &[],
         )
         .await
@@ -1583,14 +1846,33 @@ fn batch_item(
         applicable,
         amount,
         request: serde_json::Value::Null,
-        resource: serde_json::Value::Null,
+        metric_id: None,
         authorized: authorized(),
-        item_scope: None,
+        idempotency: write(OperationType::Debit, &next_item_key(), 1),
     }
+}
+
+/// A key no other item of this process uses.
+fn next_item_key() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "item-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
 }
 
 fn tokens(subject_id: &str, amount: u64) -> quota_enforcement_sdk::BatchDebitItem {
     batch_item(subject_id, METRIC_TOKENS, amount)
+}
+
+/// `item` under the debit key `key`, with fingerprint `payload`.
+fn keyed(
+    mut item: quota_enforcement_sdk::BatchDebitItem,
+    key: &str,
+    payload: u8,
+) -> quota_enforcement_sdk::BatchDebitItem {
+    item.idempotency = write(OperationType::Debit, key, payload);
+    item
 }
 
 impl Harness {
@@ -1606,12 +1888,11 @@ impl Harness {
             .map(|item| quota_enforcement_sdk::BatchEntry {
                 item,
                 scope: &item_scope,
-                user_projection: None,
             })
             .collect();
         self.store
             .apply_batch_debit(
-                &ctx(),
+                &actor(),
                 &scope_for(tenant()),
                 &quota_enforcement_sdk::EvaluatedBatch {
                     envelope,
@@ -1652,14 +1933,9 @@ async fn an_allowed_batch_applies_exactly_the_union_of_its_plans_and_replays() {
     let second = h.allocation_quota("u2", Some(100)).await;
     let untouched = h.allocation_quota("u3", Some(100)).await;
     let envelope = write(OperationType::BatchDebit, "b1", 1);
+    let items = [tokens("u1", 10), tokens("u2", 20), tokens("u1", 5)];
 
-    let outcome = h
-        .batch(
-            &[tokens("u1", 10), tokens("u2", 20), tokens("u1", 5)],
-            &envelope,
-        )
-        .await
-        .expect("batch");
+    let outcome = h.batch(&items, &envelope).await.expect("batch");
 
     assert_eq!(allowed(&outcome), [true, true, true]);
     assert_eq!(
@@ -1674,18 +1950,89 @@ async fn an_allowed_batch_applies_exactly_the_union_of_its_plans_and_replays() {
         "a Quota no plan names never moves"
     );
 
+    for item in &items {
+        let (charge, entries) = h
+            .charge(&item.idempotency.scope)
+            .await
+            .expect("every item writes a debit charge under its key");
+        assert_eq!(
+            charge.payload_hash,
+            item.idempotency.payload_hash.as_bytes()
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.charged).sum::<i64>(),
+            i64::try_from(item.amount).expect("small")
+        );
+    }
+
+    // The items' own charges do not turn the duplicate into a mismatch: the
+    // envelope answers first.
     let calls = h.calls();
-    let replay = h
-        .batch(
-            &[tokens("u1", 10), tokens("u2", 20), tokens("u1", 5)],
-            &envelope,
-        )
-        .await
-        .expect("replay");
+    let replay = h.batch(&items, &envelope).await.expect("replay");
     assert!(matches!(replay, TransitionOutcome::NoOp(_)));
     assert_eq!(allowed(&replay), [true, true, true]);
     assert_eq!(h.calls(), calls, "a replay evaluates nothing");
     assert_eq!(h.consumed("u1", first).await, 15, "and moves nothing");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_batch_whose_item_key_names_a_single_debit_is_refused_whole() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.debit("u1", 10, &write(OperationType::Debit, "charged", 1))
+        .await
+        .expect("an allowed debit");
+    let denied = h
+        .debit("u1", 1_000, &write(OperationType::Debit, "denied", 2))
+        .await
+        .expect("a denied debit");
+    assert!(matches!(
+        denied.get().decision.result,
+        DecisionResult::Denied { .. }
+    ));
+
+    for key in ["charged", "denied"] {
+        let envelope = write(OperationType::BatchDebit, key, 3);
+        let err = h
+            .batch(
+                &[tokens("u1", 1), keyed(tokens("u1", 10), key, 1)],
+                &envelope,
+            )
+            .await
+            .expect_err("a batch never answers with a single debit's result");
+        assert_eq!(
+            err,
+            StorageError::IdempotencyPayloadMismatch.at_item(1),
+            "{key}"
+        );
+        assert_eq!(h.consumed("u1", id).await, 10, "{key}: nothing moved");
+        assert!(!h.has_record(&envelope.scope).await, "{key}");
+    }
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_single_debit_under_an_item_key_gets_the_items_result() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let item = keyed(tokens("u1", 10), "item", 1);
+    h.batch(
+        std::slice::from_ref(&item),
+        &write(OperationType::BatchDebit, "b1", 2),
+    )
+    .await
+    .expect("batch");
+
+    let replay = h.debit("u1", 10, &item.idempotency).await.expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(
+        h.debit("u1", 10, &write(OperationType::Debit, "item", 9))
+            .await
+            .expect_err("another fingerprint"),
+        StorageError::IdempotencyPayloadMismatch
+    );
+    assert_eq!(h.consumed("u1", id).await, 10);
     h.down().await;
 }
 
@@ -2074,6 +2421,168 @@ async fn a_counter_at_the_last_version_keeps_accepting_writes() {
     h.down().await;
 }
 
+impl Harness {
+    async fn commit(
+        &self,
+        token: quota_enforcement_sdk::LeaseToken,
+        actual: u64,
+    ) -> quota_enforcement_sdk::AppliedMutation {
+        self.store
+            .commit_lease(
+                &actor(),
+                &scope_for(tenant()),
+                token,
+                Some(actual),
+                None,
+                &partial("c1", 2),
+                &[],
+            )
+            .await
+            .expect("commit")
+            .get()
+            .clone()
+    }
+}
+
+#[tokio::test]
+async fn a_commit_writes_the_charge_of_what_it_keeps_with_the_leases_digest() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("held");
+
+    h.commit(token, 25).await;
+
+    let commit = partial("c1", 2).complete(OperationType::Commit);
+    let (charge, entries) = h.charge(&commit.scope).await.expect("the commit's charge");
+    assert_eq!(charge.attribution_digest, authorized().as_bytes());
+    assert_eq!(charge.payload_hash, commit.payload_hash.as_bytes());
+    assert_eq!(charge.amount, 25);
+    assert_eq!(charge.metric, METRIC_TOKENS);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        (entries[0].quota_id, entries[0].charged, entries[0].returned),
+        (id.as_uuid(), 25, 0)
+    );
+    assert!(
+        !h.has_record(&commit.scope).await,
+        "the charge is its record"
+    );
+
+    let replay = h
+        .store
+        .commit_lease(
+            &actor(),
+            &scope_for(tenant()),
+            token,
+            Some(25),
+            None,
+            &partial("c1", 2),
+            &[],
+        )
+        .await
+        .expect("replay from the charge");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(
+        h.store
+            .commit_lease(
+                &actor(),
+                &scope_for(tenant()),
+                token,
+                Some(25),
+                None,
+                &partial("c1", 3),
+                &[],
+            )
+            .await
+            .expect_err("another fingerprint"),
+        StorageError::IdempotencyPayloadMismatch
+    );
+    assert_eq!(h.consumed("u1", id).await, 25);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_commit_below_the_held_amount_unwinds_a_cascade_from_its_last_entry() {
+    let h = Harness::under("cel").await;
+    h.evaluator
+        .cascade
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let primary = h.allocation_quota("u1", Some(30)).await;
+    let fallback = h.allocation_quota("u1", None).await;
+    let acquired = h
+        .acquire("u1", 50, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+    assert_eq!(
+        (
+            h.consumed("u1", primary).await,
+            h.consumed("u1", fallback).await
+        ),
+        (30, 20)
+    );
+
+    let committed = h.commit(token, 35).await;
+
+    assert_eq!(
+        (
+            h.consumed("u1", primary).await,
+            h.consumed("u1", fallback).await
+        ),
+        (30, 5),
+        "the fallback gives back first"
+    );
+    assert_eq!(
+        committed.decision.debit_plan,
+        vec![vec![
+            QuotaDebitPlan {
+                quota_id: primary,
+                amount: 30
+            },
+            QuotaDebitPlan {
+                quota_id: fallback,
+                amount: 5
+            },
+        ]]
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_commit_below_the_held_amount_keeps_the_actual_amount_in_every_chain_of_an_and() {
+    let h = Harness::under("cel").await;
+    let first = h.allocation_quota("u1", Some(100)).await;
+    let second = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+
+    let committed = h.commit(token, 25).await;
+
+    assert_eq!(
+        (
+            h.consumed("u1", first).await,
+            h.consumed("u1", second).await
+        ),
+        (25, 25)
+    );
+    assert_eq!(committed.decision.debit_plan.len(), 2);
+    assert!(
+        committed.decision.debit_plan.iter().all(|chain| chain
+            .iter()
+            .map(|entry| entry.amount)
+            .sum::<u64>()
+            == 25)
+    );
+    h.down().await;
+}
+
 #[tokio::test]
 async fn a_commit_refuses_a_hold_a_faster_clock_already_returned() {
     let h = Harness::up().await;
@@ -2096,10 +2605,11 @@ async fn a_commit_refuses_a_hold_a_faster_clock_already_returned() {
     let committed = h
         .store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             token,
             Some(25),
+            None,
             &partial("c1", 3),
             &[],
         )
@@ -2144,10 +2654,11 @@ async fn a_grant_for_one_lease_commits_that_lease_and_no_other() {
     let committed = h
         .store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &only_lease(mine),
             mine,
             Some(25),
+            None,
             &partial("c1", 3),
             &[],
         )
@@ -2164,10 +2675,11 @@ async fn a_grant_for_one_lease_commits_that_lease_and_no_other() {
     let replayed = h
         .store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &only_lease(mine),
             mine,
             Some(25),
+            None,
             &partial("c1", 3),
             &[],
         )
@@ -2180,10 +2692,11 @@ async fn a_grant_for_one_lease_commits_that_lease_and_no_other() {
     let refused = h
         .store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &only_lease(mine),
             theirs,
             Some(10),
+            None,
             &partial("c2", 4),
             &[],
         )
@@ -2215,7 +2728,7 @@ async fn a_grant_for_one_lease_releases_that_lease() {
 
     let released = h
         .store
-        .release_lease(&ctx(), &only_lease(token), token, &partial("x1", 2), &[])
+        .release_lease(&actor(), &only_lease(token), token, &partial("x1", 2), &[])
         .await;
     assert!(
         matches!(released, Ok(TransitionOutcome::Applied(_))),
@@ -2270,10 +2783,11 @@ async fn a_grant_for_one_quota_resolves_the_leases_that_hold_it() {
     let committed = h
         .store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             token,
             Some(10),
+            None,
             &partial("c1", 2),
             &[],
         )
@@ -2365,10 +2879,11 @@ async fn the_backlog_gauge_counts_only_expired_leases_still_active() {
     .expect("acquire a lease that outlives the sample");
     h.store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             committed,
             Some(5),
+            None,
             &partial("c1", 2),
             &[],
         )
@@ -2407,9 +2922,10 @@ async fn a_full_commit_refuses_a_hold_whose_counter_row_is_missing() {
     let committed = h
         .store
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             token,
+            None,
             None,
             &partial("c1", 2),
             &[],
@@ -2524,5 +3040,52 @@ async fn a_warm_acquisition_reads_no_configuration_table() {
         "{}",
         toolkit_db::test_support::format_trace(&config_reads)
     );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_commit_naming_another_metric_type_is_refused_and_the_lease_stays_active() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 5, TTL, &write(OperationType::Reserve, "a1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("held");
+    let commit = |metric: &str, key: &str, amount: u64| {
+        let metric = quota_enforcement_sdk::MetricId::parse(metric).expect("metric");
+        let key = partial(key, 2);
+        let store = &h.store;
+        async move {
+            store
+                .commit_lease(
+                    &actor(),
+                    &scope_for(tenant()),
+                    token,
+                    Some(amount),
+                    Some(&metric),
+                    &key,
+                    &[],
+                )
+                .await
+        }
+    };
+
+    let err = commit(crate::test_support::METRIC_REQUESTS, "c1", 3)
+        .await
+        .expect_err("another metric type");
+    assert_eq!(
+        err,
+        StorageError::MetricTypeMismatch {
+            requested: crate::test_support::METRIC_REQUESTS.to_owned(),
+            charged: METRIC_TOKENS.to_owned(),
+        }
+    );
+    assert_eq!(h.consumed("u1", id).await, 5, "the hold is untouched");
+
+    commit(METRIC_TOKENS, "c2", 3)
+        .await
+        .expect("the lease's own metric type");
+    assert_eq!(h.consumed("u1", id).await, 3);
     h.down().await;
 }

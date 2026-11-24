@@ -1,16 +1,18 @@
-"""Pytest fixtures for Quota Enforcement E2E tests.
+"""Pytest fixtures for Quota Enforcement and Quota Resolver E2E tests.
 
 The suite runs on a focused server built from ``e2e.yaml``: QE, its SQL
-storage plugin over SQLite, the standalone cluster profile, and an E2E-owned
-GTS catalog (one counter metric, a tenant and a user projection). Tokens map
+storage plugin over SQLite, the Quota Resolver in front of it, the standalone
+cluster profile, and an E2E-owned GTS catalog (two counter metrics and a user
+quota subject type, which the resolver maps user principals to). Tokens map
 to static identities (static-authn-plugin)::
 
-    e2e-token-tenant-a  -> tenant 00000000-df51-...953
+    e2e-token-tenant-a  -> user 11111111-...ed of tenant 00000000-df51-...953
     e2e-token-tenant-b  -> tenant bbbbbbbb-...
 
-Every test creates user-subject Quotas under a fresh subject id and never a
-tenant-subject Quota, which would apply to every debit in the tenant. So tests
-are order-independent and re-runnable against a long-lived database.
+Tests create Quotas under a fresh subject id where they can, so they are
+order-independent. The quota-state tests use the fixed user and tenant of the
+tokens, on a metric of their own; the suite starts on an empty database
+(`clean_home` in `e2e.yaml`), so their Quotas do not pile up across runs.
 """
 from __future__ import annotations
 
@@ -22,11 +24,17 @@ import httpx
 import pytest
 
 TENANT_A = "00000000-df51-5b42-9538-d2b56b7ee953"
-PREFIX = "/v1/quota-enforcement"
+TENANT_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+PREFIX = "/quota-enforcement/v1"
 
-METRIC = "gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"
-USER_PROJECTION = "gts.cf.core.qe.subj.v1~cf.e2e.qe.user.v1~"
-USER_SCOPE = "gts.cf.core.qe.scope.v1~cf.core.qe.user.v1"
+USER_A = "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+
+METRIC = "gts.cf.core.quota.metric.v1~cf.e2e.qe.tokens.v1~"
+STATE_METRIC = "gts.cf.core.quota.metric.v1~cf.e2e.qe.state.v1~"
+USER_SUBJECT_TYPE = "gts.cf.core.quota.subj.v1~cf.e2e.qe.user.v1~"
+TENANT_SUBJECT_TYPE = "gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~"
+USER_PRINCIPAL_TYPE = "gts.cf.core.security.subject_user.v1~"
+UNMAPPED_PRINCIPAL_TYPE = "gts.cf.core.security.subject_service.v1~"
 
 GEAR = "quota-enforcement"
 # Under the suite's 10 s pytest timeout, which also covers fixture setup.
@@ -38,7 +46,7 @@ READY_POLL_SECS = 0.5
 def _check_quota_enforcement_enabled():
     """Skip all tests unless the focused QE server runs.
 
-    The shared ``make e2e-local`` server has no QE. Run via:
+    The shared ``make e2e-local`` server seeds no quota types. Run via:
     make e2e-local SUITE=quota-enforcement (which sets E2E_QUOTA_ENFORCEMENT=1).
     """
     if not os.getenv("E2E_QUOTA_ENFORCEMENT"):
@@ -111,18 +119,19 @@ def subject():
     return f"e2e-qe-{uuid.uuid4().hex[:12]}"
 
 
-def quota_body(subject: str, cap: int = 100, **over) -> dict:
-    """A hard monthly consumption Quota on the user subject, region ``eu``."""
+def quota_body(
+    subject: str, cap: int = 100, metric: str = METRIC, subject_type: str = USER_SUBJECT_TYPE, **over
+) -> dict:
+    """A hard monthly consumption Quota on a user subject (or another subject type)."""
     body = {
         "tenant_id": TENANT_A,
-        "subject": {"projection_type": USER_PROJECTION, "subject_id": subject},
-        "metric": METRIC,
+        "subject": {"type": subject_type, "id": subject},
+        "metric": metric,
         "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
         "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
         "enforcement_mode": "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
         "cap": cap,
         "notification_thresholds": [],
-        "metadata": {"regions": ["eu"]},
         "source": "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1",
     }
     body.update(over)
@@ -134,9 +143,8 @@ def debit_body(subject: str, amount: int) -> dict:
     return {
         "attribution": {
             "tenant_id": TENANT_A,
-            "metric": METRIC,
-            "subjects": [{"kind": USER_SCOPE, "id": subject}],
-            "metadata": {"region": "eu"},
+            "subjects": [{"type": USER_SUBJECT_TYPE, "id": subject}],
+            "metric": {"type": METRIC, "metadata": {"region": "eu"}},
         },
         "amount": amount,
         "idempotency_key": f"e2e-qe-{uuid.uuid4().hex}",
@@ -147,7 +155,13 @@ def subject_filter(subject: str) -> dict:
     """``GET /quotas`` ``$filter`` naming one user subject."""
     return {
         "$filter": (
-            f"tenant_id eq {TENANT_A} and projection_type eq '{USER_PROJECTION}' "
+            f"tenant_id eq {TENANT_A} and subject_type eq '{USER_SUBJECT_TYPE}' "
             f"and subject_id eq '{subject}'"
         )
     }
+
+
+@pytest.fixture
+def qr_url(base_url):
+    """Quota Resolver REST prefix."""
+    return f"{base_url}/quota-resolver/v1"

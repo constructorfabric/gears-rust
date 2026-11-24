@@ -160,7 +160,7 @@ Realises `cpt-cf-quota-enforcement-seq-debit`.
   counter mutation
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/debit` with a `DebitRequest` carrying `tenant_id`, `{type, id}` subjects, the metric object `metric: {type, id?, metadata}`, positive integer `amount`, and the client-supplied idempotency key; in the metric object, `type` is the **metric type** (the GTS type that the metric's owner registers, ADR-0013), `id` is optional and names the one thing the amount is counted for, and `metadata` holds the attributes of the operation that policies read; foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) and projection-contracts ingress validation (`cpt-cf-quota-enforcement-flow-ingress-validation`) have already run - `inst-deb-request`
+1. [ ] - `p1` - Caller sends `POST /quota-enforcement/v1/operations/debit` with a `DebitRequest` carrying `tenant_id`, `{type, id}` subjects, the metric object `metric: {type, id?, metadata}`, positive integer `amount`, and the client-supplied idempotency key; in the metric object, `type` is the **metric type** (the GTS type that the metric's owner registers, ADR-0013), `id` is optional and names the one thing the amount is counted for, and `metadata` holds the attributes of the operation that policies read; foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) and projection-contracts ingress validation (`cpt-cf-quota-enforcement-flow-ingress-validation`) have already run - `inst-deb-request`
 2. [x] - `p1` - **IF** `amount <= 0` - `inst-deb-amount-if`
    1. [x] - `p1` - **RETURN** `INVALID_AMOUNT` (`DomainError::InvalidAmount`, canonical `InvalidArgument`) before idempotency lookup, subject resolution, or any other pipeline step; no idempotency record, operation-log entry, or counter mutation occurs (`cpt-cf-quota-enforcement-fr-debit`) - `inst-deb-amount`
 3. [ ] - `p1` - Run the pipeline `cpt-cf-quota-enforcement-algo-evaluation-pipeline`; on `Allowed`, the storage plugin applies the Engine's Debit Plan atomically: for every entry, an allocation Quota increments its in-flight counter and a consumption Quota increases the current-period consumed amount by `entry.amount`, and writes the charge; Quotas not named in the plan are never mutated - `inst-deb-pipeline`
@@ -194,14 +194,14 @@ Realises `cpt-cf-quota-enforcement-seq-credit`.
 - Consumption Quota whose calendar window has elapsed: `PERIOD_CLOSED` (400)
 
 **Steps**:
-1. [x] - `p1` - Quota Manager sends `POST /v1/quota-enforcement/operations/credit` with a `CreditRequest` naming an explicit `quota_id`, a positive integer `amount`, and an idempotency key; credit invokes no subject resolution and no Engine (`cpt-cf-quota-enforcement-fr-credit`) - `inst-cre-request`
+1. [x] - `p1` - Quota Manager sends `POST /quota-enforcement/v1/operations/credit` with a `CreditRequest` naming an explicit `quota_id`, a positive integer `amount`, and an idempotency key; credit invokes no subject resolution and no Engine (`cpt-cf-quota-enforcement-fr-credit`) - `inst-cre-request`
 2. [x] - `p1` - **IF** `amount <= 0` - `inst-cre-amount-if`
    1. [x] - `p1` - **RETURN** `INVALID_AMOUNT` before idempotency lookup, the row-locked Quota read, or any other pipeline step; nothing is persisted - `inst-cre-amount`
-3. [x] - `p1` - DB: `lookup_idempotency` inside the transaction; on an exact replay **RETURN** the stored outcome verbatim per `cpt-cf-quota-enforcement-algo-idempotency-replay` - `inst-cre-idem`
-4. [x] - `p1` - DB: read the Quota row by `quota_id` and the caller's `AccessScope` in one predicate, under a row lock, so the four rejection arms and the mutation share atomic semantics - `inst-cre-lock`
+3. [x] - `p1` - DB: read the Quota row by `quota_id` and the caller's `AccessScope` in one predicate, under a row lock, so the four rejection arms and the mutation share atomic semantics; a row that is absent, outside the scope, or another tenant's is rejected here, before the replay lookup - `inst-cre-lock`
+4. [x] - `p1` - DB: under the key lock, which the lock order takes after the Quota row, `lookup_idempotency`; on an exact replay **RETURN** the stored outcome verbatim per `cpt-cf-quota-enforcement-algo-idempotency-replay`, before the guards that apply only to a fresh credit - `inst-cre-idem`
 5. [x] - `p1` - **IF** the row is absent or outside the scope, in scope but another tenant's, deactivated, or a consumption Quota whose calendar window has elapsed (`time >= period_end` at the moment the transaction is evaluated) - `inst-cre-guard-if`
    1. [x] - `p1` - **RETURN** the matching rejection before any mutation: `StorageError::QuotaNotFound` lifts to `NotFound { kind: "quota" }` (404), `StorageError::SubjectOutOfScope` lifts to `PdpDenied` (403), `StorageError::QuotaDeactivated` lifts to `QUOTA_DEACTIVATED` (400), and `StorageError::PeriodClosed` lifts to `PERIOD_CLOSED` (400); credit closure is calendar-keyed, so the rejection fires immediately at the boundary even while the settlement window is still draining cross-period lease commits - `inst-cre-guard`
-6. [ ] - `p1` - DB: `apply_credit(quota_id, amount, idem_key, events)` in the same transaction: an allocation Quota decrements its in-flight counter and a consumption Quota decreases the current-period consumed amount, both with a floor of zero; the idempotency record under `(tenant, credit, key)` and the operation-log entry are persisted, and the `quota-counter-adjusted` event carrying the credited amount, the target `quota_id`, and the authenticated service principal from `SecurityContext` is enqueued (I11); commit - `inst-cre-apply`
+6. [ ] - `p1` - DB: `apply_credit(quota_id, amount, idem_key, events)` in the same transaction: an allocation Quota decrements its in-flight counter and a consumption Quota decreases the current-period consumed amount, both with a floor of zero; the idempotency record under `(tenant, credit, key)` and the operation-log entry are persisted, and the `quota-counter-adjusted` event carrying the credited amount, the target `quota_id`, and the actor that admission returned is enqueued (I11); commit - `inst-cre-apply`
 7. [x] - `p1` - **RETURN** the outcome; the SDK path is `QuotaManagerApi::credit(req)` returning `Decision` - `inst-cre-return`
 
 ### Return
@@ -233,7 +233,7 @@ Realises `cpt-cf-quota-enforcement-seq-credit`.
 1. [ ] - `p1` - The resolver plugin calls return with the tenant, the charge's operation (debit or lease commit) and idempotency key, the id of the metric type, the amount, and the return's own idempotency key; the call is admitted in trusted mode (`cpt-cf-quota-enforcement-flow-authorized-admission`) and is not part of QE's REST API (`cpt-cf-quota-enforcement-fr-return`) - `inst-rtn-request`
 2. [ ] - `p1` - **IF** `amount <= 0` **RETURN** `INVALID_AMOUNT`; nothing is persisted - `inst-rtn-amount`
 3. [ ] - `p1` - DB: read the charge by `(tenant, operation, key)` to learn the Quotas of its entries, then take the locks in the lock rank of DESIGN (Rollback and Return): those Quota rows in ascending `quota_id` order (ADR-0002), the key lock of the charge and the key lock of the return key `(tenant, return, key)`, then the counter rows of the entries; read the charge again under the locks; a return with the same key that is running ends first, so its return record is then found; whether a period is settled is read under the counter lock in this transaction - `inst-rtn-lock`
-4. [ ] - `p1` - **IF** a return record under `(tenant, return key)` exists: with the same charge and amount **RETURN** the first result and change nothing; with another charge or amount **RETURN** `IDEMPOTENCY_PAYLOAD_MISMATCH`; the return record is deleted with its charge and is the return's only idempotency record - `inst-rtn-idem`
+4. [ ] - `p1` - **IF** a return record under `(tenant, return key)` exists: with another charge or amount **RETURN** `IDEMPOTENCY_PAYLOAD_MISMATCH`; with the same charge and amount and a metric type that is not the metric type of the charge **RETURN** `METRIC_TYPE_MISMATCH`, as a first call does; otherwise **RETURN** the first result and change nothing; the return record is deleted with its charge and is the return's only idempotency record - `inst-rtn-idem`
 5. [ ] - `p1` - **IF** the charge is absent or deleted (`cpt-cf-quota-enforcement-algo-retention-sweep`), the metric type of the return is not the metric type of the charge, the amount exceeds what remains of it, or no entry can take a part of the unwound amount by the rules of step 7 (the current value of a counter does not decide this) - `inst-rtn-reject-if`
    1. [ ] - `p1` - **RETURN** the matching error from the error scenarios; the return is all or nothing - `inst-rtn-reject`
 6. [ ] - `p1` - Unwind the amount over the charge's entries (`cpt-cf-quota-enforcement-algo-unwind`) - `inst-rtn-unwind`
@@ -261,7 +261,7 @@ Realises `cpt-cf-quota-enforcement-seq-rollback`.
 - Rollback targeting a credit: `UNKNOWN_OPERATION`; a credit writes no charge
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/rollback` with a `RollbackRequest` that names the charge by the tenant, the charge's operation (debit or lease commit), and the charge's idempotency key, and carries the attribution of the charged operation: the subjects and the metric with its type and optional id; it carries no amount and no idempotency key of its own - `inst-rlb-request`
+1. [ ] - `p1` - Caller sends `POST /quota-enforcement/v1/operations/rollback` with a `RollbackRequest` that names the charge by the tenant, the charge's operation (debit or lease commit), and the charge's idempotency key, and carries the attribution of the charged operation: the subjects and the metric with its type and optional id; it carries no amount and no idempotency key of its own - `inst-rlb-request`
 2. [ ] - `p1` - The attribution passes the same PDP admission as a debit's, for the action `rollback`, before any storage access, and the PDP returns an access scope; QE computes the attribution digest of the admitted attribution (the tenant, the subjects, and the metric with its type and optional id), the digest that every charge keeps of its own attribution (ADR-0011) - `inst-rlb-authz`
 3. [ ] - `p1` - DB: in the transaction, take the locks as in step 3 of `cpt-cf-quota-enforcement-flow-return`, without a return key, and apply the access scope to the charge; a lease-commit charge is named by the commit call's idempotency key exactly like a debit (`cpt-cf-quota-enforcement-fr-rollback`) - `inst-rlb-lookup`
 4. [ ] - `p1` - **IF** no charge exists, it is deleted, it is outside the caller's access, or its attribution digest differs from the digest of step 2 - `inst-rlb-unknown-if`
@@ -292,8 +292,8 @@ Realises `cpt-cf-quota-enforcement-seq-evaluate-preview`.
   corresponding write (fail-closed)
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/preview` with the same tenant, subjects, metric object, and amount as the corresponding write but no idempotency key; preview requires the same PDP authorization as the corresponding write (`cpt-cf-quota-enforcement-fr-evaluate-preview`) - `inst-prv-request`
-2. [x] - `p1` - Consume the admitted subject set (`cpt-cf-quota-enforcement-algo-subject-resolution`), then DB: `read_quota_snapshot` as a transactional snapshot read of current counter state with no read-modify hold and no contention against concurrent debits (I3) - `inst-prv-read`
+1. [ ] - `p1` - Caller sends `POST /quota-enforcement/v1/operations/preview` with the same tenant, subjects, metric object, and amount as the corresponding write but no idempotency key; preview requires the same PDP authorization as the corresponding write (`cpt-cf-quota-enforcement-fr-evaluate-preview`) - `inst-prv-request`
+2. [x] - `p1` - Consume the admitted subject set (`cpt-cf-quota-enforcement-algo-subject-resolution`), then DB: `read_quota_snapshot` as a transactional snapshot read of current counter state with no read-modify hold and no contention against concurrent debits (I3), keeping only the Quotas whose conditions hold on the request's metadata (I15) - `inst-prv-read`
 3. [x] - `p1` - DB: `read_policy(scope)`; invoke the Engine boundary (`cpt-cf-quota-enforcement-algo-engine-boundary`) unchanged: an invariant violation on the returned Decision surfaces the same canonical `Internal` error as the corresponding write (fail-closed) and increments `debit_plan_invariant_violations_total` per the engine boundary - `inst-prv-engine`
 4. [x] - `p1` - Persist nothing: no counter mutation, no held capacity, no idempotency record, no operation-log entry, and no outbox event, and no period row even across a boundary; only ephemeral telemetry counters move - `inst-prv-nopersist`
 5. [x] - `p1` - **RETURN** `DecisionPreview` carrying the full Decision shape plus `preview: true`, with `policy_id` and `policy_version` in diagnostics; the SDK path is `QuotaEnforcementApi::evaluate_preview(req)`; the verdict can be invalidated by concurrent debits, and callers that need held capacity use the lease flow instead (lease-operations feature) - `inst-prv-return`
@@ -312,10 +312,10 @@ counter mutation
 
 **Steps**:
 1. [x] - `p1` - Consume the complete admitted subject set from `cpt-cf-quota-enforcement-algo-subject-resolution`; `EvaluationOrchestrator` never re-admits it - `inst-pipe-resolve`
-2. [ ] - `p1` - Construct the typed `IdempotencyScope { tenant_id, operation_type, idem_key }`; the subjects are part of the request fingerprint, not of the scope; then DB: `lookup_idempotency(scope)`; **IF** a record exists, short-circuit to `cpt-cf-quota-enforcement-algo-idempotency-replay` without opening the evaluation transaction - `inst-pipe-idem`
-3. [x] - `p1` - DB: begin the single backend transaction and run the applicable-Quotas locked read (`read_quota_snapshot` with lock); `EvaluationContext` metadata is captured at this locked-read step per ADR-0003, and lazy period-row materialization runs here when a boundary was crossed (`cpt-cf-quota-enforcement-algo-period-rollover`) - `inst-pipe-lockread`
-4. [x] - `p1` - **IF** the operation targets a Quota whose metric is classified `Direct` - `inst-pipe-gated-if`
-   1. [ ] - `p1` - **RETURN** `METRIC_NOT_QUOTA_GATED` (canonical `FailedPrecondition`; the service decides it from the `enforcement` trait in the metric's `MetricCatalog` entry, the storage plugin does not decide the mode) with no counter mutation and no idempotency, operation-log, or lease record; this admission-time rejection applies to every entry point that takes or checks capacity (debit, reserve, batch debit, preview) and to no other: credit, rollback, return, commit, and release never make this check (PRD §3.2) - `inst-pipe-gated`
+2. [x] - `p1` - **IF** the operation targets a Quota whose metric is classified `Direct` - `inst-pipe-gated-if`
+   1. [ ] - `p1` - **RETURN** `METRIC_NOT_QUOTA_GATED` (canonical `FailedPrecondition`; the service decides it from the `enforcement` trait in the metric's `MetricCatalog` entry, the storage plugin does not decide the mode) with no counter mutation and no idempotency, operation-log, or lease record; this admission-time rejection applies to every entry point that takes or checks capacity (debit, reserve, batch debit, preview) and to no other: credit, rollback, return, commit, and release never make this check (PRD §3.2); this check and the catalogue check of admission run before the idempotency lookup, so a repeated request for a metric whose type was revised to `direct`, or became unavailable, after its charge gets this error or `FailedPrecondition` and not the stored result - `inst-pipe-gated`
+3. [ ] - `p1` - Construct the typed `IdempotencyScope { tenant_id, operation_type, idem_key }`; the admitted subject set is part of the request fingerprint, not of the scope, so neither the order of the subjects nor naming the tenant changes it; then DB: `lookup_idempotency(scope)`; **IF** a record exists, short-circuit to `cpt-cf-quota-enforcement-algo-idempotency-replay` without opening the evaluation transaction - `inst-pipe-idem`
+4. [x] - `p1` - DB: begin the single backend transaction and run the applicable-Quotas locked read (`read_quota_snapshot` with lock), keeping only the Quotas whose conditions hold on the request's metadata, judged on the locked rows (I15); `EvaluationContext` metadata is captured at this locked-read step per ADR-0003, and lazy period-row materialization runs here when a boundary was crossed (`cpt-cf-quota-enforcement-algo-period-rollover`) - `inst-pipe-lockread`
 5. [x] - `p1` - DB: `read_policy(scope = metric, else global)`, then invoke the Engine boundary (`cpt-cf-quota-enforcement-algo-engine-boundary`, resolution-policy-engine feature): Policy selection, the synchronous no-I/O `evaluate` call, the per-Policy timeout, `EngineError` lifting, and the closed Debit-Plan invariant set are all specified there and invoked here unchanged - `inst-pipe-engine`
 6. [x] - `p1` - **IF** the boundary surfaces a canonical error (timeout, cost cap, invariant violation, internal) - `inst-pipe-fail-if`
    1. [x] - `p1` - **RETURN** the canonical error and roll the transaction back; fail-closed, no counter mutation, no idempotency record - `inst-pipe-fail`
@@ -464,8 +464,8 @@ denial.
 `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/operations/debit`, `POST /v1/quota-enforcement/operations/credit`,
-  `POST /v1/quota-enforcement/operations/rollback`, `POST /v1/quota-enforcement/operations/preview`
+- API: `POST /quota-enforcement/v1/operations/debit`, `POST /quota-enforcement/v1/operations/credit`,
+  `POST /quota-enforcement/v1/operations/rollback`, `POST /quota-enforcement/v1/operations/preview`
 - DB: `cpt-cf-quota-enforcement-db-schema`
 - Entities: `DebitRequest`, `CreditRequest`, `RollbackRequest`, `PreviewRequest`, `Decision`, `DecisionPreview`
 
@@ -569,7 +569,8 @@ is not settled, read under the counter lock; rate never; a deactivated Quota as 
 It **MUST** fail and change nothing when the charge is unknown, the amount exceeds what remains, or no entry can take
 a part of the amount; the current value of a counter does not decide that, and an allocation entry always takes a
 return. Every applied return **MUST** write one return record with its key, charge, and amount, unique per `(tenant,
-return key)` and deleted with the charge: a repeated key with the same charge and amount gets the first result, with
+return key)` and deleted with the charge: a repeated key with the same charge and amount gets the first result
+(`METRIC_TYPE_MISMATCH` when its metric type is not the charge's), with
 another charge or amount a payload mismatch, also when the two returns run at the same time. A charge **MUST** take
 its return
 window, and the time it is kept after a return, from the configuration in force when each is written. Rollback
@@ -588,7 +589,7 @@ entry of it holds an amount on an active Quota.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: return through the resolver plugin; `POST /v1/quota-enforcement/operations/rollback`
+- API: return through the resolver plugin; `POST /quota-enforcement/v1/operations/rollback`
 - DB: `cpt-cf-quota-enforcement-db-schema` (charge ledger)
 - Entities: `Charge`, `OperationLog`
 

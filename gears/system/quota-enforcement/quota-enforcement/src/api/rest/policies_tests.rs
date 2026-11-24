@@ -309,15 +309,6 @@ async fn delete_is_idempotent_protects_global_and_404s_only_for_a_never_created_
     let (status, body) = send(&app, Method::DELETE, "/policies/never-created", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
-    created(
-        &app,
-        json!({
-            "scope": { "kind": "global" },
-            "engine_id": "most-restrictive-wins",
-            "engine_config": {}
-        }),
-    )
-    .await;
     let (status, body) = send(&app, Method::DELETE, "/policies/global", None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(

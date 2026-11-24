@@ -19,6 +19,15 @@ surface in `api-gateway`.
   in process by default, or a REST client when `clients.provides.<contract>` says
   so. It also hosts their internal REST routes under `/quota-enforcement/v1`,
   served from its own domain service beside the public API.
+- **Quota Resolver backend.** The gear publishes a plugin instance of the
+  Quota Resolver (`gts.cf.toolkit.plugins.plugin.v1~cf.core.quota_resolver.plugin.v1~`)
+  at `init`, so the resolver's gateway, which runs in the same process, finds QE
+  by vendor and priority. The plugin type, the quota subject base types and the
+  metric base type are published by the resolver gear, so a host that links QE
+  links `quota-resolver` too; the two have no start order. Metric types, derived
+  from `gts.cf.core.quota.metric.v1~`, and quota subject types, derived from
+  `gts.cf.core.quota.subj.v1~`, are registered in the types registry by the
+  modules that own them; QE reads them there.
 - **Cluster coordination.** The sweeper singletons run under the platform
   `cluster` gear's leader election (ADR-0006). The gear depends on
   `cluster-sdk` only, defines the typed profile `quota-enforcement`, and
@@ -51,6 +60,14 @@ gears:
       pdp_deadline_ms: 250                  # budget for one PDP evaluation; overrun is 503
       metrics:
         prefix: ""                          # empty: catalogue names verbatim
+      catalog:
+        read_timeout_ms: 2000               # one types-registry read of a metric or subject type
+        read_interval_secs: 60              # scheduled re-read; a revised metric type reaches every replica within it
+        unknown_ttl_secs: 10                # how long "the registry does not know this type" is remembered
+        unknown_capacity: 10000             # how many such answers are remembered
+      resolver_plugin:
+        vendor: "constructorfabric"         # vendor of the plugin instance QE publishes for the Quota Resolver
+        priority: 100                       # lower wins when the resolver finds several of that vendor
       quotas:
         bulk_max_items: 50                  # most items one bulk create, update, or deactivate
                                             # may carry; 1..=500, and more than 500 is always refused

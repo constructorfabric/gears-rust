@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, EvaluatedDebit, EvaluatedMutation, IdempotencyRecord,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, NotificationEvent, OperationType,
-    PartialIdempotencyWrite, QuotaId, QuotaSnapshot, RollbackTarget, StorageError, TenantId,
-    TransitionOutcome,
+    IdempotencyScope, NotificationEvent, OperationType, PartialIdempotencyWrite, QuotaId,
+    QuotaSnapshot, RollbackTarget, StorageError, TenantId, TransitionOutcome,
 };
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{ConsumptionStore, StoragePlugin};
@@ -54,7 +53,6 @@ async fn plugin_over(store: Arc<RecordingConsumptionStore>) -> StoragePlugin {
 fn idempotency_scope() -> IdempotencyScope {
     IdempotencyScope {
         tenant_id: TenantId::new(Uuid::from_u128(1)),
-        subject_key: IdempotencySubjectKey::from_bytes([2; 32]),
         operation_type: OperationType::Debit,
         key: "request-1".to_owned(),
     }
@@ -64,7 +62,7 @@ fn idempotency_scope() -> IdempotencyScope {
 impl ConsumptionStore for RecordingConsumptionStore {
     async fn apply_debit_plan(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _mutation: &EvaluatedMutation<'_>,
         _events: &[NotificationEvent],
@@ -74,7 +72,7 @@ impl ConsumptionStore for RecordingConsumptionStore {
 
     async fn apply_batch_debit(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
         _events: &[NotificationEvent],
@@ -84,7 +82,7 @@ impl ConsumptionStore for RecordingConsumptionStore {
 
     async fn apply_credit(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _quota_id: QuotaId,
         _amount: u64,
@@ -94,12 +92,21 @@ impl ConsumptionStore for RecordingConsumptionStore {
         Err(StorageError::Internal("not part of this test".into()))
     }
 
+    async fn apply_return(
+        &self,
+        _actor: &quota_enforcement_sdk::Actor,
+        _scope: &AccessScope,
+        _ret: &quota_enforcement_sdk::ChargeReturn,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        Err(StorageError::Internal("not part of this test".into()))
+    }
+
     async fn apply_rollback(
         &self,
-        _ctx: &SecurityContext,
+        _actor: &quota_enforcement_sdk::Actor,
         _scope: &AccessScope,
         _target: &RollbackTarget,
-        _idempotency: &IdempotencyWrite,
         _events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         Err(StorageError::Internal("not part of this test".into()))
@@ -107,7 +114,6 @@ impl ConsumptionStore for RecordingConsumptionStore {
 
     async fn read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         _applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
@@ -116,10 +122,10 @@ impl ConsumptionStore for RecordingConsumptionStore {
 
     async fn bulk_read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         _pairs: &[ApplicableQuotas],
         _page: quota_enforcement_sdk::PageRequest,
+        _in_window_only: bool,
     ) -> Result<quota_enforcement_sdk::PageResult<QuotaSnapshot>, StorageError> {
         Err(StorageError::Internal("not part of this test".into()))
     }
@@ -157,6 +163,21 @@ impl ConsumptionStore for RecordingConsumptionStore {
             .expect("recording lock")
             .push(ReadCall::ReclaimOperationLog { batch_size, before });
         Ok(5)
+    }
+
+    async fn reclaim_expired_charges(
+        &self,
+        _batch_size: u32,
+        _now: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        Err(StorageError::Internal("not part of this test".into()))
+    }
+
+    async fn read_held_allocation_charge_stats(
+        &self,
+        _before: OffsetDateTime,
+    ) -> Result<Vec<quota_enforcement_sdk::HeldAllocationCharges>, StorageError> {
+        Err(StorageError::Internal("not part of this test".into()))
     }
 }
 

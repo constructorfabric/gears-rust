@@ -9,11 +9,11 @@
 //! - Input shapes reject unknown fields.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::str::FromStr;
 
-use gts::{GtsId, GtsIdError, GtsInstanceId, GtsTypeId};
+use gts::{GtsIdError, GtsTypeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
@@ -21,8 +21,6 @@ use time::serde::rfc3339;
 use toolkit_gts::gts_id;
 use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
-
-use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
 
 // ---------------------------------------------------------------------------
 // Identifiers
@@ -143,34 +141,32 @@ impl fmt::Display for PolicyId {
     }
 }
 
-/// Registered metric identity: a `types-registry` instance id.
-///
-/// QE mints no metric names. The value is validated against the registry at
-/// Quota create and update time, never on the evaluation path.
+/// A metric type id: a GTS type derived from `gts.cf.core.quota.metric.v1~`,
+/// registered by the module that owns the metric (ADR-0013).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
 #[schema(value_type = String)]
-pub struct MetricId(GtsInstanceId);
+pub struct MetricId(GtsTypeId);
 
 impl MetricId {
-    /// Wrap an already validated instance id.
+    /// Wrap an already validated type id.
     #[must_use]
-    pub const fn new(id: GtsInstanceId) -> Self {
+    pub const fn new(id: GtsTypeId) -> Self {
         Self(id)
     }
 
-    /// Parse a full GTS instance id.
+    /// Parse a full GTS type id.
     ///
     /// # Errors
     ///
-    /// Returns the GTS parse error when `raw` is not a well-formed instance id.
+    /// Returns the GTS parse error when `raw` is not a well-formed type id.
     pub fn parse(raw: &str) -> Result<Self, GtsIdError> {
-        GtsInstanceId::try_new(raw).map(Self)
+        GtsTypeId::try_new(raw).map(Self)
     }
 
-    /// The underlying instance id.
+    /// The underlying type id.
     #[must_use]
-    pub const fn as_gts(&self) -> &GtsInstanceId {
+    pub const fn as_gts(&self) -> &GtsTypeId {
         &self.0
     }
 
@@ -273,18 +269,13 @@ macro_rules! digest_newtype {
 }
 
 digest_newtype!(
-    /// Fixed-width fingerprint of the canonical applicable-subject set:
-    /// sort and deduplicate `(projection_type, subject_id)` pairs, encode them
-    /// canonically, hash with SHA-256 (PRD section 5.8).
-    IdempotencySubjectKey
-);
-digest_newtype!(
     /// SHA-256 of the canonical sorted-JSON request payload.
     PayloadHash
 );
 digest_newtype!(
-    /// SHA-256 of the authorized metric, mapped subjects, and resource. A
-    /// rollback uses it to prove authorization for the original mutation.
+    /// SHA-256 of the attribution admission accepted for a charged operation:
+    /// the tenant, the subjects, and the metric with its type and optional id
+    /// (ADR-0011). A charge keeps it in place of any subject identifier.
     AttributionDigest
 );
 
@@ -336,41 +327,44 @@ impl PayloadHash {
 }
 
 impl AttributionDigest {
-    /// Digest of the authorized attribution document, canonically.
-    ///
-    /// # Errors
-    ///
-    /// Returns the serialization error when `properties` cannot become JSON.
-    pub fn of_canonical<T: Serialize>(properties: &T) -> Result<Self, serde_json::Error> {
-        hash_canonical(properties).map(Self::from_bytes)
-    }
-}
-
-impl IdempotencySubjectKey {
-    /// Fingerprints sorted, deduplicated `(projection_type, subject_id)` pairs.
-    ///
-    /// Length prefixes prevent boundary collisions. Input order and duplicates
-    /// do not affect the result.
+    /// The digest in its fixed form: the tenant id; the subjects other than
+    /// the tenant subject, which the tenant id already covers, ordered by
+    /// subject type id; the metric type id; the metric id or its absence. The
+    /// metric `metadata` is not part of it, so a rollback that names the same
+    /// attribution always gets the same digest.
     #[must_use]
-    pub fn of(subjects: &[SubjectRef]) -> Self {
-        let pairs: BTreeSet<(&str, &str)> = subjects
+    pub fn of(
+        tenant_id: TenantId,
+        subjects: &[SubjectRef],
+        metric: &MetricId,
+        metric_id: Option<&str>,
+    ) -> Self {
+        // Length prefixes keep field boundaries unambiguous.
+        fn field(hasher: &mut Sha256, value: &str) {
+            let len = u32::try_from(value.len()).unwrap_or(u32::MAX);
+            hasher.update(len.to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        let mut named: Vec<(&str, &str)> = subjects
             .iter()
-            .map(|subject| {
-                (
-                    subject.projection_type.as_ref(),
-                    subject.subject_id.as_str(),
-                )
-            })
+            .filter(|subject| !subject.is_tenant())
+            .map(|subject| (subject.subject_type.as_ref(), subject.subject_id.as_str()))
             .collect();
+        named.sort_unstable();
         let mut hasher = Sha256::new();
-        for (projection_type, subject_id) in pairs {
-            for field in [projection_type, subject_id] {
-                // Catalogue limits keep lengths within `u32`; saturation remains
-                // deterministic for defensive callers.
-                let len = u32::try_from(field.len()).unwrap_or(u32::MAX);
-                hasher.update(len.to_be_bytes());
-                hasher.update(field.as_bytes());
+        hasher.update(tenant_id.as_uuid().as_bytes());
+        hasher.update(u32::try_from(named.len()).unwrap_or(u32::MAX).to_be_bytes());
+        for (subject_type, subject_id) in named {
+            field(&mut hasher, subject_type);
+            field(&mut hasher, subject_id);
+        }
+        field(&mut hasher, metric.as_str());
+        match metric_id {
+            Some(id) => {
+                hasher.update([1]);
+                field(&mut hasher, id);
             }
+            None => hasher.update([0]),
         }
         Self::from_bytes(finish(hasher))
     }
@@ -570,8 +564,9 @@ pub enum OperationType {
     Debit,
     /// Compensating credit against one named Quota.
     Credit,
-    /// Reversal of a prior debit by its original key.
-    Rollback,
+    /// Return of part of a charge (ADR-0011). Its key names the return
+    /// record.
+    Return,
     /// Lease acquisition.
     Reserve,
     /// Lease commit.
@@ -593,7 +588,7 @@ impl OperationType {
     pub const ALL: [Self; 10] = [
         Self::Debit,
         Self::Credit,
-        Self::Rollback,
+        Self::Return,
         Self::Reserve,
         Self::Commit,
         Self::Release,
@@ -609,7 +604,7 @@ impl OperationType {
         match self {
             Self::Debit => "debit",
             Self::Credit => "credit",
-            Self::Rollback => "rollback",
+            Self::Return => "return",
             Self::Reserve => "reserve",
             Self::Commit => "commit",
             Self::Release => "release",
@@ -621,13 +616,12 @@ impl OperationType {
     }
 }
 
-/// Which kind of operation a rollback reverses.
+/// Which kind of operation wrote the charge a rollback or a return names.
 ///
 /// [`OperationType::Debit`] and [`OperationType::Commit`] are separate
-/// idempotency namespaces, so one caller may legitimately hold a debit and a
-/// lease commit under the same key, subjects and tenant. The rollback names
-/// which of the two it means; there is no fallback lookup that could reverse
-/// the wrong one.
+/// idempotency namespaces, so one tenant may hold a debit and a lease commit
+/// under the same key. The request names which of the two it means; there is
+/// no fallback lookup that could reach the wrong one.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, utoipa::ToSchema,
 )]
@@ -669,7 +663,8 @@ pub enum NotificationEventKind {
     QuotaChanged,
     /// A credit was applied outside the debit and rollback flow.
     QuotaCounterAdjusted,
-    /// A committed debit was reversed.
+    /// A charge, in full or in part, was given back by a return or a
+    /// rollback.
     QuotaRollbackApplied,
     /// A Policy was created, updated, rolled back, or deleted.
     PolicyChanged,
@@ -693,8 +688,8 @@ impl NotificationEventKind {
     }
 }
 
-/// Registry-reported kind of a metric (PRD section 3.2). Closed; the gear
-/// reads it from the metric instance and never defaults it.
+/// The `kind` trait of a metric type. Closed; the gear reads it from the
+/// metric type's traits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricKind {
@@ -705,194 +700,73 @@ pub enum MetricKind {
 }
 
 // ---------------------------------------------------------------------------
-// Subjects and contracts
+// Subjects and metrics
 // ---------------------------------------------------------------------------
 
-/// Storage-facing subject identity after catalogue mapping.
-///
-/// The projection type never arrives on the wire. The gear maps the caller's
-/// `(metric, kind)` through its validated catalogue after PDP authorization.
+/// A quota subject as a Quota stores it (ADR-0008): a quota subject type and
+/// an opaque id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[schema(as = QuotaSubjectRef)]
 pub struct SubjectRef {
-    /// Concrete owner projection derived from `gts.cf.core.qe.subj.v1~`.
+    /// A type derived from `gts.cf.core.quota.subj.v1~`.
+    #[serde(rename = "type")]
     #[schema(value_type = String)]
-    pub projection_type: GtsTypeId,
+    pub subject_type: GtsTypeId,
     /// Opaque, non-empty subject identifier.
+    #[serde(rename = "id")]
     pub subject_id: String,
 }
 
-/// The constraint contract a Quota's metadata was validated against.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ContractRef {
-    /// Concrete contract type derived from `gts.cf.core.qe.constraint.v1~`.
-    #[schema(value_type = String)]
-    pub type_id: GtsTypeId,
-    /// Accepted contract version.
-    pub version: u32,
-}
-
-impl ContractRef {
-    /// The reference to `type_id` at the version its last segment declares.
-    ///
-    /// Returns `None` when the id does not parse or its last segment carries
-    /// no major version, which a registry-validated type id never does.
+impl SubjectRef {
+    /// The tenant subject of `tenant_id`.
     #[must_use]
-    pub fn for_type(type_id: &GtsTypeId) -> Option<Self> {
-        let version = GtsId::try_new(type_id.as_ref())
-            .ok()?
-            .segments()
-            .last()?
-            .ver_major_opt()?;
-        Some(Self {
-            type_id: type_id.clone(),
-            version,
-        })
-    }
-}
-
-/// A validated instance of the `gts.cf.core.qe.scope.v1~` discriminator.
-/// Deserialization preserves the same invariant as [`Self::parse`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, utoipa::ToSchema)]
-#[serde(try_from = "String")]
-#[schema(value_type = String)]
-pub struct SubjectScope(GtsInstanceId);
-
-impl SubjectScope {
-    /// Parse a scope instance id.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScopeError`] when `raw` is not a well-formed GTS instance id
-    /// or its declaring type is not the scope-discriminator type.
-    pub fn parse(raw: &str) -> Result<Self, ScopeError> {
-        let parsed = GtsId::try_new(raw).map_err(|e| ScopeError::Invalid {
-            id: raw.to_owned(),
-            detail: e.to_string(),
-        })?;
-        if parsed.is_type() || parsed.get_type_id().as_deref() != Some(SCOPE_TYPE) {
-            return Err(ScopeError::NotAScope { id: raw.to_owned() });
+    pub fn tenant(tenant_id: TenantId) -> Self {
+        Self {
+            subject_type: GtsTypeId::new(quota_resolver_sdk::QUOTA_TENANT_SUBJECT_TYPE_ID),
+            subject_id: tenant_id.to_string(),
         }
-        GtsInstanceId::try_new(raw)
-            .map(Self)
-            .map_err(|e| ScopeError::Invalid {
-                id: raw.to_owned(),
-                detail: e.to_string(),
-            })
     }
 
-    /// The `user` scope.
-    #[must_use]
-    pub fn user() -> Self {
-        Self(GtsInstanceId::new(SCOPE_TYPE, user_segment()))
-    }
-
-    /// The `tenant` scope, materialized from every request's `tenant_id`.
-    #[must_use]
-    pub fn tenant() -> Self {
-        Self(GtsInstanceId::new(SCOPE_TYPE, tenant_segment()))
-    }
-
-    /// True for the `tenant` scope.
+    /// True for a subject of the tenant subject type.
     #[must_use]
     pub fn is_tenant(&self) -> bool {
-        self.0 == SCOPE_TENANT
-    }
-
-    /// The underlying instance id.
-    #[must_use]
-    pub const fn as_gts(&self) -> &GtsInstanceId {
-        &self.0
-    }
-
-    /// The id as text.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        self.0.as_ref()
+        self.subject_type == quota_resolver_sdk::QUOTA_TENANT_SUBJECT_TYPE_ID
     }
 }
 
-/// The instance segment of a well-known scope id: the text after the type id.
-fn user_segment() -> &'static str {
-    &SCOPE_USER[SCOPE_TYPE.len()..]
-}
-
-/// The instance segment of the tenant scope id, after the scope type.
-fn tenant_segment() -> &'static str {
-    &SCOPE_TENANT[SCOPE_TYPE.len()..]
-}
-
-impl TryFrom<String> for SubjectScope {
-    type Error = ScopeError;
-
-    fn try_from(raw: String) -> Result<Self, Self::Error> {
-        Self::parse(&raw)
-    }
-}
-
-impl Serialize for SubjectScope {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(self.as_str())
-    }
-}
-
-impl fmt::Display for SubjectScope {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// A value that is not a scope instance.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ScopeError {
-    /// Not a well-formed GTS instance id.
-    #[error("{id} is not a GTS instance id: {detail}")]
-    Invalid {
-        /// The rejected text.
-        id: String,
-        /// The parser's diagnostic.
-        detail: String,
-    },
-    /// A well-formed id whose declaring type is not `gts.cf.core.qe.scope.v1~`.
-    #[error("{id} is not an instance of the QE scope type")]
-    NotAScope {
-        /// The rejected id.
-        id: String,
-    },
-}
-
-/// One caller-supplied subject: a scope `kind` and an opaque `id`.
-///
-/// `kind` travels as text so a malformed value becomes a canonical
-/// `InvalidArgument` at ingress rather than a deserialization failure. The
-/// gear maps `(metric, kind)` to the owner projection; callers never name a
-/// projection.
+/// One subject a request names, as text, so a malformed value is a canonical
+/// `InvalidArgument` rather than a deserialization failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectClaim {
-    /// A well-known instance of the scope-discriminator type, as text.
-    pub kind: String,
+    /// A quota subject type id.
+    #[serde(rename = "type")]
+    pub subject_type: String,
     /// Opaque, non-empty subject identifier.
     pub id: String,
 }
 
-/// An optional `{type, id?, metadata}` resource projection.
+/// The metric object of a request (ADR-0013): the metric type, an optional id
+/// of the one thing the amount is counted for, and the metadata policies read.
 ///
 /// Optional fields distinguish omission from `null`; explicit `null` is
-/// rejected and omitted values are not serialized.
+/// rejected and omitted values are not serialized. `metadata` is required on
+/// the wire and never defaulted; it is an [`Option`] only so the service can
+/// tell its omission apart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ResourceProjection {
-    /// The concrete resource projection type, as text.
+pub struct MetricRef {
+    /// The metric type id, as text.
     #[serde(rename = "type")]
-    pub r#type: String,
-    /// Optional resource identity.
+    pub metric_type: String,
+    /// Non-empty when present. Not part of the counter key.
     #[serde(
         default,
         deserialize_with = "present_or_error",
         skip_serializing_if = "Option::is_none"
     )]
     pub id: Option<String>,
-    /// Schematized resource properties. Required by the resource base.
+    /// Attributes of the operation, refined by the metric type's schema.
     #[serde(
         default,
         deserialize_with = "present_or_error",
@@ -902,35 +776,16 @@ pub struct ResourceProjection {
 }
 
 /// Caller-supplied attribution for an evaluation request. It remains untrusted
-/// until the PDP authorizes the complete tuple.
-///
-/// `metadata` is represented as [`Option`] only to distinguish omission; the
-/// service requires it on the wire and rejects `null`.
+/// until admission authorizes the complete tuple.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluationAttribution {
-    /// Target tenant. The tenant-scope subject is materialized from it.
+    /// Target tenant. QE adds its tenant subject to every request.
     pub tenant_id: TenantId,
-    /// The metric, as text: a registered instance of the platform metric base.
-    pub metric: String,
-    /// Additional subjects. The tenant scope must not be repeated here.
-    #[serde(default)]
+    /// At least one subject, no two of one type.
     pub subjects: Vec<SubjectClaim>,
-    /// The operation-level metadata object, validated against the metric's
-    /// request contract.
-    #[serde(
-        default,
-        deserialize_with = "present_or_error",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub metadata: Option<Map<String, Value>>,
-    /// Optional resource projection.
-    #[serde(
-        default,
-        deserialize_with = "present_or_error",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub resource: Option<ResourceProjection>,
+    /// The metric object.
+    pub metric: MetricRef,
 }
 
 /// Deserializes a present field as `Some`, so that `null` is an error rather
@@ -943,22 +798,11 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
-/// The `(metric, projection_type)` pair an active Quota binds. Storage reports
-/// the distinct set at bootstrap so the configured catalogue can be checked
-/// against it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ProjectionBinding {
-    /// The Quota's metric.
-    pub metric: MetricId,
-    /// The subject projection the Quota is bound to.
-    pub projection_type: GtsTypeId,
-}
-
 /// Active-Quota counts behind the lifecycle gauges (PRD section 5.16):
 /// `quota_cap_zero_total`, `quota_cap_unbounded_total`, and, joined with the
-/// current metric classification by the gear, `quota_for_direct_metric_total`.
-/// Platform-plane and caller-less, like [`ProjectionBinding`]; only Quotas with
-/// lifecycle status `active` count, whatever their validity window.
+/// metric catalogue by the gear, `quota_for_direct_metric_total`.
+/// Platform-plane and caller-less; only Quotas with lifecycle status `active`
+/// count, whatever their validity window.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ActiveQuotaCounts {
     /// Active Quotas with `cap = 0`.
@@ -967,6 +811,29 @@ pub struct ActiveQuotaCounts {
     pub cap_unbounded: u64,
     /// Active Quotas per metric.
     pub by_metric: HashMap<MetricId, u64>,
+    /// The distinct non-empty `metadata` of the active Quotas of each metric,
+    /// at most [`ActiveQuotaCounts::MAX_CONDITION_SETS`] of them: the gear
+    /// checks them against the current metric type.
+    #[serde(default)]
+    pub conditions: Vec<ActiveConditions>,
+}
+
+impl ActiveQuotaCounts {
+    /// The most condition sets one read returns. Conditions name attributes of
+    /// a request, so the distinct sets of a metric are few; a deployment past
+    /// this bound has the rest checked only when a Quota is written.
+    pub const MAX_CONDITION_SETS: u64 = 1_000;
+}
+
+/// One distinct `metadata` of the active Quotas of a metric.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveConditions {
+    /// The metric.
+    pub metric: MetricId,
+    /// The conditions.
+    pub metadata: Map<String, Value>,
+    /// Active Quotas that carry them.
+    pub quotas: u64,
 }
 
 /// Optional validity bounds of a Quota. Both ends are inclusive.
@@ -1006,7 +873,7 @@ pub struct Quota {
     pub tenant_id: TenantId,
     /// Subject the Quota is bound to. Immutable after creation.
     pub subject: SubjectRef,
-    /// Registered metric. Immutable after creation.
+    /// Metric type. Immutable after creation.
     pub metric: MetricId,
     /// Accounting model. Immutable after creation.
     pub quota_type: QuotaType,
@@ -1023,15 +890,14 @@ pub struct Quota {
     pub validity_window: Option<ValidityWindow>,
     /// Informational hint for callers: prefer fail-open when QE is unavailable.
     pub fail_open_hint: bool,
-    /// Operator-authored, contract-validated attributes. Opaque to QE core.
+    /// The Quota's conditions over the `metadata` of a request's metric object:
+    /// the Quota applies to a request only when all of them hold. QE checks
+    /// them against the metric type when the Quota is written.
     pub metadata: Map<String, Value>,
     /// Who imposed the Quota.
     pub source: QuotaSource,
     /// Lifecycle state.
     pub status: QuotaStatus,
-    /// Contract the metadata was validated against: snapshotted at creation and
-    /// moved with every accepted metadata update.
-    pub constraint_contract: ContractRef,
     /// Record version. Increments once per accepted mutation.
     pub record_version: u32,
     /// Creation time.
@@ -1055,9 +921,8 @@ pub struct QuotaView {
     pub quota: Quota,
     /// Whether the response clock lies within `validity_window`.
     pub currently_within_window: bool,
-    /// Registry-reported kind of the metric at read time. `None` only when
-    /// the registry no longer knows the metric; the record stays readable and
-    /// the removal is logged.
+    /// Kind of the metric from its served catalogue entry at read time. `None`
+    /// when the metric has no served entry; the record stays readable.
     #[serde(default)]
     pub metric_kind: Option<MetricKind>,
 }
@@ -1075,16 +940,15 @@ impl QuotaView {
     }
 }
 
-/// Public Quota create input. The service resolves and snapshots the constraint
-/// contract before constructing a [`QuotaDraft`].
+/// Public Quota create input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuotaSpec {
     /// PDP-authorized target tenant.
     pub tenant_id: TenantId,
-    /// Subject the Quota binds to: `(projection_type, subject_id)`.
+    /// Subject the Quota binds to.
     pub subject: SubjectRef,
-    /// Registered metric.
+    /// Metric type.
     pub metric: MetricId,
     /// Accounting model. `rate` is reserved and rejected.
     pub quota_type: QuotaType,
@@ -1108,7 +972,9 @@ pub struct QuotaSpec {
     /// Informational fail-open hint. Defaults to fail-closed.
     #[serde(default)]
     pub fail_open_hint: bool,
-    /// Metadata validated against the metric owner's constraint contract.
+    /// The Quota's conditions over the `metadata` of a request's metric object:
+    /// the Quota applies to a request only when all of them hold. QE checks
+    /// them against the metric type when the Quota is written.
     #[serde(default)]
     pub metadata: Map<String, Value>,
     /// Who imposes the Quota.
@@ -1121,9 +987,9 @@ pub struct QuotaSpec {
 pub struct QuotaDraft {
     /// PDP-authorized target tenant.
     pub tenant_id: TenantId,
-    /// Catalogue-mapped subject.
+    /// Admitted subject.
     pub subject: SubjectRef,
-    /// Registered metric.
+    /// Metric type.
     pub metric: MetricId,
     /// Accounting model.
     pub quota_type: QuotaType,
@@ -1145,21 +1011,17 @@ pub struct QuotaDraft {
     /// Informational fail-open hint. Defaults to fail-closed.
     #[serde(default)]
     pub fail_open_hint: bool,
-    /// Contract-validated metadata.
+    /// The conditions, checked against the metric type.
     #[serde(default)]
     pub metadata: Map<String, Value>,
     /// Who imposes the Quota.
     pub source: QuotaSource,
-    /// Contract the metadata was validated against. Set by the gear from the
-    /// catalogue, never caller-supplied: the public create shape is
-    /// [`QuotaSpec`], which has no such field.
-    pub constraint_contract: ContractRef,
 }
 
 impl QuotaDraft {
-    /// The storage draft of a validated `spec` with the resolved contract.
+    /// The storage draft of a validated `spec`.
     #[must_use]
-    pub fn from_spec(spec: QuotaSpec, constraint_contract: ContractRef) -> Self {
+    pub fn from_spec(spec: QuotaSpec) -> Self {
         Self {
             tenant_id: spec.tenant_id,
             subject: spec.subject,
@@ -1173,7 +1035,6 @@ impl QuotaDraft {
             fail_open_hint: spec.fail_open_hint,
             metadata: spec.metadata,
             source: spec.source,
-            constraint_contract,
         }
     }
 }
@@ -1200,8 +1061,7 @@ pub enum ValidityWindowPatch {
 
 /// A caller's partial update of a Quota, the client and REST shape. Absent
 /// fields stay untouched. Metric, type, period, and subject are immutable and
-/// therefore absent here, as is the constraint contract, which the gear alone
-/// resolves.
+/// therefore absent here.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct QuotaUpdate {
@@ -1232,11 +1092,6 @@ pub struct QuotaPatch {
     pub validity_window: Option<ValidityWindowPatch>,
     /// New metadata object, replacing the previous one.
     pub metadata: Option<Map<String, Value>>,
-    /// The contract the new `metadata` was validated against, stored with it in
-    /// the same write so the reference never lags the object. Set by the gear
-    /// whenever `metadata` is present. Storage rejects a `metadata` patch
-    /// without it as `Internal`.
-    pub constraint_contract: Option<ContractRef>,
     /// New enforcement mode.
     pub enforcement_mode: Option<EnforcementMode>,
     /// New fail-open hint.
@@ -1381,26 +1236,80 @@ impl<T> Default for PageResult<T> {
 // Evaluation
 // ---------------------------------------------------------------------------
 
-/// The PDP-authorized, catalogue-mapped subject set of one operation.
+/// The admitted subject set of one operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicableQuotas {
     /// Authorized target tenant.
     pub tenant_id: TenantId,
-    /// Every applicable subject, tenant scope included.
+    /// Every applicable subject, the tenant subject included.
     pub subjects: Vec<SubjectRef>,
     /// The operation's metric.
     pub metric: MetricId,
 }
 
-/// Per-Quota mutation directive inside a [`Decision`].
+/// Whether every condition of a Quota's `metadata` holds on `request`, the
+/// `metadata` of the request's metric object (ADR-0013): the request has the
+/// property, and its value equals the condition's value or one of its values.
+/// The empty object has no conditions.
+#[must_use]
+pub fn conditions_hold(conditions: &Map<String, Value>, request: &Value) -> bool {
+    conditions.iter().all(|(property, admitted)| {
+        request.get(property).is_some_and(|value| match admitted {
+            Value::Array(values) => values.contains(value),
+            admitted => admitted == value,
+        })
+    })
+}
+
+/// One condition of Quota metadata that does not fit the metric type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaMetadataViolation {
+    /// JSON pointer into the metadata; empty for the metadata as a whole.
+    pub path: String,
+    /// What is wrong there.
+    pub reason: String,
+}
+
+/// One entry of a [`DebitChain`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QuotaDebitPlan {
-    /// Total counter mutation for the Quota. Never negative.
+    /// The charged Quota.
+    pub quota_id: QuotaId,
+    /// Counter mutation for the Quota. Never negative.
     pub amount: u64,
 }
 
-/// Which Quotas to mutate and by how much.
-pub type DebitPlan = BTreeMap<QuotaId, QuotaDebitPlan>;
+/// Entries of one chain, primary pool first. Their amounts add up to exactly
+/// the requested amount: a cascade or a split.
+pub type DebitChain = Vec<QuotaDebitPlan>;
+
+/// Chains of a [`Decision`]. Several chains are an AND: each counts the whole
+/// operation. A Quota appears at most once in a plan.
+pub type DebitPlan = Vec<DebitChain>;
+
+/// Rebuild a plan from entries tagged with their `(chain, position)`; chains
+/// and entries keep the order of those indices.
+#[must_use]
+pub fn plan_of(entries: impl IntoIterator<Item = ((u32, u32), QuotaDebitPlan)>) -> DebitPlan {
+    let mut chains: BTreeMap<u32, BTreeMap<u32, QuotaDebitPlan>> = BTreeMap::new();
+    for ((chain, position), entry) in entries {
+        chains.entry(chain).or_default().insert(position, entry);
+    }
+    chains
+        .into_values()
+        .map(|chain| chain.into_values().collect())
+        .collect()
+}
+
+/// Every entry of `plan` with its `(chain, position)`, in plan order.
+pub fn plan_entries(plan: &DebitPlan) -> impl Iterator<Item = ((u32, u32), &QuotaDebitPlan)> {
+    plan.iter().zip(0_u32..).flat_map(|(chain, chain_index)| {
+        chain
+            .iter()
+            .zip(0_u32..)
+            .map(move |(entry, position)| ((chain_index, position), entry))
+    })
+}
 
 /// Two-arm verdict of an evaluation (PRD section 3.4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1422,8 +1331,11 @@ pub enum DecisionResult {
 pub struct Decision {
     /// The verdict.
     pub result: DecisionResult,
-    /// Mutation plan. Empty when the result is `Denied`.
+    /// Mutation plan, one list per chain. Empty when the result is `Denied`.
+    // Spelled out: utoipa names a schema after the alias's outer type, and a
+    // component named `Vec` collides with any other gear's.
     #[serde(default)]
+    #[schema(value_type = Vec<Vec<QuotaDebitPlan>>)]
     pub debit_plan: DebitPlan,
     /// Engine-supplied per-Quota detail.
     #[serde(default)]
@@ -1506,24 +1418,21 @@ pub struct CreditRequest {
     pub idempotency_key: String,
 }
 
-/// Reverse a committed debit.
+/// Return everything that remains of a charge (ADR-0011).
 ///
-/// The attribution is the reversed debit's, not a new one: the server
-/// re-authorizes it, recomputes the subject key the debit was recorded under
-/// (a caller may never supply one), and requires the stored record to carry the
-/// same authorized attribution.
+/// The attribution is the charged operation's, not a new one: the server
+/// authorizes it for the action `rollback` and requires the charge to carry
+/// the same attribution digest. A rollback has no amount and no key of its
+/// own; on a charge with nothing left it succeeds and changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RollbackRequest {
-    /// Attribution of the debit being reversed.
+    /// Attribution of the charged operation.
     pub attribution: EvaluationAttribution,
-    /// Which kind of operation the original key names. Defaults to a direct
-    /// debit, so a request that predates leases keeps its meaning.
+    /// Which kind of operation the key names. Defaults to a direct debit.
     #[serde(default)]
     pub original_operation: RollbackableOperation,
-    /// Idempotency key the original debit was committed under.
+    /// Idempotency key the charged operation was committed under.
     pub original_idempotency_key: String,
-    /// Client-supplied key of this rollback.
-    pub idempotency_key: String,
 }
 
 /// Evaluate without mutating anything.
@@ -1568,6 +1477,10 @@ pub struct CommitLeaseRequest {
     /// above the reserved amount is `OVER_COMMIT_NOT_AUTHORIZED`.
     #[serde(default)]
     pub actual_amount: Option<i64>,
+    /// The metric type id the amount is for. When present it must be the
+    /// lease's, or the commit is `METRIC_TYPE_MISMATCH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric_type: Option<String>,
     /// Client-supplied idempotency key of this commit.
     pub idempotency_key: String,
 }
@@ -1745,13 +1658,13 @@ pub const fn positive_amount(amount: i64) -> Option<u64> {
 // Idempotency
 // ---------------------------------------------------------------------------
 
-/// Full idempotency scope: `(tenant_id, subject_key, operation_type, key)`.
+/// Idempotency scope: `(tenant_id, operation_type, key)`. The subjects are
+/// part of the request fingerprint, not of the scope, so a key is taken for
+/// the whole tenant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IdempotencyScope {
     /// Authorized target tenant.
     pub tenant_id: TenantId,
-    /// Fingerprint of the canonical subject set.
-    pub subject_key: IdempotencySubjectKey,
     /// Operation kind.
     pub operation_type: OperationType,
     /// Client-supplied key.
@@ -1770,7 +1683,9 @@ pub struct IdempotencyWrite {
     pub payload_hash: PayloadHash,
 }
 
-/// A stored idempotency record.
+/// A stored idempotency record. For an allowed debit or a lease commit it is
+/// read from the charge, which is the record of that operation for as long as
+/// the charge lives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdempotencyRecord {
     /// Full scope.
@@ -1786,15 +1701,11 @@ pub struct IdempotencyRecord {
     pub policy_id: Option<PolicyId>,
     /// Version of that policy, when one was selected.
     pub policy_version: Option<u32>,
-    /// The attribution the operation was authorized under. Present on debit
-    /// records, which rollback must prove it was authorized to reverse; absent
-    /// on credit and rollback records, which reverse nothing themselves.
-    #[serde(default)]
-    pub attribution_hash: Option<AttributionDigest>,
     /// Record creation time.
     #[serde(with = "rfc3339")]
     pub created_at: OffsetDateTime,
-    /// Retention deadline.
+    /// Retention deadline; for a charge, the end of its return window, which
+    /// it lives at least until.
     #[serde(with = "rfc3339")]
     pub expires_at: OffsetDateTime,
 }
@@ -1815,12 +1726,9 @@ impl IdempotencyRecord {
 /// Schema version written as the `__version` key of a stored decision blob.
 pub const DECISION_BLOB_VERSION: u32 = 1;
 
-/// The caller's half of an idempotency record whose subject key is not knowable
-/// before the transaction.
-///
-/// Credit addresses one Quota by id; its subject pair is only readable from the
-/// locked row, and the caller may not supply or narrow a subject key
-/// (PRD section 5.8). The plugin completes the scope under that lock.
+/// The caller's half of an idempotency record whose operation type the
+/// primitive fixes: a credit, and a lease commit or release, which share one
+/// settlement path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartialIdempotencyWrite {
     /// Authorized target tenant.
@@ -1832,17 +1740,12 @@ pub struct PartialIdempotencyWrite {
 }
 
 impl PartialIdempotencyWrite {
-    /// Complete the scope with what the transaction read under the row lock.
+    /// The full write under `operation_type`.
     #[must_use]
-    pub fn complete(
-        self,
-        subject_key: IdempotencySubjectKey,
-        operation_type: OperationType,
-    ) -> IdempotencyWrite {
+    pub fn complete(self, operation_type: OperationType) -> IdempotencyWrite {
         IdempotencyWrite {
             scope: IdempotencyScope {
                 tenant_id: self.tenant_id,
-                subject_key,
                 operation_type,
                 key: self.key,
             },
@@ -1851,21 +1754,59 @@ impl PartialIdempotencyWrite {
     }
 }
 
-/// The committed debit a rollback reverses.
+/// The charge a rollback reverses.
 ///
-/// The scope locates the record; the digest proves the caller was authorized
-/// for that operation's metric and resource, not merely for some operation over
-/// the same subjects. A record whose stored digest differs is reported absent.
+/// The scope locates the charge; the digest proves the caller was authorized
+/// for that charge's attribution, not merely for some operation of the
+/// tenant. A charge whose attribution digest differs is reported absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollbackTarget {
-    /// Full scope of the original operation. Its `operation_type` is
+    /// Scope of the charged operation. Its `operation_type` is
     /// [`OperationType::Debit`] or [`OperationType::Commit`], as the caller's
     /// [`RollbackableOperation`] named it; the plugin looks up that one scope
     /// and never falls back to the other.
     pub original: IdempotencyScope,
-    /// The attribution the rollback caller was authorized under, which must
-    /// equal the original debit's.
+    /// Digest of the attribution the rollback caller was authorized under,
+    /// which must equal the charge's.
     pub authorized: AttributionDigest,
+}
+
+/// A return as storage applies it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChargeReturn {
+    /// Scope of the charged operation, as in [`RollbackTarget::original`].
+    pub charge: IdempotencyScope,
+    /// The metric type the amount is counted in.
+    pub metric: MetricId,
+    /// Positive amount to give back.
+    pub amount: u64,
+    /// The return's own key; its scope is `(tenant, return, key)`.
+    pub key: String,
+}
+
+impl ChargeReturn {
+    /// The idempotency scope of the return's own key.
+    #[must_use]
+    pub fn scope(&self) -> IdempotencyScope {
+        IdempotencyScope {
+            tenant_id: self.charge.tenant_id,
+            operation_type: OperationType::Return,
+            key: self.key.clone(),
+        }
+    }
+}
+
+/// The allocation charges of one metric that hold an amount on an active
+/// Quota past their return window (ADR-0011).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldAllocationCharges {
+    /// The charges' metric.
+    pub metric: MetricId,
+    /// How many there are.
+    pub count: u64,
+    /// Creation time of the oldest.
+    #[serde(with = "rfc3339")]
+    pub oldest_created_at: OffsetDateTime,
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,6 +1827,66 @@ pub enum NotificationScope {
     Platform,
 }
 
+/// The identity the operation log and the events name as the cause of an
+/// operation. It is recorded, never authorized by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Actor {
+    /// The authenticated principal of a call through QE's own API.
+    Caller {
+        /// The principal's subject id.
+        subject_id: Uuid,
+    },
+    /// The platform identity of the quota resolver's caller, as the resolver
+    /// plugin request carries it. `None` for a caller in the resolver's
+    /// process, which the platform gives no identity.
+    Platform {
+        /// The caller's platform identity, when it has one.
+        identity: Option<toolkit_security::PlatformIdentity>,
+    },
+    /// Work that no caller started.
+    Task {
+        /// The task.
+        task: BackgroundTask,
+    },
+}
+
+/// A background task acting without a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackgroundTask {
+    /// The lease sweeper, which releases expired leases.
+    LeaseSweeper,
+    /// The gear's bootstrap, which seeds the `global` Policy.
+    Bootstrap,
+}
+
+impl BackgroundTask {
+    /// The task's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::LeaseSweeper => "lease-sweeper",
+            Self::Bootstrap => "bootstrap",
+        }
+    }
+}
+
+impl fmt::Display for Actor {
+    /// The record form: the subject id of a caller, `platform:<peer name>` or
+    /// `platform` for the resolver's caller, the name of a task.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Caller { subject_id } => write!(f, "{subject_id}"),
+            Self::Platform {
+                identity: Some(identity),
+            } => write!(f, "platform:{}", identity.peer_name()),
+            Self::Platform { identity: None } => f.write_str("platform"),
+            Self::Task { task } => f.write_str(task.name()),
+        }
+    }
+}
+
 /// Same-transaction outbox event (invariant I11).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotificationEvent {
@@ -1893,6 +1894,8 @@ pub struct NotificationEvent {
     pub event_id: EventId,
     /// Catalog kind.
     pub kind: NotificationEventKind,
+    /// The cause of the operation that enqueued the event.
+    pub actor: Actor,
     /// Explicit ownership scope; platform events never carry a synthetic tenant.
     #[serde(flatten)]
     pub scope: NotificationScope,
@@ -1967,8 +1970,6 @@ pub struct ExpiredLease {
     pub token: LeaseToken,
     /// Owning tenant.
     pub tenant_id: TenantId,
-    /// Subject key persisted at acquisition.
-    pub subject_key: IdempotencySubjectKey,
     /// Holds returned by the auto-release.
     pub holds: Vec<LeaseHold>,
     /// Expiry time.
@@ -1983,16 +1984,16 @@ pub struct BatchDebitItem {
     pub applicable: ApplicableQuotas,
     /// The item's requested amount. The plan is the transaction's to compute.
     pub amount: u64,
-    /// Validated request projection value for this item.
+    /// The validated `metadata` of the item's metric object.
     pub request: Value,
-    /// Validated resource projection value, `null` when the item has none.
-    pub resource: Value,
-    /// The attribution this item was authorized under, recorded with it so a
-    /// later rollback can prove it reverses its own operation.
+    /// The `id` of the item's metric object, for the Engine.
+    pub metric_id: Option<String>,
+    /// Digest of the attribution this item was authorized under, which its
+    /// charge keeps.
     pub authorized: AttributionDigest,
-    /// Optional per-item idempotency scope.
-    #[serde(default)]
-    pub item_scope: Option<IdempotencyScope>,
+    /// The item's own key in the key space of single debits, `(tenant, debit,
+    /// key)`, with the fingerprint of a single debit of the item's request.
+    pub idempotency: IdempotencyWrite,
 }
 
 /// What an evaluated mutation committed: the decision the transaction's own
@@ -2043,8 +2044,8 @@ impl Retention {
     }
 }
 
-/// What a corrective mutation committed: credit and rollback, which evaluate no
-/// policy and are always allowed once their guards pass.
+/// What a corrective mutation committed: credit, return and rollback, which
+/// evaluate no policy and are always allowed once their guards pass.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppliedMutation {
     /// The recorded decision. Always [`DecisionResult::Allowed`]; its plan
@@ -2052,9 +2053,6 @@ pub struct AppliedMutation {
     pub decision: Decision,
     /// Counter state after the mutation.
     pub mutation: MutationResult,
-    /// Retention deadline of the record written with it.
-    #[serde(with = "rfc3339")]
-    pub expires_at: OffsetDateTime,
 }
 
 /// What an evaluated lease acquisition committed. A denied acquisition holds
@@ -2114,89 +2112,63 @@ impl AcquireLeaseOutcome {
     }
 }
 
-/// Split `actual` across the holds of a lease, proportionally to what each one
-/// holds, rounding the charged total **up**.
+/// What one entry of a charge or of a lease's holds still holds, at the chain
+/// and position its Debit Plan gave it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldEntry {
+    /// Index of the entry's chain in the plan.
+    pub chain: u32,
+    /// Index of the entry inside its chain, primary pool first.
+    pub position: u32,
+    /// What the entry still holds.
+    pub held: u64,
+}
+
+// @cpt-algo:cpt-cf-quota-enforcement-algo-unwind:p1
+/// Take `amount` back from every chain of `entries`: in each chain from the
+/// last entry back, each entry at most what it still holds, so each chain
+/// gives back exactly `amount` (ADR-0010).
 ///
-/// The total charged is `ceil(sum(held) * actual / reserved)`; each hold takes
-/// its floor share and the units left over go to the largest fractional
-/// remainders, ties to the earlier hold. So the amounts sum to exactly that
-/// total, no hold is charged more than it held, and any positive `actual`
-/// charges at least one unit — the engine contract does not promise that the
-/// holds sum to the reserved amount, so a plan holding `[1]` of a reserved `10`
-/// still charges `1` when `1` was used.
+/// Returns the amount taken from each entry, in the order of `entries`.
 ///
 /// # Errors
 ///
-/// [`ApportionError::Overflow`] when the held amounts cannot be summed or
-/// scaled within `u128`, and [`ApportionError::OverCommit`] when `actual`
-/// exceeds `reserved`.
-pub fn apportion(
-    holds: &[u64],
-    actual: u64,
-    reserved: std::num::NonZeroU64,
-) -> Result<Vec<u64>, ApportionError> {
-    let reserved_u128 = u128::from(reserved.get());
-    if u128::from(actual) > reserved_u128 {
-        return Err(ApportionError::OverCommit);
-    }
-    let actual = u128::from(actual);
-    let mut total_held: u128 = 0;
-    for held in holds {
-        total_held = total_held
-            .checked_add(u128::from(*held))
-            .ok_or(ApportionError::Overflow)?;
-    }
-    let scaled = total_held
-        .checked_mul(actual)
-        .ok_or(ApportionError::Overflow)?;
-    // Ceiling of `scaled / reserved`, which never exceeds `total_held` because
-    // `actual <= reserved` and `total_held` is an integer.
-    let target = scaled.div_ceil(reserved_u128);
-    let mut kept = Vec::with_capacity(holds.len());
-    let mut assigned: u128 = 0;
-    // (remainder, index), so the largest remainder wins and an earlier hold
-    // wins a tie.
-    let mut remainders = Vec::with_capacity(holds.len());
-    for (index, held) in holds.iter().enumerate() {
-        let scaled_hold = u128::from(*held)
-            .checked_mul(actual)
-            .ok_or(ApportionError::Overflow)?;
-        // Floor division by a non-zero divisor, so `checked_div` never
-        // refuses; it spells the intent the lint asks for.
-        let share = scaled_hold
-            .checked_div(reserved_u128)
-            .ok_or(ApportionError::Overflow)?;
-        assigned += share;
-        remainders.push((scaled_hold % reserved_u128, index));
-        kept.push(share);
-    }
-    remainders.sort_by(|(left, left_index), (right, right_index)| {
-        right.cmp(left).then(left_index.cmp(right_index))
+/// [`UnwindError`] naming the first chain that holds less than `amount`.
+pub fn unwind(entries: &[HeldEntry], amount: u64) -> Result<Vec<u64>, UnwindError> {
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-unwind:p1:inst-unw-chain
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_by_key(|&index| {
+        (
+            entries[index].chain,
+            std::cmp::Reverse(entries[index].position),
+        )
     });
-    for (_, index) in remainders {
-        if assigned >= target {
-            break;
+    let mut taken = vec![0; entries.len()];
+    for chain in order.chunk_by(|&left, &right| entries[left].chain == entries[right].chain) {
+        let mut left = amount;
+        for &index in chain {
+            let take = left.min(entries[index].held);
+            taken[index] = take;
+            left -= take;
         }
-        // A hold can only take a further unit while it still holds one.
-        if kept[index] < u128::from(holds[index]) {
-            kept[index] += 1;
-            assigned += 1;
+        if left > 0 {
+            return Err(UnwindError {
+                chain: entries[chain[0]].chain,
+            });
         }
     }
-    kept.iter()
-        .map(|share| u64::try_from(*share).map_err(|_| ApportionError::Overflow))
-        .collect()
+    // @cpt-end:cpt-cf-quota-enforcement-algo-unwind:p1:inst-unw-chain
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-unwind:p1:inst-unw-return
+    Ok(taken)
+    // @cpt-end:cpt-cf-quota-enforcement-algo-unwind:p1:inst-unw-return
 }
 
-/// Why a commit's holds could not be split.
+/// A chain holds less than the amount to unwind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ApportionError {
-    /// The held amounts cannot be summed or scaled within `u128`.
-    #[error("the held amounts overflow the apportionment arithmetic")]
-    Overflow,
-    /// `actual` exceeds the reserved amount.
-    #[error("the committed amount exceeds the reserved amount")]
-    OverCommit,
+#[error("chain {chain} holds less than the amount to unwind")]
+pub struct UnwindError {
+    /// The chain that falls short.
+    pub chain: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2246,24 +2218,30 @@ pub struct QuotaSnapshot {
     pub currently_within_window: bool,
 }
 
-/// One target of a snapshot read: a subject scope, its identifier, and a
-/// metric, all as text. The gear maps `(metric, kind)` to the owner
-/// projection; callers never name a projection.
+/// One target of a snapshot read: a subject type, its identifier, and a
+/// metric type, all as text.
 ///
-/// A filter describes a target, not an evaluation claim. A non-tenant kind
-/// (for example [`SCOPE_USER`]) selects the active Quotas on the metric whose
-/// subject is that subject or the request's tenant. The tenant kind
-/// ([`SCOPE_TENANT`]) is a tenant-only filter: its `id` must equal the
-/// request's `tenant_id`, and it selects the tenant's own Quotas only.
+/// A filter describes a target, not an evaluation claim. A subject of any
+/// type but the tenant's selects the active Quotas on the metric whose subject
+/// is that subject or the request's tenant. A tenant-type subject is a
+/// tenant-only filter: its `id` must equal the request's `tenant_id`, and it
+/// selects the tenant's own Quotas only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotSubject {
-    /// A well-known instance of the scope-discriminator type, as text.
-    pub kind: String,
+    /// A quota subject type id, as text.
+    #[serde(rename = "type")]
+    pub subject_type: String,
     /// Opaque, non-empty subject identifier.
     pub id: String,
-    /// The metric, as text: a registered instance of the platform metric base.
+    /// The metric type id, as text.
     pub metric: String,
+    /// The `metadata` of a request's metric object. When present, the target
+    /// selects only the Quotas whose conditions hold on it, the set a debit
+    /// with this `metadata` is checked against; it must fit the metric type.
+    /// When absent, the target selects the Quotas whatever their conditions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Map<String, Value>>,
 }
 
 /// Read the per-Quota state of `1..N` explicit targets in one tenant.
@@ -2273,7 +2251,9 @@ pub struct SnapshotSubject {
 /// anything is mapped or read, so a deployment's `snapshot`/`read` policy must
 /// inspect each filter: one filter outside the caller's grant denies the whole
 /// request. The union of the filters returns each active Quota once, ordered
-/// by `quota_id`, including Quotas outside their validity window.
+/// by `quota_id`, including Quotas outside their validity window. A page may
+/// hold fewer Quotas than `limit` when a target carries `metadata`; the cursor
+/// says whether more follow.
 ///
 /// Refused with `InvalidArgument` before the PDP: no subjects
 /// (`SNAPSHOT_SUBJECTS_REQUIRED`), more than the operator allows
@@ -2416,7 +2396,7 @@ pub struct PolicyDraft {
     /// Version comment.
     #[serde(default)]
     pub comment: Option<String>,
-    /// Caller identity from the `SecurityContext`.
+    /// The record form of the actor that wrote the version.
     pub created_by: String,
 }
 
@@ -2441,7 +2421,7 @@ pub struct PolicyUpdate {
     /// Version comment.
     #[serde(default)]
     pub comment: Option<String>,
-    /// Caller identity from the `SecurityContext`.
+    /// The record form of the actor that wrote the version.
     pub created_by: String,
 }
 
@@ -2513,7 +2493,7 @@ pub struct ConfigDefaults {
 impl Default for ConfigDefaults {
     fn default() -> Self {
         Self {
-            contention_timeout_ms: 0,
+            contention_timeout_ms: 50,
             max_active_leases: 1000,
             idempotency_retention_secs: 86_400,
         }

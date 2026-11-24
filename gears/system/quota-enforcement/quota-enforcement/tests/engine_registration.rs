@@ -48,13 +48,10 @@ impl QuotaResolutionEngineV1 for LinkedEngine {
         let quota = context.quotas.first().ok_or(EngineError::CostExceeded)?;
         Ok(Decision {
             result: DecisionResult::Allowed,
-            debit_plan: std::iter::once((
-                quota.snapshot.quota_id,
-                QuotaDebitPlan {
-                    amount: context.amount,
-                },
-            ))
-            .collect(),
+            debit_plan: vec![vec![QuotaDebitPlan {
+                quota_id: quota.snapshot.quota_id,
+                amount: context.amount,
+            }]],
             diagnostics: std::collections::BTreeMap::new(),
         })
     }
@@ -80,7 +77,7 @@ fn policy() -> PolicyVersion {
 }
 
 fn metric() -> MetricId {
-    MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
+    MetricId::parse("gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~")
         .expect("metric")
 }
 
@@ -88,8 +85,8 @@ fn snapshot() -> QuotaSnapshot {
     QuotaSnapshot {
         quota_id: QuotaId::generate(),
         subject: serde_json::from_value(json!({
-            "projection_type": "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~",
-            "subject_id": "alice"
+            "type": "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~",
+            "id": "alice"
         }))
         .expect("subject"),
         metric: metric(),
@@ -127,8 +124,7 @@ fn a_linked_engine_evaluates_like_a_built_in() {
     let quota = snapshot();
     let quotas = [EvaluationQuota {
         snapshot: &quota,
-        tier: QuotaScopeTier::User,
-        arbitration: &Value::Null,
+        tier: QuotaScopeTier::Subject,
     }];
     let thousand = NonZeroU64::new(1000).expect("nonzero");
     let context = EvaluationContext {
@@ -138,14 +134,17 @@ fn a_linked_engine_evaluates_like_a_built_in() {
         time: OffsetDateTime::UNIX_EPOCH,
         quotas: &quotas,
         request: &Value::Null,
-        resource: &Value::Null,
+        metric_id: None,
         budget: EvaluationBudget::new(Some(1000), thousand, thousand).expect("budget"),
     };
 
     let outcome = evaluate_prepared(&registry, &cache, &context, &NoopMetrics)
         .expect("a linked engine must evaluate");
     assert_eq!(
-        outcome.decision().debit_plan.get(&quota.quota_id),
-        Some(&QuotaDebitPlan { amount: 7 })
+        outcome.decision().debit_plan,
+        vec![vec![QuotaDebitPlan {
+            quota_id: quota.quota_id,
+            amount: 7
+        }]]
     );
 }

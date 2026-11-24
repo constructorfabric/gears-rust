@@ -175,7 +175,9 @@ which type its metric uses and calls the matching operations.
 * Authorization of platform-plane callers by the policy decision point.
 * Quota notifications.
 * Reconciliation of held allocation with the resources that exist: a resource deleted without a return keeps its
-  capacity held until the module returns it or the operator corrects the quota through the backend's own API.
+  capacity held until the module returns it. Comparing held amounts with the resources that exist is the task of a
+  component above the resolver and its backend that reads the records of the Usage Collector, the gear that stores
+  measured usage, and the quota state.
 
 ## 5. Functional Requirements
 
@@ -229,7 +231,11 @@ exceeds what remains of the charge, names an unknown charge, or gives nothing ba
 fail with an error and change nothing. A repeated return with the same key inside the backend's replay window
 (`cpt-cf-quota-resolver-fr-idempotency`) **MUST** get the first result and give nothing back again. Each growth of a
 resource is a separate charge with its own key, so a module returns every
-charge of a resource when it deletes the resource. Release only cancels a lease that is not committed; it does not
+charge of a resource when it deletes the resource. The module that made a charge is the only one that can return it,
+so it is responsible for delivering the return: it records the intent to return in the same transaction that deletes
+or reduces the resource, and repeats the call until it succeeds. The module builds the key of a charge from its own
+data, for example the resource id and the number of the growth, so that it can send the return again at any later
+time without reading anything from the resolver. Release only cancels a lease that is not committed; it does not
 return an amount after a commit.
 
 - **Rationale**: Allocation capacity stays held after a commit until the module gives it back, and a charge for work
@@ -272,6 +278,11 @@ The system **MUST** return, for one subject and given metrics in one tenant, the
 backend applies to them: cap, consumed amount, remaining amount, and, for a quota with a period, the current period
 with its reset time. The
 backend decides which quotas apply, including quotas of the tenant; the resolver returns the backend's page unchanged.
+
+A request names each metric by its metric type and **MAY** add the `metadata` of the metric object of a request that
+the caller is about to make. A backend can limit a quota to requests with certain attributes; with the metadata the
+read returns only the quotas that apply to such a request, and without it the quotas whatever attributes they are
+limited to.
 
 - **Rationale**: Modules and users must see remaining capacity before they start work.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`, `cpt-cf-quota-resolver-actor-end-user`
@@ -422,9 +433,11 @@ p95 latency **MUST** be at most the backend's p95 latency threshold plus 5 ms.
 
 Once the principal type and the plugin of a call are resolved, the call **MUST** depend on the plugin only, so calls
 through the resolver meet the backend's availability target. At start the resolver checks the form of
-its configuration and needs no other gear. After start, types-registry is
-needed only to resolve the plugin on the first call and, once, for a principal type without its own configuration
-entry; a failed or timed-out lookup fails the call with
+its configuration and publishes its GTS types to types-registry: the process does not start while types-registry
+does not admit them. After start, types-registry is
+needed only to resolve the plugin on the first call and for a principal type without its own configuration
+entry (once for a registered type, on every call for an unregistered one); a lookup that types-registry does not answer,
+or does not answer in time, fails the call with
 `ServiceUnavailable`.
 
 A calling module **MUST** limit each call by its own deadline. It **MAY** retry a call that failed with
@@ -434,7 +447,11 @@ call is still running. A backend **MUST** answer `Aborted` only when a repeat of
 succeed. A key that is already in use for another request is a different error, `AlreadyExists`: the module **MUST
 NOT** retry it and **MUST NOT** treat it as unavailable charging, because every repeat fails the same way: the module
 reused a key, or the operator changed the mapping of the principal between the attempts (ADR-0002), and a new charge
-needs a new key. If charging stays
+needs a new key. When it answers a retry, the outcome of the first attempt is unknown, and that attempt may have
+charged: before it charges under a new key, the module returns the whole amount of the first attempt's charge, named
+by that attempt's key (`cpt-cf-quota-resolver-fr-return`). A return that names an unknown charge means that the
+first attempt charged nothing. A lease acquisition makes no charge; a lease that its first attempt may hold ends when
+its time runs out. If charging stays
 unavailable, the module decides whether to do the work without a charge.
 
 - **Threshold**: availability of calls through the resolver is at least the backend's target, over the backend's
@@ -601,14 +618,14 @@ any quota of the charge, fails and changes nothing.
 
 | Dependency            | Description                                                                     | Criticality |
 |-----------------------|---------------------------------------------------------------------------------|-------------|
-| types-registry        | SDK type registration; plugin discovery; ancestors of principal types           | p1          |
+| types-registry        | SDK type registration; plugin discovery; whether a principal type is registered | p1          |
 | Quota backend plugin  | Quotas of each type, counters, leases, idempotency, and evaluation              | p1          |
 | AuthN and api-gateway | `SecurityContext` and `PlatformSecurityContext` of the caller; edge publication | p1          |
 
 ## 11. Assumptions
 
-* Principal types are GTS types that derive from a platform principal base, so their ancestors resolve in
-  types-registry (issue #5446).
+* Principal types are GTS types that derive from a platform principal base, so the ancestors of a type are part of its
+  type id (issue #5446).
 * A platform-plane caller is trusted to name the tenant and the subjects, as for other platform-plane resolvers.
 
 ## 12. Risks
@@ -617,8 +634,8 @@ any quota of the charge, fails and changes nothing.
 |-----------------------------------------------------------|--------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
 | A platform service charges the wrong subject              | Wrong quota charged                              | Platform plane only for platform services; the principal of a user request comes from its `SecurityContext`                        |
 | The mapping points to a type the metric does not admit    | Every debit for that principal type fails        | The backend rejects it as an invalid request; the resolver logs the misconfiguration                                               |
-| A resource is deleted without a return                    | Its allocation capacity stays held               | The module reconciles its resources; the operator corrects the quota through the backend's own API                                 |
-| A platform service charges or returns quota in any tenant | Another tenant's quota is used up or freed       | Platform routes are internal and need a platform credential; authorization of platform-plane callers when the platform supports it |
+| A resource is deleted without a return                    | Its allocation capacity stays held               | The module delivers every return: it records the intent with the deletion and repeats the call (`cpt-cf-quota-resolver-fr-return`). The operator can raise the cap in the backend until then |
+| A platform service charges or returns quota in any tenant | Another tenant's quota is used up or freed       | Platform routes are internal and need a platform credential. Authorization of the calling service is tracked in #6037. |
 | A module returns another module's charge                  | Capacity is freed that this module never charged | Keys are unique across modules (`cpt-cf-quota-resolver-fr-idempotency`)                                                            |
 
 ## 13. Open Questions

@@ -80,8 +80,9 @@ base, its own version is major 0, or a trait is wrong). An entry is built from t
 Quota or Policy never makes a metric unavailable. Requests for an unavailable metric fail with `FailedPrecondition`.
 Other metrics are served. QE reports the metric and the reason in a log entry and in telemetry.
 
-Bootstrap fails only on QE's own state and configuration: storage, schema version, and engines. A wrong metric type
-does not fail bootstrap.
+Bootstrap fails on QE's own state and configuration (storage, schema version, and engines). While the registry does
+not answer the catalogue read at start, QE is not ready and repeats bootstrap until it answers. A wrong metric type does
+not fail bootstrap.
 
 ## Flow 3 — Quota write
 
@@ -92,8 +93,8 @@ flowchart LR
     authz[("authz-resolver")] <--> pdp
     pdp --> entry["Take the metric's catalogue entry"]
     catalog["MetricCatalog"] --> entry
-    entry --> engine["Engine checks Quota metadata"]
-    engine --> quota[("Quota")]
+    entry --> conditions["Check the conditions of Quota metadata"]
+    conditions --> quota[("Quota")]
 ```
 
 A caller sends a Quota create or update request. QE first checks the public target shape.
@@ -105,11 +106,11 @@ catalogue does not hold, it runs the read of Flow 2 as a request does. A create 
 rejected; a deactivation always runs. It
 checks that the metric admits the Quota's subject type.
 
-QE core checks only that the Quota metadata is a JSON object of at most 4 KB. On create and on a change of the
-metadata, QE gives the metadata to the Engine of the Policy that is active for the Quota's metric
-(`validate_quota_metadata`). The Engine accepts it, or rejects it with a list of what is wrong. On a rejection QE
-writes nothing and answers `InvalidArgument` with the token `QUOTA_METADATA_REJECTED` and the Engine's list. The
-`most-restrictive-wins` Engine accepts only an empty object.
+Quota metadata is a JSON object of at most 4 KB that holds the Quota's conditions over the `metadata` of the request.
+On create and on a change of the metadata, QE checks each condition against the `metadata` schema of the metric type
+in the catalogue entry: the property is declared and is a string, an integer, or a boolean, and the value has its
+type. When a condition does not fit, QE writes nothing and answers `InvalidArgument` with the token
+`QUOTA_METADATA_REJECTED` and the list of what is wrong.
 
 A Policy write takes the catalogue entry of its metric in the same way. QE does not check existing Quotas when a
 Policy changes.
@@ -144,5 +145,5 @@ registered is `InvalidArgument`. A metric whose entry is unavailable is `FailedP
 no registry call.
 
 `EvaluationOrchestrator` loads the applicable Quotas by subject and metric type. The metric `id` is not part of the
-counter key; QE gives it to the Engine with the request. The Engine returns a Decision and a Debit Plan of chains. QE
+counter key; the PDP, the Engine, and the charge's attribution see it. The Engine returns a Decision and a Debit Plan of chains. QE
 validates the plan before `StoragePlugin` applies it.

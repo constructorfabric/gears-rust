@@ -2,17 +2,20 @@
 //! or refused as a whole.
 //!
 //! The gear validates the envelope and its size, admits every item on its own
-//! attribution, derives the envelope's idempotency scope from the union of the
-//! items' subject sets, and answers a replay before the `mode` check. The size
-//! check comes before admission, so an oversized batch costs no PDP call, and
-//! a lowered size limit applies to replays too. Evaluation, the batch timer
-//! and the all-or-nothing write belong to the storage transaction.
+//! attribution, and answers a replay of the envelope before the `mode` check.
+//! An item is a debit under its own key, in the key space of single debits: a
+//! batch whose item key already names a record of a single debit fails as a
+//! payload mismatch, and is replayed only as a whole, by its envelope key. The
+//! size check comes before admission, so an oversized batch costs no PDP call,
+//! and a lowered size limit applies to replays too. Evaluation, the batch
+//! timer and the all-or-nothing write belong to the storage transaction.
 //!
 //! The batch path feeds no `operation`-labelled series: the feature claims no
 //! `operation = batch_debit` label. Denials and engine instruments are
 //! recorded as on every other path.
 
 use crate::domain::admission::admission_span;
+use futures::future::join_all;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,18 +23,20 @@ use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
     BatchDebitItem, BatchDebitRequest, BatchDecision, BatchEntry, BatchMode, BatchRecord,
-    BatchTimer, Decision, DecisionResult, EvaluatedBatch, IdempotencyScope, IdempotencySubjectKey,
-    IdempotencyWrite, OperationType, PayloadHash, SubjectRef, TenantId, positive_amount,
+    BatchTimer, Decision, DecisionResult, EvaluatedBatch, IdempotencyScope, IdempotencyWrite,
+    OperationType, PayloadHash, TenantId, TransitionOutcome, positive_amount,
 };
 use serde::Serialize;
 use toolkit_macros::domain_model;
 
-use super::service::{Operations, applicable_of, digest, policy_values};
+use super::service::{
+    DebitPayload, Operations, applicable_of, digest, ensure_quota_gated, key_fault,
+};
 use crate::domain::attribution::AdmittedEvaluation;
 use crate::domain::engines::PreparedEvaluation;
 use crate::domain::error::DomainError;
 use crate::domain::pep::{actions, resources};
-use crate::domain::ports::metrics::DenialReason;
+use crate::domain::ports::metrics::{DenialReason, OperationKind};
 use crate::domain::tokens;
 
 /// The batch debit's bounds (`[quota-enforcement.operations]`).
@@ -54,11 +59,23 @@ impl Default for BatchLimits {
     }
 }
 
-/// What a batch's payload digest covers: everything but the envelope key.
+/// How many items of one batch are admitted at a time, each with its own PDP
+/// call.
+const ADMISSION_CONCURRENCY: usize = 8;
+
+/// What the envelope's payload digest covers: the mode, and each item's key
+/// and its single-debit fingerprint, in item order.
 #[derive(Serialize)]
 struct BatchPayload<'a> {
     mode: BatchMode,
-    items: &'a [quota_enforcement_sdk::BatchItemRequest],
+    items: Vec<BatchItemPayload<'a>>,
+}
+
+#[derive(Serialize)]
+struct BatchItemPayload<'a> {
+    idempotency_key: &'a str,
+    #[serde(flatten)]
+    debit: DebitPayload<'a>,
 }
 
 // @cpt-flow:cpt-cf-quota-enforcement-flow-batch-debit:p1
@@ -78,7 +95,6 @@ impl Operations<'_> {
     #[tracing::instrument(name = "quota_enforcement.operations.batch_debit", skip_all, fields(item_count = request.items.len()))]
     pub async fn batch_debit(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: BatchDebitRequest,
     ) -> Result<BatchDecision, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-amount-if
@@ -99,17 +115,29 @@ impl Operations<'_> {
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-request
-        let payload_hash = digest(&BatchPayload {
-            mode: request.mode,
-            items: &request.items,
-        })?;
         let admitted = self
-            .admit_items(ctx, &request)
+            .admit_items(&request)
             .instrument(admission_span(request.items.len()))
             .await?;
+        let payload_hash = digest(&BatchPayload {
+            mode: request.mode,
+            items: request
+                .items
+                .iter()
+                .zip(&admitted)
+                .map(|(item, admitted)| BatchItemPayload {
+                    idempotency_key: &item.idempotency_key,
+                    debit: DebitPayload::of(admitted, item.amount),
+                })
+                .collect(),
+        })?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-resolve
-        let scope = envelope_scope(tenant, &admitted, request.idempotency_key.clone());
+        let scope = IdempotencyScope {
+            tenant_id: tenant,
+            operation_type: OperationType::BatchDebit,
+            key: request.idempotency_key.clone(),
+        };
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-resolve
         let keys: Vec<String> = request
             .items
@@ -120,6 +148,7 @@ impl Operations<'_> {
         if let Some(decisions) = self.batch_replay(&scope, payload_hash).await? {
             return Ok(BatchDecision::of(keys, decisions));
         }
+        let items = batch_items(&request, &admitted, &amounts)?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-idem
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-mode-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-mode
@@ -131,12 +160,10 @@ impl Operations<'_> {
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-mode
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-mode-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-envelope
-        let decisions = self
+        let (decisions, replayed) = self
             .run_batch(
-                ctx,
-                &request,
+                &items,
                 &admitted,
-                &amounts,
                 IdempotencyWrite {
                     scope,
                     payload_hash,
@@ -146,9 +173,10 @@ impl Operations<'_> {
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-envelope
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-denied-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-denied
-        if let Some(denied) = decisions
-            .iter()
-            .find(|decision| matches!(decision.result, DecisionResult::Denied { .. }))
+        if !replayed
+            && let Some(denied) = decisions
+                .iter()
+                .find(|decision| matches!(decision.result, DecisionResult::Denied { .. }))
         {
             // Counted once per batch, under the first denied item's reason.
             self.count_denial(denied);
@@ -187,14 +215,14 @@ impl Operations<'_> {
                 })
             })?);
         }
-        self.validate_key(&request.idempotency_key)?;
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
         let mut seen = HashSet::with_capacity(request.items.len());
         for (index, item) in request.items.iter().enumerate() {
-            if item.idempotency_key.trim().is_empty() {
+            if let Some(reason) = key_fault(&item.idempotency_key) {
                 return Err(refuse(DomainError::InvalidBatchItem {
                     index,
                     field: "idempotency_key",
-                    reason: tokens::IDEMPOTENCY_KEY_REQUIRED,
+                    reason,
                 }));
             }
             if !seen.insert(item.idempotency_key.as_str()) {
@@ -219,29 +247,38 @@ impl Operations<'_> {
     }
 
     /// Admit every item on its own attribution and refuse a metric whose
-    /// usage does not flow through Quota Enforcement.
+    /// usage does not flow through Quota Enforcement. The items are admitted
+    /// [`ADMISSION_CONCURRENCY`] at a time, each with its own PDP call; the
+    /// error returned is that of the first item that fails, in request order.
     async fn admit_items(
         &self,
-        ctx: &toolkit_security::SecurityContext,
         request: &BatchDebitRequest,
     ) -> Result<Vec<AdmittedEvaluation>, DomainError> {
         let mut admitted = Vec::with_capacity(request.items.len());
-        for item in &request.items {
-            let one = self
-                .attribution
-                .admit_evaluation(
-                    ctx,
-                    &resources::OPERATION,
-                    actions::BATCH_DEBIT,
-                    item.attribution.clone(),
-                )
-                .await?;
-            // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-gated
-            self.classifications.ensure_quota_gated(&one.metric)?;
-            // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-gated
-            admitted.push(one);
+        for group in request.items.chunks(ADMISSION_CONCURRENCY) {
+            for one in join_all(group.iter().map(|item| self.admit_item(item))).await {
+                admitted.push(one?);
+            }
         }
         Ok(admitted)
+    }
+
+    async fn admit_item(
+        &self,
+        item: &quota_enforcement_sdk::BatchItemRequest,
+    ) -> Result<AdmittedEvaluation, DomainError> {
+        let one = self
+            .attribution()
+            .admit_evaluation(
+                &resources::OPERATION,
+                actions::BATCH_DEBIT,
+                item.attribution.clone(),
+            )
+            .await?;
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-gated
+        ensure_quota_gated(&one.metric)?;
+        // @cpt-end:cpt-cf-quota-enforcement-algo-batch-envelope-evaluation:p1:inst-bev-gated
+        Ok(one)
     }
 
     /// A stored envelope under `scope`: its decisions, or the payload
@@ -266,31 +303,16 @@ impl Operations<'_> {
     /// missing artifact within the same bounded budget a debit uses.
     async fn run_batch(
         &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: &BatchDebitRequest,
+        items: &[BatchDebitItem],
         admitted: &[AdmittedEvaluation],
-        amounts: &[u64],
         envelope: IdempotencyWrite,
-    ) -> Result<Vec<Decision>, DomainError> {
-        let items: Vec<BatchDebitItem> = request
-            .items
-            .iter()
-            .zip(admitted)
-            .zip(amounts)
-            .map(|((item, admitted), amount)| batch_item(item, admitted, *amount))
-            .collect();
-        let projections: Vec<Option<gts::GtsTypeId>> = admitted
-            .iter()
-            .map(|admitted| self.user_projection(&admitted.metric))
-            .collect();
+    ) -> Result<(Vec<Decision>, bool), DomainError> {
         let entries: Vec<BatchEntry<'_>> = items
             .iter()
             .zip(admitted)
-            .zip(&projections)
-            .map(|((item, admitted), projection)| BatchEntry {
+            .map(|(item, admitted)| BatchEntry {
                 item,
                 scope: &admitted.attribution.access_scope,
-                user_projection: projection.as_ref(),
             })
             .collect();
         let prepared = PreparedEvaluation::new(
@@ -311,65 +333,57 @@ impl Operations<'_> {
         };
         // Every item shares the tenant, so any item's scope covers the
         // envelope's own rows.
-        let envelope_scope = &admitted
+        let first = &admitted
             .first()
             .ok_or_else(|| DomainError::Internal("an admitted batch has no items".to_owned()))?
-            .attribution
-            .access_scope;
+            .attribution;
         let outcome = prepared
             .run_within(Some(timer.as_ref()), || {
                 self.storage
-                    .apply_batch_debit(ctx, envelope_scope, &batch, &[])
+                    .apply_batch_debit(&first.actor, &first.access_scope, &batch, &[])
             })
-            .await?;
-        Ok(outcome
+            .await;
+        let outcome = self.contended(OperationKind::Debit, outcome)?;
+        let replayed = matches!(outcome, TransitionOutcome::NoOp(_));
+        let decisions = outcome
             .into_inner()
             .into_iter()
             .map(|item| item.decision)
-            .collect())
+            .collect();
+        Ok((decisions, replayed))
     }
 }
 
-/// The envelope's scope: the tenant every item shares, the sorted,
-/// deduplicated union of every item's subject set, and the envelope key.
-fn envelope_scope(
-    tenant_id: TenantId,
+/// Every admitted item as storage evaluates it: a debit under the item's own
+/// key, with the fingerprint a single debit of the item's request has.
+fn batch_items(
+    request: &BatchDebitRequest,
     admitted: &[AdmittedEvaluation],
-    key: String,
-) -> IdempotencyScope {
-    let subjects: Vec<SubjectRef> = admitted
+    amounts: &[u64],
+) -> Result<Vec<BatchDebitItem>, DomainError> {
+    request
+        .items
         .iter()
-        .flat_map(|item| item.attribution.subjects.iter().cloned())
-        .collect();
-    IdempotencyScope {
-        tenant_id,
-        subject_key: IdempotencySubjectKey::of(&subjects),
-        operation_type: OperationType::BatchDebit,
-        key,
-    }
-}
-
-/// One admitted item as storage evaluates it; its own key rides as the item
-/// scope, for identification only.
-fn batch_item(
-    item: &quota_enforcement_sdk::BatchItemRequest,
-    admitted: &AdmittedEvaluation,
-    amount: u64,
-) -> BatchDebitItem {
-    let (request, resource) = policy_values(admitted);
-    BatchDebitItem {
-        applicable: applicable_of(admitted),
-        amount,
-        request,
-        resource,
-        authorized: admitted.authorized,
-        item_scope: Some(IdempotencyScope {
-            tenant_id: admitted.attribution.tenant_id,
-            subject_key: IdempotencySubjectKey::of(&admitted.attribution.subjects),
-            operation_type: OperationType::BatchDebit,
-            key: item.idempotency_key.clone(),
-        }),
-    }
+        .zip(admitted)
+        .zip(amounts)
+        .map(|((item, admitted), amount)| {
+            Ok(BatchDebitItem {
+                applicable: applicable_of(admitted),
+                amount: *amount,
+                request: serde_json::Value::Object(admitted.request.clone()),
+                metric_id: admitted.metric_id.clone(),
+                authorized: admitted.authorized,
+                idempotency: IdempotencyWrite {
+                    scope: IdempotencyScope {
+                        tenant_id: admitted.attribution.tenant_id,
+                        operation_type: OperationType::Debit,
+                        key: item.idempotency_key.clone(),
+                    },
+                    payload_hash: digest(&DebitPayload::of(admitted, item.amount))?,
+                },
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

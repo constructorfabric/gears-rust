@@ -28,11 +28,10 @@ use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, BulkCreateEntry, BulkCreateEnvelope, BulkDeactivateEntry,
     BulkDeactivateEnvelope, BulkDeactivated, BulkUpdateEntry, BulkUpdateEnvelope, BulkUpdated,
-    CapPatch, DeactivateOutcome, Decision, EvaluatedMutation, IdempotencyScope,
-    IdempotencySubjectKey, IdempotencyWrite, LeaseToken, MetricId, OperationType, PageRequest,
-    PayloadHash, PeriodType, PolicyDraft, PolicyScope, Quota, QuotaDebitPlan, QuotaDraft,
-    QuotaFilter, QuotaId, QuotaPatch, QuotaType, StorageError, SubjectRef, TenantId,
-    TransitionOutcome,
+    CapPatch, DeactivateOutcome, Decision, EvaluatedMutation, IdempotencyScope, IdempotencyWrite,
+    LeaseToken, MetricId, OperationType, PageRequest, PayloadHash, PeriodType, PolicyDraft,
+    PolicyScope, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaType,
+    StorageError, SubjectRef, TenantId, TransitionOutcome,
 };
 use sea_orm::{ColumnTrait as _, EntityTrait as _, QueryFilter as _, QuerySelect as _};
 use sea_orm_migration::MigratorTrait as _;
@@ -44,9 +43,7 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt as _;
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{
-    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
-};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::domain::ports::LeaseStore as _;
@@ -63,8 +60,8 @@ use quota_enforcement_storage_plugin::{
 mod common;
 use common::lock_waiters;
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 
 fn tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(0x00ac_ce55))
@@ -75,23 +72,14 @@ fn scope() -> AccessScope {
 }
 
 fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: None,
     }
-}
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
 }
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -109,7 +97,6 @@ fn envelope_write(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::of(&[]),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -161,11 +148,10 @@ fn applicable(holders: &[&str]) -> ApplicableQuotas {
     }
 }
 
-fn mutation_write(applicable: &ApplicableQuotas, op: OperationType, key: &str) -> IdempotencyWrite {
+fn mutation_write(op: OperationType, key: &str) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::of(&applicable.subjects),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -184,8 +170,7 @@ fn mutation<'a>(
         applicable,
         amount,
         request: null,
-        resource: null,
-        user_projection: None,
+        metric_id: None,
         limits: limits(),
         idempotency,
         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -216,12 +201,10 @@ fn allow_within_cap() -> Arc<TransactionEvaluator> {
                     .quotas
                     .iter()
                     .map(|quota| {
-                        (
-                            quota.snapshot.quota_id,
-                            QuotaDebitPlan {
-                                amount: context.amount,
-                            },
-                        )
+                        vec![QuotaDebitPlan {
+                            quota_id: quota.snapshot.quota_id,
+                            amount: context.amount,
+                        }]
                     })
                     .collect(),
             )
@@ -235,7 +218,7 @@ fn allow_within_cap() -> Arc<TransactionEvaluator> {
                         .collect(),
                     reason: "QUOTA_EXCEEDED".to_owned(),
                 },
-                debit_plan: std::collections::BTreeMap::new(),
+                debit_plan: Vec::new(),
                 diagnostics: std::collections::BTreeMap::new(),
             }
         };
@@ -277,7 +260,6 @@ impl Held {
         };
         Self::Stripe(stripe_of(&ScopeKey {
             tenant_id: scope.tenant_id.as_uuid(),
-            subject_key: scope.subject_key.as_bytes(),
             operation_type: scope.operation_type.as_str(),
             idem_key: &scope.key,
         }))
@@ -329,7 +311,7 @@ impl PgHarness {
         let enqueuer: Arc<dyn NotificationOutbox> = bound;
         SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer))
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     engine_id: "cel".to_owned(),
@@ -388,7 +370,7 @@ impl PgHarness {
     }
 
     /// Give `metric` a contention budget (I8); without one the platform
-    /// default applies: 0 ms, fail fast.
+    /// default applies: 50 ms.
     async fn set_contention_timeout(&self, metric: &str, timeout: Duration) {
         use quota_enforcement_storage_plugin::infra::storage::entity::contention_timeout_config;
         use sea_orm::ActiveValue::Set;
@@ -423,7 +405,7 @@ impl PgHarness {
         tokio::task::JoinHandle<Result<(), HolderError>>,
         tokio::sync::oneshot::Sender<()>,
     ) {
-        use quota_enforcement_storage_plugin::infra::storage::repo::idempotency_repo::lock_stripe;
+        use quota_enforcement_storage_plugin::infra::storage::repo::idempotency_repo::lock_stripes;
         let (held_tx, held_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let db = self.db.clone();
@@ -433,7 +415,11 @@ impl PgHarness {
                     let all = AccessScope::allow_all();
                     match held {
                         Held::Stripe(stripe) => {
-                            assert!(lock_stripe(tx, stripe).await?, "the stripe exists");
+                            assert_eq!(
+                                lock_stripes(tx, &[stripe]).await?,
+                                [stripe],
+                                "the stripe exists"
+                            );
                         }
                         Held::Quota(id) => {
                             quota_repo::find_by_id(tx, &all, id.as_uuid(), Some(RowWait::Wait))
@@ -476,11 +462,11 @@ impl PgHarness {
     /// A ten-minute lease of 1 over every Quota of `holders`.
     async fn lease(&self, holders: &[&str], key: &str) -> LeaseToken {
         let applicable = applicable(holders);
-        let idempotency = mutation_write(&applicable, OperationType::Reserve, key);
+        let idempotency = mutation_write(OperationType::Reserve, key);
         let null = serde_json::Value::Null;
         self.debits
             .acquire_lease(
-                &ctx(),
+                &actor(),
                 &scope(),
                 &mutation(&applicable, &idempotency, &null, 1),
                 Duration::from_mins(10),
@@ -543,7 +529,6 @@ impl PgHarness {
     async fn consumed(&self, holder: &str, id: QuotaId) -> u64 {
         self.debits
             .read_quota_snapshot(
-                &ctx(),
                 &scope(),
                 &ApplicableQuotas {
                     tenant_id: tenant(),
@@ -561,11 +546,11 @@ impl PgHarness {
 
 async fn debit(store: &SqlConsumptionStore, holder: &str, amount: u64, key: &str) {
     let applicable = applicable(&[holder]);
-    let idempotency = mutation_write(&applicable, OperationType::Debit, key);
+    let idempotency = mutation_write(OperationType::Debit, key);
     let null = serde_json::Value::Null;
     let outcome = store
         .apply_debit_plan(
-            &ctx(),
+            &actor(),
             &scope(),
             &mutation(&applicable, &idempotency, &null, amount),
             &[],
@@ -687,7 +672,8 @@ async fn identical_envelopes_under_one_key_apply_once() {
     let settle = |outcome: Result<TransitionOutcome<_>, StoreError>| async {
         match outcome {
             Ok(outcome) => outcome,
-            // Refused on the stripe at the 0 ms default: a retry replays.
+            // Refused on the stripe once the default budget runs out: a retry
+            // replays.
             Err(StoreError::ContentionTimeout) => h
                 .quotas
                 .bulk_create_quotas(&actor(), &envelope)

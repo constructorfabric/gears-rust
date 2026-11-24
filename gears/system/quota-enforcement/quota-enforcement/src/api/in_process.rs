@@ -43,9 +43,9 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         spec: QuotaSpec,
     ) -> Result<QuotaId, QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
+        let quotas = self.service.quotas(ctx)?;
         let request = CreateQuotaRequest::try_from(spec)?;
-        Ok(quotas.create(ctx, request).await?.quota.id)
+        Ok(quotas.create(request).await?.quota.id)
     }
 
     async fn update_quota(
@@ -53,9 +53,9 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::UpdateQuotaRequest,
     ) -> Result<(), QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
+        let quotas = self.service.quotas(ctx)?;
         let patch = UpdateQuotaRequest::try_from(request.patch)?;
-        quotas.update(ctx, request.quota_id, patch).await?;
+        quotas.update(request.quota_id, patch).await?;
         Ok(())
     }
 
@@ -64,8 +64,8 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         quota_id: QuotaId,
     ) -> Result<DeactivateOutcome, QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
-        Ok(quotas.deactivate(ctx, quota_id).await?)
+        let quotas = self.service.quotas(ctx)?;
+        Ok(quotas.deactivate(quota_id).await?)
     }
 
     async fn read_quotas(
@@ -73,9 +73,9 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::ReadQuotasRequest,
     ) -> Result<PageResult<QuotaView>, QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
+        let quotas = self.service.quotas(ctx)?;
         Ok(quotas
-            .list(ctx, ListQuotasRequest::from((request.filter, request.page)))
+            .list(ListQuotasRequest::from((request.filter, request.page)))
             .await?)
     }
 
@@ -84,7 +84,7 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::CreditRequest,
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
-        Ok(self.service.operations()?.credit(ctx, request).await?)
+        Ok(self.service.operations(ctx)?.credit(request).await?)
     }
 
     async fn bulk_create_quotas(
@@ -92,17 +92,14 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         request: BulkCreateQuotasRequest,
     ) -> Result<BulkCreated, QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
+        let quotas = self.service.quotas(ctx)?;
         let items = create_items(request.items);
         Ok(quotas
-            .bulk_create(
-                ctx,
-                BulkCreateRequest {
-                    tenant_id: request.tenant_id,
-                    idempotency_key: request.idempotency_key,
-                    items,
-                },
-            )
+            .bulk_create(BulkCreateRequest {
+                tenant_id: request.tenant_id,
+                idempotency_key: request.idempotency_key,
+                items,
+            })
             .await?)
     }
 
@@ -111,17 +108,14 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         request: BulkUpdateQuotasRequest,
     ) -> Result<BulkUpdated, QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
+        let quotas = self.service.quotas(ctx)?;
         let items = update_items(request.items);
         Ok(quotas
-            .bulk_update(
-                ctx,
-                BulkUpdateRequest {
-                    tenant_id: request.tenant_id,
-                    idempotency_key: request.idempotency_key,
-                    items,
-                },
-            )
+            .bulk_update(BulkUpdateRequest {
+                tenant_id: request.tenant_id,
+                idempotency_key: request.idempotency_key,
+                items,
+            })
             .await?)
     }
 
@@ -130,23 +124,20 @@ impl QuotaManagerApi for InProcessQuotaManager {
         ctx: &SecurityContext,
         request: BulkDeactivateQuotasRequest,
     ) -> Result<BulkDeactivated, QuotaEnforcementError> {
-        let quotas = self.service.quotas()?;
+        let quotas = self.service.quotas(ctx)?;
         Ok(quotas
-            .bulk_deactivate(
-                ctx,
-                BulkDeactivateRequest {
-                    tenant_id: request.tenant_id,
-                    idempotency_key: request.idempotency_key,
-                    items: request
-                        .items
-                        .into_iter()
-                        .map(|item| BulkDeactivateItem {
-                            idempotency_key: item.idempotency_key,
-                            quota_id: item.quota_id,
-                        })
-                        .collect(),
-                },
-            )
+            .bulk_deactivate(BulkDeactivateRequest {
+                tenant_id: request.tenant_id,
+                idempotency_key: request.idempotency_key,
+                items: request
+                    .items
+                    .into_iter()
+                    .map(|item| BulkDeactivateItem {
+                        idempotency_key: item.idempotency_key,
+                        quota_id: item.quota_id,
+                    })
+                    .collect(),
+            })
             .await?)
     }
 }
@@ -199,7 +190,7 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
         ctx: &SecurityContext,
         spec: quota_enforcement_sdk::PolicySpec,
     ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
-        Ok(self.service.policies()?.create(ctx, spec).await?)
+        Ok(self.service.policies(ctx)?.create(spec).await?)
     }
     async fn update_policy(
         &self,
@@ -208,8 +199,8 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
     ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
         Ok(self
             .service
-            .policies()?
-            .update(ctx, request.id, request.patch)
+            .policies(ctx)?
+            .update(request.id, request.patch)
             .await?)
     }
     async fn rollback_policy(
@@ -219,8 +210,8 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
     ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
         Ok(self
             .service
-            .policies()?
-            .rollback(ctx, request.id, request.target_version, request.comment)
+            .policies(ctx)?
+            .rollback(request.id, request.target_version, request.comment)
             .await?)
     }
     async fn delete_policy(
@@ -230,8 +221,8 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
     ) -> Result<(), QuotaEnforcementError> {
         Ok(self
             .service
-            .policies()?
-            .delete(ctx, request.id, request.comment)
+            .policies(ctx)?
+            .delete(request.id, request.comment)
             .await?)
     }
     async fn read_policy(
@@ -241,8 +232,8 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
     ) -> Result<quota_enforcement_sdk::PolicyVersion, QuotaEnforcementError> {
         Ok(self
             .service
-            .policies()?
-            .read(ctx, &request.id, request.version)
+            .policies(ctx)?
+            .read(&request.id, request.version)
             .await?)
     }
     async fn list_policy_versions(
@@ -252,8 +243,8 @@ impl quota_enforcement_sdk::QuotaOperatorApi for InProcessQuotaOperator {
     ) -> Result<PageResult<quota_enforcement_sdk::PolicyVersionMeta>, QuotaEnforcementError> {
         Ok(self
             .service
-            .policies()?
-            .list(ctx, &request.id, request.limit, request.cursor)
+            .policies(ctx)?
+            .list(&request.id, request.limit, request.cursor)
             .await?)
     }
 }
@@ -281,7 +272,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::DebitRequest,
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
-        Ok(self.service.operations()?.debit(ctx, request).await?)
+        Ok(self.service.operations(ctx)?.debit(request).await?)
     }
 
     async fn rollback(
@@ -289,7 +280,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::RollbackRequest,
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
-        Ok(self.service.operations()?.rollback(ctx, request).await?)
+        Ok(self.service.operations(ctx)?.rollback(request).await?)
     }
 
     async fn evaluate_preview(
@@ -297,7 +288,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::PreviewRequest,
     ) -> Result<quota_enforcement_sdk::DecisionPreview, QuotaEnforcementError> {
-        Ok(self.service.operations()?.preview(ctx, request).await?)
+        Ok(self.service.operations(ctx)?.preview(request).await?)
     }
 
     async fn acquire_lease(
@@ -305,11 +296,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::AcquireLeaseRequest,
     ) -> Result<quota_enforcement_sdk::AcquireLeaseOutcome, QuotaEnforcementError> {
-        Ok(self
-            .service
-            .operations()?
-            .acquire_lease(ctx, request)
-            .await?)
+        Ok(self.service.operations(ctx)?.acquire_lease(request).await?)
     }
 
     async fn commit_lease(
@@ -317,11 +304,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::CommitLeaseRequest,
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
-        Ok(self
-            .service
-            .operations()?
-            .commit_lease(ctx, request)
-            .await?)
+        Ok(self.service.operations(ctx)?.commit_lease(request).await?)
     }
 
     async fn release_lease(
@@ -329,11 +312,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::ReleaseLeaseRequest,
     ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
-        Ok(self
-            .service
-            .operations()?
-            .release_lease(ctx, request)
-            .await?)
+        Ok(self.service.operations(ctx)?.release_lease(request).await?)
     }
 
     async fn batch_debit(
@@ -341,7 +320,7 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         ctx: &SecurityContext,
         request: quota_enforcement_sdk::BatchDebitRequest,
     ) -> Result<quota_enforcement_sdk::BatchDecision, QuotaEnforcementError> {
-        Ok(self.service.operations()?.batch_debit(ctx, request).await?)
+        Ok(self.service.operations(ctx)?.batch_debit(request).await?)
     }
 
     async fn snapshot(
@@ -352,6 +331,6 @@ impl quota_enforcement_sdk::QuotaEnforcementApi for InProcessQuotaEnforcement {
         quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>,
         QuotaEnforcementError,
     > {
-        Ok(self.service.operations()?.snapshot(ctx, request).await?)
+        Ok(self.service.operations(ctx)?.snapshot(request).await?)
     }
 }

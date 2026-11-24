@@ -1,7 +1,4 @@
 #![allow(clippy::expect_used)]
-//! The lease sweeper over the in-memory double: it drains expired leases in
-//! batches, publishes the backlog it leaves, and withdraws that sample when a
-//! pass fails or leadership ends.
 
 use std::sync::{Arc, Mutex};
 
@@ -11,10 +8,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::harness_tests::{Harness, attribution};
 use super::{LeaseSweepTiming, LeaseSweeper};
+use crate::domain::catalog::CatalogEntry;
 use crate::domain::ports::metrics::{LeaseBacklog, LeaseBacklogSink, MetricLabel};
-use crate::test_support::ctx;
 
-/// Every sample the sweeper published, in order.
 #[derive(Default)]
 struct Samples(Mutex<Vec<Option<LeaseBacklog>>>);
 
@@ -31,18 +27,18 @@ impl LeaseBacklogSink for Samples {
 }
 
 fn tokens_label(h: &Harness) -> MetricLabel {
-    h.classifications
-        .label(
-            &quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
-                .expect("metric"),
-        )
-        .expect("the harness classifies the tokens metric")
+    let metric =
+        quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS).expect("metric");
+    let Some(CatalogEntry::Served(served)) = h.catalog.peek(&metric) else {
+        panic!("a lease acquisition left the tokens metric served");
+    };
+    served.label().clone()
 }
 
 fn sweeper(h: &Harness, batch: u32, samples: &Arc<Samples>) -> LeaseSweeper {
     LeaseSweeper::new(
         h.storage.clone(),
-        Arc::new(h.classifications.clone()),
+        Arc::clone(&h.catalog),
         Arc::clone(samples) as Arc<dyn LeaseBacklogSink>,
         LeaseSweepTiming {
             interval: std::time::Duration::from_millis(10),
@@ -56,15 +52,12 @@ async fn leases(h: &Harness, count: usize) -> Vec<quota_enforcement_sdk::LeaseTo
     for n in 0..count {
         let outcome = h
             .operations()
-            .acquire_lease(
-                &ctx(),
-                AcquireLeaseRequest {
-                    attribution: attribution(),
-                    amount: 1,
-                    ttl_secs: Some(60),
-                    idempotency_key: format!("lease-{n}"),
-                },
-            )
+            .acquire_lease(AcquireLeaseRequest {
+                attribution: attribution(),
+                amount: 1,
+                ttl_secs: Some(60),
+                idempotency_key: format!("lease-{n}"),
+            })
             .await
             .expect("acquire");
         let AcquireLeaseOutcome::Acquired { token, .. } = outcome else {

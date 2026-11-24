@@ -13,7 +13,7 @@ use axum::{Extension, Router};
 use quota_enforcement_sdk::testing::{InMemoryStorage, bundle_with_global_policy};
 use quota_enforcement_sdk::{
     EnforcementMode, QuotaDraft, QuotaEnforcementApi, QuotaEnforcementStoragePluginV1, QuotaSource,
-    QuotaType, SCOPE_TENANT, SCOPE_USER, SnapshotRequest, SnapshotSubject, SubjectRef,
+    QuotaType, SnapshotRequest, SnapshotSubject, SubjectRef,
 };
 use serde_json::{Value, json};
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;
@@ -25,8 +25,8 @@ use uuid::Uuid;
 use super::super::routes::{PATH_PREFIX, register_routes};
 use crate::domain::Service;
 use crate::test_support::{
-    LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_USER_PROJECTION, METRIC_REQUESTS,
-    METRIC_TOKENS, PermitTenantsPdp, bound_service_over, ctx, tenant,
+    METRIC_REQUESTS, METRIC_TOKENS, PermitTenantsPdp, TENANT_SUBJECT_TYPE, USER_SUBJECT_TYPE,
+    bound_service_over, ctx, tenant,
 };
 
 fn draft(subject: SubjectRef) -> QuotaDraft {
@@ -43,10 +43,6 @@ fn draft(subject: SubjectRef) -> QuotaDraft {
         fail_open_hint: false,
         metadata: serde_json::Map::new(),
         source: QuotaSource::Operator,
-        constraint_contract: quota_enforcement_sdk::ContractRef {
-            type_id: gts::GtsTypeId::new(LLM_TOKEN_CONSTRAINT),
-            version: 1,
-        },
     }
 }
 
@@ -59,16 +55,21 @@ async fn seeded_service() -> (Arc<Service>, Arc<InMemoryStorage>) {
     storage.bootstrap(&bundle).await.expect("bootstrap");
     for subject in [
         SubjectRef {
-            projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+            subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
             subject_id: "u-1".to_owned(),
         },
         SubjectRef {
-            projection_type: gts::GtsTypeId::new(LLM_TENANT_PROJECTION),
+            subject_type: gts::GtsTypeId::new(TENANT_SUBJECT_TYPE),
             subject_id: tenant().to_string(),
         },
     ] {
         storage
-            .create_quota(&ctx(), &AccessScope::allow_all(), draft(subject), &[])
+            .create_quota(
+                &crate::test_support::actor(),
+                &AccessScope::allow_all(),
+                draft(subject),
+                &[],
+            )
             .await
             .expect("quota");
     }
@@ -107,7 +108,7 @@ fn body(subjects: &[(&str, &str)]) -> Value {
         "tenant_id": tenant().as_uuid(),
         "subjects": subjects
             .iter()
-            .map(|(kind, id)| json!({ "kind": kind, "id": id, "metric": METRIC_TOKENS }))
+            .map(|(subject_type, id)| json!({ "type": subject_type, "id": id, "metric": METRIC_TOKENS }))
             .collect::<Vec<_>>(),
     })
 }
@@ -117,7 +118,7 @@ async fn a_page_carries_per_quota_state_and_no_policy_attribution() {
     let (service, _storage) = seeded_service().await;
     let app = app(service, ctx());
 
-    let (status, page) = snapshot(&app, body(&[(SCOPE_USER, "u-1")])).await;
+    let (status, page) = snapshot(&app, body(&[(USER_SUBJECT_TYPE, "u-1")])).await;
 
     assert_eq!(status, StatusCode::OK, "{page}");
     let items = page["items"].as_array().expect("items");
@@ -171,10 +172,11 @@ async fn an_operator_and_a_backend_get_the_same_state_shape() {
 
     let (_, as_operator) = snapshot(
         &app(Arc::clone(&service), ctx()),
-        body(&[(SCOPE_USER, "u-1")]),
+        body(&[(USER_SUBJECT_TYPE, "u-1")]),
     )
     .await;
-    let (_, as_backend) = snapshot(&app(service, backend), body(&[(SCOPE_USER, "u-1")])).await;
+    let (_, as_backend) =
+        snapshot(&app(service, backend), body(&[(USER_SUBJECT_TYPE, "u-1")])).await;
 
     assert_eq!(as_operator, as_backend);
 }
@@ -187,7 +189,7 @@ async fn a_target_matching_nothing_is_two_hundred_with_an_empty_page() {
         &app(service, ctx()),
         json!({
             "tenant_id": tenant().as_uuid(),
-            "subjects": [{ "kind": SCOPE_USER, "id": "u-1", "metric": METRIC_REQUESTS }],
+            "subjects": [{ "type": USER_SUBJECT_TYPE, "id": "u-1", "metric": METRIC_REQUESTS }],
         }),
     )
     .await;
@@ -204,8 +206,8 @@ async fn a_bad_target_is_a_four_hundred_naming_the_subject() {
     let (status, problem) = snapshot(
         &app,
         body(&[
-            (SCOPE_USER, "u-1"),
-            (SCOPE_TENANT, &Uuid::from_u128(0xbad).to_string()),
+            (USER_SUBJECT_TYPE, "u-1"),
+            (TENANT_SUBJECT_TYPE, &Uuid::from_u128(0xbad).to_string()),
         ]),
     )
     .await;
@@ -228,9 +230,10 @@ async fn the_in_process_client_answers_through_the_same_domain_path() {
             SnapshotRequest {
                 tenant_id: tenant(),
                 subjects: vec![SnapshotSubject {
-                    kind: SCOPE_TENANT.to_owned(),
+                    subject_type: TENANT_SUBJECT_TYPE.to_owned(),
                     id: tenant().to_string(),
                     metric: METRIC_TOKENS.to_owned(),
+                    metadata: None,
                 }],
                 limit: None,
                 cursor: None,

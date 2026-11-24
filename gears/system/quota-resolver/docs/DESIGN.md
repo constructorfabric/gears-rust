@@ -92,8 +92,8 @@ The design keeps the resolver thin:
 | `cpt-cf-quota-resolver-nfr-fail-closed`    | Never allow by default            | Gateway, error mapping     | No plugin and a registry failure are errors; a plugin error passes through as an error; not mapped is a denial. No code path builds an allowed result. | Tests for each condition: no allowed decision, no lease.      |
 | `cpt-cf-quota-resolver-nfr-tenant-scoping` | One tenant per operation          | Gateway                    | Platform plane: the tenant from the request. Tenant plane: `subject_tenant_id` from the context. The plugin receives exactly one tenant.          | Tests on both planes: the plugin receives the request's tenant (platform) or the caller's tenant (tenant plane), never another. |
 | `cpt-cf-quota-resolver-nfr-overhead`       | ≤ 5 ms p95 added at backend load  | Principal mapper, selector | Budget in §4.1: in-memory map lookups, memoized plugin and ancestor chains; no network call of its own once resolved.                                  | Boundary benchmark with a no-op plugin at the backend's throughput threshold. |
-| `cpt-cf-quota-resolver-nfr-throughput`     | Backend's ops/s, its p95 + 5 ms   | Gateway                    | No lock shared between calls; co-located with the backend gear, so it scales with it; per-call cost bounded by the overhead budget.                    | Load test through the resolver at the backend's throughput threshold; p95 compared with the backend's p95 threshold plus 5 ms. |
-| `cpt-cf-quota-resolver-nfr-availability`   | Backend's target, plugin only     | Principal mapper, selector | No other gear needed at start; after start types-registry only for the plugin and, once, for a principal type without its own entry; memoized chains and plugin serve the rest. | Test with types-registry stopped after warm-up: calls with resolved principal types succeed; availability tracked against the backend's target. |
+| `cpt-cf-quota-resolver-nfr-throughput`     | Backend's ops/s, its p95 + 5 ms   | Gateway                    | Once the plugin is selected, no lock is held across a call to another gear (the first selection is single-flight and holds its lock across the types-registry call); calls share only a read lock on the memo of resolved principal types, which is written once per type; co-located with the backend gear, so it scales with it; per-call cost bounded by the overhead budget.                    | Load test through the resolver at the backend's throughput threshold; p95 compared with the backend's p95 threshold plus 5 ms. |
+| `cpt-cf-quota-resolver-nfr-availability`   | Backend's target, plugin only     | Principal mapper, selector | At start types-registry must admit the resolver's GTS types, or the process does not start; after start types-registry only for the plugin and, once, for a principal type without its own entry; memoized chains and plugin serve the rest. | Test with types-registry stopped after warm-up: calls with resolved principal types succeed; availability tracked against the backend's target. |
 
 #### Key ADRs
 
@@ -174,7 +174,8 @@ Callers in other processes use the REST projections of the two public contracts.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-constraint-toolkit`
 
-The three contracts are `#[toolkit::contract]` traits. Each public contract has a `#[toolkit::rest_contract]`
+The two public contracts are `#[toolkit::contract]` traits; the plugin contract is a plain in-process trait. Each public
+contract has a `#[toolkit::rest_contract]`
 projection with its own base path (§3.3), as in types-registry. Errors are `CanonicalError`, rendered as RFC 9457
 Problem responses.
 
@@ -184,7 +185,7 @@ Problem responses.
 
 **Technology**: transport-agnostic Rust value objects in the SDK, with serde and utoipa schemas.
 
-**Location**: `quota-resolver-sdk/src/models.rs` (planned).
+**Location**: `quota-resolver-sdk/src/models.rs`.
 
 - [ ] `p2` - **ID**: `cpt-cf-quota-resolver-entity-request-model`
 
@@ -201,14 +202,14 @@ subject forms, whose wire shape is fixed below the table.
 | Metric item                   | One metric of a debit or a lease acquisition: a metric object and its amount. A **metric object** is `{type, id?, metadata}`: `type` is the metric type, a GTS type id derived from `gts.cf.core.quota.metric.v1~`; `id` is optional and names the one thing the amount is counted for, for example a model or a virtual machine; `metadata` holds the attributes of the operation that the backend's policies read (required, may be empty). All items of a request are applied or none. |
 | `PlatformDebitRequest`        | The tenant, the subjects (at least one), the metric items (at least one), and an idempotency key. |
 | `PlatformAcquireLeaseRequest` | What a debit carries, plus the requested lease duration.                                                                                                                                            |
-| `PlatformCommitLeaseRequest`  | The tenant, the lease token, the actual amount of each metric of the lease, named by its metric type id (absent means the full held amounts), and an idempotency key.                                                                                       |
+| `PlatformCommitLeaseRequest`  | The tenant, the lease token, the actual amount of each metric of the lease, named by its metric type id (absent means the full held amounts; an empty list is refused), and an idempotency key.                                                                                       |
 | `PlatformReleaseLeaseRequest` | The tenant, the lease token, and an idempotency key.                                                                                                                                               |
 | `PlatformReturnRequest`       | The tenant, the charge (its operation, debit or lease commit, and its idempotency key), the amounts to return, each with the id of its metric type (at least one), and the return's own idempotency key.                                                                   |
-| `PlatformQuotaStateRequest`   | The tenant, one subject, the metrics to read (metric type ids, at most 100), and paging.                                                                                                                                          |
+| `PlatformQuotaStateRequest`   | The tenant, one subject, the metrics to read (1 to 100), and paging. Each metric is a `QuotaStateMetric`: the metric type id as `type` and, optionally, the `metadata` of a request's metric object; with it the backend returns only the quotas that apply to such a request.                                                                                                                                          |
 | `QuotaStateRequest`           | The tenant-plane read: the metrics and paging only. It has no subject and no tenant, so the caller cannot name either.                                                                           |
 | `QuotaDecision`               | The verdict of a debit or a lease acquisition: allowed or denied, the reason for a denial, and a map of non-authoritative diagnostics. The reason is one of a closed set that the SDK defines, so that a caller can branch on it: `quota_exceeded` (the quotas of the backend deny the request), `no_applicable_quota` (no quota applies to the request), and `principal_not_mapped` (set by the resolver, §3.2). A later SDK version can add a reason without a major version: the type is not exhaustive, and a caller treats a reason it does not know as a denial. A backend maps its own reasons to this set and puts its own text and identifiers, for example the ids of the quotas that deny, into the diagnostics.  |
-| `LeaseOutcome`                | An acquired lease (its token and expiry) or a denial with its `QuotaDecision`.                                                                                                                     |
-| `QuotaState`                  | The state of one quota: its id, its `QuotaSubject`, the metric type id, the cap or none, the consumed and remaining amounts, and, for a quota with a period, the current period with its reset time.                                  |
+| `LeaseOutcome`                | An acquired lease (its token and expiry) or a denial with its `QuotaDecision`. A caller treats an outcome it does not know as no lease.                                                                                                                     |
+| `QuotaState`                  | The state of one quota: its id, its `QuotaSubject`, the metric type id, the cap or none, the consumed and remaining amounts, for a quota with a period the current period with its reset time, and, for a quota limited to some requests, `metadata`: the attributes of a request's metric `metadata` that the quota requires, each with a value or a list of values.                                  |
 | Plugin requests               | `PluginDebitRequest`, `PluginAcquireLeaseRequest`, `PluginQuotaStateRequest`: the platform request with every subject a `QuotaSubject`. Commit, release, and return need no conversion; the plugin receives their platform requests. |
 
 **Subject wire forms**: each subject of a platform request is one JSON object. Its `kind` selects the form, and the
@@ -296,7 +297,7 @@ graph LR
     C[Consuming module or platform service] -->|PlatformQuotaResolverApi| G[Gateway]
     E[Edge] -->|QuotaResolverApi: quota-state| G
     G --> M[Principal mapper]
-    M -->|ancestor chain| R[types-registry]
+    M -->|is the type registered| R[types-registry]
     G --> S[Plugin selector]
     S -->|plugin instances| R
     G -->|QuotaResolverPluginClient| A[Backend plugin]
@@ -341,12 +342,18 @@ It turns the two planes and the two subject forms into one plugin call.
   tenant from `subject_tenant_id`, then runs the platform-plane quota state path.
 * **Principal mapper**: looks up `principal_subject_types` (principal type → quota subject type):
   1. it uses the entry for the type itself;
-  2. otherwise it resolves the type in types-registry and takes the nearest ancestor that has an entry;
-  3. it memoizes the resolved chain per type. A registered GTS type id never changes, so the cached chain stays valid. A type that is not registered is not memoized, so a type registered later is mapped on its next call.
+  2. otherwise, when the configuration has no entry at all, the type is not mapped and types-registry is not asked;
+  3. otherwise it asks types-registry whether the type is registered and active, and takes the nearest ancestor
+     that has an entry; the ancestors are read from the type id, not from the registry;
+  4. it memoizes the answer per type for the life of the process. The ancestors of a type are part of its GTS type
+     id, so they never change. A type that is not registered is not memoized, so a type registered later is mapped on
+     its next call. A type that is deleted after its answer was memoized stays mapped until the process restarts.
 * **Not mapped**: an absent, malformed, or unregistered type is not mapped (a type that types-registry returns as
-  deleted is an unregistered type), and so is a nil principal id or, on the
+  deleted on its first lookup is an unregistered type), and so is a nil principal id or, on the
   tenant plane, a nil tenant. The result:
-  * a write that has such a subject is denied with `principal_not_mapped`;
+  * a write that has such a subject is denied with `principal_not_mapped`; a caller with no principal type cannot be
+    sent as a principal subject at all (`PrincipalSubject::from_security_context` returns none), and the module then
+    refuses the work instead of skipping the charge;
   * a quota state read returns an empty page.
 * **Plugin selector**: resolves the plugin instance from types-registry by vendor and priority, memoizes it, and calls
   it through scoped ClientHub.
@@ -415,7 +422,8 @@ process; a caller in the same process has no identity of its own, so the record 
 | `PlatformQuotaResolverApi` | `/quota-resolver/v1/platform` | `PlatformSecurityContext` | `quota_state`       | `/quota-state`       | internal    | `Page<QuotaState>` |
 | `QuotaResolverApi`         | `/quota-resolver/v1`          | `SecurityContext`         | `quota_state`       | `/quota-state`       | **exposed** | `Page<QuotaState>` |
 
-The exposed `quota-state` route gets a rate-limit zone of the API gateway, keyed on the caller's identity: every
+The exposed `quota-state` route gets a rate-limit zone of the API gateway, `rl_quota_resolver_quota_state`, which the
+gateway configuration must declare (api-gateway does not start without it), keyed on the caller's identity: every
 authenticated user can call it, and each call reaches the backend. A request that names more than 100 metrics is
 `InvalidArgument`.
 
@@ -429,11 +437,17 @@ reads are `SafeRead`.
 | Malformed subject form or unknown field in a subject | `InvalidArgument`                       |
 | No subject, several subjects in a quota state request, or a tenant subject of another tenant | `InvalidArgument` |
 | No metric item in a debit or lease acquisition request, or a metric object without `type` or `metadata` | `InvalidArgument` |
-| No plugin, types-registry unavailable                | `ServiceUnavailable`                    |
+| No metric, or more than 100 metrics, in a quota state request | `InvalidArgument` |
+| No plugin, types-registry unavailable or not answering in time | `ServiceUnavailable`          |
+| Another types-registry error (a refused credential, a malformed answer), or a malformed plugin instance | `Internal` |
 | Any plugin error                                     | passed through unchanged                |
 | Plugin error `Aborted`: the backend could not take a lock in time, for example while an earlier attempt of the call runs. A backend uses it only when a repeat with the same key can succeed | passed through unchanged; the caller may retry with the same key |
 | Plugin error `AlreadyExists`: the idempotency key is in use for another request | passed through unchanged; the caller must not retry and needs a new key |
 | Principal not mapped                                 | not an error: a denial or an empty page |
+
+Accepted deviation: on the exposed route `quota-state` a body that is not valid JSON, or does not have the form of
+the request, is refused by the HTTP framework before the gateway reads it. The answer is HTTP 422 with a Problem of
+type `about:blank`, not the canonical `InvalidArgument`.
 
 A denial is a successful call; only a failure to decide is an error.
 
@@ -441,7 +455,7 @@ A denial is a successful call; only a failure to decide is an error.
 
 | Dependency Gear | Interface Used                                           | Purpose                                              |
 |-----------------|----------------------------------------------------------|------------------------------------------------------|
-| types-registry  | `TypesRegistryClient`                                    | Plugin discovery; ancestor chains of principal types |
+| types-registry  | `PlatformTypesRegistryApi`                               | Plugin discovery; whether a principal type is registered |
 | quota backend   | `QuotaResolverPluginClient` (implemented by the backend) | Quota operations                                     |
 | api-gateway     | `rest_contract` route registration                       | REST routes and edge publication                     |
 
@@ -470,7 +484,7 @@ sequenceDiagram
     Note over M: user request with the user's SecurityContext
     M->>M: subject = principal(ctx.subject_type, ctx.subject_id), tenant = ctx.subject_tenant_id
     M->>G: PlatformQuotaResolverApi.acquire_lease(platform ctx, {tenant, subjects: [subject], items: [{metric: {type, metadata}, amount}], ttl, key})
-    G->>R: ancestor chain of subject_type (first call only)
+    G->>R: is subject_type registered (only for a type without its own entry, first call only)
     G->>G: map to quota subject type
     G->>A: acquire_lease({tenant, [{type, id}], ...})
     A-->>G: acquired {token, expires_at}
@@ -568,10 +582,14 @@ the warm-cache budget.
 | `quota_resolver_operation`   | counter   | `operation`, `plane` (`platform`, `tenant`), `outcome` (`allowed`, `denied`, `principal_not_mapped`, `error`) |
 | `quota_resolver_overhead_ms` | histogram | none                                                                                                |
 
-When the plugin rejects a debit or a lease acquisition with `InvalidArgument` and that request has a mapped
-principal, the gateway logs a throttled warning. A quota state read logs none: there the backend gives no error for
+A plugin that refuses a request for a subject **MUST** answer `InvalidArgument` with a field violation that names
+the subject field as the request has it. A debit and a lease acquisition carry the list `subjects`, so the field
+starts with `subjects`, for example `subjects[0].type`. A quota state read carries one `subject`, so the field starts
+with `subject`, for example `subject.type`. The gateway names the fields of its own checks the same way. When the plugin rejects a debit or
+a lease acquisition this way, and that request has a mapped principal, the gateway logs a throttled warning. A rejection of another field, such as the
+amount, says nothing about the mapping and logs none. A quota state read logs none: there the backend gives no error for
 a subject type that the metric does not admit. The warning names the principal type and the quota subject type, because this most likely means a
-mapping to a subject type that the metric does not admit.
+mapping to a subject type that the metric does not admit or that is not registered.
 
 ### 4.3 Security
 
@@ -580,11 +598,14 @@ mapping to a subject type that the metric does not admit.
 * The tenant plane has no write operation; its only route, `quota-state`, is exposed.
 * No policy check runs in the resolver. Platform callers are trusted by the resolver, also for the principal they pass
   as data; on the tenant plane the context fixes the subject and the tenant (`cpt-cf-quota-resolver-adr-two-planes`).
-  This is an exception to `cpt-cf-adr-two-plane-auth` until the toolkit authorizes platform-plane callers.
+  No component checks which platform service may charge which tenant: this is an exception to
+  `cpt-cf-adr-two-plane-auth` until the toolkit authorizes platform-plane callers
+  ([#6037](https://github.com/constructorfabric/gears-rust/issues/6037)).
 * The backend decides which quotas a quota state read returns; the resolver returns the backend's page unchanged.
 * A charge never carries a user's `SecurityContext`, and the resolver never synthesizes one. A module that reads its
   user's quota state passes that user's context to the tenant plane, which limits the read to that user.
-* A commit or release accepts any lease token of the request's tenant; the token is an unguessable capability.
+* A commit or release accepts any lease token of the request's tenant. The token is not a secret: any platform
+  caller that names the tenant may settle its leases.
 
 ## 5. Traceability
 

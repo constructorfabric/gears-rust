@@ -2985,6 +2985,7 @@ dependencies = [
  "cf-gears-policy-engine",
  "cf-gears-quota-enforcement",
  "cf-gears-quota-enforcement-storage-plugin",
+ "cf-gears-quota-resolver",
  "cf-gears-resource-group",
  "cf-gears-rg-tr-plugin",
  "cf-gears-service-discovery",
@@ -4153,6 +4154,8 @@ dependencies = [
  "cf-gears-quota-enforcement-engine-most-restrictive",
  "cf-gears-quota-enforcement-sdk",
  "cf-gears-quota-enforcement-storage-plugin",
+ "cf-gears-quota-resolver",
+ "cf-gears-quota-resolver-sdk",
  "cf-gears-standalone-cluster-plugin",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
@@ -4163,10 +4166,12 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "chrono",
  "criterion",
  "futures",
  "gts",
  "inventory",
+ "lru",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -4210,6 +4215,7 @@ version = "0.5.5"
 dependencies = [
  "async-trait",
  "axum",
+ "cf-gears-quota-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-contract",
@@ -4263,6 +4269,62 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-quota-resolver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "cf-gears-quota-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "gts",
+ "inventory",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-test",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-quota-resolver-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "chrono",
+ "gts",
+ "schemars 1.2.3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "utoipa",
  "uuid",
 ]
 

@@ -1,4 +1,4 @@
-//! `qe_lease_holds`: one row per Quota in a lease's plan.
+//! `qe_lease_holds`: one row per entry of a lease's plan.
 //!
 //! Separate rows rather than an array on the lease, so a Quota's holds are
 //! reachable from the Quota side: the deactivation cascade and the
@@ -32,6 +32,10 @@ pub struct Model {
     /// The acquisition period of a consumption Quota, fixed here and never
     /// recomputed: every settlement of this hold lands on it (I5).
     pub period_id: Option<Uuid>,
+    /// Chain of the plan entry this hold applied (ADR-0010).
+    pub chain: i32,
+    /// Position of that entry inside its chain, primary pool first.
+    pub position: i32,
     /// When the capacity was given back, by whichever writer or sweep got here
     /// first. `NULL` while the counter still carries it.
     pub returned_at: Option<OffsetDateTime>,

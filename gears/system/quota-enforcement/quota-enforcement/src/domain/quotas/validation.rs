@@ -10,8 +10,7 @@
 
 use quota_enforcement_sdk::{
     CapPatch, EnforcementMode, MetricId, PageRequest, PeriodType, Quota, QuotaFilter, QuotaPatch,
-    QuotaSource, QuotaType, SubjectRef, SubjectScope, TenantId, ValidityWindow,
-    ValidityWindowPatch,
+    QuotaSource, QuotaType, SubjectRef, TenantId, ValidityWindow, ValidityWindowPatch,
 };
 use serde_json::{Map, Value};
 use toolkit_macros::domain_model;
@@ -19,15 +18,26 @@ use toolkit_macros::domain_model;
 use super::request::{
     CreateQuotaRequest, IMMUTABLE_FIELDS, ListQuotasRequest, Presence, UpdateQuotaRequest,
 };
-use crate::domain::catalog::parse_metric_under_base;
+use crate::domain::catalog::MetricCatalog;
 use crate::domain::error::DomainError;
 use crate::domain::tokens;
 
 /// The reserved capability name in `NotYetImplemented`.
 pub const RATE_QUOTAS: &str = "rate quotas";
 
-/// Longest `subject_id` accepted for a non-tenant scope.
+/// Longest `subject_id` accepted for a subject that is not the tenant.
 pub const SUBJECT_ID_MAX_LEN: usize = 256;
+
+/// Longest idempotency key accepted, in characters: at most 1 KiB of UTF-8,
+/// well within what an index entry of the storage backend can hold.
+pub const IDEMPOTENCY_KEY_MAX_LEN: usize = 256;
+
+/// The most subjects one request may name. A request names at most one
+/// subject of a type, and each type costs a catalogue check and a PDP property.
+pub const SUBJECTS_MAX: usize = 16;
+
+/// Longest `id` of a metric object accepted, in characters.
+pub const METRIC_ID_MAX_LEN: usize = 256;
 
 /// Operator-configured bounds of the lifecycle surface.
 #[domain_model]
@@ -43,8 +53,7 @@ pub struct QuotaLimits {
     pub bulk_max_items: usize,
 }
 
-/// A create request that passed the draft validation. Everything but the
-/// constraint contract, which the catalogue supplies.
+/// A create request that passed the draft validation.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShapedDraft {
@@ -52,7 +61,7 @@ pub struct ShapedDraft {
     pub tenant_id: TenantId,
     /// The explicit target subject.
     pub subject: SubjectRef,
-    /// The metric, well-formed under the metric base.
+    /// The metric type, well-formed under the metric base.
     pub metric: MetricId,
     /// Accounting model; never `rate`.
     pub quota_type: QuotaType,
@@ -68,7 +77,7 @@ pub struct ShapedDraft {
     pub validity_window: Option<ValidityWindow>,
     /// Informational fail-open hint.
     pub fail_open_hint: bool,
-    /// Metadata to validate against the constraint contract.
+    /// The Quota's conditions, checked against the metric type.
     pub metadata: Map<String, Value>,
     /// Who imposes the Quota.
     pub source: QuotaSource,
@@ -89,9 +98,12 @@ fn invalid(field: &'static str, reason: &'static str) -> DomainError {
 // @cpt-dod:cpt-cf-quota-enforcement-dod-rate-rejection:p1
 pub fn validate_create_shape(req: CreateQuotaRequest) -> Result<ShapedDraft, DomainError> {
     if req.subject.subject_id.trim().is_empty() {
-        return Err(invalid("subject.subject_id", tokens::SUBJECT_ID_REQUIRED));
+        return Err(invalid("subject.id", tokens::SUBJECT_ID_REQUIRED));
     }
-    let metric = parse_metric_under_base(&req.metric)
+    if MetricCatalog::parse_subject_type(req.subject.subject_type.as_ref()).is_none() {
+        return Err(invalid("subject.type", tokens::SUBJECT_TYPE_INVALID));
+    }
+    let metric = MetricCatalog::parse_metric(&req.metric)
         .ok_or_else(|| invalid("metric", tokens::METRIC_INVALID))?;
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-draft-validation:p1:inst-qdv-type
@@ -290,8 +302,6 @@ pub fn validate_update_shape(req: UpdateQuotaRequest) -> Result<QuotaPatch, Doma
         notification_thresholds: req.notification_thresholds,
         validity_window,
         metadata: req.metadata,
-        // Filled by the service once the metadata passed its contract.
-        constraint_contract: None,
         enforcement_mode: req.enforcement_mode,
         fail_open_hint: req.fail_open_hint,
     };
@@ -344,32 +354,28 @@ impl Not for bool {
     }
 }
 
-/// The explicit `subject_id` against the declared scope of the resolved
-/// projection: a tenant-scope subject is the target tenant itself; any other
-/// scope takes a non-empty, bounded identifier.
+/// The explicit subject id against its type: a tenant-type subject is the
+/// target tenant itself; any other subject takes a bounded identifier.
 ///
 /// # Errors
 ///
-/// `InvalidArgument` with `SUBJECT_SCOPE_VIOLATION` on `subject.subject_id`.
+/// `InvalidArgument` on `subject.id` with `TENANT_SUBJECT_MISMATCH` or
+/// `SUBJECT_ID_TOO_LONG`.
+// @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-subject-scope
 pub fn validate_subject_scope(
-    scope: &SubjectScope,
+    subject: &SubjectRef,
     tenant_id: TenantId,
-    subject_id: &str,
 ) -> Result<(), DomainError> {
-    let accepted = if scope.is_tenant() {
-        subject_id == tenant_id.to_string()
-    } else {
-        !subject_id.trim().is_empty() && subject_id.chars().count() <= SUBJECT_ID_MAX_LEN
-    };
-    if accepted {
-        Ok(())
-    } else {
-        Err(invalid(
-            "subject.subject_id",
-            tokens::SUBJECT_SCOPE_VIOLATION,
-        ))
+    if subject.is_tenant() {
+        if subject.subject_id != tenant_id.to_string() {
+            return Err(invalid("subject.id", tokens::TENANT_SUBJECT_MISMATCH));
+        }
+    } else if subject.subject_id.chars().count() > SUBJECT_ID_MAX_LEN {
+        return Err(invalid("subject.id", tokens::SUBJECT_ID_TOO_LONG));
     }
+    Ok(())
 }
+// @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-subject-scope
 
 /// The list gate: the subject halves come together, the ids and the page are
 /// bounded, the metric parses. Returns the storage filter and page.
@@ -381,15 +387,15 @@ pub fn validate_list(
     req: ListQuotasRequest,
     limits: &QuotaLimits,
 ) -> Result<(QuotaFilter, PageRequest), DomainError> {
-    let subject = match (req.projection_type, req.subject_id) {
-        (Some(projection_type), Some(subject_id)) => Some(SubjectRef {
-            projection_type,
+    let subject = match (req.subject_type, req.subject_id) {
+        (Some(subject_type), Some(subject_id)) => Some(SubjectRef {
+            subject_type,
             subject_id,
         }),
         (None, None) => None,
         (Some(_), None) => return Err(invalid("subject_id", tokens::LIST_SUBJECT_INCOMPLETE)),
         (None, Some(_)) => {
-            return Err(invalid("projection_type", tokens::LIST_SUBJECT_INCOMPLETE));
+            return Err(invalid("subject_type", tokens::LIST_SUBJECT_INCOMPLETE));
         }
     };
     if req.ids.len() > limits.list_max_ids {
@@ -399,7 +405,8 @@ pub fn validate_list(
         .metric
         .as_deref()
         .map(|text| {
-            parse_metric_under_base(text).ok_or_else(|| invalid("metric", tokens::METRIC_INVALID))
+            MetricCatalog::parse_metric(text)
+                .ok_or_else(|| invalid("metric", tokens::METRIC_INVALID))
         })
         .transpose()?;
     let limit = match req.limit {

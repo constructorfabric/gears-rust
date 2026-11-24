@@ -12,9 +12,10 @@
 
 use std::sync::Arc;
 
-use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, PolicyScope, StorageError};
+use quota_enforcement_sdk::{
+    Actor, BackgroundTask, BootstrapBundle, ConfigDefaults, PolicyScope, StorageError,
+};
 use toolkit_macros::domain_model;
-use toolkit_security::SecurityContext;
 
 use super::ports::{
     ConsumptionStore, FoundationStore, LeaseStore, NotificationPipeline, PolicyStore, QuotaStore,
@@ -137,10 +138,15 @@ impl StoragePlugin {
         {
             return Ok(());
         }
-        // Bootstrap has no principal; the nil subject records that absence.
         match self
             .policies
-            .create_policy(&SecurityContext::anonymous(), draft, &[])
+            .create_policy(
+                &Actor::Task {
+                    task: BackgroundTask::Bootstrap,
+                },
+                draft,
+                &[],
+            )
             .await
         {
             Ok(seeded) => {
@@ -240,7 +246,6 @@ impl FromStore for StorageError {
             StoreError::ContentionTimeout => Self::LeaseContentionTimeout,
             StoreError::BulkItem { index, cause } => Self::from_store(*cause).at_item(index),
             StoreError::DefaultOutOfRange { .. }
-            | StoreError::InvalidPatch { .. }
             | StoreError::InvalidFilter { .. }
             | StoreError::ValueOutOfRange { .. }
             | StoreError::Corrupt { .. } => Self::Internal(err.to_string()),

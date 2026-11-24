@@ -7,6 +7,7 @@
 //! omitted on `SQLite`, whose writers serialize) is taken on the plain select
 //! before the secure layer scopes it.
 
+use quota_enforcement_sdk::QuotaType;
 use sea_orm::sea_query::{Condition, Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder, QuerySelect,
@@ -26,9 +27,9 @@ use crate::infra::storage::quota_mapping::{QuotaUpdate, STATUS_ACTIVE, STATUS_DE
 pub struct ListQuery<'a> {
     /// Owning tenant.
     pub tenant_id: Option<Uuid>,
-    /// `(projection_type, subject_id)`.
+    /// `(subject_type, subject_id)`.
     pub subject: Option<(&'a str, &'a str)>,
-    /// Metric instance id.
+    /// Metric type id.
     pub metric: Option<&'a str>,
     /// Stored status name.
     pub status: Option<&'a str>,
@@ -40,19 +41,10 @@ pub struct ListQuery<'a> {
     pub limit: u64,
 }
 
-/// One `(metric, projection_type)` pair of the bindings aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
-pub struct BindingRow {
-    /// Metric instance id.
-    pub metric: String,
-    /// Subject projection type id.
-    pub projection_type: String,
-}
-
 /// One row of the per-metric count aggregate.
 #[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
 pub struct MetricCountRow {
-    /// Metric instance id.
+    /// Metric type id.
     pub metric: String,
     /// Active Quotas on it.
     pub total: i64,
@@ -105,9 +97,9 @@ pub async fn list_page(
     if let Some(tenant) = query.tenant_id {
         condition = condition.add(Column::TenantId.eq(tenant));
     }
-    if let Some((projection_type, subject_id)) = query.subject {
+    if let Some((subject_type, subject_id)) = query.subject {
         condition = condition
-            .add(Column::ProjectionType.eq(projection_type))
+            .add(Column::SubjectType.eq(subject_type))
             .add(Column::SubjectId.eq(subject_id));
     }
     if let Some(metric) = query.metric {
@@ -166,17 +158,6 @@ pub async fn apply_update(
     if let Some(metadata) = &update.metadata {
         statement = statement.col_expr(Column::Metadata, Expr::value(metadata.clone()));
     }
-    if let Some((contract_type, contract_version)) = &update.constraint_contract {
-        statement = statement
-            .col_expr(
-                Column::ConstraintContractType,
-                Expr::value(contract_type.clone()),
-            )
-            .col_expr(
-                Column::ConstraintContractVersion,
-                Expr::value(*contract_version),
-            );
-    }
     if let Some(mode) = &update.enforcement_mode {
         statement = statement.col_expr(Column::EnforcementMode, Expr::value(mode.clone()));
     }
@@ -192,8 +173,9 @@ pub async fn apply_update(
     Ok(result.rows_affected == 1)
 }
 
-/// Flip the active row at `expected_version` to `deactivated`. `false` when
-/// no such row exists any more.
+/// Flip the active row at `expected_version` to `deactivated`, marking an
+/// allocation Quota `holds_pending` for the sweeper. `false` when no such row
+/// exists any more.
 ///
 /// # Errors
 ///
@@ -207,6 +189,10 @@ pub async fn mark_deactivated(
 ) -> Result<bool, ScopeError> {
     let result = Entity::update_many()
         .col_expr(Column::Status, Expr::value(STATUS_DEACTIVATED))
+        .col_expr(
+            Column::HoldsPending,
+            Expr::col(Column::QuotaType).eq(QuotaType::Allocation.as_gts_id()),
+        )
         .col_expr(Column::RecordVersion, Expr::value(expected_version + 1))
         .col_expr(Column::UpdatedAt, Expr::value(now))
         .filter(cas_predicate(id, expected_version))
@@ -222,26 +208,6 @@ fn cas_predicate(id: Uuid, expected_version: i32) -> Condition {
         .add(Column::Id.eq(id))
         .add(Column::Status.eq(STATUS_ACTIVE))
         .add(Column::RecordVersion.eq(expected_version))
-}
-
-/// Distinct `(metric, projection_type)` pairs of active rows, platform-wide.
-///
-/// # Errors
-///
-/// The database error of the read.
-pub async fn active_bindings(runner: &impl DBRunner) -> Result<Vec<BindingRow>, ScopeError> {
-    Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .filter(Condition::all().add(Column::Status.eq(STATUS_ACTIVE)))
-        .project_all(runner, |q| {
-            q.select_only()
-                .column(Column::Metric)
-                .column(Column::ProjectionType)
-                .distinct()
-                .into_model::<BindingRow>()
-        })
-        .await
 }
 
 /// Active rows per metric, platform-wide.
@@ -262,6 +228,50 @@ pub async fn active_counts_by_metric(
                 .column_as(Expr::col(Column::Id).count(), "total")
                 .group_by(Column::Metric)
                 .into_model::<MetricCountRow>()
+        })
+        .await
+}
+
+/// One row of the per-metric aggregate of distinct conditions.
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct ConditionsCountRow {
+    /// Metric type id.
+    pub metric: String,
+    /// The stored `metadata` JSON.
+    pub metadata: String,
+    /// Active Quotas that carry it.
+    pub total: i64,
+}
+
+/// The distinct non-empty `metadata` of the active rows of each metric,
+/// platform-wide, at most `limit` of them.
+///
+/// # Errors
+///
+/// The database error of the read.
+pub async fn active_conditions(
+    runner: &impl DBRunner,
+    limit: u64,
+) -> Result<Vec<ConditionsCountRow>, ScopeError> {
+    Entity::find()
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .filter(
+            Condition::all()
+                .add(Column::Status.eq(STATUS_ACTIVE))
+                .add(Column::Metadata.ne("{}")),
+        )
+        .project_all(runner, |q| {
+            q.select_only()
+                .column(Column::Metric)
+                .column(Column::Metadata)
+                .column_as(Expr::col(Column::Id).count(), "total")
+                .group_by(Column::Metric)
+                .group_by(Column::Metadata)
+                .order_by(Column::Metric, Order::Asc)
+                .order_by(Column::Metadata, Order::Asc)
+                .limit(limit)
+                .into_model::<ConditionsCountRow>()
         })
         .await
 }
@@ -303,19 +313,20 @@ pub async fn count_active_cap_unbounded(runner: &impl DBRunner) -> Result<u64, S
 }
 
 /// One target of a snapshot read: a tenant's Quotas on `metric` bound to one
-/// of `subjects`, each `(projection_type, subject_id)`.
+/// of `subjects`, each `(subject_type, subject_id)`.
 #[derive(Debug, Clone)]
 pub struct SnapshotPair {
     /// Owning tenant.
     pub tenant_id: Uuid,
     /// The metric.
     pub metric: String,
-    /// `(projection_type, subject_id)` pairs.
+    /// `(subject_type, subject_id)` pairs.
     pub subjects: Vec<(String, String)>,
 }
 
 /// The active Quota rows any of `pairs` selects, each once, ascending by id,
-/// after `after` and at most `limit` of them.
+/// after `after` and at most `limit` of them; with `window_at`, only those
+/// whose validity window contains it.
 ///
 /// The read takes no lock: a snapshot read reads under its transaction's
 /// snapshot and never mutates a Quota.
@@ -329,14 +340,15 @@ pub async fn find_snapshot_rows(
     pairs: &[SnapshotPair],
     after: Option<Uuid>,
     limit: Option<u64>,
+    window_at: Option<OffsetDateTime>,
 ) -> Result<Vec<quota::Model>, ScopeError> {
     let mut targets = Condition::any();
     for pair in pairs.iter().filter(|pair| !pair.subjects.is_empty()) {
         let mut subjects = Condition::any();
-        for (projection_type, subject_id) in &pair.subjects {
+        for (subject_type, subject_id) in &pair.subjects {
             subjects = subjects.add(
                 Condition::all()
-                    .add(Column::ProjectionType.eq(projection_type.as_str()))
+                    .add(Column::SubjectType.eq(subject_type.as_str()))
                     .add(Column::SubjectId.eq(subject_id.as_str())),
             );
         }
@@ -355,6 +367,19 @@ pub async fn find_snapshot_rows(
         .add(targets);
     if let Some(after) = after {
         condition = condition.add(Column::Id.gt(after));
+    }
+    if let Some(at) = window_at {
+        condition = condition
+            .add(
+                Condition::any()
+                    .add(Column::ValidityStart.is_null())
+                    .add(Column::ValidityStart.lte(at)),
+            )
+            .add(
+                Condition::any()
+                    .add(Column::ValidityEnd.is_null())
+                    .add(Column::ValidityEnd.gte(at)),
+            );
     }
     let query = Entity::find()
         .filter(condition)
@@ -387,10 +412,10 @@ pub async fn find_applicable_ids(
         return Ok(Vec::new());
     }
     let mut pairs = Condition::any();
-    for (projection_type, subject_id) in subjects {
+    for (subject_type, subject_id) in subjects {
         pairs = pairs.add(
             Condition::all()
-                .add(Column::ProjectionType.eq(projection_type.as_str()))
+                .add(Column::SubjectType.eq(subject_type.as_str()))
                 .add(Column::SubjectId.eq(subject_id.as_str())),
         );
     }

@@ -8,12 +8,12 @@ use super::{CreateQuotaDto, UpdateQuotaDto};
 use crate::domain::error::DomainError;
 use crate::domain::quotas::{CreateQuotaRequest, Presence, UpdateQuotaRequest};
 use crate::domain::tokens;
-use crate::test_support::{LLM_USER_PROJECTION, METRIC_TOKENS};
+use crate::test_support::{METRIC_TOKENS, USER_SUBJECT_TYPE};
 
 fn create_body() -> Value {
     json!({
         "tenant_id": Uuid::from_u128(1),
-        "subject": { "projection_type": LLM_USER_PROJECTION, "subject_id": "u1" },
+        "subject": { "type": USER_SUBJECT_TYPE, "id": "u1" },
         "metric": METRIC_TOKENS,
         "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
         "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
@@ -29,10 +29,7 @@ fn create_bodies_keep_period_presence_and_signed_caps() {
     assert_eq!(dto.period, Presence::Value(PeriodType::Month));
     assert_eq!(dto.cap, Some(-1), "a negative cap reaches the domain");
     let request = CreateQuotaRequest::try_from(dto).expect("request");
-    assert_eq!(
-        request.subject.projection_type.as_ref(),
-        LLM_USER_PROJECTION
-    );
+    assert_eq!(request.subject.subject_type.as_ref(), USER_SUBJECT_TYPE);
     assert_eq!(request.metadata, None);
 
     let mut body = create_body();
@@ -51,25 +48,19 @@ fn create_bodies_keep_period_presence_and_signed_caps() {
         "unknown keys"
     );
     let mut body = create_body();
-    body["constraint_contract"] = json!({ "type_id": "x", "version": 1 });
-    assert!(
-        serde_json::from_value::<CreateQuotaDto>(body).is_err(),
-        "the contract is never caller-supplied"
-    );
-    let mut body = create_body();
     body["enforcement_mode"] = json!("gts.cf.core.qe.enforcement_type.v1~cf.core.qe.soft.v1");
     assert!(
         serde_json::from_value::<CreateQuotaDto>(body).is_err(),
         "the enforcement mode enum is closed"
     );
     let mut body = create_body();
-    body["subject"]["projection_type"] = json!("not a type id");
+    body["subject"]["type"] = json!("not a type id");
     let dto: CreateQuotaDto = serde_json::from_value(body).expect("body");
     assert_eq!(
-        CreateQuotaRequest::try_from(dto).expect_err("projection parses in the domain"),
+        CreateQuotaRequest::try_from(dto).expect_err("the subject type parses in the domain"),
         DomainError::InvalidArgument {
-            field: "subject.projection_type",
-            reason: tokens::PROJECTION_INVALID
+            field: "subject.type",
+            reason: tokens::SUBJECT_TYPE_INVALID
         }
     );
 }

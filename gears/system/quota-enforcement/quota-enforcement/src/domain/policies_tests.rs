@@ -1,48 +1,44 @@
 #![allow(clippy::expect_used)]
-//! The operator policy lifecycle through the shared service: admission first,
-//! engine validation before persistence, artifacts published after the write,
-//! and transition telemetry that counts committed changes only.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
-use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
     MetricId, PolicyDraft, PolicyId, PolicyPatch, PolicySchemaSnapshot, PolicyScope, PolicySpec,
     PolicyUpdate, PolicyVersionState, QuotaEnforcementStoragePluginV1,
 };
 use serde_json::json;
+use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 
-use crate::domain::catalog::{
-    CatalogBuilder, CatalogConfig, MetricClassifications, ProjectionContractCatalog,
-};
 use crate::domain::engines::{PolicyArtifactCache, linked_registry};
 use crate::domain::error::DomainError;
-use crate::domain::policies::schemas::CatalogPolicySchemas;
-use crate::domain::policies::{PolicyRuntimeLimits, PolicySchemas};
+use crate::domain::policies::PolicyRuntimeLimits;
 use crate::domain::ports::metrics::PolicyTransition;
 use crate::domain::{Admission, Bound, Readiness, Service};
 use crate::test_support::{
-    DenyAllPdp, FakeContractRegistry, FakeMetricRegistry, LLM_TENANT_PROJECTION,
-    LLM_USER_PROJECTION, METRIC_OTHER, METRIC_TOKENS, NoopCoordinator, PermitUnconstrainedPdp,
-    RecordingMetrics, ctx, policy_limits, test_limits,
+    DenyAllPdp, METRIC_OTHER, METRIC_TOKENS, NoopCoordinator, PermitUnconstrainedPdp,
+    RecordingMetrics, actor, caller, catalog_over, ctx, fail_registry_reads, metric_type_document,
+    platform_registry, policy_limits, test_limits,
 };
+
+const BROKEN_METRIC: &str = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
 
 struct Harness {
     service: Arc<Service>,
     metrics: Arc<RecordingMetrics>,
     storage: Arc<InMemoryStorage>,
     artifacts: Arc<PolicyArtifactCache>,
-    catalog: Arc<ProjectionContractCatalog>,
+    registry: Arc<MockTypesRegistry>,
 }
 
-async fn harness(pdp: Arc<dyn AuthZResolverApi>) -> Harness {
-    harness_with(pdp, policy_limits()).await
+fn harness(pdp: Arc<dyn AuthZResolverApi>) -> Harness {
+    harness_with(pdp, policy_limits())
 }
 
-async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimits) -> Harness {
+fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimits) -> Harness {
     let metrics = Arc::new(RecordingMetrics::default());
     let service = Arc::new(Service::new(
         Admission::new(PolicyEnforcer::new(pdp), metrics.clone()),
@@ -58,18 +54,11 @@ async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimit
             snapshot: crate::domain::operations::SnapshotLimits::default(),
         },
     ));
-    let registry = Arc::new(FakeContractRegistry::llm_gateway());
-    let catalog = CatalogBuilder::new(registry.as_ref(), metrics.as_ref())
-        .build(&CatalogConfig {
-            subject_projections: vec![
-                GtsTypeId::new(LLM_USER_PROJECTION),
-                GtsTypeId::new(LLM_TENANT_PROJECTION),
-            ],
-            resource_projections: Vec::new(),
-        })
-        .await
-        .expect("catalogue");
-    let catalog = Arc::new(catalog);
+    let registry = platform_registry();
+    let mut broken = metric_type_document(BROKEN_METRIC, json!({ "kind": "counter" }), json!({}));
+    broken["x-gts-abstract"] = json!(true);
+    registry.seed(BROKEN_METRIC, broken);
+    let catalog = catalog_over(&registry, metrics.clone());
     let storage = Arc::new(InMemoryStorage::new());
     let artifacts = Arc::new(PolicyArtifactCache::new(
         NonZeroUsize::new(8).expect("capacity"),
@@ -81,10 +70,7 @@ async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimit
             artifacts: Arc::clone(&artifacts),
             storage: storage.clone(),
             coordinator: Arc::new(NoopCoordinator),
-            catalog: Arc::clone(&catalog),
-            registry,
-            metric_registry: Arc::new(FakeMetricRegistry::classified()),
-            classifications: Arc::new(MetricClassifications::default()),
+            catalog,
         })
         .expect("bind");
     Harness {
@@ -92,7 +78,7 @@ async fn harness_with(pdp: Arc<dyn AuthZResolverApi>, limits: PolicyRuntimeLimit
         metrics,
         storage,
         artifacts,
-        catalog,
+        registry,
     }
 }
 
@@ -106,6 +92,10 @@ fn tokens() -> MetricId {
 
 fn other() -> MetricId {
     MetricId::parse(METRIC_OTHER).expect("metric")
+}
+
+fn broken() -> MetricId {
+    MetricId::parse(BROKEN_METRIC).expect("metric")
 }
 
 fn mrw(scope: PolicyScope) -> PolicySpec {
@@ -135,11 +125,11 @@ fn transitions(h: &Harness) -> Vec<PolicyTransition> {
 
 #[tokio::test]
 async fn create_validates_with_the_engine_persists_the_actor_and_publishes_after_the_write() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
 
     let created = policies
-        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .create(mrw(PolicyScope::Metric { metric: tokens() }))
         .await
         .expect("create");
     assert_eq!(created.version, 1);
@@ -150,7 +140,7 @@ async fn create_validates_with_the_engine_persists_the_actor_and_publishes_after
         "actor identity comes from the security context, never the caller"
     );
     assert!(
-        created.schema_snapshot.environments.is_empty(),
+        created.schema_snapshot.schemas.is_empty(),
         "most-restrictive-wins reads no metadata and persists an empty snapshot"
     );
     assert!(
@@ -161,7 +151,7 @@ async fn create_validates_with_the_engine_persists_the_actor_and_publishes_after
 
     // A second live policy at the same exact scope is refused by storage.
     let occupied = policies
-        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .create(mrw(PolicyScope::Metric { metric: tokens() }))
         .await
         .expect_err("occupied");
     assert!(matches!(occupied, DomainError::PolicyScopeOccupied { .. }));
@@ -170,17 +160,14 @@ async fn create_validates_with_the_engine_persists_the_actor_and_publishes_after
 
 #[tokio::test]
 async fn an_unknown_engine_or_a_bad_config_is_refused_before_anything_is_stored() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
 
     let unknown = policies
-        .create(
-            &ctx(),
-            PolicySpec {
-                engine_id: "starlark".to_owned(),
-                ..mrw(PolicyScope::Global)
-            },
-        )
+        .create(PolicySpec {
+            engine_id: "starlark".to_owned(),
+            ..mrw(PolicyScope::Global)
+        })
         .await
         .expect_err("unknown engine");
     match unknown {
@@ -195,13 +182,10 @@ async fn an_unknown_engine_or_a_bad_config_is_refused_before_anything_is_stored(
     }
 
     let bad_config = policies
-        .create(
-            &ctx(),
-            PolicySpec {
-                engine_config: json!({ "weights": [1, 2] }),
-                ..mrw(PolicyScope::Global)
-            },
-        )
+        .create(PolicySpec {
+            engine_config: json!({ "weights": [1, 2] }),
+            ..mrw(PolicyScope::Global)
+        })
         .await
         .expect_err("non-empty MRW config");
     assert!(
@@ -215,25 +199,31 @@ async fn an_unknown_engine_or_a_bad_config_is_refused_before_anything_is_stored(
         "{bad_config:?}"
     );
 
-    let outside = policies
-        .create(
-            &ctx(),
-            mrw(PolicyScope::Metric {
-                metric: MetricId::parse(METRIC_OTHER).expect("metric"),
-            }),
-        )
+    let unregistered = policies
+        .create(mrw(PolicyScope::Metric { metric: other() }))
         .await
-        .expect_err("metric outside the catalogue");
+        .expect_err("unregistered metric type");
     assert!(
-        matches!(
-            outside,
-            DomainError::InvalidPolicy {
-                reason: DomainError::PROJECTION_NOT_RESOLVABLE,
-                ..
-            }
-        ),
-        "{outside:?}"
+        matches!(unregistered, DomainError::MetricNotRegistered { .. }),
+        "{unregistered:?}"
     );
+    assert!(matches!(
+        CanonicalError::from(unregistered),
+        CanonicalError::InvalidArgument { .. }
+    ));
+
+    let unavailable = policies
+        .create(mrw(PolicyScope::Metric { metric: broken() }))
+        .await
+        .expect_err("no served entry");
+    assert!(
+        matches!(unavailable, DomainError::ProjectionNotResolvable { .. }),
+        "{unavailable:?}"
+    );
+    assert!(matches!(
+        CanonicalError::from(unavailable),
+        CanonicalError::FailedPrecondition { .. }
+    ));
 
     assert!(
         h.storage
@@ -247,67 +237,39 @@ async fn an_unknown_engine_or_a_bad_config_is_refused_before_anything_is_stored(
 }
 
 #[tokio::test]
-async fn a_cel_policy_is_type_checked_against_the_catalogue_and_keeps_its_schema_closure() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+async fn a_cel_policy_is_type_checked_against_the_metric_type_and_keeps_its_schema() {
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     let expr = r#"{ "debit_plan": quotas
-        .filter(q, size(q.arbitration.regions) > 0)
-        .map(q, { "id": q.id, "amount": amount }) }"#;
+        .filter(q, request.region == "eu")
+        .map(q, [{ "id": q.id, "amount": amount }]) }"#;
     let created = policies
-        .create(
-            &ctx(),
-            PolicySpec {
-                engine_id: "cel".to_owned(),
-                engine_config: json!({ "expr": expr }),
-                ..mrw(PolicyScope::Metric { metric: tokens() })
-            },
-        )
+        .create(PolicySpec {
+            engine_id: "cel".to_owned(),
+            engine_config: json!({ "expr": expr }),
+            ..mrw(PolicyScope::Metric { metric: tokens() })
+        })
         .await
         .expect("cel policy");
-    assert_eq!(created.schema_snapshot.environments.len(), 1);
-    assert_eq!(created.schema_snapshot.environments[0].metric, tokens());
-    assert!(
-        !created.schema_snapshot.schemas.is_empty(),
-        "the closure the engine needs to rebuild offline travels with the version"
+    assert_eq!(
+        created.schema_snapshot.schemas.keys().collect::<Vec<_>>(),
+        vec![METRIC_TOKENS],
+        "the version keeps the metric type schema it was checked against, and nothing else"
     );
-    // The expression reads only `q.arbitration`, so only the constraint
-    // contract is persisted; a change to the request or resource contracts
-    // cannot strand this policy.
     assert_eq!(
         created.schema_snapshot.inputs,
-        quota_enforcement_sdk::EnvironmentInputs {
-            request: false,
-            resource: false,
-            arbitration: true,
-        }
-    );
-    assert!(
-        created
-            .schema_snapshot
-            .schemas
-            .contains_key(crate::test_support::LLM_TOKEN_CONSTRAINT)
-    );
-    assert!(
-        !created
-            .schema_snapshot
-            .schemas
-            .contains_key(crate::test_support::LLM_TOKEN_REQUEST)
+        quota_enforcement_sdk::EnvironmentInputs { request: true }
     );
     assert!(h.artifacts.get(&created.policy_id, 1).is_some());
 
-    // A reference the constraint contract does not declare is caught at save
-    // time, with a position, before persistence.
     let err = policies
-        .create(
-            &ctx(),
-            PolicySpec {
-                engine_id: "cel".to_owned(),
-                engine_config: json!({ "expr": r#"{ "deny": { "reason": request.zone } }"# }),
-                ..mrw(PolicyScope::Global)
-            },
-        )
+        .create(PolicySpec {
+            engine_id: "cel".to_owned(),
+            engine_config: json!({ "expr": r#"{ "deny": { "reason": request.zone } }"# }),
+            ..mrw(PolicyScope::Metric { metric: tokens() })
+        })
         .await
-        .expect_err("unknown property");
+        .expect_err("a property the metric type does not declare");
     match err {
         DomainError::InvalidPolicy { reason, detail, .. } => {
             assert_eq!(reason, "INVALID_ENGINE_CONFIG");
@@ -318,17 +280,101 @@ async fn a_cel_policy_is_type_checked_against_the_catalogue_and_keeps_its_schema
 }
 
 #[tokio::test]
+async fn a_policy_update_for_a_metric_with_no_served_entry_is_refused() {
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
+    let id = h
+        .storage
+        .create_policy(
+            &actor(),
+            PolicyDraft {
+                scope: PolicyScope::Metric { metric: broken() },
+                engine_id: "most-restrictive-wins".to_owned(),
+                engine_config: json!({}),
+                ..stored_cel_draft()
+            },
+            &[],
+        )
+        .await
+        .expect("v1")
+        .policy_id;
+    let err = policies
+        .update(id, patch(1))
+        .await
+        .expect_err("no served entry");
+    assert!(
+        matches!(err, DomainError::ProjectionNotResolvable { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_registry_that_does_not_answer_fails_a_policy_write_for_a_metric_not_held() {
+    let h = harness(permitted());
+    fail_registry_reads(&h.registry);
+    let err = h
+        .service
+        .policies(caller())
+        .expect("bound")
+        .create(mrw(PolicyScope::Metric { metric: tokens() }))
+        .await
+        .expect_err("registry down");
+    assert!(
+        matches!(err, DomainError::TypesRegistryUnavailable(_)),
+        "{err:?}"
+    );
+    assert!(matches!(
+        CanonicalError::from(err),
+        CanonicalError::ServiceUnavailable { .. }
+    ));
+}
+
+#[tokio::test]
+async fn rollback_and_delete_of_a_policy_for_an_unavailable_metric_run() {
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
+    let id = h
+        .storage
+        .create_policy(
+            &actor(),
+            PolicyDraft {
+                scope: PolicyScope::Metric { metric: broken() },
+                ..stored_cel_draft()
+            },
+            &[],
+        )
+        .await
+        .expect("v1")
+        .policy_id;
+    h.storage
+        .update_policy(&actor(), id.clone(), stored_cel_update(1), &[])
+        .await
+        .expect("v2");
+    fail_registry_reads(&h.registry);
+
+    let back = policies
+        .rollback(id.clone(), 1, None)
+        .await
+        .expect("a rollback makes no catalogue check");
+    assert_eq!(back.version, 1);
+    policies
+        .delete(id, None)
+        .await
+        .expect("a delete makes no catalogue check");
+}
+
+#[tokio::test]
 async fn update_is_conditional_and_a_stale_version_counts_a_conflict_not_a_transition() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     let created = policies
-        .create(&ctx(), mrw(PolicyScope::Global))
+        .create(mrw(PolicyScope::Global))
         .await
         .expect("create");
     let id = created.policy_id.clone();
 
     let stale = policies
-        .update(&ctx(), id.clone(), patch(7))
+        .update(id.clone(), patch(7))
         .await
         .expect_err("stale");
     assert!(matches!(
@@ -345,10 +391,7 @@ async fn update_is_conditional_and_a_stale_version_counts_a_conflict_not_a_trans
         "a refused write publishes nothing to the artifact cache"
     );
 
-    let updated = policies
-        .update(&ctx(), id.clone(), patch(1))
-        .await
-        .expect("update");
+    let updated = policies.update(id.clone(), patch(1)).await.expect("update");
     assert_eq!(updated.version, 2);
     assert_eq!(
         updated.timeout_ms,
@@ -360,37 +403,27 @@ async fn update_is_conditional_and_a_stale_version_counts_a_conflict_not_a_trans
         transitions(&h),
         vec![PolicyTransition::Create, PolicyTransition::Update]
     );
-    assert_eq!(
-        policies
-            .read(&ctx(), &id, None)
-            .await
-            .expect("active")
-            .version,
-        2
-    );
+    assert_eq!(policies.read(&id, None).await.expect("active").version, 2);
 }
 
 #[tokio::test]
 async fn rollback_and_delete_count_only_the_transition_that_actually_moved_state() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     let created = policies
-        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .create(mrw(PolicyScope::Metric { metric: tokens() }))
         .await
         .expect("create");
     let id = created.policy_id.clone();
-    policies
-        .update(&ctx(), id.clone(), patch(1))
-        .await
-        .expect("v2");
+    policies.update(id.clone(), patch(1)).await.expect("v2");
 
     let back = policies
-        .rollback(&ctx(), id.clone(), 1, Some("undo".to_owned()))
+        .rollback(id.clone(), 1, Some("undo".to_owned()))
         .await
         .expect("rollback");
     assert_eq!((back.version, back.state), (1, PolicyVersionState::Active));
     let replay = policies
-        .rollback(&ctx(), id.clone(), 1, Some("retry".to_owned()))
+        .rollback(id.clone(), 1, Some("retry".to_owned()))
         .await
         .expect("replay is a no-op");
     assert_eq!(replay.version, 1);
@@ -404,39 +437,32 @@ async fn rollback_and_delete_count_only_the_transition_that_actually_moved_state
         "the replay counted nothing"
     );
     assert!(matches!(
-        policies.rollback(&ctx(), id.clone(), 2, None).await,
+        policies.rollback(id.clone(), 2, None).await,
         Err(DomainError::VersionRolledBack { version: 2, .. })
     ));
     assert!(matches!(
-        policies.rollback(&ctx(), id.clone(), 9, None).await,
+        policies.rollback(id.clone(), 9, None).await,
         Err(DomainError::UnknownPolicyVersion { version: 9, .. })
     ));
 
+    policies.delete(id.clone(), None).await.expect("delete");
     policies
-        .delete(&ctx(), id.clone(), None)
-        .await
-        .expect("delete");
-    policies
-        .delete(&ctx(), id.clone(), None)
+        .delete(id.clone(), None)
         .await
         .expect("repeated delete is a no-op");
     assert_eq!(transitions(&h).last(), Some(&PolicyTransition::Delete));
     assert_eq!(transitions(&h).len(), 4);
     assert!(matches!(
-        policies.read(&ctx(), &id, None).await,
+        policies.read(&id, None).await,
         Err(DomainError::PolicyDeleted { .. })
     ));
     assert_eq!(
-        policies
-            .read(&ctx(), &id, Some(2))
-            .await
-            .expect("retained")
-            .state,
+        policies.read(&id, Some(2)).await.expect("retained").state,
         PolicyVersionState::RolledBack
     );
     assert!(matches!(
         policies
-            .read(&ctx(), &PolicyId::new("never-created".to_owned()), None)
+            .read(&PolicyId::new("never-created".to_owned()), None)
             .await,
         Err(DomainError::PolicyNotFound { .. })
     ));
@@ -444,28 +470,26 @@ async fn rollback_and_delete_count_only_the_transition_that_actually_moved_state
 
 #[tokio::test]
 async fn the_global_policy_cannot_be_deleted_and_history_pages_are_bounded() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     policies
-        .create(&ctx(), mrw(PolicyScope::Global))
+        .create(mrw(PolicyScope::Global))
         .await
         .expect("global");
     assert!(matches!(
-        policies.delete(&ctx(), PolicyId::global(), None).await,
+        policies.delete(PolicyId::global(), None).await,
         Err(DomainError::CannotDeleteSeededGlobalPolicy)
     ));
 
     let page = policies
-        .list(&ctx(), &PolicyId::global(), Some(10), None)
+        .list(&PolicyId::global(), Some(10), None)
         .await
         .expect("history");
     assert_eq!(page.items.len(), 1);
     for limit in [0, policy_limits().authoring.list_limit + 1] {
         assert!(
             matches!(
-                policies
-                    .list(&ctx(), &PolicyId::global(), Some(limit), None)
-                    .await,
+                policies.list(&PolicyId::global(), Some(limit), None).await,
                 Err(DomainError::InvalidPolicy {
                     reason: "INVALID_PAGE",
                     ..
@@ -476,13 +500,12 @@ async fn the_global_policy_cannot_be_deleted_and_history_pages_are_bounded() {
     }
 }
 
-/// A CEL version whose stored schema closure no longer matches the catalogue.
-fn stale_cel_draft() -> PolicyDraft {
+fn stored_cel_draft() -> PolicyDraft {
     PolicyDraft {
         schema_snapshot: PolicySchemaSnapshot::default(),
         scope: PolicyScope::Metric { metric: tokens() },
         engine_id: "cel".to_owned(),
-        engine_config: json!({ "expr": r#"{ "allow": true }"# }),
+        engine_config: json!({ "expr": r#"{ "deny": { "reason": "none" } }"# }),
         timeout_ms: None,
         description: None,
         comment: None,
@@ -490,7 +513,7 @@ fn stale_cel_draft() -> PolicyDraft {
     }
 }
 
-fn stale_cel_update(if_match_version: u32) -> PolicyUpdate {
+fn stored_cel_update(if_match_version: u32) -> PolicyUpdate {
     PolicyUpdate {
         schema_snapshot: Some(PolicySchemaSnapshot::default()),
         if_match_version,
@@ -503,25 +526,25 @@ fn stale_cel_update(if_match_version: u32) -> PolicyUpdate {
 }
 
 #[tokio::test]
-async fn a_terminal_rollback_target_is_reported_before_catalogue_drift() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+async fn a_terminal_rollback_target_is_reported_in_storage_order() {
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
 
     let deleted = h
         .storage
-        .create_policy(&ctx(), stale_cel_draft(), &[])
+        .create_policy(&actor(), stored_cel_draft(), &[])
         .await
         .expect("v1")
         .policy_id;
     h.storage
-        .update_policy(&ctx(), deleted.clone(), stale_cel_update(1), &[])
+        .update_policy(&actor(), deleted.clone(), stored_cel_update(1), &[])
         .await
         .expect("v2");
     h.storage
-        .delete_policy(&ctx(), deleted.clone(), None, &[])
+        .delete_policy(&actor(), deleted.clone(), None, &[])
         .await
         .expect("delete");
-    let err = policies.rollback(&ctx(), deleted, 1, None).await;
+    let err = policies.rollback(deleted, 1, None).await;
     assert!(
         matches!(err, Err(DomainError::PolicyDeleted { .. })),
         "{err:?}"
@@ -530,10 +553,10 @@ async fn a_terminal_rollback_target_is_reported_before_catalogue_drift() {
     let rolled = h
         .storage
         .create_policy(
-            &ctx(),
+            &actor(),
             PolicyDraft {
                 scope: PolicyScope::Metric { metric: other() },
-                ..stale_cel_draft()
+                ..stored_cel_draft()
             },
             &[],
         )
@@ -541,14 +564,14 @@ async fn a_terminal_rollback_target_is_reported_before_catalogue_drift() {
         .expect("v1")
         .policy_id;
     h.storage
-        .update_policy(&ctx(), rolled.clone(), stale_cel_update(1), &[])
+        .update_policy(&actor(), rolled.clone(), stored_cel_update(1), &[])
         .await
         .expect("v2");
     h.storage
-        .rollback_policy(&ctx(), rolled.clone(), 1, None, &[])
+        .rollback_policy(&actor(), rolled.clone(), 1, None, &[])
         .await
         .expect("v2 rolled back");
-    let err = policies.rollback(&ctx(), rolled, 2, None).await;
+    let err = policies.rollback(rolled, 2, None).await;
     assert!(
         matches!(err, Err(DomainError::VersionRolledBack { version: 2, .. })),
         "{err:?}"
@@ -557,34 +580,28 @@ async fn a_terminal_rollback_target_is_reported_before_catalogue_drift() {
 
 #[tokio::test]
 async fn a_deleted_policy_reports_deletion_for_a_rolled_back_or_unknown_target() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     let id = policies
-        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .create(mrw(PolicyScope::Metric { metric: tokens() }))
         .await
         .expect("v1")
         .policy_id;
+    policies.update(id.clone(), patch(1)).await.expect("v2");
     policies
-        .update(&ctx(), id.clone(), patch(1))
-        .await
-        .expect("v2");
-    policies
-        .rollback(&ctx(), id.clone(), 1, None)
+        .rollback(id.clone(), 1, None)
         .await
         .expect("v2 rolled back");
-    policies
-        .delete(&ctx(), id.clone(), None)
-        .await
-        .expect("delete");
+    policies.delete(id.clone(), None).await.expect("delete");
     for target in [2, 9] {
-        let err = policies.rollback(&ctx(), id.clone(), target, None).await;
+        let err = policies.rollback(id.clone(), target, None).await;
         assert!(
             matches!(err, Err(DomainError::PolicyDeleted { .. })),
             "target {target}: {err:?}"
         );
     }
     let never = PolicyId::new(uuid::Uuid::now_v7().to_string());
-    let err = policies.rollback(&ctx(), never, 1, None).await;
+    let err = policies.rollback(never, 1, None).await;
     assert!(
         matches!(err, Err(DomainError::PolicyNotFound { .. })),
         "{err:?}"
@@ -599,30 +616,30 @@ async fn an_omitted_history_limit_is_the_platform_default_within_the_configured_
     }
     .to_limits()
     .expect("limits");
-    let h = harness_with(permitted(), limits).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness_with(permitted(), limits);
+    let policies = h.service.policies(caller()).expect("bound");
     let id = policies
-        .create(&ctx(), mrw(PolicyScope::Metric { metric: tokens() }))
+        .create(mrw(PolicyScope::Metric { metric: tokens() }))
         .await
         .expect("v1")
         .policy_id;
     for version in 1..=100 {
         policies
-            .update(&ctx(), id.clone(), patch(version))
+            .update(id.clone(), patch(version))
             .await
             .expect("next version");
     }
-    let page = policies.list(&ctx(), &id, None, None).await.expect("page");
+    let page = policies.list(&id, None, None).await.expect("page");
     assert_eq!(page.items.len(), 100);
     assert!(page.next_cursor.is_some());
 }
 
 #[tokio::test]
 async fn a_denied_operator_never_reaches_storage() {
-    let h = harness(Arc::new(DenyAllPdp)).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(Arc::new(DenyAllPdp));
+    let policies = h.service.policies(caller()).expect("bound");
     let denied = policies
-        .create(&ctx(), mrw(PolicyScope::Global))
+        .create(mrw(PolicyScope::Global))
         .await
         .expect_err("denied");
     assert!(
@@ -638,11 +655,11 @@ async fn a_denied_operator_never_reaches_storage() {
     );
     let id = PolicyId::global();
     let denials = [
-        policies.read(&ctx(), &id, None).await.err(),
-        policies.list(&ctx(), &id, Some(10), None).await.err(),
-        policies.update(&ctx(), id.clone(), patch(1)).await.err(),
-        policies.rollback(&ctx(), id.clone(), 1, None).await.err(),
-        policies.delete(&ctx(), id.clone(), None).await.err(),
+        policies.read(&id, None).await.err(),
+        policies.list(&id, Some(10), None).await.err(),
+        policies.update(id.clone(), patch(1)).await.err(),
+        policies.rollback(id.clone(), 1, None).await.err(),
+        policies.delete(id.clone(), None).await.err(),
     ];
     for denial in denials {
         assert!(
@@ -655,16 +672,15 @@ async fn a_denied_operator_never_reaches_storage() {
 
 #[tokio::test]
 async fn a_policy_write_waits_for_a_compilation_permit() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     // The harness allows two concurrent compilations; take both.
     let held = [
         h.artifacts.compile_permit().await.expect("permit"),
         h.artifacts.compile_permit().await.expect("permit"),
     ];
 
-    let operator = ctx();
-    let write = policies.create(&operator, mrw(PolicyScope::Global));
+    let write = policies.create(mrw(PolicyScope::Global));
     tokio::pin!(write);
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(100), &mut write)
@@ -679,38 +695,26 @@ async fn a_policy_write_waits_for_a_compilation_permit() {
 }
 
 #[tokio::test]
-async fn a_contract_read_through_brackets_is_persisted_and_the_version_rebuilds_after_a_restart() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
-    // `q['arbitration']` selects the constraint contract exactly as
-    // `q.arbitration` does; the persisted closure must carry it either way.
+async fn a_policy_that_reads_no_request_keeps_no_schema_and_rebuilds_from_what_storage_holds() {
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     let expr = r#"{ "debit_plan": quotas
-        .filter(q, size(q['arbitration'].regions) > 0)
-        .map(q, { "id": q.id, "amount": amount }) }"#;
+        .filter(q, q['tier'] == "subject")
+        .map(q, [{ "id": q.id, "amount": amount }]) }"#;
     let created = policies
-        .create(
-            &ctx(),
-            PolicySpec {
-                engine_id: "cel".to_owned(),
-                engine_config: json!({ "expr": expr }),
-                ..mrw(PolicyScope::Metric { metric: tokens() })
-            },
-        )
+        .create(PolicySpec {
+            engine_id: "cel".to_owned(),
+            engine_config: json!({ "expr": expr }),
+            ..mrw(PolicyScope::Metric { metric: tokens() })
+        })
         .await
         .expect("cel policy");
+    assert!(!created.schema_snapshot.inputs.request);
     assert!(
-        created.schema_snapshot.inputs.arbitration,
-        "a bracket read is a read"
-    );
-    assert!(
-        created
-            .schema_snapshot
-            .schemas
-            .contains_key(crate::test_support::LLM_TOKEN_CONSTRAINT)
+        created.schema_snapshot.schemas.is_empty(),
+        "a policy that reads no request keeps no metric type schema"
     );
 
-    // Restart: bootstrap rebuilds every active version from its own persisted
-    // closure, with no access to the environment the operator saved against.
     let stored = h
         .storage
         .read_active_policies()
@@ -719,10 +723,6 @@ async fn a_contract_read_through_brackets_is_persisted_and_the_version_rebuilds_
         .into_iter()
         .find(|version| version.policy_id == created.policy_id)
         .expect("the created policy is active");
-    let schemas = CatalogPolicySchemas::new(Arc::clone(&h.catalog), policy_limits().snapshot);
-    schemas
-        .check_activation(&stored)
-        .expect("the persisted closure still matches the catalogue");
     linked_registry()
         .expect("engines")
         .get(&stored.engine_id)
@@ -736,8 +736,8 @@ async fn a_contract_read_through_brackets_is_persisted_and_the_version_rebuilds_
 
 #[tokio::test]
 async fn an_oversized_config_a_zero_timeout_or_a_long_comment_is_refused_before_any_write() {
-    let h = harness(permitted()).await;
-    let policies = h.service.policies().expect("bound");
+    let h = harness(permitted());
+    let policies = h.service.policies(caller()).expect("bound");
     let reason = |err: DomainError| match err {
         DomainError::InvalidPolicy { reason, .. } => reason,
         other => panic!("expected an invalid policy, got {other:?}"),
@@ -755,7 +755,7 @@ async fn an_oversized_config_a_zero_timeout_or_a_long_comment_is_refused_before_
         (zero_timeout, "INVALID_TIMEOUT"),
         (long_comment, "COMMENT_TOO_LONG"),
     ] {
-        let err = policies.create(&ctx(), spec).await.expect_err(expected);
+        let err = policies.create(spec).await.expect_err(expected);
         assert_eq!(reason(err), expected);
     }
     assert!(

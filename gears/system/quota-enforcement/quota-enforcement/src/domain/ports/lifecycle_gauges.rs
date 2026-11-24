@@ -2,9 +2,9 @@
 //! Telemetry Gauges"; PRD section 5.16).
 //!
 //! The three gauges are label-free counts of active Quotas: `cap = 0`,
-//! unbounded cap, and declared on a metric the registry currently classifies
-//! `Direct`. They are storage-backed: the elected replica reads the counts,
-//! joins them with the current classification, and publishes one sample
+//! unbounded cap, and declared on a metric whose `enforcement` trait is
+//! `direct`. They are storage-backed: the elected replica reads the counts,
+//! joins them with the metric catalogue, and publishes one sample
 //! through this sink. `None` withdraws the sample, so a stale or demoted
 //! replica exports no data point rather than a wrong number. The sink's only
 //! implementation is the `LifecycleGaugeCell` in `infra::lifecycle_gauges`,
@@ -20,9 +20,12 @@ pub struct LifecycleCounts {
     pub cap_zero: u64,
     /// Active Quotas with an unbounded cap (`quota_cap_unbounded_total`).
     pub cap_unbounded: u64,
-    /// Active Quotas whose metric is currently classified `Direct`
+    /// Active Quotas whose metric's enforcement is `direct`
     /// (`quota_for_direct_metric_total`).
     pub for_direct_metric: u64,
+    /// Active Quotas whose conditions do not fit their metric type as it is
+    /// now (`quota_conditions_unfit_total`).
+    pub conditions_unfit: u64,
 }
 
 /// Where the refresh publishes its sample.

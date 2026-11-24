@@ -5,22 +5,13 @@ use std::sync::Arc;
 use quota_enforcement_sdk::{
     PageRequest, QuotaFilter, QuotaId, QuotaPatch, StorageError, SubjectRef,
 };
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::StoragePlugin;
 use crate::domain::ports::{Actor, StoreError};
 use crate::infra::storage::SqlFoundationStore;
-use crate::test_support::{FakeQuotaStore, draft, tenant, test_db};
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_type("service")
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
-}
+use crate::test_support::{FakeQuotaStore, actor, draft, tenant, test_db};
 
 async fn plugin_over(store: FakeQuotaStore) -> (StoragePlugin, Arc<FakeQuotaStore>) {
     let store = Arc::new(store);
@@ -73,14 +64,6 @@ async fn every_store_error_lifts_to_its_contract_error() {
         ),
         (StoreError::InvalidCursor, StorageError::InvalidCursor),
         (
-            StoreError::InvalidPatch {
-                detail: "metadata patch carries no constraint contract".to_owned(),
-            },
-            StorageError::Internal(
-                "invalid patch: metadata patch carries no constraint contract".to_owned(),
-            ),
-        ),
-        (
             StoreError::InvalidFilter {
                 detail: "too many ids".to_owned(),
             },
@@ -109,7 +92,7 @@ async fn every_store_error_lifts_to_its_contract_error() {
         let (plugin, _) = plugin_over(FakeQuotaStore::failing(store_err.clone())).await;
         let err = plugin
             .update_quota(
-                &ctx(),
+                &actor(),
                 &AccessScope::allow_all(),
                 id,
                 QuotaPatch::default(),
@@ -126,19 +109,18 @@ async fn the_security_context_becomes_the_operation_log_actor() {
     let (plugin, store) = plugin_over(FakeQuotaStore::default()).await;
     let scope = AccessScope::for_tenant(tenant().as_uuid());
     plugin
-        .create_quota(&ctx(), &scope, draft(tenant(), "u1", Some(1)), &[])
+        .create_quota(&actor(), &scope, draft(tenant(), "u1", Some(1)), &[])
         .await
         .expect("created");
     plugin
-        .deactivate_quota(&ctx(), &scope, QuotaId::generate(), &[])
+        .deactivate_quota(&actor(), &scope, QuotaId::generate(), &[])
         .await
         .expect("deactivated");
     assert_eq!(
         store.actors(),
         vec![
-            Actor {
+            Actor::Caller {
                 subject_id: Uuid::from_u128(0x5eed),
-                subject_type: Some("service".to_owned()),
             };
             2
         ]
@@ -150,11 +132,10 @@ async fn reads_forward_with_the_caller_scope_and_the_contract_signatures() {
     let (plugin, _) = plugin_over(FakeQuotaStore::default()).await;
     let page = plugin
         .read_quotas(
-            &ctx(),
             &AccessScope::allow_all(),
             QuotaFilter {
                 subject: Some(SubjectRef {
-                    projection_type: gts::GtsTypeId::new("gts.cf.core.qe.subj.v1~x.y.v1"),
+                    subject_type: gts::GtsTypeId::new("gts.cf.core.quota.subj.v1~x.y.z.v1~"),
                     subject_id: "s".to_owned(),
                 }),
                 ..QuotaFilter::default()
@@ -164,13 +145,6 @@ async fn reads_forward_with_the_caller_scope_and_the_contract_signatures() {
         .await
         .expect("page");
     assert!(page.items.is_empty());
-    assert!(
-        plugin
-            .read_active_projection_bindings()
-            .await
-            .expect("bindings")
-            .is_empty()
-    );
     assert_eq!(
         plugin
             .read_active_quota_counts()

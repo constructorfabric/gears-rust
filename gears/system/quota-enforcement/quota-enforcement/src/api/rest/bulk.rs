@@ -242,8 +242,8 @@ async fn bulk_create_quotas(
     Extension(service): Extension<Arc<Service>>,
     JsonBody(body): JsonBody<BulkCreateQuotasDto>,
 ) -> ApiResult<impl IntoResponse> {
-    let quotas = service.quotas()?;
-    let outcome = quotas.bulk_create(&ctx, create_request(body)).await?;
+    let quotas = service.quotas(&ctx)?;
+    let outcome = quotas.bulk_create(create_request(body)).await?;
     Ok(Json(BulkCreatedDto::from(outcome)))
 }
 
@@ -252,7 +252,7 @@ async fn bulk_update_quotas(
     Extension(service): Extension<Arc<Service>>,
     JsonBody(body): JsonBody<BulkUpdateQuotasDto>,
 ) -> ApiResult<impl IntoResponse> {
-    let quotas = service.quotas()?;
+    let quotas = service.quotas(&ctx)?;
     let request = BulkUpdateRequest {
         tenant_id: TenantId::new(body.tenant_id),
         idempotency_key: body.idempotency_key,
@@ -266,7 +266,7 @@ async fn bulk_update_quotas(
             })
             .collect(),
     };
-    let outcome = quotas.bulk_update(&ctx, request).await?;
+    let outcome = quotas.bulk_update(request).await?;
     Ok(Json(BulkUpdatedDto::from(outcome)))
 }
 
@@ -275,7 +275,7 @@ async fn bulk_deactivate_quotas(
     Extension(service): Extension<Arc<Service>>,
     JsonBody(body): JsonBody<BulkDeactivateQuotasDto>,
 ) -> ApiResult<impl IntoResponse> {
-    let quotas = service.quotas()?;
+    let quotas = service.quotas(&ctx)?;
     let request = BulkDeactivateRequest {
         tenant_id: TenantId::new(body.tenant_id),
         idempotency_key: body.idempotency_key,
@@ -288,7 +288,7 @@ async fn bulk_deactivate_quotas(
             })
             .collect(),
     };
-    let outcome = quotas.bulk_deactivate(&ctx, request).await?;
+    let outcome = quotas.bulk_deactivate(request).await?;
     Ok(Json(BulkDeactivatedDto::from(outcome)))
 }
 

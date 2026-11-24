@@ -142,6 +142,13 @@ gears:
           key:
             type: ip
           max_keys: 10000
+        # Bound by the quota-resolver tenant route POST /quota-resolver/v1/quota-state.
+        rl_quota_resolver_quota_state:
+          rate_limit: 20/s
+          burst_limit: 40
+          key:
+            type: identity
+          max_keys: 10000
       in_flight_limit_zones:
         ifl_mini_chat_chat:
           in_flight_limit: 100
@@ -330,6 +337,10 @@ gears:
         # Construct's deletion job elects its leader in this profile; a host
         # without it runs no job and says so.
         construct:
+          cache:
+            provider: standalone
+        # Elects the quota-enforcement sweepers.
+        quota-enforcement:
           cache:
             provider: standalone
 
@@ -696,6 +707,27 @@ gears:
     database:
       server: "sqlite_users"
       file: "construct.db"
+
+  # Quota Enforcement behind the Quota Resolver. The quota-enforcement suite
+  # runs on a focused server (testing/e2e/suites/quota_enforcement/e2e.yaml),
+  # which also seeds the metric and subject types its tests charge.
+  quota-enforcement:
+    config:
+      storage_vendor: "constructorfabric"
+      election:
+        ttl_secs: 30
+        max_missed_renewals: 2
+      sweeper_stop_timeout_secs: 10
+  quota-enforcement-storage-plugin:
+    database:
+      server: "sqlite_users"
+      file: "quota_enforcement.db"
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+  quota-resolver:
+    config:
+      vendor: "constructorfabric"
 
 # OpenTelemetry configuration (resource identity, tracing, metrics)
 opentelemetry:

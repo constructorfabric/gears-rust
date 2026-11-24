@@ -1,9 +1,8 @@
 #![allow(clippy::expect_used)]
 
-use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    CapPatch, ContractRef, EnforcementMode, PeriodType, Quota, QuotaId, QuotaPatch, QuotaStatus,
-    QuotaType, ValidityWindow, ValidityWindowPatch,
+    CapPatch, EnforcementMode, PeriodType, Quota, QuotaId, QuotaPatch, QuotaStatus, QuotaType,
+    ValidityWindow, ValidityWindowPatch,
 };
 use serde_json::json;
 use time::OffsetDateTime;
@@ -38,7 +37,7 @@ fn stored(cap: Option<u64>) -> (QuotaId, quota::Model) {
     let model = quota::Model {
         id: row.id.unwrap(),
         tenant_id: row.tenant_id.unwrap(),
-        projection_type: row.projection_type.unwrap(),
+        subject_type: row.subject_type.unwrap(),
         subject_id: row.subject_id.unwrap(),
         metric: row.metric.unwrap(),
         quota_type: row.quota_type.unwrap(),
@@ -52,11 +51,10 @@ fn stored(cap: Option<u64>) -> (QuotaId, quota::Model) {
         metadata: row.metadata.unwrap(),
         source: row.source.unwrap(),
         status: row.status.unwrap(),
-        constraint_contract_type: row.constraint_contract_type.unwrap(),
-        constraint_contract_version: row.constraint_contract_version.unwrap(),
         record_version: row.record_version.unwrap(),
         created_at: row.created_at.unwrap(),
         updated_at: row.updated_at.unwrap(),
+        holds_pending: row.holds_pending.unwrap(),
     };
     (id, model)
 }
@@ -85,7 +83,6 @@ fn a_draft_round_trips_through_the_row() {
     assert_eq!(quota.metadata["weight"], json!(5));
     assert_eq!(quota.status, QuotaStatus::Active);
     assert_eq!(quota.record_version, 1);
-    assert_eq!(quota.constraint_contract.version, 1);
     assert_eq!(quota.created_at, now());
 }
 
@@ -107,14 +104,7 @@ fn caller_values_that_do_not_fit_their_columns_are_refused_before_the_write() {
         MappingError::CapOutOfRange { cap: u64::MAX }
     );
     over.cap = Some(Quota::MAX_CAP);
-    over.constraint_contract.version = u32::MAX;
-    assert_eq!(
-        draft_to_row(QuotaId::generate(), &over, now()).expect_err("version"),
-        MappingError::VersionOutOfRange {
-            field: "constraint_contract.version",
-            value: u64::from(u32::MAX),
-        }
-    );
+    assert!(draft_to_row(QuotaId::generate(), &over, now()).is_ok());
     assert_eq!(
         patch_to_update(&QuotaPatch {
             cap: Some(CapPatch::Bounded(u64::MAX)),
@@ -150,18 +140,11 @@ fn a_row_that_does_not_read_as_the_contract_type_names_its_column() {
 
 #[test]
 fn a_patch_maps_onto_column_changes_and_merges_over_the_current_row() {
-    let contract_v2 = ContractRef {
-        type_id: GtsTypeId::new(
-            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v2~",
-        ),
-        version: 2,
-    };
     let update = patch_to_update(&QuotaPatch {
         cap: Some(CapPatch::Unbounded),
         notification_thresholds: Some(vec![]),
         validity_window: Some(ValidityWindowPatch::Clear),
         metadata: Some(json!({ "a": 1 }).as_object().cloned().expect("object")),
-        constraint_contract: Some(contract_v2.clone()),
         enforcement_mode: Some(EnforcementMode::Hard),
         fail_open_hint: Some(true),
     })
@@ -170,28 +153,6 @@ fn a_patch_maps_onto_column_changes_and_merges_over_the_current_row() {
     assert_eq!(update.notification_thresholds.as_deref(), Some("[]"));
     assert_eq!(update.validity, Some((None, None)));
     assert_eq!(update.metadata.as_deref(), Some(r#"{"a":1}"#));
-    assert_eq!(
-        update.constraint_contract,
-        Some((contract_v2.type_id.as_ref().to_owned(), 2))
-    );
-    assert_eq!(
-        patch_to_update(&QuotaPatch {
-            metadata: Some(json!({ "a": 1 }).as_object().cloned().expect("object")),
-            ..QuotaPatch::default()
-        })
-        .expect_err("metadata without its contract"),
-        MappingError::MetadataWithoutContract
-    );
-    assert_eq!(
-        patch_to_update(&QuotaPatch {
-            fail_open_hint: Some(true),
-            constraint_contract: Some(contract_v2),
-            ..QuotaPatch::default()
-        })
-        .expect("a contract without metadata is ignored")
-        .constraint_contract,
-        None
-    );
     assert_eq!(
         update.enforcement_mode.as_deref(),
         Some(EnforcementMode::Hard.as_gts_id())

@@ -22,7 +22,7 @@ const FORWARD: &str = "fwd";
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct QuotaFilterParts {
     pub tenant_id: Option<TenantId>,
-    pub projection_type: Option<gts::GtsTypeId>,
+    pub subject_type: Option<gts::GtsTypeId>,
     pub subject_id: Option<String>,
     pub metric: Option<String>,
     pub status: Option<QuotaStatus>,
@@ -34,7 +34,7 @@ impl QuotaFilterParts {
     pub fn into_request(self, limit: u32, cursor: Option<String>) -> ListQuotasRequest {
         ListQuotasRequest {
             tenant_id: self.tenant_id,
-            projection_type: self.projection_type,
+            subject_type: self.subject_type,
             subject_id: self.subject_id,
             metric: self.metric,
             status: self.status,
@@ -55,7 +55,7 @@ impl QuotaFilterParts {
         fingerprint(&serde_json::json!([
             "quotas",
             effective_tenant.to_string(),
-            self.projection_type.as_ref().map(AsRef::<str>::as_ref),
+            self.subject_type.as_ref().map(AsRef::<str>::as_ref),
             self.subject_id,
             self.metric,
             status,
@@ -145,14 +145,14 @@ fn assign(
         (QuotaFilterField::TenantId, [ODataValue::Uuid(id)]) => {
             set(&mut parts.tenant_id, TenantId::new(*id)).map_err(|()| twice())?;
         }
-        (QuotaFilterField::ProjectionType, [ODataValue::String(raw)]) => {
-            let projection = gts::GtsTypeId::try_new(raw).map_err(|_| {
+        (QuotaFilterField::SubjectType, [ODataValue::String(raw)]) => {
+            let subject_type = gts::GtsTypeId::try_new(raw).map_err(|_| {
                 Box::new(Problem::from(DomainError::InvalidArgument {
-                    field: "projection_type",
-                    reason: tokens::PROJECTION_INVALID,
+                    field: "subject_type",
+                    reason: tokens::SUBJECT_TYPE_INVALID,
                 }))
             })?;
-            set(&mut parts.projection_type, projection).map_err(|()| twice())?;
+            set(&mut parts.subject_type, subject_type).map_err(|()| twice())?;
         }
         (QuotaFilterField::SubjectId, [ODataValue::String(raw)]) => {
             set(&mut parts.subject_id, raw.clone()).map_err(|()| twice())?;

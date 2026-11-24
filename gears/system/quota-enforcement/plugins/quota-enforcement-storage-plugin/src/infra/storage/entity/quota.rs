@@ -17,11 +17,11 @@ pub struct Model {
     pub id: Uuid,
     /// PDP-authorized owning tenant.
     pub tenant_id: Uuid,
-    /// Subject projection type id.
-    pub projection_type: String,
+    /// Quota subject type id.
+    pub subject_type: String,
     /// Opaque subject identifier.
     pub subject_id: String,
-    /// Metric instance id.
+    /// Metric type id.
     pub metric: String,
     /// `QuotaType` as a GTS instance id.
     pub quota_type: String,
@@ -43,22 +43,21 @@ pub struct Model {
     pub validity_end: Option<OffsetDateTime>,
     /// Informational fail-open hint.
     pub fail_open_hint: bool,
-    /// JSON object, contract-validated by the gear.
+    /// JSON object of the Quota's conditions.
     pub metadata: String,
     /// `QuotaSource` as a GTS instance id.
     pub source: String,
     /// `active` or `deactivated`.
     pub status: String,
-    /// Constraint contract type id snapshotted at creation.
-    pub constraint_contract_type: String,
-    /// Constraint contract version snapshotted at creation.
-    pub constraint_contract_version: i32,
     /// Increments once per accepted mutation.
     pub record_version: i32,
     /// Creation time.
     pub created_at: OffsetDateTime,
     /// Last mutation time.
     pub updated_at: OffsetDateTime,
+    /// Deactivated allocation Quota whose holding charge entries the sweeper
+    /// has not released yet.
+    pub holds_pending: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

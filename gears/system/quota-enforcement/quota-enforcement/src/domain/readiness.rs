@@ -13,7 +13,8 @@ use super::error::Dependency;
 pub enum ReadinessState {
     /// Bootstrap has not completed yet.
     Starting,
-    /// Bootstrap failed on a dependency. The gear serves nothing.
+    /// The last bootstrap attempt failed on a dependency. The gear serves
+    /// nothing; an attempt that failed on an outage is repeated.
     Failed {
         /// The failing dependency.
         dependency: Dependency,

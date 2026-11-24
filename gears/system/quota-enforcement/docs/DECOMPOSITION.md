@@ -60,7 +60,7 @@ per-feature FEATURE documents, not here.
 
 - **Scope**:
   - `quota-enforcement` and `quota-enforcement-sdk` crate skeletons registered in the workspace
-  - `QuotaEnforcementStoragePluginV1` trait, closed `StorageError` enum, invariants I1–I14, `toolkit-db` plugin
+  - `QuotaEnforcementStoragePluginV1` trait, closed `StorageError` enum, invariants I1–I15, `toolkit-db` plugin
   - `cluster-sdk` dependency (no `deps = [cluster]` edge), typed `quota-enforcement` cluster profile, and the
     coordination adapter (one leader election per sweeper scope, linearizable requirement validated at startup)
   - Gateway REST registration into the platform `api-gateway`, DTO validation shell, phase-1 PDP admission via
@@ -110,7 +110,7 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-coordination-plugin`
 
 - **API**:
-  - REST route registration under `/v1/quota-enforcement/...` (routes land with their owning features)
+  - REST route registration under `/quota-enforcement/v1/...` (routes land with their owning features)
   - `QuotaEnforcementStoragePluginV1` plugin trait in the SDK crate; cluster leader election consumed through
     `cluster-sdk`
 
@@ -155,7 +155,7 @@ per-feature FEATURE documents, not here.
 
 - **Out of scope**:
   - Quota records themselves (feature `quota-lifecycle`)
-  - Engine consumption of the metric's metadata and of Quota metadata (feature `resolution-policy-engine`)
+  - Engine consumption of the metric's metadata (feature `resolution-policy-engine`)
   - The trusted admission mode (feature `foundation`)
   - Registration of GTS types: the quota resolver SDK owns the subject base, the tenant subject type, and the metric
     base; the owner of a metric registers its metric type; QE registers none
@@ -205,22 +205,21 @@ per-feature FEATURE documents, not here.
 - **Feature**: [features/quota-lifecycle.md](features/quota-lifecycle.md)
 
 - **Purpose**: Implement the Quota entity and its lifecycle — create, update, deactivate, read — with metric
-  validation against the metric type, cap and validity-window semantics, size-capped metadata that the Engine of the
-  active Policy checks when it is written, the closed `enforcement_mode` and `source` enums, rate-type rejection, and
+  validation against the metric type, cap and validity-window semantics, size-capped metadata of conditions checked
+  against the metric type when it is written, the closed `enforcement_mode` and `source` enums, rate-type rejection, and
   the deactivation cascade that resolves active leases atomically.
 
 - **Depends On**: `cpt-cf-quota-enforcement-feature-foundation`,
-  `cpt-cf-quota-enforcement-feature-projection-contracts`,
-  `cpt-cf-quota-enforcement-feature-resolution-policy-engine`
+  `cpt-cf-quota-enforcement-feature-projection-contracts`
 
 - **Scope**:
   - `QuotaManagementService` with transactional CRUD via the storage plugin
   - Metric validation through the `MetricCatalog` entry of the Quota's metric type: the type is registered, its entry
     is served, and it admits the Quota's subject type; fail-closed
   - Cap semantics (`CAP_MUST_BE_NON_NEGATIVE`, `cap = 0`, `cap = null`, `CAP_BELOW_CONSUMED` at commit time)
-  - Quota metadata: a JSON object of at most 4 KB; on create and on a change of the metadata, the Engine of the
-    Policy that is active for the Quota's metric checks it (`validate_quota_metadata`), and a rejection is
-    `QUOTA_METADATA_REJECTED` with the Engine's list of what is wrong; stored metadata is never checked again
+  - Quota metadata: a JSON object of at most 4 KB of conditions over the request's metadata; on create and on a
+    change of the metadata, QE checks them against the metric type, and a violation is `QUOTA_METADATA_REJECTED`
+    with the list of what is wrong; stored metadata is never checked again
   - Validity-window storage and `currently_within_window` computation
   - Deactivation cascade marking leases resolved-by-deactivation
   - `rate` quota-type rejection with canonical `Unimplemented`
@@ -253,11 +252,11 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-quota-management-service`
 
 - **API**:
-  - POST /v1/quota-enforcement/quotas
-  - GET /v1/quota-enforcement/quotas/{id}
-  - PATCH /v1/quota-enforcement/quotas/{id}
-  - POST /v1/quota-enforcement/quotas/{id}/deactivate
-  - GET /v1/quota-enforcement/quotas
+  - POST /quota-enforcement/v1/quotas
+  - GET /quota-enforcement/v1/quotas/{id}
+  - PATCH /quota-enforcement/v1/quotas/{id}
+  - POST /quota-enforcement/v1/quotas/{id}/deactivate
+  - GET /quota-enforcement/v1/quotas
   - `QuotaManagerApi` Quota methods (`create_quota`, `update_quota`, `deactivate_quota`, `read_quotas`)
 
 - **Sequences**:
@@ -289,16 +288,14 @@ per-feature FEATURE documents, not here.
   - `EngineRegistry` with fail-fast bootstrap registration; seeding of the `global` Policy
     (`most-restrictive-wins`, version 1) as this feature's bootstrap extension, so no active Policy ever references an
     unregistered Engine
-  - Engine contract: `id`/`validate_config`/`validate_quota_metadata`/`evaluate`, `ValidatedConfig` cache keyed by
+  - Engine contract: `id`/`validate_config`/`evaluate`, `ValidatedConfig` cache keyed by
     `(policy_id, policy_version)`
-  - Check of Quota metadata by the Engine for the quota-lifecycle feature; `most-restrictive-wins` accepts only an
-    empty object, and the `cel` Engine accepts any JSON object
   - Debit Plan as a list of chains (ADR-0010) and its invariant enforcement at the Engine boundary with violation
     telemetry
   - `most-restrictive-wins` binding-Quota selection over the `Subject` and `Tenant` tiers and validity-window
     prefilter; sandboxed cost-bounded `cel`
   - Check of a `cel` Policy against the schema of its metric type, which describes `request`, the metadata of the
-    request's metric; `arbitration`, the Quota metadata, has no registered schema
+    request's metric
   - No check of existing Quotas when a Policy is created, changed, or replaced; the preview operation is the
     operator's tool for that
   - Operator-only Policy surface (`QuotaOperatorApi`)
@@ -339,12 +336,12 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-policy-service`
 
 - **API**:
-  - POST /v1/quota-enforcement/policies
-  - GET /v1/quota-enforcement/policies/{id}
-  - GET /v1/quota-enforcement/policies/{id}/versions
-  - PATCH /v1/quota-enforcement/policies/{id}
-  - POST /v1/quota-enforcement/policies/{id}/rollback
-  - DELETE /v1/quota-enforcement/policies/{id}
+  - POST /quota-enforcement/v1/policies
+  - GET /quota-enforcement/v1/policies/{id}
+  - GET /quota-enforcement/v1/policies/{id}/versions
+  - PATCH /quota-enforcement/v1/policies/{id}
+  - POST /quota-enforcement/v1/policies/{id}/rollback
+  - DELETE /quota-enforcement/v1/policies/{id}
   - `QuotaOperatorApi` Policy methods; `QuotaResolutionEngineV1` plugin trait
 
 - **Sequences**:
@@ -427,10 +424,10 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-retention-sweeper`
 
 - **API**:
-  - POST /v1/quota-enforcement/operations/debit
-  - POST /v1/quota-enforcement/operations/credit
-  - POST /v1/quota-enforcement/operations/rollback
-  - POST /v1/quota-enforcement/operations/preview
+  - POST /quota-enforcement/v1/operations/debit
+  - POST /quota-enforcement/v1/operations/credit
+  - POST /quota-enforcement/v1/operations/rollback
+  - POST /quota-enforcement/v1/operations/preview
   - `QuotaEnforcementApi` (`debit`, `rollback`, `evaluate_preview`)
   - `QuotaManagerApi` (`credit`)
   - Return: reached only through the quota resolver plugin (feature `resolver-plugin`)
@@ -499,9 +496,9 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-lease-sweeper`
 
 - **API**:
-  - POST /v1/quota-enforcement/leases
-  - POST /v1/quota-enforcement/leases/{token}/commit
-  - POST /v1/quota-enforcement/leases/{token}/release
+  - POST /quota-enforcement/v1/leases
+  - POST /quota-enforcement/v1/leases/{token}/commit
+  - POST /quota-enforcement/v1/leases/{token}/release
   - `QuotaEnforcementApi` (`acquire_lease`, `commit_lease`, `release_lease`)
 
 - **Sequences**:
@@ -556,7 +553,7 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-evaluation-orchestrator`
 
 - **API**:
-  - POST /v1/quota-enforcement/operations/batch-debit
+  - POST /quota-enforcement/v1/operations/batch-debit
   - `QuotaEnforcementApi` (`batch_debit`)
 
 - **Sequences**:
@@ -581,7 +578,7 @@ per-feature FEATURE documents, not here.
   `cpt-cf-quota-enforcement-feature-consumption-operations`
 
 - **Scope**:
-  - `POST /v1/quota-enforcement/snapshot` for `1..N` `(subject, metric)` filters with cursor pagination
+  - `POST /quota-enforcement/v1/snapshot` for `1..N` `(subject, metric)` filters with cursor pagination
   - Consumer-backed self-service reads for a `{type, id}` user subject and its tenant, returning every applicable
     Quota
   - The read-only guarantee (I3): a consumption Quota without a current period row reads as zero, and no read creates one
@@ -612,7 +609,7 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-quota-enforcement-service`
 
 - **API**:
-  - POST /v1/quota-enforcement/snapshot
+  - POST /quota-enforcement/v1/snapshot
   - `QuotaEnforcementApi` (`snapshot`)
 
 - **Sequences**:
@@ -717,9 +714,9 @@ per-feature FEATURE documents, not here.
   - [ ] `p1` - `cpt-cf-quota-enforcement-component-quota-management-service`
 
 - **API**:
-  - POST /v1/quota-enforcement/quotas/bulk-create
-  - POST /v1/quota-enforcement/quotas/bulk-update
-  - POST /v1/quota-enforcement/quotas/bulk-deactivate
+  - POST /quota-enforcement/v1/quotas/bulk-create
+  - POST /quota-enforcement/v1/quotas/bulk-update
+  - POST /quota-enforcement/v1/quotas/bulk-deactivate
 
 - **Sequences**:
 
@@ -798,8 +795,8 @@ per-feature FEATURE documents, not here.
   - Conversion of resolver requests to QE requests and of QE results and errors to resolver results
   - Operations without a `SecurityContext`; the platform identity of the resolver's caller recorded as the
     operation-log actor
-  - Quota state served from the snapshot read without the fields only operators see (metadata, enforcement mode,
-    validity window)
+  - Quota state served from the snapshot read with the Quota metadata and without the fields only operators see
+    (enforcement mode, validity window)
 
 - **Out of scope**:
   - Trusted admission itself (feature `foundation`); return and the charge ledger (feature `consumption-operations`)
@@ -875,10 +872,9 @@ cpt-cf-quota-enforcement-feature-foundation
     ↓
     ├─→ cpt-cf-quota-enforcement-feature-projection-contracts
     │       ↓
-    │   cpt-cf-quota-enforcement-feature-resolution-policy-engine
-    │       ↓
-    │   cpt-cf-quota-enforcement-feature-quota-lifecycle (also needs projection-contracts)
-    │       ↓ (joined with resolution-policy-engine)
+    │       ├─→ cpt-cf-quota-enforcement-feature-resolution-policy-engine
+    │       └─→ cpt-cf-quota-enforcement-feature-quota-lifecycle
+    │       ↓ (both joined)
     │           cpt-cf-quota-enforcement-feature-consumption-operations
     │               ↓
     │               ├─→ cpt-cf-quota-enforcement-feature-lease-operations
@@ -899,9 +895,8 @@ cpt-cf-quota-enforcement-feature-foundation
   `cpt-cf-quota-enforcement-feature-projection-contracts` because a Policy write needs a served catalogue entry of
   its metric and checks a `cel` Policy against the schema of the metric type.
 - `cpt-cf-quota-enforcement-feature-quota-lifecycle` requires the foundation storage plugin for transactional CRUD,
-  `cpt-cf-quota-enforcement-feature-projection-contracts` because Quota creation checks that the metric admits the
-  Quota's subject type, and `cpt-cf-quota-enforcement-feature-resolution-policy-engine` because a Quota write gives
-  the Quota metadata to the Engine of the active Policy.
+  and `cpt-cf-quota-enforcement-feature-projection-contracts` because Quota creation checks that the metric admits the
+  Quota's subject type and the conditions of its metadata against the metric type.
 - `cpt-cf-quota-enforcement-feature-consumption-operations` joins
   `cpt-cf-quota-enforcement-feature-quota-lifecycle` (Quotas and counters to mutate) with
   `cpt-cf-quota-enforcement-feature-resolution-policy-engine` (the Decision it applies).

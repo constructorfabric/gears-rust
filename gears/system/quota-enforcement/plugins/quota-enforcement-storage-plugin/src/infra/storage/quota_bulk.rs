@@ -170,8 +170,6 @@ async fn record(
         key,
         payload_hash: write.payload_hash.as_bytes(),
         decision_blob: blob,
-        applied_entries: None,
-        attribution_hash: None,
         engine_id: None,
         policy_id: None,
         policy_version: None,

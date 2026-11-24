@@ -26,9 +26,9 @@ date: 2026-11-23
 
 ## Context and Problem Statement
 
-A request to the resolver named three things about what it charges: a metric, which was an instance of one metric
-type with the single field `kind`; operation metadata for that metric; and an optional resource with its own type,
-id, and metadata. The resolver passed all three to the backend unchecked.
+A request to the resolver named two things about what it charges: a metric, which was an instance of one metric
+type with the single field `kind`, and operation metadata for that metric. The resolver passed both to the backend
+unchecked. The backend's own requests added a third: an optional resource with its own type, id, and metadata.
 
 The backend then needed more registered objects to check them: a schema for the operation metadata, a place for the
 subject types that a metric admits, and a list of resource types. The operation metadata and the resource metadata
@@ -67,7 +67,7 @@ Chosen option: (a).
     `gts.cf.core.quota.subj.v1~`, which admits every subject type;
   * `enforcement`: `quota_gated` (the default) or `direct`. A `direct` metric is not checked against quotas: the backend rejects the operations that take capacity on it (debit, lease acquisition), and commit, release, and return still run.
 * A **metric item** of a request is a metric object and its amount. A request has no separate operation metadata and
-  no resource. The resource base `gts.cf.core.quota.res.v1~` is removed.
+  no resource.
 * The resolver passes a metric object to the backend as it is. The backend reads the metric type, checks the object
   against it, checks the subject types against `admitted_subjects`, and applies `kind` and `enforcement`.
 * Another major version of a metric type is another metric. The own version of a metric type is major 1 or higher:

@@ -45,7 +45,7 @@ class TestDebit:
             assert resp.status_code == 200, resp.text
             decision = resp.json()
             assert decision["result"] == {"outcome": "allowed"}, decision
-            assert decision["debit_plan"] == [{"quota_id": quota_id, "amount": 60}], decision
+            assert decision["debit_plan"] == [[{"quota_id": quota_id, "amount": 60}]], decision
 
             resp = await client.post(
                 f"{qe_url}/operations/debit",

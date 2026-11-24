@@ -108,10 +108,11 @@ consumption-operations feature)
 - Incompatible storage schema fails readiness with `SchemaVersionMismatch`
 - No storage plugin resolves, or the `quota-enforcement` cluster profile is unbound or lacks a linearizable
   election: the gear refuses to serve
-- PDP unreachable at startup: readiness fails (fail-closed)
+- Storage or the PDP does not answer at startup: the gear is not ready (fail-closed) and repeats bootstrap, with a
+  growing pause, until it answers
 - `types-registry` does not answer the catalogue read at start (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`):
-  bootstrap does not fail and readiness does not change; a metric type that was not read gets no catalogue entry
-  and is read when a request or a write names it (ADR-0012)
+  the gear is not ready and repeats bootstrap until it answers, so a replica never takes requests with an empty
+  catalogue (ADR-0012)
 
 **Steps**:
 1. [x] - `p1` - Operator starts the gear with a configuration naming exactly one active storage plugin - `inst-boot-start`
@@ -122,7 +123,7 @@ consumption-operations feature)
 5. [x] - `p1` - API: resolve the cluster leader-election facade for the `quota-enforcement` profile with the linearizable requirement; the cluster resolver validates the operator's backend binding - `inst-boot-cluster-resolve`
 6. [x] - `p1` - API: verify `authz-resolver` reachability with one bounded PDP evaluation round trip; any decision proves the PDP answered, a transport error or the deadline fails the probe - `inst-boot-pdp-probe`
 7. [x] - `p1` - **IF** any probe or the cluster resolve fails - `inst-boot-probe-if`
-   1. [x] - `p1` - Fail readiness and surface the failing dependency in the health endpoint; every bootstrap dependency call is bounded (storage-plugin selection and each types-registry call 10 s, cluster resolve by the cluster SDK's descriptor timeout, the PDP probe by the PEP's default evaluation deadline, schema check and seeding by the backend's statement and lock timeouts), so a hung dependency fails readiness instead of stalling it - `inst-boot-probe-abort`
+   1. [x] - `p1` - Fail readiness and surface the failing dependency in the health endpoint; every bootstrap dependency call is bounded (storage-plugin selection and each types-registry call 10 s, cluster resolve by the cluster SDK's descriptor timeout, the PDP probe by the PEP's default evaluation deadline, schema check and seeding by the backend's statement and lock timeouts), so a hung dependency fails readiness instead of stalling it; an attempt that failed because storage, the PDP, or `types-registry` did not answer is repeated, with a pause that doubles from 1 s to 30 s, until it succeeds or the gear is stopped, and any other failure ends bootstrap - `inst-boot-probe-abort`
 8. [x] - `p1` - Register REST routes into the platform `api-gateway` via ToolKit typed-operation registration - `inst-boot-rest`
 9. [x] - `p1` - **RETURN** ready; later features extend this bootstrap hook with their own steps (the resolution-policy-engine feature seeds the `global` Policy here once its Engine is registered) - `inst-boot-ready`
 
@@ -264,7 +265,7 @@ management refused. This is the plugin-path exception to `cpt-cf-quota-enforceme
 `cpt-cf-quota-enforcement-constraint-no-business-logic`
 
 **Touches**:
-- API: REST registration under `/v1/quota-enforcement/...`
+- API: REST registration under `/quota-enforcement/v1/...`
 - DB: `cpt-cf-quota-enforcement-db-schema`
 - Entities: `SecurityContext` (platform-provided)
 
@@ -352,8 +353,11 @@ the platform OTLP pipeline, not to this gear.
   is refused; QE's API still calls the PDP
 - [ ] Bootstrap fails readiness on: incompatible schema version, missing storage plugin, unbound `quota-enforcement`
   cluster profile or unmet linearizable-election requirement, or unreachable PDP — and serves no operation in that
-  state; a wrong metric type does not fail bootstrap or change readiness; while `types-registry` does not answer the
-  catalogue read at start the gear becomes ready, serves every operation that needs no catalogue entry, and answers
+  state; a wrong metric type does not fail bootstrap or change readiness; while storage, the PDP, or `types-registry`
+  does not
+  answer at start, the gear is not ready and repeats bootstrap until it answers; a gear that has started stays ready
+  when `types-registry` stops
+  answering, serves the metrics it holds and every operation that needs no catalogue entry, and answers
   `ServiceUnavailable` to a request for a metric it has not read (ADR-0012)
 - [ ] Binding the `quota-enforcement` profile to an eventually consistent cache double fails startup with
   `CapabilityNotMet` naming the primitive, the capability, and the provider

@@ -1,40 +1,51 @@
 //! Closed `UPPER_SNAKE` reason tokens of the `InvalidArgument` field violations
-//! the projection-contracts and quota-lifecycle features raise (DESIGN section
-//! 3.3, "Error Model": discriminators ride as `errors[].reason` tokens, never
-//! as private variants).
+//! the gear raises (DESIGN section 3.3, "Error Model": discriminators ride as
+//! `errors[].reason` tokens, never as private variants).
 
 /// `tenant_id` is nil.
 pub const TENANT_ID_REQUIRED: &str = "TENANT_ID_REQUIRED";
-/// `metric` is not a well-formed instance of the metric base.
+/// `metric` is not a metric type id: a GTS type id derived from
+/// `gts.cf.core.quota.metric.v1~`.
 pub const METRIC_INVALID: &str = "METRIC_INVALID";
-/// The metric is not admitted by any configured projection at the kind's scope.
+/// A request through the quota resolver plugin carries other than one metric
+/// item, or several amounts.
+pub const ONE_METRIC_ITEM_REQUIRED: &str = "ONE_METRIC_ITEM_REQUIRED";
+/// The metric type does not admit the subject type.
 pub const METRIC_NOT_ADMITTED: &str = "METRIC_NOT_ADMITTED";
+/// The `id` of a metric object is empty.
+pub const METRIC_ID_INVALID: &str = "METRIC_ID_INVALID";
+/// The `id` of a metric object is longer than the bound.
+pub const METRIC_ID_TOO_LONG: &str = "METRIC_ID_TOO_LONG";
+/// A request names no subject.
+pub const SUBJECTS_REQUIRED: &str = "SUBJECTS_REQUIRED";
+/// A request names more subjects than the bound.
+pub const SUBJECTS_TOO_MANY: &str = "SUBJECTS_TOO_MANY";
 /// A subject id is empty.
 pub const SUBJECT_ID_REQUIRED: &str = "SUBJECT_ID_REQUIRED";
-/// A subject kind is not a well-formed instance of the scope type.
-pub const SUBJECT_KIND_INVALID: &str = "SUBJECT_KIND_INVALID";
-/// Two subjects carry the same kind.
-pub const SUBJECT_KIND_DUPLICATE: &str = "SUBJECT_KIND_DUPLICATE";
-/// A subject kind is a scope no configured projection admits the metric at.
-pub const SUBJECT_KIND_NOT_ADMITTED: &str = "SUBJECT_KIND_NOT_ADMITTED";
-/// The tenant scope appears in `subjects`; it is materialized from `tenant_id`.
-pub const TENANT_SCOPE_REPEATED: &str = "TENANT_SCOPE_REPEATED";
-/// The operation-level `metadata` object is absent.
+/// A subject id is longer than the bound.
+pub const SUBJECT_ID_TOO_LONG: &str = "SUBJECT_ID_TOO_LONG";
+/// A subject type is not a quota subject type id: a GTS type id derived from
+/// `gts.cf.core.quota.subj.v1~`.
+pub const SUBJECT_TYPE_INVALID: &str = "SUBJECT_TYPE_INVALID";
+/// Two subjects carry the same type.
+pub const SUBJECT_TYPE_DUPLICATE: &str = "SUBJECT_TYPE_DUPLICATE";
+/// A tenant-type subject names a tenant other than the request's.
+pub const TENANT_SUBJECT_MISMATCH: &str = "TENANT_SUBJECT_MISMATCH";
+/// A subject type is abstract.
+pub const SUBJECT_TYPE_ABSTRACT: &str = "SUBJECT_TYPE_ABSTRACT";
+/// A subject does not fit the schema of its subject type.
+pub const SUBJECT_INVALID: &str = "SUBJECT_INVALID";
+/// The metric object carries no `metadata`.
 pub const METADATA_REQUIRED: &str = "METADATA_REQUIRED";
-/// The resource `type` is not a well-formed GTS type id.
-pub const RESOURCE_TYPE_INVALID: &str = "RESOURCE_TYPE_INVALID";
-/// The resource `type` is not a configured resource projection.
-pub const RESOURCE_TYPE_UNKNOWN: &str = "RESOURCE_TYPE_UNKNOWN";
-/// The resource `metadata` object is absent.
-pub const RESOURCE_METADATA_REQUIRED: &str = "RESOURCE_METADATA_REQUIRED";
-/// A metadata or resource document violated its contract.
+/// The metric object does not fit the resolved schema of its metric type.
 pub const CONTRACT_VIOLATION: &str = "CONTRACT_VIOLATION";
-/// A projection reference is abstract, not a subject projection, of unknown
-/// scope, or not derived from the QE base.
-pub const PROJECTION_INVALID: &str = "PROJECTION_INVALID";
 
 // --- quota lifecycle ---
 
+/// The `kind` of the metric type does not take the quota type: a `counter`
+/// metric takes consumption and rate Quotas, a `gauge` metric allocation
+/// Quotas.
+pub const QUOTA_TYPE_KIND_MISMATCH: &str = "QUOTA_TYPE_KIND_MISMATCH";
 /// A patch names an immutable field (`metric`, `quota_type`, `period`,
 /// `subject`); a breaking change is a deactivate followed by a create.
 pub const IMMUTABLE_FIELD: &str = "IMMUTABLE_FIELD";
@@ -50,8 +61,6 @@ pub const THRESHOLD_OUT_OF_RANGE: &str = "THRESHOLD_OUT_OF_RANGE";
 pub const THRESHOLDS_NOT_ASCENDING: &str = "THRESHOLDS_NOT_ASCENDING";
 /// A validity window ends before it starts.
 pub const VALIDITY_WINDOW_INVERTED: &str = "VALIDITY_WINDOW_INVERTED";
-/// The `subject_id` violates the declared scope of the projection.
-pub const SUBJECT_SCOPE_VIOLATION: &str = "SUBJECT_SCOPE_VIOLATION";
 /// The canonical JSON of `metadata` exceeds the configured size limit.
 pub const METADATA_TOO_LARGE: &str = "METADATA_TOO_LARGE";
 /// A list filter names one half of the subject only.
@@ -60,10 +69,6 @@ pub const LIST_SUBJECT_INCOMPLETE: &str = "LIST_SUBJECT_INCOMPLETE";
 pub const LIST_TOO_MANY_IDS: &str = "LIST_TOO_MANY_IDS";
 /// A list page limit is zero or above the configured maximum.
 pub const LIST_LIMIT_OUT_OF_RANGE: &str = "LIST_LIMIT_OUT_OF_RANGE";
-/// A Quota identifier is not a UUID.
-pub const QUOTA_ID_INVALID: &str = "QUOTA_ID_INVALID";
-/// A tenant identifier is not a UUID.
-pub const TENANT_ID_INVALID: &str = "TENANT_ID_INVALID";
 /// A status filter is neither `active` nor `deactivated`.
 pub const STATUS_INVALID: &str = "STATUS_INVALID";
 /// A cap above `Quota::MAX_CAP`; caps live in `0..=i64::MAX`.
@@ -77,6 +82,8 @@ pub const CURSOR_INVALID: &str = "CURSOR_INVALID";
 pub const INVALID_AMOUNT: &str = "INVALID_AMOUNT";
 /// A write operation carried no idempotency key.
 pub const IDEMPOTENCY_KEY_REQUIRED: &str = "IDEMPOTENCY_KEY_REQUIRED";
+/// An idempotency key is longer than the bound.
+pub const IDEMPOTENCY_KEY_TOO_LONG: &str = "IDEMPOTENCY_KEY_TOO_LONG";
 /// No committed operation is registered under the key the caller named.
 pub const UNKNOWN_OPERATION: &str = "UNKNOWN_OPERATION";
 /// No Quota exists under the identifier the caller named.
@@ -106,5 +113,5 @@ pub const SNAPSHOT_SUBJECTS_REQUIRED: &str = "SNAPSHOT_SUBJECTS_REQUIRED";
 pub const SNAPSHOT_TOO_MANY_SUBJECTS: &str = "SNAPSHOT_TOO_MANY_SUBJECTS";
 /// A snapshot page size outside `1..=page_size`.
 pub const SNAPSHOT_LIMIT_OUT_OF_RANGE: &str = "SNAPSHOT_LIMIT_OUT_OF_RANGE";
-/// A tenant-scope snapshot subject names a tenant other than the request's.
+/// A tenant-type snapshot subject names a tenant other than the request's.
 pub const SNAPSHOT_TENANT_MISMATCH: &str = "SNAPSHOT_TENANT_MISMATCH";

@@ -16,7 +16,7 @@ fn foundation_bundle_carries_the_contract_major_and_prd_defaults() {
     assert_eq!(
         bundle.config_defaults,
         ConfigDefaults {
-            contention_timeout_ms: 0,
+            contention_timeout_ms: 50,
             max_active_leases: 1000,
             idempotency_retention_secs: 86_400,
         }

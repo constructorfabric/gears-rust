@@ -25,12 +25,10 @@ pub fn allow_all() -> Arc<TransactionEvaluator> {
             .quotas
             .iter()
             .map(|quota| {
-                (
-                    quota.snapshot.quota_id,
-                    QuotaDebitPlan {
-                        amount: context.amount,
-                    },
-                )
+                vec![QuotaDebitPlan {
+                    quota_id: quota.snapshot.quota_id,
+                    amount: context.amount,
+                }]
             })
             .collect();
         Ok(EvaluationOutcome::validate(
@@ -53,4 +51,42 @@ pub async fn lock_waiters(container: &ContainerAsync<Postgres>) -> u32 {
         .trim()
         .parse()
         .expect("a count")
+}
+
+/// Counts the statements `sqlx` reports while it dispatches for one future.
+#[derive(Clone, Default)]
+pub struct Statements(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Statements {
+    /// `op`'s output and the statements it issued.
+    pub async fn during<T>(op: impl std::future::Future<Output = T>) -> (T, usize) {
+        use tracing::instrument::WithSubscriber as _;
+        let counter = Self::default();
+        let out = op
+            .with_subscriber(tracing::Dispatch::new(counter.clone()))
+            .await;
+        (out, counter.0.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+impl tracing::Subscriber for Statements {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "sqlx::query"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }

@@ -1,10 +1,5 @@
-//! `qe_leases`: the lease state machine and the two values a settlement cannot
-//! take from its caller.
-//!
-//! `subject_key` is the idempotency subject the acquisition fingerprinted, and
-//! `attribution_hash` the attribution the PDP authorized it under. A commit or
-//! release completes its idempotency scope from the first — the caller may
-//! never supply one — and a rollback of a commit must present the second.
+//! `qe_leases`: the lease state machine and the attribution digest of the
+//! acquisition, which the charge of its commit takes (ADR-0011).
 
 use sea_orm::entity::prelude::*;
 use time::OffsetDateTime;
@@ -22,18 +17,15 @@ pub struct Model {
     /// The metric the hold was acquired on, which the active-lease cap is
     /// keyed by together with the tenant (I7).
     pub metric: String,
-    /// The subject key the acquisition recorded under. Commit and release
-    /// reuse it rather than resolving against the current catalogue.
-    pub subject_key: Vec<u8>,
-    /// The authorized attribution digest of the acquisition.
-    pub attribution_hash: Vec<u8>,
+    /// The attribution digest of the acquisition.
+    pub attribution_digest: Vec<u8>,
     /// The acquisition's own idempotency key, for the audit trail.
     pub idem_key: String,
     /// One of `active`, `committed`, `released`, `auto_released`,
     /// `resolved_by_deactivation`. Every value but the first is terminal.
     pub state: String,
-    /// What the acquisition requested. The plan's holds need not sum to it, so
-    /// the commit's share is measured against this, not against the holds.
+    /// What the acquisition requested; the holds of every chain of the plan
+    /// add up to it, and a commit unwinds what it does not keep of it.
     pub reserved_amount: i64,
     /// When the hold was taken.
     pub acquired_at: OffsetDateTime,

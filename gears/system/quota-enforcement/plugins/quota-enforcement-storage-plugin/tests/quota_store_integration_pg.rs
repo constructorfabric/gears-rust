@@ -41,8 +41,8 @@ use quota_enforcement_storage_plugin::{
     start_undelivered_outbox,
 };
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 
 struct PgHarness {
     db: Db,
@@ -60,16 +60,15 @@ fn scope() -> AccessScope {
 }
 
 fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: None,
     }
 }
 
 fn draft(subject_id: &str, cap: Option<u64>) -> QuotaDraft {
     let mut draft = quota_draft(
         SubjectRef {
-            projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+            subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
             subject_id: subject_id.to_owned(),
         },
         cap,
@@ -447,15 +446,16 @@ async fn the_platform_plane_reads_answer_on_postgres() {
     let h = PgHarness::up().await;
     h.create(draft("u1", Some(0))).await;
     h.create(draft("u2", None)).await;
-    let bindings = h
-        .store
-        .read_active_projection_bindings()
-        .await
-        .expect("bindings");
-    assert_eq!(bindings.len(), 1);
+    for subject in ["u3", "u4"] {
+        let mut conditioned = draft(subject, Some(1));
+        conditioned.metadata.insert("region".into(), "eu".into());
+        h.create(conditioned).await;
+    }
     let counts = h.store.read_active_quota_counts().await.expect("counts");
     assert_eq!((counts.cap_zero, counts.cap_unbounded), (1, 1));
-    assert_eq!(counts.by_metric.values().sum::<u64>(), 2);
+    assert_eq!(counts.by_metric.values().sum::<u64>(), 4);
+    assert_eq!(counts.conditions.len(), 1, "one distinct set");
+    assert_eq!(counts.conditions[0].quotas, 2);
     h.down().await;
 }
 

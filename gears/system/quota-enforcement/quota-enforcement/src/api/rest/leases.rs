@@ -53,6 +53,9 @@ pub struct CommitLeaseRequestDto {
     /// Amount actually used, at most the reserved amount. Absent keeps the
     /// whole hold; zero keeps nothing and returns every hold.
     pub actual_amount: Option<i64>,
+    /// The metric type id the amount is for; when present it must be the
+    /// lease's, or the commit is refused with `METRIC_TYPE_MISMATCH`.
+    pub metric_type: Option<String>,
     /// Client-supplied idempotency key of this commit.
     pub idempotency_key: String,
 }
@@ -107,16 +110,13 @@ async fn acquire(
     JsonBody(body): JsonBody<AcquireLeaseRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let outcome = service
-        .operations()?
-        .acquire_lease(
-            &ctx,
-            AcquireLeaseRequest {
-                attribution: body.attribution.into(),
-                amount: body.amount,
-                ttl_secs: body.ttl_secs,
-                idempotency_key: body.idempotency_key,
-            },
-        )
+        .operations(&ctx)?
+        .acquire_lease(AcquireLeaseRequest {
+            attribution: body.attribution.into(),
+            amount: body.amount,
+            ttl_secs: body.ttl_secs,
+            idempotency_key: body.idempotency_key,
+        })
         .await?;
     Ok(Json(AcquireLeaseOutcomeDto::from(outcome)))
 }
@@ -128,16 +128,14 @@ async fn commit(
     JsonBody(body): JsonBody<CommitLeaseRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = service
-        .operations()?
-        .commit_lease(
-            &ctx,
-            CommitLeaseRequest {
-                tenant_id: TenantId::new(body.tenant_id),
-                token: LeaseToken::new(token),
-                actual_amount: body.actual_amount,
-                idempotency_key: body.idempotency_key,
-            },
-        )
+        .operations(&ctx)?
+        .commit_lease(CommitLeaseRequest {
+            tenant_id: TenantId::new(body.tenant_id),
+            token: LeaseToken::new(token),
+            actual_amount: body.actual_amount,
+            metric_type: body.metric_type,
+            idempotency_key: body.idempotency_key,
+        })
         .await?;
     Ok(Json(DecisionDto::from(decision)))
 }
@@ -149,15 +147,12 @@ async fn release(
     JsonBody(body): JsonBody<ReleaseLeaseRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
     let decision = service
-        .operations()?
-        .release_lease(
-            &ctx,
-            ReleaseLeaseRequest {
-                tenant_id: TenantId::new(body.tenant_id),
-                token: LeaseToken::new(token),
-                idempotency_key: body.idempotency_key,
-            },
-        )
+        .operations(&ctx)?
+        .release_lease(ReleaseLeaseRequest {
+            tenant_id: TenantId::new(body.tenant_id),
+            token: LeaseToken::new(token),
+            idempotency_key: body.idempotency_key,
+        })
         .await?;
     Ok(Json(DecisionDto::from(decision)))
 }
@@ -193,11 +188,11 @@ pub fn register(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .operation_id("quota_enforcement.commit_lease")
         .summary("Convert an active lease into a debit")
         .description(
-            "Keeps `actual_amount` of what the lease holds, apportioned across its holds, and \
-             returns the rest, all against the acquisition period. An expired or resolved lease \
-             answers 400 LEASE_NOT_ACTIVE; more than was reserved answers 400 \
-             OVER_COMMIT_NOT_AUTHORIZED. The commit is reversible by a rollback naming \
-             `lease_commit`.",
+            "Keeps `actual_amount` of what the lease holds and returns the rest, taken from \
+             the last entry of each chain of the plan first, all against the acquisition \
+             period. An expired or resolved lease answers 400 LEASE_NOT_ACTIVE; more than was \
+             reserved answers 400 OVER_COMMIT_NOT_AUTHORIZED. The commit is reversible by a \
+             rollback naming `lease_commit`.",
         )
         .tag(TAG)
         .authenticated()
