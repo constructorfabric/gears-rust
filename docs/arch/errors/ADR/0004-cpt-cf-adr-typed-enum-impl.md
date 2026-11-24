@@ -33,8 +33,8 @@ Chosen option: **Option A — Typed enum with category-typed constructors**, bec
 ### Consequences
 
 * The error library must define a single `CanonicalError` enum with 16 variants, each carrying its specific context type — the enum is the central error type for the entire platform
-* Each context type (`ResourceInfo`, `Validation`, `ErrorInfo`, etc.) must be a separate struct with its own fields — these structs are part of the public API surface
-* Blanket `From` implementations for common library errors (`anyhow`, `sea_orm`, `sqlx`, `serde_json`, `std::io`) must be provided in the error library to enable `?` propagation
+* Each category has its own context type (`NotFoundV1`, `InvalidArgumentV1`, `ResourceExhaustedV1`, etc., with unversioned aliases) with its own fields — these types are part of the public API surface
+* Blanket `From` implementations for common library errors (`std::io`, `serde_json`, `sea_orm` behind the `sea-orm` feature) must be provided in the error library to enable `?` propagation
 * The `Problem` wire format conversion must be a single exhaustive `match` in one location — all 16 categories are handled centrally, not per-gear
 * Adding a new category in the future adds a new enum variant, which is a breaking change — `#[non_exhaustive]` or major version bump must be decided
 * Gears that need error customisation beyond the 16 categories must do so through context payload specialisation, not through new enum variants
@@ -42,18 +42,18 @@ Chosen option: **Option A — Typed enum with category-typed constructors**, bec
 
 ### Confirmation
 
-The PoC implementation (`canonical-errors/src/lib.rs`) demonstrates all 16 variants with typed constructors, builder methods, exhaustive `match` in `Problem` conversion, and blanket `From` impls. All 16 showcase tests pass.
+`libs/toolkit-canonical-errors` implements all 16 variants (`src/error.rs`), typed builders (`src/builder.rs`), the exhaustive `match` in `Problem` conversion (`src/problem.rs`) and the blanket `From` impls. `tests/showcase.rs` covers every category.
 
 ## Pros and Cons of the Options
 
 ### Option A: Typed Enum
 
-A single `enum CanonicalError` with 16 variants. Each variant carries `ctx: ContextType`, `message: String`, `resource_type: Option<String>`.
+A single `enum CanonicalError` with 16 variants. Each variant carries `ctx: ContextType`, `detail: String`, `resource_type: Option<String>`, `resource_name: Option<String>` and `overrides: TransportOverrides` (`Internal` has no resource fields).
 
 * Good, because exhaustive `match` — compiler enforces all categories are handled
 * Good, because each variant has a specific context type — wrong context is a compile error
 * Good, because one `From<CanonicalError> for Problem` impl covers all gears
-* Good, because blanket `From` impls for library errors (anyhow, sea_orm, sqlx, serde_json, io) enable `?`
+* Good, because blanket `From` impls for library errors (io, serde_json, sea_orm) enable `?`
 * Good, because stack-allocated — no heap allocation for the error itself
 * Neutral, because enum size equals largest variant (acceptable for error types)
 * Bad, because new variants require `#[non_exhaustive]` or a major version bump
@@ -82,17 +82,15 @@ A trait with `fn category(&self) -> Category` and `fn context(&self) -> ContextV
 
 ## More Information
 
-Library error blanket `From` impls shipped with `toolkit-errors`:
+Library error blanket `From` impls shipped with `cf-gears-toolkit-canonical-errors` (`src/error.rs`):
 
 | Library Type | Maps To | Rationale |
 |---|---|---|
-| `anyhow::Error` | `Internal` | Untyped errors are internal by definition |
-| `sea_orm::DbErr` | `Internal` | Database errors are infrastructure failures |
-| `sqlx::Error` | `Internal` | Database driver errors are infrastructure failures |
-| `serde_json::Error` | `InvalidArgument` | Serialization failures indicate malformed input at API boundary |
 | `std::io::Error` | `Internal` | IO failures are infrastructure errors |
+| `serde_json::Error` | `InvalidArgument` (format) | Serialization failures indicate malformed input at API boundary |
+| `sea_orm::DbErr` (feature `sea-orm`) | `Internal` | Database errors are infrastructure failures |
 
-Gears needing finer-grained mapping (e.g., `sqlx::Error::RowNotFound` → `NotFound`) implement their own `From` instead of relying on the blanket.
+There are no impls for `anyhow::Error` or `sqlx::Error`. Gears needing finer-grained mapping (e.g., a missing row → `NotFound`) map the library error into their own domain error first and convert that to `CanonicalError`; the orphan rule prevents a gear from adding `From<LibraryError> for CanonicalError` itself.
 
 ## Traceability
 

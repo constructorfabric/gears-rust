@@ -1,9 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-08-06
 ---
 
 # Evolve Contracts Additively Within a Major Version; Use Parallel Traits for Breaking Changes
+
+> **Implementation:** version checks in `libs/toolkit-contract/src/ir/validation.rs` (`version_matches_base_path`) and `contract.rs` (`assert_grpc_package_major`); v1/v2 coexistence in `examples/toolkit/api-contracts` (`PaymentApiV2`); the `oasdiff` gate in `.github/workflows/api_contracts.yml`.
 
 **ID**: `cpt-cf-binding-adr-contract-versioning`
 

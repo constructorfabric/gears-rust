@@ -40,7 +40,9 @@ Chosen option: **Option B — GTS compound type identifiers**, because GTS is th
 
 ### Confirmation
 
-All 16 error categories have GTS identifiers defined in the PoC implementation. The `GtsSchema` trait generates JSON Schema from the Rust types, ensuring schema and code cannot diverge.
+All 16 error categories have GTS identifiers: `CanonicalError::gts_type()` in `libs/toolkit-canonical-errors/src/error.rs` returns one `gts_id!(...)` constant per category, and `gts_id!` validates the pattern at compile time. `#[resource_error]` validates resource-type identifiers with the `gts-id` parser.
+
+Not yet implemented (as of this revision): the context types do not implement `GtsSchema` and are not built with `#[struct_to_gts_schema]`; neither the categories nor the context schemas are registered in the Types Registry; CI does not export or diff error schemas. The consequences above that depend on these remain open.
 
 ## Pros and Cons of the Options
 
@@ -86,7 +88,7 @@ gts.cf.core.errors.err.v1~cf.core.err.{category}.v1~
 
 The base type `gts.cf.core.errors.err.v1~` identifies "canonical error." The instance type `cf.core.err.{category}.v1~` identifies the specific category.
 
-All 16 identifiers are defined as `const` values in the `CanonicalError` implementation. See [DESIGN.md](../DESIGN.md) § Category Reference.
+All 16 identifiers are returned by `CanonicalError::gts_type()`. See [DESIGN.md](../DESIGN.md) § Category Reference.
 
 ## Traceability
 

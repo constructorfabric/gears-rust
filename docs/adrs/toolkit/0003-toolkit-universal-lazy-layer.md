@@ -1,4 +1,10 @@
+---
+status: superseded by cpt-cf-binding-adr-consumer-wiring and cpt-toolkit-adr-client-circuit-breaker
+---
+
 # ADR-0003: Universal Lazy Typed REST Clients for OoP Gears
+
+> **Superseded by [Consumer Wiring via `#[toolkit::consumes]`](../../arch/toolkit-contract-binding/ADR/0004-cpt-cf-binding-adr-consumer-wiring.md) and [ADR-0005: Client Circuit Breaker](./0005-toolkit-client-circuit-breaker.md).** Only part of Phase 1 shipped: REST endpoint discovery (`DirectoryClient::resolve_rest_service`). The `ClientDescriptor` trait, `RestClientProvider` / `GrpcClientProvider`, `LazyClientError`, the `clients = [...]` gear attribute and the `libs/toolkit/src/clients/` module were never built. Consumers declare dependencies with `#[toolkit::consumes]`, the runtime wires lazily resolving clients in its proxy-wiring phase, and the circuit breaker lives in `libs/toolkit-resilience`. The design below is kept as a historical record.
 
 ## Executive Summary
 
@@ -1799,7 +1805,7 @@ pub enum ServiceError {
 ```text
 libs/toolkit/src/
 ├── clients/
-│   ├── mod.rs              # Gear exports
+│   ├── mod.rs              # Module exports
 │   ├── transport.rs        # Transport enum
 │   ├── descriptor.rs       # ClientDescriptor trait, ClientConfig
 │   ├── rest_provider.rs    # RestClientProvider (default)

@@ -1,9 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-06-02
 ---
 
 # Extend Projection Traits to Generate Server Routes and Enforce Base-Projection Parity
+
+> **Implementation:** `libs/toolkit-contract-macros/src/rest_contract.rs` (`generate_server_registration`, `generate_full_coverage_check`) and `projection.rs` (`build_delegation_body`); remaining gaps are listed in [Implementation status](#implementation-status-poc).
 
 **ID**: `cpt-cf-binding-adr-projection-server-gen`
 
@@ -336,8 +338,7 @@ group; the implemented form is the bare `#[server_manual]`, per this rule.)
 
 ### Implementation status (PoC)
 
-A first PoC of the server-side generation has landed on `feature/toolkit_contracts`. What it
-actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[toolkit::rest_contract]`):
+Server-side generation is on `main`. What it actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[toolkit::rest_contract]`):
 
 * **Generated symbol**: `register_<trait_snake>_routes(router, openapi, svc)` —
   e.g. `register_payment_api_rest_routes`. Signature
@@ -385,11 +386,13 @@ actually builds (the macro crate is `toolkit-contract-macros`, attribute `#[tool
 
 ### Confirmation
 
-* Unit tests: each projection annotation → `OperationBuilder` emission mapping covered by
-  `cargo expand`-based macro expansion tests in `libs/toolkit-contract-macros/tests/`.
+* Codegen tests: the generated routes and their OpenAPI output are exercised end to end in
+  `libs/toolkit-contract/tests/rest_server_codegen.rs` (path and query binding, visibility,
+  security requirements); macro errors are covered by the trybuild suite in
+  `libs/toolkit-contract-macros-tests`.
 * Parity test: a projection method absent from the base fails to compile, naming the offending
   method — `E0576` from the delegating default body. Covered by the trybuild fixture
-  `tests/ui/fail/rest_extra_projection_method.rs`; signature drift is covered by
+  `libs/toolkit-contract-macros-tests/tests/ui/fail/rest_extra_projection_method.rs`; signature drift is covered by
   `rest_sig_drift_param_type.rs` (`E0308`).
 * Coverage test: `require_full_coverage` on a projection that omits a base method fails, listing
   the uncovered method. This is a **generated `#[test]` that panics**, not a compile error — see
@@ -458,5 +461,6 @@ Commit `openapi.json` per SDK crate; CI regenerates and diffs on every PR.
   satisfies that requirement.
 * Vision ADR-0004 (PR #1957) `cpt-cf-adr-rest-client-generation` — Phase 2 (proc-macro from
   annotated trait) is implemented here via the extended projection macro.
-* Current PoC: `libs/toolkit-contract-macros/src/rest_contract.rs` (client generation);
-  `examples/toolkit/api-contracts/api-contracts/src/api/rest/routes.rs` (hand-written routes to be replaced).
+* Implementation: `libs/toolkit-contract-macros/src/rest_contract.rs` (client and server generation);
+  `examples/toolkit/api-contracts/api-contracts/src/api/rest/routes.rs` (generated routes plus the
+  hand-written streaming routes, composed on one router).

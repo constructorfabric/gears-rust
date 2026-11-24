@@ -15,7 +15,6 @@
 |-------|------|-------------|
 | `resource_type` | `String` | GTS type identifier of the resource |
 | `resource_name` | `String` | Identifier of the duplicate resource |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 ## Constructor Example
 
@@ -57,10 +56,6 @@ let err = UserResourceError::already_exists("User already exists")
             "resource_name": {
               "type": "string",
               "description": "Identifier of the duplicate resource"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

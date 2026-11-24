@@ -18,7 +18,6 @@ Precondition failure:
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `violations` | `Vec<PreconditionViolation>` | List of precondition violations |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 Precondition violation:
 
@@ -76,10 +75,6 @@ let err = TenantResourceError::failed_precondition()
             "violations": {
               "type": "array",
               "items": { "$ref": "#/$defs/PreconditionViolation" }
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

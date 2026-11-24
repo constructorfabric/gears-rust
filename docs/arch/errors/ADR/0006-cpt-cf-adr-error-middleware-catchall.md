@@ -90,7 +90,12 @@ for any extractor-shaped wrapper to intercept in the first place.
 * `canonical_error_middleware` gains a second branch: any response reaching
   it with a client- or server-error status that is not already
   `application/problem+json`, and is not tagged `ForeignPassthrough` (see
-  below), is rewritten into a minimal, valid `Problem`. This wrap is
+  below), is rewritten into a minimal, valid `Problem`. As built, the branch
+  rewrites only unstructured bodies - no `Content-Type` or `text/plain`
+  (`is_unstructured_error_body` in `libs/toolkit/src/api/canonical_error_layer.rs`);
+  an error response with any other content type (e.g. the JSON body of
+  api-gateway's `/health`) passes through unchanged so its fields are not
+  destroyed. This wrap is
   category-aware, not a single uniform shape: a foreign 5xx becomes a real
   `internal` `CanonicalError` (DESIGN.md §2.1's fail-safe fallback - a 5xx
   is unambiguously this platform's own fault), a foreign 4xx uses RFC 9457
@@ -166,7 +171,7 @@ untouched; confirms 2xx/3xx and already-`Problem` responses are unaffected;
 and confirms - by routing a bare `axum::Json<T>` handler through
 `canonical_error_middleware` with no `extract::Json` involved - that the
 fallback alone already produces a valid `Problem` for an unmigrated call
-site. `oagw`'s own e2e suite (`testing/e2e/gears/oagw/`) exercises
+site. `oagw`'s own e2e suite (`testing/e2e/suites/oagw/`) exercises
 `ForeignPassthrough` end-to-end against a real proxied upstream failure.
 
 ## Pros and Cons of the Options
@@ -244,7 +249,7 @@ purely a client-fault mapping, unlike `Json`/`Query`:
 | any future (`#[non_exhaustive]`) variant | same `>= 500` status-driven classification as `FailedToDeserializePathParams` | `internal` or `invalid_path_params` per the status - never panics: that classification was already status-driven, not variant-specific, so an unknown variant needs nothing invented; logged at `error!` for visibility |
 
 Wrapper-extractor pattern precedent: `tokio-rs/axum`'s own
-`examples/customize-path-rejection/src/main.rs` wraps `axum::extract::Path<T>`
+[`examples/customize-path-rejection/src/main.rs`](https://github.com/tokio-rs/axum/blob/main/examples/customize-path-rejection/src/main.rs) wraps `axum::extract::Path<T>`
 identically - delegate to the built-in extractor, pattern-match its
 rejection, return a custom error shape.
 

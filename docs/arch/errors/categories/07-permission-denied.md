@@ -15,9 +15,8 @@
 |-------|------|-------------|
 | `resource_type` | `String` | Transport-injected resource GTS type identifier when provided by the canonical error wrapper |
 | `reason` | `String` | Machine-readable reason code (e.g., `CROSS_TENANT_ACCESS`) |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
-> Note: In Rust, `resource_type` is carried on `CanonicalError::PermissionDenied` as an envelope field, not inside `ErrorInfo`. It is injected into the wire `context` object during mapping to `Problem` via `Problem::from_error`. It is not part of the `ErrorInfo` GTS type (`gts.cf.core.errors.error_info.v1~`).
+> Note: In Rust, `resource_type` is carried on `CanonicalError::PermissionDenied` as an envelope field, not inside `PermissionDeniedV1`. It is injected into the wire `context` object during mapping to `Problem` via `Problem::from_error`.
 
 ## Constructor Example
 
@@ -59,10 +58,6 @@ let err = TenantResourceError::permission_denied()
             "reason": {
               "type": "string",
               "description": "Machine-readable reason code (e.g., CROSS_TENANT_ACCESS)"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

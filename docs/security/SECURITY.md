@@ -379,7 +379,8 @@ Project-specific Dylint rules are orchestrated by [`cargo-gears`](https://github
 | DE0301 | `no_infra_in_domain` | Prevents domain modules from importing infrastructure dependencies such as database and HTTP stacks |
 | DE0308 | `no_http_in_domain` | Prevents HTTP types and status codes from becoming domain policy |
 | DE0801 | `api_endpoint_version` | Enforces versioned API paths (`/{service}/v{N}/{resource}`) |
-`DE0902` forbids `schema_for` on GTS-typed structs |
+| DE0901 | `gts_string_pattern` | Validates GTS identifier string literals, keeping malformed type IDs out of the codebase |
+| DE0902 | `no_schema_for_on_gts_structs` | Forbids `schema_for!` on GTS-typed structs so their schemas keep the correct `$id` and `$ref`s |
 | DE1301 | `no_print_macros` | Forbids print/debug macros in production code, reducing uncontrolled disclosure |
 
 These lints materially strengthen the secure development path, especially layer isolation, direct-SQL prevention, plugin contracts, and GTS correctness. They complement rather than replace framework type-state and runtime controls: the current published rule catalog does **not** itself prove that every protected operation invokes `PolicyEnforcer`, that every entity derives `Scopable`, or that every outbound connection uses OAGW. Those properties come from `OperationBuilder`, Secure ORM APIs/macros, code review and tests, and deployment policy; additional Dylint rules can make more of them build-breaking over time.

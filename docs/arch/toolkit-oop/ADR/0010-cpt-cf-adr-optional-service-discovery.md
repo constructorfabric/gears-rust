@@ -5,6 +5,8 @@ date: 2026-10-12
 
 # Optional Service Discovery and Registration for Out-of-Process Gears
 
+> **Implementation:** not implemented yet — there is no `discovery` setting; `OopRunOptions::directory_endpoint` is still a `String` whose `Default` falls back to `http://127.0.0.1:50051` (`libs/toolkit/src/bootstrap/oop.rs`), and `OopServeOptions::directory` is not optional. The static `clients.consumes.<dep>.endpoint` override (`ConsumerWiring::endpoint`, `StaticEndpointResolver`) already exists.
+
 **ID**: `cpt-cf-adr-optional-service-discovery`
 
 ## Table of Contents
@@ -216,8 +218,8 @@ The code changes are localized to `libs/toolkit/src/bootstrap/oop.rs` and
 * **Platform-plane credential test**: launch a directory-less consumer that calls a platform-plane method through a
   static endpoint; assert the request carries `X-ToolKit-Internal-Token` (i.e. the credential survives the removal of
   `build_directory_client`) and does not 401.
-* **Backward-compatibility test**: launch the existing `config/oop-self-hosted.yaml` example configured for
-  `discovery: directory` and verify the worker still registers with the directory and is reachable through the edge
+* **Backward-compatibility test**: launch an existing OoP example (for instance `config/oop-example-master.yaml`,
+  whose host runs the directory) configured for `discovery: directory` and verify the worker still registers with the directory and is reachable through the edge
   gateway.
 * **Guidance consistency review** (part of the `cpt-cf-binding-adr-consumer-wiring` amendment): verify that the
   `host_runtime.rs` proxy-wiring `warn!` **and** the doc comments on `ConsumerWiring::endpoint`

@@ -14,8 +14,6 @@
 | Field | Type | Description |
 |-------|------|-------------|
 | `resource_type` | `String` | GTS type identifier of the associated resource |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
-
 
 ## Constructor Example
 
@@ -51,10 +49,6 @@ let err = UserResourceError::cancelled().create();
             "resource_type": {
               "type": "string",
               "description": "GTS type identifier of the associated resource"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

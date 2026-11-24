@@ -1,9 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-06-02
 ---
 
 # Discovery-Driven Consumer Wiring via `#[toolkit::consumes]`
+
+> **Implementation:** `libs/toolkit-contract-macros/src/consumes.rs` (`#[toolkit::consumes]`) and the proxy-wiring phase in `libs/toolkit/src/runtime/host_runtime.rs`; used by gears such as `settings-service`.
 
 **ID**: `cpt-cf-binding-adr-consumer-wiring`
 

@@ -6,6 +6,8 @@ decision-makers: Constructor Fabric Steering Committee
 
 # AuthN Resolver Minimalist Interface
 
+> **Amended:** `exchange_client_credentials` was added later to `AuthNResolverClient` and `AuthNResolverPluginClient` (`authn-resolver-sdk`, `api.rs` and `plugin_api.rs`) for service-to-service credential exchange. Token validation is still the single `authenticate` method described here.
+
 ## Context and Problem Statement
 
 AuthN Resolver is a gear that validates bearer tokens and produces `SecurityContext` for downstream gears (PEPs). The gear needs to define an interface for vendor-specific plugins that integrate with various Identity Providers (IdPs).

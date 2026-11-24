@@ -507,7 +507,7 @@ Together, Gears and Studio let a team build and assemble products **faster** (a 
 - **CTO:** architecture rules stay enforceable as the platform and team grow; fewer one-off conventions, simpler operations, and version upgrades or provider swaps validated by tooling rather than manual audit.
 - **Developer / AI:** a precise build failure with the preferred alternative beats a production incident; familiar structure and machine-checked contracts mean less context to load and a faster path from one reported problem to a repository-wide fix.
 
-References: [Specification templates](spec-templates/README.md), [ToolKit guide](toolkit_unified_system/README.md), [`Cargo.toml`](../Cargo.toml), [`clippy.toml`](../clippy.toml), [`Gears.toml`](../Gears.toml), [Defect class → control map](toolkit_unified_system/16_defect_class_to_control_map.md), [ClientHub and plugins](toolkit_unified_system/03_clienthub_and_plugins.md).
+References: [ToolKit guide](toolkit_unified_system/README.md), [`Cargo.toml`](../Cargo.toml), [`clippy.toml`](../clippy.toml), [`Gears.toml`](../Gears.toml), [Defect class → control map](toolkit_unified_system/16_defect_class_to_control_map.md), [ClientHub and plugins](toolkit_unified_system/03_clienthub_and_plugins.md).
 
 ---
 

@@ -124,7 +124,7 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 - SSE streaming support via `#[streaming]` annotation
 - Retryable method support via `#[retryable]` annotation with exponential backoff
 - Error mapping via `#[derive(ContractError)]` generating RFC 9457 Problem Details with `error_code` and `error_domain`
-- Runtime support crate: `ProblemDetails` type, SSE parser, `ClientConfig`, `with_retry()` helper
+- Runtime support: RFC 9457 wire type (`toolkit_canonical_errors::Problem`), SSE parser, `ClientConfig`, retry helper
 - Service directory trait definition (interface only, implementation out of scope)
 - OpenAPI spec validation at service registration time
 - ClientHub fallback resolution: compile-time registration priority, REST proxy fallback
@@ -388,14 +388,13 @@ Endpoints marked as optional (description contains "MAY omit") SHALL NOT cause r
 >   transport/protocol failures into the fallback variant.
 > - Duplicate `(error_domain, error_code)` pairs are a compile error.
 >
-> The requirement text below is retained for intent; treat the note above as the
-> current contract.
+> The requirements below are stated against this API.
 
 #### ContractError Derive Macro
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-contract-error-derive`
 
-The `#[derive(ContractError)]` macro SHALL generate RFC 9457 Problem Details conversion from an annotated error enum. The error code SHALL be derived from the variant name in UPPER_SNAKE_CASE. The error domain SHALL be specified via `#[contract_error(domain = "...")]` attribute.
+The `#[derive(ContractError)]` macro SHALL generate RFC 9457 Problem Details conversion (`From<MyError> for Problem` and `TryFrom<Problem> for MyError`) from an annotated error enum. Each variant SHALL declare its error code explicitly with `#[error_code("…")]`; the error domain SHALL be declared with `#[error_domain("…")]` on the enum or the variant.
 
 - **Rationale**: Consistent, machine-readable error responses across all gear boundaries without hand-written conversion code.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
@@ -404,7 +403,7 @@ The `#[derive(ContractError)]` macro SHALL generate RFC 9457 Problem Details con
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-error-round-trip`
 
-A `ContractError` converted to Problem Details JSON via `to_problem_details()` and deserialized back via `from_problem_details()` MUST result in the same error variant with all structured context fields preserved.
+A `ContractError` converted to a `Problem` (`From<MyError> for Problem`), serialized to JSON, deserialized and converted back (`TryFrom<Problem> for MyError`) MUST result in the same error variant with all structured context fields preserved.
 
 - **Rationale**: Enables reliable error reconstruction on the client side without lossy manual mapping.
 - **Actors**: `cpt-cf-binding-actor-api-consumer`
@@ -413,7 +412,7 @@ A `ContractError` converted to Problem Details JSON via `to_problem_details()` a
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-unknown-error-fallback`
 
-When `from_problem_details()` receives an `error_code` or `error_domain` that does not match any known variant, it SHALL return a fallback error variant (typically `Internal`) with the unknown code or domain in the description.
+When `TryFrom<Problem>` receives an `error_code` or `error_domain` that does not match any known variant, it SHALL return the original `Problem` as its error, so no information is lost. A variant marked `#[contract_error(fallback)]` additionally receives transport and protocol failures the generated client cannot map to a typed variant.
 
 - **Rationale**: Graceful degradation when the server adds new error variants that the client does not yet know about.
 - **Actors**: `cpt-cf-binding-actor-api-consumer`
@@ -422,7 +421,7 @@ When `from_problem_details()` receives an `error_code` or `error_domain` that do
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-variant-annotations`
 
-Each error enum variant SHALL be annotated with HTTP status code and problem type URI suffix (e.g., `#[error(status = 404, problem_type = "not-found")]`). The macro SHALL generate `status_code()` and `problem_type()` methods from these annotations.
+Each error enum variant SHALL be annotated with a canonical category (`#[canonical(<ProblemCategory>)]`, e.g. `#[canonical(NotFound)]`), which determines the HTTP status, the problem `type` and the title. The macro SHALL generate a `category()` accessor from the same annotation.
 
 - **Rationale**: HTTP status mapping is explicit in the error definition, not in framework middleware.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
@@ -431,7 +430,7 @@ Each error enum variant SHALL be annotated with HTTP status code and problem typ
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-structured-context`
 
-The `context` field in Problem Details SHALL carry the variant's associated data as a JSON object. Named fields SHALL be serialized to context, and `from_problem_details()` SHALL deserialize the context back into the variant's fields.
+The `context` field in Problem Details SHALL carry the variant's associated data as a JSON object. Named fields SHALL be serialized to context, and `TryFrom<Problem>` SHALL deserialize the context back into the variant's fields.
 
 - **Rationale**: Machine-readable error context enables programmatic error handling beyond status code matching.
 - **Actors**: `cpt-cf-binding-actor-api-consumer`
@@ -476,11 +475,11 @@ Methods annotated with `#[retryable]` SHALL generate retry logic with exponentia
 >   `reqwest`) and `utoipa` (not `openapiv3`); `schemars` is used for
 >   JSON-schema derivation on request/response DTOs.
 
-#### ProblemDetails Type
+#### Problem Details Type
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-problem-details-type`
 
-The runtime crate SHALL provide a `ProblemDetails` struct for RFC 9457 wire format with fields: `type`, `title`, `status`, `detail`, `error_code`, `error_domain`, `context` (when non-null), and `trace_id` (when present).
+The runtime SHALL provide one struct for the RFC 9457 wire format with fields: `type`, `title`, `status`, `detail`, `error_code`, `error_domain`, `context`, and `trace_id` (when present). Satisfied by `toolkit_canonical_errors::Problem` (re-exported as `toolkit_contract::Problem`), which also carries `instance`.
 
 - **Rationale**: Shared type for generated client error deserialization and server error serialization.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`, `cpt-cf-binding-actor-api-consumer`

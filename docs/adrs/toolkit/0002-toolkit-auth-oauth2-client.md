@@ -22,7 +22,7 @@ The platform HTTP client is `toolkit-http::HttpClient` (hyper + tower), which al
 
 ## Decision
 
-Use an in-house `token_watcher` gear (`oauth2/token_watcher.rs`) for token lifecycle management — background refresh with jitter, exponential backoff, and lock-free reads via `ArcSwap`. This replaces the earlier `aliri_tokens` dependency, which was removed to eliminate its transitive `ring` dependency (see [ADR 0005 — FIPS Dependency Policy](../../security/fips/adrs/0005-fips-dependency-policy.md)).
+Use an in-house `token_watcher` module (`oauth2/token_watcher.rs`) for token lifecycle management — background refresh with jitter, exponential backoff, and lock-free reads via `ArcSwap`. This replaces the earlier `aliri_tokens` dependency, which was removed to eliminate its transitive `ring` dependency (see [ADR 0005 — FIPS Dependency Policy](../../security/fips/adrs/0005-fips-dependency-policy.md)).
 
 OAuth2 Client Credentials exchange is implemented as a custom token source that uses `toolkit-http::HttpClient` with `HttpClientConfig::token_endpoint()`. Outbound HTTP composition is hyper + tower. Authentication is implemented as a tower layer that composes with the existing `HttpClient` layer stack.
 
@@ -48,9 +48,9 @@ OAuth2 Client Credentials exchange is implemented as a custom token source that 
 
 All components are implemented in `libs/toolkit-auth/src/oauth2/` and `libs/toolkit-http/src/builder.rs`.
 
-### Gears and public API
+### Modules and public API
 
-| Gear | Path | Public type | Description |
+| Module | Path | Public type | Description |
 |--------|------|-------------|-------------|
 | `config` | `oauth2/config.rs` | `OAuthClientConfig`, `TokenEndpoint` | Configuration struct built with `OAuthClientConfig::new(endpoint, client_id, credentials)`; scopes, extra headers, refresh policy and the optional `HttpClientConfig` override have defaults and are set with struct update syntax. `TokenEndpoint` is `Direct(url)` or `Issuer(url)` (OIDC discovery). `Debug` redacts credentials and header values. |
 | `credentials` | `oauth2/credentials.rs` | `ClientCredentials`, `PrivateKeyJwt`, `RsaJwsAlg` | Client authentication method together with its credential: `SecretBasic` (`client_secret_basic`), `SecretPost` (`client_secret_post`), `PrivateKeyJwt` (RFC 7523 `private_key_jwt`, ES256 / RS256 / PS256). Assertions are signed per request through the `toolkit-security` crypto facade (`toolkit_security::jwt::encode`), never by jsonwebtoken's signer. |
@@ -67,14 +67,14 @@ All public types are re-exported from `toolkit_auth::oauth2` and from the crate 
 
 ### `toolkit-http` integration
 
-`HttpClientBuilder::with_auth_layer(wrap)` accepts a generic `FnOnce(BoxCloneService) -> BoxCloneService` transform inserted between retry and timeout in the tower stack. This avoids a circular dependency (`toolkit-auth` depends on `toolkit-http`, not vice versa). The `HttpClientBuilderExt` extension trait in `toolkit-auth` wraps `BearerAuthLayer` into this hook.
+`HttpClientBuilder::with_auth_layer(wrap)` accepts a generic `FnOnce(BoxCloneService) -> BoxCloneService` transform inserted inside the retry layer, above the optional attempt layer, error mapping and timeout. This avoids a circular dependency (`toolkit-auth` depends on `toolkit-http`, not vice versa). The `HttpClientBuilderExt` extension trait in `toolkit-auth` wraps `BearerAuthLayer` into this hook.
 
 ### Architecture notes
 
 - **No circular dependency:** `toolkit-http` has zero awareness of `toolkit-auth`. The auth layer is injected via a generic hook (`with_auth_layer`) and an extension trait pattern.
 - **OIDC discovery is one-time:** Runs on the first token fetch. The resolved `token_endpoint` is shared by source clones through `OnceCell`, so invalidation never re-runs successful discovery. Failed discovery can be retried.
 - **Secret safety:** `SecretString` uses `Zeroizing<String>` for secure memory cleanup. `Debug` and `Display` impls are redacted. Access tokens are only exposed transiently in `format!("Bearer {}", secret.expose())` within the auth layer.
-- **Stack order:** `Buffer -> OTel -> LoadShed -> Retry -> **Auth** -> Timeout -> UserAgent -> Decompress -> Redirect -> hyper`
+- **Stack order** (outer to inner, `HttpClientBuilder::build` in `libs/toolkit-http/src/builder.rs`): `Buffer -> OTel -> Metrics -> LoadShed/ConcurrencyLimit -> Retry -> **Auth** -> Attempt -> ErrorMapping -> Timeout -> UserAgent -> Decompression -> FollowRedirect -> hyper`. OTel, Metrics, LoadShed/ConcurrencyLimit, Retry, Auth and Attempt are installed only when configured; the attempt slot holds the circuit breaker ([ADR-0005](./0005-toolkit-client-circuit-breaker.md)).
 
 ### Provider lifecycle
 

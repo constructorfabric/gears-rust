@@ -195,7 +195,7 @@ appropriate for the running OS (AWS-LC FIPS on Linux, Apple corecrypto on macOS,
 
 #### Inbound HTTPS / mTLS routes through a CMVP-validated module
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-fr-inbound-tls`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-fr-inbound-tls`
 
 The system **MUST** support `rustls::ServerConfig` construction over the FIPS provider so that inbound HTTPS termination
 and mTLS client-certificate authentication route every cryptographic primitive — including server-side / client-cert
@@ -211,7 +211,7 @@ signing — through the CMVP-validated module.
 
 #### Wire profile contains only Approved algorithms
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-fr-wire-profile`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-fr-wire-profile`
 
 The system **MUST** restrict the wire-level cipher-suite list, key-exchange group list, and signature scheme list under
 `--features fips` to FIPS-Approved algorithms: AES-128/256-GCM, ECDHE on NIST P-256/P-384, ECDSA on P-256/P-384/P-521,
@@ -226,17 +226,17 @@ RSA-PSS and RSA-PKCS#1 v1.5 with SHA-256/384/512, HKDF over SHA-256/384, SHA-2 f
 
 #### RSA modulus minimum enforced at key load
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-fr-rsa-modulus`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-fr-rsa-modulus`
 
 The system **MUST** reject RSA private keys with modulus < 2048 bits at load time, per NIST FIPS 186-5 §5.1.
 
 - **Rationale**: Apple's `SecKeyCreateWithData` accepts 1024-bit RSA keys silently. Without the check, a weak server key
   would pass through to `SecKeyCreateSignature` and produce technically-valid but FIPS-invalid signatures.
-- **Acceptance Evidence**: `libs/rustls-corecrypto-provider/src/signer/rsa.rs::rsa_1024_key_is_rejected`.
+- **Acceptance Evidence**: `libs/rustls-corecrypto-provider/src/signer/rsa_tests.rs::rsa_1024_key_is_rejected`.
 
 #### TLS 1.2 EMS required under FIPS claim
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-fr-tls12-ems`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-fr-tls12-ems`
 
 The system **MUST** set `require_ems = true` on every TLS 1.2 `ClientConfig` / `ServerConfig` constructed under
 `--features fips`, per NIST SP 800-52 Rev. 2 §3.5.
@@ -250,7 +250,7 @@ The system **MUST** set `require_ems = true` on every TLS 1.2 `ClientConfig` / `
 
 #### EC public point read from SEC1, never derived
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-fr-ec-publickey-read`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-fr-ec-publickey-read`
 
 The system **MUST NOT** derive an EC public point `Q = d · G` from a private scalar `d` in non-CMVP-validated Rust code
 on macOS. EC keys imported via `cf-gears-rustls-corecrypto-provider` MUST read the public point from the SEC1
@@ -259,7 +259,7 @@ be rejected fail-closed.
 
 - **Rationale**: EC scalar multiplication is itself a cryptographic primitive. Performing it outside Apple corecrypto
   violates the FIPS 140-3 cryptographic boundary; auditors will flag the claim as void.
-- **Acceptance Evidence**: `libs/rustls-corecrypto-provider/src/signer/ec.rs::sec1_without_public_key_is_rejected`,
+- **Acceptance Evidence**: `libs/rustls-corecrypto-provider/src/signer/ec_tests.rs::sec1_without_public_key_is_rejected`,
   `sec1_with_compressed_public_key_is_rejected`.
 
 ### 5.4 Build-Time Dependency Discipline
@@ -298,7 +298,7 @@ pre-release macOS.
 
 #### Windows OS-level FIPS-mode required
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-fr-windows-fips-mode`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-fr-windows-fips-mode`
 
 The system **MUST** refuse to install the CNG-backed crypto provider on Windows when the OS-level FIPS-mode flag (
 `HKLM\System\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy`) is not `1`. The bootstrap MUST detect
@@ -340,7 +340,7 @@ per [§9](#9-acceptance-criteria) MUST show only Apple `Security.framework` on m
 
 #### Memory-safety preservation under FIPS-build
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-nfr-memory-safety`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-nfr-memory-safety`
 
 The TLS state machine MUST remain implemented in memory-safe Rust (`rustls`) under `--features fips`. Heartbleed-class
 C-TLS-state-machine vulnerabilities MUST NOT enter Gears' threat model via the FIPS toolchain.
@@ -351,7 +351,7 @@ C-TLS-state-machine vulnerabilities MUST NOT enter Gears' threat model via the F
 
 #### Cross-OS architectural uniformity
 
-- [ ] `p2` - **ID**: `cpt-toolkit-fips-nfr-cross-os-uniformity`
+- [x] `p2` - **ID**: `cpt-toolkit-fips-nfr-cross-os-uniformity`
 
 Adding a new supported OS, or upgrading an existing supported OS to a new major version, MUST NOT require rewriting the
 TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST change.
@@ -365,7 +365,7 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
 
 #### `--features fips` build flag
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-interface-cargo-feature`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-interface-cargo-feature`
 
 - **Type**: Cargo feature on `cf-gears-toolkit`, `cf-gears-toolkit-http`, and `cf-gears-fips-probe`.
 - **Stability**: stable.
@@ -376,7 +376,7 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
 
 #### `toolkit::bootstrap::init_crypto_provider`
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-interface-init-crypto-provider`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-interface-init-crypto-provider`
 
 - **Type**: Rust public function on `cf-gears-toolkit`.
 - **Stability**: stable.
@@ -388,15 +388,15 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
 
 #### `cf_gears_rustls_corecrypto_provider::{default_provider, fips_provider}`
 
-- [ ] `p1` - **ID**: `cpt-toolkit-fips-interface-corecrypto-provider`
+- [x] `p1` - **ID**: `cpt-toolkit-fips-interface-corecrypto-provider`
 
 - **Type**: Rust public functions on `cf-gears-rustls-corecrypto-provider`.
-- **Stability**: unstable (`0.1.x`).
+- **Stability**: unstable (`0.x`; currently `0.2.x`).
 - **Description**: Factory functions returning `rustls::crypto::CryptoProvider`. `default_provider()` returns TLS 1.2 +
   1.3 with `fips() = false`; `fips_provider()` returns TLS 1.3 only with `fips() = true`. Under the crate's own `fips`
   feature, `default_provider()` is aliased to `fips_provider()` for single-entry-point compatibility with the
   `rustls-cng-crypto` pattern.
-- **Breaking Change Policy**: Caret-pinned to `0.1.x`; semver bumps require dep-graph regression review.
+- **Breaking Change Policy**: Caret-pinned in the workspace `Cargo.toml`; semver bumps require dep-graph regression review.
 
 ### 7.2 External Integration Contracts
 
@@ -503,7 +503,7 @@ TLS state machine. Only the crypto-primitive backend behind a `cfg` branch MUST 
   `Security.framework`.
 - [ ] `dumpbin /imports target/release/cf-gears-fips-probe.exe | findstr /i "bcrypt aws"` on Windows+fips shows only
   `bcrypt.dll`.
-- [ ] `cargo test -p cf-gears-rustls-corecrypto-provider --features fips --test fips_provider_invariants` passes.
+- [x] `cargo test -p cf-gears-rustls-corecrypto-provider --features fips --test fips_provider_invariants` passes.
 - [ ] `cargo run -p cf-gears-fips-probe --features fips -- --url https://www.howsmyssl.com/a/check` reports
   `given_cipher_suites` containing only AES-GCM, `given_named_groups` only `secp256r1` / `secp384r1`,
   `post_quantum_key_agreement: false`.

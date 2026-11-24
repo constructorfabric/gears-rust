@@ -9,9 +9,9 @@ The canonical error system provides a single, universal error type (`CanonicalEr
 **Canonical errors** are a closed set of 16 error categories (based on Google's canonical error codes). Each category has:
 - A typed context struct carrying machine-readable error details
 - A GTS compound type identifier for global uniqueness
-- A fixed HTTP status mapping for REST (gRPC/SSE mappings are future work)
+- A fixed default HTTP status; the same RFC 9457 `Problem` envelope also travels over gRPC (binary trailer) and SSE (`event: error` frames) — see [§3.3](#33-api-contracts)
 
-The `CanonicalError` enum has one variant per category. Every variant carries four fields: `ctx` (category-specific context type), `detail`, `resource_type`, and `resource_name` (the `Internal` variant is an exception — it carries only `ctx` and `detail`). Constructing an error uses the builder pattern — e.g., `CanonicalError::internal("db failure").create()` or `UserResourceError::not_found("User not found").with_resource("user-123").create()`. Using the wrong context type for a category is a compile error.
+The `CanonicalError` enum has one variant per category. Every variant carries five fields: `ctx` (category-specific context type), `detail`, `resource_type`, `resource_name`, and `overrides` (`TransportOverrides`, see [§2.2 Transport Overrides](#transport-overrides)). The `Internal` variant is an exception — it carries only `ctx`, `detail` and `overrides`. Constructing an error uses the builder pattern — e.g., `CanonicalError::internal("db failure").create()` or `UserResourceError::not_found("User not found").with_resource("user-123").create()`. Using the wrong context type for a category is a compile error.
 
 **Builder-only enforcement**: The enum and all variants are marked `#[non_exhaustive]`, preventing direct variant construction from outside the crate. Internal constructors and mutation methods (`with_detail`, `with_resource_type`, `with_resource`) are `pub(crate)`, ensuring the only external construction path is through the builder API (`ResourceErrorBuilder` or the three non-resource builders: `internal`, `service_unavailable`, `unauthenticated`).
 
@@ -62,12 +62,15 @@ struct UserResourceError;
 // Generated constructors return builders — call .create() to produce CanonicalError:
 UserResourceError::not_found("User not found")     // → builder (resource required)
     .with_resource("user-123").create();             // → CanonicalError::NotFound with resource_type set
-UserResourceError::permission_denied().create();     // → CanonicalError::PermissionDenied with resource_type set
+UserResourceError::permission_denied()                // → builder (reason required)
+    .with_reason("CROSS_TENANT_ACCESS").create();    // → CanonicalError::PermissionDenied with resource_type set
 ```
+
+The attribute also accepts `gts_id!("cf.core.users.user.v1~")`, which prepends the configured GTS ID prefix; both forms are validated at compile time.
 
 Non-resource errors (e.g., `service_unavailable`, `unauthenticated`) use `CanonicalError::` constructors directly.
 
-The `Problem` struct (RFC 9457) is the REST wire format. A single `From<CanonicalError> for Problem` implementation handles all 16 categories.
+The `Problem` struct (RFC 9457) is the wire envelope. A single `From<CanonicalError> for Problem` implementation handles all 16 categories.
 
 ### 1.2 Canonical Error Categories
 
@@ -110,12 +113,12 @@ See [§ 4. Category Reference](#4-category-reference) for full definitions inclu
 | `cpt-cf-errors-fr-mandatory-trace-id` | `Problem.trace_id` field populated by middleware |
 | `cpt-cf-errors-fr-public-private-isolation` | Internal details never included in production responses; `trace_id` used for correlation |
 | `cpt-cf-errors-fr-compile-time-safety` | Typed enum + `#[resource_error]` macro |
-| `cpt-cf-errors-fr-gts-identification` | `GtsSchema` trait with `SCHEMA_ID` const per context type |
+| `cpt-cf-errors-fr-gts-identification` | `CanonicalError::gts_type()` returns one `gts_id!` constant per category; `gts_id!` and `#[resource_error]` validate identifiers at compile time. Types Registry registration is not implemented (see [§3.5](#35-gts-registration)) |
 | `cpt-cf-errors-fr-single-line-construction` | One builder per category; `CanonicalError::category(detail).create()` or `ResourceError::category(detail).with_resource(id).create()` |
 | `cpt-cf-errors-fr-resource-scoped-construction` | `#[resource_error]` macro generates constructors with auto-tagged `resource_type` |
 | `cpt-cf-errors-fr-builder-only-construction` | `#[non_exhaustive]` on enum + variants; `pub(crate)` internal constructors and mutation methods |
 | `cpt-cf-errors-fr-library-error-propagation` | Blanket `From` impls for common library errors (`io::Error`, `serde_json::Error`, `DbErr`) |
-| `cpt-cf-errors-fr-schema-drift-prevention` | Showcase snapshot tests + `cargo-semver-checks` + schema file diffing in CI |
+| `cpt-cf-errors-fr-schema-drift-prevention` | Showcase tests asserting the full `Problem` JSON per category; `cargo-semver-checks` in the release-plz workflow. Schema file diffing is not implemented |
 | `cpt-cf-errors-fr-standard-adoption` | RFC 9457 Problem Details as REST wire format |
 
 #### Key ADRs
@@ -126,6 +129,8 @@ See [§ 4. Category Reference](#4-category-reference) for full definitions inclu
 | `cpt-cf-errors-adr-gts-error-identification` | GTS compound type identifiers for error categories |
 | `cpt-cf-errors-adr-rfc9457-wire-format` | RFC 9457 Problem Details as REST wire format |
 | `cpt-cf-errors-adr-typed-enum-impl` | Typed enum with category-typed constructors |
+| `cpt-cf-errors-adr-sdk-canonical-projection` | SDKs return `CanonicalError` at the boundary; typed projection is opt-in |
+| `cpt-cf-errors-adr-error-middleware-catchall` | Wrapper extractors plus a generic middleware fallback for responses never typed as `CanonicalError` |
 
 ### 1.4 Architecture Layers
 
@@ -139,13 +144,22 @@ See [§ 4. Category Reference](#4-category-reference) for full definitions inclu
       │  CanonicalError │ ← domain layer (transport-agnostic)
       │  (16 variants)  │
       └────────┬────────┘
-               │
-    ┌──────────┼──────────┐
-    v          v          v
- Problem    Status      Event
- (REST)     (gRPC)      (SSE)
- RFC9457    (future)    (future)
+               │  From<CanonicalError> for Problem
+               v
+      ┌─────────────────┐
+      │ Problem         │ ← RFC 9457 envelope
+      └────────┬────────┘
+    ┌──────────┼──────────────────┐
+    v          v                  v
+  REST       gRPC                SSE
+  body       x-toolkit-problem-  `event: error`
+             bin trailer         data frame
 ```
+
+- **REST**: `impl IntoResponse for CanonicalError` (feature `axum`, `libs/toolkit-canonical-errors/src/problem.rs`) renders `application/problem+json`.
+- **gRPC**: `toolkit_transport_grpc::attach_problem` / `extract_problem` (`libs/toolkit-transport-grpc/src/lib.rs`) carry the `Problem` JSON in the `x-toolkit-problem-bin` trailer. There is no shared `From<CanonicalError> for tonic::Status`; the server picks the status code and attaches the trailer (example: `gears/system/cluster/cluster-sdk/src/convert.rs`). Clients map `tonic::Status` with `toolkit_contract::grpc::map_tonic_status`.
+- **SSE**: the client parser in `libs/toolkit-contract/src/runtime/sse.rs` reads the `data:` line after `event: error` as a `Problem`. The toolkit has no shared server-side emitter for these frames.
+- **Client side**: `From<TransportError> for CanonicalError` (`libs/toolkit-contract/src/runtime/canonical.rs`) recovers the typed variant from the REST body or the gRPC trailer via `TryFrom<Problem>`, with status-code fallbacks for peers that send no envelope.
 
 ## 2. Principles & Constraints
 
@@ -155,7 +169,7 @@ See [§ 4. Category Reference](#4-category-reference) for full definitions inclu
 
 - [ ] `p1` - **ID**: `cpt-cf-errors-principle-transport-agnosticism`
 
-`CanonicalError` is the only error type accepted by API layers. It carries no HTTP status codes, gRPC codes, or transport headers. Transport mapping happens in exactly one `From` impl per transport at the boundary.
+`CanonicalError` is the only error type accepted by API layers. It carries no gRPC codes or transport headers; the only transport data it holds is an optional per-occurrence HTTP status override (`TransportOverride`). Transport mapping goes through the single `From<CanonicalError> for Problem` conversion at the boundary.
 
 **ADRs**: `cpt-cf-errors-adr-typed-enum-impl`
 
@@ -191,7 +205,7 @@ Every canonical category has a GTS identifier assigned before any code is writte
 
 Any 5xx error that does not match a canonical category is mapped to `internal` with a trace ID - a 5xx is unambiguous (it's this platform's own fault regardless of specifics), so `internal` is a correct answer, not a guess. A 4xx that does not match a canonical category instead uses RFC 9457 §4.2.1's `about:blank` convention, since a bare 4xx genuinely does not determine one canonical category over another (e.g. a 400 could be `invalid_argument`, `failed_precondition`, or `out_of_range`) - asserting a specific GTS category there would misrepresent unrelated failures as one thing. Every error that reaches the middleware and is rewritten by it still becomes a syntactically valid `Problem` carrying a trace ID; "with a canonical category" is guaranteed for 5xx, and deliberately declined for an unattributable 4xx. A response tagged `ForeignPassthrough`, or a non-error (2xx/3xx) response that merely mislabeled its `Content-Type` as `application/problem+json`, is outside this guarantee - neither is rewritten by the middleware, so its body is whatever it originally was.
 
-> **Note**: Enforced by `toolkit::api::canonical_error_middleware`'s generic-wrap fallback (`cpt-cf-errors-fr-middleware-catchall`, see `cpt-cf-errors-adr-error-middleware-catchall`) for any response that reaches it without already being `CanonicalError`-typed, and by compile-time enforcement (typed enum, Architecture lint rules) plus the single `From<CanonicalError> for Problem` conversion path for everything constructed via the typed API.
+> **Note**: Enforced by `toolkit::api::canonical_error_middleware`'s generic-wrap fallback (`cpt-cf-errors-fr-middleware-catchall`, see `cpt-cf-errors-adr-error-middleware-catchall`) for any response that reaches it without already being `CanonicalError`-typed, and by compile-time enforcement (typed enum, builder typestate) plus the single `From<CanonicalError> for Problem` conversion path for everything constructed via the typed API.
 
 ### 2.2 Constraints
 
@@ -199,7 +213,7 @@ Any 5xx error that does not match a canonical category is mapped to `internal` w
 
 - [ ] `p1` - **ID**: `cpt-cf-errors-constraint-rfc9457`
 
-All REST error responses this platform produces or rewrites use `Content-Type: application/problem+json` and include the RFC 9457 fields: `type`, `title`, `status`, `detail`, and `instance`. The `type` field carries the GTS URI for the error category, except for a response the platform could not attribute to any canonical category at all (an unattributable foreign 4xx caught only by the error-middleware catch-all fallback) - RFC 9457 §4.2.1's `"about:blank"` sentinel is used there instead, since asserting a specific GTS category from a bare, unattributable status code would be a guess, not a contract. A `ForeignPassthrough`-tagged response is excluded from this constraint entirely - it is relayed verbatim and was never a candidate for rewriting.
+All REST error responses this platform produces from a `CanonicalError` or rewrites use `Content-Type: application/problem+json` and include the RFC 9457 fields: `type`, `title`, `status`, `detail`, and `instance`. The `type` field carries the GTS URI for the error category, except for a response the platform could not attribute to any canonical category at all (an unattributable foreign 4xx caught only by the error-middleware catch-all fallback) - RFC 9457 §4.2.1's `"about:blank"` sentinel is used there instead, since asserting a specific GTS category from a bare, unattributable status code would be a guess, not a contract. A `ForeignPassthrough`-tagged response is excluded from this constraint entirely - it is relayed verbatim and was never a candidate for rewriting.
 
 **ADRs**: `cpt-cf-errors-adr-rfc9457-wire-format`, `cpt-cf-errors-adr-error-middleware-catchall`
 
@@ -243,7 +257,7 @@ Every error response consists of **contract parts** (fixed per category) and **v
 - Context field values
 - Per-occurrence transport override (e.g. `Http::status_code(..)`) — see below
 
-**Breaking changes** (require major version bump of `cf-gears-toolkit-errors`):
+**Breaking changes** (require major version bump of `cf-gears-toolkit-canonical-errors`):
 - Removing or renaming a canonical category
 - Changing the context type associated with a category
 - Removing or renaming a field in a context type schema
@@ -259,7 +273,7 @@ Every error response consists of **contract parts** (fixed per category) and **v
 
 - [ ] `p2` - **ID**: `cpt-cf-errors-constraint-transport-overrides`
 
-A caller MAY attach a transport-specific override to a single `CanonicalError` occurrence, without changing that occurrence's canonical category, GTS type, title, or context schema — only the named transport's wire projection is affected. This is an escape hatch for cases where a specific call site needs to diverge from the category's default HTTP status (e.g. a `not_found` that must read as `410 Gone` for one legacy endpoint) while keeping the category correct for dispatch, classification, and any future gRPC/SSE mapping.
+A caller MAY attach a transport-specific override to a single `CanonicalError` occurrence, without changing that occurrence's canonical category, GTS type, title, or context schema — only the named transport's wire projection is affected. This is an escape hatch for cases where a specific call site needs to diverge from the category's default HTTP status (e.g. a `not_found` that must read as `410 Gone` for one legacy endpoint) while keeping the category correct for dispatch, classification, and the other transports.
 
 ```rust
 use toolkit_canonical_errors::{CanonicalError, Http};
@@ -322,25 +336,27 @@ async fn get_user(Path(id): Path<String>) -> Result<Json<User>, CanonicalError> 
 | Entity | Description |
 |--------|-------------|
 | `CanonicalError` | 16-variant enum — the universal error type |
-| `Problem` | RFC 9457 wire format struct for REST responses |
-| Context types | `Validation`, `ResourceInfo`, `ErrorInfo`, `QuotaFailure`, `PreconditionFailure`, `RetryInfo`, `RequestInfo` |
+| `Problem` | RFC 9457 envelope (`src/problem.rs`), used as the REST body, gRPC trailer and SSE error frame |
+| Context types | One per category in `src/context.rs`: `CancelledV1`, `UnknownV1`, `InvalidArgumentV1`, `DeadlineExceededV1`, `NotFoundV1`, `AlreadyExistsV1`, `PermissionDeniedV1`, `ResourceExhaustedV1`, `FailedPreconditionV1`, `AbortedV1`, `OutOfRangeV1`, `UnimplementedV1`, `InternalV1`, `ServiceUnavailableV1`, `DataLossV1`, `UnauthenticatedV1`; shared item types `FieldViolationV1`, `QuotaViolationV1`, `PreconditionViolationV1`. Each has an unversioned alias (`NotFound`, `FieldViolation`, …) |
+| `TransportOverride` | Per-occurrence transport override (`src/transport.rs`); only `Http` today |
 
 ### 3.2 Component Model
 
 ```text
 ┌─────────────────────────────────────────────────┐
-│  libs/toolkit-errors                            │
+│  libs/toolkit-canonical-errors                  │
+│  (package cf-gears-toolkit-canonical-errors)    │
 │  ┌───────────────┐  ┌─────────────────────────┐ │
 │  │ CanonicalError│  │ Context Types           │ │
-│  │ (16 variants) │──│ Validation, ResourceInfo│ │
-│  └───────┬───────┘  │ ErrorInfo, QuotaFailure │ │
-│          │          │ PreconditionFailure,    │ │
-│          │          │ RetryInfo, RequestInfo  │ │
+│  │ (16 variants) │──│ XxxV1 per category,     │ │
+│  └───────┬───────┘  │ FieldViolationV1,       │ │
+│          │          │ QuotaViolationV1,       │ │
+│          │          │ PreconditionViolationV1 │ │
 │          │          └─────────────────────────┘ │
 │          v                                      │
 │  ┌─────────────────┐                            │
 │  │ REST Mapping    │  From<CanonicalError>      │
-│  │ → Problem       │  for Problem               │
+│  │ → Problem       │  for Problem; TryFrom back │
 │  └─────────────────┘                            │
 ├─────────────────────────────────────────────────┤
 │  libs/toolkit-canonical-errors-macro            │
@@ -348,12 +364,14 @@ async fn get_user(Path(id): Path<String>) -> Result<Json<User>, CanonicalError> 
 │  │ #[resource_error]    │ macro                 │
 │  └──────────────────────┘                       │
 ├─────────────────────────────────────────────────┤
-│  architecture lints (via `cargo gears lint`)    │
-│  ┌─────────────────────────┐                    │
-│  │ Architecture Lint Rules │ compile-time lint  │
-│  └─────────────────────────┘                    │
+│  libs/toolkit/src/api/canonical_error_layer.rs  │
+│  ┌──────────────────────────────┐               │
+│  │ canonical_error_middleware   │ axum layer    │
+│  └──────────────────────────────┘               │
 └─────────────────────────────────────────────────┘
 ```
+
+Architecture lint rules (below) are proposed and not implemented.
 
 #### CanonicalError
 
@@ -361,15 +379,15 @@ async fn get_user(Path(id): Path<String>) -> Result<Json<User>, CanonicalError> 
 
 **Responsibility scope**:
 
-Owns the 16 canonical error categories. Owns the mapping from category to GTS identifier, HTTP status code, and title. Each variant is a struct with four fields: `ctx` (category-specific context type), `detail: String`, `resource_type: Option<String>`, `resource_name: Option<String>` (the `Internal` variant carries only `ctx` and `detail`).
+Owns the 16 canonical error categories. Owns the mapping from category to GTS identifier, HTTP status code, and title. Each variant is a struct with five fields: `ctx` (category-specific context type), `detail: String`, `resource_type: Option<String>`, `resource_name: Option<String>`, `overrides: TransportOverrides` (the `Internal` variant carries only `ctx`, `detail` and `overrides`).
 
-Provides builder-returning constructors (one per category) and public accessors (`detail()`, `resource_type()`, `resource_name()`, `gts_type()`, `status_code()`, `title()`). Internal mutation methods (`with_detail()`, `with_resource_type()`, `with_resource()`) are `pub(crate)` — used only by the builder's `.create()` implementation. The enum and all variants are `#[non_exhaustive]`, preventing direct variant construction from outside the crate.
+Provides builder-returning constructors (one per category) and public accessors (`detail()`, `resource_type()`, `resource_name()`, `retry_after_seconds()`, `diagnostic()`, `http_status_override()`, `gts_type()`, `status_code()`, `title()`). Internal mutation methods (`with_detail()`, `with_resource_type()`, `with_resource()`) are `pub(crate)` — used only by the builder's `.create()` implementation. The enum and all variants are `#[non_exhaustive]`, preventing direct variant construction from outside the crate.
 
 Provides blanket `From` implementations for common library error types so that `?` propagates library errors into canonical categories without per-call-site mapping.
 
 **Responsibility boundaries**:
 
-Does not know about HTTP, gRPC, or any transport. Does not perform serialization. Does not enrich errors with trace IDs (that is the middleware's job).
+Knows no transport beyond the default HTTP status per category and the optional HTTP override. Does not perform serialization. Does not enrich errors with trace IDs (that is the middleware's job).
 
 ##### Related components (by ID)
 
@@ -382,7 +400,7 @@ Does not know about HTTP, gRPC, or any transport. Does not perform serialization
 
 **Responsibility scope**:
 
-Defines the structured payload types for each error category. All context types use versioned naming (`XxxV1`) with unversioned type aliases (e.g., `pub type ResourceInfo = ResourceInfoV1;`). Each struct has a fixed set of public fields and provides builder/constructor methods. All context types implement the `GtsSchema` trait (via `#[struct_to_gts_schema]` macro) and carry an internal `gts_type: GtsSchemaId` field that is skipped during serialization.
+Defines the structured payload types for each error category in `libs/toolkit-canonical-errors/src/context.rs`. All context types use versioned naming (`XxxV1`) with unversioned type aliases (e.g., `pub type NotFound = NotFoundV1;`). Each type is a plain `serde` struct (or, for `InvalidArgumentV1`, an untagged enum) with a fixed set of public fields and a constructor. `InternalV1::description` and `UnknownV1::description` are `#[serde(skip)]`, so they never reach the wire. Context types do not implement `GtsSchema` and carry no GTS identifier of their own.
 
 **Responsibility boundaries**:
 
@@ -398,13 +416,13 @@ Context types are pure data. They do not perform validation, logging, or transpo
 
 **Responsibility scope**:
 
-Implements `From<CanonicalError> for Problem`.
+Implements `From<CanonicalError> for Problem`, `TryFrom<Problem> for CanonicalError`, and (feature `axum`) `IntoResponse` for `Problem` and `CanonicalError`.
 
-Maps each category to its HTTP status code and serializes the context type into the `context` JSON field. Injects `resource_type` into the context JSON when present.
+Maps each category to its HTTP status code and serializes the context type into the `context` JSON field. Injects `resource_type` and `resource_name` into the context JSON when present.
 
 **Responsibility boundaries**:
 
-Only handles REST (HTTP). Does not handle gRPC or SSE. Does not add `trace_id` or `instance` — those are set by the middleware/framework layer.
+Produces the `Problem` envelope that all transports carry; does not pick gRPC status codes or write gRPC trailers (see [§1.4](#14-architecture-layers)). Does not add `trace_id` or `instance` — those are set by the middleware.
 
 ##### Related components (by ID)
 
@@ -417,7 +435,7 @@ Only handles REST (HTTP). Does not handle gRPC or SSE. Does not add `trace_id` o
 
 **Responsibility scope**:
 
-Axum middleware that catches any `CanonicalError` returned from handlers, calls `Problem::from_error()`, sets `trace_id` from the request span, sets `instance` from the request URI, and returns the `application/problem+json` response. Also catches any error-status response that never went through `CanonicalError` at all (an axum extractor rejection, a tower-layer short-circuit, an unmatched route) and wraps it into a valid `Problem`: a foreign 5xx becomes a real `internal` category error, a foreign 4xx becomes an `about:blank` `Problem` (see `cpt-cf-errors-adr-error-middleware-catchall`). Exception: a response tagged `ForeignPassthrough` is returned unchanged, regardless of status or `Content-Type` - a reverse-proxy/passthrough layer relaying a genuine upstream response verbatim.
+Implemented as `toolkit::api::canonical_error_middleware` (`libs/toolkit/src/api/canonical_error_layer.rs`), layered on every gear router by the api-gateway gear (`gears/system/api-gateway/src/gear.rs`) and by OoP serving (`layer_serving` in `libs/toolkit/src/runtime/oop_serve.rs`). A handler's `CanonicalError` is rendered by its `IntoResponse` impl, which also stores a clone in the response extensions; the middleware then fills `trace_id` (live OpenTelemetry span, else W3C `traceparent`) and `instance` (request URI path) on every `application/problem+json` response and logs it. Also catches an error-status response that never went through `CanonicalError` at all (an axum extractor rejection, a tower-layer short-circuit, an unmatched route) when its body is unstructured - no `Content-Type` or `text/plain` (`is_unstructured_error_body`) - and wraps it into a valid `Problem`; an error response with any other content type (e.g. a hand-built JSON body such as api-gateway's `/health`) passes through unchanged so its fields are not destroyed. In the wrapped case a foreign 5xx becomes a real `internal` category error, a foreign 4xx becomes an `about:blank` `Problem` (see `cpt-cf-errors-adr-error-middleware-catchall`). Exception: a response tagged `ForeignPassthrough` is returned unchanged, regardless of status or `Content-Type` - a reverse-proxy/passthrough layer relaying a genuine upstream response verbatim.
 
 **Responsibility boundaries**:
 
@@ -429,11 +447,16 @@ Does not construct domain errors. Does not decide which category to use for a `C
 
 **Responsibility scope**:
 
-The `#[resource_error("gts.cf.core.users.user.v1~")] struct UserResourceError;` attribute macro on a unit struct generates 13 associated functions (all categories except `internal`, `service_unavailable`, and `unauthenticated`). Each generated function returns a `ResourceErrorBuilder` that:
+The `#[resource_error("gts.cf.core.users.user.v1~")] struct UserResourceError;` attribute macro on a unit struct generates 13 associated functions (all categories except `internal`, `service_unavailable`, and `unauthenticated`). Each generated function returns a `ResourceErrorBuilder` whose typestate decides when `.create()` is available:
 1. Pre-sets `resource_type` to the GTS identifier (e.g., `"gts.cf.core.users.user.v1~"`)
-2. Accepts a `detail` string describing the error occurrence
+2. Accepts a `detail` string, except `permission_denied`, `cancelled`, `invalid_argument` and `failed_precondition`, which take no arguments and use a default message
 3. For `not_found`, `already_exists`, and `data_loss`: requires `.with_resource(name)` before `.create()` to set the `resource_name`
-4. For `deadline_exceeded`: accepts an optional `.with_reason(code)` that sets `context.reason`
+4. For `permission_denied` and `aborted`: requires `.with_reason(code)`; for `deadline_exceeded`: accepts an optional `.with_reason(code)` that sets `context.reason`
+5. For `invalid_argument`: requires `.with_field_violation(..)`, `.with_format(..)` or `.with_constraint(..)`; `out_of_range` requires `.with_field_violation(..)`, `failed_precondition` `.with_precondition_violation(..)`, `resource_exhausted` `.with_quota_violation(..)`
+
+Missing required calls are compile errors, covered by the `trybuild` cases in `libs/toolkit-canonical-errors/tests/ui/`.
+
+**Known defect (`out_of_range`)**: `out_of_range` shares the `NeedsFieldViolation` typestate with `invalid_argument`, so `.with_format(..)` and `.with_constraint(..)` also compile on it. `ResourceErrorBuilder::create()` (`libs/toolkit-canonical-errors/src/builder.rs`) builds `OutOfRange` from the field violations only, so the format or constraint context is dropped and the error carries an empty `field_violations` list; the message survives only as `detail`, which both methods overwrite.
 
 **Responsibility boundaries**:
 
@@ -443,13 +466,15 @@ The macro is a code generator. It does not add new categories or context types. 
 
 - [ ] `p1` - **ID**: `cpt-cf-errors-component-architecture-lint-rules`
 
+**Status**: proposed, not implemented. The only error-related lint in `cargo gears lint` today is DE1302 `error_from_to_string` (cargo-gears repository, `crates/cargo-gears-lints/src/de13_common_patterns/de1302_error_from_to_string`), which flags `.to_string()` on the source error inside `From`/`TryFrom` impls. It does not enforce the rules below.
+
 **Responsibility scope**:
 
-A set of architecture lint rules (via `cargo gears lint`) that enforce canonical error construction patterns at compile time. The rules detect and reject code that bypasses the canonical error system — e.g., constructing `Problem` directly, returning raw HTTP error responses, or using legacy error patterns (`Problem::new()`, `ErrDef`, `declare_errors!`, `ErrorCode`).
+A set of architecture lint rules (via `cargo gears lint`) that would reject code bypassing the canonical error system — e.g., constructing `Problem` directly or returning raw HTTP error responses.
 
-**Rules**:
+**Proposed rules**:
 1. **No direct `Problem` construction** — all `Problem` instances must originate from `CanonicalError` via the `From` impl
-2. **No legacy error patterns** — usage of `Problem::new()`, `ErrDef`, `declare_errors!`, or `ErrorCode` is flagged
+2. **No legacy error patterns** — usage of `Problem::new()`, `ErrDef`, `declare_errors!`, or `ErrorCode` is flagged. These APIs have since been removed from the workspace, so this rule is moot unless they come back
 3. **No raw status-code error responses** — handlers must return `CanonicalError`, not ad-hoc HTTP error responses
 
 **Responsibility boundaries**:
@@ -479,6 +504,8 @@ Every REST error response the canonical middleware produces or rewrites follows 
 | `instance` | Request URI path | Variable | URI identifying this specific occurrence |
 | `trace_id` | Request context | Variable | W3C trace ID for correlation |
 | `context` | Serialized context type | Contract schema / Variable values | Category-specific structured details |
+| `error_code` | `#[derive(ContractError)]` | Contract (per domain) | Typed variant identifier inside its domain; absent for plain canonical errors |
+| `error_domain` | `#[derive(ContractError)]` | Contract (per domain) | Namespace owning `error_code` (e.g. `billing.v1`); absent for plain canonical errors |
 
 **Base Error Schema**
 
@@ -541,32 +568,44 @@ The base error schema defines the common structure for all error categories, for
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Problem {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default = "default_problem_type")] // "about:blank"
     pub problem_type: String,
+    #[serde(default)]
     pub title: String,
-    pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default)]
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(default = "default_context")] // {}
     pub context: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_domain: Option<String>,
 }
 ```
+
+`status` is optional only on input (RFC 9457 §3.1 makes every member optional); `Problem::from_error` always sets it.
 
 **Conversion functions**:
 
 ```rust
 impl Problem {
-    pub fn from_error(err: CanonicalError) -> Self;
+    pub fn from_error(err: &CanonicalError) -> Result<Self, serde_json::Error>;
 }
 
 impl From<CanonicalError> for Problem {
-    fn from(err: CanonicalError) -> Self {
-        Problem::from_error(err)
-    }
+    // Calls from_error; if the context fails to serialize, emits
+    // `context: { "serialization_error": "..." }` instead.
+    fn from(err: CanonicalError) -> Self;
 }
 ```
+
+`Problem` also has `from_error_debug`, `with_trace_id`, `with_instance`, `with_error_code`, `with_error_domain` and `contract_error`.
 
 #### Round-Trip Deserialization
 
@@ -596,8 +635,8 @@ Resource-scoped construction              Non-resource construction
 struct R;
 UserResourceError::not_found(detail)      CanonicalError::service_unavailable().create()
   .with_resource(id).create()             CanonicalError::unauthenticated()
-UserResourceError::permission_denied(d)     .with_reason(r).create()
-  .create()                                           │
+UserResourceError::permission_denied()      .with_reason(r).create()
+  .with_reason(r).create()                            │
         │                                             │
         │  resource_type auto-tagged by macro         │  resource_type = None
         └─────────────────────┬───────────────────────┘
@@ -608,22 +647,18 @@ UserResourceError::permission_denied(d)     .with_reason(r).create()
                      │  (16 variants)  │  #[non_exhaustive]
                      └────────┬────────┘
                               │
-                ┌─────────────┼─────────────┐
-                v             v             v
-           Problem(REST)   Status(gRPC)  Event(SSE)
-           RFC 9457        (future)      (future)
+                              │  From<CanonicalError> for Problem
+                              v
+                     Problem (RFC 9457) → REST body / gRPC trailer / SSE error frame
 ```
 
 **Direct canonical error instantiation**:
 
 ```rust
-use toolkit_canonical_errors::resource_error;
+use toolkit_canonical_errors::CanonicalError;
 
-#[resource_error("gts.cf.core.users.user.v1~")]
-struct UserResourceError;
-
-let err = UserResourceError::invalid_argument()
-    .with_field_violation("email", "must be a valid email address", "INVALID_FORMAT")
+let err = CanonicalError::service_unavailable()
+    .with_retry_after_seconds(30)
     .create();
 ```
 
@@ -642,21 +677,22 @@ let err = UserResourceError::not_found("User not found")
 
 ### 3.5 GTS Registration
 
-Each error category and each context type is registered in the GTS Types Registry as a base type. The `GtsSchema` trait generates JSON Schema from the Rust type definitions, ensuring the schema and code are always in sync.
+**Not implemented**: error categories and context types are not registered in the GTS Types Registry, and no JSON Schema is generated from the context types. The per-category JSON Schemas in [categories/](./categories/) are hand-written documentation. Registration remains the intent of `cpt-cf-errors-adr-gts-error-identification`.
 
-**Error category GTS identifiers** are defined as `const` values returned by `CanonicalError::gts_type()`. Each is a single string ending in `.v1~`:
+**Error category GTS identifiers** are compile-time constants returned by `CanonicalError::gts_type()`. `gts_id!` validates the pattern and prepends the configured GTS ID prefix (`gts.` by default, overridable via `GTS_ID_PREFIX`):
 
 ```rust
 pub fn gts_type(&self) -> &'static str {
     match self {
-        Self::Cancelled { .. }        => "gts.cf.core.errors.err.v1~cf.core.err.cancelled.v1~",
-        Self::NotFound { .. }         => "gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
-        Self::PermissionDenied { .. } => "gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
-        Self::Internal { .. }         => "gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
-        // ... all 16 variants, each a single &'static str
+        Self::Cancelled { .. } => gts_id!("cf.core.errors.err.v1~cf.core.err.cancelled.v1~"),
+        Self::NotFound { .. }  => gts_id!("cf.core.errors.err.v1~cf.core.err.not_found.v1~"),
+        Self::Internal { .. }  => gts_id!("cf.core.errors.err.v1~cf.core.err.internal.v1~"),
+        // ... all 16 variants
     }
 }
 ```
+
+`Problem.type` is `gts_uri!(err.gts_type())`, i.e. the identifier with a `gts://` scheme.
 
 ### 3.6 Internal Details Logging
 
@@ -679,10 +715,12 @@ Handler                CanonicalError          Problem              Client
   │  Err(canonical_error)  │                      │                   │
   ├────────────────────────┤                      │                   │
   │                        │                      │                   │
-  │              Middleware: From<CanonicalError> │                   │
+  │ IntoResponse for CanonicalError               │                   │
   │                        ├─────────────────────>│                   │
-  │                        │  set trace_id        │                   │
-  │                        │  set instance        │                   │
+  │                        │                      │                   │
+  │ canonical_error_middleware (problem+json resp)│                   │
+  │                        │                      │  set trace_id     │
+  │                        │                      │  set instance     │
   │                        │                      │                   │
   │                        │                      │  application/     │
   │                        │                      │  problem+json     │
@@ -691,14 +729,14 @@ Handler                CanonicalError          Problem              Client
 
 1. Handler constructs `CanonicalError` via builder + `.create()` or `#[resource_error]` macro builder + `.create()`
 2. Handler returns `Err(canonical_error)` from the handler function
-3. Error middleware catches the error, calls `Problem::from_error()`
-4. Middleware sets `trace_id` from the trace context, `instance` from request URI
+3. `impl IntoResponse for CanonicalError` converts it to a `Problem` response and stores a clone of the error in the response extensions
+4. `canonical_error_middleware` sets `trace_id` from the trace context and `instance` from the request URI
 5. Middleware logs error details server-side at WARN/ERROR; the log-correlation formatter splices the live trace id onto the record for correlation
 6. Middleware returns `application/problem+json` response to client
 
 #### Trace ID Injection
 
-The `trace_id` and `instance` fields are **not** set by handler code. They are injected automatically by the error middleware layer when converting `CanonicalError` to `Problem`.
+The `trace_id` and `instance` fields are **not** set by handler code. `impl IntoResponse for CanonicalError` (`libs/toolkit-canonical-errors/src/problem.rs`) builds the `Problem` without them; `canonical_error_middleware` (`libs/toolkit/src/api/canonical_error_layer.rs`) then fills them on the `application/problem+json` response.
 
 **How trace_id is resolved**: the currently active OpenTelemetry span context if present, otherwise the W3C `traceparent` (32-hex trace-id segment). The live span is preferred so the wire id always matches the one the process's own logs carry (they agree when the inbound continuation succeeded, and on a fresh root the span's id is what the logs show). `x-request-id` and the tracing span handle are **not** used — they are different identifiers and would put a non-trace value on the wire. When neither source exists, `trace_id` is left absent.
 
@@ -731,7 +769,7 @@ async fn get_user(Path(id): Path<String>) -> Result<Json<User>, CanonicalError> 
             .create())?;
     Ok(Json(user))
 }
-// Middleware automatically adds trace_id and instance when converting to Problem
+// canonical_error_middleware fills trace_id and instance on the problem+json response
 ```
 
 ### 3.8 Context Type Extensibility (`extra` field)
@@ -763,16 +801,18 @@ Not applicable. Errors are transient in-memory values. No persistent storage.
 
 | Tier | When | Mechanism | What It Catches |
 |------|------|-----------|-----------------|
-| 1. Compile-time | `cargo build` | Typed enum variants, exhaustive `match`, `#[resource_error]` macro, `GtsSchema` const, architecture lint rules (via `cargo gears lint`), `#[non_exhaustive]` on enum + variants, `pub(crate)` internal constructors | Wrong context type, missing match arm, GTS typos, direct `Problem` construction, legacy error patterns, direct variant construction, bypassing builder API |
-| 2. Test-time | `cargo test` | Showcase tests with `assert_eq!` on full Problem JSON per category; JSON Schema equality assertions per context type | Field renames, default message changes, status code changes, schema drift |
-| 3. CI-time | PR merge gate | `cargo-semver-checks` on `cf-gears-toolkit-errors`; schema file diffing; snapshot CI gate | Removed types, changed signatures, schema evolution |
-| 4. Design-time | Architecture | Single `Problem` conversion point; dedicated context constructors; `GtsSchema` generates schemas from types | Ad-hoc JSON construction, missing required fields, schema/code divergence |
+| 1. Compile-time | `cargo build` | Typed enum variants, exhaustive `match`, `#[resource_error]` macro, `gts_id!` validation, builder typestate, `#[non_exhaustive]` on enum + variants, `pub(crate)` internal constructors | Wrong context type, missing required context, missing match arm, GTS typos, direct variant construction, bypassing builder API |
+| 2. Test-time | `cargo test` | `tests/showcase.rs`: `assert_eq!` on the full Problem JSON for every category; `tests/ui/` `trybuild` cases for the typestate | Field renames, default message changes, status code changes, missing builder calls |
+| 3. Release-time | release-plz workflow | `cargo-semver-checks` on published crates, including `cf-gears-toolkit-canonical-errors` | Removed types, changed signatures |
+| 4. Design-time | Architecture | Single `Problem` conversion point; dedicated context constructors | Ad-hoc JSON construction, missing required fields |
+
+Not implemented: architecture lint rules, JSON Schema assertions per context type, schema file diffing in CI.
 
 ## 4. Category Reference
 
 Each section below defines one canonical error category: GTS ID, HTTP mapping, context type, constructor, JSON wire example, and similar categories.
 
-All variants share the same structure: `{ ctx: ContextType, detail: String, resource_type: Option<String>, resource_name: Option<String> }` (the `Internal` variant carries only `ctx` and `detail`). Context schemas are documented where first introduced; subsequent categories using the same context type reference back.
+All variants share the same structure: `{ ctx: ContextType, detail: String, resource_type: Option<String>, resource_name: Option<String>, overrides: TransportOverrides }` (the `Internal` variant carries only `ctx`, `detail` and `overrides`). Context schemas are documented where first introduced; subsequent categories using the same context type reference back.
 
 
 ### 4.1 `cancelled`
@@ -972,7 +1012,7 @@ All variants share the same structure: `{ ctx: ContextType, detail: String, reso
 - **Performance Architecture (PERF)**: Not applicable. Error construction is O(1) enum + struct allocation. No caching, pooling, or scaling concerns specific to the error system.
 - **Data Architecture (DATA)**: Not applicable. Errors are transient; no persistent storage.
 - **Operations (OPS)**: Not applicable. Error handling does not introduce deployment topology, infrastructure, or monitoring requirements beyond what the observability stack already provides.
-- **Compliance (COMPL)**: Flexible fields (`ResourceInfo.resource_name`, `FieldViolation.field`) may carry user-provided identifiers. Gears MUST apply data minimization when populating these fields. The `cpt-cf-errors-constraint-no-internal-details` constraint prevents stack traces and internal detail leakage in production, but does not address PII in context fields. PII handling in error responses follows the platform's data classification policy.
+- **Compliance (COMPL)**: Flexible fields (`resource_name`, `FieldViolation.field`) may carry user-provided identifiers. Gears MUST apply data minimization when populating these fields. The `cpt-cf-errors-constraint-no-internal-details` constraint prevents stack traces and internal detail leakage in production, but does not address PII in context fields. PII handling in error responses follows the platform's data classification policy.
 - **Usability (UX)**: Not applicable. This design covers the API error wire format, not user-facing error display.
 
 ## 6. Traceability
@@ -980,4 +1020,4 @@ All variants share the same structure: `{ ctx: ContextType, detail: String, reso
 - **PRD**: [PRD.md](./PRD.md)
 - **ADRs**: [ADR/](./ADR/)
 - **Existing implementation**: [`libs/toolkit-canonical-errors/src/problem.rs`](../../../libs/toolkit-canonical-errors/src/problem.rs)
-- **Supersedes**: PR #290 (`docs/unified-error-system/`)
+- **Supersedes**: PR #290

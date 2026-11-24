@@ -1,10 +1,12 @@
 ---
 description: "A client-side circuit breaker in a small own crate, `toolkit-resilience`, used as a tower layer that sees every attempt below retry, for REST and gRPC clients alike."
-status: proposed
+status: accepted
 date: 2026-11-06
 ---
 
 # Own client-side circuit breaker in `toolkit-resilience`, counted per attempt below retry
+
+> **Implementation:** `libs/toolkit-resilience` (`circuit_breaker::CircuitBreaker`, `CircuitBreakerLayer`); used by the contract clients in `libs/toolkit-contract` (`wiring.rs`, `grpc/mod.rs`), OAGW and the OIDC AuthN plugin.
 
 **ID**: `cpt-toolkit-adr-client-circuit-breaker`
 
@@ -40,8 +42,8 @@ every call still waits its full timeout, often once per attempt, the caller's co
 fill with calls that cannot succeed, latency grows up the call chain, and the provider gets full
 load the moment it comes back.
 
-[ADR-0003](./0003-toolkit-universal-lazy-layer.md) §3.4 sketched a circuit breaker in
-`libs/toolkit/src/clients/`. It was never built.
+[ADR-0003](./0003-toolkit-universal-lazy-layer.md) §3.4 sketched a circuit breaker in a
+planned `libs/toolkit/src/clients/` module. Neither the module nor that breaker was built.
 
 This ADR decides where the breaker lives, what it counts, and where it sits in the client stack.
 How the generated contract clients use it (what counts as a failure for a contract call, the

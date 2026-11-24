@@ -37,14 +37,14 @@ Chosen option: **Option A — Contract trait as source of truth, with `#[toolkit
 
 The Rust trait is the authoritative definition of the domain contract. Consumers depend on the base trait (`Arc<dyn NotificationBackend>`). The macro reads the optional protocol projection trait (`NotificationBackendRest`) and generates a REST client that implements the base trait with HTTP dispatch. For cases the macro does not cover (complex path templates, query parameter composition, custom auth, bespoke retry), authors write the client by hand — the consumer interface is identical either way.
 
-This option was chosen because it is the only one that satisfies all decision drivers simultaneously. Option B solves nothing — it just codifies the status quo of every SDK reinventing HTTP clients. Option C forces the team to maintain OpenAPI YAML alongside Rust code, creating drift. Option D fails because no IDL captures REST and gRPC faithfully at the same time (see evidence report `docs/research/rest-grpc-unification-evidence.html`), and the generated Rust types would be second-class citizens.
+This option was chosen because it is the only one that satisfies all decision drivers simultaneously. Option B solves nothing — it just codifies the status quo of every SDK reinventing HTTP clients. Option C forces the team to maintain OpenAPI YAML alongside Rust code, creating drift. Option D fails because no IDL captures REST and gRPC faithfully at the same time (see the [evidence report](https://github.com/striped-zebra-dev/toolkit-binding-poc/blob/main/docs/research/rest-grpc-unification-evidence.html) in the PoC repository), and the generated Rust types would be second-class citizens.
 
 ### Consequences
 
 * All gear SDK crates define contracts as plain Rust traits with zero transport annotations
 * Protocol projections are separate traits annotated with `#[toolkit::rest_contract]` that extend the base via `: Base`
 * The `cf-toolkit-contract-macros` crate owns the proc macros and must be maintained for the platform's lifetime
-* The `cf-toolkit-contract-runtime` crate provides `ProblemDetails`, `ClientConfig`, SSE parser, retry helper — all dependencies of generated clients
+* The `toolkit-contract` crate (`runtime` module) provides `ClientConfig`, the SSE parser and the retry helper, and re-exports the `Problem` wire type from `toolkit-canonical-errors` — all dependencies of generated clients
 * OpenAPI specs are a **derived artifact** generated at runtime from the trait via `schemars`, not a hand-written source
 * Third-party implementors consume the generated OpenAPI spec at `/.well-known/openapi.json` to build clients in other languages
 * Manual client implementations must implement the same base trait; the consumer cannot tell the difference

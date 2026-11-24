@@ -1,10 +1,12 @@
 ---
 description: "Replace Cloudflare Pingora with an in-house hyper-based upstream proxy engine (`toolkit-http-proxy`) shared by OAGW, the event-broker dispatcher and future gateways."
-status: proposed
+status: accepted
 date: 2026-10-25
 ---
 
 # Build an in-house upstream proxy engine on hyper instead of using Pingora
+
+> **Implementation:** `libs/toolkit-http-proxy` (`ProxyClient`), used by OAGW (`gears/system/oagw/oagw/src/infra/proxy`) and the event-broker dispatcher (`infra/dispatcher/forward.rs`); no `pingora-*` crate remains in the workspace.
 
 **ID**: `cpt-toolkit-adr-http-proxy-engine`
 

@@ -16,7 +16,6 @@
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `field_violations` | `Vec<FieldViolation>` | List of per-field out-of-range errors |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 Field violation:
 
@@ -68,8 +67,7 @@ let err = BookResourceError::out_of_range("Page out of range")
             "field_violations": {
               "type": "array",
               "items": { "$ref": "#/$defs/FieldViolation" }
-            },
-            "extra": { "type": ["object", "null"] }
+            }
           },
           "additionalProperties": false
         }
