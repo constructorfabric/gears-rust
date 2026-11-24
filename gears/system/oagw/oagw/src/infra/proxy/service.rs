@@ -2114,9 +2114,20 @@ fn auth_plugin_error(e: PluginError, instance_uri: &str, scope: AuthScope<'_>) -
             detail,
             instance,
         },
-        PluginError::InvalidConfig(_) => DomainError::Internal {
-            message: format!("auth plugin misconfigured: {e}"),
-        },
+        PluginError::InvalidConfig(_) => {
+            // The response says only `internal`; the log names the config
+            // key at fault. Plugin messages never carry a secret.
+            let message = format!("auth plugin misconfigured: {e}");
+            tracing::warn!(
+                caller_tenant_id = %scope.caller_tenant_id,
+                upstream_id = %scope.upstream_id,
+                upstream_alias = scope.upstream_alias,
+                plugin = scope.plugin_type,
+                reason = %message,
+                "auth plugin misconfigured"
+            );
+            DomainError::Internal { message }
+        }
         PluginError::Internal(_) => {
             // A stored secret the header cannot carry, or an unexpected
             // store error: logged as in `request_ref` mode, so an operator

@@ -6,6 +6,9 @@ pub(crate) mod aws_sigv4_auth;
 pub(crate) mod noop_auth;
 /// OAuth2 client-credentials auth plugin.
 pub(crate) mod oauth2_client_cred_auth;
+#[cfg(test)]
+#[cfg(not(feature = "fips"))]
+mod private_key_jwt_tests;
 /// Plugin registries keyed by GTS plugin ID.
 pub(crate) mod registry;
 /// Transform plugin that injects a request ID header.

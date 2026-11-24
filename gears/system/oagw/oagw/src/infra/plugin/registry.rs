@@ -8,13 +8,14 @@ use credstore_sdk::CredStoreClientV1;
 use super::apikey_auth::ApiKeyAuthPlugin;
 use super::aws_sigv4_auth::AwsSigV4AuthPlugin;
 use super::noop_auth::NoopAuthPlugin;
-use super::oauth2_client_cred_auth::{OAuth2ClientCredAuthPlugin, SecretAuthMethod};
+use super::oauth2_client_cred_auth::{ClientAuthMethod, OAuth2ClientCredAuthPlugin};
 use super::request_id_transform::RequestIdTransformPlugin;
 use super::required_headers_guard::RequiredHeadersGuardPlugin;
 use crate::domain::gts_helpers::{
     APIKEY_AUTH_PLUGIN_ID, AWS_SIGV4_AUTH_PLUGIN_ID, GUARD_PLUGIN_SCHEMA, NOOP_AUTH_PLUGIN_ID,
     OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
-    REQUEST_ID_TRANSFORM_PLUGIN_ID, REQUIRED_HEADERS_GUARD_PLUGIN_ID, TRANSFORM_PLUGIN_SCHEMA,
+    OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID, REQUEST_ID_TRANSFORM_PLUGIN_ID,
+    REQUIRED_HEADERS_GUARD_PLUGIN_ID, TRANSFORM_PLUGIN_SCHEMA,
 };
 
 /// Registry that resolves auth plugin GTS identifiers to plugin implementations.
@@ -23,8 +24,8 @@ pub struct AuthPluginRegistry {
 }
 
 impl AuthPluginRegistry {
-    /// Create a registry with the built-in plugins (apikey, noop, oauth2 CC,
-    /// AWS SigV4).
+    /// Create a registry with the built-in plugins (apikey, noop, OAuth2
+    /// client credentials with each client authentication method, AWS SigV4).
     #[must_use]
     pub fn with_builtins(
         credstore: Arc<dyn CredStoreClientV1>,
@@ -38,31 +39,28 @@ impl AuthPluginRegistry {
         );
         plugins.insert(NOOP_AUTH_PLUGIN_ID.to_string(), Arc::new(NoopAuthPlugin));
 
-        let mut form_plugin = OAuth2ClientCredAuthPlugin::new(
-            credstore.clone(),
-            SecretAuthMethod::Form,
-            token_cache_config.ttl,
-            token_cache_config.capacity,
-        );
-        let mut basic_plugin = OAuth2ClientCredAuthPlugin::new(
-            credstore.clone(),
-            SecretAuthMethod::Basic,
-            token_cache_config.ttl,
-            token_cache_config.capacity,
-        );
-        if let Some(ref cfg) = token_http_config {
-            form_plugin = form_plugin.with_http_config(cfg.clone());
-            basic_plugin = basic_plugin.with_http_config(cfg.clone());
+        for (plugin_id, method) in [
+            (OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID, ClientAuthMethod::Form),
+            (
+                OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
+                ClientAuthMethod::Basic,
+            ),
+            (
+                OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID,
+                ClientAuthMethod::PrivateKeyJwt,
+            ),
+        ] {
+            let mut plugin = OAuth2ClientCredAuthPlugin::new(
+                credstore.clone(),
+                method,
+                token_cache_config.ttl,
+                token_cache_config.capacity,
+            );
+            if let Some(ref cfg) = token_http_config {
+                plugin = plugin.with_http_config(cfg.clone());
+            }
+            plugins.insert(plugin_id.to_string(), Arc::new(plugin));
         }
-
-        plugins.insert(
-            OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID.to_string(),
-            Arc::new(form_plugin),
-        );
-        plugins.insert(
-            OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID.to_string(),
-            Arc::new(basic_plugin),
-        );
         plugins.insert(
             AWS_SIGV4_AUTH_PLUGIN_ID.to_string(),
             Arc::new(AwsSigV4AuthPlugin::new(credstore)),
@@ -231,6 +229,16 @@ mod tests {
     fn resolves_aws_sigv4_plugin_which_signs() {
         let registry = make_registry();
         assert!(registry.resolve(AWS_SIGV4_AUTH_PLUGIN_ID).unwrap().signs());
+    }
+
+    #[test]
+    fn resolves_oauth2_client_cred_private_key_jwt_plugin() {
+        let registry = make_registry();
+        assert!(
+            registry
+                .resolve(OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -429,6 +437,7 @@ mod implemented_ids_tests {
                 ("token_endpoint", "https://idp.example.com/token"),
                 ("region", "us-east-1"),
                 ("service", "bedrock"),
+                ("signing_alg", "ES256"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))

@@ -22,8 +22,8 @@
 /// * an upstream's credential reference is not provisioned yet or not
 ///   shared with the tenant; the `subject` is the auth config key holding
 ///   it: [`SECRET_REF`], [`CLIENT_ID_REF`], [`CLIENT_SECRET_REF`],
-///   [`ACCESS_KEY_ID_REF`], [`SECRET_ACCESS_KEY_REF`] or
-///   [`SESSION_TOKEN_REF`].
+///   [`ACCESS_KEY_ID_REF`], [`SECRET_ACCESS_KEY_REF`], [`SESSION_TOKEN_REF`]
+///   or [`PRIVATE_KEY_REF`].
 pub const STATE: &str = "STATE";
 
 /// The upstream or route is managed by the types registry, so the
@@ -58,3 +58,6 @@ pub const SECRET_ACCESS_KEY_REF: &str = "auth.config.secret_access_key_ref";
 
 /// The `subject` of a [`STATE`] violation for an AWS session token.
 pub const SESSION_TOKEN_REF: &str = "auth.config.session_token_ref";
+/// The `subject` of a [`STATE`] violation for an OAuth2 `private_key_jwt`
+/// signing key.
+pub const PRIVATE_KEY_REF: &str = "auth.config.private_key_ref";

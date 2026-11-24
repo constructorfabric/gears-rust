@@ -1,6 +1,6 @@
 //! Centralized catalog of all OAGW GTS entities for Types Registry registration.
 //!
-//! Returns all 22 entities (7 schemas + 15 instances) in a single batch,
+//! Returns all 23 entities (7 schemas + 16 instances) in a single batch,
 //! ready for `TypesRegistryClient::register()`.
 
 use serde_json::{Value, json};
@@ -29,6 +29,57 @@ fn instance_entity(gts_id: &str, description: &str) -> Value {
     })
 }
 
+/// The `private_key_jwt` plugin's instance, with the JSON Schema of its
+/// `auth.config`: `signing_alg` is a closed enum. Upstream create and update
+/// enforce each rule of this schema ([`PrivateKeyJwtConfig::parse`]); the
+/// schema publishes them.
+///
+/// [`PrivateKeyJwtConfig::parse`]: crate::domain::plugin::credentials::PrivateKeyJwtConfig::parse
+fn private_key_jwt_plugin_entity() -> Value {
+    use crate::domain::plugin::credentials::{
+        AUDIENCE_KEY, CLIENT_ID_REF_KEY, CLIENT_SECRET_REF_KEY, ISSUER_URL_KEY, KID_KEY,
+        MAX_AUDIENCE_LEN, MAX_KID_LEN, PRIVATE_KEY_REF_KEY, SIGNING_ALG_KEY, SigningAlg,
+        TOKEN_ENDPOINT_KEY,
+    };
+    let algs: Vec<&str> = SigningAlg::ALL.iter().map(|a| a.as_str()).collect();
+    let mut properties = serde_json::Map::new();
+    for (key, schema) in [
+        (
+            TOKEN_ENDPOINT_KEY,
+            json!({"type": "string", "format": "uri"}),
+        ),
+        (ISSUER_URL_KEY, json!({"type": "string", "format": "uri"})),
+        (CLIENT_ID_REF_KEY, json!({"type": "string"})),
+        (PRIVATE_KEY_REF_KEY, json!({"type": "string"})),
+        (SIGNING_ALG_KEY, json!({"type": "string", "enum": algs})),
+        (
+            KID_KEY,
+            json!({"type": "string", "minLength": 1, "maxLength": MAX_KID_LEN}),
+        ),
+        (
+            AUDIENCE_KEY,
+            json!({"type": "string", "minLength": 1, "maxLength": MAX_AUDIENCE_LEN}),
+        ),
+        ("scopes", json!({"type": "string"})),
+    ] {
+        properties.insert(key.to_owned(), schema);
+    }
+    json!({
+        "$id": OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID,
+        "description": "OAuth2 client credentials (private_key_jwt)",
+        "config_schema": {
+            "type": "object",
+            "properties": properties,
+            "required": [CLIENT_ID_REF_KEY, PRIVATE_KEY_REF_KEY, SIGNING_ALG_KEY],
+            "not": {"required": [CLIENT_SECRET_REF_KEY]},
+            "oneOf": [
+                {"required": [TOKEN_ENDPOINT_KEY], "not": {"required": [ISSUER_URL_KEY]}},
+                {"required": [ISSUER_URL_KEY], "not": {"required": [TOKEN_ENDPOINT_KEY]}}
+            ]
+        }
+    })
+}
+
 /// Returns all OAGW GTS entities (7 schemas + 15 instances) for batch registration.
 pub fn oagw_gts_entities() -> Vec<Value> {
     vec![
@@ -43,7 +94,7 @@ pub fn oagw_gts_entities() -> Vec<Value> {
         // -- Protocol instances (2) --
         instance_entity(HTTP_PROTOCOL_ID, "HTTP protocol"),
         instance_entity(GRPC_PROTOCOL_ID, "gRPC protocol"),
-        // -- Auth plugin instances (7) --
+        // -- Auth plugin instances (8) --
         instance_entity(NOOP_AUTH_PLUGIN_ID, "No-op (passthrough) auth"),
         instance_entity(APIKEY_AUTH_PLUGIN_ID, "API key injection"),
         instance_entity(BASIC_AUTH_PLUGIN_ID, "HTTP Basic auth"),
@@ -57,6 +108,7 @@ pub fn oagw_gts_entities() -> Vec<Value> {
             "OAuth2 client credentials (Basic)",
         ),
         instance_entity(AWS_SIGV4_AUTH_PLUGIN_ID, "AWS Signature Version 4"),
+        private_key_jwt_plugin_entity(),
         // -- Guard plugin instances (3) --
         instance_entity(TIMEOUT_GUARD_PLUGIN_ID, "Request timeout"),
         instance_entity(CORS_GUARD_PLUGIN_ID, "CORS handling"),
@@ -82,12 +134,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_returns_exactly_22_entities() {
+    fn catalog_returns_exactly_23_entities() {
         let entities = oagw_gts_entities();
         assert_eq!(
             entities.len(),
-            22,
-            "expected 22 entities (7 schemas + 15 instances)"
+            23,
+            "expected 23 entities (7 schemas + 16 instances)"
         );
     }
 
@@ -131,7 +183,7 @@ mod tests {
             .collect();
 
         assert_eq!(schemas.len(), 7, "expected 7 schemas");
-        assert_eq!(instances.len(), 15, "expected 15 instances");
+        assert_eq!(instances.len(), 16, "expected 16 instances");
     }
 
     #[test]
@@ -142,5 +194,54 @@ mod tests {
             // Validate via the gts crate
             gts::GtsId::try_new(id).unwrap_or_else(|e| panic!("invalid GTS ID '{id}': {e}"));
         }
+    }
+
+    /// The published config schema lists exactly the algorithms the write
+    /// check accepts.
+    #[test]
+    fn private_key_jwt_schema_lists_the_accepted_algorithms() {
+        use crate::domain::plugin::credentials::SigningAlg;
+        let entity = private_key_jwt_plugin_entity();
+        let algs: Vec<&str> = entity["config_schema"]["properties"]["signing_alg"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(algs, ["ES256", "RS256", "PS256"]);
+        for alg in algs {
+            assert!(SigningAlg::parse(alg).is_some(), "{alg}");
+        }
+    }
+
+    /// The schema's length bounds are the write check's, and every key the
+    /// write check reads is a published property.
+    #[test]
+    fn private_key_jwt_schema_matches_the_write_check() {
+        use crate::domain::plugin::credentials::{MAX_AUDIENCE_LEN, MAX_KID_LEN};
+        let entity = private_key_jwt_plugin_entity();
+        let properties = &entity["config_schema"]["properties"];
+        assert_eq!(properties["kid"]["maxLength"], MAX_KID_LEN);
+        assert_eq!(properties["audience"]["maxLength"], MAX_AUDIENCE_LEN);
+        let mut keys: Vec<&str> = properties
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "audience",
+                "client_id_ref",
+                "issuer_url",
+                "kid",
+                "private_key_ref",
+                "scopes",
+                "signing_alg",
+                "token_endpoint"
+            ]
+        );
     }
 }
