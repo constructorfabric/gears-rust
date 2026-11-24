@@ -15,7 +15,7 @@ accidentally bypass.
    migrations, the domain layer importing infrastructure).
 2. **Authentication** — the API Gateway validates tokens and injects a `SecurityContext`
    (subject id, subject tenant, token scopes). Gears never parse tokens.
-3. **Authorization** — handlers/services call the `PolicyEnforcer` (the PEP), which queries
+3. **Authorization** — domain services call the `PolicyEnforcer` (the PEP), which queries
    the AuthZ resolver (the PDP). The decision includes row-level constraints compiled into an
    `AccessScope`.
 4. **Database scoping** — gears query through `SecureConn`, which applies the `AccessScope`
@@ -30,7 +30,7 @@ argument to SDK methods and service calls — rather than hidden in thread-local
 Gears define only the **PDP–PEP contract**, not a policy language:
 
 - The **PEP** (Policy Enforcement Point) is the `PolicyEnforcer` your service calls. It
-  builds an `AccessRequest`, asks the PDP, and compiles the answer into an `AccessScope`.
+  builds an `EvaluationRequest`, asks the PDP, and compiles the answer into an `AccessScope`.
 - The **PDP** (Policy Decision Point) is a vendor plugin behind the AuthZ resolver. It may
   implement RBAC, ABAC, ReBAC, or anything else, and returns a decision plus row-level
   constraint predicates (e.g. `eq`, `in`, `in_tenant_subtree`, `in_group`).
@@ -46,7 +46,11 @@ let scope = self.policy_enforcer
 ```
 
 Authorization is **fail-closed**: a denied decision, an unreachable PDP, or a constraint that
-can't be compiled all result in access being denied.
+can't be compiled never grants access. The enforcer reports these as `AccessDenied`,
+`EvaluationFailed` and `CompileFailed`; each gear maps them to HTTP itself. The recommended
+mapping is 403 for `AccessDenied`, 503 for an unreachable PDP (500 for other evaluation
+failures) and 500 for `CompileFailed`; some gears use different mappings (the
+users-info example maps `CompileFailed` to 403 and every evaluation failure to 500).
 
 ## SecureConn & Scopable
 

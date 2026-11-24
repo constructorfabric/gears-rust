@@ -62,7 +62,7 @@ owner column) so the PDP can return "only your own rows" constraints.
 ## Construct the enforcer
 
 The `PolicyEnforcer` is built once in `init` from the AuthZ resolver client (resolved through
-`ClientHub`), then shared by all services. The gear must declare `deps = ["authz-resolver"]`.
+`ClientHub`), then shared by all services. The gear must declare `deps = [authz_resolver]`.
 
 ```rust
 let authz = ctx.client_hub().get::<dyn AuthZResolverApi>()?;
@@ -74,9 +74,13 @@ let enforcer = PolicyEnforcer::new(authz);
 In each service method, request the scope and pass it to the repository:
 
 ```rust title="domain/service/users.rs"
-// List: no resource id, constraints come entirely from the PDP
+// List: no resource id, constraints come entirely from the PDP.
+// An empty permitted scope must yield an empty page, not a denial.
 let scope = self.policy_enforcer
-    .access_scope(ctx, &resources::USER, actions::LIST, None)
+    .access_scope_with(
+        ctx, &resources::USER, actions::LIST, None,
+        &AccessRequest::new().allow_empty_scope(true),
+    )
     .await?;
 let page = self.repo.list_page(&conn, &scope, query).await?;
 
@@ -88,6 +92,7 @@ let scope = self.policy_enforcer
             .resource_property(pep_properties::OWNER_TENANT_ID, new_user.tenant_id),
     )
     .await?;
+// `user` is the domain `User` built from `new_user` (generated id, timestamps)
 let created = self.repo.create(&conn, &scope, user).await?;
 ```
 
@@ -110,11 +115,19 @@ The PDP returns a decision plus row-level constraints, which the PEP compiles in
 
 ## Fail-closed by design
 
-Authorization denies on anything uncertain:
+Authorization never grants access on anything uncertain; only `Ok(scope)` lets the operation proceed:
 
-- PDP **denies** → permission denied (HTTP 403);
-- PDP is **unreachable** or evaluation fails → internal error (HTTP 500);
-- a constraint **can't be compiled** to a column → denied.
+- PDP **denies** → `EnforcerError::AccessDenied` → permission denied (HTTP 403);
+- PDP is **unreachable** or evaluation fails → `EnforcerError::EvaluationFailed` → service
+  unavailable (HTTP 503) when `is_pdp_unavailable()`, otherwise internal error (HTTP 500);
+- the PDP's constraints **can't be compiled** (required but missing, every constraint
+  rejected against the resource type's `supported_properties`, or a predicate needing an
+  unadvertised capability) → `EnforcerError::CompileFailed` → internal error (HTTP 500).
+
+These HTTP statuses are the recommended mapping; the users-info example uses a different one
+(`CompileFailed` → 403, and every evaluation failure, PDP unavailability included → 500).
+A compiled property with no mapped column on the entity is not an error: `SecureConn` drops
+that constraint, and if no constraint remains the query is deny-all (no rows).
 
 Map the enforcer error into your domain error so it renders as the right canonical problem:
 

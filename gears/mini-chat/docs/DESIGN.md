@@ -2606,15 +2606,15 @@ PEP -> PDP Request:
 {
   "subject": {
     "type": "gts.cf.core.security.subject_user.v1~",
-    "id": "user-abc-123",
-    "properties": { "tenant_id": "tenant-xyz-789" }
+    "id": "8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37",
+    "properties": { "tenant_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63" }
   },
   "action": { "name": "list" },
   "resource": { "type": "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~" },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "tenant-xyz-789"
+      "root_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63"
     },
     "token_scopes": ["*"],
     "require_constraints": true,
@@ -2633,14 +2633,14 @@ PDP -> PEP Response (P1 - user-owned chats only):
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
-            "value": "tenant-xyz-789"
+            "op": "eq",
+            "property": "owner_tenant_id",
+            "value": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63"
           },
           {
-            "type": "eq",
-            "resource_property": "owner_id",
-            "value": "user-abc-123"
+            "op": "eq",
+            "property": "owner_id",
+            "value": "8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37"
           }
         ]
       }
@@ -2652,8 +2652,8 @@ PDP -> PEP Response (P1 - user-owned chats only):
 Compiled SQL:
 ```sql
 SELECT * FROM chats
-WHERE tenant_id = 'tenant-xyz-789'
-  AND user_id = 'user-abc-123'
+WHERE tenant_id = '3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63'
+  AND user_id = '8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37'
   AND deleted_at IS NULL
 ORDER BY updated_at DESC
 ```
@@ -2665,18 +2665,18 @@ PEP -> PDP Request:
 {
   "subject": {
     "type": "gts.cf.core.security.subject_user.v1~",
-    "id": "user-abc-123",
-    "properties": { "tenant_id": "tenant-xyz-789" }
+    "id": "8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37",
+    "properties": { "tenant_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63" }
   },
   "action": { "name": "read" },
   "resource": {
     "type": "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~",
-    "id": "chat-456"
+    "id": "c4b2a9e7-1d3f-4f60-8e25-7a9b0c1d2e48"
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "tenant-xyz-789"
+      "root_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63"
     },
     "token_scopes": ["*"],
     "require_constraints": true,
@@ -2695,14 +2695,14 @@ PDP -> PEP Response:
       {
         "predicates": [
           {
-            "type": "eq",
-            "resource_property": "owner_tenant_id",
-            "value": "tenant-xyz-789"
+            "op": "eq",
+            "property": "owner_tenant_id",
+            "value": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63"
           },
           {
-            "type": "eq",
-            "resource_property": "owner_id",
-            "value": "user-abc-123"
+            "op": "eq",
+            "property": "owner_id",
+            "value": "8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37"
           }
         ]
       }
@@ -2714,9 +2714,9 @@ PDP -> PEP Response:
 Compiled SQL:
 ```sql
 SELECT * FROM chats
-WHERE id = 'chat-456'
-  AND tenant_id = 'tenant-xyz-789'
-  AND user_id = 'user-abc-123'
+WHERE id = 'c4b2a9e7-1d3f-4f60-8e25-7a9b0c1d2e48'
+  AND tenant_id = '3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63'
+  AND user_id = '8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37'
   AND deleted_at IS NULL
 ```
 
@@ -2729,21 +2729,21 @@ PEP -> PDP Request:
 {
   "subject": {
     "type": "gts.cf.core.security.subject_user.v1~",
-    "id": "user-abc-123",
-    "properties": { "tenant_id": "tenant-xyz-789" }
+    "id": "8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37",
+    "properties": { "tenant_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63" }
   },
   "action": { "name": "create" },
   "resource": {
     "type": "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~",
     "properties": {
-      "owner_tenant_id": "tenant-xyz-789",
-      "owner_id": "user-abc-123"
+      "owner_tenant_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63",
+      "owner_id": "8a1f3c2e-5b7d-4e19-9c0a-2f6d4b8e1a37"
     }
   },
   "context": {
     "tenant_context": {
       "mode": "root_only",
-      "root_id": "tenant-xyz-789"
+      "root_id": "3d9e7b10-6c2f-4a85-b1e4-9f0c7a2d5e63"
     },
     "token_scopes": ["*"],
     "require_constraints": true,
@@ -2772,8 +2772,8 @@ Mini Chat follows the platform's fail-closed rules (see [Authorization Design - 
 | PDP unreachable / timeout / evaluation failure | 503 `service_unavailable` with `Retry-After: 5` (still fail-closed: no access). Kept apart from 403 so clients and monitoring can tell a PDP outage from a denial; the cause is logged at `error` |
 | Scoped query returns 0 rows (missing, soft-deleted or foreign resource) | 404 Not Found |
 | `decision: true` + no constraints + `require_constraints: true` | 403 Forbidden |
-| Unknown predicate type in constraints | Treat constraint as false; if all constraints false -> 403 |
-| Unknown `resource_property` in predicate | Treat constraint as false; log error (PDP contract violation) |
+| Unknown predicate `op` in constraints | The PDP response fails to decode (`EnforcerError::EvaluationFailed`), handled as an evaluation failure: 503 |
+| Unknown `property` in predicate | Treat constraint as false; log error (PDP contract violation) |
 | Empty `constraints: []` | 403 Forbidden |
 
 #### Token Scopes

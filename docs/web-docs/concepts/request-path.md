@@ -11,10 +11,10 @@ A request flows through clearly separated responsibilities. Each stage has one j
 ```text
 Client
   → API Gateway        validates the token → SecurityContext; checks license
-  → Gear handler       calls PolicyEnforcer (PEP)
+  → Gear handler       passes SecurityContext to the domain service
+  → domain service     calls PolicyEnforcer (PEP); runs business logic
       → AuthZ Resolver (PDP) returns decision + row-level constraints → AccessScope
   → SecureConn         applies AccessScope as automatic WHERE clauses
-  → domain service     business logic
   → response           (RFC-9457 problem on error)
 ```
 

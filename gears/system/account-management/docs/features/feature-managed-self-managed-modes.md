@@ -449,7 +449,7 @@ The system **MUST** populate `expires_at` on every `pending` `ConversionRequest`
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-managed-self-managed-modes-parent-side-minimal-surface`
 
-The system **MUST** expose only minimal conversion-request metadata across the self-managed barrier on `GET /tenants/{parent_id}/child-conversions` and `GET /tenants/{parent_id}/child-conversions/{request_id}`: `request_id`, `tenant_id`, `child_name`, `initiator_side`, `target_mode`, `status`, actor uuids (`requested_by`, `approved_by`, `cancelled_by`, `rejected_by`), and timestamps per DESIGN §3.2 `list_inbound_for_parent`. Child-subtree data (tenant metadata, descendants, user records, resource inventories) **MUST NOT** leak through this endpoint. Cross-barrier reads **MUST NOT** bypass the barrier invariant for any field beyond this minimal projection; AuthZ is delegated to `PolicyEnforcer::enforce` on `ConversionRequest.read` at the REST layer before the service call is made.
+The system **MUST** expose only minimal conversion-request metadata across the self-managed barrier on `GET /tenants/{parent_id}/child-conversions` and `GET /tenants/{parent_id}/child-conversions/{request_id}`: `request_id`, `tenant_id`, `child_name`, `initiator_side`, `target_mode`, `status`, actor uuids (`requested_by`, `approved_by`, `cancelled_by`, `rejected_by`), and timestamps per DESIGN §3.2 `list_inbound_for_parent`. Child-subtree data (tenant metadata, descendants, user records, resource inventories) **MUST NOT** leak through this endpoint. Cross-barrier reads **MUST NOT** bypass the barrier invariant for any field beyond this minimal projection; AuthZ is delegated to `PolicyEnforcer::access_scope_with` on the `ConversionRequest` `list_inbound` action, which `ConversionService` calls (via `domain::authz::authz_scope`) before any read.
 
 **Implements**:
 
@@ -459,7 +459,7 @@ The system **MUST** expose only minimal conversion-request metadata across the s
 
 - Entities: `ConversionRequest`
 - Data: `cpt-cf-account-management-dbtable-conversion-requests`
-- Sibling integration: `PolicyEnforcer` at the REST layer (external to this feature's surface)
+- Sibling integration: `PolicyEnforcer` / AuthZ Resolver, called from `ConversionService` (policy evaluation is external to this feature's surface)
 - Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `not_found` and `validation` codes referenced by name only.
 
 ### Root-Tenant Non-Convertibility

@@ -43,7 +43,7 @@ The architecture makes the insecure path harder than the secure one. Gear develo
 
 1. **Static checks** — Custom lints and CI workflows catch violations at build time (e.g. domain layer importing infra, raw SQL outside migrations).
 2. **Authentication** — API Gateway validates tokens and injects `SecurityContext` into every request. Gears never parse tokens.
-3. **Authorization** — Handlers call `PolicyEnforcer`, which queries the PDP plugin. The PDP returns a decision plus row-level constraints, compiled into an `AccessScope`.
+3. **Authorization** — Domain services call `PolicyEnforcer`, which queries the PDP plugin. The PDP returns a decision plus row-level constraints, compiled into an `AccessScope`.
 4. **Database scoping** — Gears access the database through `SecureConn`, which applies `AccessScope` as automatic WHERE clauses to implement tenant-level isolation and ABAC. Raw connections are not exposed.
 5. **Credentials storage** — vendors can use the `credstore` gear to manage secrets.
 6. **Outbound traffic** — External HTTP goes through `oagw`, which centralizes credential injection and egress policy.
@@ -334,8 +334,9 @@ sequenceDiagram
     GW->>Lic: Validate license feature for route
     Lic-->>GW: Allowed / Denied
     GW->>Mod: Handler(SecurityContext)
-    Mod->>AuthZ: PolicyEnforcer → AccessScope
-    AuthZ-->>Mod: AccessScope + row-level constraints
+    Mod->>AuthZ: PolicyEnforcer → EvaluationRequest
+    AuthZ-->>Mod: decision + row-level constraints
+    Mod->>Mod: PolicyEnforcer compiles constraints → AccessScope
     Mod->>DB: Entity::find().secure().scope_with(&scope)
     DB-->>Mod: Scoped query results
     Mod-->>GW: Response
@@ -438,11 +439,11 @@ See more in: [arch/authorization/TENANT_MODEL.md](arch/authorization/TENANT_MODE
 
 ### 10.3 Authorization and Role Model
 
-Constructor Fabric Gears uses a PEP → PDP → `AccessScope` pipeline for authorization. Domain services act as the PEP: they receive `SecurityContext`, build an `AccessRequest`, and call `PolicyEnforcer`, which delegates to the AuthZ resolver client. The PDP returns a decision plus constraints, and those constraints are compiled into an `AccessScope` that the secure DB layer applies as scoped query conditions. In practice, this means gear business logic does not embed policy engines or hard-code role semantics; it consumes platform authorization results expressed as tenant, resource, owner, and type filters.
+Constructor Fabric Gears uses a PEP → PDP → `AccessScope` pipeline for authorization. Domain services act as the PEP: they receive `SecurityContext`, build an `AccessRequest`, and call `PolicyEnforcer`, which delegates to the AuthZ resolver client. The PDP returns a decision plus constraints, and those constraints are compiled into an `AccessScope` that the secure DB layer applies as scoped query conditions. In practice, this means gear business logic does not embed policy engines or hard-code role semantics; it consumes platform authorization results expressed as row-level filters over resource properties (such as tenant, resource, and owner).
 
 - [x] `gears/system/authz-resolver/` provides a PDP client abstraction via `authz-resolver-sdk`.
-- [x] `PolicyEnforcer` wraps `AuthZResolverApi`; domain services call `policy_enforcer.access_scope_with(ctx, resource_type, action, resource_id, properties)`.
-- [x] `AccessScope` carries four constraint dimensions: tenant, resource, owner, and type.
+- [x] `PolicyEnforcer` wraps `AuthZResolverApi`; domain services call `policy_enforcer.access_scope_with(ctx, resource_type, action, resource_id, &access_request)`.
+- [x] `AccessScope` is an OR of constraints, each an AND of filters over resource properties (e.g. `owner_tenant_id`, `id`, `owner_id`, or custom `pep_prop` properties); the `type` dimension has no property name, so no scope can address it.
 - [x] `ScopableEntity` requires each DB entity to declare which column maps to each scope dimension.
 - [x] `pep_properties` defines `OWNER_TENANT_ID` and `RESOURCE_ID`, and these properties are used in current gears.
 - [x] `authz-resolver` plugs in via `ClientHub`; the platform does not hard-code a specific PDP.

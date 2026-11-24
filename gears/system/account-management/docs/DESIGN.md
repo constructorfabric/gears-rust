@@ -122,7 +122,7 @@ graph LR
 | `cpt-cf-account-management-fr-tenant-metadata-crud` | `MetadataService` provides CRUD for metadata entries keyed by `(tenant_id, schema_id)` with GTS schema validation. |
 | `cpt-cf-account-management-fr-tenant-metadata-api` | `MetadataService::resolve` walks the hierarchy when the schema's `inheritance_policy` trait is `inherit`; returns the tenant's own value (or empty) when `override_only`. |
 | `cpt-cf-account-management-fr-tenant-metadata-list` | `MetadataService::list_for_tenant` returns paginated own-entries for a tenant; REST endpoint `GET /api/account-management/v1/tenants/{id}/metadata` is tenant-scope-filtered by the platform layer, so self-managed barriers apply without AM-specific logic. |
-| `cpt-cf-account-management-fr-tenant-metadata-permissions` | REST handlers pass `schema_id` into `PolicyEnforcer::enforce` as a resource attribute (`SCHEMA_ID`) on `Metadata.read`, `Metadata.write`, `Metadata.delete`, and `Metadata.list` actions, so external AuthZ policy can express per-`schema_id` grants without AM evaluating policy itself. |
+| `cpt-cf-account-management-fr-tenant-metadata-permissions` | `MetadataService` passes the validated chained GTS type id into `PolicyEnforcer::access_scope_with` (through the shared `domain::authz::authz_scope` helper) as a resource attribute (`TYPE_ID` = `"type_id"`, set via `AccessRequest::resource_property`) on `Metadata.read`, `Metadata.write`, `Metadata.delete`, and `Metadata.list` actions, so external AuthZ policy can express per-schema grants without AM evaluating policy itself. `Metadata.list` carries no `TYPE_ID` on the outer gate; listed rows are then filtered by a per-row `Metadata.read` check that does carry it. |
 | `cpt-cf-account-management-fr-deterministic-errors` | Unified error mapper translates domain and infrastructure failures to stable public categories; the authoritative HTTP/code mapping is published in the OpenAPI contract. |
 | `cpt-cf-account-management-fr-observability-metrics` | OpenTelemetry metrics for domain-internal latencies (IdP calls, GTS validation, metadata resolution, bootstrap), background job throughput, error rates, closure-maintenance counters, and security counters. Per-endpoint CRUD counts and children-query latency are captured by platform HTTP middleware; capacity gauges (active tenants) are derivable from DB queries. |
 
@@ -131,7 +131,7 @@ graph LR
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
 | `cpt-cf-account-management-nfr-context-validation-latency` | End-to-end tenant-context validation p95 ≤ 5ms | Schema design + indexes on `tenants` / `tenant_closure` + bounded reverse-hydration caches for UUID-backed public GTS identifiers | Composite indexes on `(parent_id, status)`, the single-root invariant backing `parent_id IS NULL`, `(tenant_type_uuid)`, `tenant_closure(ancestor_id, barrier, descendant_status)`, and `tenant_closure(descendant_id)`; denormalized `depth` avoids recursive checks on write paths. AM provides the indexed source-of-truth schema; the end-to-end p95 ≤ 5ms target assumes indexed resolver reads and warm reverse-hydration mappings for `tenant_type_uuid` / `schema_uuid`, not hierarchy caching. | AM: integration tests verify indexed query baselines and deterministic reverse-hydration miss behavior. Platform: pre-GA load test benchmark (end-to-end through Tenant Resolver) against approved deployment profile. |
-| `cpt-cf-account-management-nfr-tenant-isolation` | Zero cross-tenant data leaks | SecureConn + PolicyEnforcer on all API endpoints | All database access through `SecureConn` with tenant-scoped queries; `PolicyEnforcer` PEP pattern on every REST handler. | Automated security test suite with cross-tenant access attempts |
+| `cpt-cf-account-management-nfr-tenant-isolation` | Zero cross-tenant data leaks | SecureConn + PolicyEnforcer on all API endpoints | All database access through `SecureConn` with tenant-scoped queries; `PolicyEnforcer` PEP pattern applied in every AM domain service (`TenantService`, `UserService`, `ServiceAccountService`, `MetadataService`, `ConversionService`) through the shared `domain::authz::authz_scope` helper. | Automated security test suite with cross-tenant access attempts |
 | `cpt-cf-account-management-nfr-audit-completeness` | 100% tenant config changes audited | Platform append-only audit infrastructure | AM relies on the platform append-only audit infrastructure as the single audit sink. Request handlers emit audit records via the platform request pipeline; AM-owned non-request flows emit into the same sink with `actor=system` (bootstrap completion, conversion expiry, provisioning-reaper compensation, hard-delete / tenant-deprovision cleanup). Database-level `created_at`/`updated_at` timestamps provide additional chronology but are not the audit system. **v1 deferral**: the platform append-only audit sink is not yet wired, so AM-owned non-request flows emit a structured log on the `am.events` target with `actor=system` as the v1 stand-in for the audit envelope; full sink integration is tracked as a follow-up. | Verify platform audit entries exist for state-changing API operations and for AM-owned system-actor lifecycle events in integration tests once the audit sink lands; until then, verify the structured-log stand-in carries `actor=system` and the expected `kind` for each AM-owned non-request transition |
 | `cpt-cf-account-management-nfr-barrier-enforcement` | Barrier state sufficient for downstream enforcement; AM-owned barrier-state changes audited | `self_managed` column on `tenants` + `barrier` column on `tenant_closure` | AM exposes `self_managed` on tenant rows and the materialized `barrier` column on `tenant_closure`; Tenant Resolver and AuthZ Resolver consume both directly for barrier traversal and access decisions. AM commits `self_managed` on the tenant row and the affected `tenant_closure.barrier` rows inside the same conversion transaction, so barrier-aware queries reflect the new state as soon as the transaction commits. Platform request audit logging captures all barrier-state-changing operations (mode conversions) per `cpt-cf-account-management-nfr-audit-completeness`; cross-tenant access auditing is a platform AuthZ concern. | Integration tests validating barrier data completeness across `tenants` and `tenant_closure`; verify platform audit log entries exist for mode conversion operations |
 | `cpt-cf-account-management-nfr-tenant-model-versatility` | Both managed and self-managed in same tree | `self_managed` boolean per tenant, independent of siblings | Sibling tenants under the same parent can have different `self_managed` values; mode conversion is a per-tenant operation. | Integration tests with mixed-mode hierarchies |
@@ -243,7 +243,7 @@ AM does not maintain a local user table, user projection, or cached user-tenant 
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-constraint-security-context`
 
-All AM API endpoints require a valid `SecurityContext` propagated by the Gears middleware. `PolicyEnforcer` PEP pattern is applied on every REST handler. AM does not construct, validate, or modify `SecurityContext` — it consumes the context provided by the framework.
+All AM API endpoints require a valid `SecurityContext` propagated by the Gears middleware. `PolicyEnforcer` PEP pattern is applied inside the AM domain services (via the shared `domain::authz::authz_scope` helper) before any data access; REST handlers only forward the `SecurityContext`. AM does not construct, validate, or modify `SecurityContext` — it consumes the context provided by the framework.
 
 **ADRs**: None yet — framework convention.
 
@@ -558,7 +558,7 @@ TenantService owns tenant lifecycle orchestration, tenant-related IdP operations
 
 ##### Responsibility boundaries
 
-Does not evaluate authorization policies — relies on `PolicyEnforcer` PEP in the REST handler layer. Does not decide barrier policy in domain logic — the PDP-emitted `AccessScope` (`PolicyEnforcer` → AuthZ Resolver → Tenant Resolver) is the authority; the service only applies that scope to its reads, including the identity-level direct-child carve-out (`scope_util::relax_barriers`) that the direct and recursive children listings share. Does not store user data locally — all user operations pass through the IdP contract.
+Does not evaluate authorization policies — delegates the decision to the PDP through `PolicyEnforcer::access_scope_with`, called by the service itself (via `domain::authz::authz_scope`) before any data access. Does not decide barrier policy in domain logic — the PDP-emitted `AccessScope` (`PolicyEnforcer` → AuthZ Resolver → Tenant Resolver) is the authority; the service only applies that scope to its reads, including the identity-level direct-child carve-out (`scope_util::relax_barriers`) that the direct and recursive children listings share. Does not store user data locally — all user operations pass through the IdP contract.
 
 ##### Related components (by ID)
 
@@ -625,11 +625,11 @@ The ConversionService owns everything about pending and resolved conversion requ
 - `expire` (background): scans `status = 'pending' AND expires_at < now() AND deleted_at IS NULL`, transitions matching rows to `expired`, emits an audit record with `system` actor and the `am_conversion_expired_total` counter.
 - `soft_delete_resolved` (background): scans resolved rows (`status IN ('approved','cancelled','rejected','expired')`) whose `updated_at + resolved_retention < now() AND deleted_at IS NULL`, stamps `deleted_at = now()`, and emits the `am_conversion_soft_deleted_total` counter. Hard deletion follows AM's existing retention cadence on `deleted_at`-tombstoned rows.
 
-Role-per-transition validation (initiator vs. counterparty) lives in the service layer, not in the REST dispatcher and not in AuthZ. The single PEP action on `ConversionRequest` is `write`; the service is what distinguishes legal transitions per caller side, so the rules apply uniformly to both URL collections. Role-check failures surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION` plus `attempted_status` and `caller_side` carried in the precondition-violation entry; operations on already-resolved rows surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=ALREADY_RESOLVED`.
+Role-per-transition validation (initiator vs. counterparty) lives in the service layer, not in the REST dispatcher and not in AuthZ. The PEP action names the operation (`request`, `approve`, `reject`, `cancel`), not the caller side; the service is what distinguishes legal transitions per caller side, so the rules apply uniformly to both URL collections. Role-check failures surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=INVALID_ACTOR_FOR_TRANSITION` plus `attempted_status` and `caller_side` carried in the precondition-violation entry; operations on already-resolved rows surface as `CanonicalError::FailedPrecondition` (HTTP 400) with `reason=ALREADY_RESOLVED`.
 
 ##### Responsibility boundaries
 
-Does not evaluate authorization policies — the REST handler calls `PolicyEnforcer::enforce` on `ConversionRequest.read` / `ConversionRequest.write` first, then the service runs the role-per-transition check. Does not bypass self-managed barriers — the `list_inbound_for_parent` carve-out is a structural hierarchy-owner read (`parent_id` lookup on AM-owned data), the same pattern AM already uses for deletion pre-checks and child-count validation. Does not manage tenant creation-time `self_managed=true` — that path is handled directly by `TenantService::create_tenant` and never touches `conversion_requests`.
+Does not evaluate authorization policies — the service's own `authorize` gate calls `PolicyEnforcer::access_scope_with` (via `domain::authz::authz_scope`) on the `ConversionRequest` action for the operation (`request`, `approve`, `reject`, `cancel`, `list_own`, `list_inbound`) first, then the service runs the role-per-transition check. Does not bypass self-managed barriers — the `list_inbound_for_parent` carve-out is a structural hierarchy-owner read (`parent_id` lookup on AM-owned data), the same pattern AM already uses for deletion pre-checks and child-count validation. Does not manage tenant creation-time `self_managed=true` — that path is handled directly by `TenantService::create_tenant` and never touches `conversion_requests`.
 
 ##### Configuration — AM gear config
 
@@ -985,7 +985,7 @@ IdP provider plugin credentials are managed by the plugin implementation and the
 | **Type** | Platform shared service |
 | **Direction** | Bidirectional integration through framework PEP/PDP flow |
 | **Protocol / Driver** | `PolicyEnforcer` plus `SecurityContext` propagation through the framework |
-| **Data Format** | Tenant-scoped access requests, `OWNER_TENANT_ID` / `RESOURCE_ID` / `SCHEMA_ID` attributes, and resolver-produced access scopes |
+| **Data Format** | Tenant-scoped access requests, `OWNER_TENANT_ID` / `RESOURCE_ID` / `TYPE_ID` attributes, and resolver-produced access scopes |
 | **Compatibility** | AM resource types and action names are stable design-time contracts defined in Section 4 `Authorization Model`; changes require coordinated updates with AuthZ policies and resolver behavior |
 | **Availability / Fallback** | AM does not implement a local authorization fallback. When AuthZ is unavailable, protected operations fail as platform-owned authorization failures. |
 
@@ -1365,7 +1365,7 @@ The sequences above are the canonical interaction views. The table below closes 
 | `cpt-cf-account-management-usecase-write-tenant-metadata` | `cpt-cf-account-management-interface-metadata-rest`, `cpt-cf-account-management-component-metadata-service` | Metadata writes remain schema-driven and tenant-scoped. |
 | `cpt-cf-account-management-usecase-list-tenant-metadata` | `cpt-cf-account-management-interface-metadata-rest`, `cpt-cf-account-management-component-metadata-service` | Listing returns direct entries only; inherited resolution is a separate boundary. |
 | `cpt-cf-account-management-usecase-metadata-schema-vs-entry-not-found` | `cpt-cf-account-management-interface-metadata-rest`, Section 3.8 Error Codes Reference | The contract distinguishes unregistered schema identifiers from missing tenant entries. |
-| `cpt-cf-account-management-usecase-metadata-permission-denied-per-schema` | `cpt-cf-account-management-interface-metadata-rest`, Section 4 Security Architecture | Authorization on metadata includes `SCHEMA_ID` as a first-class policy attribute. |
+| `cpt-cf-account-management-usecase-metadata-permission-denied-per-schema` | `cpt-cf-account-management-interface-metadata-rest`, Section 4 Security Architecture | Authorization on metadata includes `TYPE_ID` (the chained GTS type id) as a first-class policy attribute. |
 | `cpt-cf-account-management-usecase-resolve-metadata-multi-barrier` | `cpt-cf-account-management-seq-resolve-metadata`, `cpt-cf-account-management-component-metadata-service` | Metadata resolution stops at the nearest self-managed barrier and never crosses it. |
 
 ### 3.7 Database schemas & tables
@@ -1554,14 +1554,14 @@ AM uses `PolicyEnforcer` as the PEP boundary. AuthZ decisions are delegated to t
 |--------------|---------------|----------------|
 | Tenant | `gts.cf.core.am.tenant.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
 | User (IdP proxy) | `gts.cf.core.am.user.v1~` | `OWNER_TENANT_ID` |
-| TenantMetadata | `gts.cf.core.am.tenant_metadata.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID`, `SCHEMA_ID` |
+| TenantMetadata | `gts.cf.core.am.tenant_metadata.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID`, `TYPE_ID` |
 | ConversionRequest | `gts.cf.core.am.conversion_request.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
 | ServiceAccount (IdP-backed machine identity) | `gts.cf.core.am.service_account.v1~` | `OWNER_TENANT_ID`, `RESOURCE_ID` |
 
 | Action | Resource Type | Purpose |
 |--------|---------------|---------|
 | `create`, `read`, `update`, `delete`, `list_children` | Tenant | Tenant lifecycle and child discovery (direct, or recursive over the visible subtree) |
-| `read`, `write` | ConversionRequest | Create, discover, and resolve dual-consent conversion requests |
+| `request`, `cancel`, `reject`, `approve`, `list_own`, `list_inbound` | ConversionRequest | Create, discover, and resolve dual-consent conversion requests |
 | `create`, `update`, `delete`, `list` | User | IdP-backed user lifecycle operations exposed through the AM user proxy surface |
 | `read`, `write`, `delete`, `list` | TenantMetadata | Schema-scoped metadata CRUD and listing |
 | `create`, `list`, `rotate_secret`, `revoke` | ServiceAccount | IdP-backed machine-identity lifecycle. Per-verb rather than a read/write/delete triad: minting a credential and re-keying an existing account are separately grantable, so an operator who may rotate need not be able to create |
@@ -1587,10 +1587,10 @@ The following bundles are design guidance for policy authors. They are not hardc
 | Policy bundle | Intended holder | Allowed actions | Explicit exclusions |
 |---------------|-----------------|-----------------|---------------------|
 | Tenant lifecycle admin | Tenant administrator in a scoped subtree | `Tenant.create`, `Tenant.read`, `Tenant.update`, `Tenant.delete`, `Tenant.list_children` | No user lifecycle, no metadata beyond separately granted schemas, no barrier bypass outside normal scope |
-| Child-side conversion initiator | Administrator of the tenant whose mode is changing | `ConversionRequest.read`, `ConversionRequest.write` on child-scope collection | No parent-scope discovery of other tenants, no implicit approval right on self-initiated requests |
-| Parent oversight admin | Administrator of the parent tenant | `ConversionRequest.read`, `ConversionRequest.write` on parent-scope collection | No raw reads through self-managed barriers beyond the minimal conversion metadata projection |
+| Child-side conversion initiator | Administrator of the tenant whose mode is changing | `ConversionRequest.request`, `ConversionRequest.cancel`, `ConversionRequest.reject`, `ConversionRequest.approve`, `ConversionRequest.list_own` on child-scope collection | No parent-scope discovery of other tenants, no implicit approval right on self-initiated requests |
+| Parent oversight admin | Administrator of the parent tenant | `ConversionRequest.request`, `ConversionRequest.cancel`, `ConversionRequest.reject`, `ConversionRequest.approve`, `ConversionRequest.list_inbound` on parent-scope collection | No raw reads through self-managed barriers beyond the minimal conversion metadata projection |
 | User administrator | Tenant admin or delegated identity operator | `User.create`, `User.update`, `User.delete`, `User.list` | No tenant-topology mutation, no metadata write unless separately granted |
-| Metadata steward | Tenant admin or delegated schema owner | `Metadata.read`, `Metadata.write`, `Metadata.delete`, `Metadata.list` for allowed `SCHEMA_ID` values | No implicit access to all metadata schemas; per-schema grants remain explicit |
+| Metadata steward | Tenant admin or delegated schema owner | `Metadata.read`, `Metadata.write`, `Metadata.delete`, `Metadata.list` for allowed `TYPE_ID` values | No implicit access to all metadata schemas; per-schema grants remain explicit |
 | Billing / reporting reader | Platform-operated downstream consumer | Read-only AM views through `cpt-cf-account-management-contract-billing` | No AM write actions, no dependence on internal storage tables |
 
 #### Audit, Privacy, and Inherited Controls

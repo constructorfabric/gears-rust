@@ -56,7 +56,10 @@ pub enum ConstraintCompileError {
     #[error("constraints required but PDP returned none (fail-closed)")]
     ConstraintsRequiredButAbsent,
 
-    /// All constraints contained unknown predicates (fail-closed).
+    /// No constraint compiled (fail-closed), for structural reasons such as
+    /// unsupported properties, malformed values, empty `predicates`, or a
+    /// group predicate without an `owner_tenant_id` predicate, possibly mixed
+    /// with capability-negotiation failures. `reason` joins every failure.
     #[error("all constraints failed compilation (fail-closed): {reason}")]
     AllConstraintsFailed { reason: String },
 
@@ -199,7 +202,8 @@ impl From<String> for ConstraintFailure {
 /// # Errors
 ///
 /// - `ConstraintsRequiredButAbsent` if constraints were required but empty
-/// - `AllConstraintsFailed` if all constraints have unsupported predicates
+/// - `AllConstraintsFailed` if no constraint compiled (unsupported property,
+///   malformed value, empty predicates, etc.)
 /// - `ScopeMatchesNothing` if every successfully compiled constraint has an empty set
 pub fn compile_to_access_scope(
     response: &EvaluationResponse,

@@ -175,7 +175,7 @@ graph TB
 | Domain | Local client; catalog service (operation flow, authorization calls, validation order, transactions, audit columns); effective-catalog algorithm, approval and sharing rules, PDP scope gate, GTS type and settings checks | Rust in `domain/` (local client included), `#[domain_model]` types, toolkit `PolicyEnforcer` (`cpt-cf-model-registry-tech-toolkit-gear`); settings validated with the workspace JSON Schema validator (`jsonschema`) against schemas from Types Registry (`cpt-cf-model-registry-tech-json-schema-validation`) |
 | Infrastructure | SeaORM entities with `Scopable`, repositories over `DBRunner`, migrations, OData field-to-column mapping, chain cache | SeaORM through `toolkit-db` `SecureConn`; PostgreSQL in production, SQLite in dev/test (`cpt-cf-model-registry-tech-relational-storage`) |
 
-Domain components call dependency SDK traits (`TenantResolverClient`, `AuthZResolverClient` through `PolicyEnforcer`, `TypesRegistryApi`, `CredStoreClientV2`) obtained from ClientHub, and storage through repository traits. These traits are the seams where tests inject mocks.
+Domain components call dependency SDK traits (`TenantResolverClient`, `AuthZResolverApi` through `PolicyEnforcer`, `TypesRegistryApi`, `CredStoreClientV2`) obtained from ClientHub, and storage through repository traits. These traits are the seams where tests inject mocks.
 
 Layer rules follow the [platform gear layout](../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md): serde and `ToSchema` derives appear only in `api/rest/` DTOs and in SDK models; domain types carry `#[domain_model]`; all endpoints are versioned. `unsafe` is forbidden and `unwrap`/`expect` are denied in non-test code.
 
@@ -837,7 +837,7 @@ What LLM Gateway and its provider plugins rely on:
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
 | `tenant-resolver` | `TenantResolverClient::get_ancestors` via ClientHub, once with the default `BarrierMode::Respect` per cache miss | Ancestor chain for inheritance and shadowing |
-| `authz-resolver` | `AuthZResolverClient` wrapped in `PolicyEnforcer` (`authz-resolver-sdk`) | PDP decisions for every operation |
+| `authz-resolver` | `AuthZResolverApi` wrapped in `PolicyEnforcer` (`authz-resolver-sdk`) | PDP decisions for every operation |
 | `types-registry` | `TypesRegistryApi::get_type_schema` (authored content and resolved schema selected) under the caller's context; platform GTS publication (provider base type and permission instances) | Provider type checks and settings validation on writes |
 | `credstore` | `CredStoreClientV2::get_record` via ClientHub, under the caller's context | Ownership check of `secret_ref` on model create and on an update that changes it to a non-null value (§4 Credential Binding) |
 | `llm-gateway` (consumer) | Calls `ModelRegistryClientV1` | Resolves models on every inference request; its provider plugins publish provider types derived from `gts.cf.genai.model.provider.v1~` (§3.3 Consumer Contract) |

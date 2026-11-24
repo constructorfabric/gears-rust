@@ -117,7 +117,7 @@ Gears implement a **PDP/PEP authorization model** per NIST SP 800-162, extended 
 
 ```
 Client → AuthN Middleware → AuthN Resolver (token validation)
-       → Gear Handler (PEP) → AuthZ Resolver (PDP, policy evaluation)
+       → Gear Domain Service (PEP) → AuthZ Resolver (PDP, policy evaluation)
        → Constraints compiled to AccessScope
        → Database (query with WHERE clauses from constraints)
 ```
@@ -382,7 +382,7 @@ Project-specific Dylint rules are orchestrated by [`cargo-gears`](https://github
 `DE0902` forbids `schema_for` on GTS-typed structs |
 | DE1301 | `no_print_macros` | Forbids print/debug macros in production code, reducing uncontrolled disclosure |
 
-These lints materially strengthen the secure development path, especially layer isolation, direct-SQL prevention, plugin contracts, and GTS correctness. They complement rather than replace framework type-state and runtime controls: the current published rule catalog does **not** itself prove that every protected handler invokes `PolicyEnforcer`, that every entity derives `Scopable`, or that every outbound connection uses OAGW. Those properties come from `OperationBuilder`, Secure ORM APIs/macros, code review and tests, and deployment policy; additional Dylint rules can make more of them build-breaking over time.
+These lints materially strengthen the secure development path, especially layer isolation, direct-SQL prevention, plugin contracts, and GTS correctness. They complement rather than replace framework type-state and runtime controls: the current published rule catalog does **not** itself prove that every protected operation invokes `PolicyEnforcer`, that every entity derives `Scopable`, or that every outbound connection uses OAGW. Those properties come from `OperationBuilder`, Secure ORM APIs/macros, code review and tests, and deployment policy; additional Dylint rules can make more of them build-breaking over time.
 
 ## 8. Dependency Security — cargo-deny
 

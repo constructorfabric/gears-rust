@@ -128,7 +128,7 @@ This separation provides:
 - **Security boundaries** — Credentials (tokens) isolated in AuthN layer, AuthZ works with validated identity
 - **Mix & match vendors** — Use different vendors for IdP (AuthN) and Policy Engine (AuthZ)
 
-Each vendor develops their own AuthN and AuthZ plugins (or a unified plugin implementing both interfaces) that bridge to their specific systems. See [ADR 0002](./ADR/0002-split-authn-authz-resolvers.md) for the rationale behind this separation.
+Each vendor develops their own AuthN and AuthZ plugins (a unified plugin implementing both interfaces is a design option only and is not implemented — see [Unified Plugin Pattern](#plugin-roles)) that bridge to their specific systems. See [ADR 0002](./ADR/0002-split-authn-authz-resolvers.md) for the rationale behind this separation.
 
 ### Plugin Roles
 
@@ -169,6 +169,8 @@ The plugin is responsible for evaluating policies (in whatever internal format a
 **Unified Plugin Pattern:**
 
 Vendors with integrated AuthN+AuthZ APIs can provide a unified plugin implementing both interfaces, allowing single API calls to vendor services, shared caching between AuthN and AuthZ operations, and coordinated version updates. See [ADR 0002](./ADR/0002-split-authn-authz-resolvers.md) for details.
+
+> **Not implemented:** there is no unified plugin trait or shared AuthN/AuthZ cache. Each resolver selects its own plugin independently by a single `vendor` config string, and a vendor wanting both must ship two plugins (one per resolver). See the implementation note in ADR 0002.
 
 ### Integration Architecture
 
@@ -330,7 +332,7 @@ let ctx = SecurityContext::builder()
 ### PDP Evaluation Flow
 
 1. **PEP** includes `token_scopes` in evaluation request context
-2. **PDP** applies scope restrictions:
+2. **PDP** applies scope restrictions (a vendor PDP responsibility; neither shipped plugin, `static-authz-plugin` or `tr-authz-plugin`, reads `token_scopes`):
    - If `token_scopes: ["*"]` → no scope-based restrictions
    - Otherwise → intersect with user permissions
 3. **PDP** returns constraints reflecting both scopes and permissions
@@ -513,6 +515,8 @@ pub struct SecurityContext {
 - `bearer_token` MUST NOT be logged, serialized to persistent storage, or included in error messages
 - An in-process PDP can use the original token if the AuthN plugin supplied it. Serialization skips the field, so the remote evaluation endpoint receives only the subject and context data sent by the PEP. The REST client authenticates the call with the workload credential.
 
+
+  The token reaches AuthZ Resolver plugins only in-process: `EvaluationRequestContext.bearer_token` is `#[serde(skip)]`, so it is never sent over the REST route. Neither shipped plugin reads it.
 
 ### VerifiedPrincipal
 
@@ -968,7 +972,7 @@ The response contains a `decision` and, when `decision: true`, optional `context
   "context": {
     // Structured denial diagnostics
     "deny_reason": {
-      // GTS-formatted error code for programmatic handling (required)
+      // GTS-formatted error code for programmatic handling (required when deny_reason is present)
       "error_code": "gts.cf.core.errors.err.v1~x.authz.errors.insufficient_permissions.v1",
       // Human-readable details for logging (optional)
       "details": "Subject lacks permission for action 'list' on resource type 'gts.cf.core.events.event.v1~'"
@@ -1107,7 +1111,7 @@ This separate example assumes no requested resource properties. The PEP advertis
             "barrier_mode": "respect"  // default: "respect"
           },
           {
-            // Group subtree predicate - uses resource_group_membership + resource_group_closure tables
+            // Group subtree predicate - uses resource_group_membership + resource_group_closure + gts_type tables
             "op": "in_group_subtree",
             "property": "id",
             "ancestor_ids": ["project-root-group-uuid"]
@@ -1133,6 +1137,8 @@ The producer contract requires `decision: false` with a structured `context.deny
 | `details` | No | Human-readable description for logging/debugging |
 
 ##### Standard Error Codes
+
+> **Not implemented:** the codes below are proposed conventions only. They are not defined anywhere in the code, and no shipped plugin emits them.
 
 | Code | When to use |
 |------|-------------|

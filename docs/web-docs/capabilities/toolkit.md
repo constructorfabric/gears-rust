@@ -14,11 +14,11 @@ The toolkit (`libs/`) is the low-level substrate every gear builds on.
 | --- | --- | --- |
 | `toolkit` | Core runtime: gear lifecycle (`HostRuntime`), in-process composition (`ClientHub`), REST/OpenAPI wiring, SSE, transactional outbox, telemetry | `#[toolkit::gear]`, `GearCtx`, `ClientHub`, `OperationBuilder`, `SseBroadcaster` |
 | `toolkit-macros` | Proc-macros for gear discovery and domain validation | `#[domain_model]`, `#[gear(...)]` |
-| `toolkit-db` | Secure ORM over SeaORM: scoped access, transactions | `SecureConn`, `SecureTx`, `DBProvider`, `AccessScope` |
+| `toolkit-db` | Secure ORM over SeaORM: scoped access, transactions | `SecureConn`, `SecureTx`, `DBProvider`, `AccessScope`, `ScopableEntity` |
 | `toolkit-db-macros` | Entity security-dimension derive | `#[derive(Scopable)]`, `#[secure(...)]` |
-| `toolkit-security` | Core security types | `SecurityContext`, `AccessScope`, `ScopableEntity` |
+| `toolkit-security` | Core security types | `SecurityContext`, `AccessScope` |
 | `toolkit-canonical-errors` | 16-category canonical errors + RFC-9457 rendering | `CanonicalError`, `Problem` |
-| `toolkit-auth` | AuthN/AuthZ integration types | `PolicyEnforcer`, `AuthZResolverApi` |
+| `toolkit-auth` | AuthN token validation (JWT/JWKS) and OAuth2 client helpers; `PolicyEnforcer` and `AuthZResolverApi` live in `authz-resolver-sdk` | `TokenValidator`, `JwksKeyProvider`, `AuthConfig` |
 | `toolkit-http` | HTTP client with OpenTelemetry tracing | `HttpClient`, `.with_otel()` |
 | `toolkit-odata` | OData `$filter` / `$orderby` / `$select` + cursor pagination | `Page<T>`, OData extractors |
 | `toolkit-odata-macros` | OData-filterable DTO derive | `#[derive(ODataFilterable)]` |

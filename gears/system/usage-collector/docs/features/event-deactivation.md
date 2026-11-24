@@ -202,7 +202,7 @@ deactivate(<id>) -> Ok(())     # on success: the primary row PLUS every active r
 1. [x] - `p1` - Receive the inbound `SecurityContext` at the `cpt-cf-usage-collector-component-deactivation-handler` boundary — on REST as `Extension<SecurityContext>` from the gateway middleware, on SDK as the `ctx: &SecurityContext` first argument — along with the prefetched record - `inst-algo-pdp-receive-ctx`
 2. [x] - `p1` - **IF** no `SecurityContext` is present at the boundary **RETURN** `unauthenticated`; the collector never synthesizes identity and never forwards an unauthenticated request to the PDP. (Realised at the framework layer: `OperationBuilder::authenticated()` on the route plus the axum `Extension<SecurityContext>` extractor on the handler — the algorithm body is not entered without ctx.) - `inst-algo-pdp-no-ctx`
 3. [x] - `p1` - Compose the deactivation attribution tuple from the inbound `SecurityContext` (operator principal and operator's tenant scope) and the prefetched record's PEP attributes: `OWNER_TENANT_ID = record.tenant_id`, `PROP_RESOURCE_TYPE = record.resource_ref.resource_type`, `PROP_RESOURCE_ID = record.resource_ref.resource_id`, and (when `record.subject_ref` is set) `OWNER_ID = subject.subject_id` plus optional `PROP_SUBJECT_TYPE = subject.subject_type`. The verb is `actions::DEACTIVATE`. The UsageType `gts_id` field of the standard attribution tuple is not applicable to operator deactivation and is omitted - `inst-algo-pdp-compose-tuple`
-4. [x] - `p1` - Invoke `cpt-cf-usage-collector-flow-foundation-pdp-authorize` via the shared per-resource `authorize_usage_record` helper (`PolicyEnforcer::access_scope_with(ctx, &usage_record::RESOURCE, actions::DEACTIVATE, None, &request)` against `cpt-cf-usage-collector-contract-authz-resolver`) to obtain the `PdpDecision` (`permit` or `deny`) - `inst-algo-pdp-call`
+4. [x] - `p1` - Invoke `cpt-cf-usage-collector-flow-foundation-pdp-authorize` via the shared per-resource `authorize_usage_record` helper (`PolicyEnforcer::access_scope_with(ctx, &usage_record::RESOURCE, actions::DEACTIVATE, None, &request)` against `cpt-cf-usage-collector-contract-authz-resolver`) to obtain the `EvaluationResponse` (`permit` or `deny`) - `inst-algo-pdp-call`
 5. [x] - `p1` - **IF** the PDP helper returns `unreachable` (PDP transport failure) **RETURN** `deny`; no cached decision is consulted and no permissive fallback is applied (`EnforcerError::EvaluationFailed` maps to `DomainError::AuthorizationUnavailable`) - `inst-algo-pdp-fail-closed`
 6. [x] - `p1` - **IF** the PDP decision is `deny` **RETURN** `deny` (`EnforcerError::AccessDenied` / `CompileFailed` map to `DomainError::AuthorizationDenied`); the deactivation flow collapses the lifted `PermissionDenied` into the canonical `NotFound` envelope per the existence-oracle guard - `inst-algo-pdp-deny`
 7. [x] - `p1` - **RETURN** `Ok(())` — the surrounding flow proceeds to Method 5 dispatch - `inst-algo-pdp-allow`
@@ -454,7 +454,7 @@ The system **MUST** realize `cpt-cf-usage-collector-principle-fail-closed` on th
 
 - API: `POST /usage-collector/v1/records/{id}/deactivate`
 - Component: `cpt-cf-usage-collector-component-deactivation-handler`, `cpt-cf-usage-collector-component-plugin-host`
-- Entities: `SecurityContext`, `PdpDecision`
+- Entities: `SecurityContext`, `EvaluationResponse`
 
 ### ADR: Monotonic Deactivation
 

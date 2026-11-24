@@ -23,10 +23,11 @@ use uuid::Uuid;
 ///   bind via `InTenantSubtree(OWNER_TENANT_ID, tid)` -- without that addition the
 ///   `In(OWNER_TENANT_ID)` clamp restricts visibility to the caller's own tenant row,
 ///   hiding direct-child writes the test fixtures exercise.
-/// - Constraints are OR-ed, and the `SecureORM` compiler drops any predicate whose
-///   property doesn't resolve to a column on the entity being queried -- so the
-///   addition is invisible to PEPs that don't advertise the capability and to entities
-///   that don't expose the property.
+/// - Constraints are OR-ed, and a constraint whose property is unusable fails on its
+///   own: the PEP compiler fails it when the property is outside
+///   `supported_properties`, and `SecureORM` drops it when the property doesn't
+///   resolve to a column (all failing → deny) -- so the addition is invisible to PEPs
+///   that don't advertise the capability and to entities that don't expose the property.
 /// - Emits an empty constraint set when the PEP declares none of the properties above.
 ///   The PEP compiler turns that into `allow_all()`, or a deny under
 ///   `require_constraints` -- this service does not repeat that matrix. Such a permit
@@ -127,11 +128,12 @@ impl Service {
         //   declared with `resource_col` (e.g. AM's `tenants` itself,
         //   `no_tenant`) and clamps via the resource id.
         //
-        // The constraints are OR-ed, and the SecureORM compiler drops any
-        // predicate whose property doesn't resolve to a column on the
-        // entity being queried -- so the addition is invisible to PEPs
-        // that don't advertise the capability and to entities that don't
-        // expose the property. Gears that do not opt-in to
+        // The constraints are OR-ed, and a constraint whose property is
+        // unusable fails on its own (the PEP compiler fails it outside
+        // `supported_properties`; SecureORM drops it when the property
+        // doesn't resolve to a column; all failing → deny) -- so the
+        // addition is invisible to PEPs that don't advertise the capability
+        // and to entities that don't expose the property. Gears that do not opt-in to
         // `Capability::TenantHierarchy` see the baseline shape unchanged.
         if advertises_tenant_hierarchy(request) {
             for prop in [pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID] {

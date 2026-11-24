@@ -86,7 +86,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Steps**:
 
-1. [ ] - `p2` - Validate caller identity and `SecurityContext` per platform AuthN middleware; BEFORE any DB access, apply `PolicyEnforcer::enforce` for `Metadata.list` on `{tenant_id}` per `fr-tenant-metadata-permissions`, omitting `SCHEMA_ID` because the list endpoint has no per-schema selector - `inst-flow-mdlist-authz`
+1. [ ] - `p2` - Validate caller identity and `SecurityContext` per platform AuthN middleware; BEFORE any DB access, apply `PolicyEnforcer::access_scope_with` for `Metadata.list` on `{tenant_id}` per `fr-tenant-metadata-permissions`, omitting `TYPE_ID` because the list endpoint has no per-schema selector (each listed row is then re-checked with `Metadata.read` + `TYPE_ID` and dropped if denied) - `inst-flow-mdlist-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` to a visible tenant via `TenantService`; forward not-found / cross-tenant-denied outcomes as envelope-mapped errors - `inst-flow-mdlist-resolve-tenant`
 3. [ ] - `p2` - Invoke `MetadataService::list_for_tenant(tenant_id, pagination)` via MetadataRepository; the query hits `dbtable-tenant-metadata` filtered by `tenant_id` only (NO ancestor walk) - `inst-flow-mdlist-query`
 4. [ ] - `p2` - Reverse-hydrate each distinct `schema_uuid` to its public chained `schema_id` via Types Registry per DESIGN §3.2.3 - `inst-flow-mdlist-hydrate`
@@ -110,7 +110,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Steps**:
 
-1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.read` with `schema_id` as resource attribute - `inst-flow-mdget-authz`
+1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::access_scope_with` for `Metadata.read` with the chained type id as the `TYPE_ID` resource attribute - `inst-flow-mdget-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` via `TenantService` and `{schema_id}` via GTS types registry - `inst-flow-mdget-resolve`
 3. [ ] - `p2` - **IF** schema is not registered in GTS - `inst-flow-mdget-schema-unknown`
    1. [ ] - `p2` - **RETURN** `(reject, code=not_found)` via the envelope (HTTP 404) - `inst-flow-mdget-schema-return`
@@ -138,7 +138,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Steps**:
 
-1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.write` with `schema_id` as resource attribute - `inst-flow-mdput-authz`
+1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::access_scope_with` for `Metadata.write` with the chained type id as the `TYPE_ID` resource attribute - `inst-flow-mdput-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` via `TenantService` and `{schema_id}` via GTS types registry - `inst-flow-mdput-resolve`
 3. [ ] - `p2` - **IF** schema is not registered - `inst-flow-mdput-schema-unknown`
    1. [ ] - `p2` - **RETURN** `(reject, code=not_found)` - `inst-flow-mdput-schema-return`
@@ -164,7 +164,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Steps**:
 
-1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.delete` with `schema_id` as resource attribute - `inst-flow-mddel-authz`
+1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::access_scope_with` for `Metadata.delete` with the chained type id as the `TYPE_ID` resource attribute - `inst-flow-mddel-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` and `{schema_id}`; reject unregistered schemas with the unified metadata `not_found` - `inst-flow-mddel-resolve`
 3. [ ] - `p2` - Derive `schema_uuid` via `algo-schema-uuid-derivation` - `inst-flow-mddel-derive-uuid`
 4. [ ] - `p2` - Delete the row at `(tenant_id, schema_uuid)` via MetadataRepository - `inst-flow-mddel-delete`
@@ -188,7 +188,7 @@ Delivers PRD §5.7 (Extensible Tenant Metadata) by making every metadata categor
 
 **Steps**:
 
-1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::enforce` for `Metadata.resolve` with `schema_id` as resource attribute - `inst-flow-mdres-authz`
+1. [ ] - `p2` - Validate caller identity + `SecurityContext`; apply `PolicyEnforcer::access_scope_with` for `Metadata.read` (the `/resolved` endpoint reuses the read action) with the chained type id as the `TYPE_ID` resource attribute - `inst-flow-mdres-authz`
 2. [ ] - `p2` - Resolve `{tenant_id}` and `{schema_id}`; reject unregistered schemas with the unified metadata `not_found` - `inst-flow-mdres-resolve`
 3. [ ] - `p2` - Resolve the schema's `inheritance_policy` trait from its `x-gts-traits` (falling back to the base schema default `override_only`) via Types Registry - `inst-flow-mdres-policy`
 4. [ ] - `p2` - Invoke `algo-metadata-resolve-walk-up` with `(tenant_id, schema_uuid, policy)` — returns effective value or empty - `inst-flow-mdres-invoke-algo`
@@ -371,7 +371,7 @@ This feature **MUST NOT** implement an application-layer cascade cleanup *job* (
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-dod-tenant-metadata-per-schema-authz`
 
-Per-schema handlers in the `/tenants/{tenant_id}/metadata` family **MUST** pass the public chained `schema_id` into `PolicyEnforcer::enforce` as a resource attribute (e.g., `SCHEMA_ID`) on the corresponding action (`Metadata.read`, `Metadata.write`, `Metadata.delete`, `Metadata.resolve`) so external AuthZ policy can express per-schema grants without AM evaluating policy itself. The list handler for `GET /tenants/{tenant_id}/metadata` **MUST** call `PolicyEnforcer::enforce` for `Metadata.list` before any DB access but **MUST** omit `SCHEMA_ID` because that endpoint has no per-schema selector. AM **MUST NOT** cache or interpret the policy decision beyond the permit/deny outcome returned by `PolicyEnforcer`.
+For every per-schema operation in the `/tenants/{tenant_id}/metadata` family, `MetadataService` **MUST** pass the validated chained GTS type id into `PolicyEnforcer::access_scope_with` (via `domain::authz::authz_scope`) as the `TYPE_ID` (`"type_id"`) resource attribute, set via `AccessRequest::resource_property`, on the corresponding action (`Metadata.read` — also used by `/resolved` — `Metadata.write`, `Metadata.delete`) so external AuthZ policy can express per-schema grants without AM evaluating policy itself. For `GET /tenants/{tenant_id}/metadata`, `MetadataService::list_metadata` **MUST** call `PolicyEnforcer::access_scope_with` for `Metadata.list` before any DB access but **MUST** omit `TYPE_ID` because that endpoint has no per-schema selector. AM **MUST NOT** cache or interpret the policy decision beyond the permit/deny outcome returned by `PolicyEnforcer`.
 
 **Implements**:
 
@@ -383,7 +383,7 @@ Per-schema handlers in the `/tenants/{tenant_id}/metadata` family **MUST** pass 
 
 **Touches**:
 
-- Sibling integration: `PolicyEnforcer` at the REST layer (external to this feature's surface)
+- Sibling integration: `PolicyEnforcer` / AuthZ Resolver, called from `MetadataService` (policy evaluation is external to this feature's surface)
 - Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `cross_tenant_denied` referenced by name only.
 
 ## 6. Acceptance Criteria
@@ -395,7 +395,7 @@ Per-schema handlers in the `/tenants/{tenant_id}/metadata` family **MUST** pass 
 - [ ] A `GET /resolved` for a schema whose `inheritance_policy` is `override_only` returns the tenant's own value if present or HTTP 200 with an empty response if absent; for a schema whose `inheritance_policy` is `inherit`, the walk-up traverses `parent_id` ancestors, returns the first ancestor value found up to and including the nearest self-managed ancestor (the inheritance domain root), stops after that domain root without crossing the barrier (returning empty only when no value exists from the start tenant down to and including the domain root), and skips (continues past) ancestors whose `status == suspended`. An empty terminal state is HTTP 200 with an empty response, NOT HTTP 404. Fingerprints `dod-tenant-metadata-inheritance-resolution-contract`.
 - [ ] A direct `SELECT ... FROM tenant_metadata WHERE tenant_id = X` bypassing `MetadataService` returns only the rows directly written on tenant X — inherited values from ancestors are NOT visible through this path, confirming application-only enforcement. The schema-migration ddl for `tenant_metadata` contains no DB-level CHECK, trigger, or materialized-inheritance column, and no reconciliation job ships with this feature. Fingerprints `dod-tenant-metadata-application-only-enforcement`.
 - [ ] Deleting a tenant row from `dbtable-tenants` atomically removes all its `dbtable-tenant-metadata` rows in the same transaction. On PostgreSQL the removal is performed by `ON DELETE CASCADE` on `tenant_metadata.tenant_id → tenants.id`; on SQLite (where `PRAGMA foreign_keys` is intentionally disabled) the removal is performed by an explicit `delete_many` issued by `TenantRepoImpl::hard_delete_one` inside the tenant-hard-delete transaction. No out-of-band sweep / application-layer cleanup job is issued, and the cascade contract is preserved across schema migrations (PostgreSQL FK clause + SQLite explicit-delete branch). Fingerprints `dod-tenant-metadata-cascade-delete`.
-- [ ] The per-schema handlers in the `/tenants/{tenant_id}/metadata` family call `PolicyEnforcer::enforce` with the public chained `schema_id` as a resource attribute on the corresponding action (`Metadata.read` / `Metadata.write` / `Metadata.delete` / `Metadata.resolve`) BEFORE any DB read or write; the list handler calls `PolicyEnforcer::enforce` for `Metadata.list` BEFORE any DB access but omits `SCHEMA_ID` because the endpoint has no per-schema selector. A denied policy decision returns `code=cross_tenant_denied` (or the mapped category per `feature-errors-observability`) without touching `dbtable-tenant-metadata`. Fingerprints `dod-tenant-metadata-per-schema-authz`.
+- [ ] For the per-schema operations in the `/tenants/{tenant_id}/metadata` family, `MetadataService` calls `PolicyEnforcer::access_scope_with` with the chained GTS type id as the `TYPE_ID` resource attribute on the corresponding action (`Metadata.read` (including `/resolved`) / `Metadata.write` / `Metadata.delete`) BEFORE any DB read or write; for the list operation it calls `PolicyEnforcer::access_scope_with` for `Metadata.list` BEFORE any DB access but omits `TYPE_ID` because the endpoint has no per-schema selector. A denied policy decision returns `code=cross_tenant_denied` (or the mapped category per `feature-errors-observability`) without touching `dbtable-tenant-metadata`. Fingerprints `dod-tenant-metadata-per-schema-authz`.
 - [ ] The deterministic UUIDv5 derivation at `algo-schema-uuid-derivation` produces the same `schema_uuid` for a given `schema_id` across restarts, deployments, and replica sets — verified by a test that derives the UUID in two independent processes and asserts byte-equality; the derivation is a pure computation and does NOT call Types Registry. Fingerprints `dod-tenant-metadata-schema-registration-and-uuid-derivation`.
 
 ## 7. Deliberate Omissions
@@ -406,5 +406,5 @@ Per-schema handlers in the `/tenants/{tenant_id}/metadata` family **MUST** pass 
 - **Problem Details envelope shape, RFC 9457 formatting, HTTP status mapping, and the authoritative error-code taxonomy** — *Owned by `cpt-cf-account-management-feature-errors-observability`* (DECOMPOSITION §2.8). Sub-codes (`not_found`, `validation`, `cross_tenant_denied`) are catalogued authoritatively there; this feature emits them by name and defers envelope formatting, HTTP status mapping, audit emission, and metric sample naming to that feature.
 - **Metadata-schema authoring, JSON Schema body design, `inheritance_policy` trait values, and semantic interpretation of metadata content** — *GTS-registry authoring concern.* Schemas are registered by deployment owners; `MetadataService` treats values as opaque GTS-validated payloads and does not inspect or normalize their semantics.
 - **Materialized inheritance views, DB-level CHECK/trigger enforcement, materialized-inheritance columns, and reconciliation jobs** — *Forbidden by `cpt-cf-account-management-adr-metadata-inheritance`* (ADR-0002). Inheritance is derived on every read inside `MetadataService::resolve`; no write-side materialization exists.
-- **Authentication, session, token issuance, and user lifecycle** — *Inherited from the platform AuthN layer and `feature-idp-user-operations-contract`* (DESIGN §4.2). `SecurityContext` validation is a platform-layer precondition; AuthZ policy evaluation for `Metadata.*` actions is delegated to `PolicyEnforcer` at the REST layer.
+- **Authentication, session, token issuance, and user lifecycle** — *Inherited from the platform AuthN layer and `feature-idp-user-operations-contract`* (DESIGN §4.2). `SecurityContext` validation is a platform-layer precondition; AuthZ policy evaluation for `Metadata.*` actions is delegated to the PDP through `PolicyEnforcer`, invoked by `MetadataService`.
 - **Future `inheritance_policy` values (`merge`, `readonly`, `computed`)** — *Deliberate v1 scope reduction per DESIGN §3.1 rationale.* `inheritance_policy` is a string enum precisely so new values can be added additively without a breaking contract change; v1 ships `override_only` and `inherit` only.

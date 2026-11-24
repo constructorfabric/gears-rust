@@ -21,7 +21,7 @@ For the full architectural design (AuthZEN model, predicate types, caching, depl
 ```text
 Request → API Gateway (AuthN middleware) → SecurityContext
               ↓
-         Gear Handler (PEP)
+         Gear Domain Service (PEP)
               ↓
          PolicyEnforcer → AuthZ Resolver (PDP) → decision + constraints
               ↓
@@ -755,7 +755,7 @@ The server binary uses feature flags to include static plugins:
 
 ```bash
 # Run with static AuthN + AuthZ plugins (development mode)
-cargo run --bin cf-gears-server --features static-authn,static-authz -- --config config.yaml run
+cargo run --bin cf-gears-example-server --features static-authn,static-authz -- --config config/quickstart.yaml run
 
 # Makefile target includes these features
 make example
@@ -768,7 +768,8 @@ For the simplest local development (no auth at all), configure the API Gateway:
 ```yaml
 gears:
   api-gateway:
-    auth_disabled: true
+    config:
+      auth_disabled: true
 ```
 
 This injects a default `SecurityContext` for all requests without calling any AuthN resolver.

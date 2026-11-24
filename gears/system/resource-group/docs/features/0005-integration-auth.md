@@ -92,12 +92,12 @@ This feature bridges RG with the AuthZ ecosystem. The integration read port prov
 **Steps**:
 1. [x] - `p1` - Actor sends request to any RG REST endpoint with JWT bearer token - `inst-jwt-1`
 2. [x] - `p1` - API Gateway: authenticate JWT via AuthNResolverClient → SecurityContext {subject_id, subject_tenant_id} - `inst-jwt-2`
-3. [x] - `p1` - RG Gateway: call PolicyEnforcer.access_scope(ctx, resource_type, action) - `inst-jwt-3`
+3. [x] - `p1` - RG domain service (`GroupService` / `MembershipService`): call PolicyEnforcer.access_scope(ctx, &resource_type, action, resource_id) (or `access_scope_with` when extra resource properties are sent) - `inst-jwt-3`
 4. [x] - `p1` - PolicyEnforcer → AuthZ Resolver: evaluate(EvaluationRequest) - `inst-jwt-4`
 5. [x] - `p1` - AuthZ plugin internally: call ResourceGroupReadHierarchy.list_group_depth() for tenant hierarchy resolution (in-process via `ClientHub` — bypasses AuthZ to break the circular dependency; the MTLS transport variant is `p2` — deferred, not implemented yet) - `inst-jwt-5`
 6. [x] - `p1` - AuthZ plugin: produce constraints (e.g., owner_tenant_id IN (...)) - `inst-jwt-6`
 7. [x] - `p1` - PolicyEnforcer: compile_to_access_scope() → AccessScope - `inst-jwt-7`
-8. [x] - `p1` - RG Gateway: apply AccessScope via SecureORM (WHERE tenant_id IN (...)) to query - `inst-jwt-8`
+8. [x] - `p1` - RG domain service: pass AccessScope to the repository, which applies it to the query via SecureORM (WHERE tenant_id IN (...)) - `inst-jwt-8`
 9. [x] - `p1` - RG Service: execute query with SQL predicates, return results - `inst-jwt-9`
 10. [x] - `p1` - **RETURN** response to actor - `inst-jwt-10`
 

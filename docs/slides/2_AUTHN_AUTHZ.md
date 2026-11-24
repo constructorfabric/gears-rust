@@ -299,9 +299,9 @@ The PDP replies with a decision plus optional **`context.constraints`** — type
 ```json
 { "decision": true,
   "context": { "constraints": [ { "predicates": [
-    { "type": "eq", "resource_property": "owner_tenant_id",
+    { "op": "eq", "property": "owner_tenant_id",
       "value": "tenant-uuid" },
-    { "type": "eq", "resource_property": "owner_id",
+    { "op": "eq", "property": "owner_id",
       "value": "user-uuid" }
   ] } ] } }
 ```
@@ -340,7 +340,7 @@ The PEP declares which it supports; the PDP returns only those.
 | `in_group_subtree` | group + descendants | join group closure + membership |
 
 > Predicates name **properties**, not columns. Unknown type → **fail-closed**.
-> **Extensible** — vendors can register custom predicate types.
+> **Closed set** — `Predicate` is a fixed enum in the SDK; vendors cannot register custom predicate types.
 
 ---
 

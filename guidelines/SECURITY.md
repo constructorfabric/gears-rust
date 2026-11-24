@@ -59,7 +59,8 @@ For secure ORM usage, see `docs/toolkit_unified_system/06_authn_authz_secure_orm
 ### Quick Example
 
 ```rust
-use toolkit_db::secure::{SecurityContext, SecureConn};
+use toolkit_db::secure::SecureConn;
+use toolkit_security::SecurityContext;
 use toolkit_db_macros::Scopable;
 
 // Define a scopable entity
@@ -85,7 +86,7 @@ pub async fn list_users_handler(
     let secure_conn = db.sea_secure();
 
     // Query with automatic tenant isolation
-    let scope = toolkit_db::secure::AccessScope::tenant(ctx.tenant_id());
+    let scope = toolkit_db::secure::AccessScope::for_tenant(ctx.subject_tenant_id());
     let users = secure_conn
         .find::<user::Entity>(&scope)
         .all(&secure_conn)

@@ -10,7 +10,7 @@ This crate defines the transport-agnostic interface for the AuthZ Resolver gear:
 - **`AuthZResolverPluginClient`** — Async trait for PDP plugin implementations
 - **`PolicyEnforcer`** — High-level PEP helper (build request → evaluate → compile to `AccessScope`)
 - **`EvaluationRequest` / `EvaluationResponse`** — AuthZEN 1.0-based request/response models
-- **Constraint types** — `Constraint`, `Predicate`, `EqPredicate`, `InPredicate`
+- **Constraint types** — `Constraint`, `Predicate`, `EqPredicate`, `InPredicate`, `InGroupPredicate`, `InGroupSubtreePredicate`, `InTenantSubtreePredicate`
 - **PEP compiler** — `compile_to_access_scope()` converts PDP constraints to SecureORM `AccessScope`
 
 ## Usage
@@ -33,8 +33,8 @@ use sea_orm::EntityTrait;
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_security::pep_properties;
 
-// `user::Entity` is the gear's SeaORM entity; `conn` is its `SecureConn`
-// (any `DBRunner`, e.g. from `db.conn()`).
+// `user::Entity` is the gear's SeaORM entity; `conn` is any `DBRunner`, e.g. the
+// `DbConn` returned by `db.conn()?`.
 
 // Define resource type with supported constraint properties
 const USER: ResourceType = ResourceType::from_static(
@@ -80,6 +80,7 @@ optional constraints, allowing empty scopes):
 ```rust
 use authz_resolver_sdk::pep::AccessRequest;
 use authz_resolver_sdk::models::TenantMode;
+use toolkit_security::pep_properties;
 
 let scope = enforcer.access_scope_with(
     &ctx, &USER, "create", None,
@@ -187,11 +188,11 @@ pub struct Constraint {
 // Multiple constraints are ORed
 
 pub enum Predicate {
-    Eq(EqPredicate),   // property = value
-    In(InPredicate),   // property IN (values)
-    InGroup(InGroupPredicate),
-    InGroupSubtree(InGroupSubtreePredicate),
-    InTenantSubtree(InTenantSubtreePredicate),
+    Eq(EqPredicate),                           // property = value
+    In(InPredicate),                           // property IN (values)
+    InGroup(InGroupPredicate),                 // member of any listed group
+    InGroupSubtree(InGroupSubtreePredicate),   // member of any group under the listed ancestors
+    InTenantSubtree(InTenantSubtreePredicate), // tenant is a descendant of a root tenant
 }
 ```
 
@@ -206,7 +207,7 @@ The table describes the current compiler API for a decoded `decision: true` resp
 | `true` | absent or empty array | Error (fail-closed) |
 | `true` | nonempty | Compile to `AccessScope` |
 
-An unsupported property invalidates its branch. If every branch is invalid, the compiler returns an error and the operation must stop. An empty outer `constraints` array differs from a predicate with `values: []`; see [empty-scope handling](../../../../docs/arch/authorization/DESIGN.md#permission-gates-and-empty-scopes).
+An unsupported property invalidates its branch. If every branch is invalid, the request fails closed with `EnforcerError::CompileFailed` (`AllConstraintsFailed`, or `UnadvertisedCapabilities` when every failure is a capability-negotiation violation), not with `AccessDenied`, and the operation must stop. An empty outer `constraints` array differs from a predicate with `values: []`; see [empty-scope handling](../../../../docs/arch/authorization/DESIGN.md#permission-gates-and-empty-scopes).
 
 Empty `In`, `InGroup`, and `InGroupSubtree` sets are valid and compile to SQL `FALSE`; other OR branches may match. Empty `predicates: []` is malformed. Property, capability, and tenant checks still apply. See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for handling an all-empty scope.
 
@@ -253,9 +254,9 @@ fn http_status(err: &EnforcerError) -> u16 {
 ```
 
 `is_pdp_unavailable()` is true only for an evaluation failure whose canonical
-category is `ServiceUnavailable` or `DeadlineExceeded` (including the
-enforcer's own evaluation deadline). It names the cause, not whether a retry is
-safe: that depends on the operation and its idempotency.
+category is `ServiceUnavailable` or `DeadlineExceeded`. The enforcer's own
+evaluation deadline surfaces as `ServiceUnavailable`. It names the cause, not
+whether a retry is safe: that depends on the operation and its idempotency.
 
 ## Implementing a Plugin
 

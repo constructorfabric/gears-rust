@@ -801,17 +801,21 @@ in the resource context so that the Authorization Service can apply per-type pol
 
 ##### Responsibility scope
 
-- For each auth-required operation, build a `PolicyRequest` with:
-  - `subject = SecurityContext.principal` — the user, resolved from the platform JWT
-  - `action ∈ {read, write, delete, ownership.transfer}` mapped from the endpoint
-  - `resource = gts.cf.fstorage.file.type.v1~<gts_file_type>~<file_id>`
+- For each auth-required operation, build an `AccessRequest` (which `PolicyEnforcer` turns into an `EvaluationRequest`) carrying only the `OWNER_TENANT_ID` (caller's subject tenant) and `gts_file_type` resource properties; the rest of the evaluation request comes from:
+  - the subject — taken by the enforcer from the `SecurityContext` (`ctx`), i.e. the user resolved from the platform JWT
+  - `action ∈ {read, write, delete, admin_policy}` mapped from the operation (ownership transfer is checked as `write`)
+  - resource type `file_storage.file`, with the target `file_id` as the resource id when the operation addresses one file
 - For **content** operations the read/write check runs at **presign** time (control plane); the resulting
   authorization is then carried to the sidecar inside the signed URL — the sidecar makes no fresh AuthZ call. The
   sidecar's later finalize/report-part callbacks never call `authz-adapter` either: they run under an unrestricted
   internal scope, treating the previously-verified signed token itself as the full authorization for that specific
   `(file_id, version_id)` operation (no app-token, no on-behalf-of delegation)
-- Call `PolicyEnforcer::check` (in-process via ClientHub)
-- Convert `Deny` decisions to `403 Forbidden` Problem+JSON; `Allow` decisions are silent
+- Call `PolicyEnforcer::access_scope_with(ctx, &FILE_RESOURCE, action, file_id, &request)` (in-process via ClientHub)
+- Map enforcer outcomes (`infra::authz::map_enforcer_error`): `EnforcerError::AccessDenied` and
+  `EnforcerError::CompileFailed` (unenforceable constraints) → `DomainError::Forbidden` → `403 Forbidden`
+  Problem+JSON (`PERMISSION_DENIED`, reason `ACCESS_DENIED`); `EnforcerError::EvaluationFailed` (PDP unreachable or
+  failed) and any unknown outcome → `DomainError::InternalError` → `500 Internal Server Error` (never treated as a
+  denial); a successful decision returns the compiled `AccessScope` and the operation proceeds silently
 
 ##### Responsibility boundaries
 
@@ -822,7 +826,7 @@ scope directly — so a cross-tenant file is invisible before authorization is e
 
 ##### Related components
 
-- `cpt-cf-file-storage-component-http-gateway` — calls before dispatch on auth-required routes
+- `cpt-cf-file-storage-component-http-gateway` — does not call the adapter; the domain services (`FileService`, `PolicyService`, `MultipartService`) call `Authorizer::authorize` before each auth-required operation
 - `cpt-cf-file-storage-component-metadata-service` — provides `gts_file_type` for the resource context
 
 #### `sdk-facade`

@@ -103,7 +103,7 @@ Projection tables let the PEP join against indexed local data. Query cost still 
 |-------|---------|---------|
 | `tenant_closure` | Denormalized tenant hierarchy (ancestor→descendant pairs) | `in_tenant_subtree` predicate — efficient subtree queries without recursive CTEs |
 | `resource_group` + `resource_group_closure` | Group entities + denormalized group hierarchy | Group hierarchy queries for PDP/PIP resolution |
-| `resource_group_membership` | Resource-to-group M:N associations | `in_group`/`in_group_subtree` predicates at SQL level |
+| `resource_group_membership` + `gts_type` | Resource-to-group M:N associations, qualified by the RG-local type registry (the SQL resolves the resource's GTS type to `gts_type.id`) | `in_group`/`in_group_subtree` predicates at SQL level |
 
 **Closure tables** specifically solve the hierarchy traversal problem. A closure table contains all ancestor-descendant pairs, allowing subtree queries with a simple `WHERE ancestor_id = X` instead of recursive tree walking.
 
@@ -1036,7 +1036,7 @@ S14–S17 assume the task type is active in Types Registry, is permitted by the 
 
 > The policy in S14–S17 must validate group ownership before emitting group or ancestor IDs. The native SQL checks membership, resource type and resource tenant. The current TR plugin only appends group predicates for group selectors supplied in the request. It checks selector syntax and capabilities but does not look up the groups’ tenants or derive the caller’s group permissions.
 >
-> All group-based constraints also include a tenant predicate on the resource (typically `eq` on `owner_tenant_id`) as defense in depth, ensuring tenant isolation at the resource level.
+> All group-based constraints also include a tenant predicate on the resource (typically `eq`/`in` on `owner_tenant_id`) in the same constraint, so tenant isolation at the resource level holds even when a supplied group ID belongs to another tenant.
 >
 > **Important — projection architecture:** `resource_group_membership` grows as `M_resources × N_groups_per_resource` and is expected to be 10×+ larger than hierarchy tables. Project it only when profiling confirms the two-request pattern is unacceptable (see [When to Project](#resource_group_membership--when-to-project)). `in_group`/`in_group_subtree` predicates require this table and are only executable when it is present in the PEP's database (RG gear, monolith with shared DB, or an explicit projection). S18–S19 assume a PDP that can check membership itself for a point operation or return explicit resource IDs for a LIST. Scenarios S14–S17 below are reference patterns (require membership table); S18–S19 are the standard domain service patterns.
 
@@ -2486,7 +2486,7 @@ The matrix relies on two core capabilities provided by `tr-authz-plugin`:
 1. **`is_parent(ancestor, descendant)`** — reflexive ancestor check, implemented in `tr-authz-plugin` as `Service::is_in_subtree` on top of `TenantResolverClient::is_ancestor` (with the reflexive `anchor == candidate` short-circuit returning `true`).
 2. **Reading `context.tenant_context.mode`** — `root_only` / `subtree` selection used to route R1–R8 branches; surfaced through `authz-resolver-sdk::TenantMode` on `TenantContext`.
 
-Test all 8 rules and fail-closed paths (missing subject tenant, `is_parent` returns false, TR error).
+Test all 8 rules and fail-closed paths (missing subject tenant, `is_parent` returns false, TR error). If the resolved descendants set is empty, R6/R8 deny (fail-closed) rather than return an empty constraint.
 
 ---
 

@@ -38,7 +38,7 @@ This doc defines `gts.cf.toolkit.authz.permission.v1~` as that canonical base GT
 
 The Type Schema has `additionalProperties: false` in v1. Future fields on the base (`description`, `category`, `deprecated`, `implies`, …) will be added via GTS minor version evolution when a concrete consumer needs them — YAGNI governs today's shape.
 
-**Extending with per-permission metadata.** If a gear needs ABAC-style per-permission attributes (audit category, MFA requirement, risk class, …), it can declare a derived Type Schema with `#[toolkit_gts::gts_type_schema(base = AuthzPermissionV1, schema_id = "...", ...)]` and register Instances against that derived Type Schema (three-segment instance IDs, analogous to how [`PluginV1`-derived plugin specs](../../TOOLKIT_PLUGINS.md) work). The wrapper joins the link-time inventory automatically, so the derived Type Schema lands in `types-registry` on the same path as the base. This is reserved for concrete consumers with real need; today's `AuthzPermissionV1` is non-generic and gear catalogs live at level 2.
+**Extending with per-permission metadata.** If a gear needs ABAC-style per-permission attributes (audit category, MFA requirement, risk class, …), it can declare a derived Type Schema with `#[toolkit_gts::gts_type_schema(base = AuthzPermissionV1, type_id = gts_id!("..."), ...)]` and register Instances against that derived Type Schema (three-segment instance IDs, analogous to how [`PluginV1`-derived plugin specs](../../TOOLKIT_PLUGINS.md) work). The wrapper joins the link-time inventory automatically, so the derived Type Schema lands in `types-registry` on the same path as the base. This is reserved for concrete consumers with real need; today's `AuthzPermissionV1` is non-generic and gear catalogs live at level 2.
 
 ## Instance Identifier Convention
 
@@ -53,8 +53,8 @@ The right-hand segment encodes the declaring gear's ownership (`<vendor>.<packag
 Examples:
 
 - `gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1`
-- `gts.cf.toolkit.authz.permission.v1~cf.am._.tenant_create.v1`
-- `gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.retry_turn.v1`
+- `gts.cf.toolkit.authz.permission.v1~cf.core.am.tenant_create.v1`
+- `gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_retry_turn.v1`
 
 ## `resource_type` Semantics
 
@@ -85,7 +85,7 @@ Matches every mini-chat chat. The PDP returns `decision: true` and tenant/owner 
 
 ```json
 {
-  "id": "gts.cf.toolkit.authz.permission.v1~cf.am._.tenant_create.v1",
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.core.am.tenant_create.v1",
   "resource_type": "gts.cf.core.am.tenant.*",
   "action": "create",
   "display_name": "Tenant creation"
@@ -111,7 +111,7 @@ Built-in AuthZ plugin compiles the `[category='support']` predicate into a PEP c
 
 ```json
 {
-  "id": "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.retry_turn.v1",
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_retry_turn.v1",
   "resource_type": "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.v1~",
   "action": "retry_turn",
   "display_name": "Retry chat turn"
@@ -143,19 +143,19 @@ No edit to a central list is ever needed — adding a new `#[gts_type_schema(...
 
 ### Per-gear permission Instances — declared at compile time via `gts_instance!`
 
-Gears that define permissions depend on `cf-gears-toolkit-gts` directly and declare each permission with the typed form of the `gts_instance!` macro. The macro takes a single `AuthzPermissionV1` struct literal with the full Instance Identifier as the `id` field's string literal; the upstream macro emits a compile-time assertion that the literal's prefix matches `<AuthzPermissionV1 as GtsSchema>::SCHEMA_ID` exactly, so a typo in the prefix is a build error rather than a silent runtime mismatch. The wrapper additionally emits an `inventory::submit!` block that lands in the process-wide `InventoryInstance` collector consumed by `types-registry::init()` — no gear-side registration code, no `types-registry-sdk` dependency, and no ordering coupling with the declaring gear's own `init()`.
+Gears that define permissions depend on `cf-gears-toolkit-gts` directly and declare each permission with the typed form of the `gts_instance!` macro. The macro takes a single `AuthzPermissionV1` struct literal with the Instance Identifier in the `id` field, written canonically as `gts_id!("<suffix>")` (which prepends the `gts.` prefix at compile time; a full string literal is also accepted); the upstream macro emits a compile-time assertion that the identifier's prefix matches `<AuthzPermissionV1 as GtsSchema>::SCHEMA_ID` exactly, so a typo in the prefix is a build error rather than a silent runtime mismatch. The wrapper additionally emits an `inventory::submit!` block that lands in the process-wide `InventoryInstance` collector consumed by `types-registry::init()` — no gear-side registration code, no `types-registry-sdk` dependency, and no ordering coupling with the declaring gear's own `init()`.
 
 ```rust
 // gears/mini-chat/mini-chat/src/gts/permissions.rs
 use crate::domain::service::actions;
-use toolkit_gts::{AuthzPermissionV1, gts_instance};
+use toolkit_gts::{AuthzPermissionV1, gts_id, gts_instance};
 
 const CHAT_RESOURCE_TYPE_WILDCARD: &str =
-    "gts.cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.*";
+    gts_id!("cf.core.ai_chat.chat.v1~cf.core.mini_chat.chat.*");
 
 gts_instance! {
     AuthzPermissionV1 {
-        id: "gts.cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1",
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.mini_chat._.chat_read.v1"),
         resource_type: CHAT_RESOURCE_TYPE_WILDCARD.to_owned(),
         action: actions::READ.to_owned(),
         display_name: "Read chat".to_owned(),
@@ -165,7 +165,7 @@ gts_instance! {
 // ...one invocation per (resource_type, action) the gear surfaces.
 ```
 
-The struct literal must contain exactly one of `id` / `gts_id` / `gtsId` as a string literal — upstream rewrites it into a `GtsInstanceId` value before constructing the typed struct. The emitted `payload_fn` serializes the typed struct via `serde_json::to_value`. Typos in field names, wrong field types, and missing required fields surface as compile errors; by pulling `action` values from `crate::domain::service::actions`, the permission catalog and the runtime PEP arguments share a single source of truth.
+The struct literal must contain exactly one of `id` / `gts_id` / `gtsId`, given as `gts_id!("...")` or a full string literal — upstream rewrites it into a `GtsInstanceId` value before constructing the typed struct. The emitted `payload_fn` serializes the typed struct via `serde_json::to_value`. Typos in field names, wrong field types, and missing required fields surface as compile errors; by pulling `action` values from `crate::domain::service::actions`, the permission catalog and the runtime PEP arguments share a single source of truth.
 
 > **Optional typed runtime accessor.** Prefix the struct literal with `#[gts_static(NAME)]` to additionally emit `pub static NAME: LazyLock<AuthzPermissionV1>` alongside the inventory submission, giving call-sites a direct typed handle (`&AuthzPermissionV1`) without going through the registry.
 
@@ -191,4 +191,4 @@ The struct literal must contain exactly one of `id` / `gts_id` / `gtsId` as a st
 - [DESIGN.md](./DESIGN.md) — overall authn/authz architecture, PDP/PEP contract, constraint semantics.
 - [GTS Specification](https://github.com/GlobalTypeSystem/gts-spec/blob/main/README.md) — specifically §2.2 (chain semantics), §3.3 (Query Language), §3.5 (wildcard access control), §3.7 (well-known vs anonymous instances).
 - `libs/toolkit-gts/src/permission.rs` — Rust definition of `AuthzPermissionV1`.
-- `libs/toolkit-gts-macro/` — proc-macros `#[gts_type_schema]`, `gts_instance!`, and `gts_instance_raw!` used to declare GTS Type Schemas and well-known Instances.
+- `libs/toolkit-gts-macros/` — proc-macros `#[gts_type_schema]`, `gts_instance!`, and `gts_instance_raw!` used to declare GTS Type Schemas and well-known Instances.
