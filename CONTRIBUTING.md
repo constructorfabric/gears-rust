@@ -28,7 +28,7 @@ git clone --recurse-submodules <repository-url>
 cd gears-rust
 
 # If you did not clone with --recurse-submodules
-# (includes Constructor Studio for PR reviews)
+# (the only submodule is guidelines/DNA, the shared coding guidelines)
 git submodule update --init --recursive
 
 # Build the whole-project example server release binary
@@ -181,7 +181,9 @@ file paths, line endings, file locking), run those tests on your branch before m
 Actions > macOS and Windows tests > Run workflow > pick your branch. If you can't run
 workflows in this repo, run it in your fork.
 
-Aim for high test coverage:
+Aim for high test coverage. Codecov requires 85% coverage on the lines a PR changes (`.codecov.yml`), and the local
+coverage report warns for any crate below 80% line coverage. See [Testing, Coverage and CI § 2](./docs/toolkit_unified_system/15_testing_and_ci.md#2-coverage).
+
 - **Unit tests**: Test individual functions and methods
 - **Integration tests**: Test gear interactions
 - **End-to-end tests**: Test complete request flows
@@ -370,7 +372,7 @@ Best practices:
 
 New functionality development:
 
-- Follow the repository structure in `README.md`
+- Follow the repository structure in [ARCHITECTURE_MANIFEST.md §6](./docs/ARCHITECTURE_MANIFEST.md#6-repository-structure) and the gear layout in [02_gear_layout_and_sdk_pattern.md](./docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md)
 - Prefer soft-deletion for entities; provide hard-deletion with retention routines
 - Include unit tests (and integration tests when relevant)
 
@@ -410,7 +412,7 @@ before requesting human review:
 cf-gears-pr-review PR <number>
 ```
 
-Use any supported IDE agent (Windsurf, Cursor, Claude, Copilot) — each redirects to the canonical workflows via `/cf-gears-pr-review` and `/cf-gears-pr-status` commands.
+Use any supported IDE agent (Windsurf, Cursor, Claude, Copilot) — each redirects to the canonical workflows via `/cf-gears-pr-review` and `/cf-gears-pr-status` commands. These command stubs are generated, gitignored files: they exist only after Constructor Studio (`cfs`) is installed and `cfs init` has run in the clone (`make cfs-validate`, part of `make check`, runs it).
 
 You can also check the PR status (unreplied comments, severity, etc.):
 
@@ -421,6 +423,8 @@ cf-gears-pr-status PR <number>
 See the results in `.prs/{ID}/` folder.
 
 See [docs/pr-review/README.md](./docs/pr-review/README.md) for full setup (GitHub CLI authentication, configuration, available review prompts) and usage details.
+
+For Rust code changes use `/toolkit-pr-review`, a Claude Code skill that checks the diff against Rust and ToolKit rules; see [docs/toolkit-pr-review/README.md](./docs/toolkit-pr-review/README.md). The Constructor Studio flow above covers spec documents (PRD, DESIGN, ADR) and PR status reports; [docs/pr-review/README.md](./docs/pr-review/README.md) compares the two.
 
 
 ## 3. Versioning
@@ -528,8 +532,10 @@ We use per-crate versioning, controlled via Cargo manifests and release automati
 - Internal crates can still follow SemVer for sanity, but do not promise external stability.
 
 ### Version sources
-- Gears and SDKs keep explicit `version = "..."` in their `Cargo.toml`.
-- ToolKit libs may use `version.workspace = true` (unified framework versioning).
+- Every publishable crate, ToolKit libraries included, keeps an explicit `version = "..."` in its `Cargo.toml`. The
+  root `[workspace.package]` has no `version`, and `version.workspace = true` is not used. A crate without a
+  `version` (several `gears/bss/**` crates today) is treated as unpublishable. See
+  [docs/RELEASING.md](./docs/RELEASING.md).
 
 ## ToolKit Unified Release Rule
 

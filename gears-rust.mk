@@ -405,7 +405,7 @@ md-fabric: py-env
 ## Build the slides with Marp
 slides:
 	$(call print_target_banner)
-	@command -v npx >/dev/null || (echo "npx is required to build slides. Install Node.js or run 'npm install' from the repo root." && exit 1)
+	@command -v npx >/dev/null || (echo "npx is required to build slides. Install Node.js; see docs/slides/README.md." && exit 1)
 	npx marp docs/slides/[0-9]*.md --theme-set docs/slides/css/slides.css --allow-local-files
 
 # Preview the documentation website with local docs/web-docs content.

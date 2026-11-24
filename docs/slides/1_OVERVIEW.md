@@ -191,7 +191,7 @@ developer machine.
 
 Deep, *built-in* integration with the typical XaaS backbone:
 
-- Multi-tenancy · permissions & roles· licensing & quota · usage collection
+- Multi-tenancy · permissions & roles · licensing & quota · usage collection
 
 Every backbone concern is a **regular, replaceable gear** with its own SDK:
 
@@ -217,7 +217,7 @@ Every backbone concern is a **regular, replaceable gear** with its own SDK:
 
 - **Spec-Driven Development** — PRD → Design & ADR → Feature *before* code
 - **Code validation** — custom architecture lints + Clippy + tests + fuzzing + audits in CI
-- **Quality First** — 90%+ coverage target across unit / integration / E2E / perf / security
+- **Quality First** — 80% line-coverage threshold (`docs/toolkit_unified_system/15_testing_and_ci.md`), 85% Codecov patch target; unit / integration / E2E / fuzz / security
 - **Core in Rust** — compile-time safety + deep static analysis
 - **Monorepo** — atomic refactors, consistent tooling, realistic local E2E
 
@@ -255,15 +255,15 @@ Constructor Gears is a **co-evolving platform**, not a loose collection of packa
 
 ---
 
-## Deployment shapes (FUTURE)
+## Deployment shapes
 
-Same gear code & API — three physical shapes via `runtime.type: local | oop`:
+Same gear code & API — three deployment profiles (ADR-0001); in-process vs. out-of-process is a per-gear `runtime.type: local | oop` setting:
 
-- **Single-node** — all gears in one process → edge, on-prem appliances, dev/test
-- **Multi-node** — gears across processes/machines over REST/gRPC, no orchestration → bare-metal on-prem
-- **Kubernetes** — containerized services, full orchestration, cloud-native ops
+- **Embedded** — all gears in one process → edge, on-prem appliances, dev/test
+- **Self-Hosted** — gears across processes/machines over REST/gRPC, no orchestration → bare-metal on-prem (single-node today; multi-node is P2)
+- **K8s Native** — containerized services, full orchestration, cloud-native ops
 
-> Develop locally single-node → deploy bare-metal → scale to K8s, no rewrites.
+> Develop locally embedded → deploy self-hosted → scale to K8s, no rewrites.
 
 ---
 
@@ -301,7 +301,7 @@ A Gear:
 - **Is discovered at link time** via `inventory`, initialized in dependency order
 - **Composes** through the typed `ClientHub` (in-proc) or gRPC SDKs (remote)
 - **Is extensible** via built-in or external plugins
-- **Published at crates.io** independently with it's own version
+- **Published at crates.io** independently with its own version
 
 ---
 
@@ -334,7 +334,7 @@ A Gear:
 
 The **logical model stays identical** regardless of the physical boundary.
 
-- **In-process (default)** — gears share one runtime; communicate via typed `ClientHub` clients; wired by Tookit
+- **In-process (default)** — gears share one runtime; communicate via typed `ClientHub` clients; wired by Toolkit
 - **Out-of-process** — gears as separate processes over **gRPC**
   - `HostRuntime` OoP orchestration hooks
   - `toolkit-transport-grpc` transport library
@@ -415,7 +415,7 @@ Gears Toolkit is the **central framework** that turns the gear architecture into
 
 ---
 
-## Tookit — features
+## Toolkit — features
 
 - **Inventory-based gear discovery** → dependency-ordered registry
 - **Lifecycle orchestration** (`HostRuntime` phases)
@@ -495,7 +495,7 @@ pub fn register_routes(
 - Gear code **never** parses tokens or resolves tenancy directly
 
 Gateway middleware order:
-`SetRequestId → Trace → Timeout → BodyLimit → CORS → MIME → RateLimit → ErrorMapping → Auth → ScopeEnforcement → License → Router`
+`SetRequestId → Trace → Timeout → BodyLimit → CORS → MIME → PreAuthThrottling → ErrorMapping → Auth → PlatformGate → ScopeEnforcement → PostAuthThrottling → License → Router`
 
 ---
 
@@ -573,7 +573,7 @@ One platform-wide error vocabulary, aligned with the **16 gRPC categories**:
 - `NotFound`, `AlreadyExists`, `PermissionDenied`, `InvalidArgument`, `Unauthenticated`, ... (16 total)
 - Each category: typed context + HTTP mapping + **stable GTS type identifier**
 - Rendered as **RFC-9457 `Problem`** documents over HTTP
-- Aligns REST · SDK boundaries · future gRPC · retry classification
+- Aligns REST · SDK boundaries · gRPC (`Problem` in the `x-toolkit-problem-bin` trailer) · retry classification
 
 > Foundation implemented (`libs/toolkit-canonical-errors`); repo-wide migration in progress.
 
@@ -583,7 +583,7 @@ One platform-wide error vocabulary, aligned with the **16 gRPC categories**:
 
 - **OpenTelemetry** tracing (`libs/toolkit/src/telemetry/`)
 - **API Gateway**: request IDs, tracing, timeout layers, body limits, structured access logs
-- **Health endpoints**: `/health` (detailed JSON) and `/healthz` (liveness)
+- **Health endpoints**: `/health` (detailed JSON), `/healthz` (liveness), `/readyz` (readiness)
 - **Governor-based rate limiting** with policy headers + inflight semaphores
 - CI workflows + test infrastructure aligned with operational quality
 
@@ -602,7 +602,7 @@ One platform-wide error vocabulary, aligned with the **16 gRPC categories**:
 - **OpenAPI auto-generated** from the same route declarations that run the service
 - **`GET /cf/docs`** live Swagger UI on the example server
 - **Architecture lints** enforce design rules and patterns at build time
-- **Rich docs**: `docs/toolkit_unified_system/` (13 topic files) + per-gear specs
+- **Rich docs**: `docs/toolkit_unified_system/` (16 topic files) + per-gear specs
 
 ---
 
@@ -665,10 +665,11 @@ make run GEAR=file-parser    # run server with only that gear feature set
 
 # Health checks
 curl http://127.0.0.1:8087/cf/health   # detailed JSON
+curl http://127.0.0.1:8087/cf/readyz   # readiness: 200 ready / 503 not ready
 curl http://127.0.0.1:8087/cf/healthz  # liveness "ok"
 ```
 
-Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `--mock`.
+Run modes: SQLite (`config/quickstart.yaml`) or no-DB (`config/no-db.yaml`).
 
 ---
 
@@ -676,18 +677,20 @@ Run modes: SQLite (`config/quickstart.yaml`), no-DB (`config/no-db.yaml`), or `-
 
 ```yaml
 server:   { home_dir: "~/.cf-gears" }
-database: { url: "sqlite://database/database.db", max_conns: 10 }
+database:
+  servers:
+    sqlite_users: { engine: "sqlite", pool: { max_conns: 5 } }
 gears:
-  api_gateway:
-    config: { bind_addr: "127.0.0.1:8087", enable_docs: true }
-  users_info:
+  api-gateway:
+    config: { bind_addr: "127.0.0.1:8087", enable_docs: true, prefix_path: "/cf" }
+  users-info:
     database: { server: "sqlite_users", file: "users_info.db" }
     config:   { default_page_size: 5, max_page_size: 100 }
 ```
 
 Build selects compiled-in gears by Cargo feature flags. YAML config supplies each compiled-in gear's `config` and optional gear-owned `database` settings.
 
-Env overrides with `APP__` prefix and `__` between levels, e.g. `APP__SERVER__PORT=8087`
+Env overrides with `APP__` prefix and `__` between levels, e.g. `APP__GEARS__API_GATEWAY__CONFIG__BIND_ADDR=0.0.0.0:8087` (`_` in a gear name maps to `-`)
 
 ---
 
@@ -721,15 +724,15 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 5. **DCO sign-off** — `git commit -s`
 6. **Conventional commits** — `feat(auth): ...`, `fix(ui): ...`
 7. **Open PR** → CI green + 1 maintainer approval + conversations resolved
-8. **Local AI review** — `cypilot review PR <number>`
+8. **Local AI review** — `/toolkit-pr-review local` (branch vs `main`) or `/toolkit-pr-review <PR_NUMBER>`
 
 ---
 
 ## Documentation map
 
-- **Architecture Manifest** — `docs/ARCHITECTURE_MANIFEST.md`defining characteristics
+- **Architecture Manifest** — `docs/ARCHITECTURE_MANIFEST.md` defining characteristics
 - **Gears inventory** — `docs/GEARS.md`
-- **Toolkit guide (13 topics)** — `docs/toolkit_unified_system/README.md`
+- **Toolkit guide (16 topics)** — `docs/toolkit_unified_system/README.md`
 - **Gear overview** — `docs/toolkit_unified_system/00_gear_overview.md`
 - **Authorization design** — `docs/arch/authorization/DESIGN.md`
 - **Security overview** — `docs/security/SECURITY.md`

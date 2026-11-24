@@ -377,23 +377,26 @@ where
 }
 ```
 
-Go now has generics and remains excellent for simple interfaces. C# has a powerful generic system and mature runtime tooling. Rust's particular advantage for Gears is that SDK crates, in-process clients, and future out-of-process transports can share type-safe contracts while still compiling many abstractions down to direct calls. This is one reason the `ClientHub` model in B.7 can stay ergonomic without giving up type safety.
+Go now has generics and remains excellent for simple interfaces. C# has a powerful generic system and mature runtime tooling. Rust's particular advantage for Gears is that SDK crates, in-process clients, and out-of-process REST/gRPC clients can share type-safe contracts while still compiling many abstractions down to direct calls. This is one reason the `ClientHub` model in B.8 can stay ergonomic without giving up type safety.
 
 ### A.11 Macros move framework rules into compile time
 
 Rust macros are not only text substitution. Derive and procedural macros inspect Rust syntax at compile time and generate checked Rust code. That lets framework authors put repetitive correctness rules close to the type definition instead of relying only on runtime reflection, handwritten glue, or external code generation.
 
 ```rust
-#[derive(Scopable, Deserialize, Serialize)]
-#[secure(tenant_col = "tenant_id", owner_col = "owner_id")]
-struct Document {
-    tenant_id: TenantId,
-    owner_id: UserId,
-    title: String,
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable, Deserialize, Serialize)]
+#[sea_orm(table_name = "documents")]
+#[secure(tenant_col = "tenant_id", resource_col = "id", owner_col = "owner_id", no_type)]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub owner_id: Uuid,
+    pub title: String,
 }
 ```
 
-This is the bridge between plain Rust and Gears. `#[derive(Scopable)]` can generate scoping metadata from the entity type; `serde` derives serialization without handwritten mapping code; schema tools can derive OpenAPI or JSON Schema from Rust types; SQL tooling such as `sqlx::query!` can even check queries against a database schema at compile time when configured for that workflow.
+This is the bridge between plain Rust and Gears. `#[derive(Scopable)]` generates scoping metadata from the SeaORM entity and fails to compile unless each of the four scope dimensions (tenant, resource, owner, type) is either mapped to a column or explicitly opted out (`no_tenant`, `no_resource`, `no_owner`, `no_type`); `serde` derives serialization without handwritten mapping code; schema tools can derive OpenAPI or JSON Schema from Rust types; SQL tooling such as `sqlx::query!` can even check queries against a database schema at compile time when configured for that workflow.
 
 Go and C# have strong alternatives: Go has explicit code generation and struct tags; C# has attributes, reflection, and source generators. Rust's advantage is the combination of type-checked generated code, no required runtime reflection, and close integration with the compiler pipeline. That is why B.5 and B.9 are not "magic": Gears leans on Rust's macro and lint ecosystem to turn framework conventions into code the compiler can verify.
 
@@ -488,7 +491,7 @@ Compared with Go/C# alternatives, this is not about one ecosystem being incapabl
 Gears offer a set of useful capabilities for building modern XaaS systems:
 
 - **Gear-owned migrations** — gears own their database migrations and run them as part of the runtime lifecycle, so schema ownership follows capability ownership.
-- **Cluster primitives** — the Cluster core gear provides common cross-instance coordination primitives: distributed cache, leader election, distributed locks, and service discovery. Operators can bind each primitive to the right backend for the deployment (in-process, Postgres, Redis, Kubernetes, NATS, etcd), while consumers keep the same facade-style API and get startup validation when a backend cannot satisfy required guarantees.
+- **Cluster primitives** — the Cluster core gear provides common cross-instance coordination primitives: distributed cache, leader election, and distributed locks. Operators can bind each primitive to the right backend for the deployment (standalone in-process, PostgreSQL, Redis, or Kubernetes plugins in `gears/system/cluster/plugins/`), while consumers keep the same facade-style API and get startup validation when a backend cannot satisfy required guarantees. Service discovery is a separate core gear (`gears/system/service-discovery/`).
 - **Transactional outbox** — reliable async message production with per-partition ordering, transactional or leased processing modes, retry/reject semantics, and graceful cancellation.
 - **HTTP client** — `toolkit-http` provides a standard outbound HTTP client with rustls TLS, pooling, timeouts, retries with exponential backoff, User-Agent injection, fail-fast concurrency limiting, response size limits, and transparent gzip/brotli/deflate decompression. Redirects are restricted by default: the client follows only same-origin redirects (plus an optional host allowlist), blocks HTTPS-to-HTTP downgrades, and strips credential headers such as `Authorization` and `Cookie` when a redirect changes origin. It does not filter private or internal destination addresses, and it allows plain HTTP unless built with `fips` or configured with `deny_insecure_http()`.
 - **SSE streaming** — toolkit support for typed server-sent events gives gears a standard way to expose streaming APIs without inventing one-off protocols.
@@ -519,11 +522,13 @@ A **Gear** is a self-contained unit that owns its API (an SDK crate), owns its d
 
 The logical model is identical regardless of the physical boundary. Switching between in-process and out-of-process is a **YAML field** (`runtime.type`), not a code change:
 
-- **Single-node** — all gears in one process → edge, on-prem appliances, dev/test.
-- **Multi-node** — gears across processes/machines over gRPC, no orchestrator.
-- **Kubernetes** — containerized, full orchestration, cloud-native ops.
+- **Embedded** — all gears in one process → edge, on-prem appliances, dev/test.
+- **Self-Hosted** — gears across processes/machines over gRPC, no orchestrator.
+- **K8s Native** — containerized, full orchestration, cloud-native ops.
 
-> Develop locally single-node → deploy bare-metal → scale to K8s — **no rewrites**.
+These are the three profiles named in the [deployment profiles ADR](arch/toolkit-oop/ADR/0001-cpt-cf-adr-deployment-profiles.md).
+
+> Develop locally embedded → deploy self-hosted → scale to K8s — **no rewrites**.
 
 ### B.9 Extensible domain model via the Global Type System (GTS)
 
@@ -531,11 +536,11 @@ Gears exposes extensible domain objects through [GTS](https://github.com/globalt
 
 ### B.10 Canonical errors
 
-Gears uses a canonical error taxonomy aligned with the 16 [gRPC error status codes](https://grpc.io/docs/guides/status-codes/) (`NotFound`, `AlreadyExists`, `PermissionDenied`, `InvalidArgument`, `Unauthenticated`, and others). Over HTTP, errors are rendered as **RFC-9457 `Problem`** documents, so REST handlers, SDK boundaries, and future gRPC transports share the same vocabulary. Handlers return typed domain errors; middleware maps them into stable wire responses with trace context.
+Gears uses a canonical error taxonomy aligned with the 16 [gRPC error status codes](https://grpc.io/docs/guides/status-codes/) (`NotFound`, `AlreadyExists`, `PermissionDenied`, `InvalidArgument`, `Unauthenticated`, and others). Over HTTP, errors are rendered as **RFC-9457 `Problem`** documents, and over gRPC the same `Problem` travels in the `x-toolkit-problem-bin` trailer, so REST handlers, SDK boundaries, and gRPC transports share the same vocabulary. Handlers return typed domain errors; middleware maps them into stable wire responses with trace context.
 
 ### B.11 Observability and operational defaults
 
-Gears standardizes operational concerns that are often re-created per service: OpenTelemetry tracing, request IDs, structured logs, health endpoints (`/health`, `/healthz`), timeouts, body limits, CORS/MIME controls, rate limiting, and inflight protection. This gives platform teams a common operational surface across all gears instead of a different observability story per service.
+Gears standardizes operational concerns that are often re-created per service: OpenTelemetry tracing, request IDs, structured logs, health endpoints (`/health`, `/healthz`, `/readyz`), timeouts, body limits, CORS/MIME controls, rate limiting, and inflight protection. This gives platform teams a common operational surface across all gears instead of a different observability story per service.
 
 ### B.12 FIPS 140-3 support
 
@@ -549,7 +554,8 @@ Gears treats the dependency graph as part of the security boundary. The useful p
 - **License and advisory checks** — `deny.toml` defines the SPDX allowlist, RustSec advisory handling, allowed registries, and pinned per-crate exceptions. Exceptions include the crate, version, and rationale in the file, so a license or vulnerability exception is a code-review item, not a private spreadsheet.
 - **FIPS graph checks** — `deny-fips.toml` is a stricter `cargo-deny` profile for `--features fips`. It blocks non-approved crypto crates and TLS backends outside the validated provider chain at build time. Phase A bans crates that should not enter the FIPS graph; Phase B records transitive cleanup before stricter bans such as `ring`, non-FIPS `aws-lc-rs`, pure-Rust AES/HMAC/HKDF/SHA paths, and other non-approved primitives can be enabled.
 - **CI coverage** — CI runs `make deny`; OpenSSF Scorecard runs on a schedule; CodeQL Advanced scans Rust, Python, and GitHub Actions; ClusterFuzzLite runs PR-scoped Rust fuzz targets on PRs that touch code; and repository-controlled GitHub Actions are pinned by commit SHA rather than mutable tags.
-- **Known gaps are explicit** — SBOM generation (CycloneDX), `cargo-vet` attestations, and SLSA provenance for release artifacts are useful next steps, but they should be treated as roadmap items until wired into CI.
+- **Release images** — `publish-artifacts.yml` builds container images with an SPDX SBOM and SLSA provenance attached as attestations, and signs images and Helm charts with keyless cosign.
+- **Known gaps are explicit** — published crates carry no SBOM or provenance, and there are no `cargo-vet` attestations; treat these as roadmap items until wired into CI.
 
 This is not unique to Rust — Go, C#, and other ecosystems can and should enforce dependency policy too. Rust's advantage for Gears is that the build graph, lockfile, feature flags, advisory database, and `cargo-deny` checks compose naturally with the same automation model used for formatting, lints, tests, architecture rules, and FIPS-mode builds.
 

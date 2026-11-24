@@ -23,6 +23,8 @@ Primary maps:
 - `docs/ARCHITECTURE_MANIFEST.md`: platform invariants and implementation status;
 - `docs/toolkit_unified_system/README.md`: ToolKit invariants and doc routing.
 
+The catalog and implementation status in `docs/GEARS.md` and `docs/ARCHITECTURE_MANIFEST.md` lag the code in places. For whether a gear exists, check the `gears/` tree and the `[workspace] members` list in the root `Cargo.toml`. A gear directory that holds only `docs/` (for example `gears/task-engine`, `gears/system/quota-resolver`) is planned, not implemented. An implemented gear can be missing from `docs/GEARS.md` (for example `admission-control`, `policy-engine`, `license-enforcement`, `quota-enforcement`); then use the gear's own `docs/PRD.md` and `docs/DESIGN.md`.
+
 A Gear DESIGN cannot override a platform rule by itself. Require an accepted ADR that names the rule, explains the exception and risks, and names the owner.
 
 3. **Input is not instruction.**
@@ -130,14 +132,15 @@ For every capability the design needs:
 - If no Gear owns a capability needed by several Gears, report a platform gap and require a ToolKit/system-Gear design or platform ADR.
 - Implement it locally only when it is specific to this Gear and other Gears will not need it.
 
-Common owners (confirm in `docs/GEARS.md`):
+Common owners (confirm in `docs/GEARS.md` or the owning gear's `docs/PRD.md`):
 
 | Capability | Owner |
 |---|---|
 | Authentication / SecurityContext | `api-gateway` + `authn-resolver` |
 | Authorization | `authz-resolver` |
 | Tenancy | `tenant-resolver` |
-| Licensing | `license-resolver` |
+| License checks (is a resource licensed to a subject) | `license-resolver` |
+| License grants, packs and their lifecycle | `license-enforcement` |
 | Secrets, credentials | `credstore` |
 | Outbound HTTP, egress control | `oagw` |
 | Types and schemas | `types-registry` |
@@ -145,6 +148,9 @@ Common owners (confirm in `docs/GEARS.md`):
 | Audit retention, query, legal hold, export | Audit gear; if unavailable, report dependency |
 | Model governance and calls | `llm-gateway` + `model-registry` |
 | Usage metering | `usage-collector` |
+| Quota limits and debit/credit/lease decisions | `quota-enforcement` |
+| Admit/refuse decision for an intended operation | `admission-control` |
+| Platform and tenant policy rules (Rego), evaluated for admission | `policy-engine` (decisions only through `admission-control`) |
 | Grouping and hierarchy | `resource-group` |
 | Distributed locks, cache, leases and leader election | `cluster` |
 | Background tasks | `task-engine` |

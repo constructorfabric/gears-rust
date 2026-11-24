@@ -5,6 +5,7 @@ This repository uses **release-plz** to automate:
 - changelog updates
 - crates.io publishing
 - GitHub releases
+- Docker images and Helm charts for released gears (via [`publish-artifacts.yml`](../.github/workflows/publish-artifacts.yml))
 
 ### How the flow works
 
@@ -13,8 +14,9 @@ This repository uses **release-plz** to automate:
 1. `release-plz release` publishes crates to crates.io and creates GitHub Releases. It
    only publishes versions that are in the manifests but **not yet on crates.io**, so on
    an ordinary push it finds nothing to do and exits. This is also what makes the pipeline
-   self-healing: if a publish is interrupted, the next push to `main` finishes it — no
-   manual intervention.
+   self-healing: the job retries a failed publish up to twice
+   ([`tools/scripts/release_retry.py`](../tools/scripts/release_retry.py)), and if it is
+   still interrupted, the next push to `main` finishes it — no manual intervention.
 2. `release-plz release-pr` opens or updates a **Release PR** with:
    - crate versions (per-crate, based on each crate's `Cargo.toml`)
    - the root [`CHANGELOG.md`](../CHANGELOG.md)
@@ -33,6 +35,19 @@ and it is why a release cannot be lost by a workflow being skipped or cancelled.
 
 Workflows:
 - Root workspace: [`.github/workflows/release-plz.yml`](../.github/workflows/release-plz.yml)
+- Images and charts: [`.github/workflows/publish-artifacts.yml`](../.github/workflows/publish-artifacts.yml)
+
+### Images and Helm charts
+
+After `release`, the `plan-publish` job maps release-plz's `releases` output to the
+released components listed in [`deploy/components.yaml`](../deploy/components.yaml)
+([`tools/scripts/resolve_release.py`](../tools/scripts/resolve_release.py) `plan`). The
+`publish` job then calls `publish-artifacts.yml` once per component, which builds and pushes
+the Docker image to GHCR (with SBOM and provenance attestations), packages and pushes the
+Helm chart, and signs both with keyless cosign. Released crates that are not in
+`deploy/components.yaml` get no image or chart. The `toolkit-platform` umbrella chart is not a
+crate and is published by running `publish-artifacts.yml` manually (`workflow_dispatch`).
+See [`deploy/README.md`](../deploy/README.md) for details.
 
 ### What gets published
 
@@ -45,11 +60,15 @@ no say in it:
 
 A crate that is not publishable is skipped by release-plz completely — no version bump,
 no tag, no changelog, no release. It therefore needs no entry in `release-plz.toml`, and
-adding one is dead config.
+adding one is dead config. The exception is a `publish = false` crate with `git_only = true`
+in `release-plz.toml` (`cf-gears-flight-control` and a few examples): release-plz versions
+and tags it from git without publishing to crates.io, so it appears in the `releases`
+output and gets its image and chart.
 
 This repo is configured so that:
-- `apps/**`, `examples/**` and `tools/**` are **not** publishable (we set `publish = false`)
-- `libs/**` and `gears/**` are publishable as intended
+- `apps/**`, `examples/**` and `tools/**` are **not** publishable to crates.io (we set `publish = false`)
+- `libs/**` and `gears/**` are publishable as intended, except crates that omit `version` (several `gears/bss/**`
+  crates today), which `make check-release-config` treats as unpublishable
 
 That first rule is enforced, not just documented: `make check-release-config` fails if a
 crate under those directories is publishable, and CI runs it on every build (see
@@ -139,8 +158,8 @@ What does verify a release:
   never runs is never satisfied.
 - The publish job runs on the pushed commit itself, so each crate is built from the source
   that landed on `main`. Not a byte-for-byte copy of it: cargo rewrites every manifest on
-  the way out, resolving workspace inheritance such as `version.workspace = true` into
-  concrete values.
+  the way out, resolving workspace inheritance such as `edition.workspace = true` or
+  `{ workspace = true }` dependencies into concrete values.
 - `cargo publish` compiles every crate, so a crate that does not build cannot be
   published. It builds lib and bin targets only — it runs no tests.
 
@@ -165,7 +184,7 @@ CI, so confirm the branch is green first. Running the workspace tests locally gi
 faster feedback than waiting for CI:
 
 ```bash
-cargo test --workspace --no-fail-fast --exclude cf-gears-toolkit-macros-tests --exclude cf-gears-toolkit-db-macros
+make test
 ```
 
 Fallback if CI is unavailable: publish locally from a clean checkout (you must have `CARGO_REGISTRY_TOKEN` set):

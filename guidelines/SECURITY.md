@@ -1,97 +1,57 @@
 # Security Guideline
 
-## Input Validation
+Short secure-coding rules for gear code. The full security model is in
+[docs/security/SECURITY.md](../docs/security/SECURITY.md); the AuthN, AuthZ and Secure ORM data path is in
+[06_authn_authz_secure_orm.md](../docs/toolkit_unified_system/06_authn_authz_secure_orm.md).
 
-```rust
-use validator::{Validate, ValidationError};
+## Input
 
-#[derive(Deserialize, Validate)]
-pub struct CreateUserRequest {
-    #[validate(length(min = 1, max = 100))]
-    pub name: String,
+1. Deserialize request input into typed DTOs through `toolkit::api::rest::extract::{Json, Path, Query}`, not axum's
+   built-in extractors. A failed extraction (oversized body, wrong `Content-Type`, schema mismatch) renders as an RFC 9457
+   problem (`400` for path and query, `413`/`415`/`422` for JSON bodies) instead of axum's plain-text rejection.
+2. Check business invariants in the domain layer and return `InvalidArgument` (HTTP `400`), as described in
+   [docs/arch/errors/DESIGN.md](../docs/arch/errors/DESIGN.md).
+3. Declare every route through `OperationBuilder` with `.authenticated()` (tenant bearer token),
+   `.platform_authenticated()` (internal platform token), or `.anonymous()` only for routes that are public by design. Authentication runs in the API Gateway middleware; handlers receive a ready `SecurityContext`.
 
-    #[validate(email)]
-    pub email: String,
+## Data access
 
-    #[validate(custom = "validate_password")]
-    pub password: String,
-}
+4. Obtain the `AccessScope` for resource access from `PolicyEnforcer` (`authz-resolver-sdk`), which compiles PDP
+   constraints into the scope. Do not build an `AccessScope` by hand in production code. Explicit scopes
+   (`AccessScope::for_tenant`, `for_tenants`, `for_resources`) are for repository tests; `AccessScope::allow_all()` is
+   allowed only in the prefetch step of the GET/UPDATE/DELETE patterns in the 06 doc, with its compensating checks.
+5. Treat every `EnforcerError` as a refusal and map it to a domain error. Do not expose PDP details to the client.
+6. Derive `Scopable` on every SeaORM entity and declare all four dimensions in `#[secure(...)]`: tenant, resource,
+   owner and type, each as `*_col = "..."` or `no_*`. Use `#[secure(unrestricted)]` only for global tables with no
+   scoping columns.
+7. Query through the secure builders (`.secure().scope_with(scope)`, from `toolkit_db::secure::SecureEntityExt`) on a
+   `DBRunner`. `clippy.toml` lists `sea_orm::Select::all`/`one`/`count`, `UpdateMany::exec` and `DeleteMany::exec` as
+   disallowed methods to catch bypasses.
+8. No raw SQL outside migrations.
 
-fn validate_password(password: &str) -> Result<(), ValidationError> {
-    if password.len() < 8 {
-        return Err(ValidationError::new("Password too short"));
-    }
-    Ok(())
-}
-```
+## Secrets
 
-## Secrets Management
+9. Never commit secrets. Store per-tenant and per-user credentials in the `credstore` gear (`CredStoreClientV1`).
+   Its `SecretValue` zeroizes on drop, redacts `Debug`/`Display` and does not implement `Serialize`.
+10. For secrets in gear configuration, write a `${VAR}` placeholder in YAML, mark the field `#[expand_vars]` on a
+    `#[derive(ExpandVars)]` config struct, and load it with `GearCtx::config_expanded`. Hold the value in
+    `secrecy::SecretString`, the only redacting type `#[expand_vars]` supports, or expand into a `String` and wrap it
+    afterwards.
+11. Never log secrets, tokens or credentials, including inside error messages.
 
-- **Never commit secrets** to version control
-- **Use environment variables** for configuration
-- **Rotate secrets regularly**
-- **Use secure random generation** for tokens
+## Code
 
-```rust
-// Bad: hardcoded secret
-const API_KEY: &str = "sk-1234567890abcdef";
-
-// Good: environment variable
-let api_key = std::env::var("API_KEY")
-    .context("API_KEY environment variable not set")?;
-```
-
-## Secure ORM
-
-Gears provide a secure-by-default ORM layer that enforces access control at compile time using the typestate pattern. This prevents unscoped database queries from executing and ensures tenant isolation.
-
-For secure ORM usage, see `docs/toolkit_unified_system/06_authn_authz_secure_orm.md`.
-
-### Key Features
-
-1. **Compile-time enforcement**: Cannot bypass scoping via type system
-2. **Deny-by-default**: Empty scopes explicitly denied with `WHERE 1=0`
-3. **Tenant isolation**: Automatic filtering when tenant_ids provided
-4. **Request-scoped**: Security context tied to request lifecycle
-5. **No SQL injection**: Uses SeaORM's parameterized queries
-6. **Audit trail**: Raw access logs security warnings
-
-### Quick Example
-
-```rust
-use toolkit_db::secure::SecureConn;
-use toolkit_security::SecurityContext;
-use toolkit_db_macros::Scopable;
-
-// Define a scopable entity
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
-#[sea_orm(table_name = "users")]
-#[secure(tenant_col = "tenant_id")]
-pub struct Model {
-    #[sea_orm(primary_key)]
-    pub id: Uuid,
-    pub tenant_id: Uuid,
-    pub email: String,
-}
-
-// Use in API handler
-pub async fn list_users_handler(
-    Extension(auth): Extension<AuthContext>,
-    Extension(db): Extension<DbHandle>,
-) -> Result<Json<Vec<User>>, Problem> {
-    // Create security context from request
-    let ctx = SecurityContext::for_tenants(vec![auth.tenant_id], auth.user_id);
-
-    // Get secure connection
-    let secure_conn = db.sea_secure();
-
-    // Query with automatic tenant isolation
-    let scope = toolkit_db::secure::AccessScope::for_tenant(ctx.subject_tenant_id());
-    let users = secure_conn
-        .find::<user::Entity>(&scope)
-        .all(&secure_conn)
-        .await?;
-
-    Ok(Json(users))
-}
-```
+12. No `unwrap()`/`expect()` outside tests: `clippy::unwrap_used` and `clippy::expect_used` are denied in the workspace.
+    `unsafe_code` is forbidden.
+13. New outbound HTTP code uses `toolkit_http::HttpClient`
+    ([ADR toolkit/0001](../docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md)), which carries the shared
+    timeout, retry, body-limit and redirect (SSRF) policies. Calls to third-party services are meant to go through the
+    `oagw` gear ([Security Overview §5](../docs/security/SECURITY.md#5-outbound-api-gateway-oagw)).
+14. TLS uses `rustls` with the `aws-lc-rs` provider. Do not enable a second provider such as `ring` (for example via a
+    crate's `*-rustls-ring` feature): two active providers make rustls 0.23 panic at runtime, as the TLS comments in the
+    root `Cargo.toml` explain. For FIPS builds (`--features fips`) see
+    [Security Overview §9](../docs/security/SECURITY.md#9-cryptographic-stack--fips-140-3).
+15. When you add or update dependencies, run `make security`: `cargo deny check` against `deny.toml` (advisories,
+    licenses, bans, sources) plus the FIPS ban check against `deny-fips.toml`. CI runs `make deny` in the `security`
+    job; the FIPS check is local only. Run `make dylint` (`cargo gears lint --dylint`) for the architecture lints,
+    which CI also runs.

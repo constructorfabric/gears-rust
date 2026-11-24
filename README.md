@@ -37,7 +37,7 @@ See also:
 **Engineering principles:**
 - **Spec-Driven Development**: [Specification templates](studio-kit-gears/artifacts/README.md) (PRD, Design, ADR, Feature) define what gets built *before* code is written. Every gear is well documented.
 - **Shift Left**: Custom architecture lints (via `cargo gears lint`) enforce design rules at compile time, alongside Clippy, [tests](#testing), fuzzing, and security audits in CI
-- **Quality First**: 90%+ test coverage target with unit, integration, E2E, performance, and security testing
+- **Quality First**: unit, integration, E2E, performance, and security testing; Codecov requires 85% coverage on changed lines, and the local coverage report flags crates below 80% (see [Testing, Coverage and CI § 2](docs/toolkit_unified_system/15_testing_and_ci.md#2-coverage))
 - **Core in Rust**: Compile-time safety, deep static analysis including project-specific lints, so more issues are prevented before review/runtime
 - **Monorepo**: All the core gears and contracts in one place for atomic refactors, consistent tooling/CI, and realistic local build + E2E testing
 
@@ -109,35 +109,43 @@ cargo run --bin cf-gears-example-server -- --config config/no-db.yaml run
 
 ### Example Configuration (config/quickstart.yaml)
 
-```yaml
-# Constructor Fabric Gears Configuration
+An excerpt of [config/quickstart.yaml](config/quickstart.yaml); see the file for the full set of gears and comments:
 
-# Core server configuration (global section)
+```yaml
 server:
   home_dir: "~/.cf-gears"
 
-# Database configuration (global section)
 database:
-  url: "sqlite://database/database.db"
-  max_conns: 10
-  busy_timeout_ms: 5000
+  servers:
+    sqlite_users:            # shared template that gears reference by name
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        synchronous: "NORMAL"
+        busy_timeout: "5000"
+      pool:
+        max_conns: 5
+        acquire_timeout: "30s"
 
-# Logging configuration (global section)
 logging:
   default:
     console_level: info
     file: "logs/cf-gears.log"
-    file_level: warn
-    max_age_days: 28
-    max_backups: 3
-    max_size_mb: 1000
+    file_level: info
 
-# Per-gear configurations moved under gears section
 gears:
-  api_gateway:
-    bind_addr: "127.0.0.1:8087"
-    enable_docs: true
-    cors_enabled: false
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8087"
+      enable_docs: true
+      cors_enabled: false
+      prefix_path: "/cf"
+      auth_disabled: true    # local development only
+  resource-group:
+    database:
+      server: "sqlite_users"
+      file: "resource_group.db"
+    config: {}
 ```
 
 ### Creating Your First Gear
@@ -169,62 +177,30 @@ See **[Security Overview §9 — Cryptographic Stack & FIPS-140-3](docs/security
 
 ### YAML Configuration Structure
 
-```yaml
-# config/server.yaml
+The top-level keys are fixed by `AppConfig` in `libs/toolkit/src/bootstrap/config/mod.rs`: `server`, `database`,
+`logging`, `opentelemetry`, `gears_dir`, `gears`, `vendor` and `oop_http`. Unknown keys are rejected
+(`deny_unknown_fields`).
 
-# Global server configuration
-server:
-  home_dir: "~/.cf-gears"
-
-# Database configuration
-database:
-  servers:
-    sqlite_users:
-      params:
-        WAL: "true"
-        synchronous: "NORMAL"
-        busy_timeout: "5000"
-      pool:
-        max_conns: 5
-        acquire_timeout: "30s"
-
-# Logging configuration
-logging:
-  default:
-    console_level: info
-    file: "logs/cf-gears.log"
-    file_level: warn
-    max_age_days: 28
-    max_backups: 3
-    max_size_mb: 1000
-
-# Per-gear configuration
-gears:
-  api_gateway:
-    config:
-      bind_addr: "127.0.0.1:8087"
-      enable_docs: true
-      cors_enabled: true
-  users_info:
-    database:
-      server: "sqlite_users"
-      file: "users_info.db"
-    config:
-      default_page_size: 5
-      max_page_size: 100
-```
+Each entry under `gears:` is keyed by the kebab-case gear name (`api-gateway`, `resource-group`) and may contain only
+`config` (the gear's own settings), `database`, `runtime`, `metadata` and `clients` (`GearConfig` in the same file).
+The example under [Quick Start](#example-configuration-configquickstartyaml) shows the common shape.
 
 ### Environment Variable Overrides
 
 Configuration supports environment variable overrides with the `APP__` prefix,
-using `__` to separate nesting levels:
+using `__` to separate nesting levels. Keys are case-insensitive. In the segment after `GEARS`, `_` maps to `-`, so
+`API_GATEWAY` addresses the `api-gateway` gear (`remap_gear_env_key`):
 
 ```bash
-export APP__SERVER__PORT=8087
-export APP__MODULES__api_gateway__CONFIG__BIND_ADDR="0.0.0.0:8080"
+export APP__SERVER__HOME_DIR="/var/lib/cf-gears"
+export APP__GEARS__API_GATEWAY__CONFIG__BIND_ADDR="0.0.0.0:8080"
 export APP__LOGGING__DEFAULT__CONSOLE_LEVEL="debug"
 export APP__OPENTELEMETRY__TRACING__ENABLED=true
 ```
+
+`${VAR}` placeholders in YAML are expanded from the environment in database `dsn`, `password` and `params`, and in gear
+`config` fields marked `#[expand_vars]` (see [guidelines/SECURITY.md](guidelines/SECURITY.md#secrets)). Use them to
+keep secrets out of config files.
 
 ## Testing
 

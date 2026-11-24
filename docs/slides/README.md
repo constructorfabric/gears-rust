@@ -4,29 +4,25 @@ This folder contains sources of presentation slides in markdown format (*.md) an
 
 ## Installing `marp`
 
-Marp CLI is declared in the repo root `package.json` as a dev dependency.
-Install it from the repository root:
-
-```sh
-npm install
-```
-
-That gives you a local `marp` binary via `npx` or `npm exec`.
-
-If you prefer a global install, use:
+The repository has no `package.json`. `make slides` runs `npx marp`, which uses the `marp`
+binary from Marp CLI, so install it globally first:
 
 ```sh
 npm install -g @marp-team/marp-cli
 ```
 
-## Build the overview deck
+## Build the decks
+
+Build every numbered deck (`docs/slides/[0-9]*.md`) into an `.html` file next to its source:
+
+```sh
+make slides
+```
+
+Or build one deck directly:
 
 ```sh
 npx marp docs/slides/1_OVERVIEW.md --theme-set docs/slides/css/slides.css --allow-local-files -o docs/slides/1_OVERVIEW.html
 ```
 
-Or run the convenience target:
-
-```sh
-make slides
-```
+Without a global install, replace `npx marp` with `npx @marp-team/marp-cli`.

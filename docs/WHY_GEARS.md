@@ -34,7 +34,7 @@ These points are **not steps in a sequence** — they depend on each other. Wher
 
 | # | Factor | What it gives you |
 |---|---|---|
-| 1 | XaaS DNA in every Gear | 200+ reusable OSS and BSS gears that package common patterns, built-in XaaS concerns, and a shared product-portfolio foundation |
+| 1 | XaaS DNA in every Gear | Reusable OSS and BSS gears (target catalog: 200+) that package common patterns, built-in XaaS concerns, and a shared product-portfolio foundation |
 | 2 | Composable capabilities | Single-process AI-friendly development, configurable deployment topology from one codebase, and infrastructure-agnostic deployment |
 | 3 | Multi-level logic customization | Product-level composition, third-party applications and integrations, and safe tenant/user customization |
 | 4 | Security & isolation | Compile-time-validated request processing, safe extension coexistence, and policy-driven access control |
@@ -44,7 +44,7 @@ These points are **not steps in a sequence** — they depend on each other. Wher
 
 ## 1. XaaS DNA in every Gear: proven patterns packaged for reuse
 
-> 200+ reusable OSS and BSS gears that allow you to build and run your product portfolio faster. Common XaaS patterns are delivered as specifications, decision guides, stable contracts, and reference implementations; tenancy, identity, security, policy, licensing, usage, billing, audit, and observability follow one coherent architecture.
+> Reusable OSS and BSS gears (target catalog: 200+) that allow you to build and run your product portfolio faster. Common XaaS patterns are delivered as specifications, decision guides, stable contracts, and reference implementations; tenancy, identity, security, policy, licensing, usage, billing, audit, and observability follow one coherent architecture.
 
 ### Overview
 
@@ -203,9 +203,9 @@ For local development, compatible gears compile into a single process and execut
 
 #### 2. Different deployments from one codebase
 
-Gears allow to have both different products and different deployments from one codebase by gears composition and defining needed deployment profiles: Embedded, Host + Workers, and Kubernetes Native. Embedded is the current default for local development. The distributed model has active foundations and documented gaps; full equivalence is still being completed.
+Gears allow to have both different products and different deployments from one codebase by gears composition and defining needed deployment profiles: Embedded, Self-Hosted, and K8s Native. Embedded is the current default for local development. The distributed model has active foundations and documented gaps; full equivalence is still being completed.
 
-Gears DSL called GDL (Gears Definition Language) makes composition explicit and validated. It declares:
+Gears DSL called GDL (Gears Description Language) makes composition explicit and validated. It declares:
 
 - gears, versions, dependencies, and capabilities;
 - how gears will be packaged into executable processes;
