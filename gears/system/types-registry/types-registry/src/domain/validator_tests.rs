@@ -51,11 +51,11 @@ fn the_wire_form_is_base64url_of_the_version_byte_and_the_digest() {
     let encoded = Validator::compute(3, Some(FINGERPRINT)).encode();
     // Computed outside this crate, so it pins the version byte, its place in the
     // hash, the digest order and the base64url form rather than echoing `encode`.
-    assert_eq!(encoded, "Anl11EJWAxpvuinixMx1Fm0");
+    assert_eq!(encoded, "A7KJwXjXF_-BvZDgKqCKHaY");
     let wire = URL_SAFE_NO_PAD.decode(&encoded).expect("base64url");
     assert_eq!(
         (wire[0], wire.len()),
-        (2, 17),
+        (3, 17),
         "a version byte, then a 128-bit digest"
     );
 }
@@ -77,7 +77,7 @@ fn a_token_decodes_back_to_its_validator() {
 fn every_digest_round_trips_through_the_wire_form() {
     let ascending: Vec<u8> = (0..16).collect();
     for digest in [[0_u8; 16].to_vec(), [0xff; 16].to_vec(), ascending] {
-        let wire = token(2, &digest);
+        let wire = token(3, &digest);
         let validator = Validator::decode(&wire).expect("a well-formed token");
         assert_eq!(validator.encode(), wire);
         assert_eq!(digest_of(validator), digest);
@@ -87,7 +87,15 @@ fn every_digest_round_trips_through_the_wire_form() {
 #[test]
 fn an_unknown_version_is_not_a_match() {
     let validator = Validator::compute(3, Some(FINGERPRINT));
-    assert_eq!(Validator::decode(&token(3, &digest_of(validator))), None);
+    assert_eq!(Validator::decode(&token(4, &digest_of(validator))), None);
+}
+
+/// A v2 snapshot predates the mandatory `ownership` field, so its holder gets the
+/// full entity rather than an unchanged answer.
+#[test]
+fn a_v2_token_is_not_a_match() {
+    let validator = Validator::compute(3, Some(FINGERPRINT));
+    assert_eq!(Validator::decode(&token(2, &digest_of(validator))), None);
 }
 
 /// v1 also digested the selected fields, so its tokens describe one projection only;

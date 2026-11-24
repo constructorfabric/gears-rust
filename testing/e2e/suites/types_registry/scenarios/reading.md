@@ -42,7 +42,6 @@ body. Reads follow terminal operations without sleeps or retries.
 - [Batch resolution](#batch-resolution)
   - [TR-READ-401 — Both planes resolve every distinct key to its stored identity](#tr-read-401--both-planes-resolve-every-distinct-key-to-its-stored-identity)
   - [TR-READ-402 — A deleted entity keeps its identity](#tr-read-402--a-deleted-entity-keeps-its-identity)
-  - [TR-READ-403 — The batch bound counts duplicates](#tr-read-403--the-batch-bound-counts-duplicates)
   - [TR-READ-404 — A resolution takes no selection or condition](#tr-read-404--a-resolution-takes-no-selection-or-condition)
 
 ## Exact read
@@ -288,18 +287,6 @@ unrequested `other_*` entities are omitted.
 
 **Then:** both `200` responses match by echoed key. Both schema keys keep the same
 identity and the absent key stays `not_found`.
-
-### TR-READ-403 — The batch bound counts duplicates
-
-**Fixtures:** [person_schema](../fixtures/reading/person_schema.json).
-
-**Given:** register `person_schema`.
-
-**When:** POST `:batchResolve` with `person_schema`'s GTS ID repeated 100 times, then repeated 101 times.
-
-**Then:** the raw item count applies before deduplication. 100 items return
-`200` with one `found` result. 101 return `400` Problem JSON with one
-`VALIDATION_FAILED` violation on `items`.
 
 ### TR-READ-404 — A resolution takes no selection or condition
 

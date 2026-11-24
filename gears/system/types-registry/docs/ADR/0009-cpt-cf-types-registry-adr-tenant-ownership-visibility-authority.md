@@ -22,7 +22,7 @@ decision-makers: Constructor Fabric Steering Committee
   - [Version-family ownership versus derivation](#version-family-ownership-versus-derivation)
   - [Identifier uniqueness and the disclosure boundary](#identifier-uniqueness-and-the-disclosure-boundary)
   - [A shared namespace is not a hole in tenant isolation](#a-shared-namespace-is-not-a-hole-in-tenant-isolation)
-  - [The contract exposes whether the caller owns an entity, not who does](#the-contract-exposes-whether-the-caller-owns-an-entity-not-who-does)
+  - [The contract exposes ownership relative to the Context Tenant, not the owner](#the-contract-exposes-ownership-relative-to-the-context-tenant-not-the-owner)
   - [Deletion blocked by an invisible dependent](#deletion-blocked-by-an-invisible-dependent)
   - [Ownership is immutable, and a mistake is repaired by purge](#ownership-is-immutable-and-a-mistake-is-repaired-by-purge)
   - [Authorization matrix](#authorization-matrix)
@@ -162,9 +162,9 @@ Per-tenant namespaces are incompatible with three existing decisions:
 * ADR-0001 deterministically derives one Registry Reference from one identifier. Including the tenant would destroy its portability;
 * a descendant deriving from an ancestor's contract requires both to share one namespace.
 
-### The contract exposes whether the caller owns an entity, not who does
+### The contract exposes ownership relative to the Context Tenant, not the owner
 
-Ownership is stored, asserted, and evaluated; it is not returned as a tenant identifier. A read result carries a boolean — the Context Tenant is the owner, or it is not — and no `owner_tenant_id`. On the platform plane, where there is no Context Tenant unless one is named, even the boolean is absent.
+Ownership is stored, asserted, and evaluated; it is not returned as a tenant identifier. A read result carries `ownership` — `global`, `context_tenant` (the Context Tenant owns it) or `ancestor_tenant` (an ancestor of the Context Tenant does) — and no `owner_tenant_id`. The Context Tenant is the subject's tenant unless another is named; visibility stays subject-based, while the label is relative to the Context Tenant. `ancestor_tenant` reveals that an ancestor owns the entity, never which one. The platform plane reads global entities only, so there it is always `global`.
 
 An owning tenant identifier is not exposed because:
 
@@ -174,9 +174,9 @@ An owning tenant identifier is not exposed because:
 
 The first reason is decisive: the value answers no question its holder can act on.
 
-The boolean is deliberately not named for authority. Owning an entity is necessary for managing it and not sufficient: `cpt-cf-types-registry-fr-registration-authority` also requires a grant covering the candidate identifier. A field called "manageable" would promise more than it knows. The composite question — may I change this — is answered by the caller from the boolean and the entity's origin, since no write path reaches an externally managed entity however its source assigns it.
+The value is deliberately not named for authority. Owning an entity is necessary for managing it and not sufficient: `cpt-cf-types-registry-fr-registration-authority` also requires a grant covering the candidate identifier. A field called "manageable" would promise more than it knows. The label describes the read context, not authority: whether the caller may change the entity is decided by its write grant and the ownership check at admission — no write path reaches an externally managed entity however its source assigns it — and a subject reading its own type for a named descendant sees `ancestor_tenant`.
 
-The **global versus tenant-owned** distinction is not exposed either; it was considered and rejected — see *Sub-choices within the selected option*, below.
+The **global versus tenant-owned** distinction is part of `ownership`; *Sub-choices within the selected option*, below, records why it was first left out and why it was added.
 
 A read may name a **Context Tenant**, the tenant scope root of an operation, which may differ from the subject's tenant. The two identities govern different checks:
 
@@ -226,20 +226,20 @@ Visibility never implies authority. The matrix below is the P1 baseline; concret
 | Register | Platform authority — a platform gear during startup registration, or a platform-plane maintenance job | Owning tenant, within its own scope |
 | Admit content revision | Platform authority | Owning tenant |
 | Delete | Platform authority | Owning tenant |
-| Exact resolve, batch resolve | Any tenant holding a read grant | Owner subtree only, holding a read grant |
-| Discovery, search, query assistance | Any tenant holding a list grant | Owner subtree only, holding a list grant |
+| Exact resolve, batch resolve | Any authenticated subject; no grant | Owner subtree only, holding a read grant |
+| Discovery, search, query assistance | Any authenticated subject; no grant | Owner subtree only, holding a list grant |
 | Derive a new type from it | Any tenant that can see it, where registration policy admits the candidate and a covering PDP grant authorizes it; the derived type is owned by the deriving tenant | Any tenant in the owner subtree, subject to the same policy and grant checks |
 | Publish a Version Successor | Platform authority | Owning tenant only, never a descendant |
 
-Every tenant-plane row requires a grant, the read rows included. What those rows state is which entities an authorized operation may reach, not that it needs no authorization: `read` and `list` are actions of their own, and the visible set is the ceiling a grant is intersected with rather than a substitute for one. A release ships baseline read grants, so the default audience of a contract remains its visible subtree; what the two actions add is the ability to narrow that audience per subject — closing the catalogue to a third-party token, or to a role restricted inside its own tenant — which visibility cannot express, being a property of the tenant rather than of the subject. P1 narrows per subject only; a read grant carries no region, unlike a write grant.
+Every tenant-plane write row requires a grant, and so does reading a tenant-owned entity. Global entities are platform contracts every authenticated subject reads; no grant closes them. For tenant-owned entities `read` and `list` are actions of their own, and the visible set is the ceiling a grant is intersected with rather than a substitute for one. A release ships baseline read grants, so the default audience of a tenant's contract remains its visible subtree; what the two actions add is the ability to narrow that audience per subject — closing a tenant's own catalogue to a third-party token, or to a role restricted inside its own tenant — which visibility cannot express, being a property of the tenant rather than of the subject. A read grant carries no region, unlike a write grant.
 
 **The platform plane has no human actor.** Gears and maintenance jobs authenticate as workloads. A person may trigger a job but never holds a platform-plane credential.
 
-The Register row therefore names gears and jobs, not a role. Introducing a platform equivalent of Tenant Administrator would expose a human credential able to author global contracts and read every tenant. ADR-0013's deliberate purge act is the decision to run the job, not a person calling an endpoint.
+The Register row therefore names gears and jobs, not a role. Introducing a platform equivalent of Tenant Administrator would expose a human credential able to author global contracts and reach every tenant through operator flows. ADR-0013's deliberate purge act is the decision to run the job, not a person calling an endpoint.
 
 Two further properties of the plane follow from the matrix rather than being added to it.
 
-**The platform plane reads across every tenant without visibility filtering.** With no requesting tenant, the descendant relation has no left-hand side. The tenant PDP is not substituted for it.
+**The platform plane reads global entities only.** With no requesting tenant, the descendant relation has no left-hand side, so a workload has no tenant to see tenant-owned entities through. Work on a tenant's data — validating a payload against a type that tenant defined — runs under that tenant's service account on the tenant plane, where visibility, the PDP and per-subject caching apply. The tenant PDP is not substituted on this plane.
 
 Under `cpt-cf-adr-two-plane-auth`:
 
@@ -247,9 +247,9 @@ Under `cpt-cf-adr-two-plane-auth`:
 * the authenticated workload identity authorizes a platform handler;
 * any narrowing is workload policy, not a subject grant.
 
-The matrix above is therefore tenant-plane policy; the platform plane authorizes the plane itself. This is required for ADR-0013 purge reports grouped by owner and for enumerating dependents invisible to a deleting tenant.
+The matrix above is therefore tenant-plane policy; the platform plane authorizes the plane itself. Cross-tenant access remains only in dedicated operator flows: ADR-0013 purge reports grouped by owner, and a platform-plane Dry Run deletion enumerating dependents invisible to a deleting tenant.
 
-Tenant non-disclosure does not apply on this plane, but ownership disclosure still does not widen. Entity reads expose no owner tenant on either plane; purge names owners only in its job-specific report.
+Tenant non-disclosure does not apply to the operator flows above, but ownership disclosure still does not widen. Ordinary platform reads see global entities only, entity reads expose no owner tenant on either plane, and purge names owners only in its job-specific report.
 
 **It cannot create a tenant-owned entity.** Ownership is derived from the requesting context and is never request data; a platform-plane request has no tenant context, so there is nothing an owner could be derived from. This is a consequence of the rule rather than a separate prohibition, and it leaves purge as the only cross-tenant mutation — destructive maintenance under an operator rather than authoring.
 
@@ -268,7 +268,7 @@ Three rules depend on ownership never being request data:
 "Within its own scope" in the Register row bounds the *ownership* of the result, not the region of the namespace a tenant may name. Those are different limits, and leaving the second unstated would make the global identifier namespace first-come-first-served: a tenant could occupy `gts.<other-vendor>.<package>...` merely by registering it before that vendor did. Authority over a region of the namespace is therefore a **grant**, evaluated by the platform PDP against the candidate's canonical GTS Identifier, and specified by `cpt-cf-types-registry-fr-registration-authority`. Two consequences belong here because they interact with this ADR's own rules:
 
 * the grant check **precedes** the identifier-availability check. This ADR deliberately permits a registration conflict to disclose that a name is unavailable; evaluating availability first would extend that disclosure to callers with no authority to register there at all, turning a bounded leak into an enumeration primitive. An unauthorized caller receives one response whether the identifier is free, held by a visible entity, held by an invisible one, or held by a tombstone or a Source Claim reservation;
-* a grant authorizes an operation and never widens what that operation may see. Reading is authorized as its own action, so a caller needs a read grant — gear-wide in P1, where only write grants carry a region — while visibility remains the directed descendant relation above: the grant decides whether the operation runs, the relation bounds what it may return, and neither substitutes for the other. A subject may therefore hold a write grant over a region it cannot fully see, see contracts it holds no grant to modify, and be refused a catalogue it can see. This is the same separation the matrix already asserts, applied to the namespace rather than to the individual entity;
+* a grant authorizes an operation and never widens what that operation may see. Global entities need no read grant; reading a tenant-owned entity is authorized as its own action — a read grant carries no region, unlike a write grant — while visibility remains the directed descendant relation above: the grant may narrow which tenant-owned entities a read returns by ownership constraints, the relation bounds what it may return, and neither substitutes for the other. A subject may therefore hold a write grant over a region it cannot fully see, see contracts it holds no grant to modify, and be kept from tenant-owned contracts it can see. This is the same separation the matrix already asserts, applied to the namespace rather than to the individual entity;
 * **a grant creates an entity only where registration policy already admits the candidate,** and what it admits is configuration rather than a constant. `cpt-cf-types-registry-fr-registration-policy` decides per GTS Identifier Region whether candidates there may be tenant-owned and which vendors they may name, both closed by default, and it is evaluated from the candidate's identifier and plane before the PDP is consulted. This is a bound on what a grant can reach rather than a grant of its own, so the two never disagree: a region the policy closes cannot be opened by any grant, and a grant is never asked about a candidate the policy has already refused. The bound applies where ownership comes into being — a candidate creating a new logical entity — not to a revision or deletion of one already admitted, so closing a region stops the next entity rather than freezing what it admitted. Withdrawing ongoing write authority stays the grant's job, the revocable half of the pair.
 
   The bound exists because of §*Ownership is immutable, and a mistake is repaired by purge*. The requested owner must equal the family's stored owner, so revision cannot repair a platform contract admitted as tenant-owned. Repair requires delete and ADR-0013 purge, the destructive operation guarded by deployment policy.
@@ -280,7 +280,7 @@ Three rules depend on ownership never being request data:
 ### Consequences
 
 * Ownership scope is a stored, indexed property of every Managed Entity, and every read path filters on the directed descendant relation. The tenant hierarchy therefore becomes a read-path dependency of Types Registry, not only of authorization.
-* Reads acquire a policy dependency alongside the hierarchy one: an unreachable PDP fails a read closed exactly as it fails a registration. The cost is that a deployment must ship the baseline read grants with the release, because a tenant subject holding none cannot resolve even a platform contract.
+* Tenant-plane reads acquire a policy dependency alongside the hierarchy one: an unreachable PDP fails such a read closed, even one that would return only global entries, exactly as it fails a registration; a completed deny or empty scope only empties the tenant-owned part. A deployment ships baseline read grants so a subject sees its visible tenant-owned contracts by default; a subject holding none still reads every global contract.
 * The family record introduced by ADR-0008 carries the family's ownership scope, so the successor-ownership rule is a lookup and a constraint rather than a convention.
 * The GTS namespace is closed to tenant ownership and to cross-vendor naming until a region is opened, so onboarding a vendor is a deliberate configuration act rather than a consequence of that vendor's first registration. The cost is that a deployment must declare a region before the vendors it serves can register in it, and a missing declaration surfaces as a refused registration.
 * A platform contract is extensible per region rather than uniformly. Two deployments of the same release can differ in which of the platform's own types third parties may derive from, which is deliberate — it is the XaaS operator's decision — and it means a derived type admitted in one deployment may be refused in another.
@@ -301,13 +301,13 @@ This decision is confirmed when:
 * a global entity is visible to every tenant and modifiable by none of them;
 * registering an identifier held by an entity invisible to the caller returns the same conflict response as one held by a visible entity, and neither reveals owner, scope, content, or status;
 * reverse resolution of a Registry Reference for an out-of-scope entity is indistinguishable from reverse resolution of an unissued reference, a batch read reports it `not_found` exactly as it reports an identifier that was never registered, and a discovery page omits it;
-* no tenant-plane read result carries an owning tenant identifier, and a tenant caller can determine only whether the entity is its own; discovery accepts a scope selector and rejects a supplied tenant identifier;
-* a platform-plane read returns entities owned by every tenant, without disclosing which tenant owns any of them, evaluates a Tenant Availability verdict only when a Context Tenant is named explicitly, and cannot create a tenant-owned entity under any grant;
+* no tenant-plane read result carries an owning tenant identifier, and a tenant caller learns only whether the entity is `global`, `context_tenant` (its Context Tenant's) or `ancestor_tenant` (an ancestor's); discovery accepts a scope selector and rejects a supplied tenant identifier;
+* a platform-plane read returns global entities only, evaluates a Tenant Availability verdict only when a Context Tenant is named explicitly, and cannot create a tenant-owned entity under any grant;
 * an externally managed entity is visible to the subtree of the tenant its source names, a plugin response omitting the ownership assertion or naming an unknown tenant is rejected as an invalid source response, and the assertion grants no write authority because no write path to an external entity exists;
 * deletion blocked by a dependent invisible to the caller reports a count and no identifying information, and a platform-authority path can enumerate the dependents;
 * the owner of an entity admitted on the tenant plane equals the requesting tenant of its `SecurityContext`, and a request body carrying an owner is rejected rather than honoured;
 * no operation changes the ownership scope of an admitted entity, and a mis-assigned owner is repaired only by delete, purge, and re-registration;
-* a caller holding no read grant is refused, indistinguishably for a free, visible, invisible, or reserved identifier, and a caller holding one receives exactly its subject tenant's visible set — naming a descendant as Context Tenant changes the availability verdict and never the visible set;
+* a caller holding no read grant receives global entities only, a tenant-owned key answering exactly as a free, invisible or reserved identifier does; a caller holding the baseline grant receives exactly its subject tenant's visible set, and a restricted grant narrows only the tenant-owned part, global entries staying in the result — naming a descendant as Context Tenant changes the availability verdict and never the visible set;
 * every row of the authorization matrix is covered by a test that also asserts the negative case;
 * a tenant holding a grant over one vendor prefix can register inside it and is refused outside it, and a tenant-plane request cannot create a global entity under any grant;
 * an unauthorized caller cannot distinguish a free identifier from one held by a visible entity, an invisible entity, a tombstone, or a Source Claim reservation, proving the grant check runs before the availability check.
@@ -357,7 +357,7 @@ A **property in the authored GTS document** — the registrant marking its own t
 
 Widening the prefix would also cover vendor derivations beneath platform base types, closing the extension path this ADR preserves. A closed-default per-region table expresses both cases. The platform vendor identity remains one build-time value rather than a literal repeated at each check.
 
-The **global versus tenant-owned** distinction is not exposed either. It was considered: it discloses nothing about the hierarchy and would let a management view group a catalogue into platform contracts, inherited contracts, and one's own. It is left out because no requirement or actor names that grouping, and the discovery filter is narrowed to match rather than left able to select a bucket the response cannot explain. Adding both back later is additive.
+The **global versus tenant-owned** distinction was first left out: no requirement or actor named the grouping of a catalogue into platform contracts, ancestor tenants' contracts and the Context Tenant's own. It is now exposed as `ownership` — `global`, `context_tenant` or `ancestor_tenant` — because the client cache needs it: global entities are readable by every authenticated subject, so a client cache serves a fresh global snapshot to every reader. It discloses nothing about the hierarchy beyond what visibility already implies, and never an owner identifier.
 
 ## More Information
 

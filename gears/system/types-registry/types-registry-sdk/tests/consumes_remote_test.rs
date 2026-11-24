@@ -106,6 +106,7 @@ async fn stub_registry() -> (String, Arc<Mutex<Vec<Received>>>) {
         "gts_uuid": STUB_UUID,
         "kind": "type_schema",
         "lifecycle_status": "active",
+        "ownership": "global",
     });
     let page = json!({"items": [entity], "page_info": {}}).to_string();
     entity["content"] = json!({"title": "from batchGet"});

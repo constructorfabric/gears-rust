@@ -14,12 +14,13 @@ use uuid::Uuid;
 
 use super::identity::Identities;
 use crate::models::{
-    Entity, EntityField, EntityIdentity, EntityKey, FieldSelection, JsonDocument, Validator,
+    Entity, EntityField, EntityIdentity, EntityKey, FieldSelection, JsonDocument, Ownership,
+    Validator,
 };
 
 /// Who a tenant read is answered for: the subject, its type, home tenant and token
-/// scopes. The registry may authorize each entity per subject, so a positive answer
-/// to one read context proves nothing to another.
+/// scopes. From P1 the registry scopes reads per subject by ownership constraints, so a
+/// positive answer to one read context proves nothing to another.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReadContext {
     subject: Uuid,
@@ -153,6 +154,7 @@ pub fn weight(snapshot: &Entity) -> Weight {
         gts_uuid: _,
         kind: _,
         lifecycle_status: _,
+        ownership: _,
         origin: _,
         content,
         resolved_schema,
@@ -184,6 +186,7 @@ pub fn project(snapshot: &Entity, selection: &FieldSelection) -> Entity {
         gts_uuid: snapshot.gts_uuid,
         kind: snapshot.kind,
         lifecycle_status: snapshot.lifecycle_status,
+        ownership: snapshot.ownership,
         origin: snapshot.origin.filter(|_| keep(EntityField::Origin)),
         content: kept(snapshot.content.as_ref(), keep(EntityField::Content)),
         resolved_schema: kept(
@@ -219,6 +222,7 @@ pub fn merge(mut fresh: Entity, selection: &FieldSelection, resident: &Entity) -
         gts_uuid: _,
         kind: _,
         lifecycle_status: _,
+        ownership: _,
         origin,
         content,
         resolved_schema,
@@ -325,6 +329,16 @@ pub struct Ticket {
     seen: u64,
 }
 
+impl Ticket {
+    /// The pair the read named when it started, if one was known.
+    pub fn pair(&self) -> Option<(&GtsId, Uuid)> {
+        match &self.spelling {
+            Spelling::Pair(gts_id, gts_uuid) => Some((gts_id, *gts_uuid)),
+            Spelling::Key(_) => None,
+        }
+    }
+}
+
 /// Snapshot LRU with per-key read tickets. Registry-issued pairs index resident
 /// snapshots and let either key fence in-flight reads.
 pub struct Store {
@@ -394,6 +408,55 @@ impl Store {
     /// Limit confirmations independently of the number of readers and entities.
     pub fn track_visibility(&mut self) {
         self.confirmations = NonZeroUsize::new(self.max_entries).map(LruCache::sparse);
+    }
+
+    /// Whether the entity `gts_uuid` names is known to be global: from its resident
+    /// snapshot, or from what an entity-carrying reply said of its remembered pair.
+    pub fn known_global(&self, gts_uuid: Uuid) -> bool {
+        self.entries.peek(&gts_uuid).map_or_else(
+            || self.identities.is_global(gts_uuid) == Some(true),
+            |entry| entry.snapshot.ownership == Ownership::Global,
+        )
+    }
+
+    /// The remembered pair `key` names, without promoting it.
+    pub fn remembered_pair(&self, key: &EntityKey) -> Option<(GtsId, Uuid)> {
+        let uuid = self.identities.peek_uuid(key)?;
+        Some((self.identities.peek_id(uuid)?.clone(), uuid))
+    }
+
+    /// Whether `key` names an entity known to be global.
+    pub fn key_known_global(&self, key: &EntityKey) -> bool {
+        self.reference(key)
+            .is_some_and(|uuid| self.known_global(uuid))
+    }
+
+    /// Whether a reply saying the entity `gts_uuid` is `global` (or not) contradicts
+    /// what its resident snapshot or remembered pair already says.
+    pub fn class_conflict(&self, gts_uuid: Uuid, global: bool) -> bool {
+        self.entries
+            .peek(&gts_uuid)
+            .is_some_and(|entry| (entry.snapshot.ownership == Ownership::Global) != global)
+            || self
+                .identities
+                .is_global(gts_uuid)
+                .is_some_and(|known| known != global)
+    }
+
+    /// The pair `key` names if it is known to be global: any authenticated reader may
+    /// see a global entity.
+    pub fn resolvable_global(&mut self, key: &EntityKey) -> Option<EntityIdentity> {
+        let uuid = self.reference(key)?;
+        if !self.known_global(uuid) {
+            return None;
+        }
+        if let Some(entry) = self.entries.get(&uuid) {
+            return Some(EntityIdentity {
+                gts_id: entry.snapshot.gts_id.clone(),
+                gts_uuid: entry.snapshot.gts_uuid,
+            });
+        }
+        self.identities.get(&EntityKey::GtsUuid(uuid))
     }
 
     /// The Registry Reference `key` names, from a resident snapshot or a remembered
@@ -503,10 +566,11 @@ impl Store {
         let Some(uuid) = self.resident(key) else {
             return;
         };
+        // A global entity is served by its class alone; its own proof would only take a slot.
         let Some(version) = self
             .entries
             .peek(&uuid)
-            .filter(|entry| entry.etag == *etag)
+            .filter(|entry| entry.etag == *etag && entry.snapshot.ownership != Ownership::Global)
             .and_then(|entry| entry.confirmed_version.clone())
         else {
             return;
@@ -525,6 +589,9 @@ impl Store {
     /// Record that a resolution started at `read_at` showed `context` the
     /// remembered pair for `gts_uuid`. Leaves any read proof as it is.
     pub fn confirm_resolved(&mut self, gts_uuid: Uuid, context: &ReadContext, read_at: Instant) {
+        if self.known_global(gts_uuid) {
+            return;
+        }
         let Some(incarnation) = self.identities.incarnation(gts_uuid).cloned() else {
             return;
         };
@@ -611,8 +678,12 @@ impl Store {
             self.peek(key)
                 .map(|entry| (&entry.snapshot.gts_id, entry.snapshot.gts_uuid))
         };
-        match stated.or_else(resident) {
-            Some((gts_id, gts_uuid)) => Spelling::Pair(gts_id.clone(), gts_uuid),
+        if let Some((gts_id, gts_uuid)) = stated.or_else(resident) {
+            return Spelling::Pair(gts_id.clone(), gts_uuid);
+        }
+        // A remembered pair names both keys even with no snapshot resident.
+        match self.remembered_pair(key) {
+            Some((gts_id, gts_uuid)) => Spelling::Pair(gts_id, gts_uuid),
             None => Spelling::Key(key.clone()),
         }
     }

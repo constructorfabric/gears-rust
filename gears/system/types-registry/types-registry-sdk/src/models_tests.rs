@@ -162,6 +162,7 @@ mod narrowed {
             gts_uuid: Uuid::from_u128(7),
             kind,
             lifecycle_status: LifecycleStatus::Active,
+            ownership: crate::models::Ownership::Global,
             origin: None,
             content: Some(json!({ "n": 1 })),
             resolved_schema: None,
@@ -216,6 +217,27 @@ mod narrowed {
         );
         assert_eq!(instance.type_id, GtsTypeId::try_new(TYPE).expect("valid"));
         assert_eq!(instance.content, Some(json!({ "n": 1 })));
+    }
+
+    /// Both typed views keep the mandatory `ownership` rather than defaulting it.
+    #[test]
+    fn typed_views_keep_the_ownership() {
+        use crate::models::Ownership;
+        let ownership = Ownership::AncestorTenant;
+        let mut schema = snapshot(TYPE, EntityKind::TypeSchema);
+        schema.ownership = ownership;
+        let mut instance = snapshot(INSTANCE, EntityKind::Instance);
+        instance.ownership = ownership;
+        assert_eq!(
+            TypeSchema::try_from(schema)
+                .expect("a Type Schema")
+                .ownership,
+            ownership
+        );
+        assert_eq!(
+            Instance::try_from(instance).expect("an Instance").ownership,
+            ownership
+        );
     }
 
     #[test]
@@ -536,6 +558,7 @@ mod conditions {
             gts_uuid,
             kind,
             lifecycle_status: LifecycleStatus::Active,
+            ownership: crate::models::Ownership::Global,
             origin: None,
             content: Some(json!({ "n": 1 })),
             resolved_schema: None,

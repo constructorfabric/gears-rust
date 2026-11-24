@@ -16,12 +16,13 @@ pub enum EntityField {
     Kind,
     LifecycleStatus,
     Origin,
+    Ownership,
     Provenance,
     ResolvedSchema,
 }
 
 impl EntityField {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Content,
         Self::EffectiveTraits,
         Self::EffectiveTraitsSchema,
@@ -30,6 +31,7 @@ impl EntityField {
         Self::Kind,
         Self::LifecycleStatus,
         Self::Origin,
+        Self::Ownership,
         Self::Provenance,
         Self::ResolvedSchema,
     ];
@@ -45,6 +47,7 @@ impl EntityField {
             Self::Kind => "kind",
             Self::LifecycleStatus => "lifecycle_status",
             Self::Origin => "origin",
+            Self::Ownership => "ownership",
             Self::Provenance => "provenance",
             Self::ResolvedSchema => "resolved_schema",
         }
@@ -73,7 +76,7 @@ impl EntityField {
 
 /// DESIGN §3.3 fields that P0 cannot answer without tenancy, so it neither
 /// advertises nor synthesizes them.
-const UNAVAILABLE: [&str; 2] = ["availability", "owned_by_context_tenant"];
+const UNAVAILABLE: [&str; 1] = ["availability"];
 
 /// A bitset, so equality is identity. [`FieldSelection::MANDATORY_FIELDS`] are
 /// always members: naming one must not change a cursor or validator.
@@ -89,20 +92,22 @@ impl Default for FieldSelection {
 }
 
 impl FieldSelection {
-    /// Identity, kind and lifecycle: on every entity whatever `$select` names.
-    pub const MANDATORY_FIELDS: [EntityField; 4] = [
+    /// Identity, kind, lifecycle and ownership: on every entity whatever `$select` names.
+    pub const MANDATORY_FIELDS: [EntityField; 5] = [
         EntityField::GtsId,
         EntityField::GtsUuid,
         EntityField::Kind,
         EntityField::LifecycleStatus,
+        EntityField::Ownership,
     ];
 
-    pub const DEFAULT_FIELDS: [EntityField; 5] = [
+    pub const DEFAULT_FIELDS: [EntityField; 6] = [
         EntityField::GtsId,
         EntityField::GtsUuid,
         EntityField::Kind,
         EntityField::Origin,
         EntityField::LifecycleStatus,
+        EntityField::Ownership,
     ];
 
     #[must_use]

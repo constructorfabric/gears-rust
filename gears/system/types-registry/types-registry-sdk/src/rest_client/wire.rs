@@ -20,8 +20,8 @@ use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, Cursor, DeleteEntitiesRequest,
     DeletionItemResult, DeletionOperation, DeletionOutcome, Entity, EntityField, EntityIdentity,
     EntityKey, EntityKind, EntityLookup, JsonDocument, LifecycleFilter, LifecycleStatus,
-    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Projection,
-    Provenance, RegisterEntitiesRequest, RegistrationItemResult, RegistrationOperation,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Ownership,
+    Projection, Provenance, RegisterEntitiesRequest, RegistrationItemResult, RegistrationOperation,
     RegistrationOutcome, Validator,
 };
 
@@ -345,6 +345,25 @@ enum LifecycleStatusWire {
     Deleted,
 }
 
+/// Every entity carries it; an unknown value is refused, not guessed.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OwnershipWire {
+    Global,
+    ContextTenant,
+    AncestorTenant,
+}
+
+impl From<OwnershipWire> for Ownership {
+    fn from(ownership: OwnershipWire) -> Self {
+        match ownership {
+            OwnershipWire::Global => Self::Global,
+            OwnershipWire::ContextTenant => Self::ContextTenant,
+            OwnershipWire::AncestorTenant => Self::AncestorTenant,
+        }
+    }
+}
+
 impl From<LifecycleStatusWire> for LifecycleStatus {
     fn from(status: LifecycleStatusWire) -> Self {
         match status {
@@ -579,6 +598,7 @@ pub struct EntityWire {
     gts_uuid: Uuid,
     kind: EntityKindWire,
     lifecycle_status: LifecycleStatusWire,
+    ownership: OwnershipWire,
     #[serde(default)]
     origin: Option<OriginWire>,
     #[serde(default, deserialize_with = "present")]
@@ -618,6 +638,7 @@ impl EntityWire {
             gts_uuid: self.gts_uuid,
             kind: self.kind.into(),
             lifecycle_status: self.lifecycle_status.into(),
+            ownership: self.ownership.into(),
             origin: self.origin.map(|origin| match origin {
                 OriginWire::Managed {
                     resource_version,

@@ -26,7 +26,7 @@ pub use crate::domain::admission::{DeleteRequest, DeleteTarget};
 use crate::domain::caller::CallerContext;
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
-    OperationStatus,
+    OperationStatus, Ownership, OwnershipScope,
 };
 pub use crate::domain::key::{EntityKey, MAX_KEY_LEN};
 use crate::domain::policy::RegistrationPolicy;
@@ -72,6 +72,7 @@ pub struct EntityRecord {
     pub kind: EntityKind,
     pub origin: Option<ManagedOrigin>,
     pub lifecycle_status: LifecycleStatus,
+    pub ownership: Ownership,
     pub content: Option<Box<RawValue>>,
     pub resolved_schema: Option<Box<RawValue>>,
     pub effective_traits: Option<Box<RawValue>>,
@@ -623,6 +624,8 @@ impl RegistryService {
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
                     let mut rows = lookup.rows(&*stores, tx, &scope).await?;
+                    // Before any validator is matched: an unchanged answer discloses too.
+                    p0_global_only(&rows)?;
 
                     let etags = validators(&*stores, tx, &scope, &rows).await?;
                     let answers = answer(requested, &rows, &etags);
@@ -716,7 +719,11 @@ impl RegistryService {
             let stores = Arc::clone(&self.stores);
             provider
                 .transaction_with_config(snapshot_read(&self.db), move |tx| {
-                    Box::pin(async move { lookup.rows(&*stores, tx, &scope).await })
+                    Box::pin(async move {
+                        let rows = lookup.rows(&*stores, tx, &scope).await?;
+                        p0_global_only(&rows)?;
+                        Ok(rows)
+                    })
                 })
                 .await?
         };
@@ -790,6 +797,9 @@ impl RegistryService {
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
                     let page = stores.list_page(tx, &scope, &filter, request).await?;
+                    // The lookahead row decides the cursor, so it is checked too.
+                    p0_global_only(&page.items)?;
+                    p0_global_only(page.lookahead.as_slice())?;
                     let current =
                         read_current(&*stores, tx, &scope, &page.items, selection).await?;
                     Ok((page, current))
@@ -997,6 +1007,7 @@ fn into_records(
             missing_state(&row.gts_id, what)
         })?;
         let is_schema = row.entity_kind == EntityKind::TypeSchema;
+        let ownership = ownership(&row)?;
         let document = |field: EntityField, text: Option<String>| {
             select_document(selection, field, is_schema, text, &row.gts_id)
         };
@@ -1031,6 +1042,7 @@ fn into_records(
                         updated_at: row.updated_at,
                     }),
                 lifecycle_status: row.lifecycle_status,
+                ownership,
                 content,
                 resolved_schema,
                 effective_traits,
@@ -1040,6 +1052,25 @@ fn into_records(
         );
     }
     Ok(out)
+}
+
+/// Refuse every read that reaches a tenant-owned row, on either plane, before it
+/// answers anything about it.
+fn p0_global_only(rows: &[EntityRow]) -> Result<(), ServiceError> {
+    rows.iter().try_for_each(|row| ownership(row).map(drop))
+}
+
+/// P0 stores no tenant-owned entity, so a read refuses one rather than guess how it
+/// relates to the caller. P1's plane-aware filter replaces this: platform reads see
+/// global entities only, tenant reads the visibility fence.
+fn ownership(row: &EntityRow) -> Result<Ownership, ServiceError> {
+    match row.ownership_scope {
+        OwnershipScope::Global => Ok(Ownership::Global),
+        OwnershipScope::Tenant => Err(ServiceError::CorruptDocument(format!(
+            "entity '{}' is tenant-owned, which P0 never stores",
+            row.gts_id
+        ))),
+    }
 }
 
 fn select_document(
@@ -1072,6 +1103,35 @@ fn raw_stored(text: String, gts_id: &str) -> Result<Box<RawValue>, ServiceError>
 mod tests {
     use super::*;
     use crate::domain::enums::OwnershipScope;
+
+    /// P0 stores no tenant-owned entity: a read refuses one rather than disclose it
+    /// with a guessed relation to the caller.
+    #[test]
+    fn a_read_refuses_a_tenant_owned_row() {
+        let row = |ownership_scope, owner_tenant_id| EntityRow {
+            id: 1,
+            gts_uuid: Uuid::nil(),
+            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            entity_kind: EntityKind::TypeSchema,
+            family_id: 1,
+            ownership_scope,
+            owner_tenant_id,
+            owning_gear: None,
+            lifecycle_status: LifecycleStatus::Active,
+            resource_version: 1,
+            deleted_at: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            ownership(&row(OwnershipScope::Global, None)).ok(),
+            Some(Ownership::Global)
+        );
+        assert!(matches!(
+            ownership(&row(OwnershipScope::Tenant, Some(Uuid::from_u128(7)))),
+            Err(ServiceError::CorruptDocument(_))
+        ));
+    }
 
     const AT: OffsetDateTime = time::macros::datetime!(2026-09-23 10:00:00 UTC);
 

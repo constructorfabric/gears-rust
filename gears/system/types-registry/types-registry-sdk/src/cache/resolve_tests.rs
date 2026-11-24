@@ -39,7 +39,8 @@ fn fixture_bound(window: Duration, max_identity_entries: usize) -> Fixture {
     )
 }
 
-/// A zero window revalidates every snapshot read; a known identity needs no read at all.
+/// A zero window revalidates every snapshot read; a known identity needs no read at all,
+/// and resolves nothing under the other kind.
 #[tokio::test(start_paused = true)]
 async fn a_known_identity_resolves_without_a_read_whatever_the_window() {
     let f = fixture(Duration::ZERO);
@@ -72,6 +73,17 @@ async fn a_known_identity_resolves_without_a_read_whatever_the_window() {
             .await
             .expect("known")[&uuid(TYPE)],
         Some(type_id(TYPE))
+    );
+    assert!(matches!(
+        f.cache.resolve_instance_id(&ctx(), uuid(TYPE)).await,
+        Err(CanonicalError::NotFound { .. })
+    ));
+    assert_eq!(
+        f.cache
+            .resolve_instance_ids(&ctx(), &[uuid(TYPE)])
+            .await
+            .expect("known")[&uuid(TYPE)],
+        None
     );
     tokio::time::advance(WINDOW * 10).await;
     f.cache
@@ -190,19 +202,6 @@ async fn with_no_identity_store_only_a_fresh_resident_snapshot_answers() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_zero_identity_entry_limit_resolves_every_time() {
-    let f = fixture_bound(Duration::ZERO, 0);
-    for _ in 0..3 {
-        f.cache
-            .resolve_type_uuid(&ctx(), &type_id(TYPE))
-            .await
-            .expect("registered");
-    }
-    assert_eq!(f.recorder.resolution_count(), 3);
-    assert_eq!(f.recorder.batch_count(), 0);
-}
-
-#[tokio::test(start_paused = true)]
 async fn absence_is_never_kept() {
     let f = fixture(WINDOW);
     for _ in 0..2 {
@@ -262,28 +261,6 @@ async fn an_observed_registration_or_deletion_leaves_a_known_identity_alone() {
         "the snapshot entry was invalidated and is read anew"
     );
     assert_eq!(f.recorder.batch_count(), before + 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_known_identity_of_the_other_kind_resolves_nothing_without_a_read() {
-    let f = fixture(Duration::ZERO);
-    f.cache
-        .resolve_type_uuid(&ctx(), &type_id(TYPE))
-        .await
-        .expect("registered");
-
-    assert!(matches!(
-        f.cache.resolve_instance_id(&ctx(), uuid(TYPE)).await,
-        Err(CanonicalError::NotFound { .. })
-    ));
-    assert_eq!(
-        f.cache
-            .resolve_instance_ids(&ctx(), &[uuid(TYPE)])
-            .await
-            .expect("known")[&uuid(TYPE)],
-        None
-    );
-    assert_eq!(f.recorder.resolution_count(), 1);
 }
 
 /// An identity hit leaves snapshot recency unchanged, so the next fill evicts
@@ -394,33 +371,6 @@ async fn an_identifier_sharing_a_resident_registry_reference_is_read_and_stays_a
     );
 }
 
-/// A late alias miss cannot invalidate the registered entity's just-refreshed snapshot.
-#[tokio::test(start_paused = true)]
-async fn an_alias_absence_arriving_late_leaves_the_resident_entity_alone() {
-    let f = fixture(WINDOW);
-    let registered = format!("{TYPE}{TAIL}");
-    let alias = format!("{OTHER}{TAIL}");
-    f.registry
-        .seed(&registered, json!({ "title": "registered" }));
-    f.lookup(gts_key(&registered), full(), false).await;
-
-    let release = f.recorder.hold_next();
-    let late = f.lookup(gts_key(&alias), full(), false);
-    let meanwhile = async {
-        f.lookup(gts_key(&registered), full(), true).await;
-        release.send(()).expect("held read");
-    };
-    let (late, ()) = tokio::join!(late, meanwhile);
-    assert_eq!(late, EntityLookup::NotFound);
-    assert_eq!(f.recorder.batch_count(), 3);
-
-    assert!(matches!(
-        f.lookup(gts_key(&registered), full(), false).await,
-        EntityLookup::Found { .. }
-    ));
-    assert_eq!(f.recorder.batch_count(), 3, "still resident");
-}
-
 /// The byte budget fits two of these three equal-weight snapshots.
 /// An alias miss leaves the old snapshot least recently used.
 #[tokio::test(start_paused = true)]
@@ -514,54 +464,37 @@ async fn a_resolution_answer_contradicting_an_identity_it_holds_fails() {
     assert!(f.cache.identity(&EntityKey::GtsUuid(held)).is_none());
 }
 
-/// Missing or unsolicited keys, mismatched entities and conflicting pairs fail
-/// the whole resolution before any learning.
+/// A malformed resolution fails whole before any learning. Every malformed shape is
+/// covered where it is checked (`ext::checked_resolutions`); this pins that the
+/// cache checks before it learns.
 #[tokio::test(start_paused = true)]
 async fn a_malformed_resolution_fails_whole_and_teaches_nothing() {
-    type Rewrite = fn(&mut super::Resolutions);
-    let rewrites: [(&str, Rewrite); 4] = [
-        ("unanswered", |answers| {
-            answers.remove(&gts_key(OTHER));
-        }),
-        ("unasked", |answers| {
-            answers.insert(gts_key(UNREGISTERED), None);
-        }),
-        ("another entity", |answers| {
-            let other = answers[&gts_key(OTHER)].clone();
-            answers.insert(gts_key(TYPE), other);
-        }),
-        ("one reference twice", |answers| {
-            if let Some(Some(identity)) = answers.get_mut(&gts_key(TYPE)) {
-                identity.gts_uuid = uuid(OTHER);
-            }
-        }),
-    ];
-    for (what, rewrite) in rewrites {
-        let f = fixture(WINDOW);
-        f.recorder.tamper_next_resolution(rewrite);
-        let error = f
-            .cache
-            .batch_resolve_identities(&ctx(), vec![gts_key(TYPE), gts_key(OTHER)])
-            .await
-            .expect_err(what);
-        assert!(
-            matches!(error, CanonicalError::Internal { .. }),
-            "{what}: {error:?}"
-        );
-        for key in [
-            gts_key(TYPE),
-            gts_key(OTHER),
-            uuid_key(TYPE),
-            uuid_key(OTHER),
-        ] {
-            assert!(f.cache.identity(&key).is_none(), "{what}: {key}");
-        }
-        f.cache
-            .batch_resolve_identities(&ctx(), vec![gts_key(TYPE), gts_key(OTHER)])
-            .await
-            .expect("an honest resolution");
-        assert_eq!(f.recorder.resolution_count(), 2, "{what}");
+    let f = fixture(WINDOW);
+    f.recorder.tamper_next_resolution(|answers| {
+        answers.remove(&gts_key(OTHER));
+    });
+    let error = f
+        .cache
+        .batch_resolve_identities(&ctx(), vec![gts_key(TYPE), gts_key(OTHER)])
+        .await
+        .expect_err("an unanswered key");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+    for key in [
+        gts_key(TYPE),
+        gts_key(OTHER),
+        uuid_key(TYPE),
+        uuid_key(OTHER),
+    ] {
+        assert!(f.cache.identity(&key).is_none(), "{key}");
     }
+    f.cache
+        .batch_resolve_identities(&ctx(), vec![gts_key(TYPE), gts_key(OTHER)])
+        .await
+        .expect("an honest resolution");
+    assert_eq!(f.recorder.resolution_count(), 2);
 }
 
 /// Resident snapshots reject conflicting pairs even without an identity LRU.

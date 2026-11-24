@@ -229,6 +229,7 @@ pub enum EntityField {
     GtsUuid,
     Kind,
     LifecycleStatus,
+    Ownership,
     Origin,
     Content,
     ResolvedSchema,
@@ -238,11 +239,12 @@ pub enum EntityField {
 }
 
 impl EntityField {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::GtsId,
         Self::GtsUuid,
         Self::Kind,
         Self::LifecycleStatus,
+        Self::Ownership,
         Self::Origin,
         Self::Content,
         Self::ResolvedSchema,
@@ -252,19 +254,21 @@ impl EntityField {
     ];
 
     /// Present on every snapshot, whatever the selection.
-    pub const MANDATORY: [Self; 4] = [
+    pub const MANDATORY: [Self; 5] = [
         Self::GtsId,
         Self::GtsUuid,
         Self::Kind,
         Self::LifecycleStatus,
+        Self::Ownership,
     ];
 
     /// What [`Projection::Default`] selects on single, batch and discovery reads: no documents.
-    pub const DEFAULT: [Self; 5] = [
+    pub const DEFAULT: [Self; 6] = [
         Self::GtsId,
         Self::GtsUuid,
         Self::Kind,
         Self::LifecycleStatus,
+        Self::Ownership,
         Self::Origin,
     ];
 
@@ -276,6 +280,7 @@ impl EntityField {
             | Self::GtsUuid
             | Self::Kind
             | Self::LifecycleStatus
+            | Self::Ownership
             | Self::Origin
             | Self::Content => true,
             Self::ResolvedSchema
@@ -293,6 +298,7 @@ impl EntityField {
             Self::GtsUuid => "gts_uuid",
             Self::Kind => "kind",
             Self::LifecycleStatus => "lifecycle_status",
+            Self::Ownership => "ownership",
             Self::Origin => "origin",
             Self::Content => "content",
             Self::ResolvedSchema => "resolved_schema",
@@ -448,6 +454,8 @@ pub struct Entity {
     pub gts_uuid: Uuid,
     pub kind: EntityKind,
     pub lifecycle_status: LifecycleStatus,
+    /// How the entity is owned, as far as the caller may learn.
+    pub ownership: Ownership,
     pub origin: Option<Origin>,
     /// The authored document, whichever kind it is.
     pub content: Option<JsonDocument>,
@@ -474,7 +482,8 @@ impl Entity {
             EntityField::GtsId
             | EntityField::GtsUuid
             | EntityField::Kind
-            | EntityField::LifecycleStatus => true,
+            | EntityField::LifecycleStatus
+            | EntityField::Ownership => true,
             EntityField::Origin => self.origin.is_some(),
             EntityField::Content => self.content.is_some(),
             EntityField::ResolvedSchema => self.resolved_schema.is_some(),
@@ -498,6 +507,7 @@ pub struct TypeSchema {
     pub type_id: GtsTypeId,
     pub type_uuid: Uuid,
     pub lifecycle_status: LifecycleStatus,
+    pub ownership: Ownership,
     pub origin: Option<Origin>,
     /// The authored schema.
     pub content: Option<JsonDocument>,
@@ -515,6 +525,7 @@ pub struct Instance {
     pub uuid: Uuid,
     pub type_id: GtsTypeId,
     pub lifecycle_status: LifecycleStatus,
+    pub ownership: Ownership,
     pub origin: Option<Origin>,
     /// The authored document.
     pub content: Option<JsonDocument>,
@@ -535,6 +546,7 @@ impl TryFrom<Entity> for TypeSchema {
             type_id,
             type_uuid: snapshot.gts_uuid,
             lifecycle_status: snapshot.lifecycle_status,
+            ownership: snapshot.ownership,
             origin: snapshot.origin,
             content: snapshot.content,
             resolved_schema: snapshot.resolved_schema,
@@ -571,6 +583,7 @@ impl TryFrom<Entity> for Instance {
             uuid: snapshot.gts_uuid,
             type_id,
             lifecycle_status: snapshot.lifecycle_status,
+            ownership: snapshot.ownership,
             origin: snapshot.origin,
             content: snapshot.content,
         })
@@ -620,6 +633,19 @@ pub enum Origin {
 pub enum LifecycleStatus {
     Active,
     Deleted,
+}
+
+/// How an entity is owned relative to the Context Tenant — the subject tenant unless
+/// another is named — disclosed without any owning tenant identifier. Platform reads
+/// see global entities only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ownership {
+    /// A global entity, visible platform-wide.
+    Global,
+    /// Owned by the Context Tenant.
+    ContextTenant,
+    /// Owned by an ancestor of the Context Tenant.
+    AncestorTenant,
 }
 
 // discovery.

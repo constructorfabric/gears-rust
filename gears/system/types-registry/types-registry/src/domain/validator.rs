@@ -9,9 +9,10 @@ use toolkit_security::crypto::hash::Sha256;
 pub const MAX_VALIDATOR_LEN: usize = 1024;
 
 /// ponytail: ceiling C7 — no visibility or availability inputs yet; P1 adds them
-/// under a new version, which a v2 token then never matches. v1 also digested the
-/// selected fields; its tokens no longer match.
-const VERSION: u8 = 2;
+/// under a new version, which a v3 token then never matches. v1 also digested the
+/// selected fields; v2 predates the mandatory `ownership` field, so a holder of a v2
+/// snapshot gets the full entity rather than an unchanged answer.
+const VERSION: u8 = 3;
 
 /// A 128-bit digest of the entity state every projection of it is read from. One
 /// entity's validator is the same under every field selection, so it says nothing of

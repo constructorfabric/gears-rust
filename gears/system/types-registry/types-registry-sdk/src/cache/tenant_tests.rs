@@ -5,16 +5,29 @@ use toolkit_security::SecurityContext;
 use super::*;
 use crate::cache::CachedTypesRegistry;
 use crate::contract::TypesRegistryApi;
+use crate::models::{Entity, Ownership};
 
 /// A tenant registry with entity visibility independent of the snapshot contents.
+/// Its entities are tenant-owned unless marked global, so a test opts into the
+/// shared global path explicitly.
 struct TenantRegistry {
     registry: MockTypesRegistry,
+    /// Entities answered as `Ownership::Global`.
+    global: Mutex<HashSet<Uuid>>,
     calls: Mutex<Vec<(Uuid, Option<Validator>)>>,
     /// Subjects and tenants the registry answers `not_found`.
     hidden: Mutex<HashSet<Uuid>>,
+    /// How long a hidden read takes to answer.
+    hidden_delay: Mutex<Duration>,
+    /// Registry References a read answers with instead of the stored ones, by identifier.
+    misreported: Mutex<HashMap<String, Uuid>>,
     /// Each batch resolution's tenant and keys, in order.
     resolutions: Mutex<Vec<(Uuid, Vec<EntityKey>)>>,
+    /// Rewrites the next batch resolution's answer.
+    resolution_tamper: Mutex<Option<ResolutionTamper>>,
 }
+
+type ResolutionTamper = Box<dyn FnOnce(&mut HashMap<EntityKey, Option<EntityIdentity>>) + Send>;
 
 impl TenantRegistry {
     fn hides(&self, ctx: &SecurityContext) -> bool {
@@ -25,14 +38,40 @@ impl TenantRegistry {
     fn new(hidden: impl IntoIterator<Item = Uuid>) -> Self {
         Self {
             registry: MockTypesRegistry::new(),
+            global: Mutex::new(HashSet::new()),
             calls: Mutex::new(Vec::new()),
             hidden: Mutex::new(hidden.into_iter().collect()),
+            hidden_delay: Mutex::new(Duration::ZERO),
+            misreported: Mutex::new(HashMap::new()),
             resolutions: Mutex::new(Vec::new()),
+            resolution_tamper: Mutex::new(None),
         }
     }
 
     fn resolutions(&self) -> Vec<(Uuid, Vec<EntityKey>)> {
         self.resolutions.lock().expect("resolutions").clone()
+    }
+
+    /// Seeds `id` as a global entity.
+    fn seed_global(&self, id: &str, content: serde_json::Value) {
+        self.registry.seed(id, content);
+        self.global
+            .lock()
+            .expect("global")
+            .insert(gts::GtsId::try_new(id).expect("identifier").to_uuid());
+    }
+
+    fn set_ownership(&self, entity: &mut Entity) {
+        entity.ownership = if self
+            .global
+            .lock()
+            .expect("global")
+            .contains(&entity.gts_uuid)
+        {
+            Ownership::Global
+        } else {
+            Ownership::ContextTenant
+        };
     }
 }
 
@@ -53,6 +92,8 @@ impl TypesRegistryApi for TenantRegistry {
                 )
             }));
         if self.hides(ctx) {
+            let delay = *self.hidden_delay.lock().expect("delay");
+            tokio::time::sleep(delay).await;
             return Ok(BatchGetEntitiesResponse(
                 request
                     .items
@@ -61,7 +102,22 @@ impl TypesRegistryApi for TenantRegistry {
                     .collect(),
             ));
         }
-        TypesRegistryApi::batch_get_entities(&self.registry, ctx, request).await
+        let mut response =
+            TypesRegistryApi::batch_get_entities(&self.registry, ctx, request).await?;
+        for lookup in response.0.values_mut() {
+            if let EntityLookup::Found { entity, .. } = lookup {
+                self.set_ownership(entity);
+                if let Some(uuid) = self
+                    .misreported
+                    .lock()
+                    .expect("misreported")
+                    .get(entity.gts_id.as_ref())
+                {
+                    entity.gts_uuid = *uuid;
+                }
+            }
+        }
+        Ok(response)
     }
 
     async fn list_entities(
@@ -69,7 +125,11 @@ impl TypesRegistryApi for TenantRegistry {
         ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
-        TypesRegistryApi::list_entities(&self.registry, ctx, request).await
+        let mut page = TypesRegistryApi::list_entities(&self.registry, ctx, request).await?;
+        for entity in &mut page.items {
+            self.set_ownership(entity);
+        }
+        Ok(page)
     }
 
     async fn batch_resolve_identities(
@@ -84,7 +144,12 @@ impl TypesRegistryApi for TenantRegistry {
         if self.hides(ctx) {
             return Ok(keys.into_iter().map(|key| (key, None)).collect());
         }
-        TypesRegistryApi::batch_resolve_identities(&self.registry, ctx, keys).await
+        let mut answer =
+            TypesRegistryApi::batch_resolve_identities(&self.registry, ctx, keys).await?;
+        if let Some(tamper) = self.resolution_tamper.lock().expect("tamper").take() {
+            tamper(&mut answer);
+        }
+        Ok(answer)
     }
 }
 
@@ -133,7 +198,7 @@ async fn read_as(
     registry.calls.lock().expect("calls").clone()
 }
 
-/// The registry may authorize each entity per subject, so only the read context
+/// From P1 the registry scopes reads per subject by ownership constraints, so only the read context
 /// that was answered reuses its confirmation. The snapshot itself is shared.
 #[tokio::test(start_paused = true)]
 async fn a_confirmation_serves_only_its_read_context() {
@@ -276,6 +341,15 @@ async fn anonymous_calls_never_reuse_the_tenant_cache() {
     let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
     let anonymous = SecurityContext::anonymous();
 
+    cache
+        .list_entities(&anonymous, ListEntitiesRequest::default())
+        .await
+        .expect("page");
+    assert_eq!(
+        cache.cache.store().identities.peek_uuid(&gts_key(TYPE)),
+        None,
+        "anonymous discovery teaches no pair"
+    );
     read_as(&cache, &registry, &subject(10, Some("alice"))).await;
     read_as(&cache, &registry, &anonymous).await;
     let calls = read_as(&cache, &registry, &anonymous).await;
@@ -422,11 +496,7 @@ async fn an_absent_read_fences_only_its_read_context() {
             same_subject_in_tenant_2.subject_tenant_id(),
             false,
         ),
-        (
-            subject(102, None),
-            subject(102, None).subject_id(),
-            false,
-        ),
+        (subject(102, None), subject(102, None).subject_id(), false),
     ] {
         let registry = Arc::new(TenantRegistry::new([]));
         registry.registry.seed(TYPE, schema(TYPE, "v1"));
@@ -442,11 +512,7 @@ async fn an_absent_read_fences_only_its_read_context() {
         let (visible, hidden) =
             tokio::join!(cache.batch_get_entities(&allowed, request.clone()), async {
                 tokio::task::yield_now().await;
-                registry
-                    .hidden
-                    .lock()
-                    .expect("hidden")
-                    .insert(hide);
+                registry.hidden.lock().expect("hidden").insert(hide);
                 cache.batch_get_entities(&denied, request.clone()).await
             });
         let visible = visible.expect("found");
@@ -468,8 +534,8 @@ async fn an_absent_read_fences_only_its_read_context() {
 
 #[tokio::test(start_paused = true)]
 async fn widening_the_projection_keeps_other_tenants_confirmed_under_the_same_etag() {
-    let registry = Arc::new(MockTypesRegistry::new());
-    registry.seed(TYPE, schema(TYPE, "v1"));
+    let registry = Arc::new(TenantRegistry::new([]));
+    registry.registry.seed(TYPE, schema(TYPE, "v1"));
     let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
     let key = gts_key(TYPE);
     let request = BatchGetEntitiesRequest::new([key.clone().into()]);
@@ -478,15 +544,26 @@ async fn widening_the_projection_keeps_other_tenants_confirmed_under_the_same_et
         .batch_get_entities(&tenant(1), narrow.clone())
         .await
         .expect("narrow read");
+    let wide_request = request.with_projection(full());
     let wide = cache
-        .batch_get_entities(&tenant(2), request.with_projection(full()))
+        .batch_get_entities(&tenant(2), wide_request.clone())
         .await
         .expect("wide read");
-    let (EntityLookup::Found { etag: before, .. }, EntityLookup::Found { etag: after, .. }) =
-        (&first.0[&key], &wide.0[&key])
+    let (
+        EntityLookup::Found {
+            entity: owned,
+            etag: before,
+        },
+        EntityLookup::Found { etag: after, .. },
+    ) = (&first.0[&key], &wide.0[&key])
     else {
         panic!("both tenants see the entity");
     };
+    assert_eq!(
+        owned.ownership,
+        Ownership::ContextTenant,
+        "a global snapshot would bypass the confirmation under test"
+    );
     assert_eq!(before, after);
     assert_eq!(
         cache
@@ -495,7 +572,18 @@ async fn widening_the_projection_keeps_other_tenants_confirmed_under_the_same_et
             .expect("cached read"),
         first
     );
-    assert_eq!(registry.calls(Call::BatchGet), 2);
+    assert_eq!(
+        cache
+            .batch_get_entities(&tenant(2), wide_request)
+            .await
+            .expect("cached wide read"),
+        wide
+    );
+    assert_eq!(
+        registry.calls.lock().expect("calls").len(),
+        2,
+        "the widened snapshot was kept and the first tenant's confirmation survived"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -653,9 +741,10 @@ async fn a_resolution_absence_fences_only_its_contexts_confirmation() {
 
 #[tokio::test(start_paused = true)]
 async fn an_unconfirmed_context_s_resolution_leaves_the_snapshot_s_recency() {
-    let registry = Arc::new(MockTypesRegistry::new());
+    // Tenant-owned: a global pair would resolve for any reader and promote it.
+    let registry = Arc::new(TenantRegistry::new([]));
     for id in [TYPE, OTHER, THIRD] {
-        registry.seed(id, schema(id, "v1"));
+        registry.registry.seed(id, schema(id, "v1"));
     }
     let cache = CachedTypesRegistry::new(
         registry.clone(),
@@ -682,17 +771,17 @@ async fn an_unconfirmed_context_s_resolution_leaves_the_snapshot_s_recency() {
         .await
         .expect("resolved");
     read(THIRD).await;
-    assert_eq!(registry.calls(Call::BatchGet), 3);
+    assert_eq!(registry.registry.calls(Call::BatchGet), 3);
 
     read(OTHER).await;
     assert_eq!(
-        registry.calls(Call::BatchGet),
+        registry.registry.calls(Call::BatchGet),
         3,
         "the more recent snapshot stayed"
     );
     read(TYPE).await;
     assert_eq!(
-        registry.calls(Call::BatchGet),
+        registry.registry.calls(Call::BatchGet),
         4,
         "the probed one was evicted"
     );
@@ -731,6 +820,52 @@ async fn a_resolution_shows_the_pair_to_its_read_context_only() {
         1,
         "a resolution confirms no read"
     );
+}
+
+/// A resolution answering other keys than asked fails whole: it teaches the read
+/// context neither the valid pair beside the malformed key nor its visibility.
+#[tokio::test(start_paused = true)]
+async fn a_malformed_resolution_fails_and_teaches_the_context_nothing() {
+    type Tamper = fn(&mut HashMap<EntityKey, Option<EntityIdentity>>);
+    let rows: [(&str, Tamper); 3] = [
+        ("missing", |answer| {
+            answer.remove(&gts_key(OTHER));
+        }),
+        ("extra", |answer| {
+            answer.insert(gts_key(THIRD), Some(identity(THIRD)));
+        }),
+        ("substituted", |answer| {
+            answer.remove(&gts_key(OTHER));
+            answer.insert(gts_key(THIRD), Some(identity(THIRD)));
+        }),
+    ];
+    for (row, tamper) in rows {
+        let registry = Arc::new(TenantRegistry::new([]));
+        for id in [TYPE, OTHER, THIRD] {
+            registry.registry.seed(id, schema(id, "v1"));
+        }
+        *registry.resolution_tamper.lock().expect("tamper") = Some(Box::new(tamper));
+        let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+        let alice = subject(10, Some("alice"));
+        let error = resolve(&cache, &alice, &[gts_key(TYPE), gts_key(OTHER)])
+            .await
+            .expect_err(row);
+        assert!(matches!(error, CanonicalError::Internal { .. }), "{row}");
+        assert_eq!(
+            cache.cache.store().usage().identities,
+            0,
+            "{row}: no pair was learned"
+        );
+        let answered = resolve(&cache, &alice, &[gts_key(TYPE), uuid_key(TYPE)])
+            .await
+            .expect(row);
+        assert_eq!(answered[&uuid_key(TYPE)], Some(identity(TYPE)), "{row}");
+        assert_eq!(
+            registry.resolutions().len(),
+            2,
+            "{row}: the valid pair beside the malformed key was not learned"
+        );
+    }
 }
 
 /// A read shows its context the pair too, which outlives the read's snapshot.
@@ -927,25 +1062,6 @@ async fn a_confirmed_pin_evicted_in_flight_still_shows_its_pair() {
     );
 }
 
-/// Anonymous discovery bypasses the cache: it teaches no pair.
-#[tokio::test(start_paused = true)]
-async fn anonymous_discovery_teaches_nothing() {
-    let registry = Arc::new(TenantRegistry::new([]));
-    registry.registry.seed(TYPE, schema(TYPE, "v1"));
-    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
-    cache
-        .list_entities(
-            &SecurityContext::anonymous(),
-            ListEntitiesRequest::default(),
-        )
-        .await
-        .expect("page");
-    assert_eq!(
-        cache.cache.store().identities.peek_uuid(&gts_key(TYPE)),
-        None
-    );
-}
-
 /// Discovery is a `list`: it teaches pairs but shows them to no read context.
 #[tokio::test(start_paused = true)]
 async fn discovery_teaches_pairs_without_showing_them() {
@@ -1000,15 +1116,458 @@ async fn a_tenant_resolution_contradicting_a_resident_snapshot_fails() {
     );
 }
 
-#[test]
-fn debug_shows_the_window_only() {
-    let cache =
-        CachedTypesRegistry::new(Arc::new(MockTypesRegistry::new()), CacheSettings::default());
+// Global entities, readable by every authenticated subject.
+
+const ABSENT: &str = "gts.cf.cache.client.absent.v1~";
+
+fn global_registry() -> Arc<TenantRegistry> {
+    let registry = Arc::new(TenantRegistry::new([]));
+    for id in [TYPE, OTHER, THIRD] {
+        registry.seed_global(id, schema(id, "v1"));
+    }
+    registry
+}
+
+async fn get(
+    cache: &CachedTypesRegistry,
+    ctx: &SecurityContext,
+    ids: &[&str],
+) -> BatchGetEntitiesResponse {
+    let request = BatchGetEntitiesRequest::new(ids.iter().map(|id| gts_key(id).into()))
+        .with_projection(full());
+    cache.batch_get_entities(ctx, request).await.expect("read")
+}
+
+fn read_keys(registry: &TenantRegistry) -> usize {
+    registry.calls.lock().expect("calls").len()
+}
+
+/// A tenant-owned snapshot still needs the reader's own confirmation.
+#[tokio::test(start_paused = true)]
+async fn a_tenant_owned_snapshot_still_needs_its_own_confirmation() {
+    let registry = Arc::new(TenantRegistry::new([]));
+    registry.seed_global(TYPE, schema(TYPE, "v1"));
+    registry.registry.seed(OTHER, schema(OTHER, "v1"));
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let (alice, bob) = (subject(10, Some("a")), subject(11, None));
+    get(&cache, &alice, &[TYPE]).await;
+    get(&cache, &bob, &[OTHER]).await;
+    resolve(&cache, &alice, &[gts_key(OTHER)])
+        .await
+        .expect("resolved");
+    assert_eq!(registry.resolutions().len(), 1);
+    get(&cache, &alice, &[OTHER]).await;
+    assert_eq!(read_keys(&registry), 3);
+}
+
+/// A pair resolves by its class only once an entity-carrying reply showed it global;
+/// a bare resolution leaves it unknown.
+#[tokio::test(start_paused = true)]
+async fn only_an_entity_carrying_reply_classifies_a_pair() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let (alice, bob, dave) = (subject(10, Some("a")), subject(11, None), subject(13, None));
+    get(&cache, &alice, &[TYPE]).await;
+    get(&cache, &dave, &[TYPE]).await;
+    resolve(&cache, &bob, &[gts_key(OTHER)])
+        .await
+        .expect("bare");
+    resolve(&cache, &alice, &[gts_key(OTHER)])
+        .await
+        .expect("unknown class");
     assert_eq!(
-        format!("{cache:?}"),
-        format!(
-            "CachedTypesRegistry {{ freshness_window: {:?}, .. }}",
-            CacheSettings::DEFAULT_FRESHNESS_WINDOW
-        )
+        registry.resolutions().len(),
+        2,
+        "a bare resolution classified nothing"
+    );
+
+    cache
+        .list_entities(&bob, ListEntitiesRequest::default())
+        .await
+        .expect("page");
+    resolve(&cache, &dave, &[gts_key(OTHER)])
+        .await
+        .expect("by class");
+    assert_eq!(registry.resolutions().len(), 2, "discovery classified it");
+}
+
+/// The ownership of an admitted entity never changes, so a reply contradicting it is
+/// refused rather than learned.
+#[tokio::test(start_paused = true)]
+async fn a_contradictory_ownership_is_refused() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let bob = subject(11, None);
+    get(&cache, &bob, &[OTHER]).await;
+    registry
+        .global
+        .lock()
+        .expect("global")
+        .remove(&gts::GtsId::try_new(OTHER).expect("identifier").to_uuid());
+    let error = cache
+        .list_entities(&bob, ListEntitiesRequest::default())
+        .await
+        .expect_err("contradiction");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+}
+
+/// Global answers keep no per-entity proofs, so they never evict a usable one.
+#[tokio::test(start_paused = true)]
+async fn global_answers_take_no_per_entity_slots() {
+    let registry = Arc::new(TenantRegistry::new([]));
+    registry.registry.seed(TYPE, schema(TYPE, "v1"));
+    registry.seed_global(OTHER, schema(OTHER, "v1"));
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            max_entries: 2,
+            ..CacheSettings::default()
+        },
+    );
+    let alice = subject(10, Some("a"));
+    get(&cache, &alice, &[TYPE]).await;
+    for ctx in [subject(11, None), subject(12, None)] {
+        get(&cache, &ctx, &[OTHER]).await;
+    }
+    let before = read_keys(&registry);
+    get(&cache, &alice, &[TYPE]).await;
+    assert_eq!(
+        read_keys(&registry),
+        before,
+        "alice's own confirmation survived"
+    );
+}
+
+/// Any authenticated reader may see a global entity, so a fresh global snapshot
+/// serves every read context, whoever read it first, even after that reader's
+/// absence for another key; anonymous calls still bypass.
+#[tokio::test(start_paused = true)]
+async fn any_authenticated_context_reads_a_fresh_global_snapshot() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let (alice, bob) = (subject(10, Some("a")), subject(11, None));
+    get(&cache, &alice, &[TYPE]).await;
+    get(&cache, &alice, &[ABSENT]).await;
+    let served = get(&cache, &bob, &[TYPE]).await;
+    assert!(matches!(
+        served.0[&gts_key(TYPE)],
+        EntityLookup::Found { .. }
+    ));
+    get(&cache, &tenant(5), &[TYPE]).await;
+    get(&cache, &alice, &[TYPE]).await;
+    assert_eq!(
+        read_keys(&registry),
+        2,
+        "bob, another tenant and alice read alice's snapshot"
+    );
+    let resolved = resolve(&cache, &bob, &[uuid_key(TYPE)])
+        .await
+        .expect("resolved");
+    assert_eq!(resolved[&uuid_key(TYPE)], Some(identity(TYPE)));
+    assert!(
+        registry.resolutions().is_empty(),
+        "a known-global pair resolves for anyone"
+    );
+    get(&cache, &SecurityContext::anonymous(), &[TYPE]).await;
+    assert_eq!(read_keys(&registry), 3, "anonymous calls bypass the cache");
+}
+
+/// Sharing never extends a snapshot's own freshness: a stale global snapshot is
+/// revalidated, once, for whoever reads it next.
+#[tokio::test(start_paused = true)]
+async fn a_stale_global_snapshot_is_revalidated_for_its_next_reader() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            freshness_window: WINDOW,
+            ..CacheSettings::default()
+        },
+    );
+    get(&cache, &subject(10, Some("a")), &[TYPE]).await;
+    tokio::time::advance(WINDOW).await;
+    get(&cache, &subject(11, None), &[TYPE]).await;
+    get(&cache, &subject(12, None), &[TYPE]).await;
+    assert_eq!(
+        read_keys(&registry),
+        2,
+        "one revalidation serves the next reader too"
+    );
+}
+
+/// Every reader sees a global entity, so a tenant read's `not_found` for one is
+/// everyone's absence: it drops the shared snapshot.
+#[tokio::test(start_paused = true)]
+async fn a_global_absence_drops_the_shared_snapshot() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let (alice, bob) = (subject(10, Some("a")), subject(11, None));
+    get(&cache, &bob, &[TYPE]).await;
+    registry
+        .hidden
+        .lock()
+        .expect("hidden")
+        .insert(alice.subject_id());
+    let forced = BatchGetEntitiesRequest {
+        fresh: true,
+        ..BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full())
+    };
+    let absent = cache
+        .batch_get_entities(&alice, forced)
+        .await
+        .expect("read");
+    assert_eq!(absent.0[&gts_key(TYPE)], EntityLookup::NotFound);
+    assert!(
+        cache.cache.store().peek(&gts_key(TYPE)).is_none(),
+        "dropped"
+    );
+    let before = read_keys(&registry);
+    get(&cache, &bob, &[TYPE]).await;
+    assert_eq!(read_keys(&registry), before + 1);
+}
+
+/// A global absence invalidates the entity even if its snapshot was evicted while
+/// the read was in flight, so an older positive answer cannot refill it.
+#[tokio::test(start_paused = true)]
+async fn a_global_absence_fences_a_refill_after_an_eviction_in_flight() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            max_entries: 1,
+            max_identity_entries: 0,
+            ..CacheSettings::default()
+        },
+    );
+    let (alice, bob, carol, dave) = (
+        subject(10, Some("a")),
+        subject(11, None),
+        subject(12, None),
+        subject(13, None),
+    );
+    // A light snapshot, so dave's full read is a fill, not a pinned confirmation.
+    cache
+        .batch_get_entities(&bob, BatchGetEntitiesRequest::new([gts_key(TYPE).into()]))
+        .await
+        .expect("light read");
+    registry
+        .hidden
+        .lock()
+        .expect("hidden")
+        .insert(alice.subject_id());
+    *registry.hidden_delay.lock().expect("delay") = Duration::from_secs(1);
+    // The first read after injection is dave's, answered last.
+    registry.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(2)),
+    );
+    let forced = || BatchGetEntitiesRequest {
+        fresh: true,
+        ..BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full())
+    };
+    let (_, absent, _) = tokio::join!(
+        cache.batch_get_entities(&dave, forced()),
+        async {
+            tokio::task::yield_now().await;
+            cache.batch_get_entities(&alice, forced()).await
+        },
+        async {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            // Evicts TYPE while alice's and dave's reads are in flight.
+            get(&cache, &carol, &[OTHER]).await
+        }
+    );
+    assert_eq!(
+        absent.expect("read").0[&gts_key(TYPE)],
+        EntityLookup::NotFound
+    );
+    assert!(
+        cache.cache.store().peek(&gts_key(TYPE)).is_none(),
+        "dave's older answer did not refill TYPE"
+    );
+}
+
+/// A reply contradicting the class of the snapshot its read started from is refused,
+/// even after that snapshot was evicted.
+#[tokio::test(start_paused = true)]
+async fn a_reply_contradicting_its_evicted_snapshot_is_refused() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            max_entries: 1,
+            max_identity_entries: 0,
+            ..CacheSettings::default()
+        },
+    );
+    let (bob, carol, dave) = (subject(11, None), subject(12, None), subject(13, None));
+    cache
+        .batch_get_entities(&bob, BatchGetEntitiesRequest::new([gts_key(TYPE).into()]))
+        .await
+        .expect("light read");
+    registry.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(1)),
+    );
+    let full = BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full());
+    let (refused, ()) = tokio::join!(cache.batch_get_entities(&dave, full), async {
+        tokio::task::yield_now().await;
+        get(&cache, &carol, &[OTHER]).await;
+        registry
+            .global
+            .lock()
+            .expect("global")
+            .remove(&gts::GtsId::try_new(TYPE).expect("identifier").to_uuid());
+    });
+    let error = refused.expect_err("contradiction");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
+    );
+}
+
+/// The plan keeps what it knew at the start: evicting the remembered global pair while
+/// the reads are in flight neither unclassifies the absence nor unfences either key.
+#[tokio::test(start_paused = true)]
+async fn an_absence_keeps_the_global_class_its_plan_knew() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            max_entries: 1,
+            max_identity_entries: 2,
+            ..CacheSettings::default()
+        },
+    );
+    let (alice, bob, carol, dave) = (
+        subject(10, Some("a")),
+        subject(11, None),
+        subject(12, None),
+        subject(13, None),
+    );
+    get(&cache, &bob, &[TYPE]).await;
+    get(&cache, &bob, &[OTHER]).await;
+    registry
+        .hidden
+        .lock()
+        .expect("hidden")
+        .insert(alice.subject_id());
+    *registry.hidden_delay.lock().expect("delay") = Duration::from_secs(1);
+    registry.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(2)),
+    );
+    let (_, absent, ()) = tokio::join!(
+        get(&cache, &dave, &[TYPE]),
+        async {
+            tokio::task::yield_now().await;
+            cache
+                .batch_get_entities(
+                    &alice,
+                    BatchGetEntitiesRequest::new([uuid_key(TYPE).into()]),
+                )
+                .await
+        },
+        async {
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            // Evicts TYPE's remembered pair while both reads are in flight.
+            get(&cache, &carol, &[THIRD]).await;
+        }
+    );
+    assert_eq!(
+        absent.expect("read").0[&uuid_key(TYPE)],
+        EntityLookup::NotFound
+    );
+    assert!(
+        cache.cache.store().peek(&gts_key(TYPE)).is_none(),
+        "dave's older answer did not refill TYPE"
+    );
+}
+
+/// What becomes known meanwhile counts too: an absence planned before anything was
+/// known about the entity drops the global snapshot another reader filled in flight.
+#[tokio::test(start_paused = true)]
+async fn an_absence_drops_a_snapshot_classified_global_in_flight() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let (alice, bob) = (subject(10, Some("a")), subject(11, None));
+    registry
+        .hidden
+        .lock()
+        .expect("hidden")
+        .insert(alice.subject_id());
+    *registry.hidden_delay.lock().expect("delay") = Duration::from_secs(1);
+    let (absent, ()) = tokio::join!(
+        cache.batch_get_entities(
+            &alice,
+            BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full()),
+        ),
+        async {
+            tokio::task::yield_now().await;
+            get(&cache, &bob, &[TYPE]).await;
+            assert!(
+                cache
+                    .cache
+                    .store()
+                    .peek(&gts_key(TYPE))
+                    .is_some_and(|entry| entry.snapshot.ownership == Ownership::Global),
+                "bob's global snapshot is resident before alice's absence settles"
+            );
+        }
+    );
+    assert_eq!(
+        absent.expect("read").0[&gts_key(TYPE)],
+        EntityLookup::NotFound
+    );
+    assert!(
+        cache.cache.store().peek(&gts_key(TYPE)).is_none(),
+        "a global entity's absence is everyone's"
+    );
+}
+
+/// A reply naming the read's remembered identifier with another Registry Reference is
+/// refused, even after the remembered pair was evicted in flight.
+#[tokio::test(start_paused = true)]
+async fn a_reply_contradicting_the_tickets_remembered_pair_is_refused() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            max_identity_entries: 1,
+            ..CacheSettings::default()
+        },
+    );
+    let (bob, carol, dave) = (subject(11, None), subject(12, None), subject(13, None));
+    resolve(&cache, &bob, &[gts_key(TYPE)])
+        .await
+        .expect("remembers TYPE's pair");
+    registry
+        .misreported
+        .lock()
+        .expect("misreported")
+        .insert(TYPE.to_owned(), Uuid::from_u128(99));
+    registry.registry.inject(
+        Fault::on(Call::BatchGet)
+            .nth(1)
+            .delay(Duration::from_secs(1)),
+    );
+    let full = BatchGetEntitiesRequest::new([gts_key(TYPE).into()]).with_projection(full());
+    let (refused, _) = tokio::join!(cache.batch_get_entities(&dave, full), async {
+        tokio::task::yield_now().await;
+        // Evicts TYPE's pair while dave's read is in flight.
+        resolve(&cache, &carol, &[gts_key(OTHER)]).await
+    });
+    let error = refused.expect_err("contradiction");
+    assert!(
+        matches!(error, CanonicalError::Internal { .. }),
+        "{error:?}"
     );
 }

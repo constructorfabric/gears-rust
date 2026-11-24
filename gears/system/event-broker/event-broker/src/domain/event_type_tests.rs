@@ -100,6 +100,7 @@ fn unadmitted(effective_traits: serde_json::Value) -> TypeSchema {
         type_id: GtsTypeId::new(DERIVED_ID),
         type_uuid: Uuid::nil(),
         lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+        ownership: types_registry_sdk::Ownership::Global,
         origin: None,
         content: None,
         resolved_schema: Some(json!({

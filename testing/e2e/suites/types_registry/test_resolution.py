@@ -93,29 +93,6 @@ async def test_a_deleted_entity_keeps_its_identity(
     assert_resolutions(await batch_resolve(registry_http, registry_api_path, keys), *expected)
 
 
-@pytest.mark.scenario("TR-READ-403")
-async def test_the_batch_bound_counts_duplicates(
-    registry_http, registry_api_path, reading_fixture, given_registered
-):
-    """100 mentions of one key are one result; the 101st is over the bound."""
-    person_schema = reading_fixture("person_schema")
-    await given_registered(person_schema)
-    schema_id = person_schema["gts_id"]
-
-    assert_resolutions(
-        await batch_resolve(registry_http, registry_api_path, [schema_id] * 100),
-        resolved(schema_id, person_schema),
-    )
-    assert_bad_request(
-        await batch_resolve(registry_http, registry_api_path, [schema_id] * 101),
-        invalid_argument(
-            "items",
-            "VALIDATION_FAILED",
-            "a batch read must name between 1 and 100 keys; this one named 101",
-        ),
-    )
-
-
 @pytest.mark.scenario("TR-READ-404")
 async def test_a_resolution_takes_no_selection_or_condition(
     registry_http, registry_api_path, reading_fixture

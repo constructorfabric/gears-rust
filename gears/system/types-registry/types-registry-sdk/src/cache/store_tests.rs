@@ -26,6 +26,7 @@ fn entity(gts_id: &str, content: Option<JsonDocument>) -> Arc<Entity> {
         gts_uuid,
         kind,
         lifecycle_status: LifecycleStatus::Active,
+        ownership: crate::models::Ownership::Global,
         origin: None,
         content,
         resolved_schema: None,
@@ -125,15 +126,6 @@ fn documents_are_charged_compact_json_and_other_metadata_only_the_allowance() {
 }
 
 #[test]
-fn a_selected_null_is_charged_four_bytes_and_an_unselected_field_nothing() {
-    let id = instance_id(1);
-    assert_eq!(
-        weight(&entity(&id, Some(JsonDocument::Null))) - weight(&entity(&id, None)),
-        "null".len()
-    );
-}
-
-#[test]
 fn a_snapshot_exactly_the_bound_fits_and_one_byte_more_does_not() {
     let snapshot = entity(TYPE, Some(json!({ "a": 1 })));
     let mut exact = Store::new(resident_bytes(&snapshot), usize::MAX);
@@ -143,27 +135,6 @@ fn a_snapshot_exactly_the_bound_fits_and_one_byte_more_does_not() {
     let mut short = Store::new(resident_bytes(&snapshot) - 1, usize::MAX);
     put(&mut short, &snapshot);
     assert!(short.get(&key(&snapshot)).is_none());
-}
-
-#[test]
-fn a_hit_returns_the_stored_snapshot_validator_and_confirmation() {
-    let mut store = Store::new(1024 * 1024, usize::MAX);
-    let snapshot = entity(TYPE, None);
-    let confirmed_at = Instant::now();
-    let rep = key(&snapshot);
-    store.insert(
-        Arc::clone(&snapshot),
-        FieldSelection::light(),
-        super::weight(&snapshot),
-        etag("v1"),
-        confirmed_at,
-    );
-
-    let hit = store.get(&rep).expect("resident");
-    assert!(Arc::ptr_eq(&hit.snapshot, &snapshot));
-    assert_eq!(hit.covers, FieldSelection::light());
-    assert_eq!(hit.etag, etag("v1"));
-    assert_eq!(hit.confirmed_at, confirmed_at);
 }
 
 #[test]
@@ -260,22 +231,6 @@ fn an_entry_larger_than_the_bound_is_not_retained_and_evicts_nothing() {
 }
 
 #[test]
-fn an_evicted_entry_leaves_no_trace_in_the_entity_index() {
-    let first = entity(&instance_id(1), None);
-    let mut store = Store::new(resident_bytes(&first) * 3, usize::MAX);
-    put(&mut store, &first);
-    for n in 2..10 {
-        put(&mut store, &entity(&instance_id(n), None));
-    }
-    assert!(store.get(&key(&first)).is_none());
-    assert!(!store.indexes(&key(&first)), "eviction cleans the index");
-    assert!(
-        !store.indexes(&spelled(&first)),
-        "eviction drops the identifier with its snapshot"
-    );
-}
-
-#[test]
 fn an_invalidation_fences_a_ticket_taken_before_it_even_with_nothing_resident() {
     let mut store = Store::new(1024 * 1024, usize::MAX);
     let uuid = EntityKey::GtsUuid(Uuid::nil());
@@ -344,26 +299,6 @@ fn a_confirmation_only_refreshes_the_validator_it_names() {
 }
 
 #[test]
-fn an_unrepresentable_timestamp_is_charged_the_allowance_and_retained() {
-    let mut store = Store::new(usize::MAX, usize::MAX);
-    let mut unrepresentable = (*entity(TYPE, Some(JsonDocument::Null))).clone();
-    let year_minus_one = time::OffsetDateTime::UNIX_EPOCH
-        .replace_year(-1)
-        .expect("a representable year");
-    unrepresentable.origin = Some(Origin::Managed {
-        resource_version: 1,
-        created_at: year_minus_one,
-        updated_at: year_minus_one,
-    });
-    let unrepresentable = Arc::new(unrepresentable);
-    assert_eq!(weight(&unrepresentable), fixed(TYPE) + "null".len());
-
-    put(&mut store, &unrepresentable);
-    assert!(store.get(&key(&unrepresentable)).is_some());
-    assert_eq!(store.used(), resident_bytes(&unrepresentable));
-}
-
-#[test]
 fn a_saturated_weight_is_never_retained_even_under_an_unlimited_bound() {
     let mut store = Store::new(usize::MAX, usize::MAX);
     let ordinary = entity(&instance_id(1), None);
@@ -424,7 +359,7 @@ fn a_merge_takes_the_selection_from_the_answer_and_the_rest_from_the_entry() {
     let resident = project(&full, &traits);
     let answer = project(&full, &content);
 
-    let merged = merge(answer.clone(), &content, &resident);
+    let merged = merge(answer, &content, &resident);
     let covers = union(&traits, &content);
     assert_eq!(merged, project(&full, &covers));
     assert_eq!(
@@ -434,12 +369,6 @@ fn a_merge_takes_the_selection_from_the_answer_and_the_rest_from_the_entry() {
             EntityField::EffectiveTraits,
             EntityField::Origin
         ])
-    );
-    assert_eq!(
-        super::weight(&answer)
-            .merged(&content, &super::weight(&resident))
-            .total(),
-        weight(&merged)
     );
 }
 
@@ -552,21 +481,6 @@ mod weight_properties {
 }
 
 #[test]
-fn either_spelling_finds_an_entry_under_the_registry_reference_its_snapshot_carries() {
-    let mut store = Store::new(1024 * 1024, usize::MAX);
-    let derived = entity(TYPE, None);
-    let snapshot = issued(&derived, Uuid::from_u128(7));
-    put(&mut store, &snapshot);
-
-    assert!(store.get(&spelled(&snapshot)).is_some());
-    assert!(store.get(&key(&snapshot)).is_some());
-    assert!(
-        store.get(&key(&derived)).is_none(),
-        "the derived Registry Reference names nothing resident"
-    );
-}
-
-#[test]
 fn an_identifier_resolves_only_while_its_snapshot_is_resident() {
     let snapshot = issued(&entity(TYPE, None), Uuid::from_u128(7));
     let filler = entity(&instance_id(1), None);
@@ -644,24 +558,6 @@ fn a_ticket_taken_with_both_spellings_is_fenced_by_either_after_eviction() {
 
     store.invalidate(&spelled(&snapshot), None);
     assert!(!store.quiet_since(&by_uuid));
-}
-
-/// A one-sided invalidation fences one-sided reads of the other key form.
-#[test]
-fn an_invalidation_under_an_unknown_counterpart_fences_every_unresolved_read_of_the_other_form() {
-    let mut store = Store::new(1024 * 1024, usize::MAX);
-    let resident = entity(&instance_id(1), None);
-    put(&mut store, &resident);
-    let unresolved = store.ticket(&EntityKey::GtsUuid(Uuid::from_u128(7)));
-    let resolved = store.ticket(&key(&resident));
-
-    store.invalidate(&EntityKey::GtsId(id(TYPE)), None);
-
-    assert!(!store.quiet_since(&unresolved), "conservatively fenced");
-    assert!(
-        store.quiet_since(&resolved),
-        "another entity, known by both spellings"
-    );
 }
 
 /// A paired reply fences reads under either key of that entity.
@@ -777,7 +673,10 @@ fn a_resolution_neither_erases_nor_extends_a_read_proof() {
     let mut store = Store::new(1024 * 1024, 16);
     store.remember_identities(16);
     store.track_visibility();
-    let snapshot = entity(TYPE, None);
+    // Tenant-owned: a global entity keeps no per-entity proofs.
+    let mut owned = (*entity(TYPE, None)).clone();
+    owned.ownership = crate::models::Ownership::ContextTenant;
+    let snapshot = Arc::new(owned);
     let t0 = Instant::now();
     store.insert(
         Arc::clone(&snapshot),

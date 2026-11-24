@@ -41,7 +41,7 @@ use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
     DeletionOperation, DeletionOutcome, Entity, EntityField, EntityIdentity, EntityKey,
     EntityLookup, FieldSelection, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
-    MAX_BATCH_GET_KEYS, Operation, RegisterEntitiesRequest, RegistrationOperation,
+    MAX_BATCH_GET_KEYS, Operation, Ownership, RegisterEntitiesRequest, RegistrationOperation,
     RegistrationOutcome, Validator,
 };
 
@@ -144,6 +144,9 @@ enum Plan {
         sent: Option<Validator>,
         /// This read's ticket, taken with its lookup.
         ticket: Ticket,
+        /// Whether the entity was known global when the read started, by its snapshot
+        /// or its remembered pair, which either may lose before the answer arrives.
+        global: bool,
     },
 }
 
@@ -160,6 +163,49 @@ struct Resident {
     covers: FieldSelection,
     etag: Validator,
     weight: Weight,
+}
+
+impl Resident {
+    fn of(entry: &store::Entry) -> Self {
+        Self {
+            snapshot: Arc::clone(&entry.snapshot),
+            covers: entry.covers.clone(),
+            etag: entry.etag.clone(),
+            weight: entry.weight.clone(),
+        }
+    }
+}
+
+/// A registry read of `key`, pinned to `resident` when it covers the selection, with
+/// a ticket taken under the lookup lock.
+fn remote(
+    store: &mut Store,
+    key: &EntityKey,
+    caller: Option<Validator>,
+    resident: Option<Resident>,
+    selection: &FieldSelection,
+    held: &mut Vec<Ticket>,
+) -> Plan {
+    let pinned = resident
+        .as_ref()
+        .is_some_and(|r| r.covers.is_superset(selection));
+    let global = resident
+        .as_ref()
+        .is_some_and(|r| r.snapshot.ownership == Ownership::Global)
+        || store.key_known_global(key);
+    let ticket = store.ticket(key);
+    held.push(ticket.clone());
+    Plan::Remote {
+        global,
+        ticket,
+        sent: match &resident {
+            Some(r) if pinned => Some(r.etag.clone()),
+            _ => caller.clone(),
+        },
+        caller,
+        resident,
+        pinned,
+    }
 }
 
 /// The tickets one batch read holds, released when it completes, fails or is dropped.
@@ -341,8 +387,51 @@ impl ReadCache {
             .zip(verified)
             .filter_map(|((_, plan), answer)| identified(plan, answer.as_ref()))
             .map(|snapshot| (&snapshot.gts_id, snapshot.gts_uuid));
+        let classes = plans
+            .iter()
+            .zip(verified)
+            .filter_map(|((_, plan), answer)| identified(plan, answer.as_ref()))
+            .map(|snapshot| (snapshot.gts_uuid, snapshot.ownership == Ownership::Global));
+        // The pair a read's ticket started with may be evicted by now; it still binds both keys.
+        for ((_, plan), answer) in plans.iter().zip(verified) {
+            if let (Plan::Remote { ticket, .. }, Some(Verified::Found { snapshot, .. })) =
+                (plan, answer)
+                && let Some((gts_id, gts_uuid)) = ticket.pair()
+                && ((snapshot.gts_id == *gts_id) != (snapshot.gts_uuid == gts_uuid))
+            {
+                return Err(CanonicalError::internal(format!(
+                    "the registry returned a conflicting identity {} ({}): the read started from {gts_id} ({gts_uuid})",
+                    snapshot.gts_id, snapshot.gts_uuid
+                ))
+                .create());
+            }
+        }
+        // The snapshot a read started from may be evicted by now; it still holds the class.
+        for ((_, plan), answer) in plans.iter().zip(verified) {
+            if let (
+                Plan::Remote {
+                    resident: Some(held),
+                    ..
+                },
+                Some(Verified::Found { snapshot, .. }),
+            ) = (plan, answer)
+                && held.snapshot.gts_uuid == snapshot.gts_uuid
+                && (held.snapshot.ownership == Ownership::Global)
+                    != (snapshot.ownership == Ownership::Global)
+            {
+                return Err(CanonicalError::internal(format!(
+                    "the registry returned a conflicting ownership for {}",
+                    snapshot.gts_uuid
+                ))
+                .create());
+            }
+        }
         let (identities, snapshots) = self.update_store(|store| {
+            check_classes(store, classes.clone())?;
             let identities = Self::learn_identities(store, &[], found)?;
+            for (gts_uuid, global) in classes {
+                store.identities.classify(gts_uuid, global);
+            }
             let snapshots = commit(store, plans, verified, sent_at, context);
             Ok::<_, CanonicalError>((identities, snapshots))
         })?;
@@ -375,12 +464,26 @@ impl ReadCache {
             ))
             .create());
         }
-        self.learn_from_reply(
-            &[],
-            page.items
+        let evictions = self.update_store(|store| {
+            let classes = page
+                .items
                 .iter()
-                .map(|entity| (&entity.gts_id, entity.gts_uuid)),
-        )
+                .map(|entity| (entity.gts_uuid, entity.ownership == Ownership::Global));
+            check_classes(store, classes.clone())?;
+            let evictions = Self::learn_identities(
+                store,
+                &[],
+                page.items
+                    .iter()
+                    .map(|entity| (&entity.gts_id, entity.gts_uuid)),
+            )?;
+            for (gts_uuid, global) in classes {
+                store.identities.classify(gts_uuid, global);
+            }
+            Ok::<_, CanonicalError>(evictions)
+        })?;
+        self.metrics.evictions("identity", evictions);
+        Ok(())
     }
 
     /// Validate before learning or changing recency. `held` pairs remain part of
@@ -488,7 +591,13 @@ impl ReadCache {
             if answers.contains_key(&key) || unknown.contains(&key) {
                 continue;
             }
-            match store.resolvable(&key, context, now, self.freshness_window) {
+            // Any authenticated reader may see a global entity; others need their own proof.
+            let identity = if store.key_known_global(&key) {
+                store.resolvable_global(&key)
+            } else {
+                store.resolvable(&key, context, now, self.freshness_window)
+            };
+            match identity {
                 Some(identity) => {
                     answers.insert(key, Some(identity));
                 }
@@ -526,9 +635,15 @@ impl ReadCache {
             // The caller's validator must cover this key and projection.
             let caller = item.if_none_match_for(&request.projection).cloned();
             // Use only snapshots that carry the requested key.
-            let visible = context.is_none_or(|context| {
-                store.visible(&item.key, context, now, self.freshness_window)
-            });
+            // Any authenticated reader may see a global snapshot; others need their
+            // own confirmation.
+            let global = store
+                .peek(&item.key)
+                .is_some_and(|entry| entry.snapshot.ownership == Ownership::Global);
+            let visible = global
+                || context.is_none_or(|context| {
+                    store.visible(&item.key, context, now, self.freshness_window)
+                });
             let entry = if visible {
                 store.get(&item.key)
             } else {
@@ -548,27 +663,15 @@ impl ReadCache {
                     }
                 }
                 entry => {
-                    let resident = entry.map(|e| Resident {
-                        snapshot: Arc::clone(&e.snapshot),
-                        covers: e.covers.clone(),
-                        etag: e.etag.clone(),
-                        weight: e.weight.clone(),
-                    });
-                    let pinned = resident
-                        .as_ref()
-                        .is_some_and(|r| r.covers.is_superset(selection));
-                    let ticket = store.ticket(&item.key);
-                    tickets.held.push(ticket.clone());
-                    Plan::Remote {
-                        ticket,
-                        sent: match &resident {
-                            Some(r) if pinned => Some(r.etag.clone()),
-                            _ => caller.clone(),
-                        },
+                    let resident = entry.map(Resident::of);
+                    remote(
+                        &mut store,
+                        &item.key,
                         caller,
                         resident,
-                        pinned,
-                    }
+                        selection,
+                        &mut tickets.held,
+                    )
                 }
             };
             plans.push((item.key.clone(), plan));
@@ -616,6 +719,25 @@ impl CachedPlatformTypesRegistry {
             }
         });
     }
+}
+
+/// Refuse a reply whose ownership contradicts itself or what the cache holds: the
+/// ownership of an admitted entity never changes.
+fn check_classes(
+    store: &Store,
+    classes: impl Iterator<Item = (Uuid, bool)>,
+) -> Result<(), CanonicalError> {
+    let mut seen: HashMap<Uuid, bool> = HashMap::new();
+    for (gts_uuid, global) in classes {
+        let in_reply = *seen.entry(gts_uuid).or_insert(global) != global;
+        if in_reply || store.class_conflict(gts_uuid, global) {
+            return Err(CanonicalError::internal(format!(
+                "the registry returned a conflicting ownership for {gts_uuid}"
+            ))
+            .create());
+        }
+    }
+    Ok(())
 }
 
 /// The snapshot whose identity a checked answer establishes: the answer's own, the entry it
@@ -673,13 +795,32 @@ fn commit(
         .map(|ticket| ticket.context.clone());
     let mut evictions = 0;
     for (((asked, plan), verified), quiet) in plans.iter().zip(verified).zip(quiet) {
-        let (Plan::Remote { sent, resident, .. }, Some(verified)) = (plan, verified) else {
+        let (
+            Plan::Remote {
+                sent,
+                resident,
+                ticket,
+                global: planned_global,
+                ..
+            },
+            Some(verified),
+        ) = (plan, verified)
+        else {
             continue;
         };
-        if context.is_some() && matches!(verified, Verified::NotFound) {
+        // A tenant read's absence may be its own visibility, so the shared snapshot
+        // stays — unless it is global: every authenticated reader sees a global entity,
+        // so its absence is everyone's.
+        // What the plan held counts as much as what is resident now: an eviction in
+        // flight must not turn a global absence back into a private one.
+        let global = *planned_global || store.key_known_global(asked);
+        let absent = matches!(verified, Verified::NotFound);
+        if context.is_some() && absent && !global {
             continue;
         }
-        let pair = stated(plan, verified);
+        // An absence with no snapshot to name the pair fences both keys of the pair the
+        // read started with.
+        let pair = stated(plan, verified).or_else(|| absent.then(|| ticket.pair()).flatten());
         // The entry's validator when an entry carries the spelling asked.
         let current = store.peek(asked).map(|entry| entry.etag.clone());
         if !quiet {
@@ -1024,11 +1165,14 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
 }
 
 /// Local or REST cache with one visibility confirmation per entity and read context:
-/// the subject, its type, home tenant and token scopes. The registry may authorize each
-/// entity per subject, so confirmations are never shared between read contexts.
+/// the subject, its type, home tenant and token scopes. From P1 the registry scopes
+/// reads per subject by ownership constraints the cache cannot apply, so confirmations are never
+/// shared between read contexts.
 /// Snapshots and the identity LRU are shared; a pair resolves locally only for a
-/// read context that a read or resolution showed it to within the window. Anonymous calls bypass the cache. REST misses require the
-/// caller's bearer.
+/// read context that a read or resolution showed it to within the window, unless it
+/// is known global: every authenticated reader may see a global entity, so a fresh
+/// global snapshot serves every authenticated context. Anonymous calls bypass the
+/// cache. REST misses require the caller's bearer.
 pub struct CachedTypesRegistry {
     inner: Arc<dyn TypesRegistryApi>,
     cache: ReadCache,
@@ -1044,6 +1188,11 @@ impl std::fmt::Debug for CachedTypesRegistry {
 
 impl CachedTypesRegistry {
     /// Cache reads from `inner` using `settings`.
+    ///
+    /// `inner` must let every authenticated reader see every global entity, and gate
+    /// `batch_get_entities` and `batch_resolve_identities` alike: a global snapshot
+    /// read for one context serves all. The Types Registry local and REST clients
+    /// qualify.
     #[must_use]
     pub fn new(inner: Arc<dyn TypesRegistryApi>, settings: CacheSettings) -> Self {
         Self {

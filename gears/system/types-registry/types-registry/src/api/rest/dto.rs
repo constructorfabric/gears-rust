@@ -9,7 +9,7 @@ use types_registry_sdk::item_failure::context;
 
 use crate::domain::admission::{AdmissionFailureReason, StoredFailure, UnreadableFailure};
 use crate::domain::enums::{
-    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
+    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus, Ownership,
 };
 use crate::domain::key::EntityKey;
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
@@ -279,7 +279,13 @@ mod tests {
         let schema = schema_json::<EntityDto>();
         assert_eq!(
             schema["required"],
-            serde_json::json!(["gts_id", "gts_uuid", "kind", "lifecycle_status"])
+            serde_json::json!([
+                "gts_id",
+                "gts_uuid",
+                "kind",
+                "lifecycle_status",
+                "ownership"
+            ])
         );
         let properties = &schema["properties"];
         for field in ["gts_id", "gts_uuid"] {
@@ -363,6 +369,7 @@ mod tests {
             kind: EntityKindDto::TypeSchema,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Deleted,
+            ownership: OwnershipDto::Global,
             content: Some(RawValue::from_string("null".to_owned()).expect("JSON")),
             resolved_schema: None,
             effective_traits: None,
@@ -376,6 +383,7 @@ mod tests {
                 "gts_uuid": Uuid::nil(),
                 "kind": "type_schema",
                 "lifecycle_status": "deleted",
+                "ownership": "global",
                 "content": null,
             }),
         );
@@ -389,6 +397,7 @@ mod tests {
             kind: EntityKindDto::TypeSchema,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Active,
+            ownership: OwnershipDto::Global,
             content: None,
             resolved_schema: None,
             effective_traits: None,
@@ -404,6 +413,7 @@ mod tests {
                 "gts_uuid": Uuid::nil(),
                 "kind": "type_schema",
                 "lifecycle_status": "active",
+                "ownership": "global",
                 "provenance": { "compatibility_check_skipped": false },
             }),
         );
@@ -1100,9 +1110,9 @@ pub enum DeletionKindDto {
 
 /// One entity, projected by `$select` (SPEC §10.2).
 ///
-/// `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a
-/// projected item is identifiable, its kind needs no second read, and a tombstone is
-/// never mistaken for an absence. An
+/// `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always
+/// present, so a projected item is identifiable, its kind needs no second read, a
+/// tombstone is never mistaken for an absence, and a client knows whether it is global. An
 /// unselected field is omitted; a selected document that is JSON `null` stays
 /// present as `null`. The three artifacts and `provenance` are absent on an
 /// Instance, selected or not. Documents
@@ -1122,6 +1132,8 @@ pub struct EntityDto {
     pub origin: Option<OriginDto>,
     /// Always present. A tombstone stays exact-readable and is listed only on request.
     pub lifecycle_status: LifecycleStatusDto,
+    /// Always present. Never an owning tenant identifier.
+    pub ownership: OwnershipDto,
     /// The whole authored document, either kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<serde_json::Value>)]
@@ -1253,6 +1265,26 @@ impl From<EntityKind> for EntityKindDto {
 pub enum LifecycleStatusDto {
     Active,
     Deleted,
+}
+
+/// `global`, `context_tenant` (owned by the Context Tenant) or `ancestor_tenant`
+/// (owned by an ancestor of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum OwnershipDto {
+    Global,
+    ContextTenant,
+    AncestorTenant,
+}
+
+impl From<Ownership> for OwnershipDto {
+    fn from(ownership: Ownership) -> Self {
+        match ownership {
+            Ownership::Global => Self::Global,
+            Ownership::ContextTenant => Self::ContextTenant,
+            Ownership::AncestorTenant => Self::AncestorTenant,
+        }
+    }
 }
 
 impl From<LifecycleStatus> for LifecycleStatusDto {
@@ -1391,6 +1423,7 @@ impl From<EntityRecord> for EntityDto {
                 updated_at: origin.updated_at,
             }),
             lifecycle_status: record.lifecycle_status.into(),
+            ownership: record.ownership.into(),
             content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,

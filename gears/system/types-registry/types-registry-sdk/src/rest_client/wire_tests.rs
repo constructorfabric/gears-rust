@@ -262,7 +262,7 @@ fn a_batch_read_sends_the_selection_and_not_the_cache_flag() {
     assert_eq!(body["items"], json!([{"entity_key": TYPE}]));
     assert_eq!(
         body["$select"],
-        json!("gts_id,gts_uuid,kind,lifecycle_status,content")
+        json!("gts_id,gts_uuid,kind,lifecycle_status,ownership,content")
     );
     assert!(body.get("fresh").is_none());
 
@@ -317,7 +317,7 @@ fn discovery_sends_every_filter_and_always_the_lifecycle() {
     assert_eq!(full[5].1, "c1");
     assert_eq!(
         full[6].1,
-        "gts_id,gts_uuid,kind,lifecycle_status,effective_traits_schema"
+        "gts_id,gts_uuid,kind,lifecycle_status,ownership,effective_traits_schema"
     );
 }
 
@@ -582,6 +582,7 @@ fn entity(extra: &Value) -> Value {
         "gts_uuid": UUID,
         "kind": "type_schema",
         "lifecycle_status": "active",
+        "ownership": "global",
     });
     entity
         .as_object_mut()
@@ -592,6 +593,26 @@ fn entity(extra: &Value) -> Value {
 
 fn decode_page(body: &Value) -> Result<crate::models::ListEntitiesResponse, CanonicalError> {
     parse::<PageWire>("page", body.to_string().as_bytes())?.decode()
+}
+
+/// `ownership` is required; nothing defaults to global.
+#[test]
+fn ownership_decodes_each_value_and_is_required() {
+    for (wire, ownership) in [
+        ("global", crate::models::Ownership::Global),
+        ("context_tenant", crate::models::Ownership::ContextTenant),
+        ("ancestor_tenant", crate::models::Ownership::AncestorTenant),
+    ] {
+        let page = decode_page(&json!({
+            "items": [entity(&json!({ "ownership": wire }))],
+            "page_info": {"limit": 50},
+        }))
+        .expect("decodes");
+        assert_eq!(page.items[0].ownership, ownership, "{wire}");
+    }
+    let mut missing = entity(&json!({}));
+    missing.as_object_mut().unwrap().remove("ownership");
+    assert!(decode_page(&json!({ "items": [missing], "page_info": {"limit": 50} })).is_err());
 }
 
 #[test]

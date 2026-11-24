@@ -32,8 +32,8 @@ fn the_bindings_name_each_planes_base_path() {
     );
 }
 
-/// Every contract method has a real route on its plane: the batch resolution included,
-/// on both.
+/// Every contract method has a required route on its plane. (`api_rest_test` matches
+/// each route's verb and path to the operation the registry serves.)
 #[test]
 fn every_contract_method_is_bound_on_its_plane() {
     for (ir, binding) in [
@@ -55,15 +55,5 @@ fn every_contract_method_is_bound_on_its_plane() {
                 .unwrap_or_else(|| panic!("{} has no route", method.name));
             assert!(!bound.optional, "{} is bound as optional", method.name);
         }
-        let resolve = binding
-            .methods
-            .iter()
-            .find(|bound| bound.method_name == "batch_resolve_identities")
-            .expect("the batch resolution is bound");
-        assert_eq!(resolve.path_template, "/entities:batchResolve");
-        assert!(matches!(
-            resolve.http_method,
-            toolkit_contract::ir::HttpMethod::Post
-        ));
     }
 }

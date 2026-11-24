@@ -43,10 +43,10 @@ pub use models::{
     DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, DeletionOutcome,
     Entity, EntityField, EntityFilter, EntityIdentity, EntityKey, EntityKind, EntityLookup,
     FieldSelection, IdempotencyKey, Instance, JsonDocument, LifecycleFilter, LifecycleStatus,
-    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, PageRequest,
-    Projection, Provenance, PublisherContext, PublisherVersion, PublisherVersionError, ReadOptions,
-    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
-    RegistrationOutcome, TypeSchema, Validator,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Ownership,
+    PageRequest, Projection, Provenance, PublisherContext, PublisherVersion, PublisherVersionError,
+    ReadOptions, RegisterEntitiesRequest, RegisterItem, RegistrationItemResult,
+    RegistrationOperation, RegistrationOutcome, TypeSchema, Validator,
 };
 
 pub use payload::CompilePayloadValidatorError;

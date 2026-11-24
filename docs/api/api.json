@@ -5022,7 +5022,7 @@
         "type": "object"
       },
       "EntityDto": {
-        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts and `provenance` are absent on an\nInstance, selected or not. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
+        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always\npresent, so a projected item is identifiable, its kind needs no second read, a\ntombstone is never mistaken for an absence, and a client knows whether it is global. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts and `provenance` are absent on an\nInstance, selected or not. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
         "properties": {
           "content": {
             "description": "The whole authored document, either kind."
@@ -5053,6 +5053,10 @@
           "origin": {
             "$ref": "#/components/schemas/OriginDto"
           },
+          "ownership": {
+            "$ref": "#/components/schemas/OwnershipDto",
+            "description": "Always present. Never an owning tenant identifier."
+          },
           "provenance": {
             "$ref": "#/components/schemas/ProvenanceDto",
             "description": "Managed Type Schemas only: how the current revision was admitted."
@@ -5065,7 +5069,8 @@
           "gts_id",
           "gts_uuid",
           "kind",
-          "lifecycle_status"
+          "lifecycle_status",
+          "ownership"
         ],
         "type": "object"
       },
@@ -9562,6 +9567,15 @@
           "expires_at"
         ],
         "type": "object"
+      },
+      "OwnershipDto": {
+        "description": "`global`, `context_tenant` (owned by the Context Tenant) or `ancestor_tenant`\n(owned by an ancestor of it).",
+        "enum": [
+          "global",
+          "context_tenant",
+          "ancestor_tenant"
+        ],
+        "type": "string"
       },
       "PageInfo": {
         "properties": {

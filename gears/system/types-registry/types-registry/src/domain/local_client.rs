@@ -25,7 +25,7 @@ use crate::domain::caller::CallerContext;
 use crate::domain::cursor::{self, Binding};
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
-    OperationStatus,
+    OperationStatus, Ownership,
 };
 use crate::domain::error::LocalClientError;
 use crate::domain::key::EntityKey;
@@ -473,6 +473,7 @@ const fn domain_field(field: sdk::EntityField) -> EntityField {
         sdk::EntityField::GtsUuid => EntityField::GtsUuid,
         sdk::EntityField::Kind => EntityField::Kind,
         sdk::EntityField::LifecycleStatus => EntityField::LifecycleStatus,
+        sdk::EntityField::Ownership => EntityField::Ownership,
         sdk::EntityField::Origin => EntityField::Origin,
         sdk::EntityField::Content => EntityField::Content,
         sdk::EntityField::ResolvedSchema => EntityField::ResolvedSchema,
@@ -508,6 +509,14 @@ const fn sdk_lifecycle(status: LifecycleStatus) -> sdk::LifecycleStatus {
     match status {
         LifecycleStatus::Active => sdk::LifecycleStatus::Active,
         LifecycleStatus::Deleted => sdk::LifecycleStatus::Deleted,
+    }
+}
+
+const fn sdk_ownership(ownership: Ownership) -> sdk::Ownership {
+    match ownership {
+        Ownership::Global => sdk::Ownership::Global,
+        Ownership::ContextTenant => sdk::Ownership::ContextTenant,
+        Ownership::AncestorTenant => sdk::Ownership::AncestorTenant,
     }
 }
 
@@ -564,6 +573,7 @@ fn snapshot_from(record: EntityRecord) -> Result<sdk::Entity, CanonicalError> {
         gts_uuid: record.gts_uuid,
         kind: sdk_kind(record.kind),
         lifecycle_status: sdk_lifecycle(record.lifecycle_status),
+        ownership: sdk_ownership(record.ownership),
         origin: record
             .origin
             .map(|origin| {

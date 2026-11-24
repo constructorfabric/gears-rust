@@ -90,6 +90,7 @@ async def test_default_read_is_document_free_metadata(
                     "gts_uuid": gts_uuid(schema["gts_id"]),
                     "kind": "type_schema",
                     "lifecycle_status": "active",
+                    "ownership": "global",
                     "origin": {
                         "type": "managed",
                         "resource_version": 1,
@@ -518,7 +519,7 @@ async def test_an_unknown_selection_is_refused_on_both_transports(
         "INVALID_SELECT",
         "'contents' is not a selectable field; select from content, effective_traits, "
         "effective_traits_schema, gts_id, gts_uuid, kind, lifecycle_status, origin, "
-        "provenance, resolved_schema",
+        "ownership, provenance, resolved_schema",
     )
 
     assert_bad_request(

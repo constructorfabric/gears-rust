@@ -77,6 +77,7 @@ fn unadmitted_event_type(type_id: &str, effective_traits: serde_json::Value) -> 
         type_id: GtsTypeId::new(type_id),
         type_uuid: Uuid::nil(),
         lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+        ownership: types_registry_sdk::Ownership::Global,
         origin: None,
         content: Some(body(type_id, EVENT_BASE, &effective_traits)),
         resolved_schema: Some(json!({

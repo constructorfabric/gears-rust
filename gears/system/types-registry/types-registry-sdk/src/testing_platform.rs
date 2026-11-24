@@ -1013,6 +1013,7 @@ fn snapshot(
         gts_uuid,
         kind,
         lifecycle_status: stored.lifecycle,
+        ownership: crate::models::Ownership::Global,
         origin: has(EntityField::Origin).then_some(Origin::Managed {
             resource_version: stored.resource_version,
             created_at: OffsetDateTime::UNIX_EPOCH,

@@ -359,10 +359,11 @@ async fn probe_cache(
     let tenant_fresh = tenant_read(1, true).await?;
     let fresh = platform_read(true).await?;
     let seen = (windowed, tenant_after, tenant_first, tenant_fresh, fresh);
+    // `BASE` is global: every authenticated tenant shares its fresh snapshot.
     let expected = (
         if cached { before } else { before + 1 },
         if cached { before } else { before + 1 },
-        before + 1,
+        if cached { before } else { before + 1 },
         before + 1,
         before + 1,
     );
@@ -979,33 +980,19 @@ async fn probe(registry_config: Value, cached: bool) {
 }
 
 #[tokio::test]
-async fn the_published_apis_are_cached_and_each_tenant_reads_from_the_registry_first() {
+async fn the_published_apis_are_cached_and_tenants_share_a_global_snapshot() {
     probe(json!({ "entities": [base()] }), true).await;
 }
 
-/// Each snapshot setting can prevent the published client from serving a cached read.
+/// The gear hands its cache settings to the published client: a zero window
+/// prevents it from serving a cached read. (`config_test` pins the mapping of
+/// every key, and the SDK cache tests each key's effect.)
 #[tokio::test]
 async fn the_client_cache_keys_configure_the_published_platform_api() {
     probe(
         json!({
             "entities": [base()],
             "local_client": { "cache": { "freshness_window": "0s" } },
-        }),
-        false,
-    )
-    .await;
-    probe(
-        json!({
-            "entities": [base()],
-            "local_client": { "cache": { "max_size_bytes": 1 } },
-        }),
-        false,
-    )
-    .await;
-    probe(
-        json!({
-            "entities": [base()],
-            "local_client": { "cache": { "max_entries": 0 } },
         }),
         false,
     )

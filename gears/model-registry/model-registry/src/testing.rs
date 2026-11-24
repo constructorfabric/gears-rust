@@ -376,6 +376,7 @@ pub fn provider_type_schema(
         type_id: gts::GtsTypeId::new(type_id),
         type_uuid: Uuid::nil(),
         lifecycle_status: LifecycleStatus::Active,
+        ownership: types_registry_sdk::Ownership::Global,
         origin: None,
         content: Some(content),
         resolved_schema: Some(resolved),

@@ -233,7 +233,9 @@ def gts_uuid(gts_id):
 
 
 def mandatory(document, lifecycle_status="active"):
-    """The four fields every projection returns, whatever `$select` names.
+    """The five fields every projection returns, whatever `$select` names.
+
+    Every P0 entity is global.
 
     A GTS Type Schema identifier ends in `~`; an Instance identifier does not.
     """
@@ -243,6 +245,7 @@ def mandatory(document, lifecycle_status="active"):
         "gts_uuid": gts_uuid(gts_id),
         "kind": "type_schema" if gts_id.endswith("~") else "instance",
         "lifecycle_status": lifecycle_status,
+        "ownership": "global",
     }
 
 

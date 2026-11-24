@@ -96,6 +96,8 @@ async def test_a_tenant_reads_with_its_bearer_and_cannot_mutate(
     tenant = await get_entity(registry_tenant_http, TENANT_API, document["gts_id"])
     platform = await get_entity(registry_http, PLATFORM_API, document["gts_id"])
     assert tenant.status_code == 200, tenant.text
+    assert tenant.json()["ownership"] == "global", tenant.text
+    assert platform.json()["ownership"] == "global", platform.text
     assert (tenant.json(), tenant.headers["etag"]) == (
         platform.json(),
         platform.headers["etag"],
@@ -121,6 +123,12 @@ async def test_a_tenant_reads_with_its_bearer_and_cannot_mutate(
         registry_tenant_http, TENANT_API, document["gts_id"], select="origin"
     )
     assert after.json()["origin"]["resource_version"] == 1, after.text
+
+    listed = await registry_tenant_http.get(
+        f"{TENANT_API}/entities", params={"pattern": document["gts_id"]}
+    )
+    assert listed.status_code == 200, listed.text
+    assert [item["ownership"] for item in listed.json()["items"]] == ["global"], listed.text
 
 
 @pytest.mark.scenario("TR-PLANE-004")

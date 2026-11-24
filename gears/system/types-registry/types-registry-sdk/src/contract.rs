@@ -17,6 +17,10 @@ use crate::models::{
 
 /// The platform-plane Types Registry contract.
 ///
+/// Reads, discovery and identity resolution see global entities only: a tenant-owned
+/// key answers `not_found` (or `None`) like an absent one. Work on a tenant's data
+/// runs under that tenant's service account through [`TypesRegistryApi`].
+///
 /// Every method fails with `CanonicalError`. For typed dispatch, project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError); an operation item's failure
 /// decodes with [`AdmissionFailure::from_canonical`](crate::AdmissionFailure::from_canonical).
@@ -98,10 +102,15 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
 /// projection and validators, under a tenant's [`SecurityContext`].
 ///
 /// Pass the host-authenticated caller's context. [`CachedTypesRegistry`](crate::CachedTypesRegistry)
-/// keeps visibility confirmations per read context: subject, subject type, home tenant
-/// and the raw token scope list. It trusts the context it is given, so a context reused
+/// keeps visibility confirmations for tenant-owned entities per read context: subject,
+/// subject type, home tenant and the raw token scope list; global entities serve every
+/// authenticated reader. It trusts the context it is given, so a context reused
 /// after the registry refused its bearer can still hit within the freshness window.
 /// Anonymous calls bypass the cache. REST requests forward the caller's bearer.
+///
+/// An implementation lets every authenticated reader see every global entity — `read`
+/// and `list` authorization constrains tenant-owned results only — and applies one read
+/// gate to batch reads and resolutions; the cache relies on both.
 ///
 /// Every method fails with `CanonicalError`; project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError) for typed dispatch.

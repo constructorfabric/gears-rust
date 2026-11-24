@@ -1384,8 +1384,8 @@ async fn a_lost_acknowledgement_is_bridged_from_the_calls_logs_to_its_operation(
 }
 
 /// T36 through the real local client: an observed terminal registration leaves no stale
-/// entry, while a change the client did not observe is served from the window until
-/// `fresh` asks the database.
+/// entry. (Unobserved changes and `fresh` are covered by the SDK cache tests and the
+/// boot probe's database revalidation.)
 #[tokio::test]
 async fn the_client_cache_over_the_local_client_drops_what_it_observes_change() {
     let h = harness().await;
@@ -1463,30 +1463,4 @@ async fn the_client_cache_over_the_local_client_drops_what_it_observes_change() 
         2,
         "no stale entry after the terminal outcome"
     );
-
-    // Not observed: a deletion through another client.
-    let deletion = h
-        .client
-        .delete_entities(
-            &ctx(),
-            IdempotencyKey::new("cache-delete").unwrap(),
-            DeleteEntitiesRequest {
-                items: vec![DeleteItem {
-                    key: EntityKey::GtsId(id(CF_TYPE)),
-                    expected_resource_version: 2,
-                }],
-                dry_run: false,
-                publisher: publisher(),
-            },
-        )
-        .await
-        .expect("accepted");
-    completed(&h.client, deletion.operation_id).await;
-    assert_eq!(
-        version(read(false).await),
-        2,
-        "inside the window: the snapshot it holds"
-    );
-    assert_eq!(version(read(true).await), 3, "fresh asks the database");
-    assert_eq!(version(read(false).await), 3, "and replaced the entry");
 }

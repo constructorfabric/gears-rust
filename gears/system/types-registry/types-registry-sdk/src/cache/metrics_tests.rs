@@ -192,14 +192,19 @@ async fn tenant_metrics_include_visibility_revalidation_and_skip_anonymous_bypas
             .build()
             .expect("tenant context")
     };
-    for context in [tenant(1), tenant(2), SecurityContext::anonymous()] {
+    // The global snapshot serves tenant 2 too, so it asks `fresh` to revalidate.
+    for (context, fresh) in [
+        (tenant(1), false),
+        (tenant(2), true),
+        (SecurityContext::anonymous(), false),
+    ] {
         cache
             .batch_get_entities(
                 &context,
                 BatchGetEntitiesRequest {
                     items: vec![gts_key(TYPE).into()],
                     projection: full(),
-                    fresh: false,
+                    fresh,
                 },
             )
             .await

@@ -68,7 +68,7 @@ mod tests {
         assert!(parsed.contains(EntityField::Content));
         assert_eq!(
             parsed.canonical(),
-            "content,gts_id,gts_uuid,kind,lifecycle_status"
+            "content,gts_id,gts_uuid,kind,lifecycle_status,ownership"
         );
     }
 

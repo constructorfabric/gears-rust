@@ -3421,10 +3421,19 @@ async fn a_batch_resolution_is_bounded_on_its_raw_count() {
     let empty = call(&router, batch_resolve(&json!({ "items": [] }))).await;
     assert_batch_count_refused(&empty, 0);
 
+    register_entity(&router, "arrange", CF_TYPE).await;
     let at_ceiling = vec![CF_TYPE; MAX_BATCH_GET_KEYS];
     let response = call(&router, batch_resolve(&keys(&at_ceiling))).await;
     assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
-    assert_eq!(response.body["items"].as_array().expect("items").len(), 1);
+    assert_eq!(
+        response.body["items"],
+        json!([{
+            "entity_key": CF_TYPE,
+            "status": "found",
+            "identity": { "gts_id": CF_TYPE, "gts_uuid": gts::GtsId::try_new(CF_TYPE).expect("identifier").to_uuid() },
+        }]),
+        "duplicates count toward the bound, then collapse to one result"
+    );
 
     let past_ceiling = vec![CF_TYPE; MAX_BATCH_GET_KEYS + 1];
     let response = call(&router, batch_resolve(&keys(&past_ceiling))).await;
@@ -4115,26 +4124,41 @@ async fn seed_entities(db: &Arc<DBProvider<DbError>>, count: u32) -> Vec<String>
 
 /// Insert the given identifiers as active global Type Schemas of one family.
 async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
+    seed_owned(db, ids, None).await;
+}
+
+/// Insert the given identifiers as active Type Schemas of one family, owned by
+/// `owner` or global.
+async fn seed_owned(db: &Arc<DBProvider<DbError>>, ids: &[&str], owner: Option<uuid::Uuid>) {
     use types_registry::domain::enums::{EntityKind, OwnershipScope};
     use types_registry::domain::ports::{NewEntity, NewRevision};
     use types_registry::infra::storage::repo::{EntityRepo, TypeSchemaRepo, VersionFamilyRepo};
 
     let now = time::OffsetDateTime::now_utc();
-    let owned: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    let seeded: Vec<String> = ids.iter().map(|id| (*id).to_owned()).collect();
+    let ownership_scope = if owner.is_some() {
+        OwnershipScope::Tenant
+    } else {
+        OwnershipScope::Global
+    };
     db.transaction(move |tx| {
         Box::pin(async move {
             let scope = common::allow_all();
             let (family, _) = VersionFamilyRepo::create_or_get(
                 tx,
                 &scope,
-                "gts.cf.core.example.seed",
-                OwnershipScope::Global,
-                None,
+                if owner.is_some() {
+                    "gts.cf.core.example.owned"
+                } else {
+                    "gts.cf.core.example.seed"
+                },
+                ownership_scope,
+                owner,
                 now,
             )
             .await
             .expect("family");
-            for id in &owned {
+            for id in &seeded {
                 let row = EntityRepo::insert(
                     tx,
                     &scope,
@@ -4143,8 +4167,8 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
                         gts_id: id.clone(),
                         entity_kind: EntityKind::TypeSchema,
                         family_id: family.id,
-                        ownership_scope: OwnershipScope::Global,
-                        owner_tenant_id: None,
+                        ownership_scope,
+                        owner_tenant_id: owner,
                         owning_gear: Some("types-registry".to_owned()),
                         now,
                     },
@@ -4185,10 +4209,84 @@ async fn seed_ids(db: &Arc<DBProvider<DbError>>, ids: &[&str]) {
 // `$select` on the exact read and `:batchGet` (T22b)
 // ---------------------------------------------------------------------------
 
-const DEFAULT_FIELDS: [&str; 5] = ["gts_id", "gts_uuid", "kind", "lifecycle_status", "origin"];
+const DEFAULT_FIELDS: [&str; 6] = [
+    "gts_id",
+    "gts_uuid",
+    "kind",
+    "lifecycle_status",
+    "origin",
+    "ownership",
+];
 
 fn exact(key: &str, query: &str) -> Request<Body> {
     get(&format!("{PLATFORM}/entities/{key}{query}"))
+}
+
+/// P0 stores no tenant-owned entity, so a read that reaches one refuses on both
+/// planes before it answers anything about it — even an unchanged answer to a
+/// matching validator, or a bare pair.
+#[tokio::test]
+async fn every_read_refuses_a_tenant_owned_row_in_p0() {
+    let (router, db) = router_and_db().await;
+    let id = format!("{}cf.core.example.seed.v1~", gts::GTS_ID_PREFIX);
+    seed_owned(&db, &[&id], Some(uuid::Uuid::from_u128(7))).await;
+    let etag = format!(
+        "\"{}\"",
+        types_registry::domain::validator::Validator::compute(1, Some(&[0x11])).encode()
+    );
+    for plane in [PLATFORM, V2] {
+        let conditional = Request::builder()
+            .method("GET")
+            .uri(format!("{plane}/entities/{id}"))
+            .header("if-none-match", etag.as_str())
+            .body(Body::empty())
+            .expect("request");
+        for (what, request) in [
+            ("exact", get(&format!("{plane}/entities/{id}"))),
+            ("conditional exact", conditional),
+            (
+                "conditional batch",
+                post(
+                    &format!("{plane}/entities:batchGet"),
+                    &json!({ "items": [{ "entity_key": id, "if_none_match": etag }] }),
+                ),
+            ),
+            (
+                "resolution",
+                post(
+                    &format!("{plane}/entities:batchResolve"),
+                    &json!({ "items": [{ "entity_key": id }] }),
+                ),
+            ),
+            ("discovery", get(&format!("{plane}/entities"))),
+        ] {
+            let response = call_raw(&router, request).await;
+            assert_eq!(
+                response.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{plane} {what}: {:?}",
+                response.body
+            );
+        }
+    }
+}
+
+/// The row fetched past a discovery page decides its cursor, so a tenant-owned one
+/// right after the page boundary refuses the page too.
+#[tokio::test]
+async fn discovery_refuses_a_tenant_owned_row_past_the_page_boundary() {
+    let (router, db) = router_and_db().await;
+    let global = format!("{}cf.core.example.seed.v1~", gts::GTS_ID_PREFIX);
+    let owned = format!("{}cf.core.example.seed.v2~", gts::GTS_ID_PREFIX);
+    seed_ids(&db, &[&global]).await;
+    seed_owned(&db, &[&owned], Some(uuid::Uuid::from_u128(7))).await;
+    let response = call_raw(&router, discover("?limit=1")).await;
+    assert_eq!(
+        response.status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "{:?}",
+        response.body
+    );
 }
 
 /// A batch read of `keys` under one body `$select`.
@@ -4261,7 +4359,14 @@ async fn each_document_is_selected_alone() {
     ] {
         let response = call(&router, exact(CF_TYPE, &format!("?$select={field}"))).await;
         assert_eq!(response.status, StatusCode::OK, "{:?}", response.body);
-        let mut expected = vec![field, "gts_id", "gts_uuid", "kind", "lifecycle_status"];
+        let mut expected = vec![
+            field,
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership",
+        ];
         expected.sort_unstable();
         assert_eq!(field_names(&response.body), expected, "{field}");
         assert!(
@@ -4288,7 +4393,13 @@ async fn each_document_is_selected_alone() {
     ] {
         assert_eq!(
             field_names(entity),
-            ["gts_id", "gts_uuid", "kind", "lifecycle_status"]
+            [
+                "gts_id",
+                "gts_uuid",
+                "kind",
+                "lifecycle_status",
+                "ownership"
+            ]
         );
         assert_eq!(entity["gts_id"], CF_INSTANCE);
         assert_eq!(entity["kind"], "instance");
@@ -4317,12 +4428,20 @@ async fn a_mixed_batch_omits_type_schema_documents_on_the_instance() {
             "gts_uuid",
             "kind",
             "lifecycle_status",
+            "ownership",
             "resolved_schema"
         ]
     );
     assert_eq!(
         field_names(instance),
-        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"],
+        [
+            "content",
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership"
+        ],
         "an inapplicable document is absent, not null",
     );
     assert_eq!(instance["content"], json!({ "name": "first" }));
@@ -4342,7 +4461,14 @@ async fn provenance_is_a_type_schema_group_absent_on_instances() {
     let instance = &batch.body["items"][1]["entity"];
     assert_eq!(
         field_names(schema),
-        ["gts_id", "gts_uuid", "kind", "lifecycle_status", SELECT],
+        [
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership",
+            SELECT
+        ],
     );
     assert_eq!(
         schema[SELECT],
@@ -4351,7 +4477,13 @@ async fn provenance_is_a_type_schema_group_absent_on_instances() {
     );
     assert_eq!(
         field_names(instance),
-        ["gts_id", "gts_uuid", "kind", "lifecycle_status"],
+        [
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership"
+        ],
         "an Instance omits the group, rather than reporting null or an empty one",
     );
 
@@ -4423,7 +4555,14 @@ async fn a_tombstone_selected_for_content_still_reports_its_lifecycle() {
     assert_eq!(single.status, StatusCode::OK, "{:?}", single.body);
     assert_eq!(
         field_names(&single.body),
-        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"]
+        [
+            "content",
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership"
+        ]
     );
     assert_eq!(single.body["kind"], json!("type_schema"));
     assert_eq!(single.body["lifecycle_status"], json!("deleted"));
@@ -4653,6 +4792,7 @@ async fn discovery_projects_selected_documents_across_pages() {
                 "gts_uuid",
                 "kind",
                 "lifecycle_status",
+                "ownership",
                 "resolved_schema"
             ]
         );
@@ -4660,7 +4800,14 @@ async fn discovery_projects_selected_documents_across_pages() {
     }
     assert_eq!(
         field_names(&items[2]),
-        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"],
+        [
+            "content",
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership"
+        ],
         "the Instance has no resolved_schema",
     );
 
@@ -4684,7 +4831,13 @@ async fn a_page_under_a_metadata_only_selection_carries_only_it() {
     for item in page.body["items"].as_array().expect("items") {
         assert_eq!(
             field_names(item),
-            ["gts_id", "gts_uuid", "kind", "lifecycle_status"]
+            [
+                "gts_id",
+                "gts_uuid",
+                "kind",
+                "lifecycle_status",
+                "ownership"
+            ]
         );
     }
 }
@@ -4947,6 +5100,7 @@ async fn discovery_narrows_by_kind_and_intersects_with_pattern_and_select() {
             "gts_uuid": gts::GtsId::try_new(CF_INSTANCE).expect("id").to_uuid(),
             "kind": "instance",
             "lifecycle_status": "active",
+            "ownership": "global",
             "content": { "name": "first" },
         }]),
     );
@@ -5162,6 +5316,28 @@ fn a_submitted_item_publishes_exactly_its_fields() {
     assert_eq!(item["required"], json!(["gts_id", "content"]));
 }
 
+/// `ownership` is a string enum of exactly three values, referenced by every entity.
+#[test]
+fn ownership_is_a_three_value_enum_in_the_generated_document() {
+    let doc = generated_openapi();
+    let schemas = &doc["components"]["schemas"];
+    let ownership = &schemas["EntityDto"]["properties"]["ownership"];
+    assert_eq!(
+        ownership["$ref"], "#/components/schemas/OwnershipDto",
+        "{ownership}"
+    );
+    assert_eq!(
+        (
+            &schemas["OwnershipDto"]["type"],
+            &schemas["OwnershipDto"]["enum"]
+        ),
+        (
+            &json!("string"),
+            &json!(["global", "context_tenant", "ancestor_tenant"])
+        )
+    );
+}
+
 /// All three database-backed reads answer with the one `EntityDto`, whose
 /// identity, kind and lifecycle are required and never `null`.
 #[test]
@@ -5171,7 +5347,13 @@ fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_docum
     let entity = &schemas["EntityDto"];
     assert_eq!(
         entity["required"],
-        json!(["gts_id", "gts_uuid", "kind", "lifecycle_status"])
+        json!([
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership"
+        ])
     );
     assert_eq!(entity["properties"]["gts_id"]["type"], "string");
     assert_eq!(
@@ -5202,6 +5384,7 @@ fn every_entity_read_requires_identity_kind_and_lifecycle_in_the_generated_docum
             "kind",
             "lifecycle_status",
             "origin",
+            "ownership",
             "provenance",
             "resolved_schema",
         ],
@@ -5321,7 +5504,13 @@ async fn depth_is_an_inclusive_segment_maximum_on_roots_derived_schemas_and_inst
         for item in page.body["items"].as_array().expect("items") {
             assert_eq!(
                 field_names(item),
-                ["gts_id", "gts_uuid", "kind", "lifecycle_status"]
+                [
+                    "gts_id",
+                    "gts_uuid",
+                    "kind",
+                    "lifecycle_status",
+                    "ownership"
+                ]
             );
         }
     }
@@ -5471,7 +5660,14 @@ async fn toolkit_select_extraction_and_the_v1_cursor_work_together() {
     assert_eq!(resumed.status, StatusCode::OK, "{:?}", resumed.body);
     assert_eq!(
         field_names(&resumed.body["items"][0]),
-        ["content", "gts_id", "gts_uuid", "kind", "lifecycle_status"]
+        [
+            "content",
+            "gts_id",
+            "gts_uuid",
+            "kind",
+            "lifecycle_status",
+            "ownership"
+        ]
     );
 }
 

@@ -1,7 +1,8 @@
 //! Positive-only LRU of registry-confirmed identity pairs. It has its own recency
 //! and no validator, expiry or mutation invalidation. Deleted entities still
-//! resolve in P0. A tenant cache answers a pair only to a read context that the
-//! registry showed it to.
+//! resolve in P0. A tenant cache answers a pair a read or discovery classified as
+//! global to every authenticated reader, and any other pair only to a read context
+//! that the registry showed it to.
 //!
 //! After purge (ADR-0013, deferred) or a logical registry change, recreate the
 //! cached client or restart its consumer. `NotFound` alone leaves identities intact.
@@ -24,6 +25,9 @@ pub struct Identities {
 
 struct Record {
     gts_id: Arc<GtsId>,
+    /// Whether the entity is global, once a reply carrying the entity said so.
+    /// A bare resolution leaves it unknown; a contradiction makes it unknown again.
+    global: Option<bool>,
     /// Identifies this residency. Proofs hold it weakly, so eviction retires them
     /// even if the pair is learned again.
     incarnation: Arc<()>,
@@ -59,6 +63,31 @@ impl Identities {
             EntityKey::GtsUuid(uuid) => *uuid,
         };
         store.contains(&gts_uuid).then_some(gts_uuid)
+    }
+
+    /// Whether the pair for `gts_uuid` is known to be global, without promoting it.
+    pub fn is_global(&self, gts_uuid: Uuid) -> Option<bool> {
+        self.by_uuid.as_ref()?.peek(&gts_uuid)?.global
+    }
+
+    /// Record what an entity-carrying reply said of a resident pair's ownership.
+    pub fn classify(&mut self, gts_uuid: Uuid, global: bool) {
+        if let Some(record) = self
+            .by_uuid
+            .as_mut()
+            .and_then(|store| store.peek_mut(&gts_uuid))
+        {
+            record.global = match record.global {
+                None => Some(global),
+                Some(known) if known == global => Some(known),
+                Some(_) => None,
+            };
+        }
+    }
+
+    /// The remembered identifier for `gts_uuid`, without promoting it.
+    pub fn peek_id(&self, gts_uuid: Uuid) -> Option<&GtsId> {
+        Some(self.by_uuid.as_ref()?.peek(&gts_uuid)?.gts_id.as_ref())
     }
 
     /// The current residency of the pair for `gts_uuid`, without promoting it.
@@ -102,6 +131,7 @@ impl Identities {
             gts_uuid,
             Record {
                 gts_id: Arc::clone(&id),
+                global: None,
                 incarnation: Arc::default(),
             },
         );

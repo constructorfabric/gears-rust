@@ -334,21 +334,28 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
   Use `fresh` to check immediately. Observed terminal successes invalidate affected
   platform entries. Unobserved changes may remain cached until expiry. The cache
   skips `NotFound`, failed reads, discovery pages and operation resources.
-- `CachedTypesRegistry` shares one snapshot across tenants. A tenant's first read
-  can confirm it with its `ETag`. Up to `max_entries` confirmations are retained
-  for `freshness_window`, keyed by entity and read context: subject, subject type,
-  subject tenant and the raw token scope list. Read contexts never share one, since
-  the registry may authorize each entity per subject. Another bearer with the same
-  claims shares it. Anonymous calls bypass the cache. REST misses require the
-  caller's bearer. `NotFound` clears the read context's confirmation for that key
-  and fences its pending reads. Refusals change no confirmation. Resolution answers
-  a pair locally only when the registry showed it to the same read context within
-  the window, through a read or a resolution; discovery shows it to none.
+- `CachedTypesRegistry` shares one snapshot across tenants. For tenant-owned and
+  unclassified entities, a tenant's first read can confirm it with its `ETag`. Up to
+  `max_entries` confirmations are retained for `freshness_window`, keyed by entity
+  and read context: subject, subject type,
+  subject tenant and the raw token scope list. Read contexts never share one,
+  since from P1 the registry scopes reads per subject by constraints the SDK
+  cannot apply. Another bearer with the same claims shares it. Anonymous calls
+  bypass the cache. REST misses require the caller's bearer. `NotFound` clears the
+  read context's confirmation for that key and fences its pending reads. Refusals
+  change no confirmation. A pair not known global resolves locally only when the
+  registry showed it to the same read context within the window, through a read or
+  a resolution; discovery shows such a pair to none. Global entities are readable by every
+  authenticated subject, so a fresh global snapshot and a known-global pair serve
+  every authenticated read context without a request of its own; a `NotFound` for a
+  global entity drops its shared snapshot. A pair a read or discovery classified as
+  global resolves for every authenticated reader, from a resident snapshot whatever
+  its freshness or from the identity LRU, since pairs never change.
 - Both caches learn both keys from exact reads, resolutions and discovery.
   Discovery leaves snapshots and their freshness unchanged. The separate identity
   LRU holds `max_identity_entries` pairs (16 384) without expiry and survives
-  observed mutations. Set the bound to zero to resolve from fresh snapshots or
-  `:batchResolve`. After purge (ADR-0013, deferred) or when switching logical
+  observed mutations. Set the bound to zero to resolve from fresh snapshots (tenant
+  resolution of a known-global pair also accepts a stale one) or `:batchResolve`. After purge (ADR-0013, deferred) or when switching logical
   registries, recreate the cached client or restart its consumer. Otherwise old
   pairs may still resolve offline.
 - Legacy and new catalogues share seeds but no later writes until T38. Dependencies
@@ -357,6 +364,14 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
   reconciliation deadlines and `worker.operation_timeout` above it.
 
 ## Reading
+
+Every `Entity` carries `ownership` (`Global`, `ContextTenant` or `AncestorTenant`). Remote clients
+require it, so upgrade the registry before the gears that read it over REST.
+
+Platform reads see global entities only. Read a tenant's own types under that
+tenant's service account through `TypesRegistryApi`; read platform contracts the
+gear uses for its own work through the platform client, which shares one cache
+across all callers.
 
 ```rust,no_run
 use toolkit::client_hub::ClientHub;
@@ -371,7 +386,7 @@ async fn read(hub: &ClientHub) -> anyhow::Result<()> {
     let ctx = PlatformSecurityContext::outbound_marker();
     let type_id = GtsTypeId::try_new("gts.cf.example.events.user_created.v1~")?;
 
-    // Document-free by default: identity, kind, lifecycle and origin.
+    // Document-free by default: identity, kind, lifecycle, ownership and origin.
     let light = registry.get_type_schema(&ctx, &type_id, ReadOptions::default()).await?;
 
     // Select documents explicitly.

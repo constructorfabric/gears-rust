@@ -211,6 +211,7 @@ impl types_registry_sdk::PlatformTypesRegistryApi for ConstantTypeRegistry {
                                 gts_uuid: uuid,
                                 kind: types_registry_sdk::EntityKind::TypeSchema,
                                 lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+                                ownership: types_registry_sdk::Ownership::Global,
                                 origin: None,
                                 content: None,
                                 resolved_schema: None,
