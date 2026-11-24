@@ -1,3 +1,5 @@
+//! [`DirectoryClient`] for replicas that share a [`DirectoryBackend`].
+
 use crate::directory_backend::{DirectoryBackend, DirectoryBackendError};
 use crate::local_directory_client::{
     LocalDirectoryClient, conflict_error, not_found, parse_instance_id, registered_instance,
@@ -23,6 +25,8 @@ pub struct ReplicatedDirectoryClient {
 }
 
 impl ReplicatedDirectoryClient {
+    /// Create a client that writes through `backend` and serves reads from
+    /// `replica`.
     pub fn new(replica: Arc<DirectoryReplica>, backend: Arc<dyn DirectoryBackend>) -> Self {
         Self {
             local: LocalDirectoryClient::new(Arc::clone(replica.manager())),
