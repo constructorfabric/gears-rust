@@ -44,7 +44,9 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt as _;
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::{
+    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
+};
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::domain::ports::LeaseStore as _;
@@ -895,4 +897,33 @@ async fn a_lease_that_expires_while_a_bulk_deactivate_waits_on_its_quota_is_left
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lease_that_expires_while_a_bulk_deactivate_waits_on_a_counter_is_left_to_the_sweeper() {
     deactivate_while_the_lease_runs_out(Held::Counter).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bulk_deactivate_locks_no_cascade_row_of_a_quota_its_grant_does_not_admit() {
+    let h = PgHarness::up().await;
+    let admitted = h.quota("u1", 100).await;
+    let other = h.quota("u2", 100).await;
+    h.lease(&["u2"], "l").await;
+    // Another writer holds the counter the lease on `other` settles against.
+    let (holder, release) = h.hold(Held::Counter(other)).await;
+    let mut envelope = deactivation("off", &[other]);
+    // The item names `other` under a grant for `admitted` alone.
+    envelope.items[0].scope = AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant().as_uuid()]),
+        ScopeFilter::eq(pep_properties::RESOURCE_ID, admitted.as_uuid()),
+    ]));
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.quotas.bulk_deactivate_quotas(&actor(), &envelope),
+    )
+    .await
+    .expect("it does not wait on a row its grant does not admit");
+    assert_eq!(
+        refused,
+        Err(StoreError::QuotaNotFound { id: other }.at_item(0))
+    );
+    release.send(()).expect("release");
+    holder.await.expect("join").expect("holder commits");
+    h.down().await;
 }

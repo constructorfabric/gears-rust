@@ -17,7 +17,9 @@ use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::{
+    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
+};
 
 use crate::domain::ports::{LeaseStore, QuotaStore, StoreError};
 use crate::infra::storage::entity::{
@@ -499,6 +501,50 @@ async fn a_bulk_deactivate_resolves_a_shared_lease_under_the_earlier_item() {
             .count(),
         1
     );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_bulk_deactivate_under_one_quota_grants_resolves_the_shared_lease() {
+    let h = Harness::up().await;
+    let low = h.quota("u1", Some(10)).await;
+    let high = h.quota("u1", Some(20)).await;
+    let lease = h.lease("u1", 4, "shared").await;
+    // What a PDP grant for one Quota compiles to, item by item.
+    let only = |id: QuotaId| BulkDeactivateEntry {
+        scope: AccessScope::single(ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant().as_uuid()]),
+            ScopeFilter::eq(pep_properties::RESOURCE_ID, id.as_uuid()),
+        ])),
+        ..deactivate_entry(id)
+    };
+    let envelope = BulkDeactivateEnvelope {
+        tenant_id: tenant(),
+        idempotency: envelope_write(OperationType::BulkDeactivateQuotas, "off", 1),
+        items: vec![only(low), only(high)],
+    };
+    let outcome = h
+        .quotas
+        .bulk_deactivate_quotas(&actor(), &envelope)
+        .await
+        .expect("bulk deactivate")
+        .into_inner();
+    assert_eq!(
+        outcome.items[0].resolved_leases,
+        vec![lease],
+        "the first item that holds the lease resolves it"
+    );
+    assert_eq!(outcome.items[1].resolved_leases, Vec::new());
+    let conn = h.db.conn().expect("connection");
+    let row = lease::Entity::find()
+        .filter(lease::Column::Token.eq(lease.as_uuid()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .one(&conn)
+        .await
+        .expect("read lease")
+        .expect("the lease row");
+    assert_eq!(row.state, STATE_RESOLVED_BY_DEACTIVATION);
     h.down().await;
 }
 

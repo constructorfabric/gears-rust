@@ -8,7 +8,7 @@ use quota_enforcement_sdk::engine::{
 };
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, Decision, DecisionResult, EvaluatedMutation,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, NO_APPLICABLE_QUOTA,
+    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseToken, NO_APPLICABLE_QUOTA,
     NotificationEventKind, OperationType, PartialIdempotencyWrite, PayloadHash, PeriodType,
     PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaType, Retention,
     RollbackTarget, StorageError, TransitionOutcome,
@@ -19,8 +19,10 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
-use toolkit_db::secure::{SecureDeleteExt, SecureUpdateExt};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_db::secure::{SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
+use toolkit_security::{
+    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
+};
 
 use super::SqlConsumptionStore;
 use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore, StoreError};
@@ -334,6 +336,23 @@ impl Harness {
         .expect("read the period row")
         .expect("the period row exists")
         .consumed
+    }
+
+    /// The counter of the period row that contains `at`, read directly: a
+    /// snapshot shows only the current period.
+    async fn consumed_in_period_of(&self, id: QuotaId, at: OffsetDateTime) -> i64 {
+        let conn = self.db.conn().expect("conn");
+        counter::Entity::find()
+            .filter(counter::Column::QuotaId.eq(id.as_uuid()))
+            .filter(counter::Column::PeriodStart.lte(at))
+            .filter(counter::Column::PeriodEnd.gt(at))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .one(&conn)
+            .await
+            .expect("read the period row")
+            .expect("the period row exists")
+            .consumed
     }
 
     async fn pin_versions_at_max(&self, id: QuotaId) {
@@ -1335,6 +1354,61 @@ async fn a_period_holding_a_live_lease_is_not_settled() {
 }
 
 #[tokio::test]
+async fn closing_a_period_stores_the_total_its_rollover_event_reports() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(1000), Vec::new()).await;
+    h.debit("u1", 70, &write(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit on day one");
+    h.acquire("u1", 30, TTL, &write(OperationType::Reserve, "r1", 2))
+        .await
+        .expect("acquire on day one");
+    assert_eq!(h.consumed("u1", id).await, 100, "70 debited plus 30 held");
+
+    // Day two. The hold expired unused and nothing has returned it, so the
+    // first writer of the new period returns it while it closes day one.
+    let day_two = DAY_ONE + time::Duration::days(1);
+    h.set_now(day_two);
+    h.debit("u1", 5, &write(OperationType::Debit, "d2", 3))
+        .await
+        .expect("debit on day two");
+
+    let rollover = enqueued_messages(&h.db)
+        .await
+        .into_iter()
+        .find(|message| message.payload_type == NotificationEventKind::PeriodRollover.as_str())
+        .expect("day one closed");
+    let event: serde_json::Value =
+        serde_json::from_slice(&rollover.payload).expect("event payload");
+    assert_eq!(
+        event["payload"]["closing_consumed"],
+        serde_json::json!(70),
+        "the event reports day one without the expired hold"
+    );
+    assert_eq!(
+        h.consumed_in_period_of(id, DAY_ONE).await,
+        70,
+        "the stored row says what the event says"
+    );
+
+    // Neither a sweep nor a later writer moves the closed row again.
+    h.store
+        .reclaim_expired_leases(10, day_two)
+        .await
+        .expect("sweep");
+    h.debit("u1", 5, &write(OperationType::Debit, "d3", 4))
+        .await
+        .expect("another debit on day two");
+    assert_eq!(h.consumed_in_period_of(id, DAY_ONE).await, 70);
+    assert_eq!(
+        h.consumed("u1", id).await,
+        10,
+        "day two counts only its own debits"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
 async fn a_zero_commit_reverses_as_a_no_op_while_a_denied_debit_stays_irreversible() {
     let h = Harness::up().await;
     let id = h.allocation_quota("u1", Some(100)).await;
@@ -2035,6 +2109,179 @@ async fn a_commit_refuses_a_hold_a_faster_clock_already_returned() {
         "{committed:?}"
     );
     assert_eq!(h.consumed("u1", id).await, 10, "nothing was charged");
+    h.down().await;
+}
+
+/// What a PDP grant for one lease compiles to: the tenant, and that lease's
+/// token as the resource.
+fn only_lease(token: LeaseToken) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant().as_uuid()]),
+        ScopeFilter::eq(pep_properties::RESOURCE_ID, token.as_uuid()),
+    ]))
+}
+
+#[tokio::test]
+async fn a_grant_for_one_lease_commits_that_lease_and_no_other() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let mine = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("an allowed acquisition holds");
+    let theirs = h
+        .acquire("u1", 30, TTL, &write(OperationType::Reserve, "r2", 2))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("an allowed acquisition holds");
+    assert_eq!(h.consumed("u1", id).await, 70, "both leases hold");
+
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &only_lease(mine),
+            mine,
+            Some(25),
+            &partial("c1", 3),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Ok(TransitionOutcome::Applied(_))),
+        "{committed:?}"
+    );
+    assert_eq!(
+        h.consumed("u1", id).await,
+        55,
+        "25 kept of the first lease, the other lease's 30 still held"
+    );
+    let replayed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &only_lease(mine),
+            mine,
+            Some(25),
+            &partial("c1", 3),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(replayed, Ok(TransitionOutcome::NoOp(_))),
+        "{replayed:?}"
+    );
+
+    let refused = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &only_lease(mine),
+            theirs,
+            Some(10),
+            &partial("c2", 4),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(StorageError::LeaseNotFound { token }) if token == theirs),
+        "{refused:?}"
+    );
+    assert_eq!(
+        h.consumed("u1", id).await,
+        55,
+        "the other lease is untouched"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_grant_for_one_lease_releases_that_lease() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let token = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("an allowed acquisition holds");
+    assert_eq!(h.consumed("u1", id).await, 40);
+
+    let released = h
+        .store
+        .release_lease(&ctx(), &only_lease(token), token, &partial("x1", 2), &[])
+        .await;
+    assert!(
+        matches!(released, Ok(TransitionOutcome::Applied(_))),
+        "{released:?}"
+    );
+    assert_eq!(
+        h.consumed("u1", id).await,
+        0,
+        "the hold went back to the period"
+    );
+    h.down().await;
+}
+
+/// What a PDP grant for one Quota compiles to: the tenant, and that Quota's
+/// id as the resource.
+fn only_quota(id: QuotaId) -> AccessScope {
+    AccessScope::single(ScopeConstraint::new(vec![
+        ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![tenant().as_uuid()]),
+        ScopeFilter::eq(pep_properties::RESOURCE_ID, id.as_uuid()),
+    ]))
+}
+
+#[tokio::test]
+async fn a_grant_for_one_quota_resolves_the_leases_that_hold_it() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let token = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("an allowed acquisition holds");
+    assert_eq!(
+        h.period_consumed(id).await,
+        40,
+        "the hold occupies the period"
+    );
+
+    let outcome = h
+        .quotas
+        .deactivate_quota(&actor(), &only_quota(id), id, &[])
+        .await
+        .expect("deactivate");
+    assert_eq!(
+        outcome.resolved_leases,
+        vec![token],
+        "the cascade resolves the lease that holds the Quota"
+    );
+    assert_eq!(h.period_consumed(id).await, 0, "and gives its hold back");
+
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            Some(10),
+            &partial("c1", 2),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::LeaseNotActive { .. })),
+        "a lease the cascade resolved charges nothing: {committed:?}"
+    );
     h.down().await;
 }
 
