@@ -17,8 +17,8 @@ version: 1.0
 Use this when writing or running tests.
 
 ## Test Strategy
-- Follow the repository test pyramid and command split. Evidence: `docs/TESTING.md:8-38`
-- Maintain the documented 80% line-coverage target. Evidence: `docs/TESTING.md:42-79`
+- Follow the repository test pyramid and command split. Evidence: `docs/toolkit_unified_system/15_testing_and_ci.md:8-38`
+- Maintain the documented 80% line-coverage target. Evidence: `docs/toolkit_unified_system/15_testing_and_ci.md:63-110`
 - Use crate-level `tests/` suites for HTTP/router integration behavior. Evidence: `gears/system/account-management/account-management/tests/api_users_test.rs:1-60`
 - Use `trybuild` compile-fail suites for type-system and security invariants. Evidence: `libs/toolkit/tests/typed_builder_compilefail.rs:1-21`, `libs/toolkit-db/tests/ui.rs:1-10`
 

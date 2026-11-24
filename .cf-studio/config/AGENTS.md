@@ -70,30 +70,4 @@ ALWAYS open and follow `{cf-studio-path}/config/rules/anti-patterns.md` WHEN rev
 
 ALWAYS register new gears under `gears/<gear_name>/` as a `children[]` entry of the root `cf-gears` system in `artifacts.toml` WHEN adding a new gear / subsystem
 
-ALWAYS open `docs/toolkit_unified_system/01_overview.md` WHEN onboarding to ToolKit, understanding core concepts, or reviewing the golden path for module development
-
-ALWAYS open `docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md` WHEN starting to define requirements, architecture design, or implement any module; creating new gear directory structure; deciding where to place files; understanding SDK pattern; creating Cargo.toml; naming data types; implementing local client; registering module in cf-gears-example-server; or creating QUICKSTART.md
-
-ALWAYS open `docs/toolkit_unified_system/03_clienthub_and_plugins.md` WHEN implementing inter-module communication via ClientHub, registering or resolving typed clients, implementing plugin architecture, creating main module with plugins, or registering scoped clients via GTS
-
-ALWAYS open `docs/toolkit_unified_system/03_clienthub_and_plugins.md` AND `docs/TOOLKIT_PLUGINS.md` WHEN implementing full plugin architecture with GTS schema/instance registration, plugin selection, or studying the tenant-resolver reference implementation
-
-ALWAYS open `docs/toolkit_unified_system/04_rest_operation_builder.md` WHEN adding REST endpoints, creating DTOs, implementing handlers, using OperationBuilder, adding SSE events, or configuring endpoint authentication
-
-ALWAYS open `docs/toolkit_unified_system/05_errors_rfc9457.md` WHEN implementing error handling, creating DomainError, mapping errors to Problem (RFC-9457), defining SDK errors, or adding From impls for error conversion
-
-ALWAYS open `docs/toolkit_unified_system/06_authn_authz_secure_orm.md` WHEN adding SeaORM entities, using SecureConn, implementing AuthN/AuthZ, using PolicyEnforcer PEP pattern, or working with AccessScope from PDP constraints
-
-ALWAYS open `docs/toolkit_unified_system/11_database_patterns.md` WHEN implementing repositories, creating database migrations, using DBRunner/SecureTx, or implementing transaction patterns
-
-ALWAYS open `docs/toolkit_unified_system/07_odata_pagination_select_filter.md` WHEN adding OData filtering, pagination, $select, $orderby, implementing ODataFilterable derive, creating FieldToColumn/ODataFieldMapping, or using cursor-based pagination
-
-ALWAYS open `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md` WHEN using #[toolkit::gear] macro, implementing Gear trait, registering clients in ClientHub, configuring gear lifecycle, or using WithLifecycle/CancellationToken for background tasks
-
-ALWAYS open `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md` WHEN creating out-of-process gear, implementing gRPC service, setting up OoP binary, or wiring gRPC clients via DirectoryApi
-
-ALWAYS open `docs/toolkit_unified_system/10_checklists_and_templates.md` WHEN writing module tests, creating SecurityContext for tests, implementing integration tests, or looking for quick checklists and code templates
-
-ALWAYS open `docs/toolkit_unified_system/12_unit_testing.md` WHEN writing unit tests, setting up test infrastructure, creating test fixtures, implementing mock-based tests, or defining test file organization (`*_tests.rs` pattern)
-
-ALWAYS open `docs/toolkit_unified_system/13_e2e_testing.md` WHEN writing end-to-end tests, setting up E2E test infrastructure, implementing cross-module integration tests, or working with the `testing/e2e/` directory
+ALWAYS open `docs/toolkit_unified_system/README.md` and follow its Task → Document routing table WHEN onboarding to ToolKit, or creating or changing a gear, SDK crate, ClientHub client, plugin, REST endpoint, OData query, database access, error handling, lifecycle or background task, out-of-process gear, or tests; load only the documents the table names for the task

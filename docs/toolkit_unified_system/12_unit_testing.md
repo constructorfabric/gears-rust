@@ -3,7 +3,7 @@
 
 # Unit & Integration Testing Guide
 
-This document defines the philosophy, infrastructure, and patterns for unit and integration tests across all ToolKit gears. Gear-specific test plans (which test cases to add, gap analysis, domain-specific assertions) are out of scope. Commands, CI jobs and coverage rules are in [`docs/TESTING.md`](../TESTING.md).
+This document defines the philosophy, infrastructure, and patterns for unit and integration tests across all ToolKit gears. Gear-specific test plans (which test cases to add, gap analysis, domain-specific assertions) are out of scope. Commands, CI jobs and coverage rules are in [15_testing_and_ci.md](15_testing_and_ci.md).
 
 ---
 
@@ -213,7 +213,7 @@ not_found_maps_to_404
 a_rolled_back_enqueue_wakes_nothing
 ```
 
-[`docs/TESTING.md` §3](../TESTING.md#3-unit-tests) uses the same rule.
+[15 § 3](15_testing_and_ci.md#3-unit-tests) uses the same rule.
 
 ### Test File Organization
 

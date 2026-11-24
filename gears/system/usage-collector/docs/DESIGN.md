@@ -1161,7 +1161,7 @@ copying its fields and setting `entry_type` and the reason code.
 One `usage-collector-plugin-<backend>` crate per backend implements this trait
 under `plugins/<backend>/`. Each depends on `usage-collector-sdk`, never on the
 host crate. Registration, discovery, and vendor selection follow the
-platform pattern in [TOOLKIT_PLUGINS.md](../../../../docs/TOOLKIT_PLUGINS.md).
+platform pattern in [ToolKit plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins).
 The GTS spec is `usage-collector-sdk/src/v2/gts.rs`. There is no readiness probe
 and no flush. Availability is the conjunction of a cached selector and a
 resolvable scoped client. A plugin that buffers writes drains them on its own

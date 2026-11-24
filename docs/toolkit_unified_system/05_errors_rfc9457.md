@@ -1,6 +1,8 @@
 # Errors: CanonicalError and RFC 9457 Problem
 
-Gears report every failure as a `CanonicalError` (crate `libs/toolkit-canonical-errors`): one of 16 fixed categories (AIP-193), each with a default HTTP status and a GTS type id. The category catalogue, context schemas and wire examples are in [`docs/arch/errors/DESIGN.md`](../arch/errors/DESIGN.md) and [`docs/arch/errors/categories/`](../arch/errors/categories/); this page covers how gear code uses them.
+Gears report every failure as a `CanonicalError` (crate `libs/toolkit-canonical-errors`). The error system — the 16 categories, their HTTP statuses, GTS type ids, context schemas and wire examples — is designed in [`docs/arch/errors/DESIGN.md`](../arch/errors/DESIGN.md), with one page per category in [`docs/arch/errors/categories/`](../arch/errors/categories/). This page covers only how gear code uses it.
+
+**Design references:** [errors DESIGN](../arch/errors/DESIGN.md) · [errors PRD](../arch/errors/PRD.md) · [ADR 0001 categories](../arch/errors/ADR/0001-cpt-cf-adr-canonical-error-categories.md) · [ADR 0003 RFC 9457 wire format](../arch/errors/ADR/0003-cpt-cf-adr-rfc9457-wire-format.md) · [ADR 0005 SDK canonical projection](../arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md) · [ADR 0006 middleware catch-all](../arch/errors/ADR/0006-cpt-cf-adr-error-middleware-catchall.md)
 
 ```
 DomainError (domain/error.rs)
@@ -64,15 +66,16 @@ impl From<DomainError> for CanonicalError {
 | Builder | Required before `create()` |
 |---------|----------------------------|
 | `X::not_found(detail)`, `X::already_exists(detail)`, `X::data_loss(detail)` | `.with_resource(name)` |
-| `X::invalid_argument()` | `.with_field_violation(field, description, reason)`, `.with_format(..)` or `.with_constraint(..)` |
+| `X::invalid_argument()`, `X::out_of_range(detail)` | `.with_field_violation(field, description, reason)`, `.with_format(..)` or `.with_constraint(..)` |
 | `X::failed_precondition()` | `.with_precondition_violation(..)` |
 | `X::resource_exhausted(detail)` | `.with_quota_violation(..)` |
 | `X::permission_denied()`, `X::aborted(detail)` | `.with_reason(reason)` |
 | `CanonicalError::internal(detail)` | nothing (no resource type) |
 | `CanonicalError::unauthenticated()` | `.with_reason(reason)` |
 | `CanonicalError::service_unavailable()` | nothing; `.with_retry_after_seconds(..)` optional |
+| `X::deadline_exceeded(detail)` | nothing; `.with_reason(reason)` optional |
 
-The macro also generates `unknown`, `deadline_exceeded`, `unimplemented`, `cancelled` and `out_of_range`. Exact signatures: `libs/toolkit-canonical-errors/src/builder.rs` and `libs/toolkit-canonical-errors-macro/src/lib.rs`. A per-occurrence status override goes through `.with_override(TransportOverride)` (`libs/toolkit-canonical-errors/src/transport.rs`).
+The macro also generates `unknown`, `unimplemented` and `cancelled`. Exact signatures: `libs/toolkit-canonical-errors/src/builder.rs` and `libs/toolkit-canonical-errors-macro/src/lib.rs`. A per-occurrence status override goes through `.with_override(TransportOverride)` (`libs/toolkit-canonical-errors/src/transport.rs`); its rules (same status class, `type` stays authoritative) are in [DESIGN § Transport Overrides](../arch/errors/DESIGN.md#transport-overrides).
 
 ## Handlers
 
@@ -92,9 +95,9 @@ Declare the statuses an operation can return on its `OperationBuilder` (`.error_
 
 ## Wire format
 
-`IntoResponse for CanonicalError` converts it to `Problem` (`libs/toolkit-canonical-errors/src/problem.rs`) and responds with `Content-Type: application/problem+json` and the category's status (plus `Retry-After` when the context carries a retry hint). Serialized fields: `type` (GTS URI of the category), `title`, `status`, `detail`, `instance`, `trace_id`, `context` (category-specific, including `resource_type` / `resource_name`), and `error_code` / `error_domain` for typed contract errors.
+`IntoResponse for CanonicalError` (`libs/toolkit-canonical-errors/src/problem.rs`) responds with `Content-Type: application/problem+json`, the category's status, and `Retry-After` when the context carries a retry hint. The serialized fields are defined in [DESIGN § RFC 9457 Problem Wire Format](../arch/errors/DESIGN.md#rfc-9457-problem-wire-format). Typed contract errors (`#[derive(ContractError)]`) also carry `error_code` and `error_domain` ([contract binding DESIGN § D4](../arch/toolkit-contract-binding/DESIGN.md#d4-contracterror-derive)).
 
-`toolkit::api::canonical_error_middleware` (`libs/toolkit/src/api/canonical_error_layer.rs`) wraps every gear router — the api-gateway layers it in `gears/system/api-gateway/src/gear.rs`, OoP gears in `libs/toolkit/src/runtime/oop_serve.rs`. It fills missing `instance` and `trace_id`, logs 4xx at `warn` and 5xx at `error` (including the unredacted diagnostic of `internal` / `unknown`), and wraps any untyped error response (`text/plain` or no `Content-Type`) into a `Problem`. Responses with another content type, or tagged `ForeignPassthrough`, pass through untouched.
+`toolkit::api::canonical_error_middleware` (`libs/toolkit/src/api/canonical_error_layer.rs`) wraps every gear router — the api-gateway layers it in `gears/system/api-gateway/src/gear.rs`, OoP gears in `libs/toolkit/src/runtime/oop_serve.rs` — so a gear does not install it. It fills `instance` and `trace_id` when they are missing, logs 4xx at `warn` and 5xx at `error` (including the unredacted diagnostic of `internal` / `unknown`), and turns error responses with a `text/plain` body or no `Content-Type` into a `Problem`; error responses with any other content type, such as hand-built JSON, pass through unchanged. Catch-all and `ForeignPassthrough` rules: [DESIGN § Error Middleware](../arch/errors/DESIGN.md#error-middleware).
 
 ## Testing the mapping
 

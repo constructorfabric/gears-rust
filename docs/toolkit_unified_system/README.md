@@ -13,13 +13,14 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 
 | Task / Goal | Primary file(s) to read | Related external docs |
 |-------------|------------------------|----------------------|
+| Onboarding: what a gear is, core concepts, golden path | `00_gear_overview.md`, `01_overview.md` | |
 | Adding a new gear | `02_gear_layout_and_sdk_pattern.md` | |
 | AuthZ scopes, secure ORM (`Scopable`, `.secure().scope_with()`), AccessScope | `06_authn_authz_secure_orm.md` | |
 | DB execution (transactions, migrations, repos) | `11_database_patterns.md` | |
 | REST endpoint wiring, OperationBuilder | `04_rest_operation_builder.md` | |
 | OData, $select, pagination, filtering | `07_odata_pagination_select_filter.md` | |
 | ClientHub, inter-gear clients | `03_clienthub_and_plugins.md` | |
-| Plugins, scoped clients, GTS | `docs/TOOLKIT_PLUGINS.md` | `03_clienthub_and_plugins.md` (scoped clients) |
+| Plugins, scoped clients, GTS | `03_clienthub_and_plugins.md` § Plugins | |
 | Errors (`CanonicalError`, RFC 9457 wire format) | `05_errors_rfc9457.md` | `docs/arch/errors/DESIGN.md` |
 | Lifecycle, background tasks, cancellation | `08_lifecycle_stateful_tasks.md` | |
 | Out-of-Process / gRPC / SDK pattern | `09_oop_grpc_sdk_pattern.md` | |
@@ -28,6 +29,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 | Unit & integration testing (philosophy, patterns, infrastructure) | `12_unit_testing.md` | |
 | E2E testing (philosophy, patterns, infrastructure) | `13_e2e_testing.md` | |
 | DB behavior testing & audit (rules with no exceptions, audit method; choices with a price in TRADEOFFS) | `14_db_behavior_testing.md` | `docs/arch/database/TRADEOFFS.md` |
+| Test strategy, coverage thresholds, test commands, CI jobs, fuzzing | `15_testing_and_ci.md` | |
 | HTTP client (TLS, retries, timeouts, concurrency, OTel tracing, auth hook) | | `docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md` |
 | Client circuit breaker (`toolkit-resilience`, generated contract clients) | | `docs/adrs/toolkit/0005-toolkit-client-circuit-breaker.md` |
 | AuthN/AuthZ, PolicyEnforcer, PEP enforcement | `06_authn_authz_secure_orm.md` | `docs/arch/authorization/DESIGN.md` |
@@ -54,7 +56,7 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 - `00_gear_overview.md` – What the Gear is, core architecture, typical REST API request processing.
 - `01_overview.md` – What ToolKit provides; condensed golden path from users-info.
 - `02_gear_layout_and_sdk_pattern.md` – Gear directory layout, SDK crate, gear crate, re-exports.
-- `03_clienthub_and_plugins.md` – Typed ClientHub, in-process vs remote clients, scoped clients; plugins are in `docs/TOOLKIT_PLUGINS.md`.
+- `03_clienthub_and_plugins.md` – Typed ClientHub, in-process vs remote clients, scoped clients, plugins (main gear, plugin gears, GTS publication, selection).
 - `04_rest_operation_builder.md` – OperationBuilder usage, auth, error registration, SSE, content types.
 - `05_errors_rfc9457.md` – `CanonicalError`, `#[resource_error]`, `From<DomainError>`, the error middleware and the `Problem` wire format.
 - `06_authn_authz_secure_orm.md` – AuthN/AuthZ integration, PolicyEnforcer PEP pattern, pep_prop mapping, Scopable derive, secure query builders, CRUD authorization patterns.
@@ -66,10 +68,20 @@ This folder contains the ToolKit developer documentation, split by topic for foc
 - `12_unit_testing.md` – Philosophy, reliability principles, infrastructure, assert patterns, naming, priority matrix for unit/integration tests.
 - `13_e2e_testing.md` – Philosophy, integration seams concept, pytest infrastructure, test patterns, anti-patterns for E2E tests.
 - `14_db_behavior_testing.md` – DB-behavior testing as a third test layer: rules with no exceptions and the audit method; load- and guarantee-dependent choices are in `docs/arch/database/TRADEOFFS.md`.
+- `15_testing_and_ci.md` – Test pyramid, coverage thresholds and where they are enforced, unit/integration/E2E/fuzz commands, CI jobs, architecture lints.
 - `16_defect_class_to_control_map.md` – The inverse lookup: given a class of defect (tenant bypass, missing gate, global tables, wire/storage type mismatch, error classification, disclosure, in-process bypass, N+1, write-skew, API completeness, coverage that proves nothing), which control is supposed to catch it. Use it to find the class a defect belongs to, and to check that an applicable class has a control rather than an intention.
 
-### Related ADRs
+## Designs and ADRs
 
-- `docs/adrs/toolkit/0001-toolkit-hyper-tower-http-client.md` – **toolkit-http**: Hyper+Tower HTTP client with TLS, retries, timeouts, concurrency limiting, decompression, OTel tracing, and extensible auth layer hook.
-- `docs/adrs/toolkit/0002-toolkit-auth-oauth2-client.md` – **toolkit-auth**: Inbound JWT/OIDC route-level policies and outbound OAuth2 client-credentials flow with automatic token refresh and `Authorization: Bearer` injection.
-- `docs/adrs/toolkit/0005-toolkit-client-circuit-breaker.md` – **toolkit-resilience**: client-side circuit breaker as a tower layer, counted per attempt below retry; on by default in generated contract clients (`cpt-cf-binding-adr-client-circuit-breaker`).
+This folder explains how to write code against ToolKit. The architecture behind it lives in the designs below; the guides link to them and do not restate them.
+
+| Area | Design | ADRs |
+|------|--------|------|
+| Authorization (AuthN/AuthZ, PDP/PEP, scopes) | [DESIGN](../arch/authorization/DESIGN.md), [usage scenarios](../arch/authorization/AUTHZ_USAGE_SCENARIOS.md) | [ADR](../arch/authorization/ADR/) |
+| Errors (canonical categories, RFC 9457 wire format) | [DESIGN](../arch/errors/DESIGN.md), [categories](../arch/errors/categories/) | [ADR](../arch/errors/ADR/) |
+| Out-of-process gears, deployment, discovery | [DESIGN](../arch/toolkit-oop/DESIGN.md) | [ADR](../arch/toolkit-oop/ADR/) |
+| Contracts (REST/gRPC projection, generated clients) | [DESIGN](../arch/toolkit-contract-binding/DESIGN.md) | [ADR](../arch/toolkit-contract-binding/ADR/) |
+| Secure ORM (CTEs, property graphs) | | [ADR](../arch/secure-orm/ADR/) |
+| Database (namespacing, trade-offs) | [TRADEOFFS](../arch/database/TRADEOFFS.md) | [ADR](../arch/database/ADR/) |
+| Throttling (api-gateway) | [DESIGN](../arch/throttling/DESIGN.md) | [ADR](../arch/throttling/ADR/) |
+| ToolKit libraries (HTTP client, OAuth2, proxy, circuit breaker), test layout | | [toolkit](../adrs/toolkit/), [tests](../adrs/tests/) |

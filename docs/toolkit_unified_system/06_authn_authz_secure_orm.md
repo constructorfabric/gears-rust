@@ -1,8 +1,8 @@
 # Security: AuthN, AuthZ & Secure Database Access
 
-This document describes the complete security data-path in Gears: how requests are authenticated (AuthN), how authorization decisions are enforced (AuthZ / PEP), how `AccessScope` is produced, and how the Secure ORM layer in `toolkit-db` applies it to every database query.
+How a gear authenticates requests (AuthN), enforces authorization decisions (AuthZ / PEP), obtains an `AccessScope`, and applies it to every query through the Secure ORM in `toolkit-db`. The authorization model itself (AuthZEN extension, predicate types, fail-closed rules, caching, deployment modes) is designed in [`docs/arch/authorization/DESIGN.md`](../arch/authorization/DESIGN.md); this page does not restate it.
 
-For the full architectural design (AuthZEN model, predicate types, caching, deployment modes), see [`docs/arch/authorization/DESIGN.md`](../arch/authorization/DESIGN.md).
+**Design references:** [authorization DESIGN](../arch/authorization/DESIGN.md) · [AuthZ usage scenarios](../arch/authorization/AUTHZ_USAGE_SCENARIOS.md) · [tenant model](../arch/authorization/TENANT_MODEL.md) · [resource group model](../arch/authorization/RESOURCE_GROUP_MODEL.md) · [toolkit-oop ADR-0008 two-plane auth](../arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md) · [toolkit-oop ADR-0006 platform-plane auth](../arch/toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md) · [secure-orm ADR-0001 CTE policy](../arch/secure-orm/ADR/0001-secure-cte-policy.md)
 
 ## Core invariants
 
@@ -18,25 +18,7 @@ For the full architectural design (AuthZEN model, predicate types, caching, depl
 
 ## Architecture overview
 
-```text
-Request → API Gateway (AuthN middleware) → SecurityContext
-              ↓
-         Gear Domain Service (PEP)
-              ↓
-         PolicyEnforcer → AuthZ Resolver (PDP) → decision + constraints
-              ↓
-         PEP Compiler → AccessScope
-              ↓
-         Secure ORM (SQL WHERE) → Database
-```
-
-Three components work together:
-
-1. **AuthN Resolver** — validates bearer tokens, produces `SecurityContext` (subject identity, tenant, token scopes). Uses the gateway + plugin pattern to delegate to vendor-specific IdPs.
-2. **AuthZ Resolver (PDP)** — evaluates policies, returns `decision + constraints`. Uses the gateway + plugin pattern to delegate to vendor-specific authorization services.
-3. **Domain gears (PEP)** — call PDP via `PolicyEnforcer`, compile constraints to `AccessScope`, pass it to Secure ORM queries for SQL-level enforcement.
-
-Gear developers interact primarily with the PEP layer — the AuthN and AuthZ resolvers are infrastructure gears.
+The API Gateway (or an OoP gear's own listener) authenticates the request and hands the handler a `SecurityContext`. The gear is the PEP: its domain service asks the AuthZ Resolver (PDP) through `PolicyEnforcer` for an `AccessScope` and passes that scope to every Secure ORM query. The AuthN and AuthZ resolvers are infrastructure gears with vendor plugins; gear code only touches the PEP side. Roles and request flow: [DESIGN § PDP/PEP Model](../arch/authorization/DESIGN.md#pdppep-model), [§ Request Flow](../arch/authorization/DESIGN.md#request-flow), [§ AuthN Resolver and AuthZ Resolver](../arch/authorization/DESIGN.md#authn-resolver-and-authz-resolver-gear--plugin-architecture).
 
 ## AuthN: how requests get authenticated
 
@@ -62,11 +44,15 @@ OperationBuilder::get("/users-info/v1/health")
 The builder enforces at compile time that every route declares its auth posture before `.register()`:
 - `.authenticated()` marks the route as protected, then requires `.require_license_features::<L>(features)` (or `.no_license_required()`) before registration.
 - `.anonymous()` marks the route as unauthenticated and automatically satisfies the license requirement. Handlers on it receive an anonymous `SecurityContext`, on the gateway and on an out-of-process gear's own listener alike, and a presented bearer is ignored on both: an anonymous operation answers the same whatever bearer is presented. A presented `X-ToolKit-Internal-Token` is still validated there wherever `internal_auth` is configured, and an invalid one gets `401`.
-- `.platform_authenticated()` admits a validated `X-ToolKit-Internal-Token` only, for platform-plane routes that gears in other processes call; a bearer alone gets `401` — on the gear's own listener and through the API Gateway alike. The gateway validates the token with its inbound `internal_auth` authenticator and, with none configured, warns at startup and refuses the route. Its `OpenAPI` operation requires the `internalToken` apiKey scheme, and gateway discovery never publishes it, since the edge strips the internal token. It still requires a license decision. A bearer is never validated on these routes: alone it is dropped and the call gets `401` `MISSING_INTERNAL_TOKEN`. Handlers read the caller with `Extension<PlatformSecurityContext>` only, never a tenant `SecurityContext`, and the gateway's `route_policies` scopes do not apply to platform routes. Listeners install the stack with `toolkit_http_middleware::layer_route_auth`. A plane is per route, never per request: an API offered on both planes gets two route sets on distinct paths (for example `/types-registry/v2/…` for tenants and `/types-registry/v2/platform/…` for platform callers). `#[toolkit::rest_contract]` registers every `PlatformSecurityContext` method with `.platform_authenticated()` and refuses `#[anonymous]` on one.
+- `.platform_authenticated()` marks a platform-plane route that gears in other processes call. Only a validated `X-ToolKit-Internal-Token` admits it; a bearer is never validated there, and alone gets `401` `MISSING_INTERNAL_TOKEN`, on the gear's own listener and through the API Gateway alike. Handlers read the caller with `Extension<PlatformSecurityContext>` only, never a tenant `SecurityContext`. The route still requires a license decision; the gateway's `route_policies` scopes do not apply, gateway discovery never publishes it, and its `OpenAPI` operation requires the `internalToken` apiKey scheme. The gateway validates the token with its inbound `internal_auth` authenticator; with none configured it warns at startup and refuses the route.
 
-A listener never serves a plane it cannot check. An `OoP` gear that serves `.authenticated()` operations without a tenant authenticator refuses to start. One that serves `.platform_authenticated()` operations without `oop_http.internal_auth` warns at startup, and each of them answers `401`, as on the gateway: a linked gear's platform route that nobody calls does not stop the process. At request time a tenant or undeclared route on a listener without a tenant authenticator answers `401` `TENANT_AUTH_NOT_CONFIGURED` rather than reaching the handler unauthenticated, and a request no route matches answers `404` without running the router's fallback; such a gear warns at startup that routes not declared through `OperationBuilder` are refused. For development, `oop_http.auth_disabled` mirrors the gateway's `auth_disabled`: without a tenant authenticator, non-platform routes run with the default tenant `SecurityContext`, and platform routes still need a validated internal token. An installed tenant authenticator still wins. A worker advertised at a routable address with `auth_disabled` logs an error at startup, since every tenant's request reaching it runs as the default tenant.
+The plane is chosen per route, never per request ([ADR-0008](../arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md#decision-outcome)): an API offered on both planes gets two route sets on distinct paths (for example `/types-registry/v2/…` for tenants and `/types-registry/v2/platform/…` for platform callers). `#[toolkit::rest_contract]` registers every `PlatformSecurityContext` method with `.platform_authenticated()` and refuses `#[anonymous]` on one. Listeners install the auth stack with `toolkit_http_middleware::layer_route_auth` ([README](../../libs/toolkit-http-middleware/README.md#what-it-does)). Which operations belong on which plane, and how the platform credential works: [ADR-0008](../arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md#which-plane--the-criterion-is-tenant-scoped-vs-non-tenant-scoped-not-user-vs-system), [ADR-0006](../arch/toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md), [toolkit-oop DESIGN § Platform-Plane Authentication](../arch/toolkit-oop/DESIGN.md#platform-plane-authentication).
 
-A request carries one plane (ADR-0008). On routes covered by the auth stack of the gateway or an `OoP` listener, a request presenting both an `Authorization` header and an `X-ToolKit-Internal-Token` is refused with `401` `MIXED_CREDENTIALS` before either authenticator runs, whatever the route's declaration and whether either credential is valid. A lone credential of the other plane is dropped unvalidated, header and all: the bearer on a `.platform_authenticated()` route, the internal token on an `.authenticated()` one (and, on a listener, on a route without a declaration). So a tenant handler never sees a `PlatformSecurityContext`, and, when tenant authentication is enabled, an `.authenticated()` call carrying only a token gets `401` `MISSING_BEARER`. `.anonymous()` routes keep a lone credential of either plane.
+Runtime behaviour of the auth stack on the gateway and on an `OoP` listener:
+
+- A request presenting both an `Authorization` header and an `X-ToolKit-Internal-Token` gets `401` `MIXED_CREDENTIALS` before either authenticator runs. A lone credential of the other plane is dropped unvalidated (the bearer on a `.platform_authenticated()` route, the internal token on an `.authenticated()` one or, on a listener, on an undeclared route). A tenant handler therefore never sees a `PlatformSecurityContext`, and with tenant authentication enabled an `.authenticated()` call carrying only a token gets `401` `MISSING_BEARER`. `.anonymous()` routes keep a lone credential of either plane.
+- An `OoP` gear that serves `.authenticated()` operations without a tenant authenticator refuses to start. One that serves `.platform_authenticated()` operations without `oop_http.internal_auth` warns at startup and answers each of them `401`. On a listener without a tenant authenticator, a tenant or undeclared route answers `401` `TENANT_AUTH_NOT_CONFIGURED`, and a request no route matches answers `404` without running the router's fallback.
+- `oop_http.auth_disabled` mirrors the gateway's `auth_disabled` for development: without a tenant authenticator, non-platform routes run with the default tenant `SecurityContext`; platform routes still need a validated internal token; an installed tenant authenticator still wins. A worker advertised at a routable address with `auth_disabled` logs an error at startup.
 
 The API Gateway middleware uses these declarations to decide how to handle each request:
 - **Protected routes**: extract bearer token → call AuthN Resolver → inject `SecurityContext` into request extensions. Returns 401 if token is invalid.
@@ -182,22 +168,7 @@ pub const USER: ResourceType = ResourceType::from_static(
 .with_native_group_predicates();
 ```
 
-The PEP uses that same identity to qualify
-`resource_group_membership.gts_type_id` through RG's `gts_type.schema_id`
-(an identity dictionary: key ↔ GTS type identifier, no definitions);
-consumers do not configure a second membership type. Without the per-resource
-opt-in, or for a non-canonical GTS policy name, `PolicyEnforcer` suppresses
-`GroupMembership` and `GroupHierarchy`, asking the PDP to expand the group scope
-to explicit resource-ID `in` predicates; a PDP that cannot expand must deny (the
-bundled plugins deny — neither implements expansion today).
-
-The querying database must also contain or project the tables each predicate
-executes against before the enforcer is configured with the corresponding
-capability: native `in_group` needs `resource_group_membership` and RG's
-`gts_type` dictionary; native `in_group_subtree` additionally needs
-`resource_group_closure`. Membership types are defined in types-registry; RG
-keys any admitted member type in its dictionary on first use, and the
-membership rows must be recorded under the resource's canonical GTS type path.
+Without the opt-in, or for a non-canonical GTS policy name, `PolicyEnforcer` suppresses `GroupMembership` and `GroupHierarchy`, so the PDP must expand group scopes to resource-ID `in` predicates or deny (the bundled plugins deny). Before opting in, make sure the querying database contains or projects the tables the predicates execute against: native `in_group` needs `resource_group_membership` and RG's `gts_type` dictionary; native `in_group_subtree` also needs `resource_group_closure`. Record membership rows under the resource's canonical GTS type path; consumers do not configure a second membership type. The PEP qualifies `resource_group_membership.gts_type_id` through RG's `gts_type.schema_id` dictionary; member types are defined in types-registry, and RG adds an admitted member type to its dictionary on first use. Capability semantics and projection guidance: [DESIGN § Capabilities Array](../arch/authorization/DESIGN.md#capabilities-array), [§ Group Tenant Scoping](../arch/authorization/DESIGN.md#group-tenant-scoping).
 
 ### Defining actions
 
@@ -248,7 +219,7 @@ Choose empty-scope handling by how the caller uses the returned scope. The actio
 | Aggregation that applies the whole scope to its query | Set `true` | Run the scoped aggregation over empty input. Preserve backend semantics: an ungrouped `COUNT(*)` returns one row with `0`, not an empty list. |
 | Catalog gate for a global model or type catalog, where the scope is not applied to catalog rows | Set `true` | Explicitly check `scope.matches_nothing()` and return an empty list; otherwise apply the catalog's visibility rules. |
 
-`allow_empty_scope(true)` changes only whether a successfully compiled, permitted empty scope is returned. It is PEP-local, never sent to the PDP, and independent of `require_constraints`. PDP denials and constraint validation still apply. Never replace an empty scope with `allow_all()`, caller tenant/IDs, or an outer `constraints: []` in a PDP response (allow-all under `require_constraints(false)`). A normalized scope with empty `constraints()` that is not unconstrained is the correct empty scope.
+`allow_empty_scope(true)` is PEP-local and independent of `require_constraints`; PDP denials and constraint validation still apply. Never replace an empty scope with `allow_all()`, the caller's tenant or IDs, or a synthesized `constraints: []`.
 
 #### When to check `matches_nothing()`
 
@@ -272,24 +243,16 @@ self.catalog.list_visible(ctx).await
 
 For paginated catalogs, preserve the endpoint's empty-page format and query validation. For row-scoped queries, pass the whole scope to the Secure ORM query instead of adding an early return; this also preserves aggregate semantics.
 
-`matches_nothing()` detects statically known emptiness: deny-all, or a scope whose every OR branch contained an empty `In` / `InGroup` / `InGroupSubtree` set. Such a scope is normalized to no live branches, so `matches_nothing()` and `is_deny_all()` give the same answer. It does not query the database or detect general logical contradictions. A `false` result does not prove that rows exist or that a particular row is authorized.
-
-A standalone decision-only gate may proceed on an unconstrained permit. If the PDP supplies constraints, enforce them or refuse the operation. Row access must enforce the scope even with the default `allow_empty_scope(false)`: a nonempty scope may cover another tenant, owner, or resource.
+`matches_nothing()` detects only statically known emptiness (deny-all, or every OR branch held an empty `In` / `InGroup` / `InGroupSubtree` set); `false` does not prove that rows exist or that a row is authorized. Row access must enforce the scope even with the default `allow_empty_scope(false)`: a nonempty scope may cover another tenant, owner, or resource. A standalone decision-only gate may proceed on an unconstrained permit; if the PDP supplies constraints, enforce them or refuse the operation.
 
 #### Inspecting scope branches
 
-Every `AccessScope` is normalized, whether compiled or built by hand:
+- Enforce and inspect grants (projections, tenant/ID checks) through `constraints()`, which holds only live branches. `original_constraints()` is for diagnostics or an explicit structural check, never for enforcement.
+- An all-empty scope is not `==` to `AccessScope::deny_all()`. Test emptiness with `matches_nothing()` / `is_deny_all()`, and check `is_unconstrained()` separately: allow-all and deny-all both have no live branches.
+- `tenant_only()`, `tenant_and_owner()`, `ensure_owner()` and gear-local projections build a new scope from live branches only.
+- The low-level `compile_to_access_scope` refuses an all-empty scope with `ConstraintCompileError::ScopeMatchesNothing`; opt in with `compile_to_access_scope_with_options(.., CompileOptions::new().allow_empty_scope(true))`.
 
-- `constraints()` lists only the branches that may match, in order. A branch with an empty `In` / `InGroup` / `InGroupSubtree` set is removed whole, never narrowed to its other filters; general contradictions are not detected, and an empty `InTenantSubtree.descendant_status` disables the status filter rather than emptying the branch. Use it for enforcement and grant inspection (projections, tenant/ID checks, shape checks). If one OR branch is empty but another may match, the scope is not statically empty.
-- `original_constraints()` replays every compiled branch, removed ones included, in the original order (not the raw PDP JSON). Use it only for diagnostics or an explicit structural check; never to enforce access.
-- An all-empty scope is operationally deny-all but keeps its originals, and equality is structural: it is not `==` to `AccessScope::deny_all()`. Check `is_unconstrained()` separately: both allow-all and deny-all have no live branches.
-- `tenant_only()`, `tenant_and_owner()`, `ensure_owner()` and gear-local projections build a new scope from the live branches only; the source's originals are not carried over.
-
-The PEP compiler validates supported properties and predicate shapes before normalization. Downstream checks (SecureORM property resolution, sibling placement, OData projection) see only live branches, so an all-empty scope lowers to `FALSE` without their entity-specific diagnostics. This is an accepted loss of diagnostics, never a widening of access. The invalid-branch policy is unchanged (an invalid branch is dropped; the request fails only if no branch compiles); strict rejection is tracked in [#5958](https://github.com/constructorfabric/gears-rust/issues/5958).
-
-The low-level `compile_to_access_scope` refuses an all-empty scope by default with `ConstraintCompileError::ScopeMatchesNothing`; opt in with `compile_to_access_scope_with_options(.., CompileOptions::new().allow_empty_scope(true))`.
-
-See [the full contract](../arch/authorization/DESIGN.md#permission-gates-and-empty-scopes) for projection helpers, INSERT checks, and consumer limitations.
+Normalization rules, the loss of diagnostics for removed branches, the invalid-branch policy ([#5958](https://github.com/constructorfabric/gears-rust/issues/5958)), projection helpers, INSERT checks and consumer limitations: [DESIGN § Permission gates and empty scopes](../arch/authorization/DESIGN.md#permission-gates-and-empty-scopes) and [§ Normalized scopes](../arch/authorization/DESIGN.md#normalized-scopes).
 
 ### AccessRequest builder
 
@@ -314,11 +277,11 @@ let list_request = AccessRequest::new().allow_empty_scope(true);
 
 ### Empty constraints versus empty scopes
 
-With `decision: true`, missing `constraints` and `constraints: []` both mean no row-level restrictions were supplied. With the default `require_constraints(true)`, they cause `EnforcerError::CompileFailed`. Explicitly setting `require_constraints(false)` accepts them and produces an unconstrained scope (`allow_all()`) for a standalone decision-only gate. If constraints are supplied, the SDK compiles them and the caller must enforce them or refuse the operation. `predicates: []` inside a constraint remains malformed.
+- With `decision: true`, missing or empty outer `constraints` fail with `EnforcerError::CompileFailed` under the default `require_constraints(true)`. `require_constraints(false)` turns them into `allow_all()`; use it only for a standalone decision-only gate.
+- `allow_empty_scope(true)` does not make missing constraints acceptable, and `require_constraints(false)` does not prevent `ScopeMatchesNothing` when supplied constraints compile to an all-empty scope.
+- `in(id, [])`, `in_group(id, [])` and `in_group_subtree(id, [])` compile to SQL `FALSE`, never `IN ()`; other OR branches may still match. `predicates: []` is malformed.
 
-This differs from a valid scope that matches no rows. `allow_empty_scope(true)` preserves that empty scope; it does not make missing constraints acceptable. Conversely, `require_constraints(false)` does not prevent `ScopeMatchesNothing` when supplied constraints compile to an all-empty scope and `allow_empty_scope` remains false.
-
-`in(id, [])`, `in_group(id, [])`, and `in_group_subtree(id, [])` are valid predicates that compile to SQL `FALSE`, never `IN ()`. Property, capability, and tenant checks still apply. The PDP must verify that the selected groups belong to the authorized tenant. Other OR branches may match. [Group ownership and enforcement](../arch/authorization/DESIGN.md#group-tenant-scoping) See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for PEP options and non-SQL handling.
+Full rules: [DESIGN § Fail-Closed Rules](../arch/authorization/DESIGN.md#fail-closed-rules) (rules 2, 7, 10, 11) and, for group selectors, [§ Group Tenant Scoping](../arch/authorization/DESIGN.md#group-tenant-scoping).
 
 ### Optional resource conditions
 
@@ -460,7 +423,7 @@ Use `#[secure(unrestricted)]` only for truly global tables where the entity has 
 
 - `secure_insert` skips scope validation entirely for an unrestricted entity, even for a deny-all scope. The caller must authorize insertion before using this path.
 - Queries with a scope that contains tenant IDs will be denied (by policy: tenants requested but entity has no `tenant_col`).
-- If you need to read/write a global table within a tenant-scoped request, do not use `unrestricted`. Model it with explicit columns and use an appropriate scope shape (often `resources_only`).
+- If you need to read/write a global table within a tenant-scoped request, do not use `unrestricted`. Model it with explicit columns and use an appropriate scope shape (often `AccessScope::for_resources(..)`).
 
 ## CRUD authorization patterns
 
@@ -625,10 +588,7 @@ This is enforced inside `toolkit-db` when you call `.scope_with(&scope)` on a se
 
 ### OR/AND semantics
 
-- Multiple constraints are OR-ed (alternative access paths)
-- Filters within a constraint are AND-ed (all must match)
-- Unknown properties fail that constraint (fail-closed)
-- If all constraints fail resolution → deny-all
+Constraints are OR-ed and filters within a constraint AND-ed ([DESIGN § Constraint Compilation to SQL](../arch/authorization/DESIGN.md#constraint-compilation-to-sql)). A branch with a property the entity cannot resolve is dropped; if no branch survives, the query is deny-all.
 
 ### Scoped queries
 

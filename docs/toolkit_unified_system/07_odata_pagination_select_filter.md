@@ -2,6 +2,8 @@
 
 ToolKit provides OData query support with type-safe filtering, ordering, field selection, and cursor-based pagination.
 
+**Design references:** [Architecture Manifest § 3.3.3 Consistent API syntax and semantics](../ARCHITECTURE_MANIFEST.md#333-consistent-api-syntax-and-semantics) · [database TRADEOFFS § Pagination](../arch/database/TRADEOFFS.md#pagination) · [§ Counting and existence](../arch/database/TRADEOFFS.md#counting-and-existence). There is no separate OData design document; the query-option policy below is normative.
+
 ## Core invariants
 
 - **Rule**: Use `toolkit_odata_macros::ODataFilterable` to declare the filterable fields of a resource.
@@ -38,7 +40,7 @@ pub use UserQueryFilterField as UserFilterField;
 
 ### Filter field kinds
 
-The `kind` string names a `toolkit_odata::filter::FieldKind` variant. The SQL value is built in `toolkit_db::odata` (`core.rs`).
+The `kind` string names a `toolkit_odata::filter::FieldKind` variant. On the `paginate_odata` path the SQL value is built in `toolkit_db::odata::sea_orm_filter`.
 
 | Kind | SQL value | Example |
 |------|-----------|---------|
@@ -64,6 +66,8 @@ OperationBuilder::get("/users-info/v1/users")
     .operation_id("users_info.list_users")
     .authenticated()
     .require_license_features::<License>([])
+    .query_param_typed("limit", false, "Maximum number of users to return", "integer")
+    .query_param("cursor", false, "Cursor for pagination")
     .handler(handlers::list_users)
     .json_response_with_schema::<toolkit_odata::Page<dto::UserDto>>(
         openapi,
@@ -389,15 +393,18 @@ Both spellings are one parameter, so a gear needs no per-endpoint handling to
 honor either. Two consequences worth knowing:
 
 - OpenAPI cannot express one parameter under two names. Publish the spelling
-  your gear treats as canonical and mention the other in its `description`.
+  your gear treats as canonical with `.query_param` / `.query_param_typed`
+  (users-info publishes `limit` and `cursor`) and mention the other in its
+  `description`; the `with_odata_*` methods publish only `$filter`, `$select`
+  and `$orderby`.
 - `$top=0` is rejected (`InvalidLimit` → `400`, `field_violations[0].field` is
-  `$top`). Enforcing an upper bound is the handler's job — the extractor caps
-  filter/orderby/select size, not page size.
-- **`$skip` is not supported.** Offset paging is not the platform's model, and
-  a request that pairs `$top` with `$skip` is refused rather than served with a
-  page size it asked for at an offset it did not get. Continue a page with
-  `$skiptoken` (alias `cursor`); see [Unsupported system query
-  options](#unsupported-system-query-options).
+  `$top`). The extractor caps filter/orderby/select size, not page size; the page
+  size is clamped by `paginate_odata` to the repository's `LimitCfg { default, max }`
+  (users-info builds it from `default_page_size` / `max_page_size` in its config,
+  `ServiceConfig::limit_cfg`). A larger `$top` is clamped, not rejected.
+- **`$skip` is not supported.** The platform pages by keyset, not offset: an offset re-reads and discards every skipped row and shifts when rows are inserted ([TRADEOFFS § Pagination](../arch/database/TRADEOFFS.md#pagination));
+  a request with `$skip` is refused. Continue a page with `$skiptoken` (alias `cursor`); see
+  [Unsupported system query options](#unsupported-system-query-options).
 
 ### Continuation token (`$skiptoken` / `cursor`)
 
@@ -431,34 +438,22 @@ offending key, so one round trip names every problem:
 
 | Option | Why it is refused |
 |--------|-------------------|
-| `$skip` | Offset paging is not the model. Use `$skiptoken` / `cursor`. |
-| `$count` | A page carries no total; `PageInfo` is `{next_cursor, prev_cursor, limit}`. Serving a total would mean a `COUNT(*)` per page, which keyset pagination exists to avoid. |
+| `$skip` | Keyset paging only. Use `$skiptoken` / `cursor`. |
+| `$count` | A page carries no total (`PageInfo` is `{next_cursor, prev_cursor, limit}`): a total would mean a `COUNT(*)` per page; see [TRADEOFFS § Counting and existence](../arch/database/TRADEOFFS.md#counting-and-existence). |
 | `$expand`, `$search`, `$compute`, `$index`, `$schemaversion` | Not implemented. |
 | `$format` | Responses are JSON; negotiate the media type with `Accept`. |
-| `$filtre`, `$topp`, … | Not OData options at all, so the violation reads `unknown query option` rather than `unsupported`. A dropped `$filtre` returns the whole unfiltered collection with a `200`. |
+| `$filtre`, `$topp`, … | Not OData options at all, so the violation reads `unknown query option` rather than `unsupported`. If such an option were silently dropped, `$filtre` would return the whole unfiltered collection with a `200`. |
 
-This is required behavior, not a house rule — OASIS OData 4.01 Part 1:
-Protocol, §6.1 "Query Option Extensibility":
+Rejecting unsupported `$` options is required by OASIS OData 4.01 Part 1: Protocol, §6.1
+"Query Option Extensibility". Two rules follow for gear code:
 
-> OData services SHOULD NOT require any query options to be specified in a
-> request. Services SHOULD fail any request that contains query options that
-> they do not understand and MUST fail any request that contains unsupported
-> OData query options defined in the version of this specification supported by
-> the service.
-
-Two boundaries follow from the same section:
-
-- **Unprefixed keys are out of scope.** §6.1 reserves the `$` prefix for
-  OData, so a non-`$` key belongs to the handler's own params struct — the
-  extractor never rejects one. A gear that wants `?status=approved` refused
-  instead of ignored needs its own guard; account-management has one
-  (`reject_non_odata_params`).
-- **Spelling is case-sensitive, deliberately.** OData 4.01 Part 2 §5.1 asks a
-  4.01 service to accept system query option names case-insensitively and with
-  or without the `$` prefix. This platform accepts neither `$Top` nor the
-  unprefixed canonical `top`; it answers `400` naming the spelling that binds
-  rather than dropping the request. Closing that gap is a separate conformance
-  change.
+- **Unprefixed keys are the handler's business.** The extractor never rejects a non-`$` key. A gear
+  that wants `?status=approved` refused instead of ignored needs its own guard (account-management:
+  `reject_non_odata_params`).
+- **Spelling is case-sensitive.** `$Top` answers `400` naming the spelling that binds (`$top`); the
+  unprefixed `top` is not an option and is ignored (rule above). OData 4.01 Part 2 §5.1 asks for
+  case-insensitive, optionally unprefixed names.
+  Closing that gap is a separate conformance change.
 
 ### Page structure
 

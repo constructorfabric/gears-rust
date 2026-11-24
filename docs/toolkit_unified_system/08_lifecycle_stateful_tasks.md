@@ -2,6 +2,8 @@
 
 ToolKit manages gear startup, background tasks and cooperative shutdown.
 
+**Design references:** [toolkit-oop ADR-0005 eventual readiness](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md) · [toolkit-oop DESIGN § OoP Bootstrap](../arch/toolkit-oop/DESIGN.md#oop-bootstrap) · [Architecture Manifest § 3.2.3 Platform-owned gear lifecycle](../ARCHITECTURE_MANIFEST.md#323-platform-owned-gear-lifecycle) · [types-registry DESIGN § Deployment preparation](../../gears/system/types-registry/docs/DESIGN.md#deployment-preparation)
+
 ## Core invariants
 
 - Use `CancellationToken` and child tokens for coordinated shutdown.
@@ -80,29 +82,30 @@ gears:
         example.orders.v1.OrdersService: orders
 ```
 
-Service Discovery loads this map during system `init`; application installers add their names later.
-Until then, unconfigured names use first-registration ownership. Remote metadata is not propagated
-into Directory. Registration identity authorization is independent.
+Service Discovery loads this map during system `init`; until application installers are collected,
+unconfigured names keep first-registration ownership. Remote metadata is not propagated into
+Directory, and registration identity authorization is independent of this map. See the
+[ADR-0005 amendment](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md#amendment-2026-11-05-gts-admission-before-application-initialization).
 
 ### Failures, routes and readiness
 
-- Publication retries share a 120-second startup budget. Refusal or expiry stops started gears
-  and returns an error for supervisor restart. Shutdown cancels pending publication.
-- Both hosts serve probes before preparation, system routes after system startup, and tenant
-  routes after application initialization. Early routes need no AuthN resolver and reject tenant
-  calls with `503`. OoP serving spawns no children. All providers honor `advertised_in_directory()`.
+What the runtime does during preparation (shared 120-second publication budget, early probes and
+system routes, `503` for tenant routes until application initialization, restart on refusal or
+expiry) is decided in the [ADR-0005 amendment](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md#amendment-2026-11-05-gts-admission-before-application-initialization);
+probe semantics are in [ADR-0005 § Consequences](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md#consequences). What that means for gear code:
+
+- Make preparation retryable and migrations expand/contract-compatible with old pods: a
+  publication failure stops the process but undoes neither migrations nor partial admission.
+- One slow publisher delays every application `init` in the process; in exchange, plugins can
+  bind synchronously in `init`.
+- `await_ready` / `ready.notify()` only moves the gear's lifecycle state to `Running`; it does not
+  gate `start`, other gears, route publication or `/readyz`. For asynchronous business bootstrap,
+  do the work in `serve` and register a REST healthcheck that keeps `/readyz` at `503` until ready.
 - `application/preparation` clears after application startup and REST provider registration,
-  without waiting for children. Other dependencies and gear healthchecks still gate `/readyz`.
-- A gear's `await_ready` / `ready.notify()` changes its lifecycle state to `Running`,
-  without blocking `start`, other gears, route publication or the application readiness gate.
-  For asynchronous business bootstrap, work in `serve` and provide a REST healthcheck
-  to keep `/readyz` at `503` until ready.
-
-Publication failure does not undo migrations or partial admission. Use retryable preparation and
-expand/contract migrations compatible with old pods.
-
-The barrier permits synchronous plugin binding in `init`, but one slow publisher delays all
-applications. See [ADR-0005](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md).
+  without waiting for children; other dependencies and gear healthchecks still gate `/readyz`.
+  Shutdown cancels pending publication.
+- Early routes need no AuthN resolver. OoP serving spawns no children, and every provider honors
+  `advertised_in_directory()`.
 
 ## Publishing GTS documents
 
@@ -236,8 +239,9 @@ impl MyGear {
   (`libs/toolkit/src/bootstrap/run.rs`, `bootstrap/oop.rs`) hook OS signals themselves and pass
   `ShutdownOptions::Token`.
 - The `lifecycle(entry = ...)` method receives a child of the root token as `cancel`.
-- `GearCtx::cancellation_token()` returns a child of the root token; derive further child tokens from
-  it (`child_token()`) for work spawned in `init` or `post_init`.
+- `GearCtx::cancellation_token()` returns the runtime's root token itself, not a child: calling
+  `.cancel()` on it shuts the whole process down. Derive child tokens from it (`child_token()`) for
+  work spawned in `init` or `post_init`, and cancel only those.
 - `stop_timeout` (default 30s) bounds how long `WithLifecycle` waits for the entry method to return
   after cancellation; keep it below `shutdown_deadline` (35s), which is the hard backstop.
 

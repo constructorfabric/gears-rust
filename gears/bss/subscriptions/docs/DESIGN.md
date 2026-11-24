@@ -645,7 +645,7 @@ Subscriptions retains amount-less served/boundary evidence and exact provider re
 
 #### 3.3.7 Adapter plugins and profiles
 
-The deployment-selected seams of this design are ToolKit plugins in the pattern of [TOOLKIT_PLUGINS.md](../../../../docs/TOOLKIT_PLUGINS.md): the SDK declares a public trait for callers and a plugin trait for implementers, the plugin specification is a GTS type registered by this gear, each adapter is a GTS instance that registers a scoped client in ClientHub, and Subscriptions resolves the instance through the types registry (SUB-D-74).
+The deployment-selected seams of this design are ToolKit plugins in the pattern of [ToolKit plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins): the SDK declares a public trait for callers and a plugin trait for implementers, the plugin specification is a GTS type registered by this gear, each adapter is a GTS instance that registers a scoped client in ClientHub, and Subscriptions resolves the instance through the types registry (SUB-D-74).
 
 | Seam | Plugin specification (`gts.cf.toolkit.plugins.plugin.v1~…`) | Plugin trait | Declared capabilities |
 | --- | --- | --- | --- |

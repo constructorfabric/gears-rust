@@ -255,13 +255,14 @@ when missing:
 
 ```toml
 [dependencies]
-toolkit-http = { workspace = true, features = ["otel"] }      # .with_otel()
+toolkit-http = { workspace = true, features = ["otel"] }      # traceparent injection, .with_metrics()
 toolkit-contract = { workspace = true, features = ["otel"] }  # generated clients
 ```
 
-Without `toolkit-http/otel` the `with_otel()` method does not exist and the
-build fails; without `toolkit-contract/otel` generated clients compile fine but
-drop out of the trace.
+Without `toolkit-http/otel`, `with_otel()` still compiles and creates the client
+span but injects no `traceparent`, so the downstream service starts a new trace;
+`with_metrics` / `with_metrics_by` do not exist and the build fails. Without
+`toolkit-contract/otel` generated clients compile fine but drop out of the trace.
 
 ---
 

@@ -2,6 +2,8 @@
 
 # Gear Overview
 
+**Design references:** [Architecture Manifest](../ARCHITECTURE_MANIFEST.md) · [authorization DESIGN](../arch/authorization/DESIGN.md) · [toolkit-oop DESIGN](../arch/toolkit-oop/DESIGN.md) · [errors DESIGN](../arch/errors/DESIGN.md) · [Gears inventory](../GEARS.md)
+
 ## What a Gear is
 
 A Gear is a **vertically-sliced, self-contained capability** of the Constructor Fabric / Rust
@@ -15,8 +17,9 @@ under `gears/<name>/`. Each Gear:
   `secure_insert`, `secure_update_with_scope`), which apply an `AccessScope`.
 - **Is discovered at link time** via `inventory` and initialized in dependency
   order by the runtime (see [08_lifecycle_stateful_tasks.md](08_lifecycle_stateful_tasks.md)).
-- **Composes with other Gears** through the typed `ClientHub` (in-process) or
-  gRPC SDKs (out-of-process / remote Gears).
+- **Composes with other Gears** through the typed `ClientHub`: an in-process
+  implementation, or a REST (default) or gRPC client for out-of-process / remote
+  Gears (`#[toolkit::consumes]`, [03](03_clienthub_and_plugins.md)).
 - **Can be extended by plugins** — built-in plugins (compiled in) or external
   plugins (separate crates with their own API handler, business logic, and DB).
 - **Can extend its API data schema** through GTS schema extensions.
@@ -29,8 +32,9 @@ A Gear is intentionally a **DDD-light** structure with clear layers:
 | **Domain** | `src/domain/` | Business logic, the SDK trait implementation (local client), `#[domain_model]` types, and **PEP enforcement** via `PolicyEnforcer`. |
 | **Infra** | `src/infra/` | SeaORM entities, repositories, migrations, adapters — everything "low-level" (DB, IO, external clients). |
 
-See `02_gear_layout_and_sdk_pattern.md` for the full canonical layout and the
-SDK pattern.
+See [02_gear_layout_and_sdk_pattern.md](02_gear_layout_and_sdk_pattern.md) for the full canonical layout and the
+SDK pattern. The reasons behind the layering are in
+[Architecture Manifest § 3.2.1](../ARCHITECTURE_MANIFEST.md#321-ddd-light-layer-isolation).
 
 ## Core Architecture
 
@@ -72,25 +76,12 @@ their owning gears. Directory placement does not decide the startup group; see
 
 ## Typical REST API Request Trajectory
 
-This section traces a typical authenticated REST request end-to-end, based on the
-authorization model in `docs/arch/authorization/DESIGN.md` (PDP/PEP per NIST
-SP 800-162). The concrete code references come from the `mini-chat` Gear, which is
-representative of the golden path.
-
-### Actors
-
-- **API Gateway** (`gears/system/api-gateway`) — owns the Axum router and the
-  middleware stack; hosts the **AuthN middleware**.
-- **AuthN Resolver** (`gears/system/authn-resolver`) — validates the bearer
-  token via a vendor plugin and produces a `SecurityContext`.
-- **Gear Handler** — the Gear's Axum handler in `src/api/rest/handlers/`,
-  which extracts `Extension<SecurityContext>` and delegates to the domain service.
-- **Domain Service** — business logic that uses `PolicyEnforcer` (the PEP) to ask
-  the PDP for an `AccessScope`.
-- **AuthZ Resolver (PDP)** (`gears/system/authz-resolver`) — evaluates policies
-  and returns a decision plus query-level constraints.
-- **Repository** — compiles the `AccessScope` into SQL `WHERE` clauses with the
-  `toolkit-db` secure query builders and runs the query on a `DbConn` / `DbTx`.
+This section maps a typical authenticated REST request onto ToolKit code, using the
+`mini-chat` Gear as the golden-path example. The model it follows — who authenticates,
+who decides, who enforces — is designed in
+[authorization DESIGN § Request Flow](../arch/authorization/DESIGN.md#request-flow) and summarized in
+[Architecture Manifest § 7.2](../ARCHITECTURE_MANIFEST.md#72-request-lifecycle); it is not
+repeated here.
 
 ### Middleware stack (request order)
 
@@ -116,9 +107,9 @@ SetRequestId → PropagateRequestId → Trace → push_req_id_to_extensions
   AuthN Resolver, and injects `SecurityContext` as a request `Extension`.
 - **PlatformGate** — platform-plane admission, always applied after auth and before
   tenant scope checks.
-- **ScopeEnforcement** — optional coarse-grained `token_scopes` gate (see
-  *Gateway Scope Enforcement* in the authorization DESIGN); rejects early without
-  calling the PDP.
+- **ScopeEnforcement** — optional coarse-grained `token_scopes` gate configured with
+  `route_policies`; see
+  [authorization DESIGN § Gateway Scope Enforcement](../arch/authorization/DESIGN.md#gateway-scope-enforcement-optional).
 - **PostAuthThrottling** — identity-keyed throttling zones; reads `SecurityContext`.
 - **License** — `require_license_features([...])` on the route is enforced here.
 
@@ -186,58 +177,21 @@ sequenceDiagram
     GW-->>Client: HTTP response
 ```
 
-### Step-by-step walkthrough
+### Where each step lives in code
 
-1. **Inbound + pre-auth middleware** — Request ID, tracing span, timeout, body
-   limit, CORS, MIME validation, and IP-keyed (pre-auth) throttling run before
-   anything security-related.
-2. **Authentication (AuthN)** — `authn_middleware` checks the route policy. For an
-   `.authenticated()` route it extracts the bearer token and calls
-   `AuthNResolverClient::authenticate(token)`. The AuthN Resolver delegates to a
-   vendor plugin (JWT validation / introspection against the IdP) and returns an
-   `AuthenticationResult`. The middleware injects the resulting `SecurityContext`
-   into request extensions. Missing/invalid token → `401`.
-3. **Post-auth gates** — Platform-plane admission, optional coarse `token_scopes`
-   enforcement, identity-keyed throttling and per-route license-feature checks
-   (`require_license_features`) run next, before the handler.
-4. **Handler** — The Gear's Axum handler extracts
-   `Extension<SecurityContext>`, the shared `Arc<AppServices>`, path params, the
-   JSON body, and/or the parsed `OData` query, then calls the domain service.
-   Example: `create_chat` / `list_chats` in
-   `gears/mini-chat/mini-chat/src/api/rest/handlers/chats.rs`.
-5. **Domain service + PEP** — The service calls
-   `PolicyEnforcer::access_scope(...)` (or `access_scope_with(...)` with extra
-   resource properties such as `OWNER_TENANT_ID` / `OWNER_ID`). The enforcer
-   builds an `EvaluationRequest` and calls the AuthZ Resolver. See `create_chat` /
-   `list_chats` in `gears/mini-chat/mini-chat/src/domain/service/chat_service.rs`
-   and `PolicyEnforcer::access_scope` / `access_scope_with` in
-   `gears/system/authz-resolver/authz-resolver-sdk/src/pep/enforcer.rs`.
-6. **Authorization (PDP)** — The AuthZ Resolver delegates to a vendor plugin (the
-   PDP), which evaluates policies (optionally querying tenant / resource-group
-   hierarchies) and returns a `decision` plus query-level `constraints`.
-7. **Fail-closed / compile to scope** — If `decision = false`, the enforcer returns
-   `EnforcerError::AccessDenied`. If constraints are required
-   (`require_constraints(true)`, the default) but absent, it returns
-   `EnforcerError::CompileFailed`. Neither lets the operation proceed. Each gear
-   maps these to HTTP itself; the recommended mapping (*EnforcerError* in
-   [06](06_authn_authz_secure_orm.md#enforcererror-authz-errors)) is `403` for
-   `AccessDenied` and `500` for `CompileFailed`, while mini-chat uses a different
-   mapping (`CompileFailed` → `403`, `EvaluationFailed` → `503`). Otherwise it
-   compiles the constraints into an `AccessScope` (predicates within a constraint
-   are AND'd; multiple constraints are OR'd; unknown predicates fail closed). See
-   *Fail-Closed Rules* in `docs/arch/authorization/DESIGN.md`.
-8. **Secure DB access** — The service passes the `AccessScope` to the repository,
-   which applies `.secure().scope_with(&scope)` (or `secure_insert` /
-   `secure_update_with_scope`) so the mandatory tenant predicate plus PDP
-   constraints become SQL `WHERE` clauses. See `get` / `list_page` / `create` /
-   `update` in `gears/mini-chat/mini-chat/src/infra/db/repo/chat_repo.rs`.
-   For point operations, `0` rows means `404` (hides existence from unauthorized
-   subjects); LIST applies constraints before `LIMIT` for correct pagination.
-9. **Response** — Domain models map back to REST DTOs; the handler returns
-   `ApiResult<T>` (`Result<T, CanonicalError>`, from `toolkit::api::canonical_prelude`).
-   `IntoResponse for CanonicalError` renders an error as an RFC-9457 `Problem`
-   response, and `canonical_error_middleware` fills `instance` and `trace_id` on the
-   way out.
+| Step | Code |
+|------|------|
+| Pre-auth middleware (request ID, trace, timeout, body limit, CORS, MIME, IP-keyed throttling) | `ApiGateway::apply_middleware_stack` in `gears/system/api-gateway/src/gear.rs` |
+| AuthN: route policy, bearer extraction, `AuthNResolverClient::authenticate`, `SecurityContext` injection | `authn_middleware` in `gears/system/api-gateway/src/middleware/auth.rs`; route policy from `OperationBuilder::authenticated()` ([04](04_rest_operation_builder.md)) |
+| Post-auth gates: platform admission, `token_scopes`, identity-keyed throttling, `require_license_features` | same middleware stack; scope gate described in [authorization DESIGN § Gateway Scope Enforcement](../arch/authorization/DESIGN.md#gateway-scope-enforcement-optional) |
+| Handler: extract `Extension<SecurityContext>`, services, path, body, `OData` query | `create_chat` / `list_chats` in `gears/mini-chat/mini-chat/src/api/rest/handlers/chats.rs` |
+| Domain service + PEP: `PolicyEnforcer::access_scope` / `access_scope_with` | `gears/mini-chat/mini-chat/src/domain/service/chat_service.rs`; `gears/system/authz-resolver/authz-resolver-sdk/src/pep/enforcer.rs` |
+| PDP decision and compilation to `AccessScope` | AuthZ Resolver + vendor plugin; outcomes and the recommended HTTP mapping in [06 § EnforcerError](06_authn_authz_secure_orm.md#enforcererror-authz-errors) (each gear maps them itself; mini-chat uses `CompileFailed` → `403`, `EvaluationFailed` → `503`); the rules in [authorization DESIGN § Fail-Closed Rules](../arch/authorization/DESIGN.md#fail-closed-rules) |
+| Secure DB access: `.secure().scope_with(&scope)`, `secure_insert`, `secure_update_with_scope` | `get` / `list_page` / `create` / `update` in `gears/mini-chat/mini-chat/src/infra/db/repo/chat_repo.rs`; enforcement points in [authorization DESIGN § Scope Determination](../arch/authorization/DESIGN.md#scope-determination) |
+| Response: `ApiResult<T>`, `IntoResponse for CanonicalError`, `canonical_error_middleware` | [05_errors_rfc9457.md](05_errors_rfc9457.md) |
+
+For a point operation the gear maps "0 rows in scope" to `404`, so an unauthorized
+caller cannot tell a forbidden row from a missing one.
 
 ### Plugins in the trajectory
 
@@ -249,17 +203,17 @@ sequenceDiagram
   and owns its own DB (plugin Y).
 
 Plugin discovery and scoped clients are covered in
-[TOOLKIT_PLUGINS.md](../TOOLKIT_PLUGINS.md).
+[03_clienthub_and_plugins.md § Plugins](03_clienthub_and_plugins.md#plugins).
 
 ## References
 
-- **Gear layout & SDK pattern** — `02_gear_layout_and_sdk_pattern.md`
-- **AuthN/AuthZ, PolicyEnforcer (PEP), SecureORM** — `06_authn_authz_secure_orm.md`
-- **Authorization design (PDP/PEP, constraints, fail-closed rules)** — `docs/arch/authorization/DESIGN.md`
-- **REST wiring & OperationBuilder** — `04_rest_operation_builder.md`
-- **Errors (RFC-9457)** — `05_errors_rfc9457.md`
-- **OData / pagination / $select / $filter** — `07_odata_pagination_select_filter.md`
-- **Database patterns (connections, transactions, repos)** — `11_database_patterns.md`
-- **Out-of-Process / gRPC / SDK pattern** — `09_oop_grpc_sdk_pattern.md`
-- **Startup groups and the system capability** — `08_lifecycle_stateful_tasks.md`
-- **Platform gear inventory & high-level architecture** — `docs/GEARS.md`, `docs/ARCHITECTURE_MANIFEST.md`
+- **Gear layout & SDK pattern** — [02_gear_layout_and_sdk_pattern.md](02_gear_layout_and_sdk_pattern.md)
+- **AuthN/AuthZ, PolicyEnforcer (PEP), SecureORM** — [06_authn_authz_secure_orm.md](06_authn_authz_secure_orm.md)
+- **Authorization design (PDP/PEP, constraints, fail-closed rules)** — [docs/arch/authorization/DESIGN.md](../arch/authorization/DESIGN.md)
+- **REST wiring & OperationBuilder** — [04_rest_operation_builder.md](04_rest_operation_builder.md)
+- **Errors (RFC-9457)** — [05_errors_rfc9457.md](05_errors_rfc9457.md)
+- **OData / pagination / $select / $filter** — [07_odata_pagination_select_filter.md](07_odata_pagination_select_filter.md)
+- **Database patterns (connections, transactions, repos)** — [11_database_patterns.md](11_database_patterns.md)
+- **Out-of-Process / gRPC / SDK pattern** — [09_oop_grpc_sdk_pattern.md](09_oop_grpc_sdk_pattern.md)
+- **Startup groups and the system capability** — [08_lifecycle_stateful_tasks.md](08_lifecycle_stateful_tasks.md)
+- **Platform gear inventory & high-level architecture** — [docs/GEARS.md](../GEARS.md), [docs/ARCHITECTURE_MANIFEST.md](../ARCHITECTURE_MANIFEST.md)

@@ -66,6 +66,8 @@ pub(crate) fn register_routes(
         .tag("Users Info")
         .authenticated()
         .require_license_features::<License>([])
+        .query_param_typed("limit", false, "Maximum number of users to return", "integer")
+        .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::list_users)
         .json_response_with_schema::<toolkit_odata::Page<dto::UserDto>>(
             openapi,
@@ -103,7 +105,7 @@ Every operation picks one auth mode, and `register()` requires a license decisio
 | `.exposed()` | Visibility axis, independent of auth. Emits `x-toolkit-visibility: exposed` on the operation in OpenAPI (`libs/toolkit/src/api/openapi_registry.rs`); edge `GatewayProvider`s (`libs/toolkit-gateway`) read it to route traffic to out-of-process gears. In-process routes are served by api-gateway whether or not they are exposed. Ignored with a warning on platform-authenticated routes. |
 | `.public()` | Deprecated alias for `.anonymous().exposed()`. |
 | `.request_timeout(Duration)` | Per-route deadline replacing the gateway's `defaults.request_timeout` (capped by `defaults.max_request_timeout` when set). |
-| `.no_request_timeout()` | Exempts the route from the gateway deadline; for long-lived streams (SSE, multipart). |
+| `.no_request_timeout()` | Exempts the route from the gateway deadline; for long-lived streams (SSE, multipart). When `defaults.max_request_timeout` is set, the route gets that maximum instead and the gateway logs a warning. |
 
 Anonymous endpoint:
 
@@ -143,7 +145,7 @@ OperationBuilder::get("/users-info/v1/health")
 | `.html_response(status, desc)` | HTML |
 | `.sse_json::<T>(openapi, desc)` | `text/event-stream` of JSON events |
 | `.multipart_json::<T>(openapi, desc)` | `multipart/mixed` stream of JSON items |
-| `.response(ResponseSpec::new(status, content_type, desc, None))` | Any other content type (e.g. binary) |
+| `.response(ResponseSpec::new(status, content_type, desc, None))` | Any other content type (e.g. binary); only as the first response, before any other response method |
 
 From `gears/file-parser/file-parser/src/api/rest/routes.rs`:
 

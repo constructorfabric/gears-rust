@@ -6,8 +6,8 @@ Each topic guide ends with its own checklist and keeps its code templates next t
 
 Reference implementation: `examples/toolkit/users-info`.
 
-- [ ] Directory `gears/<name>/` (kebab-case; `make validate-gear-names`) with `<name>/` and `<name>-sdk/` crates. Package names `cf-gears-<name>` and `cf-gears-<name>-sdk`. Layout: [02_gear_layout_and_sdk_pattern.md](02_gear_layout_and_sdk_pattern.md).
-- [ ] SDK crate: client trait, models, GTS types, OData query types. New SDKs return `CanonicalError` from trait methods (re-exported under a gear alias), with an optional typed projection in `error.rs` per ADR 0005; some older SDKs (tenant-resolver, authn-resolver) still define their own error enums ([05_errors_rfc9457.md](05_errors_rfc9457.md)).
+- [ ] Directory `gears/<name>/` (kebab-case; `make validate-gear-names`) with `<name>/` and `<name>-sdk/` crates. Package names under `gears/` are `cf-gears-<name>` and `cf-gears-<name>-sdk` (examples such as users-info use `<name>` / `<name>-sdk`). Layout: [02_gear_layout_and_sdk_pattern.md](02_gear_layout_and_sdk_pattern.md).
+- [ ] SDK crate: client trait, models, GTS types, OData query types. New SDKs return `CanonicalError` from trait methods (re-exported under a gear alias), with an optional typed projection in `error.rs` per ADR 0005; some older SDKs (tenant-resolver, authn-resolver, usage-collector, policy-engine) still define their own error enums ([05_errors_rfc9457.md](05_errors_rfc9457.md)).
 - [ ] Gear crate: `gear.rs`, `api/rest/` (DTOs, handlers, routes), `domain/`, `infra/storage/`.
 - [ ] `#[toolkit::gear(name = "<name>", deps = [<crate_ident>, ...], capabilities = [...])]`. `deps` takes crate identifiers; prefer `#[toolkit::consumes(...)]` for contract dependencies ([03_clienthub_and_plugins.md](03_clienthub_and_plugins.md)).
 - [ ] `#[domain_model]` on every `struct`/`enum` in `domain/` that is not strictly module-private (lint DE0309).
@@ -26,7 +26,7 @@ Reference implementation: `examples/toolkit/users-info`.
 | Task | Checklist |
 |---|---|
 | Gear layout, SDK crate | [02 § Quick checklist](02_gear_layout_and_sdk_pattern.md#quick-checklist) |
-| ClientHub, plugins | [03 § Quick checklist](03_clienthub_and_plugins.md#quick-checklist), [TOOLKIT_PLUGINS.md](../TOOLKIT_PLUGINS.md) |
+| ClientHub, plugins | [03 § Quick checklist](03_clienthub_and_plugins.md#quick-checklist), [ToolKit plugins](03_clienthub_and_plugins.md#plugins) |
 | REST routes | [04 § Quick checklist](04_rest_operation_builder.md#quick-checklist) |
 | Errors | [05 § Quick checklist](05_errors_rfc9457.md#quick-checklist) |
 | AuthZ, secure ORM | [06 § Quick checklist](06_authn_authz_secure_orm.md#quick-checklist) |

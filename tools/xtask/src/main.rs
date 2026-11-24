@@ -50,7 +50,8 @@ Commands:
                         libs/test-containers constructs a database
                         container directly -- `Postgres::default()`,
                         `Mysql::default()` or `GenericImage::new(..)`,
-                        under any alias. See docs/TESTING.md 4.4.
+                        under any alias. See
+                        docs/toolkit_unified_system/15_testing_and_ci.md 4.4.
 
   help                  Show this message."
     );

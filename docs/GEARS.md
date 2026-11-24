@@ -74,7 +74,7 @@ API Gateway is the single public entry point into Gears for all external clients
 Once a request is validated, it is routed to the appropriate gear via stable contracts. All domain decisions and state changes occur downstream, allowing gateway to remain simple, auditable, and scalable while internal gears evolve independently.
 
 Every external request MUST pass through:
-API Gateway → Auth Resolver → Policy Manager → License Resolver → Execution Gear → Tenant Resolver → Audit / Usage Collector → Response
+API Gateway (AuthN Resolver, license check) → Execution Gear (AuthZ via `PolicyEnforcer` and AuthZ Resolver; Tenant Resolver as needed) → Audit / Usage Collector → Response. See [Typical REST API request trajectory](toolkit_unified_system/00_gear_overview.md#typical-rest-api-request-trajectory).
 
 ### API Gateway
 #### Responsibility
@@ -82,8 +82,8 @@ Provide the single public API entrypoint for Gears, including request routing, a
 #### High Level Scenarios
 - [x] p1 - route versioned HTTP APIs to gears and expose OpenAPI
 - [x] p1 - enforce request limits, timeouts, and basic middleware
-- [x] p2 - unified authn/z + license checks at gateway
-- [ ] p3 - streaming endpoints (SSE) for long-running operations
+- [x] p2 - unified authn + license checks at gateway (authz runs in the gear through `PolicyEnforcer`)
+- [x] p3 - streaming endpoints (SSE) for long-running operations
 - [ ] p4 - multi-region routing and traffic shaping policies
 #### More details
 - TODO: PRD link

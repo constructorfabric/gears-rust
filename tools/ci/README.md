@@ -1,8 +1,9 @@
 # CI compilation cache and timing
 
 On the organisation's self-hosted runners sccache uses the shared build cache
-(see `.github/actions/ci-cache` and docs/TESTING.md, section 7.4); GitHub-hosted
-runs build with plain rustc.
+(see `.github/actions/ci-cache` and
+docs/toolkit_unified_system/15_testing_and_ci.md, section 7.4); GitHub-hosted runs
+build with plain rustc.
 Only main writes the compilation cache; PRs read it. PRs also never upload Cargo
 registry caches: every rust-cache step saves only on pushes to main.
 The pinned cargo-gears executable is cached by version, OS and architecture;

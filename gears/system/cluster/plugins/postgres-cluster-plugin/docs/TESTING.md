@@ -168,7 +168,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
 // Image tags are pinned workspace-wide in `libs/test-containers`; never call
-// `Postgres::default()` here (see /docs/TESTING.md §4.4).
+// `Postgres::default()` here (see /docs/toolkit_unified_system/15_testing_and_ci.md §4.4).
 
 pub async fn start_postgres() -> (ContainerAsync<Postgres>, PostgresClusterConfig) {
     let container = test_containers::postgres_named("cluster_test")

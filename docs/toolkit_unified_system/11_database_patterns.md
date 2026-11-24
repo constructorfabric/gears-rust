@@ -2,7 +2,7 @@
 
 This document covers database execution mechanics in Gears: the `DBRunner` abstraction, transactions, the repository pattern, and database migrations.
 
-For security-scoped database access (`AccessScope`, `.secure().scope_with(..)`, `PolicyEnforcer` PEP pattern), see [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md).
+For security-scoped database access (`AccessScope`, `.secure().scope_with(..)`, `PolicyEnforcer` PEP pattern), see [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md). **Design references:** [secure-orm ADR-0001 CTE policy](../arch/secure-orm/ADR/0001-secure-cte-policy.md) · [secure-orm ADR-0002 property-graph policy](../arch/secure-orm/ADR/0002-secure-property-graph-policy.md) · [database ADR-0001 object namespacing](../arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md) · [database TRADEOFFS](../arch/database/TRADEOFFS.md) · [Architecture Manifest § 3.2.4](../ARCHITECTURE_MANIFEST.md#324-gear-owned-schema-runtime-owned-privilege)
 
 ## Core invariants
 
@@ -17,14 +17,9 @@ For security-scoped database access (`AccessScope`, `.secure().scope_with(..)`, 
 
 ## Common Table Expressions (`WITH`)
 
-The full rationale is [ADR-0001](../arch/secure-orm/ADR/0001-secure-cte-policy.md); the
-rules that matter day to day:
-
-A CTE body is an independent `SELECT`, so the outer query's scope `WHERE` does **not**
-reach inside it. The Secure ORM therefore embeds scope into *every* CTE body rather than
-relying on the outer query. `with_ctes()` is only reachable from a scoped select, and each
-body inherits that query's `AccessScope` — a differently-scoped CTE cannot be built, so
-there is no check to remember and no error to handle.
+`with_ctes()` is reachable only from a scoped select, and every CTE body inherits that query's
+`AccessScope`, so a CTE cannot leak another tenant's rows and there is no scope check to write.
+Why scope is embedded in each body: [ADR-0001 § Decision Outcome](../arch/secure-orm/ADR/0001-secure-cte-policy.md#decision-outcome).
 
 ```rust
 let rows = order::Entity::find()
@@ -39,48 +34,30 @@ let rows = order::Entity::find()
     .await?;
 ```
 
-Things to keep in mind:
+Rules (API contract and reasons: [ADR-0001 § API shape](../arch/secure-orm/ADR/0001-secure-cte-policy.md#api-shape)):
 
-- **Attaching a CTE is not using it.** `cte()` only defines; without `join_cte()` the
-  `WITH` clause is valid SQL that computes nothing.
-- **The join predicate is yours to get right.** It is not compiler-verified. Getting it
-  wrong changes which rows return, but cannot cross a tenant boundary — the body never
-  held another tenant's rows.
-- **`join_cte` is an inner join**, so an outer row repeats once per matching CTE row. Use
-  `.distinct()` when the CTE is a membership set rather than a 1:1 join — and narrow the
-  projection first with `.select_only()`, because `SELECT DISTINCT` compares every selected
-  column and PostgreSQL's `json` has no equality operator (`jsonb` does).
-- **Ordering is split by where the column comes from.** `.order_by(E::Column, ..)` for an
-  entity column, `.order_by_cte("cte", "col", ..)` for a CTE's own column (e.g. a recursive
-  walk's depth). Only the first is combinable with `.distinct()`: PostgreSQL and MySQL both
-  reject `ORDER BY` on an expression that is not in a `SELECT DISTINCT` list, so pairing
-  `.distinct()` with `.order_by_cte()` returns `ScopeError::Invalid` on every backend rather
-  than working on SQLite and failing in production. "Distinct rows, shallowest first" needs
-  `GROUP BY … ORDER BY MIN(depth)`, which this API cannot express yet — dedup in the caller.
-- **The outer query selects every column of `E` by default.** `all_as::<T>()` narrows
-  *deserialization*, not the SQL — a hop needing only ids still transfers the wide columns,
-  and on PostgreSQL that turns an index-only scan into a heap visit per row (measured 0.371
-  ms against 0.079 ms). Use `.select_only()` plus `.column()` / `.column_from_cte()` /
-  `.expr_as()` to narrow it, and pair that with `all_as::<T>()` rather than `all()`.
-- **Don't `OR` two columns in a `join_cte` predicate.** `node.id = cte.src OR node.id =
-  cte.dst` drops the index and sequentially scans (15.2 ms against 0.30 ms on 199k nodes).
-  Put the alternation inside the CTE body instead, projecting one column that already holds
-  both endpoints.
-- **Recursive walks need a depth cap**, passed to `RecursiveCte::new`. PostgreSQL's `CYCLE`
-  clause is not portable (sea_query no-ops it on MySQL and SQLite), so the cap is the only
-  termination guarantee. Separately, the dedup mode decides how much work happens inside
-  that bound: the default `RecursiveDedup::Union` discards rows duplicating ones already
-  produced, bounding re-expansion by *(rows × depth)*; `UnionAll` keeps everything and
-  enumerates *paths*, which multiplies on hub-shaped graphs. Neither is a visited set.
-- **A recursive walk spans one self-referencing table.** The recursive member joins `J` to
-  the CTE on `J.link_col = cte.anchor_col`, so both endpoints must be columns of the same
-  entity — an edge table (`src`, `dst`) or a parent-pointer tree (`parent_id`, `id`). A hop
-  *through* a separate table (`node -> edge -> node`) needs a three-way join and is not
-  expressible; use one scoped query per hop instead.
-
-For a hierarchy that is traversed often, prefer a closure table (as `tenant_closure` does)
-over recursing on every read — `recursive_cte` is the right tool for rarely-walked or
-frequently-changing trees, where materializing is not worth the write-path cost.
+- **Reference every CTE.** `cte()` only defines; without `join_cte()` the `WITH` computes nothing.
+- **Get the join predicate right.** It is not compiler-verified; a wrong one returns wrong rows but
+  cannot cross a tenant boundary.
+- **`join_cte` is an inner join.** Add `.distinct()` when the CTE is a membership set, after
+  narrowing the projection with `.select_only()` (PostgreSQL `json` has no equality operator).
+- **Order by `.order_by(E::Column, ..)` for entity columns and `.order_by_cte(..)` for CTE columns.**
+  `.distinct()` with `.order_by_cte()` returns `ScopeError::Invalid` on every backend. "Distinct rows,
+  shallowest first" (`GROUP BY … ORDER BY MIN(depth)`) is not expressible yet; dedup in the caller.
+- **Narrow the outer projection** with `.select_only()` plus `.column()` / `.column_from_cte()` /
+  `.expr_as()`, paired with `all_as::<T>()`. `all_as::<T>()` alone narrows only deserialization;
+  on PostgreSQL the wide select turns an index-only scan into a heap visit per row (measured 0.371 ms
+  against 0.079 ms).
+- **Don't `OR` two columns in a `join_cte` predicate.** `node.id = cte.src OR node.id = cte.dst`
+  drops the index (15.2 ms against 0.30 ms on 199k nodes). Put the alternation inside the CTE body
+  and project one column holding both endpoints.
+- **Give every recursive walk a depth cap** (`RecursiveCte::new`); it is the only termination
+  guarantee. Keep the default `RecursiveDedup::Union` unless the graph is a sparse parent-pointer
+  tree. A recursive walk spans one self-referencing table; a hop through a separate table needs one
+  scoped query per hop. See [ADR-0001 § Recursive CTE](../arch/secure-orm/ADR/0001-secure-cte-policy.md#recursive-cte-with-recursive).
+- **Prefer a closure table for a hot hierarchy** (as `tenant_closure` does); use `recursive_cte` for
+  rarely walked or frequently changing trees. See
+  [ADR-0001 § Closure tables](../arch/secure-orm/ADR/0001-secure-cte-policy.md#closure-tables-still-preferred-for-hot-hierarchies-no-longer-required).
 
 ## Executors: `DBRunner`
 
@@ -131,7 +108,7 @@ provider
 
 ### Retrying on contention: `Db::transaction_with_retry`
 
-Under `SERIALIZABLE`, or on any backend with lock contention, a transaction can fail with an error that succeeds on retry. `Db::transaction_with_retry(tx_config, extract_db_err, body)` ([`secure/db.rs`](../../libs/toolkit-db/src/secure/db.rs)) reruns `body` in a fresh transaction when `extract_db_err` returns a `DbErr` that `toolkit_db::contention::is_retryable_contention` classifies as retryable, up to `DEFAULT_TX_RETRY_ATTEMPTS`. The body is called once per attempt, so it must be idempotent and clone what it captures. Get the `Db` from the provider with `DBProvider::db()`. Abridged from `file-storage` ([`store/metadata.rs`](../../gears/file-storage/file-storage/src/infra/storage/store/metadata.rs)):
+Under `SERIALIZABLE`, or on any backend with lock contention, a transaction can fail with an error that succeeds on retry. `Db::transaction_with_retry(tx_config, extract_db_err, body)` ([`secure/db.rs`](../../libs/toolkit-db/src/secure/db.rs)) reruns `body` in a fresh transaction when `extract_db_err` returns a `DbErr` that `toolkit_db::contention::is_retryable_contention` classifies as retryable, up to `DEFAULT_TX_RETRY_ATTEMPTS`. The body is called once per attempt, so it must be idempotent and clone what it captures ([R1](14_db_behavior_testing.md#r1-a-retried-closure-is-safe-to-run-again), [R2](14_db_behavior_testing.md#r2-the-retry-can-fire)); retry versus reporting the abort is a choice, see [TRADEOFFS § Retrying aborted transactions](../arch/database/TRADEOFFS.md#retrying-aborted-transactions). Get the `Db` from the provider with `DBProvider::db()`. Abridged from `file-storage` ([`store/metadata.rs`](../../gears/file-storage/file-storage/src/infra/storage/store/metadata.rs)):
 
 ```rust
 self.db
@@ -157,7 +134,7 @@ self.db
 
 ### SQLite: `transaction_mode`
 
-`SQLite` begins a plain `BEGIN` as a *deferred* transaction. One that reads and then writes cannot wait for the write lock: while another connection holds it, `SQLite` fails the write at once with `SQLITE_BUSY` and ignores `busy_timeout`. Under write contention (a request beside the gear's outbox worker, two requests on one row) such a transaction fails on every retry while the other writer is busy, and the caller sees a conflict that never happened.
+`SQLite` begins a plain `BEGIN` as a *deferred* transaction (dialect background: [TRADEOFFS § Row locks and dialects](../arch/database/TRADEOFFS.md#row-locks-and-dialects)). One that reads and then writes cannot wait for the write lock: while another connection holds it, `SQLite` fails the write at once with `SQLITE_BUSY` and ignores `busy_timeout`. Under write contention (a request beside the gear's outbox worker, two requests on one row) such a transaction fails on every retry while the other writer is busy, and the caller sees a conflict that never happened.
 
 A gear whose writes contend can set `transaction_mode: "immediate"` in its database `params`. (A DSN passed to `connect_db` can carry `transaction_mode=immediate` too, but a gear config's `dsn` cannot: the config path ignores a SQLite DSN's query parameters.) `Db`'s transactions that may write then begin with `BEGIN IMMEDIATE`, which takes the write lock up front and waits for it under `busy_timeout`, so writers queue instead of failing. So do the outbox's queue registration, sequencer, vacuum and processing transactions on that database; its dead-letter replay and discard, and the migration runner, still begin deferred. The default is `deferred`.
 

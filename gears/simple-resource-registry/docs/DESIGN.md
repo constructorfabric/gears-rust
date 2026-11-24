@@ -412,7 +412,7 @@ graph TB
 
   - **Search Plugin**: Future implementation of `ResourceStoragePluginClient` for search-heavy resource types (e.g., ElasticSearch, OpenSearch). Provides full-text search within payload fields. Declares `search_support` capability.
 
-**Plugin Architecture** (per TOOLKIT_PLUGINS.md):
+**Plugin Architecture** (per [ToolKit plugins](../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins)):
 
 The storage plugin system follows the standard ToolKit plugin pattern:
 

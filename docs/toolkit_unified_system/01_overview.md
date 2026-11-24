@@ -9,7 +9,7 @@
 - **OpenAPI 3.1** generated with `utoipa`; DTO schemas are registered automatically.
 - **Canonical errors**: handlers return `CanonicalError`; its `IntoResponse` renders an RFC 9457 `Problem`, and `canonical_error_middleware` fills `instance` and `trace_id`.
 - **Typed ClientHub** for in-process clients, resolved by interface type and optional scope.
-- **Plugins** through scoped ClientHub registration and GTS-based discovery ([TOOLKIT_PLUGINS.md](../TOOLKIT_PLUGINS.md)).
+- **Plugins** through scoped ClientHub registration and GTS-based discovery ([ToolKit plugins](03_clienthub_and_plugins.md#plugins)).
 - **Lifecycle** helpers for long-running tasks and graceful shutdown.
 
 The rules that apply to every gear are in [README.md § Core invariants](README.md#core-invariants-apply-everywhere).

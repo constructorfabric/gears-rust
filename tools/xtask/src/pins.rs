@@ -3,11 +3,12 @@
 //!
 //! # Why a parser and not a grep
 //!
-//! Image tags are pinned in one place (`libs/test-containers`, docs/TESTING.md
-//! 4.4) so a version change is one reviewed diff. A fixture that calls the
-//! upstream default constructors instead re-introduces the transitive pin
-//! through `Cargo.lock` that issue #4616 removed: a dependency bump then moves
-//! the database under every test with nothing in the diff to show it.
+//! Image tags are pinned in one place (`libs/test-containers`,
+//! docs/toolkit_unified_system/15_testing_and_ci.md 4.4) so a version change is one
+//! reviewed diff. A fixture that calls the upstream default constructors instead
+//! re-introduces the transitive pin through `Cargo.lock` that issue #4616 removed: a
+//! dependency bump then moves the database under every test with nothing in the diff
+//! to show it.
 //!
 //! This started life as two `grep -E` steps in CI. A regex matches text, so it
 //! matched only the *spelling* it was given:
@@ -50,8 +51,8 @@ const BANNED_DEFAULT_TYPES: [&str; 2] = ["Postgres", "Mysql"];
 /// Constructor banned outright outside [`IMPL_CRATE_PREFIX`].
 const GENERIC_IMAGE_TYPE: &str = "GenericImage";
 
-const POINTER: &str =
-    "Database images must come from libs/test-containers (see docs/TESTING.md 4.4).";
+const POINTER: &str = "Database images must come from libs/test-containers \
+                       (see docs/toolkit_unified_system/15_testing_and_ci.md 4.4).";
 
 /// Runs the pins check and returns the process exit code.
 pub fn check(args: &[String]) -> ExitCode {

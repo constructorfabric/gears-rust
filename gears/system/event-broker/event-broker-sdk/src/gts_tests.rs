@@ -412,8 +412,8 @@ fn event_identifier_fields_accept_concrete_ids_but_reject_wildcards() {
 // The event-type example under `docs/schemas/examples/` is generated from
 // `OrderPlacedV1` below, like the base documents. The topic example is an
 // instance document, held to its base by validation. `fabrikam` is the vendor
-// this repository uses for a third party (`docs/TOOLKIT_PLUGINS.md`), and is one
-// of the four registered with `gts-validator`.
+// this repository uses for a third party, and is one of the four registered
+// with `gts-validator`.
 
 /// The worked producer example; `docs/schemas/examples/` holds the document it generates.
 #[gts_type_schema(

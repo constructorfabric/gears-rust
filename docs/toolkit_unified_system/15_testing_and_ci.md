@@ -1,14 +1,8 @@
-# Testing Policy
+# Testing, Coverage and CI
 
-This document defines the test strategy, coverage requirements, and CI enforcement for
-Gears.  It is the single source of truth for "what must be tested and how."
+Test strategy, coverage thresholds, test commands and the CI jobs that enforce them. How to write unit, E2E and DB-behaviour tests is in [12](12_unit_testing.md), [13](13_e2e_testing.md) and [14](14_db_behavior_testing.md).
 
-Gears promotes a **shift-left**, green-build-oriented development model: contributors
-should be able to run the vast majority of checks on a local development machine before
-opening a pull request.  This is practical because the codebase has a low memory and CPU footprint with help of Rust, fast and deterministic local test execution, and a packaging model where many gear combinations can be exercised through a small number of binaries rather than a large distributed deployment.
-
-The unified `Makefile` and `tools/scripts/ci.py` entry points mirror CI behavior locally, so unit tests, most integration tests, linting, safety checks, coverage, and most E2E validation can usually be reproduced before the code ever reaches GitHub Actions. CI still remains the source of truth for cross-platform validation, scheduled suites, specialized lanes such as FIPS, and final merge protection, but contributors are expected to arrive with a locally green
-build whenever feasible.
+Most checks run locally through `make` (or `tools/scripts/ci.py` on Windows) the same way CI runs them; CI adds cross-platform runs, scheduled suites and FIPS lanes. Arrive at review with a locally green build.
 
 ---
 
@@ -20,7 +14,7 @@ build whenever feasible.
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
 | **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs to `main`/`develop` that touch Rust code (`clusterfuzzlite.yml`) |
-| **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, `cargo gears lint`, cargo-deny; cargo-kani and cargo-geiger locally | varies | Every PR (`ci.yml` — `clippy`, `security`, `lint` jobs); kani and geiger are not run in CI |
+| **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, `cargo gears lint`, cargo-deny; cargo-kani and cargo-geiger locally | varies | Every PR (`ci.yml` — `clippy`, `lint` jobs); `security` (cargo-deny) when dependencies or CI files change, or on manual dispatch; kani and geiger are not run in CI |
 
 Additional testing categories such as performance (#4054), upgrade / migration (#4117), and long-haul (#4118) or soak testing are expected to be added over time, but they are not yet implemented or enforced as part of the current project test matrix.
 
@@ -82,15 +76,14 @@ The workspace `coverage` job itself has no floor and does not fail on a percenta
 
 | Mode | Command | What it measures |
 |------|---------|------------------|
-| **Unit** | `make coverage-unit` | All `#[test]` functions across the workspace (compiled with `--all-features`) |
+| **Unit** | `make coverage-unit` | All `#[test]` functions across the workspace (`cargo llvm-cov --workspace` with the example server's E2E features, not `--all-features`) |
 | **E2E** | `make coverage-e2e-local` | Server code exercised by the pytest E2E suite via an instrumented binary |
 | **Combined** | `make coverage` | Unit + E2E accumulated into a single report |
 
-> **Why no separate "integration" coverage mode?**
-> Unit coverage already compiles with `--all-features`, which enables the `integration`
-> feature gate.  SQLite-backed integration tests therefore execute as part of
-> `make coverage-unit`.  A separate mode would re-run the same tests and produce
-> identical data — so it is intentionally omitted to avoid confusion.
+> **No "integration" coverage mode.** `make coverage-unit` does not enable the
+> `integration` feature, so integration tests are not in the local coverage report.
+> In CI, the `graph-storage` and `github-mirror` jobs upload coverage from their own
+> PostgreSQL lanes (2.3).
 
 ### 2.3 CI coverage
 
@@ -103,7 +96,7 @@ job cannot run their PostgreSQL lanes.
 
 ### 2.4 Reports
 
-Local coverage commands produce four report formats under `coverage/<mode>/`:
+Local coverage commands produce five report files under `coverage/<mode>/`:
 
 | File | Format |
 |------|--------|
@@ -122,10 +115,10 @@ Local coverage commands produce four report formats under `coverage/<mode>/`:
 - Every new public function, method, or behaviour **must** have at least one unit test.
 - Tests live in a sibling file `<stem>_tests.rs`, included from the module under test with
   `#[cfg(test)] #[path = "<stem>_tests.rs"] mod <stem>_tests;`. Architecture lint DE1101
-  (`cargo gears lint`, configured in [`dylint.toml`](../dylint.toml)) rejects inline test
+  (`cargo gears lint`, configured in [`dylint.toml`](../../dylint.toml)) rejects inline test
   blocks over 100 lines; see
-  [ADR 0001](adrs/tests/0001-tests-in-separate-files.md) and
-  [`12_unit_testing.md` § Test File Organization](toolkit_unified_system/12_unit_testing.md#test-file-organization).
+  [ADR 0001](../adrs/tests/0001-tests-in-separate-files.md) and
+  [`12_unit_testing.md` § Test File Organization](12_unit_testing.md#test-file-organization).
 - Name tests after the behaviour they check, in snake_case and without a `test_` prefix:
   `{subject}_{scenario}_{outcome}`, e.g. `stream_events_returns_404_for_unknown_subscription`.
 - Prefer deterministic assertions — avoid sleeping or time-dependent checks.
@@ -183,7 +176,7 @@ and MySQL lanes, most gear lanes (`make test-integration LANE=<lane>`), and the 
 ### 4.4 Database container images
 
 Every fixture that starts a database container goes through
-[`libs/test-containers`](../libs/test-containers/src/lib.rs) (crate
+[`libs/test-containers`](../../libs/test-containers/src/lib.rs) (crate
 `cf-gears-test-containers`, imported as `test_containers`). It is the single place image
 versions are pinned, so a version change is one reviewed diff instead of a grep across the
 workspace.
@@ -246,13 +239,15 @@ GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features 
 `GEARS_TEST_TIMESCALEDB_TAG` and `GEARS_TEST_CLICKHOUSE_TAG` are each read by *both* lanes: the
 Rust plugin fixtures via `test_containers::timescaledb()` / `clickhouse()`, and the Python E2E
 sidecars via `timescaledb_tag()` / `clickhouse_tag()` in
-[`testing/e2e/lib/sidecars.py`](../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
+[`testing/e2e/lib/sidecars.py`](../../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
 migrations and E2E on the same image instead of silently testing two different ones.
 
-Because those two pins are spelled once per language, each is duplicated across a Rust constant
-and a Python one. The unit tests `e2e_sidecar_pins_the_same_timescaledb_image` and
+Because those pins are spelled once per language, each is duplicated across a Rust constant
+and a Python one; the same holds for the PostgreSQL pin (`POSTGRES_TAG`, `GEARS_TEST_PG_TAG`,
+`postgres_tag()`), which self-managed PostgreSQL E2E lanes use. The unit tests
+`e2e_sidecar_pins_the_same_timescaledb_image`, `e2e_sidecar_pins_the_same_postgres_image` and
 `e2e_sidecar_pins_the_same_clickhouse_image` in `libs/test-containers` read `sidecars.py` and
-fail the build if either copy drifts — so a version bump is still a single reviewed decision even
+fail the build if any copy drifts — so a version bump is still a single reviewed decision even
 though it touches two files.
 
 `GEARS_TEST_PG_GRAPH_REQUIRED=1` turns an unavailable PostgreSQL 19 image into a failure rather
@@ -273,7 +268,8 @@ httpx).
 
 - Every user-facing REST endpoint **should** have at least one E2E smoke test.
 - Critical flows (CRUD, auth, error responses) **must** have full E2E coverage.
-- Mark lightweight, fast tests with `@pytest.mark.smoke` — these run on every PR.
+- Mark lightweight, fast tests with `@pytest.mark.smoke`; `make e2e-local-smoke` runs only them. CI
+  does not select by the marker yet: PRs run the full suite (5.3).
 
 ### 5.2 Modes
 
@@ -299,7 +295,8 @@ and `GEAR=` are mutually exclusive.
 The `e2e.yml` workflow runs:
 - **On PRs to `main`**: full E2E suite (local mode).
 - **Nightly**: full E2E suite. Failures auto-create a GitHub issue assigned to the last commit author.
-- **Manual dispatch**: smoke or full, selectable.
+- **Manual dispatch**: a `mode` input (`smoke` or `full`); both currently run the full suite (TODO in
+  `e2e.yml` to switch smoke to `make e2e-local-smoke`).
 - **Specialized lanes**: the same workflow also runs the mini-chat E2E suite, the
   RG + AuthZ end-to-end chain tests, and the usage-collector suite.
 
@@ -324,7 +321,7 @@ reading a green run as coverage.
 Those containers are labelled per run so that concurrent sessions on one host do not reap
 each other's database. The run-identity and reap-age settings (`CF_GEARS_E2E_RUN_ID`,
 `CF_GEARS_E2E_REAP_MIN_AGE_SECS`) are documented in
-[`testing/e2e/lib/sidecars.py`](../testing/e2e/lib/sidecars.py).
+[`testing/e2e/lib/sidecars.py`](../../testing/e2e/lib/sidecars.py).
 
 Other quality-related GitHub Actions under `.github/workflows` complement the E2E
 workflow:
@@ -337,7 +334,7 @@ workflow:
 
 ### 5.4 Writing E2E tests
 
-The detailed E2E guide is [`testing/e2e/README.md`](../testing/e2e/README.md). Use it as
+The detailed E2E guide is [`testing/e2e/README.md`](../../testing/e2e/README.md). Use it as
 the source of truth for:
 
 - **Adding a new suite** — naming conventions, `testing/e2e/suites/<suite>/` layout,
@@ -367,7 +364,7 @@ attacks.
 
 ### 6.2 Targets
 
-Targets live in [`tools/fuzz/fuzz_targets/`](../tools/fuzz/fuzz_targets/); `make fuzz-list` prints them.
+Targets live in [`tools/fuzz/fuzz_targets/`](../../tools/fuzz/fuzz_targets/); `make fuzz-list` prints them.
 
 | Target | Component |
 |--------|-----------|
@@ -386,7 +383,7 @@ make fuzz-build                          # build without running
 make fuzz-clean                          # remove fuzzing artifacts
 ```
 
-See [`fuzz/README.md`](../tools/fuzz/README.md) for corpus management and crash reproduction.
+See [`fuzz/README.md`](../../tools/fuzz/README.md) for corpus management and crash reproduction.
 
 ---
 
@@ -493,15 +490,17 @@ Nightly (schedule)
   ├── macos-windows-tests.yml — unit tests on macOS and Windows (auto-creates issue on failure)
   ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
   ├── clippy-nightly.yml, shear-nightly.yml — make clippy-deep, make shear
-  ├── codeql.yml           — scheduled code scanning
-  ├── pr-governance.yml    — governance / follow-up automation
-  └── pr-reviewer-check.yml — reviewer assignment checks
+  └── codeql.yml           — scheduled code scanning
+
+Other schedules
+  ├── pr-governance.yml    — governance / follow-up automation (08:00 and 13:00 UTC)
+  └── pr-reviewer-check.yml — reviewer assignment checks (every 10 minutes)
 ```
 
 ### 7.4 CI build cache
 
 Self-hosted runners, the shared sccache build cache (`.github/actions/ci-cache`) and its
-read/write key policy are documented in [`.github/runners/README.md`](../.github/runners/README.md).
+read/write key policy are documented in [`.github/runners/README.md`](../../.github/runners/README.md).
 
 ## 8. Custom Architecture Lints
 
@@ -522,7 +521,7 @@ make gts-docs             # validate GTS identifiers in docs and schema files
 ```
 
 The CI `lint` job runs `make dylint` on every PR. Lint settings (for example DE1101's
-`max_inline_test_lines` and `excluded_paths`) are in [`dylint.toml`](../dylint.toml).
+`max_inline_test_lines` and `excluded_paths`) are in [`dylint.toml`](../../dylint.toml).
 
 ---
 
@@ -555,9 +554,9 @@ Before opening a PR, verify:
 
 ## 11. Related Documents
 
-- [CONTRIBUTING.md](../CONTRIBUTING.md) — development workflow, commit conventions, PR process
-- [testing/e2e/README.md](../testing/e2e/README.md) — E2E test guide, fixtures, advanced usage
-- [fuzz/README.md](../tools/fuzz/README.md) — fuzz target reference, corpus management
+- [CONTRIBUTING.md](../../CONTRIBUTING.md) — development workflow, commit conventions, PR process
+- [testing/e2e/README.md](../../testing/e2e/README.md) — E2E test guide, fixtures, advanced usage
+- [fuzz/README.md](../../tools/fuzz/README.md) — fuzz target reference, corpus management
 - `cargo-gears-lints` (in the `cf-cli` repository) — architecture lint catalog and development notes
-- [guidelines/SECURITY.md](../guidelines/SECURITY.md) — secure coding practices
-- [docs/QUICKSTART_GUIDE.md](./QUICKSTART_GUIDE.md) — getting started with the project
+- [guidelines/SECURITY.md](../../guidelines/SECURITY.md) — secure coding practices
+- [docs/QUICKSTART_GUIDE.md](../QUICKSTART_GUIDE.md) — getting started with the project

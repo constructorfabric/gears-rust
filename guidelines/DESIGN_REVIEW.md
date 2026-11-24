@@ -443,7 +443,7 @@ Driven by: #<n>[, #<m>]. <1–2 sentences.> Must fix before merge: #… Tracked 
 | C7 | [GTS guidelines](GTS.md), [GTS specification](https://github.com/GlobalTypeSystem/gts-spec), [Types Registry DESIGN](../gears/system/types-registry/docs/DESIGN.md), [Type compatibility ADR](../gears/system/types-registry/docs/ADR/0003-cpt-cf-types-registry-adr-type-schema-evolution-compatibility.md) |
 | C8 | [Event Broker DESIGN](../gears/system/event-broker/docs/DESIGN.md), [Partition selection ADR](../gears/system/event-broker/docs/ADR/0002-partition-selection.md), [Event schema ADR](../gears/system/event-broker/docs/ADR/0003-event-schema.md) |
 | C9 | TODO: task-engine contracts, durable task queue reference docs |
-| C10 | [ToolKit plugins](../docs/TOOLKIT_PLUGINS.md), [ClientHub and plugins](../docs/toolkit_unified_system/03_clienthub_and_plugins.md) |
+| C10 | [ToolKit plugins](../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins), [ClientHub and plugins](../docs/toolkit_unified_system/03_clienthub_and_plugins.md) |
 | C11 | [Gears Serverless catalog](../docs/GEARS.md#serverless), [Serverless Runtime DESIGN](../gears/serverless-runtime/docs/DESIGN.md), [Serverless SDK DESIGN](../gears/serverless-runtime/serverless-sdk/docs/DESIGN.md) |
 | C12 | [LLM Gateway PRD](../gears/llm-gateway/docs/PRD.md), [OAGW DESIGN](../gears/system/oagw/docs/DESIGN.md), [Security guidelines](SECURITY.md) |
 | C13 | [Database naming ADR](../docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md), [ToolKit database patterns](../docs/toolkit_unified_system/11_database_patterns.md), [Secure CTE ADR](../docs/arch/secure-orm/ADR/0001-secure-cte-policy.md), [Secure property graph ADR](../docs/arch/secure-orm/ADR/0002-secure-property-graph-policy.md) |

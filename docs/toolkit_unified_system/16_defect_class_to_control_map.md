@@ -2,6 +2,7 @@
 
 # Defect Class → Control Map
 
+**Design references:** [authorization DESIGN](../arch/authorization/DESIGN.md) · [errors DESIGN](../arch/errors/DESIGN.md) · [database TRADEOFFS](../arch/database/TRADEOFFS.md) · [security overview](../security/SECURITY.md)
 
 <!-- toc -->
 
@@ -89,10 +90,11 @@ Tables with no tenant column — type registries, plugin catalogues, platform-wi
   tenant/resource/owner columns cannot be filtered, so the *only* protection is the permission
   check. Enumerate these entities explicitly; the danger is that they look scoped because every
   neighbouring table is.
-- Note the failure mode peculiar to this class: since there is nothing to filter, a resource
-  descriptor that advertises no properties makes a PDP's baseline constraint fail to *compile*, and
-  a permitted caller receives 500 rather than a result. Fail-closed here looks like an outage, not
-  like a denial.
+- Watch for the failure mode peculiar to this class: a resource descriptor that advertises no
+  properties makes a PDP's baseline constraint fail to compile, so a permitted caller gets 500, not a
+  result. Fail-closed here looks like an outage, not a denial. The rules behind it:
+  [`require_constraints` flag](../arch/authorization/DESIGN.md#require_constraints-flag),
+  [Fail-Closed Rules](../arch/authorization/DESIGN.md#fail-closed-rules).
 
 ## Wire ↔ storage type mismatch
 

@@ -257,8 +257,8 @@ jobs:
           shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
-      # Database image tags are pinned in libs/test-containers (docs/TESTING.md
-      # 4.4). A fixture that constructs a container any other way re-introduces
+      # Database image tags are pinned in libs/test-containers
+      # (docs/toolkit_unified_system/15_testing_and_ci.md 4.4). A fixture that constructs a container any other way re-introduces
       # the transitive pin through Cargo.lock that issue #4616 removed: a
       # dependency bump then moves the database under every test with nothing in
       # the diff to show it.

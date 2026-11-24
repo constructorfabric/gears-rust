@@ -3,7 +3,7 @@
 
 # E2E Testing Guide
 
-This document defines the philosophy and patterns for end-to-end (E2E) tests across all ToolKit gears. Suites live in `testing/e2e/suites/<suite>/`. How to run them, the `e2e.yaml` format, shared-server versus self-managed suites and the `make` targets are in [`testing/e2e/README.md`](../../testing/e2e/README.md); CI lanes are in [`docs/TESTING.md` §5](../TESTING.md#5-end-to-end-e2e-tests).
+This document defines the philosophy and patterns for end-to-end (E2E) tests across all ToolKit gears. Suites live in `testing/e2e/suites/<suite>/`. How to run them, the `e2e.yaml` format, shared-server versus self-managed suites and the `make` targets are in [`testing/e2e/README.md`](../../testing/e2e/README.md); CI lanes are in [15 § 5](15_testing_and_ci.md#5-end-to-end-e2e-tests).
 
 ---
 
@@ -482,7 +482,7 @@ Some E2E tests are conditional on infrastructure availability:
 
 | Suite | Skip condition | Description |
 |-------|---------------|-------------|
-| **Cross-tenant isolation** | `E2E_AUTH_TOKEN_TENANT_B` not set | Tests requiring two real tokens from different tenants |
+| **Cross-tenant isolation** | never skipped; `E2E_AUTH_TOKEN_TENANT_B` defaults to `e2e-token-tenant-b` (`config/e2e-local.yaml`) | Tests requiring two real tokens from different tenants |
 | **MTLS** _(p2 — deferred, not implemented yet)_ | `E2E_MTLS_CERT_DIR` not set | Certificate-based authentication verification |
 
 All core integration seam tests run with a single token, no special infrastructure.
