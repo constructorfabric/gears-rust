@@ -12,6 +12,7 @@ use crate::domain::model::{
     Endpoint, HeadersConfig, HttpMatch, HttpMethod, MatchRules, PluginsConfig, RateLimitAlgorithm,
     RateLimitConfig, Route, Scheme, UpdateRouteRequest, UpdateUpstreamRequest,
 };
+use crate::domain::plugin::aws_sigv4::AwsSigV4AuthConfig;
 use crate::domain::plugin::credentials::{
     ApiKeyAuthConfig, AuthConfigError, parse_credential_mode, parse_request_secret_types,
 };
@@ -116,9 +117,12 @@ fn validate_upstream_content(
 }
 
 /// `credential_mode` and `request_secret_types` (ADR-0022), and the API-key
-/// plugin's own keys. The API-key plugin's config goes through
+/// and AWS SigV4 plugins' own keys. The API-key plugin's config goes through
 /// [`ApiKeyAuthConfig::parse`], the parser the plugin and the proxy use,
-/// plus the write-only [`ApiKeyAuthConfig::check_write_policy`]. Another
+/// plus the write-only [`ApiKeyAuthConfig::check_write_policy`]; the AWS
+/// SigV4 plugin's through [`AwsSigV4AuthConfig::parse`], the parser the
+/// plugin uses, so a required key is checked even when absent (the
+/// credential reference loop sees only the keys present). Another
 /// plugin may carry `credential_mode` and `request_secret_types` (they mean
 /// nothing there), but they must still be well-formed. A `request_ref`
 /// default `secret_ref` is a credential reference like any other and gets
@@ -130,6 +134,9 @@ fn validate_credential_mode(auth: &AuthConfig) -> Result<(), DomainError> {
         return ApiKeyAuthConfig::parse(config)
             .and_then(|parsed| parsed.check_write_policy())
             .map_err(to_domain);
+    }
+    if auth.plugin_type == crate::domain::gts_helpers::AWS_SIGV4_AUTH_PLUGIN_ID {
+        AwsSigV4AuthConfig::parse(config).map_err(to_domain)?;
     }
     let mode = parse_credential_mode(config).map_err(to_domain)?;
     parse_request_secret_types(config, mode)

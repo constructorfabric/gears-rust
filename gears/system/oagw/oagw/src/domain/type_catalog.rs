@@ -1,6 +1,6 @@
 //! Centralized catalog of all OAGW GTS entities for Types Registry registration.
 //!
-//! Returns all 21 entities (7 schemas + 14 instances) in a single batch,
+//! Returns all 22 entities (7 schemas + 15 instances) in a single batch,
 //! ready for `TypesRegistryClient::register()`.
 
 use serde_json::{Value, json};
@@ -29,7 +29,7 @@ fn instance_entity(gts_id: &str, description: &str) -> Value {
     })
 }
 
-/// Returns all OAGW GTS entities (7 schemas + 13 instances) for batch registration.
+/// Returns all OAGW GTS entities (7 schemas + 15 instances) for batch registration.
 pub fn oagw_gts_entities() -> Vec<Value> {
     vec![
         // -- Schemas (7) --
@@ -43,7 +43,7 @@ pub fn oagw_gts_entities() -> Vec<Value> {
         // -- Protocol instances (2) --
         instance_entity(HTTP_PROTOCOL_ID, "HTTP protocol"),
         instance_entity(GRPC_PROTOCOL_ID, "gRPC protocol"),
-        // -- Auth plugin instances (6) --
+        // -- Auth plugin instances (7) --
         instance_entity(NOOP_AUTH_PLUGIN_ID, "No-op (passthrough) auth"),
         instance_entity(APIKEY_AUTH_PLUGIN_ID, "API key injection"),
         instance_entity(BASIC_AUTH_PLUGIN_ID, "HTTP Basic auth"),
@@ -56,6 +56,7 @@ pub fn oagw_gts_entities() -> Vec<Value> {
             OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
             "OAuth2 client credentials (Basic)",
         ),
+        instance_entity(AWS_SIGV4_AUTH_PLUGIN_ID, "AWS Signature Version 4"),
         // -- Guard plugin instances (3) --
         instance_entity(TIMEOUT_GUARD_PLUGIN_ID, "Request timeout"),
         instance_entity(CORS_GUARD_PLUGIN_ID, "CORS handling"),
@@ -81,12 +82,12 @@ mod tests {
     }
 
     #[test]
-    fn catalog_returns_exactly_21_entities() {
+    fn catalog_returns_exactly_22_entities() {
         let entities = oagw_gts_entities();
         assert_eq!(
             entities.len(),
-            21,
-            "expected 21 entities (7 schemas + 14 instances)"
+            22,
+            "expected 22 entities (7 schemas + 15 instances)"
         );
     }
 
@@ -118,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn seven_schemas_and_thirteen_instances() {
+    fn seven_schemas_and_fifteen_instances() {
         let entities = oagw_gts_entities();
         let schemas: Vec<_> = entities
             .iter()
@@ -130,7 +131,7 @@ mod tests {
             .collect();
 
         assert_eq!(schemas.len(), 7, "expected 7 schemas");
-        assert_eq!(instances.len(), 14, "expected 14 instances");
+        assert_eq!(instances.len(), 15, "expected 15 instances");
     }
 
     #[test]

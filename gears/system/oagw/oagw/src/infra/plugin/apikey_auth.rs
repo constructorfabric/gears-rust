@@ -5,9 +5,9 @@ use credstore_sdk::CredStoreClientV1;
 
 use crate::domain::plugin::credentials::{
     ApiKeyAuthConfig, CREDENTIAL_MODE_FIELD, CredentialMode, PREFIX_KEY, SECRET_REF_KEY,
-    credstore_read_error, secret_missing,
 };
 use crate::domain::plugin::{AuthContext, AuthPlugin, PluginError};
+use crate::infra::plugin::read_credential;
 
 /// Auth plugin that resolves a secret reference and injects it as a header value.
 pub struct ApiKeyAuthPlugin {
@@ -51,16 +51,17 @@ impl AuthPlugin for ApiKeyAuthPlugin {
             PluginError::InvalidConfig(format!("invalid apikey auth config: no {SECRET_REF_KEY}"))
         })?;
 
-        let response = self
-            .credstore
-            .get(&ctx.security_context, &key)
-            .await
-            .map_err(|e| credstore_read_error(SECRET_REF_KEY, &e))?
-            .ok_or_else(|| secret_missing(SECRET_REF_KEY))?;
+        let secret = read_credential(
+            self.credstore.as_ref(),
+            &ctx.security_context,
+            SECRET_REF_KEY,
+            &key,
+        )
+        .await?;
 
         // A stored value the header cannot carry is the secret's fault, not
         // the config's: 401 `AUTH_PLUGIN_INTERNAL`, as in `request_ref` mode.
-        let secret_str = std::str::from_utf8(response.value.as_bytes())
+        let secret_str = std::str::from_utf8(secret.as_bytes())
             .map_err(|_| PluginError::Internal("secret value is not valid UTF-8".into()))?;
         if http::HeaderValue::from_str(&config.prefix).is_err() {
             return Err(PluginError::InvalidConfig(format!(

@@ -55,8 +55,9 @@ use crate::domain::model::{CircuitBreakerConfig, Endpoint, Upstream};
 const IDLE_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// The gateway's own steps before the exchange (CredStore read, endpoint
-/// selection) may use up to `1 / GATEWAY_SHARE` of the request timeout for a
-/// deadline hit to still count against the upstream.
+/// selection, an auth plugin's signing phase) may use up to
+/// `1 / GATEWAY_SHARE` of the request timeout for a deadline hit to still
+/// count against the upstream.
 const GATEWAY_SHARE: u32 = 10;
 
 /// The upstreams' breakers on this replica.
@@ -318,10 +319,11 @@ impl UpstreamPermit {
         self
     }
 
-    /// Target resolution and the exchange start with `left` of the shared
-    /// request deadline, whose whole is `request_timeout`. When the gateway's
-    /// own steps before them took more than a tenth of it, the upstream did
-    /// not get its budget and a deadline hit is not counted.
+    /// The upstream has `left` of the shared request deadline, whose whole
+    /// is `request_timeout`, for target resolution and the exchange. When the
+    /// gateway's own steps took more than a tenth of it, the upstream did not
+    /// get its budget and a deadline hit is not counted. Called again with
+    /// less once a signing phase has run; the last call holds.
     pub fn with_budget(mut self, left: Duration, request_timeout: Duration) -> Self {
         self.full_budget = has_full_budget(left, request_timeout);
         self

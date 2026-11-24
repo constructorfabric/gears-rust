@@ -1,3 +1,4 @@
+pub mod aws_sigv4;
 pub mod credentials;
 
 use std::collections::HashMap;
@@ -64,6 +65,16 @@ pub enum PluginError {
     /// returned an output the gateway cannot send.
     #[error("invalid plugin configuration: {0}")]
     InvalidConfig(String),
+    /// The plugin cannot handle this request as the caller sent it, though
+    /// its configuration is valid: for example a signer that cannot hash a
+    /// streamed body. The detail never carries the value the caller sent.
+    #[error("{detail}")]
+    InvalidRequest {
+        /// What the caller sent: a header name or `body`.
+        field: &'static str,
+        /// Why it cannot be handled, and the fix.
+        detail: String,
+    },
     /// Unexpected internal failure inside the plugin.
     #[error("plugin error: {0}")]
     Internal(String),
@@ -126,9 +137,13 @@ pub enum SigningBody {
 /// The outbound request as it will be sent, passed to [`AuthPlugin::sign`]
 /// (ADR-0023).
 #[domain_model]
-#[allow(
-    dead_code,
-    reason = "part of the auth plugin API; no built-in plugin signs yet"
+// Unit tests read the fields, so the expectation holds outside them only.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "scheme, host and port are part of the auth plugin API; the AWS SigV4 plugin signs the Host header instead"
+    )
 )]
 pub struct SigningContext {
     /// HTTP method.
@@ -141,6 +156,11 @@ pub struct SigningContext {
     pub port: u16,
     /// Path as sent, percent-encoding included.
     pub path: String,
+    /// The gateway removed an empty, `.` or `..` segment from the client's
+    /// path, or removed or added a trailing `/`, so [`Self::path`]
+    /// may name another resource than the client asked for at an upstream
+    /// that does not normalize paths (an S3 object key).
+    pub path_rewritten: bool,
     /// Query as sent, without the `?`; `None` when the URL has none.
     pub query: Option<String>,
     /// Headers as sent: lowercase names, every line of a repeated name in
@@ -188,10 +208,6 @@ impl std::fmt::Debug for SigningOutput {
 /// it may carry a presigned signature.
 #[domain_model]
 #[derive(Default, Clone, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "part of the auth plugin API; no built-in plugin signs yet"
-)]
 pub enum QueryChange {
     /// Send the query as it is.
     #[default]

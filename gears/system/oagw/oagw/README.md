@@ -24,7 +24,7 @@ The `cf-gears-oagw` gear provides:
 - **Upstream management** — CRUD for external upstream services with alias-based resolution
 - **Route management** — CRUD for routes with HTTP/gRPC match rules, plugins, and rate limits
 - **Proxy pipeline** — alias resolution → authZ → credential injection → rate limiting → HTTP forwarding
-- **Plugin system** — per-upstream/route auth plugins (`noop`, `api-key`; extensible)
+- **Plugin system** — per-upstream auth plugins (`noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `aws_sigv4`), guard and transform plugins
 - **Type provisioning** — reconciles pre-configured upstreams and routes from the types registry in a background task (in memory also once at startup)
 - **ClientHub integration** — registers `ServiceGatewayClientV1` for inter-gear use
 

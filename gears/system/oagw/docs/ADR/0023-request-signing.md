@@ -78,7 +78,7 @@ Incoming request
   → transform plugins (on_response / on_error)
 ```
 
-Signing runs after the rate limit check, so a rejected request is not signed. It runs under the request deadline that already covers endpoint selection, address resolution and the exchange; a signing phase that does not finish in time fails the request with 504 `RequestTimeout`. The `sign` future is then dropped at whatever await it reached, so a plugin must not leave shared state (a nonce, a cached credential) half-updated across an await. In `request_ref` mode the proxy injects the key itself and runs no auth plugin, so there is no signing phase.
+Signing runs after the rate limit check, so a rejected request is not signed. It runs under the request deadline that already covers endpoint selection, address resolution and the exchange; a signing phase that does not finish in time fails the request with 504 `RequestTimeout`. Signing time is the gateway's, not the upstream's: the circuit breaker takes it off the upstream's budget ([ADR-0005](./0005-circuit-breaker.md), *Full budget*). The `sign` future is then dropped at whatever await it reached, so a plugin must not leave shared state (a nonce, a cached credential) half-updated across an await. In `request_ref` mode the proxy injects the key itself and runs no auth plugin, so there is no signing phase.
 
 ### Interface
 
@@ -103,6 +103,7 @@ pub struct SigningContext {
     pub host: String,
     pub port: u16,                 // also when the URL omits the default port
     pub path: String,              // as sent, percent-encoded
+    pub path_rewritten: bool,      // the gateway removed `//` or `.`/`..` from the client's path, or removed or added a trailing `/`
     pub query: Option<String>,     // as sent, without `?`
     pub headers: Vec<(String, Vec<u8>)>,
     pub body: SigningBody,
@@ -164,6 +165,7 @@ A signing failure stops the request before anything is sent to the upstream. It 
 | `PluginError::IdpUnavailable` (identity provider token endpoint) | `IdpUnavailable`, reason `IDENTITY_PROVIDER_UNAVAILABLE` | 503 |
 | `PluginError::IdpInvalidResponse` | `IdpInvalidResponse`, reason `REQUEST_NOT_SENT` | 502 |
 | `PluginError::InvalidConfig`, or an output the gateway cannot send | `Internal` (plugin misconfiguration) | 500 |
+| `PluginError::InvalidRequest`: a valid config, but the plugin cannot handle the request as the caller sent it | `Validation`, the field the plugin names (a header name, `body`, `path`), reason `VALIDATION` | 400 |
 | Request deadline passed | `RequestTimeout`, reason `REQUEST_NOT_SENT` | 504 |
 
 Amended by [#4985](https://github.com/constructorfabric/gears-rust/issues/4985): this is the one credential-failure mapping every auth plugin uses, for `authenticate` and `sign`. Before it, a missing secret was 500 `SecretNotFound`, and `InvalidConfig`, `Rejected` and an unsendable output were 400 `INVALID_PLUGIN_CONFIG`.
@@ -232,7 +234,7 @@ Failures of the gateway's own steps before `sign` keep their usual mapping: a bu
 
 ## Open Questions
 
-- Whether a streamed-body refusal by a signer should map to its own reason instead of a plugin misconfiguration (500). The AWS SigV4 plugin (#5842) is the first plugin to need it.
+- Whether `SigningOutput` should be able to remove a header. The AWS SigV4 plugin replaces a client's `Authorization`, `X-Amz-Date` and `X-Amz-Content-Sha256`, but cannot drop a client's `X-Amz-Security-Token` when it has no session token, so it refuses that request (`InvalidRequest`, field `x-amz-security-token`) and the operator strips the header with `headers.request.remove`.
 
 ## Traceability
 
@@ -240,4 +242,4 @@ Failures of the gateway's own steps before `sign` keep their usual mapping: a bu
 - **DESIGN**: [DESIGN.md](../DESIGN.md) — `cpt-cf-oagw-seq-proxy-flow`
 - **Amends**: [ADR-0003 Plugin System](./0003-plugin-system.md#execution-order)
 - **Related ADR**: [ADR-0022 Per-Request Secret References](./0022-request-secret-refs.md)
-- **Features**: [Plugin System](../features/0003-cpt-cf-oagw-feature-plugin-system.md), [HTTP Proxy Engine](../features/0004-cpt-cf-oagw-feature-proxy-engine.md)
+- **Features**: [Plugin System](../features/0003-cpt-cf-oagw-feature-plugin-system.md) (including the [AWS SigV4 auth plugin](../features/0003-cpt-cf-oagw-feature-plugin-system.md#aws-sigv4-auth-plugin), the first built-in signer), [HTTP Proxy Engine](../features/0004-cpt-cf-oagw-feature-proxy-engine.md)
