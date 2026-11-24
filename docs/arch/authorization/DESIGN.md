@@ -800,7 +800,7 @@ Every `AccessScope` constructor removes whole branches made false by empty membe
 - With `is_unconstrained() == false`, no live branches means `is_deny_all()` and `matches_nothing()` are true. Equality compares both lists, positions and the flag, so an all-empty scope can differ from `deny_all()`.
 - Transforms (`tenant_only`, `tenant_and_owner`, `ensure_owner`, gear-local projections) start fresh from live branches: old removed branches are not inherited; new empty branches are retained in the result. `clone()` preserves both lists.
 
-The compiler validates branches before normalization. Storage checks only live branches, so diagnostics for removed branches are lost without widening access. On scoped entities, INSERT rejects all-empty scopes even for `NotSet` columns. For live branches, see [INSERT validation and its limits](../../toolkit_unified_system/06_authn_authz_secure_orm.md#insert-secure_insert--secureconninsert).
+The compiler validates branches before normalization. Storage checks only live branches, so diagnostics for removed branches are lost without widening access. On scoped entities, INSERT rejects all-empty scopes even for `NotSet` columns. For live branches, see [INSERT validation and its limits](../../toolkit_unified_system/06_authn_authz_secure_orm.md#insert-secure_insert).
 
 **Consumer limitations:** file-storage enforces only a tenant pin on nonempty scopes; resource-group memberships are scoped through their owning group.
 

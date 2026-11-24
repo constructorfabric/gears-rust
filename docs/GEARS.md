@@ -31,8 +31,7 @@ All interaction between gears and between gears and their plugins happens strict
 
 ## Gears Categories
 
-**Core gears** are all gears under `gears/system/`, including their plugins. The directory
-may be renamed to `gears/core/` in the future. This repository category is separate from
+**Core gears** are all gears under `gears/system/`, including their plugins. This repository category is separate from
 the runtime startup groups: the **system gear group** contains gears with the `system` capability; all others
 belong to the application gear group. See [the system capability](toolkit_unified_system/08_lifecycle_stateful_tasks.md#the-system-capability).
 
@@ -1283,100 +1282,15 @@ Enforce platform governance policies, compliance controls, and quality gates acr
 
 ## Sub-scenario - incoming API call processing
 
-This diagram reflects the **actual middleware stack** from `api-gateway` (see `apply_middleware_stack` in `gears/system/api-gateway/src/lib.rs`).
+An incoming REST call passes through the API gateway's Tower middleware stack (`ApiGateway::apply_middleware_stack` in `gears/system/api-gateway/src/gear.rs`), then the target gear's handler:
 
-**Middleware execution order (outermost → innermost):**
-1. Request ID (SetRequestId + PropagateRequestId)
-2. Trace span (tower-http TraceLayer)
-3. Timeout (30s default)
-4. Body limit
-5. CORS (if enabled)
-6. MIME validation
-7. **Rate limiting** (per-route RPS + in-flight semaphore)
-8. Error mapping (converts errors to RFC-9457 Problem)
-9. **Auth** (JWT validation → RBAC check → build SecurityContext with tenant from claims)
-10. Policy engine injection
-11. **License validation** (checks `license_requirement` from OperationSpec)
-12. Router → Handler
+1. **Pre-auth middleware** — request ID, trace span, access log, HTTP metrics, canonical error rendering, timeout, body limit, CORS, MIME validation, IP-keyed throttling.
+2. **Authentication** — for an `.authenticated()` route the gateway's `authn_middleware` passes the bearer token to the AuthN Resolver (`gears/system/authn-resolver`), which delegates to a vendor plugin and returns the `SecurityContext`. A missing or invalid token gets `401`. With `auth_disabled` the gateway injects a default tenant `SecurityContext` instead.
+3. **Post-auth gates** — platform-plane admission, optional `token_scopes` enforcement (`route_policies`), identity-keyed throttling, license-feature check. The license check is currently a stub that admits only the base feature.
+4. **Handler and domain service** — the handler extracts `Extension<SecurityContext>` and calls the domain service. Authorization happens here, in the gear: the service calls `PolicyEnforcer`, which asks the AuthZ Resolver (PDP, `gears/system/authz-resolver`) for a decision and compiles the constraints into an `AccessScope`.
+5. **Data access** — the repository applies the `AccessScope` to its query (`Entity::find().secure().scope_with(&scope)`, `secure_insert`), so the SQL carries the tenant and resource filters.
 
-```mermaid
-sequenceDiagram
-  autonumber
-
-  participant C as Client (Web/Mobile)
-
-  box "External Core Platform"
-    participant IdP as IdP / JWKS endpoint
-    participant LICM as License Manager
-  end
-
-  box "Gears"
-    participant I as API gateway (api-gateway)
-    participant LIC as License resolver
-    participant M as Target gear (REST handler)
-    participant D as Domain service
-    participant DB as DB (SecureConn)
-    participant EB as Event Broker
-    participant AUD as Audit
-    participant UT as Usage Collector
-  end
-
-  C->>I: HTTP request (Authorization: Bearer, traceparent, x-request-id)
-
-  Note over I: 1. SetRequestId + PropagateRequestId
-  I->>I: Generate/propagate x-request-id
-
-  Note over I: 2. TraceLayer - create span
-  I->>I: Create tracing span (method, uri, request_id, trace_id)
-
-  Note over I: 3-6. Timeout → BodyLimit → CORS → MIME
-  I->>I: Validate request basics (timeout, size, content-type)
-
-  Note over I: 7. Rate limiting
-  I->>I: Check RPS bucket + in-flight semaphore
-  alt Rate limit exceeded
-    I-->>C: 429 Too Many Requests (Retry-After header)
-  end
-
-  Note over I: 8. Error mapping layer (wraps inner errors)
-
-  Note over I: 9. Auth layer (AuthPolicyLayer)
-  I->>I: Resolve route policy (public / required / optional)
-  alt Route is public
-    I->>I: Insert anonymous SecurityContext
-  else Route requires auth
-    I->>IdP: Validate JWT (cached JWKS)
-    IdP-->>I: Token valid + claims (subject, tenant_id, permissions[])
-    I->>I: RBAC check: claims.permissions vs route SecRequirement
-    alt RBAC denied
-      I-->>C: 403 Forbidden (Problem)
-    end
-    I->>I: Build SecurityContext(tenant_id, subject_id, scope)
-  end
-
-  Note over I: 10. Inject PolicyEngine into extensions
-
-  Note over I: 11. License validation
-  I->>LIC: Check license features (from OperationSpec.license_requirement)
-  LIC->>LICM: Check license features (from OperationSpec.license_requirement)
-  LICM-->>LIC: Allowed | FeatureMissing
-  LIC-->>I: Allowed | FeatureMissing
-  alt License check failed
-    I-->>C: 403 Forbidden (license feature required)
-  end
-
-  Note over I: 12. Router dispatches to handler
-  I->>M: Call handler (SecurityContext in Extension)
-  M->>D: Execute domain logic (ctx, command/query)
-  D->>DB: SecureConn.find/insert/update (ctx applies tenant filter)
-  DB-->>D: Scoped results (WHERE tenant_id IN ...)
-  D->>EB: Publish event: chat.message.created {message_id, job_id}
-  D->>AUD: Emit audit event (actor, tenant, resource, action)
-  D->>UT: Record usage (tenant, operation, tokens/bytes)
-  D-->>M: Domain result
-  M-->>I: Map to DTO + OpenAPI response
-  I-->>C: HTTP 200/201 (JSON) or SSE stream
-```
+The full trajectory, with a sequence diagram and code references, is in [Gear Overview — Typical REST API Request Trajectory](toolkit_unified_system/00_gear_overview.md#typical-rest-api-request-trajectory). AuthN, AuthZ and the Secure ORM are described in [`06_authn_authz_secure_orm.md`](toolkit_unified_system/06_authn_authz_secure_orm.md).
 
 ## Sub-scenario - chat hook invocation
 
@@ -1866,7 +1780,7 @@ sequenceDiagram
 
 #### SSE streaming with throttling (continuation of Step 6/6)
 
-The final answer is streamed to the client using **Server-Sent Events (SSE)**. The Chat engine uses ToolKit's `SseBroadcaster` for efficient fan-out.
+The final answer is streamed to the client using **Server-Sent Events (SSE)**. Chat engine does not use ToolKit's `SseBroadcaster`: its streaming driver writes wire events to a `StreamEventBuffer`, and each HTTP connection (the initial `POST` response or a `Last-Event-ID` reconnect) is a reader that emits SSE frames from that buffer (`gears/chat-engine/chat-engine/src/api/rest/stream_reader.rs`).
 
 **Key rules:**
 - **SSE throttling**: If user/tenant consumes too many tokens, slow down or terminate stream

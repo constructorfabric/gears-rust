@@ -4,70 +4,61 @@ ToolKit provides OData query support with type-safe filtering, ordering, field s
 
 ## Core invariants
 
-- **Rule**: Use `toolkit_odata_macros::ODataFilterable` for DTO filtering.
+- **Rule**: Use `toolkit_odata_macros::ODataFilterable` to declare the filterable fields of a resource.
 - **Rule**: Use `OperationBuilderODataExt` helpers instead of manual `.query_param(...)`.
 - **Rule**: Use `apply_select()` for single-resource field projection in handlers.
 - **Rule**: Use `page_to_projected_json()` for paginated JSON responses with $select.
 - **Rule**: Return `Page<T>` from domain services.
 
-## OData macro migration
+## Filterable fields
 
-### Before (old)
+### Define a filter schema
 
-```rust
-use toolkit_db_macros::ODataFilterable;
-```
-
-### After (current)
+`#[derive(ODataFilterable)]` on a struct generates a `<Struct>FilterField` enum that implements `toolkit_odata::filter::FilterField`. Only fields with `#[odata(filter(kind = "..."))]` become filterable; the field's Rust type is not inspected. `users-info` keeps the schema in its SDK crate so clients and the server share it ([`users_info_sdk::odata::users`](../../examples/toolkit/users-info/users-info-sdk/src/odata/users.rs)):
 
 ```rust
+use time::OffsetDateTime;
 use toolkit_odata_macros::ODataFilterable;
-```
-
-## DTO with OData filtering
-
-### Define filterable DTO
-
-```rust
-use toolkit_odata_macros::ODataFilterable;
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use uuid::Uuid;
 
-/// REST DTO for user representation with OData filtering
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, ODataFilterable)]
-pub struct UserDto {
+#[derive(ODataFilterable)]
+pub struct UserQuery {
     #[odata(filter(kind = "Uuid"))]
     pub id: Uuid,
-    #[odata(filter(kind = "Uuid"))]
-    pub tenant_id: Uuid,
+
     #[odata(filter(kind = "String"))]
     pub email: String,
-    pub display_name: String,
+
     #[odata(filter(kind = "DateTimeUtc"))]
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    #[odata(filter(kind = "DateTimeUtc"))]
-    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub created_at: OffsetDateTime,
 }
+
+pub use UserQueryFilterField as UserFilterField;
 ```
 
 ### Filter field kinds
 
-| Kind | Type | Example |
-|------|------|---------|
-| `String` | `String` | `email eq 'test@example.com'` |
-| `Uuid` | `uuid::Uuid` | `id eq 550e8400-e29b-41d4-a716-446655440000` |
-| `DateTimeUtc` | `chrono::DateTime<chrono::Utc>` | `created_at gt 2024-01-01T00:00:00Z` |
-| `I32` | `i32` | `age gt 18` |
-| `I64` | `i64` | `count ge 100` |
-| `Bool` | `bool` | `is_active eq true` |
+The `kind` string names a `toolkit_odata::filter::FieldKind` variant. The SQL value is built in `toolkit_db::odata` (`core.rs`).
+
+| Kind | SQL value | Example |
+|------|-----------|---------|
+| `String` | string | `email eq 'test@example.com'` |
+| `I64` | 64-bit integer | `count ge 100` |
+| `F64` | double | `score gt 0.5` |
+| `Decimal` | decimal | `price le 19.99` |
+| `Bool` | boolean | `is_active eq true` |
+| `Uuid` | UUID | `id eq 550e8400-e29b-41d4-a716-446655440000` |
+| `DateTimeUtc` | UTC timestamp | `created_at gt 2024-01-01T00:00:00Z` |
+| `Date` | date | `birth_date eq 2024-01-01` |
+| `Time` | time of day | `opens_at lt 09:00:00` |
 
 ## OperationBuilder with OData
 
 ### OData-enabled list endpoint
 
 ```rust
-use toolkit::api::operation_builder::{OperationBuilderODataExt};
+use toolkit::api::operation_builder::{OperationBuilder, OperationBuilderODataExt};
+use users_info_sdk::odata::UserFilterField;
 
 OperationBuilder::get("/users-info/v1/users")
     .operation_id("users_info.list_users")
@@ -79,9 +70,9 @@ OperationBuilder::get("/users-info/v1/users")
         StatusCode::OK,
         "Paginated list of users",
     )
-    .with_odata_filter::<dto::UserDtoFilterField>() // not .query_param("$filter", ...)
+    .with_odata_filter::<UserFilterField>() // not .query_param("$filter", ...)
     .with_odata_select() // not .query_param("$select", ...)
-    .with_odata_orderby::<dto::UserDtoFilterField>() // not .query_param("$orderby", ...)
+    .with_odata_orderby::<UserFilterField>() // not .query_param("$orderby", ...)
     .standard_errors(openapi)
     .register(router, openapi);
 ```
@@ -91,17 +82,17 @@ OperationBuilder::get("/users-info/v1/users")
 ### List handler (paginated with $select)
 
 ```rust
-use toolkit::api::prelude::*;
-use toolkit::api::odata::OData;
-use toolkit::api::select::page_to_projected_json;
 use axum::Extension;
+use toolkit::api::canonical_prelude::*;
+use toolkit::api::select::page_to_projected_json;
+use toolkit_security::SecurityContext;
 
 pub async fn list_users(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<Service>>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
     OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
-    let page: toolkit_odata::Page<user_info_sdk::User> =
+    let page: toolkit_odata::Page<users_info_sdk::User> =
         svc.users.list_users_page(&ctx, &query).await?;
     let page = page.map_items(UserDto::from);
     Ok(Json(page_to_projected_json(&page, query.selected_fields())))
@@ -111,9 +102,7 @@ pub async fn list_users(
 ### Single-resource handler with $select
 
 ```rust
-use toolkit::api::prelude::*;
-use toolkit::api::odata::OData;
-use toolkit::api::select::apply_select;
+use toolkit::api::canonical_prelude::*;
 
 pub async fn get_user(
     OData(query): OData,
@@ -125,39 +114,66 @@ pub async fn get_user(
 }
 ```
 
-### Domain service with OData
+### Domain service and repository with OData
+
+The service obtains a connection runner and an `AccessScope` from `PolicyEnforcer`, then delegates to the repository ([service](../../examples/toolkit/users-info/users-info/src/domain/service/users.rs)):
 
 ```rust
-impl UserService {
-    pub async fn list_users_page(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<User>, DomainError> {
-        let secure_conn = self.db.sea_secure();
-        let scope = toolkit_db::secure::AccessScope::for_tenant(ctx.tenant_id());
+pub async fn list_users_page(
+    &self,
+    ctx: &SecurityContext,
+    query: &ODataQuery,
+) -> Result<Page<User>, DomainError> {
+    let conn = self.db.conn().map_err(DomainError::from)?;
 
-        // Recommended: compose security + OData in one call, without raw connection access.
-        use toolkit_db::odata::sea_orm_filter::{paginate_odata, LimitCfg};
-        use toolkit_odata::SortDir;
-        use crate::infra::storage::odata_mapper::UserODataMapper;
-        use crate::api::rest::dto::UserDtoFilterField;
-
-        let base_query = secure_conn.find::<user::Entity>(&scope);
-        let page = paginate_odata::<UserDtoFilterField, UserODataMapper>(
-            base_query,
-            &secure_conn,
-            query,
-            ("id", SortDir::Desc),
-            LimitCfg { default: 50, max: 500 },
-            |model| model.into(),
+    let scope = self
+        .policy_enforcer
+        .access_scope_with(
+            ctx,
+            &resources::USER,
+            actions::LIST,
+            None,
+            &AccessRequest::new().allow_empty_scope(true),
         )
         .await?;
 
-        Ok(page)
-    }
+    self.repo.list_page(&conn, &scope, query).await
 }
 ```
+
+The repository builds a scoped select and passes it to `paginate_odata`, which applies `$filter`, `$orderby`, the cursor and the limit ([repository](../../examples/toolkit/users-info/users-info/src/infra/storage/users_sea_repo.rs)):
+
+```rust
+use toolkit_db::odata::{LimitCfg, paginate_odata};
+use toolkit_db::secure::{DBRunner, SecureEntityExt};
+use toolkit_odata::{ODataQuery, Page, SortDir};
+use toolkit_security::AccessScope;
+use users_info_sdk::odata::UserFilterField;
+
+async fn list_page<C: DBRunner>(
+    &self,
+    conn: &C,
+    scope: &AccessScope,
+    query: &ODataQuery,
+) -> Result<Page<User>, DomainError> {
+    let base_query = UserEntity::find().secure().scope_with(scope);
+
+    let page = paginate_odata::<UserFilterField, UserODataMapper, _, _, _, _>(
+        base_query,
+        conn,
+        query,
+        ("id", SortDir::Desc),
+        self.limit_cfg,
+        Into::into,
+    )
+    .await
+    .map_err(db_err)?;
+
+    Ok(page)
+}
+```
+
+`paginate_odata` takes six generic parameters: the filter field enum, the `ODataFieldMapping` implementation that maps fields to entity columns ([`UserODataMapper`](../../examples/toolkit/users-info/users-info/src/infra/storage/odata_mapper.rs)), the entity, the domain type, the model mapper and the runner. The last four are inferred. It returns `Result<Page<D>, toolkit_odata::Error>`. For a fallible model mapper use `toolkit_db::odata::sea_orm_filter::paginate_odata_try`; it is not re-exported at `toolkit_db::odata`.
 
 ## Field projection ($select)
 
@@ -470,36 +486,7 @@ pub struct Page<T> {
 
 ### Cursor handling
 
-```rust
-// In domain service
-impl UserService {
-    pub async fn list_users_page(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<User>, DomainError> {
-        let secure_conn = self.db.sea_secure();
-        let scope = toolkit_db::secure::AccessScope::for_tenant(ctx.tenant_id());
-        use toolkit_db::odata::sea_orm_filter::{paginate_odata, LimitCfg};
-        use toolkit_odata::SortDir;
-        use crate::infra::storage::odata_mapper::UserODataMapper;
-        use crate::api::rest::dto::UserDtoFilterField;
-
-        let base_query = secure_conn.find::<user::Entity>(&scope);
-        let page = paginate_odata::<UserDtoFilterField, UserODataMapper>(
-            base_query,
-            &secure_conn,
-            query,
-            ("id", SortDir::Desc),
-            LimitCfg { default: 50, max: 500 },
-            |model| model.into(),
-        )
-        .await?;
-
-        Ok(page)
-    }
-}
-```
+`paginate_odata` decodes the incoming cursor, validates it against the query, and fills `PageInfo.next_cursor` / `prev_cursor`. The service does not handle cursors itself; see [Domain service and repository with OData](#domain-service-and-repository-with-odata).
 
 ## Common OData queries
 
@@ -566,7 +553,7 @@ $select=id,user.profile.name,user.profile.email
 
 ### OData error type
 
-OData errors are defined in `toolkit_odata::Error` (aliased as `ODataError` in `toolkit`). Key variants:
+OData errors are defined in `toolkit_odata::Error`. Crates in this workspace commonly import it as `use toolkit_odata::Error as ODataError;`; that alias is local to each file, not an exported type. Key variants:
 
 | Variant | Description | HTTP status |
 |---------|-------------|-------------|
@@ -578,8 +565,9 @@ OData errors are defined in `toolkit_odata::Error` (aliased as `ODataError` in `
 | `FilterMismatch` | Cursor/query filter conflict | 400 |
 | `InvalidLimit` | Invalid page size parameter (`$top`, alias `limit`) | 400 |
 | `Db(String)` | Database error (logged, generic message returned) | 500 |
+| `ParsingUnavailable(&'static str)` | Configuration error ("OData parsing unavailable") | 500 |
 
-Every variant above except `Db` maps through `OdataError::invalid_argument()`, and
+Every variant above except `Db` and `ParsingUnavailable` maps through `OdataError::invalid_argument()`, and
 `CanonicalError::InvalidArgument` renders as `400`. The canonical error taxonomy has no `422`
 status, so no `OData` error can produce one.
 
@@ -589,14 +577,7 @@ Unsupported system query options are not `toolkit_odata::Error` variants — the
 
 ### Error conversion
 
-The `From<toolkit_odata::Error> for Problem` impl (in `toolkit-odata/src/problem_mapping.rs`) maps each variant to a GTS error code. The HTTP layer in `toolkit` adds instance paths and trace IDs via `odata_error_to_problem()`:
-
-```rust
-use toolkit::api::odata::error::odata_error_to_problem;
-
-// Automatically used by the OData extractor; manual usage:
-let problem = odata_error_to_problem(&err, "/users-info/v1/users", None);
-```
+`From<toolkit_odata::Error> for CanonicalError` ([`toolkit-odata/src/problem_mapping.rs`](../../libs/toolkit-odata/src/problem_mapping.rs)) is the single mapping from OData errors to the canonical error catalog. The `OData` extractor and handlers return `CanonicalError`; `canonical_error_middleware` (`toolkit::api`) renders the wire `Problem` and fills `instance` and `trace_id`. A repository that wraps the error in its own domain error (as `users-info` does with `db_err`) owns that mapping instead.
 
 ## Testing OData
 
@@ -664,7 +645,7 @@ fn test_page_projection() {
 
 ## Quick checklist
 
-- [ ] Add `#[derive(ODataFilterable)]` on DTOs with `#[odata(filter(kind = "..."))]`.
+- [ ] Add `#[derive(ODataFilterable)]` on a filter schema struct with `#[odata(filter(kind = "..."))]` fields.
 - [ ] Import `toolkit_odata_macros::ODataFilterable`.
 - [ ] Use `OperationBuilderODataExt` helpers (`.with_odata_*()`).
 - [ ] Use `OData(query)` extractor in handlers.

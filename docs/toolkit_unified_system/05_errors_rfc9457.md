@@ -1,259 +1,116 @@
-# RFC 9457 Problem Errors
+# Errors: CanonicalError and RFC 9457 Problem
 
-ToolKit provides a unified error handling system with `Problem` (RFC-9457) for type-safe error propagation.
-
-## Error Architecture Overview
+Gears report every failure as a `CanonicalError` (crate `libs/toolkit-canonical-errors`): one of 16 fixed categories (AIP-193), each with a default HTTP status and a GTS type id. The category catalogue, context schemas and wire examples are in [`docs/arch/errors/DESIGN.md`](../arch/errors/DESIGN.md) and [`docs/arch/errors/categories/`](../arch/errors/categories/); this page covers how gear code uses them.
 
 ```
-DomainError (business logic)
-     ↓ From impl
-Problem (RFC-9457, implements IntoResponse)
-     ↓
-ApiResult<T> = Result<T, Problem>  (handler return type)
+DomainError (domain/error.rs)
+     ↓ impl From<DomainError> for CanonicalError   (api/rest/error.rs)
+CanonicalError ── handler: ApiResult<T> = Result<T, CanonicalError>
+     ↓ IntoResponse
+Problem (application/problem+json) ── canonical_error_middleware fills instance / trace_id
 ```
 
 ## Core invariants
 
-- **Rule**: Always return RFC 9457 Problem Details for all 4xx/5xx errors via `Problem` (implements `IntoResponse` directly).
-- **Rule**: Do not use `ProblemResponse` (doesn’t exist).
-- **Rule**: Use `ApiResult<T>` for handler return types.
-- **Rule**: Convert domain errors to `Problem` via `From` impls.
+- **Rule**: Handlers return `ApiResult<T>` from `toolkit::api::canonical_prelude` (`Result<T, CanonicalError>`). Never build a `Problem` in a handler.
+- **Rule**: Each gear has exactly one `impl From<DomainError> for CanonicalError`, in `<gear>/src/api/rest/error.rs`. The REST handlers and the ClientHub local client both go through it.
+- **Rule** (new SDKs, per [ADR 0005](../arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md)): SDK traits return `Result<_, CanonicalError>`. An SDK may alias it (`pub use toolkit_canonical_errors::CanonicalError as UsersInfoError;` in `users-info-sdk/src/lib.rs`) and may add an opt-in typed projection with `From<CanonicalError>` (see [ADR 0005](../arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md), e.g. `gears/system/resource-group/resource-group-sdk/src/error.rs`). A new SDK has no parallel `From<DomainError> for SdkError`. Some existing SDKs still define their own error enums (tenant-resolver-sdk `TenantResolverError`, authn-resolver-sdk `AuthNResolverError`, usage-collector-sdk `UsageCollectorError`, policy-engine-sdk `ManagementError`); do not copy that pattern.
+- **Rule**: Use `toolkit::api::rest::extract::{Json, Path, Query}` instead of the axum extractors so request rejections render as `Problem` too.
+- **Rule**: The string passed to `CanonicalError::internal(..)` (and the macro's `unknown(..)`) is a server-side diagnostic: it is logged by the middleware and never serialized. Every other category's `detail` is sent to the client, so keep internals out of it.
 
-## Error types and placement
+## Resource errors and the mapping
 
-| Concern | Type/Concept | File (must define) | Notes |
-|---------|--------------|--------------------|-------|
-| Domain error (business) | `DomainError` | `<gear>/src/domain/error.rs` | Pure business errors; no transport details. Variants reflect domain invariants (e.g., `UserNotFound`, `EmailAlreadyExists`, `InvalidEmail`). |
-| SDK error (public) | `<GearName>Error` | `<gear>-sdk/src/errors.rs` | Transport-agnostic surface for consumers. No `serde` derives. Lives in SDK crate. |
-| Domain → SDK error conversion | `impl From<DomainError> for <Sdk>Error` | `<gear>/src/domain/error.rs` | Gear crate imports SDK error and provides `From` impl. |
-| REST error mapping | `impl From<DomainError> for Problem` | `<gear>/src/api/rest/error.rs` | Centralize RFC-9457 mapping via `From` trait; `Problem` implements `IntoResponse` directly. |
-
-## Domain Error (`<gear>/src/domain/error.rs`)
+`#[resource_error(...)]` generates a unit struct whose constructors return a typestate builder bound to a GTS resource type. `gts_id!("...")` inside the attribute prepends the configured GTS prefix; it needs no import. From `examples/toolkit/users-info/users-info/src/api/rest/error.rs`:
 
 ```rust
-use toolkit_macros::domain_model;
-use thiserror::Error;
+use toolkit::api::canonical_prelude::*;
 
-#[domain_model]
-#[derive(Error, Debug, Clone)]
-pub enum DomainError {
-    #[error("User not found: {id}")]
-    UserNotFound { id: uuid::Uuid },
+use crate::domain::error::DomainError;
 
-    #[error("Email already exists: {email}")]
-    EmailAlreadyExists { email: String },
+#[resource_error(gts_id!("cf.example1.users.user.v1~"))]
+struct UserResourceError;
 
-    #[error("Invalid email: {email}")]
-    InvalidEmail { email: String },
-
-    #[error("Tenant not found: {id}")]
-    TenantNotFound { id: uuid::Uuid },
-
-    #[error("Permission denied")]
-    PermissionDenied,
-
-    #[error("Database error: {0}")]
-    Database(#[from] sea_orm::DbErr),
-
-    #[error("Internal error: {0}")]
-    Internal(String),
-}
-```
-
-## SDK Error (`<gear>-sdk/src/errors.rs`)
-
-```rust
-#[derive(Error, Debug, Clone)]
-pub enum UsersInfoError {
-    #[error("User not found: {id}")]
-    NotFound { id: Uuid },
-
-    #[error("User with email '{email}' already exists")]
-    Conflict { email: String },
-
-    #[error("Validation error: {message}")]
-    Validation { message: String },
-
-    #[error("Internal error")]
-    Internal,
-}
-
-// Convenience constructors
-impl UsersInfoError {
-    pub fn not_found(id: Uuid) -> Self { Self::NotFound { id } }
-    pub fn conflict(email: String) -> Self { Self::Conflict { email } }
-    pub fn validation(message: impl Into<String>) -> Self {
-        Self::Validation { message: message.into() }
-    }
-    pub fn internal() -> Self { Self::Internal }
-}
-```
-
-## Domain → SDK conversion (`<gear>/src/domain/error.rs`)
-
-```rust
-impl From<DomainError> for users_info_sdk::UsersInfoError {
-    fn from(err: DomainError) -> Self {
-        match err {
-            DomainError::UserNotFound { id } => users_info_sdk::UsersInfoError::not_found(id),
-            DomainError::EmailAlreadyExists { email } => users_info_sdk::UsersInfoError::conflict(email),
-            DomainError::InvalidEmail { email } => users_info_sdk::UsersInfoError::validation(format!("Invalid email: {email}")),
-            DomainError::TenantNotFound { .. } => users_info_sdk::UsersInfoError::validation("Tenant not found"),
-            DomainError::PermissionDenied => users_info_sdk::UsersInfoError::validation("Permission denied"),
-            DomainError::Database(_) | DomainError::Internal(_) => users_info_sdk::UsersInfoError::internal(),
+impl From<DomainError> for CanonicalError {
+    fn from(e: DomainError) -> Self {
+        match &e {
+            DomainError::UserNotFound { id } => {
+                UserResourceError::not_found(format!("User with id {id} was not found"))
+                    .with_resource(id.to_string())
+                    .create()
+            }
+            DomainError::EmailAlreadyExists { email } => {
+                UserResourceError::already_exists(format!("Email '{email}' is already in use"))
+                    .with_resource(email.clone())
+                    .create()
+            }
+            DomainError::InvalidEmail { email } => UserResourceError::invalid_argument()
+                .with_field_violation("email", format!("Email '{email}' is invalid"), "INVALID_FORMAT")
+                .create(),
+            DomainError::Forbidden => UserResourceError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create(),
+            DomainError::Database { .. } => {
+                tracing::error!(error = ?e, "Database error occurred");
+                CanonicalError::internal("An internal database error occurred").create()
+            }
+            // ...
         }
     }
 }
 ```
 
-## REST Problem mapping (`<gear>/src/api/rest/error.rs`)
+`create()` only compiles once the category's required data is set:
+
+| Builder | Required before `create()` |
+|---------|----------------------------|
+| `X::not_found(detail)`, `X::already_exists(detail)`, `X::data_loss(detail)` | `.with_resource(name)` |
+| `X::invalid_argument()` | `.with_field_violation(field, description, reason)`, `.with_format(..)` or `.with_constraint(..)` |
+| `X::failed_precondition()` | `.with_precondition_violation(..)` |
+| `X::resource_exhausted(detail)` | `.with_quota_violation(..)` |
+| `X::permission_denied()`, `X::aborted(detail)` | `.with_reason(reason)` |
+| `CanonicalError::internal(detail)` | nothing (no resource type) |
+| `CanonicalError::unauthenticated()` | `.with_reason(reason)` |
+| `CanonicalError::service_unavailable()` | nothing; `.with_retry_after_seconds(..)` optional |
+
+The macro also generates `unknown`, `deadline_exceeded`, `unimplemented`, `cancelled` and `out_of_range`. Exact signatures: `libs/toolkit-canonical-errors/src/builder.rs` and `libs/toolkit-canonical-errors-macro/src/lib.rs`. A per-occurrence status override goes through `.with_override(TransportOverride)` (`libs/toolkit-canonical-errors/src/transport.rs`).
+
+## Handlers
 
 ```rust
-use toolkit::api::problem::{Problem, ProblemType};
-use crate::domain::error::DomainError;
-
-impl From<DomainError> for Problem {
-    fn from(err: DomainError) -> Self {
-        match err {
-            DomainError::UserNotFound { id } => Problem::builder()
-                .type_url(ProblemType::NotFound)
-                .title("User not found")
-                .detail(format!("User with id {} not found", id))
-                .build(),
-
-            DomainError::EmailAlreadyExists { email } => Problem::builder()
-                .type_url(ProblemType::Conflict)
-                .title("Email already exists")
-                .detail(format!("User with email {} already exists", email))
-                .build(),
-
-            DomainError::InvalidEmail { email } => Problem::builder()
-                .type_url(ProblemType::BadRequest)
-                .title("Invalid email")
-                .detail(format!("Invalid email format: {}", email))
-                .build(),
-
-            DomainError::TenantNotFound { .. } => Problem::builder()
-                .type_url(ProblemType::NotFound)
-                .title("Tenant not found")
-                .detail("Tenant not found")
-                .build(),
-
-            DomainError::PermissionDenied => Problem::builder()
-                .type_url(ProblemType::Forbidden)
-                .title("Permission denied")
-                .detail("Permission denied")
-                .build(),
-
-            DomainError::Database(err) => Problem::builder()
-                .type_url(ProblemType::InternalServerError)
-                .title("Database error")
-                .detail(format!("Database error: {}", err))
-                .build(),
-
-            DomainError::Internal(msg) => Problem::builder()
-                .type_url(ProblemType::InternalServerError)
-                .title("Internal error")
-                .detail(msg)
-                .build(),
-        }
-    }
-}
-```
-
-## Handler error propagation
-
-```rust
-use toolkit::api::prelude::*;
-use crate::domain::error::DomainError;
-
 pub async fn get_user(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<Service>>,
-    Path(id): Path<Uuid>,
-) -> ApiResult<JsonBody<UserDto>> {
-    // DomainError auto-converts to Problem via From impl
-    let user = svc.get_user(&ctx, id).await?;
-    Ok(Json(UserDto::from(user)))
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Path(id): extract::Path<Uuid>,
+    OData(query): OData,
+) -> ApiResult<JsonBody<serde_json::Value>> {
+    let user_full = svc.users.get_user_full(&ctx, id).await?; // DomainError -> CanonicalError
+    Ok(Json(apply_select(&UserFullDto::from(user_full), query.selected_fields())))
 }
 ```
 
-## OperationBuilder error registration
+Declare the statuses an operation can return on its `OperationBuilder` (`.error_404(openapi)`, `.standard_errors(openapi)`, ...); see [04_rest_operation_builder.md](04_rest_operation_builder.md#error-responses).
+
+## Wire format
+
+`IntoResponse for CanonicalError` converts it to `Problem` (`libs/toolkit-canonical-errors/src/problem.rs`) and responds with `Content-Type: application/problem+json` and the category's status (plus `Retry-After` when the context carries a retry hint). Serialized fields: `type` (GTS URI of the category), `title`, `status`, `detail`, `instance`, `trace_id`, `context` (category-specific, including `resource_type` / `resource_name`), and `error_code` / `error_domain` for typed contract errors.
+
+`toolkit::api::canonical_error_middleware` (`libs/toolkit/src/api/canonical_error_layer.rs`) wraps every gear router — the api-gateway layers it in `gears/system/api-gateway/src/gear.rs`, OoP gears in `libs/toolkit/src/runtime/oop_serve.rs`. It fills missing `instance` and `trace_id`, logs 4xx at `warn` and 5xx at `error` (including the unredacted diagnostic of `internal` / `unknown`), and wraps any untyped error response (`text/plain` or no `Content-Type`) into a `Problem`. Responses with another content type, or tagged `ForeignPassthrough`, pass through untouched.
+
+## Testing the mapping
 
 ```rust
-OperationBuilder::get("/users-info/v1/users/{id}")
-    .operation_id("users_info.get_user")
-    .authenticated()
-    .require_license_features::<License>([])
-    .handler(handlers::get_user)
-    .json_response_with_schema::<UserDto>(openapi, StatusCode::OK, "User")
-    .error_404(openapi)
-    .error_403(openapi)
-    .error_500(openapi)
-    .register(router, openapi);
-```
-
-## ProblemType constants
-
-```rust
-use toolkit::api::problem::ProblemType;
-
-// Common types
-ProblemType::BadRequest
-ProblemType::Unauthorized
-ProblemType::Forbidden
-ProblemType::NotFound
-ProblemType::Conflict
-ProblemType::UnprocessableEntity
-ProblemType::TooManyRequests
-ProblemType::InternalServerError
-```
-
-## Custom Problem details
-
-```rust
-impl From<DomainError> for Problem {
-    fn from(err: DomainError) -> Self {
-        match err {
-            DomainError::UserNotFound { id } => Problem::builder()
-                .type_url(ProblemType::NotFound)
-                .title("User not found")
-                .detail(format!("User with id {} not found", id))
-                .instance(format!("/users-info/v1/users/{}", id))
-                .extensions(serde_json::json!({
-                    "user_id": id,
-                    "resource": "user"
-                }))
-                .build(),
-            // ... other variants
-        }
-    }
-}
-```
-
-## Testing errors
-
-```rust
-#[tokio::test]
-async fn test_get_user_not_found() {
-    let app = test_app().await;
-    let response = app
-        .get(&format!("/users-info/v1/users/{}", uuid::Uuid::new_v4()))
-        .await;
-
-    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
-    let problem: Problem = response.json().await;
-    assert_eq!(problem.type_url, "https://httpstatuses.io/404");
-    assert_eq!(problem.title, "User not found");
+#[test]
+fn user_not_found_maps_to_404() {
+    let err = CanonicalError::from(DomainError::user_not_found(Uuid::now_v7()));
+    assert_eq!(err.status_code(), 404);
 }
 ```
 
 ## Quick checklist
 
-- [ ] Define `DomainError` in `domain/error.rs` with `thiserror::Error`.
-- [ ] Define SDK error in `<gear>-sdk/src/errors.rs` (transport-agnostic).
-- [ ] Implement `From<DomainError> for <Sdk>Error` in gear crate.
-- [ ] Implement `From<DomainError> for Problem` in `api/rest/error.rs`.
-- [ ] Use `ApiResult<T>` in handlers and `?` for error propagation.
-- [ ] Register relevant errors in OperationBuilder (`.error_*` or `.standard_errors()`).
-- [ ] Do not use `ProblemResponse` (doesn’t exist).
+- [ ] `DomainError` in `domain/error.rs` (`thiserror`, `#[domain_model]`), no transport types.
+- [ ] One `#[resource_error(gts_id!(..))]` struct per resource type and one `impl From<DomainError> for CanonicalError` in `api/rest/error.rs`.
+- [ ] Handlers return `ApiResult<T>` (`toolkit::api::canonical_prelude::*`) and use `?`.
+- [ ] Body/path/query extractors from `toolkit::api::rest::extract`.
+- [ ] New SDK trait methods return `Result<_, CanonicalError>` (ADR 0005); the local client maps with `CanonicalError::from`.
+- [ ] Error statuses declared on each `OperationBuilder` route.

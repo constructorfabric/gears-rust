@@ -1,6 +1,6 @@
 # Security: AuthN, AuthZ & Secure Database Access
 
-This document describes the complete security data-path in Gears: how requests are authenticated (AuthN), how authorization decisions are enforced (AuthZ / PEP), how `AccessScope` is produced, and how the Secure ORM layer (`SecureConn`) applies it to every database query.
+This document describes the complete security data-path in Gears: how requests are authenticated (AuthN), how authorization decisions are enforced (AuthZ / PEP), how `AccessScope` is produced, and how the Secure ORM layer in `toolkit-db` applies it to every database query.
 
 For the full architectural design (AuthZEN model, predicate types, caching, deployment modes), see [`docs/arch/authorization/DESIGN.md`](../arch/authorization/DESIGN.md).
 
@@ -27,14 +27,14 @@ Request → API Gateway (AuthN middleware) → SecurityContext
               ↓
          PEP Compiler → AccessScope
               ↓
-         SecureConn (SQL WHERE) → Database
+         Secure ORM (SQL WHERE) → Database
 ```
 
 Three components work together:
 
 1. **AuthN Resolver** — validates bearer tokens, produces `SecurityContext` (subject identity, tenant, token scopes). Uses the gateway + plugin pattern to delegate to vendor-specific IdPs.
 2. **AuthZ Resolver (PDP)** — evaluates policies, returns `decision + constraints`. Uses the gateway + plugin pattern to delegate to vendor-specific authorization services.
-3. **Domain gears (PEP)** — call PDP via `PolicyEnforcer`, compile constraints to `AccessScope`, pass to `SecureConn` for SQL-level enforcement.
+3. **Domain gears (PEP)** — call PDP via `PolicyEnforcer`, compile constraints to `AccessScope`, pass it to Secure ORM queries for SQL-level enforcement.
 
 Gear developers interact primarily with the PEP layer — the AuthN and AuthZ resolvers are infrastructure gears.
 
@@ -78,18 +78,23 @@ The API Gateway middleware uses these declarations to decide how to handle each 
 The API Gateway injects `SecurityContext` as an Axum `Extension`. Extract it with the standard `Extension` extractor:
 
 ```rust
-use toolkit::api::prelude::*;
+use axum::Extension;
+use toolkit::api::canonical_prelude::*;
+use toolkit::api::select::page_to_projected_json;
 use toolkit_security::SecurityContext;
 
 pub async fn list_users(
     Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<Service>>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
     OData(query): OData,
 ) -> ApiResult<JsonPage<serde_json::Value>> {
     let page = svc.users.list_users_page(&ctx, &query).await?;
-    Ok(Json(page))
+    let page = page.map_items(UserDto::from);
+    Ok(Json(page_to_projected_json(&page, query.selected_fields())))
 }
 ```
+
+[Users handlers](../../examples/toolkit/users-info/users-info/src/api/rest/handlers/users.rs)
 
 ### SecurityContext fields
 
@@ -230,7 +235,7 @@ let scope = enforcer
     .await?;
 ```
 
-Both methods return `Result<AccessScope, EnforcerError>`. The `AccessScope` is then passed to `SecureConn` methods for SQL-level enforcement. See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for the exact difference.
+Both methods return `Result<AccessScope, EnforcerError>`. The `AccessScope` is then applied to Secure ORM queries for SQL-level enforcement. See [Permission gates and empty scopes](#permission-gates-and-empty-scopes) for the exact difference.
 
 ### Permission gates and empty scopes
 
@@ -265,7 +270,7 @@ if scope.matches_nothing() {
 self.catalog.list_visible(ctx).await
 ```
 
-For paginated catalogs, preserve the endpoint's empty-page format and query validation. For row-scoped queries, pass the whole scope to `SecureConn` instead of adding an early return; this also preserves aggregate semantics.
+For paginated catalogs, preserve the endpoint's empty-page format and query validation. For row-scoped queries, pass the whole scope to the Secure ORM query instead of adding an early return; this also preserves aggregate semantics.
 
 `matches_nothing()` detects statically known emptiness: deny-all, or a scope whose every OR branch contained an empty `In` / `InGroup` / `InGroupSubtree` set. Such a scope is normalized to no live branches, so `matches_nothing()` and `is_deny_all()` give the same answer. It does not query the database or detect general logical contradictions. A `false` result does not prove that rows exist or that a particular row is authorized.
 
@@ -380,7 +385,7 @@ impl ScopableEntity for Entity {
 
 and `#[secure(unrestricted)]` generates `EntityScope::Unrestricted`. `Dimensions` has no `Default`, so a hand-written scope must name every dimension too.
 
-When the PDP returns a constraint like `In("owner_tenant_id", [uuid1, uuid2])`, `SecureConn` calls `E::SCOPE.resolve_property("owner_tenant_id")`, gets `Column::TenantId`, and generates `WHERE tenant_id IN (uuid1, uuid2)`.
+When the PDP returns a constraint like `In("owner_tenant_id", [uuid1, uuid2])`, the Secure ORM calls `E::SCOPE.resolve_property("owner_tenant_id")`, gets `Column::TenantId`, and generates `WHERE tenant_id IN (uuid1, uuid2)`.
 
 ### Custom properties with `pep_prop`
 
@@ -423,7 +428,7 @@ pub const ADDRESS: ResourceType = ResourceType::from_static(
 );
 ```
 
-When the PDP returns constraints referencing `"city_id"`, the PEP compiler includes them in the `AccessScope`, and `SecureConn` resolves them to `Column::CityId` for the SQL `WHERE` clause.
+When the PDP returns constraints referencing `"city_id"`, the PEP compiler includes them in the `AccessScope`, and the Secure ORM resolves them to `Column::CityId` for the SQL `WHERE` clause.
 
 ### The full data flow
 
@@ -434,7 +439,7 @@ PDP constraint: In("city_id", [uuid]) ← PDP returns constraint on this propert
          ↓
 PEP compiler: ScopeFilter::In("city_id", [uuid]) → AccessScope
          ↓
-SecureConn → build_scope_condition::<E>() → E::SCOPE.resolve_property("city_id")
+scope_with → build_scope_condition::<E>() → E::SCOPE.resolve_property("city_id")
          ↓
 Column::CityId → WHERE city_id IN (uuid)
 ```
@@ -483,7 +488,7 @@ pub async fn list_users_page(
         )
         .await?;
 
-    // SecureConn applies scope as SQL WHERE clause
+    // The repository applies the scope as an SQL WHERE clause
     let page = self.repo.list_page(&conn, &scope, query).await?;
     Ok(page)
 }
@@ -540,7 +545,7 @@ let conn = self.db.conn()?;
 let created = self.repo.create(&conn, &scope, user).await?;
 ```
 
-The repository receives `scope: &AccessScope` and sets all columns before calling `secure_insert`, so the helper can check the inserted values against the returned scope. [INSERT validation](#insert-secure_insert--secureconninsert)
+The repository receives `scope: &AccessScope` and sets all columns before calling `secure_insert`, so the helper can check the inserted values against the returned scope. [INSERT validation](#insert-secure_insert)
 
 ```rust
 let model = UserAM {
@@ -597,11 +602,11 @@ if !self.repo.delete(&conn, &scope, id).await? {
 
 The repository applies the ID and scope in its DELETE statement. A concurrent change that takes the row out of scope then prevents the write. The current `users-info` update delegates to `secure_update_with_scope`, which checks scope on a SELECT and subsequently updates by primary key. That helper does not provide this atomic guarantee.
 
-## SecureConn usage
+## Secure ORM usage
 
 ### Scoped access in a repository
 
-The service passes `db.conn()?` and the scope to the repository. A `DBRunner` parameter accepts a `DbConn`, `SecureConn`, or transaction runner. For updates, `secure_conn.update_many::<E>(scope)` wraps `E::update_many().secure().scope_with(scope)`. [Users repository](../../examples/toolkit/users-info/users-info/src/infra/storage/users_sea_repo.rs)
+The service passes `db.conn()?` and the scope to the repository. A repository method takes `runner: &impl DBRunner`, which accepts a `DbConn` (from `DBProvider::conn()`) or a `DbTx` (inside `DBProvider::transaction`). Bulk updates and deletes use `E::update_many().secure().scope_with(scope)` and `E::delete_many().secure().scope_with(scope)`. [Users repository](../../examples/toolkit/users-info/users-info/src/infra/storage/users_sea_repo.rs)
 
 ### Implicit security policy (how `AccessScope` becomes SQL)
 
@@ -616,7 +621,7 @@ The service passes `db.conn()?` and the scope to the repository. A `DBRunner` pa
 | Tenants + resources | has both | AND them |
 | Tenants + resources | missing either column | deny all |
 
-This is enforced inside `toolkit-db` when you call `.scope_with(&scope)` / `SecureConn::find*` / `SecureConn::update_many` / `SecureConn::delete_many`.
+This is enforced inside `toolkit-db` when you call `.scope_with(&scope)` on a secure select, update-many or delete-many builder.
 
 ### OR/AND semantics
 
@@ -670,26 +675,26 @@ Use these when the base entity cannot be tenant-filtered directly:
 
 ## Mutations (security rules)
 
-### Insert (`secure_insert` / `SecureConn::insert`)
+### Insert (`secure_insert`)
 
 - For an entity with `tenant_col`, leaving that column `NotSet` returns `ScopeError::Invalid("tenant_id is required")`. On a scoped entity, failure to match any live branch returns `ScopeError::Denied`.
 - For constrained, scoped entities, all filters in at least one scope branch must match the inserted values; checking tenant membership alone is insufficient.
 - SecureORM rejects an all-empty scope on a scoped entity, including when a column is `NotSet`. Within a live branch, validation skips filters on `NotSet` columns. To satisfy the [resource-condition contract](../arch/authorization/DESIGN.md#scope-determination), materialize and check authorization-relevant values before inserting, or refuse the operation. The in-memory comparison supports `eq` and `in`. With a populated column it cannot satisfy a group or tenant-subtree predicate, which requires a database lookup.
 
-### Update one record (`SecureConn::update_with_ctx`)
+### Update one record (`secure_update_with_scope`)
 
 - There is no public unscoped update-one API.
-- `update_with_ctx(scope, id, am)` first checks the row exists in scope.
+- `secure_update_with_scope::<E>(am, scope, id, runner)` first checks the row exists in scope, then updates by primary key.
 - For tenant-scoped entities, `tenant_id` is immutable. Attempts to change it are denied.
 
-### Update many (`SecureConn::update_many`)
+### Update many (`SecureUpdateExt::secure`)
 
-- Must be scoped via `scope_with` / `SecureConn::update_many(scope)`.
+- Must be scoped via `E::update_many().secure().scope_with(scope)`.
 - Attempts to set the `tenant_id` column are denied at runtime (`Denied("tenant_id is immutable")`).
 
 ## Executors, transactions, repository pattern, and migrations
 
-See [`11_database_patterns.md`](./11_database_patterns.md) for `DBRunner`/`SecureTx`, transaction patterns (`in_transaction_mapped`), the repository pattern, and database migrations.
+See [`11_database_patterns.md`](./11_database_patterns.md) for `DBRunner`, transaction patterns (`DBProvider::transaction`, `Db::transaction_with_retry`), the repository pattern, and database migrations.
 
 ## Error handling
 
@@ -735,7 +740,7 @@ Every mapping keeps the fail-closed principle: no outcome other than `Ok(scope)`
 
 ### ScopeError (ORM errors)
 
-`ScopeError` is returned by `SecureConn` / `SecureTx` methods when scope violations occur (e.g., inserting into a tenant not in scope, attempting to change `tenant_id`). Map these to appropriate domain errors (typically 403 for denied, 500 for DB errors).
+`ScopeError` is returned by Secure ORM operations (`secure_insert`, `secure_update_with_scope`, scoped builders) when scope violations occur (e.g., inserting into a tenant not in scope, attempting to change `tenant_id`). Map these to appropriate domain errors (typically 403 for denied, 500 for DB errors).
 
 ## Development setup
 
@@ -772,11 +777,13 @@ gears:
       auth_disabled: true
 ```
 
+[`config/no-db.yaml`](../../config/no-db.yaml) uses this setting.
+
 This injects a default `SecurityContext` for all requests without calling any AuthN resolver.
 
 **Important**: `auth_disabled` only skips AuthN. If your gear depends on `authz-resolver`, the AuthZ call still happens (using the default `SecurityContext` from the gateway). Use static AuthZ plugin to provide predictable authorization responses.
 
-## Testing with SecureConn
+## Testing scoped queries
 
 For repository tests, construct an explicit scope with `AccessScope::for_tenant(tenant_id)`, `for_tenants(tenant_ids)`, or `for_resources(resource_ids)` and pass it with the test database runner. For service tests, configure the mock PDP and exercise the public operation. The `users-info` tests seed two tenants and assert that a scoped LIST returns only the permitted tenant’s row. [Tenant-scoping tests](../../examples/toolkit/users-info/users-info/src/domain/service/tests_tenant_scoping.rs)
 
@@ -820,12 +827,11 @@ async fn tenant_scope_only_sees_its_tenant() {
 - [ ] Use `.authenticated()` + `.require_license_features::<License>([])` on protected `OperationBuilder` routes.
 - [ ] Use `.anonymous()` only for truly unauthenticated routes (health checks, OpenAPI spec).
 
-### SecureConn / database
+### Secure ORM / database
 - [ ] Derive `Scopable` on SeaORM entities with `tenant_col` (required).
 - [ ] Declare all four dimensions or use `unrestricted`.
 - [ ] Add `pep_prop(name = "column")` for custom domain properties.
 - [ ] Obtain the connection runner with `db.conn()?` or use the active transaction runner.
-- [ ] Pass the `AccessScope` from `PolicyEnforcer` to `SecureConn` methods.
 - [ ] Apply `.secure().scope_with(&scope)` to the entity query before executing it with the runner.
 - [ ] For atomic single-record changes, apply both the resource ID and the full scope to the UPDATE statement.
 - [ ] See [`11_database_patterns.md`](./11_database_patterns.md) for DBRunner, transaction, repository, and migration checklists.

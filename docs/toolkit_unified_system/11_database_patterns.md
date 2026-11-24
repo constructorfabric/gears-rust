@@ -2,13 +2,13 @@
 
 This document covers database execution mechanics in Gears: the `DBRunner` abstraction, transactions, the repository pattern, and database migrations.
 
-For security-scoped database access (`SecureConn`, `AccessScope`, `PolicyEnforcer` PEP pattern), see [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md).
+For security-scoped database access (`AccessScope`, `.secure().scope_with(..)`, `PolicyEnforcer` PEP pattern), see [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md).
 
 ## Core invariants
 
 - **Rule**: No plain SQL in handlers/services/repos. Raw SQL is allowed only in migration infrastructure.
-- **Rule**: Repository methods accept `runner: &impl DBRunner`, not `&SecureConn`.
-- **Rule**: Use `in_transaction_mapped` for transactional work.
+- **Rule**: Repository methods accept `runner: &impl DBRunner`, so they run on a connection or inside a transaction.
+- **Rule**: Run transactional work through `DBProvider::transaction` (or `transaction_with_config`); use `Db::transaction_with_retry` when the transaction can hit serialization or lock contention.
 - **Rule**: Each gear gets its own isolated migration history table.
 - **Rule**: CTEs go through `with_ctes()` / `cte()` / `recursive_cte()`. A raw `WITH`
   string — recursive or not — is forbidden in gear code, as is reaching a raw-SQL sink
@@ -82,15 +82,20 @@ For a hierarchy that is traversed often, prefer a closure table (as `tenant_clos
 over recursing on every read — `recursive_cte` is the right tool for rarely-walked or
 frequently-changing trees, where materializing is not worth the write-path cost.
 
-## Executors: `DBRunner` and `SecureTx`
+## Executors: `DBRunner`
 
-- Repository methods should accept **`runner: &impl DBRunner`**, not `&SecureConn`.
-- Inside a transaction callback, you get **`&SecureTx`**. It also implements `DBRunner`, so the same repository methods work both inside and outside a transaction.
+A gear obtains a `DBProvider<DbError>` from `GearCtx::db()` / `db_required()` in `init()` (`toolkit_db::DBProvider`, [`db_provider.rs`](../../libs/toolkit-db/src/db_provider.rs)). It hands out two runners, both implementing the sealed `toolkit_db::secure::DBRunner` trait:
+
+- `DBProvider::conn()` returns a `DbConn` for non-transactional work.
+- Inside `DBProvider::transaction(..)` the closure receives a `&DbTx`.
+
+Repository methods accept **`runner: &impl DBRunner`** (or a generic `C: DBRunner`), so the same method works on a connection and inside a transaction. `DbConn` refuses to be created while a transaction is open on the same task (the transaction-bypass guard in `Db::conn`), so use the `tx` runner inside the closure.
 
 Example signature:
 
 ```rust
-use toolkit_db::secure::{AccessScope, DBRunner};
+use toolkit_db::secure::{DBRunner, ScopeError};
+use toolkit_security::AccessScope;
 
 pub async fn create_user(
     runner: &impl DBRunner,
@@ -103,33 +108,52 @@ pub async fn create_user(
 
 ## Transactions
 
-### Transaction with SecureConn
+### `DBProvider::transaction`
 
-`in_transaction_mapped` consumes the `SecureConn` and returns `(SecureConn, Result<T, E>)`, preventing accidental use of the outer connection inside the transaction:
+The closure receives `&DbTx` and returns a boxed future. The transaction commits when the closure returns `Ok` and rolls back on `Err`. The error type is the provider's `E` (which must implement `From<DbError>`). From the `users-info` smoke test ([`tests_tenant_scoping.rs`](../../examples/toolkit/users-info/users-info/src/domain/service/tests_tenant_scoping.rs), `dbprovider_transaction_smoke`):
 
 ```rust
-pub async fn transfer_user(
-    &self,
-    ctx: &SecurityContext,
-    from_tenant: Uuid,
-    to_tenant: Uuid,
-    user_id: Uuid,
-) -> Result<(), DomainError> {
-    let secure_conn = self.db.sea_secure();
-    let scope = enforcer.access_scope(ctx, &resources::USER, actions::UPDATE, None).await?;
+let provider: DBProvider<toolkit_db::DbError> = DBProvider::new(db.clone());
+let scope = AccessScope::for_tenants(vec![tenant_id]);
 
-    let (_conn, result) = secure_conn
-        .in_transaction_mapped(DomainError::database_infra, move |tx| {
-            Box::pin(async move {
-                // tx is &SecureTx — use it as the runner for repository calls
-                // repo.transfer_user(tx, &scope, from_tenant, to_tenant, user_id).await?;
-                Ok(())
-            })
+provider
+    .transaction(|tx| {
+        Box::pin(async move {
+            let user = ActiveModel { /* ... */ };
+            let _ = secure_insert::<UserEntity>(user, &scope, tx).await?;
+            Ok(())
         })
-        .await;
-    result
-}
+    })
+    .await?;
 ```
+
+`DBProvider::transaction_with_config(TxConfig, ..)` takes an isolation level and access mode, for example `TxConfig::serializable()` for hierarchy mutations (`chat-engine`'s `session_repo.rs` and `variant_repo.rs`) or `TxConfig::read_only()` for pure reads (`prefetch` in `gears/bss/orders/orders/src/infra/storage/scoped.rs`, via `Db::transaction_ref_mapped_with_config`).
+
+### Retrying on contention: `Db::transaction_with_retry`
+
+Under `SERIALIZABLE`, or on any backend with lock contention, a transaction can fail with an error that succeeds on retry. `Db::transaction_with_retry(tx_config, extract_db_err, body)` ([`secure/db.rs`](../../libs/toolkit-db/src/secure/db.rs)) reruns `body` in a fresh transaction when `extract_db_err` returns a `DbErr` that `toolkit_db::contention::is_retryable_contention` classifies as retryable, up to `DEFAULT_TX_RETRY_ATTEMPTS`. The body is called once per attempt, so it must be idempotent and clone what it captures. Get the `Db` from the provider with `DBProvider::db()`. Abridged from `file-storage` ([`store/metadata.rs`](../../gears/file-storage/file-storage/src/infra/storage/store/metadata.rs)):
+
+```rust
+self.db
+    .db()
+    .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+        let files = files.clone();
+        let patch_scope = patch_scope.clone();
+        Box::pin(async move {
+            let bumped = files
+                .touch_meta(tx, &patch_scope, file_id, expected_meta_version, now)
+                .await?;
+            if !bumped {
+                return Ok(false);
+            }
+            // ... upsert / delete the patched metadata keys, insert the audit record
+            Ok::<bool, DomainError>(true)
+        })
+    })
+    .await
+```
+
+`db_err` here is `fn(&DomainError) -> Option<&sea_orm::DbErr>`; returning `None` stops retrying. `transaction_with_retry_max` takes an explicit attempt budget.
 
 ### SQLite: `transaction_mode`
 
@@ -155,11 +179,12 @@ In tests, close a pool before reopening its file (`Db::close`, behind toolkit-db
 
 ## Repository pattern
 
-### Repository with `DBRunner` (works with both `SecureConn` and `SecureTx`)
+### Repository with `DBRunner` (works with both `DbConn` and `DbTx`)
 
 ```rust
-use toolkit_db::secure::{AccessScope, DBRunner, ScopeError, SecureEntityExt};
-use sea_orm::Set;
+use sea_orm::{EntityTrait, Set};
+use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt};
+use toolkit_security::AccessScope;
 
 pub struct UserRepository;
 
@@ -181,7 +206,7 @@ impl UserRepository {
         &self,
         runner: &impl DBRunner,
         scope: &AccessScope,
-        new_user: user_info_sdk::NewUser,
+        new_user: users_info_sdk::NewUser,
     ) -> Result<user::Model, ScopeError> {
         let am = user::ActiveModel {
             id: Set(new_user.id.unwrap_or_else(Uuid::new_v4)),
@@ -256,7 +281,7 @@ Raw SQL is **allowed only in migration infrastructure** (migration runner + migr
 ## Quick checklist
 
 - [ ] Use `runner: &impl DBRunner` in repository method signatures.
-- [ ] Use `in_transaction_mapped` for multi-step mutations.
+- [ ] Use `DBProvider::transaction` for multi-step mutations, and `Db::transaction_with_retry` where contention is expected.
 - [ ] Use raw SQL only in migration infrastructure (migration runner + migration
       definitions) — including raw `WITH`.
 - [ ] Build CTEs with `with_ctes()`/`cte()`/`recursive_cte()`, and reference them with
@@ -267,7 +292,7 @@ Raw SQL is **allowed only in migration infrastructure** (migration runner + migr
 
 ## Related docs
 
-- Security data path (AuthN/AuthZ, SecureConn, AccessScope): [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md)
+- Security data path (AuthN/AuthZ, Secure ORM, AccessScope): [`06_authn_authz_secure_orm.md`](./06_authn_authz_secure_orm.md)
 - OData pagination / filtering: [`07_odata_pagination_select_filter.md`](./07_odata_pagination_select_filter.md)
 - Canonical example: `examples/toolkit/users-info/`
 - DB-behavior testing & audit (rules and audit method): [`14_db_behavior_testing.md`](./14_db_behavior_testing.md)

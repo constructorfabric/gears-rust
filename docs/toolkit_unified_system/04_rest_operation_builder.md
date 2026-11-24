@@ -1,35 +1,69 @@
 # REST API with OperationBuilder
 
-ToolKit provides a type-safe operation builder that prevents half-wired routes at compile time and integrates with OpenAPI, auth, errors, SSE, and content types.
+`OperationBuilder` (`libs/toolkit/src/api/operation_builder.rs`) is a typestate builder: `register()` compiles only after a handler, at least one response, an auth decision and a license decision are set. Each registered operation is added to the router and to the OpenAPI registry.
 
 ## Core principles
 
 - **Rule**: Strictly follow the API guideline (`guidelines/DNA/REST/API.md`).
-- **Rule**: Do NOT implement a REST host. `api-gateway` owns the Axum server and OpenAPI. Gears only register routes via `register_routes(...)`.
-- **Rule**: Use `Extension<Arc<Service>>` for dependency injection and attach the service ONCE after all routes are registered: `router = router.layer(Extension(service.clone()));`.
+- **Rule**: Do NOT implement a REST host. `api-gateway` owns the Axum server and OpenAPI. A gear declares `capabilities = [rest]` and adds routes in `RestApiCapability::register_rest` (`libs/toolkit/src/contracts.rs`).
+- **Rule**: Use `Extension<Arc<Service>>` for dependency injection and attach the service ONCE after all routes are registered: `router = router.layer(axum::Extension(services));`.
 - **Rule**: Use `Extension(ctx): Extension<SecurityContext>` extractor — the gateway injects `SecurityContext` as an Axum extension.
-- **Rule**: Follow the `<crate>.<resource>.<action>` convention for `operation_id` naming.
-- **Rule**: Use `toolkit::api::prelude::*` for ergonomic handler types (ApiResult, created_json, no_content).
-- **Rule**: Always return RFC 9457 Problem Details for all 4xx/5xx errors via `Problem` (implements `IntoResponse`).
+- **Rule**: Name `operation_id` as `<gear_snake>.<action>` (`users_info.list_users`) or `<gear_snake>.<resource>.<action>` (`chat_engine.session.create` in `gears/chat-engine/chat-engine/src/api/rest/routes/mod.rs`).
+- **Rule**: Import handler types from `toolkit::api::canonical_prelude::*` (`ApiResult`, `JsonBody`, `JsonPage`, `created_json`, `no_content`, `OData`, ...).
+- **Rule**: Errors are `CanonicalError`, rendered as RFC 9457 `application/problem+json`; see [05_errors_rfc9457.md](05_errors_rfc9457.md).
+- **Rule**: Read request bodies, paths and queries with `toolkit::api::rest::extract::{Json, Path, Query}` so rejections are `Problem` responses.
 - **Rule**: Observability is provided by gateway: request tracing and `X-Request-Id` are already handled.
 - **Rule**: Do not add transport middlewares (CORS, timeouts, compression, body limits) at gear level.
-- **Rule**: Handlers should complete within ~30s (gateway timeout). If work may exceed that, return `202 Accepted`.
+- **Rule**: The gateway enforces a per-route request deadline (`request_timeout_middleware`, `gears/system/api-gateway/src/middleware/request_timeout.rs`). Routes inherit `defaults.request_timeout` from the api-gateway config (`DEFAULT_REQUEST_TIMEOUT` = 30s in `gears/system/api-gateway/src/config.rs`). If work may exceed it, return `202 Accepted`, or declare a longer deadline with `.request_timeout(..)` / opt out with `.no_request_timeout()` (see [Auth, license, visibility and timeout](#auth-license-visibility-and-timeout)).
 
-## OperationBuilder basics
+## Registration
+
+From `examples/toolkit/users-info/users-info/src/gear.rs` and `.../api/rest/routes/`:
 
 ```rust
-use toolkit::api::{OperationBuilder, OpenApiRegistry};
-use toolkit::api::operation_builder::{LicenseFeature, OperationBuilderODataExt};
-use axum::{Extension, Router};
-use std::sync::Arc;
+impl RestApiCapability for UsersInfo {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: axum::Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<axum::Router> {
+        let service = self
+            .service
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?
+            .clone();
+        Ok(routes::register_routes(router, openapi, service))
+    }
+}
+```
 
-pub fn register_routes(
-    router: Router,
+```rust
+use toolkit::api::OpenApiRegistry;
+use toolkit::api::operation_builder::{
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilder, OperationBuilderODataExt,
+};
+use users_info_sdk::odata::UserFilterField;
+
+pub(super) struct License;
+
+impl AsRef<str> for License {
+    fn as_ref(&self) -> &'static str {
+        CORE_GLOBAL_BASE_LICENSE_FEATURE
+    }
+}
+
+impl LicenseFeature for License {}
+
+pub(crate) fn register_routes(
+    mut router: Router,
     openapi: &dyn OpenApiRegistry,
-    service: Arc<Service>,
+    services: Arc<ConcreteAppServices>,
 ) -> Router {
-    let router = OperationBuilder::get("/users-info/v1/users")
+    router = OperationBuilder::get("/users-info/v1/users")
         .operation_id("users_info.list_users")
+        .summary("List users with cursor pagination")
+        .tag("Users Info")
         .authenticated()
         .require_license_features::<License>([])
         .handler(handlers::list_users)
@@ -38,227 +72,97 @@ pub fn register_routes(
             http::StatusCode::OK,
             "Paginated list of users",
         )
-        .with_odata_filter::<dto::UserDtoFilterField>()
+        .with_odata_filter::<UserFilterField>()
         .with_odata_select()
-        .with_odata_orderby::<dto::UserDtoFilterField>()
-        .standard_errors(openapi)
+        .with_odata_orderby::<UserFilterField>()
+        .error_400(openapi)
+        .error_500(openapi)
         .register(router, openapi);
 
-    // Attach service once after all routes
-    router.layer(Extension(service))
+    // ... other routes
+
+    router.layer(axum::Extension(services))
 }
 ```
 
-## Common patterns
+`UserFilterField` is generated by `#[derive(ODataFilterable)]` on the SDK query struct (`users-info-sdk/src/odata/users.rs`). OData parameters, the `OData` extractor and `$select` projection are covered in [07_odata_pagination_select_filter.md](07_odata_pagination_select_filter.md).
 
-### Auth-protected endpoint
+Declare request and response body types with `#[toolkit_macros::api_dto(request)]` / `#[toolkit_macros::api_dto(response)]` (or both, as `dto::UserDto` does): `json_request` requires `RequestApiDto`, and `json_response_with_schema` / `sse_json` require `ResponseApiDto` (`libs/toolkit/src/api/api_dto.rs`).
 
-```rust
-OperationBuilder::post("/users-info/v1/users")
-    .operation_id("users_info.create_user")
-    .authenticated()
-    .require_license_features::<License>([])
-    .handler(handlers::create_user)
-    .json_response_with_schema::<dto::UserDto>(openapi, StatusCode::CREATED, "User created")
-    .standard_errors(openapi)
-    .register(router, openapi);
-```
+## Auth, license, visibility and timeout
 
-### Public endpoint
+Every operation picks one auth mode, and `register()` requires a license decision as well:
+
+| Call | Meaning |
+|------|---------|
+| `.authenticated()` | Valid bearer token required. Must be followed by `.require_license_features(..)` or `.no_license_required()`. |
+| `.platform_authenticated()` | Validated `X-ToolKit-Internal-Token` required; handlers read `Extension<PlatformSecurityContext>`. License decision still required. |
+| `.anonymous()` | No authentication; also sets the license decision. |
+| `.require_license_features::<License>([])` | No feature required (explicit). Pass feature values to gate the route, e.g. `.require_license_features([&ChatEngineLicense])` in `gears/chat-engine/chat-engine/src/api/rest/routes/mod.rs`. |
+| `.no_license_required()` | System endpoints that need auth but no application license. |
+| `.exposed()` | Visibility axis, independent of auth. Emits `x-toolkit-visibility: exposed` on the operation in OpenAPI (`libs/toolkit/src/api/openapi_registry.rs`); edge `GatewayProvider`s (`libs/toolkit-gateway`) read it to route traffic to out-of-process gears. In-process routes are served by api-gateway whether or not they are exposed. Ignored with a warning on platform-authenticated routes. |
+| `.public()` | Deprecated alias for `.anonymous().exposed()`. |
+| `.request_timeout(Duration)` | Per-route deadline replacing the gateway's `defaults.request_timeout` (capped by `defaults.max_request_timeout` when set). |
+| `.no_request_timeout()` | Exempts the route from the gateway deadline; for long-lived streams (SSE, multipart). |
+
+Anonymous endpoint:
 
 ```rust
 OperationBuilder::get("/users-info/v1/health")
-    .operation_id("users_info.health")
     .anonymous()
-    .handler(handlers::health)
-    .json_response_with_schema::<dto::HealthDto>(openapi, StatusCode::OK, "Health check")
+    .handler(health_check)
+    .json_response(StatusCode::OK, "OK")
     .register(router, openapi);
 ```
 
-### License-gated endpoint
+## Request bodies
 
 ```rust
-OperationBuilder::get("/users-info/v1/premium")
-    .operation_id("users_info.premium")
-    .authenticated()
-    .require_license_features::<License>([License::Premium])
-    .handler(handlers::premium)
-    .json_response_with_schema::<dto::PremiumDto>(openapi, StatusCode::OK, "Premium content")
-    .standard_errors(openapi)
-    .register(router, openapi);
+// JSON
+.json_request::<dto::CreateUserReq>(openapi, "User creation data")
+
+// multipart/form-data with a single file field
+.multipart_file_request("file", Some("File to parse and stream as Markdown"))
+
+// application/octet-stream
+.octet_stream_request(Some("Raw file bytes to parse"))
+
+// Gateway-enforced request Content-Type allow-list (415 otherwise); no OpenAPI effect
+.allow_content_types(&["application/json"])
 ```
 
-## Content types
+## Responses
 
-### JSON request/response
+| Method | Use |
+|--------|-----|
+| `.json_response_with_schema::<T>(openapi, status, desc)` | JSON body with a registered schema |
+| `.json_array_response_with_schema::<T>(openapi, status, desc)` | Top-level JSON array of `T` (pass the item type, not `Vec<T>`) |
+| `.json_response(status, desc)` | JSON without a schema |
+| `.no_content_response(status, desc)` | Body-less response, e.g. `204` |
+| `.text_response(status, desc, content_type)` | Text with a custom media type (no `; charset=` parameter) |
+| `.html_response(status, desc)` | HTML |
+| `.sse_json::<T>(openapi, desc)` | `text/event-stream` of JSON events |
+| `.multipart_json::<T>(openapi, desc)` | `multipart/mixed` stream of JSON items |
+| `.response(ResponseSpec::new(status, content_type, desc, None))` | Any other content type (e.g. binary) |
 
-```rust
-OperationBuilder::post("/users-info/v1/users")
-    .json_request::<CreateUserReq>(openapi, "User creation data")
-    .handler(handlers::create_user)
-    .json_response_with_schema::<UserDto>(openapi, StatusCode::CREATED, "User created")
-    .standard_errors(openapi)
-    .register(router, openapi);
-```
-
-### Multipart file upload
-
-```rust
-OperationBuilder::post("/users-info/v1/upload")
-    .multipart_file_request("file", Some("File to upload"))
-    .handler(handlers::upload)
-    .json_response_with_schema::<UploadResponse>(openapi, StatusCode::OK, "Upload successful")
-    .standard_errors(openapi)
-    .register(router, openapi);
-```
-
-### Binary/octet-stream
+From `gears/file-parser/file-parser/src/api/rest/routes.rs`:
 
 ```rust
-OperationBuilder::post("/users-info/v1/parse")
-    .octet_stream_request(Some("Raw file bytes"))
-    .handler(handlers::parse_bytes)
-    .json_response_with_schema::<ParseResponse>(openapi, StatusCode::OK, "Parse successful")
-    .standard_errors(openapi)
-    .register(router, openapi);
-```
-
-### Custom content types
-
-```rust
-OperationBuilder::post("/users-info/v1/export")
-    .allow_content_types(&["application/pdf", "image/png", "image/jpeg"])
-    .handler(handlers::export)
-    .binary_response(openapi, StatusCode::OK, "Exported file")
-    .standard_errors(openapi)
-    .register(router, openapi);
-```
-
-## Server-Sent Events (SSE)
-
-```rust
-OperationBuilder::get("/users-info/v1/users/events")
-    .operation_id("users_info.user_events")
+OperationBuilder::post("/file-parser/v1/upload/markdown")
+    .operation_id("file_parser.upload_markdown")
     .authenticated()
     .require_license_features::<License>([])
-    .sse_json::<dto::UserEvent>(openapi, "Real-time user events")
-    .handler(handlers::user_events)
-    .register(router, openapi);
-```
-
-Handler example:
-
-```rust
-pub async fn user_events(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(broadcaster): Extension<Arc<SseBroadcaster<UserEvent>>>,
-) -> impl IntoResponse {
-    let stream = broadcaster.subscribe();
-    Sse::new(stream, "user_events")
-}
-```
-
-## Error handling
-
-### Standard errors
-
-```rust
-.standard_errors(openapi)
-```
-
-Adds: 400, 401, 403, 404, 409, 422, 429, 500.
-
-### Specific errors
-
-```rust
-.problem_response(openapi, StatusCode::BAD_REQUEST, "Invalid input")
-.problem_response(openapi, StatusCode::CONFLICT, "Email already exists")
-.problem_response(openapi, StatusCode::INTERNAL_SERVER_ERROR, "Internal error")
-.with_422_validation_error(openapi)
-```
-
-### Handler error pattern
-
-```rust
-use toolkit::api::prelude::*;
-use toolkit::api::problem::Problem;
-use crate::domain::error::DomainError;
-
-// DomainError auto-converts to Problem via From impl
-pub async fn create_user(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<Service>>,
-    Json(req): Json<CreateUserReq>,
-) -> ApiResult<impl IntoResponse> {
-    let user = svc.create_user(&ctx, req.into()).await?;
-    let id_str = user.id.to_string();
-    Ok(created_json(UserDto::from(user), &uri, &id_str))
-}
-```
-
-## OData integration
-
-### OData-enabled list endpoint
-
-```rust
-OperationBuilder::get("/users-info/v1/users")
-    .operation_id("users_info.list_users")
-    .authenticated()
-    .require_license_features::<License>([])
-    .handler(handlers::list_users)
-    .json_response_with_schema::<toolkit_odata::Page<dto::UserDto>>(
-        openapi,
-        StatusCode::OK,
-        "Paginated list of users",
-    )
-    .with_odata_filter::<dto::UserDtoFilterField>()
-    .with_odata_select()
-    .with_odata_orderby::<dto::UserDtoFilterField>()
+    .multipart_file_request("file", Some("File to parse and stream as Markdown"))
+    .handler(handlers::upload_and_parse_markdown)
+    .text_response(http::StatusCode::OK, "Markdown stream", "text/markdown")
     .standard_errors(openapi)
+    .error_415(openapi)
     .register(router, openapi);
-```
-
-Handler with OData:
-
-```rust
-pub async fn list_users(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<Service>>,
-    OData(query): OData,
-) -> ApiResult<JsonPage<serde_json::Value>> {
-    let page: toolkit_odata::Page<user_info_sdk::User> =
-        svc.users.list_users_page(&ctx, &query).await?;
-    let page = page.map_items(UserDto::from);
-    Ok(Json(page_to_projected_json(&page, query.selected_fields())))
-}
-```
-
-## OpenAPI registration
-
-### Schema-aware responses
-
-```rust
-.json_response_with_schema::<T>(openapi, StatusCode::OK, "Success")
-```
-
-### Error schemas
-
-```rust
-.error_400(openapi)
-.error_401(openapi)
-.error_403(openapi)
-.error_404(openapi)
-.error_409(openapi)
-.error_422(openapi)
-.error_500(openapi)
 ```
 
 ### Response headers
 
-Declare response headers immediately after the response they belong to. Header
-types are restricted to the scalar variants supported by
-`ResponseHeaderType`, so an invalid or misspelled type cannot silently produce
-an incorrect contract.
+Declare response headers immediately after the response they belong to. Header types are restricted to `ResponseHeaderType::{String, Integer, Boolean}`.
 
 ```rust
 use toolkit::api::{ResponseHeaderSpec, ResponseHeaderType};
@@ -278,31 +182,74 @@ OperationBuilder::post("/jobs")
     ));
 ```
 
-### SSE schema
+## Error responses
+
+All error responses use the canonical `Problem` schema with `application/problem+json`.
+
+- `.standard_errors(openapi)` adds 400, 401, 403, 404, 409, 429, 500.
+- `.error_400` … `.error_504`: `error_400`, `error_401`, `error_403`, `error_404`, `error_409`, `error_413`, `error_415`, `error_422`, `error_429`, `error_500`, `error_502`, `error_503`, `error_504`.
+- `.with_400_validation_error(openapi)` declares 400 described as a validation error (`context.field_violations[]`).
+- `.problem_response(openapi, status, desc)` for any other status.
+
+Canonical `invalid_argument` maps to 400, so `standard_errors` omits 413/415/422. A handler that takes `toolkit::api::rest::extract::Json<T>` can return all three (oversized body, wrong `Content-Type`, schema violation); declare them with `.error_413(openapi)`, `.error_415(openapi)`, `.error_422(openapi)`.
+
+## Server-Sent Events (SSE)
+
+From `examples/toolkit/users-info/users-info/src/api/rest/routes/events.rs` and `.../handlers/events.rs`:
 
 ```rust
-.sse_json::<T>(openapi, "Real-time event stream")
+let router = OperationBuilder::get("/users-info/v1/users/events")
+    .operation_id("users_info.events")
+    .authenticated()
+    .require_license_features::<License>([])
+    .handler(handlers::users_events)
+    .sse_json::<dto::UserEvent>(openapi, "SSE stream of UserEvent")
+    .register(router, openapi);
+
+router.layer(axum::Extension(sse)) // toolkit::SseBroadcaster<dto::UserEvent>
 ```
 
-## Handler return types
+```rust
+pub async fn users_events(
+    Extension(sse): Extension<SseBroadcaster<UserEvent>>,
+) -> impl IntoResponse {
+    sse.sse_response_named("users_events").into_response()
+}
+```
 
-| Pattern | Return Type | Helper |
-|---------|-------------|--------|
+`SseBroadcaster` (`libs/toolkit/src/http/sse.rs`) also provides `send`, `subscribe_stream`, `sse_response`, and the `*_with_headers` variants.
+
+## Handlers
+
+```rust
+pub async fn create_user(
+    uri: Uri,
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteAppServices>>,
+    extract::Json(req_body): extract::Json<CreateUserReq>,
+) -> ApiResult<impl IntoResponse> {
+    let user = svc.users.create_user(&ctx, req_body.into()).await?;
+    let id_str = user.id.to_string();
+    Ok(created_json(UserDto::from(user), &uri, &id_str).into_response())
+}
+```
+
+| Pattern | Return type | Body |
+|---------|-------------|------|
 | GET with body | `ApiResult<JsonBody<T>>` | `Ok(Json(dto))` |
-| POST with body | `ApiResult<impl IntoResponse>` | `Ok(created_json(dto, location))` |
-| DELETE no body | `ApiResult<impl IntoResponse>` | `Ok(no_content())` |
+| POST creating a resource | `ApiResult<impl IntoResponse>` | `Ok(created_json(dto, &uri, &id))` — 201 with `Location: <uri path>/<id>` |
+| DELETE | `ApiResult<impl IntoResponse>` | `Ok(no_content())` |
 | Paginated list | `ApiResult<JsonPage<T>>` | `Ok(Json(page))` |
-| Binary | `ApiResult<impl IntoResponse>` | `Ok(Response::new(...))` |
 
 ## Quick checklist
 
-- [ ] Use `OperationBuilder` for every route.
-- [ ] Add `.authenticated()` + `.require_license_features::<License>([])` for protected endpoints.
-- [ ] Add `.standard_errors(openapi)` or specific errors.
-- [ ] Use `.json_response_with_schema()` for typed responses.
+- [ ] Use `OperationBuilder` for every route, registered from `RestApiCapability::register_rest`.
+- [ ] Protected endpoints: `.authenticated()` + `.require_license_features::<License>([])` (or `.no_license_required()`).
+- [ ] Declare error statuses: `.standard_errors(openapi)` or individual `.error_*`; add 413/415/422 for `extract::Json` bodies.
+- [ ] Body types carry `#[toolkit_macros::api_dto(..)]`; use `.json_response_with_schema()` for typed responses.
 - [ ] Declare runtime response headers with `.response_header()`.
 - [ ] Use `Extension<Arc<Service>>` and attach once after all routes.
 - [ ] Use `Extension(ctx): Extension<SecurityContext>` to get `SecurityContext`.
-- [ ] Use `ApiResult<T>` and `?` for error propagation.
-- [ ] For OData: add `.with_odata_*()` helpers and use `OData(query)` extractor.
-- [ ] For SSE: use `.sse_json()` and `SseBroadcaster`.
+- [ ] Return `ApiResult<T>` and propagate with `?`.
+- [ ] For OData: `.with_odata_*()` helpers and the `OData(query)` extractor ([07](07_odata_pagination_select_filter.md)).
+- [ ] For SSE: `.sse_json()` and `SseBroadcaster`.

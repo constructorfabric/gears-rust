@@ -3,7 +3,7 @@
 
 # E2E Testing Guide
 
-This document defines the philosophy, infrastructure, and patterns for end-to-end (E2E) tests across all ToolKit gears. Gear-specific test plans (which seams to test, actual test implementations) live in each gear's `docs/features/` folder and `testing/e2e/suites/<gear>/`.
+This document defines the philosophy and patterns for end-to-end (E2E) tests across all ToolKit gears. Suites live in `testing/e2e/suites/<suite>/`. How to run them, the `e2e.yaml` format, shared-server versus self-managed suites and the `make` targets are in [`testing/e2e/README.md`](../../testing/e2e/README.md); CI lanes are in [`docs/TESTING.md` §5](../TESTING.md#5-end-to-end-e2e-tests).
 
 ---
 
@@ -11,7 +11,9 @@ This document defines the philosophy, infrastructure, and patterns for end-to-en
 
 ### What Is an E2E Test in This Project
 
-An E2E test is an HTTP request to a **running** `cf-gears-server` with a **real PostgreSQL** database, traversing the full chain: TCP → HTTP router → AuthN middleware → AuthZ PolicyEnforcer → Service → Repository → PostgreSQL → Response serialization → HTTP response. Pytest sends requests from the outside, exactly like a real client.
+An E2E test is an HTTP request to a **running** `cf-gears-example-server` with a **real PostgreSQL** database, traversing the full chain: TCP → HTTP router → AuthN middleware → AuthZ PolicyEnforcer → Service → Repository → PostgreSQL → Response serialization → HTTP response. Pytest sends requests from the outside, exactly like a real client.
+
+That is the target definition, not the default setup: the shared `make e2e-local` config, [`config/e2e-local.yaml`](../../config/e2e-local.yaml), puts most gears on SQLite. See [Check which venue you actually have](#coverage-goal-one-call-per-api-method) before counting a case as PostgreSQL coverage.
 
 This is **not** "another way to verify business logic." Business logic is verified by unit/integration tests (see [`12_unit_testing.md`](12_unit_testing.md)). E2E tests verify the **seams between components**, not the components themselves.
 
@@ -23,12 +25,7 @@ E2E tests live at two levels, and both matter:
 
 **Cross-gear E2E** — verifies that **2–5 gears work correctly together**. This is the primary reason E2E tests exist at all. Unit tests verify each gear in isolation (mocking its dependencies). Only an E2E test can catch bugs that appear at the boundary between gears: gear A calls gear B's SDK, gear B reads from a table that gear C seeded, the combined result flows through gear D's API. None of these seams are visible to any single gear's unit tests.
 
-Cross-gear tests live in a dedicated folder:
-```
-testing/e2e/cross_gear/
-├── conftest.py
-├── test_<gearA>_<gearB>_integration.py
-```
+There is no separate cross-gear directory. A cross-gear scenario is either its own suite under `testing/e2e/suites/` (for example `scope_enforcement`, which overlays api-gateway route policies on the shared config) or a profile of an existing suite (`resource_group`'s `tr-authz` profile runs the AuthZ → tenant-resolver → resource-group chain; `make e2e-tr-authz`).
 
 The rule still applies: **each cross-gear test targets exactly one integration seam** between the gears. Do not write a cross-gear test that simultaneously verifies intra-gear behavior — that belongs in each gear's own unit tests.
 
@@ -58,14 +55,14 @@ E2E tests cover integration seams — points where two independently correct com
 | **Cursor codec ↔ HTTP** | Base64 encode/decode roundtrip, URL-encoding, offset drift | Unit tests test pagination logic; codec only runs in the handler layer |
 | **OData filter ↔ SQL** | Full parse→SQL→result chain | Unit tests verify FilterField names/kinds, not the full pipeline |
 
-> **Note on routing**: In Axum and Actix-web, route registration can be tested in unit tests using `Router::oneshot()` — the router is instantiated in-process, no real server needed. A route smoke test (`assert non-405 for every registered path`) belongs in unit tests (`api_rest_test.rs`), not in E2E. E2E adds value here only if you need to verify routing behavior that depends on real server middleware or TLS termination.
+> **Note on routing**: route registration can be tested in unit tests with axum's `Router::oneshot()` — the router is instantiated in-process, no real server needed. A route smoke test (`assert non-405 for every registered path`) belongs in the gear's REST unit tests, not in E2E. E2E adds value here only if you need to verify routing behavior that depends on real server middleware or TLS termination.
 
 Each E2E test targets **exactly one seam**. If the seam is already covered by a unit test, there is no E2E test for it.
 
 ### What NOT to Test via E2E
 
 - **Domain validation** (field format, invariants, placement rules) — pure logic, deterministic; unit tests cover this
-- **Error variant construction and mapping** — `DomainError` variants and their → `Problem` mapping; unit tests cover this
+- **Error variant construction and mapping** — `DomainError` variants and their `CanonicalError` mapping; unit tests cover this
 - **DTO struct↔struct conversions** — unit tests cover this
 - **OData filter field names and kinds** — unit tests cover this
 - **Seeding idempotency** — pure domain logic; unit tests cover this
@@ -93,7 +90,7 @@ That permission does not loosen the restraint above it. E2E carries far fewer te
 - **This suite**, when it genuinely runs against PostgreSQL. Use it when the case needs the full HTTP chain as well as the real database.
 - **A feature-gated Rust suite against real PostgreSQL via `testcontainers`**, calling repository or service code directly — in-process, no HTTP, no running server. Use it when the divergence is in the SQL or the schema rather than in the transport, which is the common case: dialect rejections, column widths, `CHECK` and FK enforcement, isolation. It gives a far more precise diagnosis than an HTTP status can, and it costs seconds rather than a server boot.
 
-The second is in use, not hypothetical. The established wiring is a `--features integration` suite behind `#![cfg(feature = "integration")]`, a dedicated `test-<gear>-pg` `Makefile` target, and a matching step in `.github/workflows/ci.yml`'s `integration` job. `resource-group` is the worked example, and it writes the deviation from this guide down in its own docs rather than leaving it implicit — do the same if you adopt the pattern.
+The second is in use, not hypothetical. The established wiring is a `--features integration` suite behind `#![cfg(feature = "integration")]`, a lane in `INTEGRATION_LANES` in [`gears-rust.mk`](../../gears-rust.mk) (run with `make test-integration LANE=<lane>`), and a matching step in `.github/workflows/ci.yml`'s `integration` job. `resource-group` (lane `rg-pg`) is the worked example, and it writes the deviation from this guide down in its own docs rather than leaving it implicit — do the same if you adopt the pattern.
 
 Only when neither venue exists is the behaviour genuinely untested, and that is what belongs in the backlog rather than in an assumption.
 
@@ -103,43 +100,19 @@ After adding or removing any E2E test, **check the coverage checklist**: verify 
 
 **Priority 1 — Stability (no flaking).** This is the single most important requirement. An E2E test that occasionally fails without a code change is worse than no test at all — it erodes trust in the entire suite and causes teams to ignore real failures. A flaky test must be fixed or deleted immediately. Zero tolerance.
 
-Rules that protect stability:
-- Hard timeout per test (10s) and per request (5s) — fail fast, never hang
-- No `time.sleep()` — if you need to wait for state, restructure the test or use a short poll
-- Each test creates its own data — no dependencies on other tests' state or ordering
-- Session-scoped reachability check — skip the whole gear if the server is down, don't generate N failures
+The rules that protect stability are in [Anti-Flaking Practices](#anti-flaking-practices): own data, no `sleep`, hard timeouts, order independence, skip when the server is down.
 
 **Priority 2 — Speed.** A standard CRUD E2E test (create + read + assert) should complete in **under 2 seconds** running single-threaded against a local server. This is an important goal, but it is secondary to stability. A test that takes 3 seconds and never flakes is better than a test that takes 1 second and flakes 1-in-50 runs.
 
-Tactics: minimize HTTP round-trips per test, create test data via the fastest available path (direct API call, not multi-step setup), avoid unnecessary GET calls after writes if the write response already contains the needed data.
+Tactics: see [How Many Requests Per Test](#how-many-requests-per-test-the-tradeoff).
 
 **Priority 3 — Positive scenarios only, each API called once.** Test the happy path. Verify that the integration seam works end-to-end for the normal case. If `POST /entities` is already called in `test_dto_roundtrip`, `test_authz_tenant_filter` does not need to create another entity via a fresh POST — it can reuse a fixture or accept that `POST` is already covered. Keep the suite minimal: fewer calls, fewer points of failure, faster runtime.
 
 ---
 
-## Reliability Principles
-
-> *"A smaller set of reliable E2E tests is better than a large set of flaky tests that everyone ignores."*
-> — [Bunnyshell, E2E Testing for Microservices (2026)](https://www.bunnyshell.com/blog/end-to-end-testing-for-microservices-a-2025-guide/)
-
-> *"Think about the properties you'd like from your test suite using the SMURF mnemonic: Speed, Maintainability, Utilization, Reliability, Fidelity."*
-> — [Google Testing Blog, SMURF: Beyond the Test Pyramid (2024)](https://testing.googleblog.com/2024/10/smurf-beyond-test-pyramid.html)
-
-**Speed** — aim for < 15 seconds per module E2E suite. One file per module. No fan-out across many files.
-
-**Maintainability** — each test is tied to a specific seam. When the seam changes (e.g., migrating from Actix to Axum), one test breaks, not twenty.
-
-**Reliability** — `pytest-timeout=10s` per test. `httpx timeout=5s` per request. Zero `time.sleep()`. Self-contained data: each test creates its own entities via factory fixtures, never depends on another test's data.
-
-**Fidelity** — real PostgreSQL, real AuthZ pipeline, real HTTP. This is the only thing that justifies E2E on top of unit tests.
-
-**Utilization** — every test is unique. None duplicates unit test coverage. A test that can be removed without losing integration confidence should not exist.
-
----
-
 ## Anti-Flaking Practices
 
-Research on large-scale test suites shows the distribution of flake root causes: ~45% timing and async wait issues, ~20% concurrency and resource contention, ~12% test order dependencies, remainder split between environment differences and non-deterministic logic. The practices below address each category.
+These are the stability rules for every suite. Other sections link here instead of repeating them.
 
 ### 1. Data Isolation — the Foundation
 
@@ -166,7 +139,7 @@ Rules:
 
 ### 2. No `time.sleep()` — Ever
 
-`time.sleep()` is the #1 source of flakiness. It either sleeps too little (race condition) or too much (wasted time + still occasionally too little under load).
+A fixed sleep either waits too little (race condition) or too long (wasted time, and still occasionally too little under load).
 
 ```python
 # BAD
@@ -190,11 +163,7 @@ In practice, if your test needs `time.sleep()`, it usually means the test is exe
 
 A hanging test is worse than a failing test: it blocks CI, wastes wall-clock time, and obscures the real failure.
 
-```ini
-# pytest.ini
-[pytest]
-timeout = 10   # per-test hard kill via pytest-timeout
-```
+[`testing/e2e/pytest.ini`](../../testing/e2e/pytest.ini) sets `timeout = 10` (per-test hard kill via `pytest-timeout`). Give every HTTP client a per-request timeout of 5s:
 
 ```python
 # every httpx call
@@ -207,12 +176,7 @@ If a test exceeds 10s, it is **broken**, not slow. Investigate and fix — do no
 
 ### 4. Test Order Independence
 
-Tests must pass in any order. Use `pytest-randomly` in CI to shuffle test order on every run. A test that only fails when run after another test has a hidden dependency that must be eliminated.
-
-```bash
-pip install pytest-randomly
-pytest --randomly-seed=last  # reproduce a specific failing order
-```
+Tests must pass in any order. A test that only fails when run after another test has a hidden dependency that must be eliminated. CI does not shuffle test order, so check this locally (for example by running the failing test alone with `pytest -k`).
 
 ### 5. Environment Readiness — Skip, Don't Fail
 
@@ -261,16 +225,13 @@ def make_entity(client):
 
 ### 8. Minimal HTTP Round-Trips Per Test
 
-Each HTTP call is a potential source of flakiness (network jitter, timeout, server load spike). Keep tests as short as possible:
-- Use the **write response** directly — if `POST /entities` returns the created entity, do not make a separate `GET` to read it back unless you are specifically testing the read seam
-- Combine setup steps into a single factory call rather than N individual HTTP calls
-- If the test only needs to assert on one field, do not fetch the full object
+Each HTTP call is another chance for jitter or a timeout. See [How Many Requests Per Test](#how-many-requests-per-test-the-tradeoff).
 
 ### 9. Quarantine, Don't Ignore
 
 When a flaky test is found: quarantine it immediately (mark with `@pytest.mark.skip(reason="flaky: #ticket")`) and file a ticket. Do not leave it in the suite — a flaky test that is "usually green" will eventually mask a real failure.
 
-Never use `pytest-rerunfailures` as a permanent fix. Retrying a flaky test hides the root cause and doubles the execution time for that test. Use it only as a **temporary quarantine** measure while investigating.
+Do not add automatic reruns. Retrying a flaky test hides the root cause and doubles the execution time for that test.
 
 ---
 
@@ -279,8 +240,9 @@ Never use `pytest-rerunfailures` as a permanent fix. Retrying a flaky test hides
 ### File Layout
 
 ```
-testing/e2e/suites/<gear_name>/
-├── conftest.py                   ← helpers, timeout config, factory fixtures
+testing/e2e/suites/<suite_name>/
+├── e2e.yaml                      ← suite manifest: features, launcher, config overrides (testing/e2e/README.md)
+├── conftest.py                   ← helpers, factory fixtures
 ├── test_authz_tenant_scoping.py  ← AuthZ + tenant isolation seams (if applicable)
 ├── test_mtls_auth.py             ← MTLS certificate verification (if applicable; p2 — deferred, not implemented yet)
 ├── test_integration_seams.py     ← Core integration seam tests (per gear)
@@ -288,36 +250,15 @@ testing/e2e/suites/<gear_name>/
 
 Keep the number of files small. A single `test_integration_seams.py` per gear is preferred over splitting into many files.
 
-### Dependencies
+### Dependencies and pytest configuration
 
-```
-httpx>=0.27
-pytest>=8.0
-pytest-asyncio>=0.24
-pytest-timeout>=2.3        # prevents hanging async coroutines — #1 anti-flake measure
-```
+Dependencies are listed in [`testing/e2e/requirements.txt`](../../testing/e2e/requirements.txt) (`pytest`, `httpx`, `pytest-asyncio`, `pytest-timeout`, plus suite-specific packages). Do not add a test plugin without adding it there.
 
-### pytest Configuration
+[`testing/e2e/pytest.ini`](../../testing/e2e/pytest.ini) sets:
 
-```ini
-# testing/e2e/pytest.ini
-[pytest]
-asyncio_mode = auto        # every async def test_* runs automatically, no marker needed
-timeout = 10               # per-test hard timeout (seconds) via pytest-timeout
-```
-
-- `asyncio_mode = auto` — eliminates `@pytest.mark.asyncio` boilerplate on every test
-- `timeout = 10` — if a test hangs >10s, it's broken, not slow. Fail fast instead of blocking CI.
-
-### Reliability Rules
-
-| Rule | Rationale |
-|------|-----------|
-| **Per-request timeout: 5s** | Every `httpx.AsyncClient(timeout=5.0)` call. Prevents one slow response from consuming the full 10s test timeout. |
-| **No `time.sleep()` anywhere** | Sleep-based waits are the #1 flakiness source. If you wait for state, poll with a short retry or restructure the test. |
-| **No shared mutable state** | Each test creates its own entities. Never depends on another test's data. |
-| **Session-scoped reachability check** | Skip entire module if server is down — don't waste CI on N connection errors. |
-| **Function-scoped factory fixtures** | Unique names via timestamp/counter, no cleanup between tests needed. |
+- `asyncio_mode = auto` — every `async def test_*` runs without `@pytest.mark.asyncio`.
+- `timeout = 10` — per-test hard timeout via `pytest-timeout`.
+- the `smoke` marker.
 
 ### Shared Helpers (conftest.py)
 
@@ -487,7 +428,7 @@ async def test_authz_tenant_filter_applied(client):
 
 **Purpose**: Verify that the real server middleware chain produces `application/problem+json` responses with correct format.
 
-**Why not in unit tests**: Unit tests verify `DomainError → Problem` mapping in isolation. They do NOT verify that the real server sets the correct `Content-Type` header in HTTP responses.
+**Why not in unit tests**: Unit tests verify the `DomainError → CanonicalError` mapping in isolation. They do NOT verify that the real server sets the correct `Content-Type` header in HTTP responses.
 
 ```python
 async def test_error_response_rfc9457(client):
@@ -553,13 +494,13 @@ All core integration seam tests run with a single token, no special infrastructu
 | Don't test | Why | Where it's covered |
 |---|---|---|
 | Domain validation (field format, invariant) | Pure domain logic, deterministic | Unit tests: service-level |
-| Error variant construction | Pure error mapping | Unit tests: `domain_unit_test.rs` |
-| OData filter field names/kinds | Static mapping correctness | Unit tests: in-source `#[cfg(test)]` |
-| DTO `From` impl correctness | Struct conversion | Unit tests: in-source `#[cfg(test)]` |
-| Seeding idempotency | Domain logic, no HTTP | Unit tests: `seeding_test.rs` |
-| AccessScope construction | Pure logic | Unit tests: `tenant_scoping_test.rs` |
+| Error variant construction | Pure error mapping | Unit tests: `error_tests.rs` beside the error module |
+| OData filter field names/kinds | Static mapping correctness | Unit tests: `*_tests.rs` beside the filter schema |
+| DTO `From` impl correctness | Struct conversion | Unit tests: `dto_tests.rs` |
+| Seeding idempotency | Domain logic, no HTTP | Unit tests: service-level |
+| AccessScope construction | Pure logic | Unit tests: service-level, mock PDP |
 | Service-level PATCH logic | Domain logic | Unit tests: service-level |
-| Individual `DomainError` variants | Error construction + mapping | Unit tests: `domain_unit_test.rs` |
+| Individual `DomainError` variants | Error construction + mapping | Unit tests: `error_tests.rs` |
 
 A test that can be removed without reducing integration confidence should not exist.
 
@@ -570,10 +511,8 @@ A test that can be removed without reducing integration confidence should not ex
 **Suite-level:**
 - Core tests in a single file `test_integration_seams.py`
 - Total suite runtime < 15 seconds (excluding optional suites)
-- Zero flakes on 10 consecutive runs (`pytest --count=10` with `pytest-repeat`)
-- `pytest-timeout` configured: per-test hard limit 10s, per-request 5s
-- `asyncio_mode = auto` — no `@pytest.mark.asyncio` boilerplate
-- No `time.sleep()` in any test
+- Zero flakes on 10 consecutive runs of the suite
+- Follows [Anti-Flaking Practices](#anti-flaking-practices) (timeouts, no sleep, own data)
 
 **Per-test quality:**
 - Each test targets exactly one integration seam (documented in test docstring)
@@ -584,10 +523,7 @@ A test that can be removed without reducing integration confidence should not ex
 - Pagination test asserts no duplicates AND no missing items across pages
 
 **Isolation:**
-- Each test creates its own data — no cross-test dependencies
 - Optional tests (cross-tenant, MTLS — the latter is `p2`, deferred / not implemented yet) skip gracefully when infrastructure unavailable
 - No test duplicates unit test domain logic — if removing the test doesn't reduce integration confidence, the test shouldn't exist
-
-> Design guided by [Google SMURF (2024)](https://testing.googleblog.com/2024/10/smurf-beyond-test-pyramid.html): each test justified by high **Fidelity** (real PG + real AuthZ) that compensates for lower **Speed** vs unit tests.
 
 See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) — concurrency correctness under the `Service ↔ PostgreSQL` seam (transaction boundaries, retry firing, invariant survival under concurrent writers) is deliberately out of E2E's stability-first scope and lives there instead.
