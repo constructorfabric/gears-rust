@@ -699,7 +699,7 @@ Source namespaces for reference nodes **MUST** be an enforced ownership boundary
 
 The system **MUST** implement its part of the platform tenant-offboarding protocol: accept an authoritative tenant deletion generation, fence new tenant work before removing anything, cancel that tenant's in-flight ingest, index builds, backfills, re-embedding and analytics jobs, delete all tenant-keyed local and derived state, and acknowledge completion to the lifecycle owner. Before reporting ready — and unconditionally after a source-epoch rotation — the system **MUST** reconcile each tenant's applied deletion generation against the authoritative ledger and **MUST** quarantine any tenant whose local generation is behind rather than serving its data.
 
-> **Found while building the prototype.** Not built in this iteration: no deletion generation is accepted or fenced, and readiness reports `TENANT_RECONCILIATION` as `NotImplemented` (DESIGN § Tenant Offboarding and Deletion Monotonicity).
+> **Found while building the prototype.** Built without the ledger: a tenant the platform's tenant resolver reports deleted is fenced, its tenant-keyed state is removed in the background, and a permanent record says when the removal finished. The deletion generation is recorded and not checked, nothing is reconciled after a restore, and readiness reports `TENANT_RECONCILIATION` as `NotImplemented` (DESIGN § Tenant Offboarding and Deletion Monotonicity).
 
 - **Rationale**: All state lives in one PostgreSQL database, so restoring a backup taken before offboarding resurrects a deleted tenant's data; deletion must be monotonic across restore, and the authority must live outside the restored database.
 - **Actors**: `cpt-cf-graph-storage-actor-platform-admin`

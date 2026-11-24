@@ -27,6 +27,10 @@ pub mod actions {
     /// Purge: removing a node and its edges for good. Its own action, since
     /// erasure is stronger than a tombstone (gears-rust #5194).
     pub const PURGE: &str = "purge";
+    /// Offboarding a tenant: removing its whole graph for good. Its own
+    /// action on its own resource, implied by no other: nothing a producer
+    /// holds should reach it.
+    pub const OFFBOARD: &str = "offboard";
 }
 
 /// PDP resource type for graph nodes (edges are fenced by the same scope's
@@ -44,6 +48,16 @@ pub fn node_resource() -> ResourceType {
 pub fn type_resource() -> ResourceType {
     ResourceType::new(
         graph_storage_sdk::gts::TYPE_RESOURCE.to_owned(),
+        &[pep_properties::OWNER_TENANT_ID],
+    )
+}
+
+/// PDP resource type for a tenant's graph as a whole: what offboarding acts
+/// on.
+#[must_use]
+pub fn tenant_resource() -> ResourceType {
+    ResourceType::new(
+        graph_storage_sdk::gts::TENANT_RESOURCE.to_owned(),
         &[pep_properties::OWNER_TENANT_ID],
     )
 }
@@ -244,6 +258,94 @@ pub fn pinned_to(scope: &AccessScope, tenant: Uuid) -> AccessScope {
     )
 }
 
+/// Whether `scope` admits rows of `tenant` alone: every constraint names
+/// `tenant`, and only `tenant`, on `owner_tenant_id`. A deny-all admits
+/// nothing, which is within it too. Anything this gear cannot decide in
+/// memory is not.
+#[must_use]
+pub fn only(scope: &AccessScope, tenant: Uuid) -> bool {
+    if scope.is_deny_all() {
+        return true;
+    }
+    if scope.is_unconstrained() {
+        return false;
+    }
+    let own = ScopeValue::Uuid(tenant);
+    scope.constraints().iter().all(|constraint| {
+        constraint.filters().iter().any(|filter| {
+            filter.property() == pep_properties::OWNER_TENANT_ID
+                && filter.is_representable_in_memory()
+                && filter
+                    .values()
+                    .iter()
+                    .all(|value| *value == own || value.as_uuid() == Some(tenant))
+        })
+    })
+}
+
+/// `scope` without the rows of `gone`, when this gear can say so.
+///
+/// Each constraint's tenant filter loses the tenants in `gone`; a constraint
+/// left with no tenant admits nothing and is dropped. `None` when the scope
+/// cannot be narrowed in memory -- unconstrained, a constraint without a
+/// tenant filter, a tenant filter this build cannot enumerate, such as a
+/// subtree resolved in the database, or a tenant value that is no UUID -- so
+/// the caller fails closed rather than serve a scope that may still reach a
+/// tenant in `gone`.
+#[must_use]
+pub fn without_tenants<S: std::hash::BuildHasher>(
+    scope: &AccessScope,
+    gone: &std::collections::HashSet<Uuid, S>,
+) -> Option<AccessScope> {
+    if scope.is_deny_all() {
+        return Some(scope.clone());
+    }
+    if scope.is_unconstrained() {
+        return None;
+    }
+    let mut kept = Vec::new();
+    for constraint in scope.constraints() {
+        let mut filters = Vec::new();
+        let mut names_a_tenant = false;
+        let mut admits_none = false;
+        for filter in constraint.filters() {
+            if filter.property() != pep_properties::OWNER_TENANT_ID {
+                filters.push(filter.clone());
+                continue;
+            }
+            if !filter.is_representable_in_memory() {
+                return None;
+            }
+            names_a_tenant = true;
+            // A value that is no tenant id cannot be told apart from a tenant
+            // in `gone`, so the scope is refused, as `only` refuses it.
+            let mut left: Vec<ScopeValue> = Vec::new();
+            for value in filter.values() {
+                let tenant = value.as_uuid()?;
+                if !gone.contains(&tenant) {
+                    left.push(value.clone());
+                }
+            }
+            if left.is_empty() {
+                admits_none = true;
+                break;
+            }
+            filters.push(ScopeFilter::r#in(pep_properties::OWNER_TENANT_ID, left));
+        }
+        if !names_a_tenant {
+            return None;
+        }
+        if !admits_none {
+            kept.push(ScopeConstraint::new(filters));
+        }
+    }
+    Some(if kept.is_empty() {
+        AccessScope::deny_all()
+    } else {
+        AccessScope::from_constraints(kept)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +397,107 @@ mod tests {
             !reaches(&no_tenant, target),
             "a non-tenant property names no tenant"
         );
+    }
+
+    /// A subtree loses the tenants being offboarded and keeps the rest; a
+    /// scope that names no tenant, or names none it can list, cannot be
+    /// narrowed and is refused rather than served.
+    fn set(tenant: Uuid) -> std::collections::HashSet<Uuid> {
+        std::collections::HashSet::from([tenant])
+    }
+
+    #[test]
+    fn a_scope_loses_the_tenants_being_offboarded_or_is_refused() {
+        let (parent, child, other) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let subtree = AccessScope::for_tenants(vec![parent, child]);
+        let narrowed = without_tenants(&subtree, &set(child)).expect("a listed subtree narrows");
+        assert!(reaches(&narrowed, parent));
+        assert!(!reaches(&narrowed, child));
+        assert_eq!(
+            without_tenants(&subtree, &set(other)).expect("narrows"),
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::r#in(
+                pep_properties::OWNER_TENANT_ID,
+                vec![ScopeValue::Uuid(parent), ScopeValue::Uuid(child)],
+            )])]),
+        );
+        assert!(
+            without_tenants(&AccessScope::for_tenant(child), &set(child))
+                .expect("narrows")
+                .is_deny_all(),
+            "a scope of only the tenant being offboarded admits nothing"
+        );
+        assert!(without_tenants(&AccessScope::allow_all(), &set(child)).is_none());
+        let no_tenant =
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::eq(
+                "owner_id", child,
+            )])]);
+        assert!(without_tenants(&no_tenant, &set(child)).is_none());
+        let not_a_tenant_id =
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![ScopeFilter::r#in(
+                pep_properties::OWNER_TENANT_ID,
+                vec![
+                    ScopeValue::Uuid(parent),
+                    ScopeValue::String("not-a-uuid".to_owned()),
+                ],
+            )])]);
+        assert!(
+            without_tenants(&not_a_tenant_id, &set(child)).is_none(),
+            "a value that may be the tenant being offboarded is refused, as `only` refuses it"
+        );
+        assert!(!only(&not_a_tenant_id, parent));
+        let resolved_in_the_database =
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+                ScopeFilter::in_tenant_subtree(
+                    pep_properties::OWNER_TENANT_ID,
+                    parent,
+                    true,
+                    Vec::new(),
+                ),
+            ])]);
+        assert!(without_tenants(&resolved_in_the_database, &set(child)).is_none());
+
+        // A filter on another property stays as it was; a constraint left
+        // with no tenant goes, and the other one stays.
+        let owner = Uuid::now_v7();
+        let mixed = AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+            ScopeFilter::in_uuids(pep_properties::OWNER_TENANT_ID, vec![parent, child]),
+            ScopeFilter::eq("owner_id", owner),
+        ])]);
+        assert_eq!(
+            without_tenants(&mixed, &set(child)).expect("narrows"),
+            AccessScope::from_constraints(vec![ScopeConstraint::new(vec![
+                ScopeFilter::r#in(
+                    pep_properties::OWNER_TENANT_ID,
+                    vec![ScopeValue::Uuid(parent)]
+                ),
+                ScopeFilter::eq("owner_id", owner),
+            ])]),
+        );
+        let two = AccessScope::from_constraints(vec![
+            ScopeConstraint::new(vec![ScopeFilter::eq(
+                pep_properties::OWNER_TENANT_ID,
+                child,
+            )]),
+            ScopeConstraint::new(vec![ScopeFilter::eq(
+                pep_properties::OWNER_TENANT_ID,
+                parent,
+            )]),
+        ]);
+        let narrowed = without_tenants(&two, &set(child)).expect("narrows");
+        assert_eq!(narrowed.constraints().len(), 1, "{narrowed:?}");
+        assert!(reaches(&narrowed, parent) && !reaches(&narrowed, child));
+    }
+
+    /// A scope of the caller's own tenant alone needs no lookup; a subtree,
+    /// an unconstrained scope or one decided in the database does.
+    #[test]
+    fn only_the_callers_own_tenant_skips_the_lookup() {
+        let (own, child) = (Uuid::now_v7(), Uuid::now_v7());
+        assert!(only(&AccessScope::for_tenant(own), own));
+        assert!(only(&AccessScope::deny_all(), own));
+        assert!(!only(&AccessScope::for_tenants(vec![own, child]), own));
+        assert!(!only(&AccessScope::allow_all(), own));
+        assert!(!only(&AccessScope::for_tenant(child), own));
     }
 
     /// The three PDP outcomes must not be swapped, and this is the whole of

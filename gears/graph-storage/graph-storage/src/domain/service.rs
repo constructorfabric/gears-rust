@@ -26,6 +26,7 @@ use crate::domain::diagnostics::logged;
 use crate::domain::embedding;
 use crate::domain::embedding::EmbeddingCoordinator;
 use crate::domain::error::DomainError;
+use crate::domain::offboarding::{FencedTenants, NoTenantDirectory, TenantDirectory, TenantState};
 use crate::domain::traversal::{Retention, WalkPlan, walk};
 use crate::domain::{admission, authz, identity, ontology};
 
@@ -36,6 +37,12 @@ pub struct GraphServices {
     engine: Arc<dyn GraphEngineV1>,
     enforcer: PolicyEnforcer,
     embedding: EmbeddingCoordinator,
+    /// Asked before a tenant is fenced; refuses every offboarding until one
+    /// is wired.
+    tenants: Arc<dyn TenantDirectory>,
+    /// The fenced tenants, which the request path checks instead of the
+    /// store.
+    fenced: Arc<FencedTenants>,
 }
 
 /// One authorized call: the compiled scope plus the derived per-call context
@@ -76,7 +83,24 @@ impl GraphServices {
             engine,
             enforcer,
             embedding,
+            tenants: Arc::new(NoTenantDirectory),
+            fenced: Arc::new(FencedTenants::default()),
         }
+    }
+
+    /// Hold the fenced tenants in `fenced` rather than a set of its own: a
+    /// test reads them again at once.
+    #[must_use]
+    pub fn with_fenced_tenants(mut self, fenced: Arc<FencedTenants>) -> Self {
+        self.fenced = fenced;
+        self
+    }
+
+    /// Wire the directory offboarding asks whether a tenant is deleted.
+    #[must_use]
+    pub fn with_tenant_directory(mut self, tenants: Arc<dyn TenantDirectory>) -> Self {
+        self.tenants = tenants;
+        self
     }
 
     #[must_use]
@@ -84,7 +108,68 @@ impl GraphServices {
         &self.config
     }
 
+    /// Authorize a call about a tenant that is not being offboarded: the
+    /// fence refuses every operation for a fenced tenant, reads included,
+    /// after the policy decided -- a caller the policy refuses learns nothing
+    /// about the tenant, fenced or not.
+    ///
+    /// The fenced tenants come from memory ([`FencedTenants`]), not from the
+    /// store: a fence made on another replica is honoured here about the
+    /// set's refresh after it committed, and a write's own transaction checks
+    /// the fence at commit whatever the set holds. A set too old to trust is
+    /// read again here, and the call refused when that fails.
+    ///
+    /// A read without a named tenant keeps the policy's scope, a subtree
+    /// included, so it could reach a child tenant that is being offboarded.
+    /// When the scope reaches beyond the caller's own tenant, it loses the
+    /// fenced tenants. A scope this gear cannot narrow in memory is checked
+    /// against the store -- under that scope, so only tenants it reaches --
+    /// and refused as fenced while it reaches a deletion under way; one that
+    /// reaches none is served as it is.
     async fn authorize(
+        &self,
+        call: impl Into<Call<'_>>,
+        resource: &authz_resolver_sdk::pep::ResourceType,
+        action: &str,
+    ) -> Result<Authorized, DomainError> {
+        let call: Call<'_> = call.into();
+        let named = call.tenant.is_some();
+        let mut auth = self.authorize_any(call, resource, action).await?;
+        // A store that does not offboard has fenced nobody.
+        if !self.store.capabilities().offboarding {
+            return Ok(auth);
+        }
+        let fenced = self.fenced.current(self.store.as_ref()).await?;
+        if fenced.is_empty() {
+            return Ok(auth);
+        }
+        if fenced.contains(&auth.tenant) {
+            return Err(DomainError::TenantFenced {
+                tenant: auth.tenant,
+            });
+        }
+        if !named && action == authz::actions::READ && !authz::only(&auth.scope, auth.tenant) {
+            if let Some(narrowed) = authz::without_tenants(&auth.scope, &fenced) {
+                auth.scope = narrowed;
+            } else {
+                // A scope this gear cannot narrow in memory: the store says
+                // which of the deletions under way it reaches, and a scope
+                // that reaches one is refused until the deletion finishes.
+                let running = self
+                    .store
+                    .fenced_tenants(&Self::store_ctx(&auth, None))
+                    .await?;
+                if let Some(&first) = running.first() {
+                    return Err(DomainError::TenantFenced { tenant: first });
+                }
+            }
+        }
+        Ok(auth)
+    }
+
+    /// Authorize without the fence: for offboarding itself, which has to
+    /// answer about a fenced tenant.
+    async fn authorize_any(
         &self,
         call: impl Into<Call<'_>>,
         resource: &authz_resolver_sdk::pep::ResourceType,
@@ -131,6 +216,115 @@ impl GraphServices {
             budget: auth.budget,
             cancel: CancellationToken::new(),
         }
+    }
+
+    // --- tenant offboarding -------------------------------------------------
+
+    /// Start offboarding `tenant`, or answer the one already under way.
+    ///
+    /// The tenant is named, and the policy must grant `offboard` on it as
+    /// that tenant (`RootOnly`, as every named-tenant call). A tenant already
+    /// fenced answers its record without asking the platform again: the
+    /// fence is permanent, and the platform may have removed the tenant for
+    /// good since. Otherwise the platform must say the tenant is deleted --
+    /// the permission alone does not start a deletion that cannot be undone.
+    /// The worker removes the rows; this call only fences.
+    pub async fn offboard_tenant(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        tenant: uuid::Uuid,
+        request: graph_storage_sdk::models::OffboardRequest,
+    ) -> Result<graph_storage_sdk::models::TenantOffboarding, DomainError> {
+        let auth = self
+            .authorize_any(
+                Call::in_tenant(ctx, tenant),
+                &authz::tenant_resource(),
+                authz::actions::OFFBOARD,
+            )
+            .await?;
+        // A store that does not offboard would accept nothing it could then
+        // enforce: no fence on reads, no deletion. Refuse before asking the
+        // platform.
+        if !self.store.capabilities().offboarding {
+            return Err(DomainError::Unsupported {
+                what: "tenant offboarding".to_owned(),
+            });
+        }
+        let store_ctx = Self::store_ctx(&auth, None);
+        if let Some(record) = self.store.tenant_offboarding(&store_ctx).await? {
+            self.fenced.add(tenant);
+            return Ok(record);
+        }
+        self.confirm_deleted(ctx, tenant, auth.budget.remaining())
+            .await?;
+        let record = self
+            .store
+            .fence_tenant(&store_ctx, request.deletion_generation)
+            .await?;
+        // This replica's requests see the fence at once; the others at their
+        // next read of the fenced tenants.
+        self.fenced.add(tenant);
+        tracing::info!(
+            subject_id = %ctx.subject_id(),
+            subject_tenant = %ctx.subject_tenant_id(),
+            tenant = %tenant,
+            deletion_generation = ?record.deletion_generation,
+            "offboarding: the tenant is fenced and its graph will be removed"
+        );
+        Ok(record)
+    }
+
+    /// Go on only for a tenant the platform says is deleted.
+    async fn confirm_deleted(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        tenant: uuid::Uuid,
+        within: std::time::Duration,
+    ) -> Result<(), DomainError> {
+        match self.tenants.state(ctx, tenant, within).await? {
+            TenantState::Deleted => Ok(()),
+            TenantState::Live => {
+                tracing::info!(
+                    subject_id = %ctx.subject_id(),
+                    tenant = %tenant,
+                    "offboarding: refused, the platform has not marked the tenant deleted"
+                );
+                Err(DomainError::TenantNotDeleted { tenant })
+            }
+            TenantState::Unknown => {
+                tracing::warn!(
+                    subject_id = %ctx.subject_id(),
+                    tenant = %tenant,
+                    "offboarding: refused, the platform does not know the tenant; if it was \
+                     removed for good, its graph here needs an operator"
+                );
+                Err(DomainError::TenantUnknown { tenant })
+            }
+        }
+    }
+
+    /// The tenant's offboarding record. `NotFound` when it was never
+    /// offboarded, exactly as when the caller may not ask.
+    pub async fn tenant_offboarding(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        tenant: uuid::Uuid,
+    ) -> Result<graph_storage_sdk::models::TenantOffboarding, DomainError> {
+        let auth = self
+            .authorize_any(
+                Call::in_tenant(ctx, tenant),
+                &authz::tenant_resource(),
+                authz::actions::OFFBOARD,
+            )
+            .await?;
+        // A store that does not offboard never offboarded the tenant.
+        if !self.store.capabilities().offboarding {
+            return Err(DomainError::NotFound);
+        }
+        self.store
+            .tenant_offboarding(&Self::store_ctx(&auth, None))
+            .await?
+            .ok_or(DomainError::NotFound)
     }
 
     // --- ontology -----------------------------------------------------------

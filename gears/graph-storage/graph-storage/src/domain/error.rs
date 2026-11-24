@@ -34,6 +34,13 @@ pub mod reasons {
     pub const EMBEDDING_SPACE_MISMATCH: &str = "EMBEDDING_SPACE_MISMATCH";
     pub const SOURCE_NAMESPACE_FORBIDDEN: &str = "SOURCE_NAMESPACE_FORBIDDEN";
     pub const NOT_FOUND: &str = "NOT_FOUND";
+    /// The tenant is being offboarded; every operation for it is refused.
+    pub const TENANT_FENCED: &str = "TENANT_FENCED";
+    /// Offboarding was asked for a tenant the platform has not marked
+    /// deleted.
+    pub const TENANT_NOT_DELETED: &str = "TENANT_NOT_DELETED";
+    /// Offboarding was asked for a tenant the platform does not know.
+    pub const TENANT_UNKNOWN: &str = "TENANT_UNKNOWN";
     pub const STORE_CORRUPT: &str = "STORE_CORRUPT";
     pub const INTERNAL: &str = "INTERNAL";
 }
@@ -138,6 +145,23 @@ pub enum DomainError {
     #[error("dependency unavailable: {detail}")]
     Unavailable { detail: String },
 
+    /// The tenant is being offboarded (`failed_precondition`): its graph is
+    /// going away and nothing may read or write it. Never retry.
+    #[error("tenant {tenant} is fenced for offboarding")]
+    TenantFenced { tenant: uuid::Uuid },
+
+    /// Offboarding asked for a tenant the platform has not marked deleted
+    /// (`failed_precondition`). The deletion cannot be undone, so the gear
+    /// asks the platform rather than trusting the permission alone.
+    #[error("tenant {tenant} is not marked deleted")]
+    TenantNotDeleted { tenant: uuid::Uuid },
+
+    /// Offboarding asked for a tenant the platform does not know
+    /// (`failed_precondition`): never created, already removed for good, or
+    /// not visible to the caller. Waiting does not change it.
+    #[error("tenant {tenant} is not known to the platform")]
+    TenantUnknown { tenant: uuid::Uuid },
+
     #[error("operation exceeded its deadline")]
     Deadline,
 
@@ -195,6 +219,7 @@ impl From<graph_storage_sdk::plugin_api::GraphStoreError> for DomainError {
             E::Unavailable { reason } => Self::Unavailable { detail: reason },
             E::Deadline => Self::Deadline,
             E::Cancelled => Self::Cancelled,
+            E::TenantFenced { tenant } => Self::TenantFenced { tenant },
             E::Internal(detail) => Self::Internal { detail },
             other => Self::Internal {
                 detail: format!("unclassified store error: {other}"),

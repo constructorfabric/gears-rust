@@ -165,6 +165,30 @@ fn routing_outcome(error: DomainError) -> Result<CanonicalError, DomainError> {
                 .create()
         }
         DomainError::Unsupported { what } => GraphNodeError::unimplemented(what).create(),
+        // Named, not disguised as absence: the caller was authorized for
+        // this tenant, and what stops it is a fact about the tenant -- it is
+        // leaving -- which no retry or change of request can fix.
+        DomainError::TenantFenced { .. } => GraphNodeError::failed_precondition()
+            .with_precondition_violation(
+                "tenant",
+                "the tenant is being offboarded",
+                reasons::TENANT_FENCED,
+            )
+            .create(),
+        DomainError::TenantNotDeleted { .. } => GraphNodeError::failed_precondition()
+            .with_precondition_violation(
+                "tenant",
+                "the platform has not marked the tenant deleted",
+                reasons::TENANT_NOT_DELETED,
+            )
+            .create(),
+        DomainError::TenantUnknown { .. } => GraphNodeError::failed_precondition()
+            .with_precondition_violation(
+                "tenant",
+                "the platform does not know the tenant",
+                reasons::TENANT_UNKNOWN,
+            )
+            .create(),
         other => return Err(other),
     })
 }
@@ -322,6 +346,24 @@ mod tests {
                 },
                 503,
             ),
+            (
+                DomainError::TenantFenced {
+                    tenant: uuid::Uuid::nil(),
+                },
+                400,
+            ),
+            (
+                DomainError::TenantNotDeleted {
+                    tenant: uuid::Uuid::nil(),
+                },
+                400,
+            ),
+            (
+                DomainError::TenantUnknown {
+                    tenant: uuid::Uuid::nil(),
+                },
+                400,
+            ),
             (DomainError::Deadline, 504),
             (DomainError::Cancelled, 499),
             (
@@ -416,6 +458,19 @@ mod tests {
             400
         );
         assert_eq!(status_of(GraphStoreError::Serialization.into()), 409);
+        let fenced = CanonicalError::from(DomainError::from(GraphStoreError::TenantFenced {
+            tenant: uuid::Uuid::nil(),
+        }));
+        assert_eq!(fenced.status_code(), 400);
+        match &fenced {
+            CanonicalError::FailedPrecondition { ctx, .. } => assert_eq!(
+                ctx.violations
+                    .first()
+                    .map(|violation| violation.type_.as_str()),
+                Some(crate::domain::error::reasons::TENANT_FENCED)
+            ),
+            other => panic!("a failed precondition, not {other:?}"),
+        }
         assert_eq!(
             status_of(GraphStoreError::Unsupported { what: "snapshots" }.into()),
             501

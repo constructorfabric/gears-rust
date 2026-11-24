@@ -258,6 +258,55 @@ pub struct GraphTransferNamespaceRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Tenant offboarding
+// ---------------------------------------------------------------------------
+
+/// Starting a tenant's offboarding. `{}` is a complete request.
+#[derive(Debug, Default)]
+#[toolkit_macros::api_dto(request)]
+pub struct GraphOffboardRequest {
+    /// The platform's deletion generation for the tenant, when the caller
+    /// has one. Recorded as given; the first call's value stands.
+    #[serde(default)]
+    pub deletion_generation: Option<i64>,
+}
+
+/// Rows removed so far, per kind of tenant-keyed state.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphOffboardingCountsDto {
+    pub edges: u64,
+    pub nodes: u64,
+    pub types: u64,
+    pub scopes: u64,
+    pub receipts: u64,
+    pub namespaces: u64,
+    pub meta: u64,
+}
+
+/// A tenant's offboarding as it stands.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphTenantOffboardingDto {
+    pub tenant_id: uuid::Uuid,
+    pub deletion_generation: Option<i64>,
+    /// `in_progress` while rows remain, `completed` once none does.
+    pub state: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub fenced_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub completed_at: Option<time::OffsetDateTime>,
+    pub removed: GraphOffboardingCountsDto,
+    /// Deletion steps that failed in a row. Non-zero means the deletion is
+    /// stuck, not merely running; the gear retries it with backoff.
+    pub failures: u32,
+    /// The error class of the last failed step, never its message.
+    pub last_failure: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub last_failure_at: Option<time::OffsetDateTime>,
+}
+
+// ---------------------------------------------------------------------------
 // Revision
 // ---------------------------------------------------------------------------
 
@@ -676,6 +725,55 @@ impl From<m::Readiness> for GraphReadinessDto {
         Self {
             ready: value.ready,
             components: value.components.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<GraphOffboardRequest> for m::OffboardRequest {
+    type Error = &'static str;
+
+    fn try_from(value: GraphOffboardRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            deletion_generation: value
+                .deletion_generation
+                .map(|generation| {
+                    m::DeletionGeneration::new(generation)
+                        .ok_or("deletion_generation must be positive when it is given")
+                })
+                .transpose()?,
+        })
+    }
+}
+
+impl From<m::TenantOffboarding> for GraphTenantOffboardingDto {
+    fn from(value: m::TenantOffboarding) -> Self {
+        let removed = value.removed;
+        Self {
+            tenant_id: value.tenant_id,
+            deletion_generation: value.deletion_generation.map(m::DeletionGeneration::get),
+            state: if value.completed_at.is_some() {
+                "completed"
+            } else {
+                "in_progress"
+            }
+            .to_owned(),
+            fenced_at: value.fenced_at,
+            completed_at: value.completed_at,
+            removed: GraphOffboardingCountsDto {
+                edges: removed.edges,
+                nodes: removed.nodes,
+                types: removed.types,
+                scopes: removed.scopes,
+                receipts: removed.receipts,
+                namespaces: removed.namespaces,
+                meta: removed.meta,
+            },
+            failures: value.failures,
+            last_failure: value
+                .last_failure
+                .as_ref()
+                .map(|failure| failure.class.clone()),
+            last_failure_at: value.last_failure.map(|failure| failure.at),
         }
     }
 }

@@ -40,6 +40,12 @@ graph-storage:
     # embedding_remote_api_key_env: "GRAPH_STORAGE_EMBEDDING_API_KEY"
 ```
 
+Tenant offboarding runs in the background; three keys tune it and all have
+defaults: `offboarding_batch` (rows per transaction, default 1 000),
+`offboarding_interval_secs` (seconds between passes, default 10) and
+`offboarding_step_timeout_secs` (how long one step may take before it counts
+as failed, default 60).
+
 One deployment runs one embedding provider. The gear records the provider's
 embedding-space identity on first use and, on a later boot with a different
 provider, blocks the vector arm until the graph is re-embedded — lexical search,
@@ -251,8 +257,8 @@ bites ("Found while building the prototype").
 **Deferred features** (the API and schema leave room; nothing is built): content
 chunking and heavy-content offload; labels; change events; the admission layer
 beyond per-request bounds (per-tenant and global concurrency, queues, reserved
-connections, aggregate response bounds); tenant offboarding and deletion
-monotonicity; the analytics topology role and metric annotation; the
+connections, aggregate response bounds); deletion monotonicity across a
+restore (the deletion ledger); the analytics topology role and metric annotation; the
 index-activation lifecycle and per-path index DDL; the re-embedding lifecycle
 that opens a new embedding epoch; observability counters; the retained
 type-revision history; runtime plugin registration and selection (the built-in
@@ -260,6 +266,14 @@ store, engine and embedding provider are constructed directly, and no
 independently developed implementation can reach the service yet; #4873).
 
 **Narrower than documented** (built, with a stated gap):
+
+- *Tenant offboarding has no deletion ledger.* A tenant the tenant resolver
+  reports deleted is fenced and its rows are removed in the background
+  (`POST`/`GET /graph-storage/v1/tenants/{tenant_id}/offboarding`), but the
+  deletion generation is recorded and not checked, and a backup restored from
+  before the offboarding brings the tenant back unnoticed. In-flight writes are
+  refused at their commit rather than cancelled (DESIGN § Tenant Offboarding
+  and Deletion Monotonicity).
 
 - *Ordinary ingests do not take the shared scope lock the ingest protocol
   describes* — a scope replacement fences on a monotonic generation instead,

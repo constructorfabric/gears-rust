@@ -9,6 +9,7 @@
 pub mod evolution;
 pub mod ingest;
 pub mod namespaces;
+pub(crate) mod offboarding;
 pub mod projection;
 pub mod purge;
 pub mod reads;
@@ -244,6 +245,7 @@ impl GraphStoreV1 for PgGraphStore {
             labels: false,
             chunks: false,
             topology: false,
+            offboarding: true,
         }
     }
 
@@ -388,6 +390,57 @@ impl GraphStoreV1 for PgGraphStore {
         options: graph_storage_sdk::models::PurgeOptions,
     ) -> Result<graph_storage_sdk::models::PurgeOutcome, GraphStoreError> {
         purge::purge_node(self, ctx, key, options).await
+    }
+
+    async fn fence_tenant(
+        &self,
+        ctx: &StoreCtx<'_>,
+        deletion_generation: Option<graph_storage_sdk::models::DeletionGeneration>,
+    ) -> Result<graph_storage_sdk::models::TenantOffboarding, GraphStoreError> {
+        offboarding::fence(self, ctx, deletion_generation).await
+    }
+
+    async fn tenant_offboarding(
+        &self,
+        ctx: &StoreCtx<'_>,
+    ) -> Result<Option<graph_storage_sdk::models::TenantOffboarding>, GraphStoreError> {
+        offboarding::record(self, ctx).await
+    }
+
+    async fn fenced_tenants(
+        &self,
+        ctx: &StoreCtx<'_>,
+    ) -> Result<Vec<graph_storage_sdk::models::TenantId>, GraphStoreError> {
+        offboarding::fenced_ids(self, ctx).await
+    }
+
+    async fn all_fenced_tenant_ids(
+        &self,
+    ) -> Result<Vec<graph_storage_sdk::models::TenantId>, GraphStoreError> {
+        let conn = self.db().conn().map_err(|error| map_db_error(&error))?;
+        offboarding::all_fenced_ids(&conn).await
+    }
+
+    async fn offboard_step(
+        &self,
+        tenant: graph_storage_sdk::models::TenantId,
+        batch: std::num::NonZeroU64,
+    ) -> Result<graph_storage_sdk::models::TenantOffboarding, GraphStoreError> {
+        offboarding::step(self, tenant, batch).await
+    }
+
+    async fn record_offboarding_failure(
+        &self,
+        tenant: graph_storage_sdk::models::TenantId,
+        error: &GraphStoreError,
+    ) -> Result<graph_storage_sdk::models::TenantOffboarding, GraphStoreError> {
+        offboarding::note_failure(self, tenant, error).await
+    }
+
+    async fn pending_offboardings(
+        &self,
+    ) -> Result<Vec<graph_storage_sdk::models::TenantOffboarding>, GraphStoreError> {
+        offboarding::pending(self).await
     }
 
     async fn begin_read(&self, ctx: &StoreCtx<'_>) -> Result<ReadSnapshot, GraphStoreError> {

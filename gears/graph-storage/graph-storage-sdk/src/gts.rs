@@ -40,6 +40,8 @@ pub const NODE_RESOURCE: &str = gts_id!("cf.core.graph.node.v1~");
 pub const EDGE_RESOURCE: &str = gts_id!("cf.core.graph.edge.v1~");
 /// Resource type of a registered ontology type.
 pub const TYPE_RESOURCE: &str = gts_id!("cf.core.graph.type.v1~");
+/// Resource type of a tenant's graph as a whole: what offboarding acts on.
+pub const TENANT_RESOURCE: &str = gts_id!("cf.core.graph.tenant.v1~");
 
 // --- published schemas -------------------------------------------------------
 
@@ -106,11 +108,17 @@ pub const BASE_SCHEMAS: [(&str, &str); 9] = [
 pub const TYPE_RESOURCE_SCHEMA: &str =
     include_str!("../schemas/gts.cf.core.graph.type.v1~.schema.json");
 
-/// Every schema this crate publishes: the ontology and the type resource.
+/// Schema of [`TENANT_RESOURCE`], the resource the offboarding permission
+/// names. Published for the same reason as [`TYPE_RESOURCE_SCHEMA`].
+pub const TENANT_RESOURCE_SCHEMA: &str =
+    include_str!("../schemas/gts.cf.core.graph.tenant.v1~.schema.json");
+
+/// Every schema this crate publishes: the ontology and the two resources.
 pub fn published_schemas() -> impl Iterator<Item = (&'static str, &'static str)> {
-    BASE_SCHEMAS
-        .into_iter()
-        .chain([(TYPE_RESOURCE, TYPE_RESOURCE_SCHEMA)])
+    BASE_SCHEMAS.into_iter().chain([
+        (TYPE_RESOURCE, TYPE_RESOURCE_SCHEMA),
+        (TENANT_RESOURCE, TENANT_RESOURCE_SCHEMA),
+    ])
 }
 
 macro_rules! publish_base_schema {
@@ -142,5 +150,12 @@ inventory::submit! {
     InventoryTypeSchema {
         type_id: TYPE_RESOURCE,
         schema_fn: || TYPE_RESOURCE_SCHEMA.to_owned(),
+    }
+}
+
+inventory::submit! {
+    InventoryTypeSchema {
+        type_id: TENANT_RESOURCE,
+        schema_fn: || TENANT_RESOURCE_SCHEMA.to_owned(),
     }
 }

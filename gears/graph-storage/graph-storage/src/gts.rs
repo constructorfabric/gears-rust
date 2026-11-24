@@ -20,7 +20,7 @@
 //! with it, so `tests/types_registry.rs` seeds the real registry with
 //! everything this gear and its SDK submit and reads every entry back.
 
-use graph_storage_sdk::gts::{NODE_RESOURCE, TYPE_RESOURCE};
+use graph_storage_sdk::gts::{NODE_RESOURCE, TENANT_RESOURCE, TYPE_RESOURCE};
 use toolkit_gts::{AuthzPermissionV1, gts_instance};
 
 use crate::domain::authz::actions;
@@ -80,5 +80,13 @@ gts_instance! {
         resource_type: TYPE_RESOURCE.to_owned(),
         action: actions::ADMIN.to_owned(),
         display_name: "Register and change graph types".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.graph.tenant_offboard.v1"),
+        resource_type: TENANT_RESOURCE.to_owned(),
+        action: actions::OFFBOARD.to_owned(),
+        display_name: "Offboard a tenant: remove its whole graph for good".to_owned(),
     }
 }

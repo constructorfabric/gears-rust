@@ -220,6 +220,32 @@ pub async fn transfer_source_namespace(
     Ok(Json(row.into()))
 }
 
+/// The tenant is the path's, never `?tenant=`: the route is about one named
+/// tenant, and the policy is asked about that one.
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), tenant = %tenant))]
+pub async fn offboard_tenant(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Path(tenant): Path<uuid::Uuid>,
+    Json(request): Json<dto::GraphOffboardRequest>,
+) -> ApiResult<(http::StatusCode, Json<dto::GraphTenantOffboardingDto>)> {
+    let request = request
+        .try_into()
+        .map_err(|message: &str| crate::domain::error::DomainError::invalid(message))?;
+    let record = services.offboard_tenant(&ctx, tenant, request).await?;
+    Ok((http::StatusCode::ACCEPTED, Json(record.into())))
+}
+
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id(), tenant = %tenant))]
+pub async fn tenant_offboarding(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Path(tenant): Path<uuid::Uuid>,
+) -> ApiResult<Json<dto::GraphTenantOffboardingDto>> {
+    let record = services.tenant_offboarding(&ctx, tenant).await?;
+    Ok(Json(record.into()))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListTypesParams {
     /// `node`, `edge` or `attribute`.
