@@ -824,6 +824,7 @@ mod tests {
         let domain_err = DomainError::RequestTimeout {
             detail: "timed out".into(),
             instance: "/slow".into(),
+            dispatch: crate::domain::error::Dispatch::MaybeSent,
         };
         let canonical: CanonicalError = domain_err.into();
         assert!(matches!(canonical, CanonicalError::DeadlineExceeded { .. }));

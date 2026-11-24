@@ -180,7 +180,7 @@ where
 // 04 DeadlineExceeded — context: DeadlineExceeded
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadlineExceededV1 {
-    /// Machine-readable reason code (e.g. `UPSTREAM_NOT_CONTACTED`). `None`
+    /// Machine-readable reason code (e.g. `REQUEST_NOT_SENT`). `None`
     /// and an empty string both mean no reason: neither is sent, and an
     /// empty wire value reads as `None`.
     #[serde(
@@ -397,7 +397,7 @@ pub type Internal = InternalV1;
 pub struct ServiceUnavailableV1 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_after_seconds: Option<u64>,
-    /// Machine-readable reason code (e.g. `UPSTREAM_NOT_CONTACTED`). `None`
+    /// Machine-readable reason code (e.g. `REQUEST_NOT_SENT`). `None`
     /// and an empty string both mean no reason: neither is sent, and an
     /// empty wire value reads as `None`.
     #[serde(

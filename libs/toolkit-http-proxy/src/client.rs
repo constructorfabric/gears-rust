@@ -124,6 +124,10 @@ enum DispatchError {
         head: Box<http::request::Parts>,
         err: ProxyError,
         http1: bool,
+        /// The upstream may have processed this attempt (a stale
+        /// keep-alive connection, a graceful `GOAWAY`), unlike a refused
+        /// stream: an error from the resend must say so.
+        may_have_been_processed: bool,
     },
     Failed(ProxyError),
 }
@@ -256,8 +260,14 @@ impl ProxyClient {
         //   reused connection turned out stale: resend it with its
         //   replayable body.
         let mut retry: Option<Retry> = None;
+        // Set when the first attempt may have been processed: whatever the
+        // resend then fails with, even a connect error, the request may
+        // have reached the upstream.
+        let mut may_have_been_processed = false;
         loop {
-            let acquired = self.acquire(target, &key, retry).await?;
+            let acquired = self.acquire(target, &key, retry).await.map_err(|e| {
+                e.after_attempt_that_may_have_been_processed(may_have_been_processed)
+            })?;
             let reused = acquired.reused;
             let generation = acquired.conn.generation;
             let failed_generation = Some(Retry {
@@ -274,12 +284,18 @@ impl ProxyClient {
                     req = *back;
                     retry = failed_generation;
                 }
-                Err(DispatchError::Resend { head, err, http1 }) if retry.is_none() => {
+                Err(DispatchError::Resend {
+                    head,
+                    err,
+                    http1,
+                    may_have_been_processed: processed,
+                }) if retry.is_none() => {
                     let Some(body) = replay.clone() else {
                         return Err(err);
                     };
                     tracing::debug!(target = %target, error = %err, "upstream did not process the request, sending it again");
                     req = Request::from_parts(*head, full_body(body));
+                    may_have_been_processed = processed;
                     retry = Some(Retry {
                         failed_generation: generation,
                         http1,
@@ -289,7 +305,11 @@ impl ProxyClient {
                     DispatchError::Unsent(_, err)
                     | DispatchError::Resend { err, .. }
                     | DispatchError::Failed(err),
-                ) => return Err(err),
+                ) => {
+                    return Err(
+                        err.after_attempt_that_may_have_been_processed(may_have_been_processed)
+                    );
+                }
             }
         }
     }
@@ -726,6 +746,7 @@ impl ProxyClient {
                             head,
                             err: ProxyError::from_hyper(e.into_error()),
                             http1: false,
+                            may_have_been_processed: true,
                         },
                         (None, _) => DispatchError::Failed(ProxyError::from_hyper(e.into_error())),
                     }),
@@ -802,6 +823,7 @@ impl ProxyClient {
                                 head: sent_head,
                                 err,
                                 http1: fallback,
+                                may_have_been_processed: refusal == Some(Refusal::GoingAway),
                             }
                         } else {
                             DispatchError::Failed(err)

@@ -162,11 +162,10 @@ pub(crate) fn select(
         }
     };
     // A config the writes should have refused (a row stored before a check
-    // existed) is reported as the API-key plugin reports a bad config.
-    let bad_config = |detail: &str| DomainError::AuthenticationFailed {
-        reason: reason::auth::PLUGIN_INTERNAL,
-        detail: format!("invalid apikey auth config: {detail}"),
-        instance: instance.to_owned(),
+    // existed) is reported as the API-key plugin reports a bad config: a
+    // misconfiguration, 500.
+    let bad_config = |detail: &str| DomainError::Internal {
+        message: format!("auth plugin misconfigured: invalid apikey auth config: {detail}"),
     };
     let mut auth = ApiKeyAuthConfig::parse(request_ref_auth.config.as_ref())
         .map_err(|e| bad_config(&e.detail))?;

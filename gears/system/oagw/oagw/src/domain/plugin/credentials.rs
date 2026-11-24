@@ -7,6 +7,7 @@ use credstore_sdk::{CredStoreError, SecretRef};
 use toolkit_macros::domain_model;
 
 use crate::domain::gateway_headers::is_gateway_owned_header;
+use crate::domain::plugin::PluginError;
 
 #[cfg(test)]
 use crate::domain::gts_helpers::{
@@ -84,6 +85,56 @@ pub(crate) fn credstore_error_kind(e: &credstore_sdk::CredStoreError) -> &'stati
         E::UnsupportedTransition { .. } => "unsupported sharing transition",
         E::TypeViolation { .. } => "secret type violation",
         E::Internal(_) => "internal error",
+    }
+}
+
+/// The auth plugin error for a failed credential store read of the secret
+/// referenced by `auth.config.<key>`, the same classification `request_ref`
+/// mode uses: a missing or refused secret is not found, an outage is
+/// unavailable (with the store's retry hint), an error only a write can
+/// cause is internal. The error names the key and the kind, never the
+/// reference or the store's text (F0008).
+pub(crate) fn credstore_read_error(key: &'static str, e: &CredStoreError) -> PluginError {
+    match e {
+        CredStoreError::NotFound
+        | CredStoreError::AccessDenied
+        | CredStoreError::InvalidSecretRef { .. } => PluginError::SecretNotFound {
+            key,
+            kind: credstore_error_kind(e),
+        },
+        CredStoreError::ServiceUnavailable { retry_after, .. } => {
+            PluginError::CredentialStoreUnavailable {
+                detail: format!(
+                    "credential store unavailable for auth.config.{key}: {}",
+                    credstore_error_kind(e)
+                ),
+                retry_after: *retry_after,
+            }
+        }
+        CredStoreError::NoPluginAvailable | CredStoreError::Internal(_) => {
+            PluginError::CredentialStoreUnavailable {
+                detail: format!(
+                    "credential store unavailable for auth.config.{key}: {}",
+                    credstore_error_kind(e)
+                ),
+                retry_after: None,
+            }
+        }
+        CredStoreError::Conflict
+        | CredStoreError::UnsupportedTransition { .. }
+        | CredStoreError::TypeViolation { .. } => PluginError::Internal(format!(
+            "credential store error for auth.config.{key}: {}",
+            credstore_error_kind(e)
+        )),
+    }
+}
+
+/// The auth plugin error for a read that found no secret under the
+/// reference in `auth.config.<key>`.
+pub(crate) fn secret_missing(key: &'static str) -> PluginError {
+    PluginError::SecretNotFound {
+        key,
+        kind: credstore_error_kind(&CredStoreError::NotFound),
     }
 }
 

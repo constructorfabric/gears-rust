@@ -157,11 +157,16 @@ A signing failure stops the request before anything is sent to the upstream. It 
 
 | Signing outcome | Error | Status |
 |---|---|---|
-| `PluginError::AuthFailed` | `AuthenticationFailed`, reason `AUTH_PLUGIN_FAILED` | 401 |
+| `PluginError::AuthFailed`, `PluginError::Rejected` | `AuthenticationFailed`, reason `AUTH_PLUGIN_FAILED` | 401 |
 | `PluginError::Internal` | `AuthenticationFailed`, reason `AUTH_PLUGIN_INTERNAL` | 401 |
-| `PluginError::SecretNotFound` | `SecretNotFound` | 500 |
-| `PluginError::InvalidConfig`, `PluginError::Rejected`, or an output the gateway cannot send | `Validation`, field `plugin`, reason `INVALID_PLUGIN_CONFIG` | 400 |
-| Request deadline passed | `RequestTimeout` | 504 |
+| `PluginError::SecretNotFound` | `SecretNotFound`, reason `AUTH_CREDENTIAL_NOT_FOUND` | 401 |
+| `PluginError::CredentialStoreUnavailable` | `CredentialStoreUnavailable`, reason `CREDENTIAL_STORE_UNAVAILABLE` | 503 |
+| `PluginError::IdpUnavailable` (identity provider token endpoint) | `IdpUnavailable`, reason `IDENTITY_PROVIDER_UNAVAILABLE` | 503 |
+| `PluginError::IdpInvalidResponse` | `IdpInvalidResponse`, reason `REQUEST_NOT_SENT` | 502 |
+| `PluginError::InvalidConfig`, or an output the gateway cannot send | `Internal` (plugin misconfiguration) | 500 |
+| Request deadline passed | `RequestTimeout`, reason `REQUEST_NOT_SENT` | 504 |
+
+Amended by [#4985](https://github.com/constructorfabric/gears-rust/issues/4985): this is the one credential-failure mapping every auth plugin uses, for `authenticate` and `sign`. Before it, a missing secret was 500 `SecretNotFound`, and `InvalidConfig`, `Rejected` and an unsendable output were 400 `INVALID_PLUGIN_CONFIG`.
 
 Failures of the gateway's own steps before `sign` keep their usual mapping: a built URL that does not parse is a `DownstreamError` ("invalid upstream request"), as when the request is built for the engine, and a handshake the engine would refuse fails with the engine's error.
 
@@ -189,7 +194,7 @@ Failures of the gateway's own steps before `sign` keep their usual mapping: a bu
   - its headers and its replacement query reach the upstream unchanged;
   - a streamed body is seen as `Streamed` and still reaches the upstream;
   - a WebSocket handshake is signed with an empty body and its handshake headers;
-  - a signing failure or an unusable output returns 401 or 400 and the upstream receives nothing, on both paths.
+  - a signing failure or an unusable output returns 401 or 500 and the upstream receives nothing, on both paths.
 - `infra/proxy/headers.rs`: `allowlist` passthrough keeps every line of a repeated header, in order.
 - Existing auth plugin and pipeline tests pass unchanged.
 
@@ -227,7 +232,7 @@ Failures of the gateway's own steps before `sign` keep their usual mapping: a bu
 
 ## Open Questions
 
-- Whether a streamed-body refusal by a signer should map to its own reason instead of `INVALID_PLUGIN_CONFIG`. The AWS SigV4 plugin (#5842) is the first plugin to need it.
+- Whether a streamed-body refusal by a signer should map to its own reason instead of a plugin misconfiguration (500). The AWS SigV4 plugin (#5842) is the first plugin to need it.
 
 ## Traceability
 

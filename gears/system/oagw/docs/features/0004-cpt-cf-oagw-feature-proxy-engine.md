@@ -87,19 +87,19 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 
 **Error Scenarios**:
 - Upstream not found by alias (404 RouteNotFound)
-- Upstream disabled (503 LinkUnavailable)
+- Upstream disabled (503 UpstreamDisabled, reason `UPSTREAM_DISABLED`, `Retry-After: 300`)
 - Route not matched for method/path (404 RouteNotFound)
-- Auth plugin fails credential injection (401 AuthenticationFailed)
+- Auth plugin fails credential injection (one mapping for all plugins: 401 `AUTH_CREDENTIAL_NOT_FOUND` for a missing or inaccessible secret, 503 `CREDENTIAL_STORE_UNAVAILABLE` or `IDENTITY_PROVIDER_UNAVAILABLE`, 502 for an invalid identity provider response, 500 for a misconfiguration, 401 AuthenticationFailed otherwise)
 - Guard plugin rejects request (4xx per guard rule)
 - Body validation fails (400 ValidationError or 413 PayloadTooLarge)
-- Upstream returns error response (502 DownstreamError passthrough)
+- Upstream returns error response (passed through with its status, body and headers, `Retry-After` and `WWW-Authenticate` included; `X-OAGW-Error-Source: upstream`)
 - Upstream connection or request times out (504 ConnectionTimeout / RequestTimeout)
 - Upstream rejects a WebSocket upgrade (502 ProtocolError — no `101 Switching Protocols`)
 - Upstream HTTP/2 protocol error (502 ProtocolError)
 - X-OAGW-Target-Host missing for multi-endpoint common-suffix upstream (400 MissingTargetHost)
 - X-OAGW-Target-Host format invalid (400 InvalidTargetHost)
 - X-OAGW-Target-Host does not match any configured endpoint (400 UnknownTargetHost)
-- Upstream connection fails at network level (502 DownstreamError)
+- Upstream connection fails at network level (502 DownstreamError or 503 LinkUnavailable, reason `REQUEST_NOT_SENT`; a connection lost after sending is 502 with `REQUEST_MAY_HAVE_BEEN_SENT`)
 
 **Steps**:
 1. [x] - `p1` - Actor sends `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]` - `inst-proxy-1`
@@ -113,7 +113,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 7. [x] - `p1` - **IF** upstream not found - `inst-proxy-7`
    1. [x] - `p1` - **RETURN** 404 RouteNotFound with `X-OAGW-Error-Source: gateway` - `inst-proxy-7a`
 8. [x] - `p1` - **IF** upstream disabled - `inst-proxy-8`
-   1. [x] - `p1` - **RETURN** 503 LinkUnavailable with `X-OAGW-Error-Source: gateway` - `inst-proxy-8a`
+   1. [x] - `p1` - **RETURN** 503 `service_unavailable` with reason `UPSTREAM_DISABLED`, `retry_after_seconds: 300` and `Retry-After: 300` (only an operator can enable it again), with `X-OAGW-Error-Source: gateway` - `inst-proxy-8a`
 9. [x] - `p1` - Match route via `cpt-cf-oagw-algo-route-matching` - `inst-proxy-9`
 10. [x] - `p1` - **IF** no matching route - `inst-proxy-10`
     1. [x] - `p1` - **RETURN** 404 RouteNotFound with `X-OAGW-Error-Source: gateway` - `inst-proxy-10a`
@@ -125,7 +125,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
     1. [x] - `p1` - **RETURN** 400 `invalid_argument`, field violation on `server.endpoints.scheme` with reason `HTTP_UPSTREAM_FORBIDDEN` and `X-OAGW-Error-Source: gateway`, before any auth plugin runs, so no credential is prepared for a plaintext upstream - `inst-proxy-13b1`
 15. [x] - `p1` - Execute auth plugin: inject credentials into outbound request - `inst-proxy-14`
 16. [x] - `p1` - **IF** auth plugin fails (secret not found, credential error) - `inst-proxy-15`
-    1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound with `X-OAGW-Error-Source: gateway`. The error and the server log name the auth config key (`auth.config.secret_ref`, `auth.config.client_id_ref`, `auth.config.client_secret_ref`), never the reference or the credential store's own text, which may quote it - `inst-proxy-15a`
+    1. [x] - `p1` - **RETURN** the credential-failure mapping (DESIGN "Credential Failures"): 401 `AUTH_CREDENTIAL_NOT_FOUND` when the secret is missing or not accessible, 503 `CREDENTIAL_STORE_UNAVAILABLE` with the store's retry hint when the credential store is unavailable, 503 `IDENTITY_PROVIDER_UNAVAILABLE` when the identity provider's token endpoint is unreachable or answers 408, 429 or 5xx, 502 when the identity provider answers with an invalid response, 500 for a plugin misconfiguration, 401 `AUTH_PLUGIN_FAILED` / `AUTH_PLUGIN_INTERNAL` otherwise, with `X-OAGW-Error-Source: gateway`. The error and the server log name the auth config key (`auth.config.secret_ref`, `auth.config.client_id_ref`, `auth.config.client_secret_ref`), never the reference or the credential store's own text, which may quote it - `inst-proxy-15a`
 17. [x] - `p1` - Execute guard plugins: validate method, query params, path suffix, CORS origin (actual requests only; preflight returns permissive 204 at handler level; see [ADR: CORS](../ADR/0006-cors.md)) - `inst-proxy-16`
 18. [x] - `p1` - **IF** any guard rejects - `inst-proxy-17`
     1. [x] - `p1` - **RETURN** guard-specific error code with `X-OAGW-Error-Source: gateway` - `inst-proxy-17a`
@@ -140,18 +140,18 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
     1. [x] - `p1` - **RETURN** 400 UnknownTargetHost with `X-OAGW-Error-Source: gateway` - `inst-proxy-23a`
 25. [x] - `p1` - Run the auth plugin's signing phase ([ADR-0023](../ADR/0023-request-signing.md)) on the request as it will be sent: apply the upstream engine's request header sanitization (after its handshake validation for a WebSocket upgrade), then pass the method, URL (scheme, host, port, path, query after transforms), every header line (`Host` and, for a WebSocket handshake, `Connection: upgrade` and `Upgrade: websocket` included) and the body (buffered bytes, streamed marker, or empty for a WebSocket handshake). Set the headers it returns, marked sensitive, and keep, remove or replace the query as it returns, a replacement sent as returned. Only with a configured auth plugin whose `signs` flag is `true`, outside `request_ref` mode - `inst-proxy-24s`
 26. [x] - `p1` - **IF** signing fails, its output cannot be sent as given, or the request deadline passes (a built URL that does not parse is a `DownstreamError`, as for the engine request) - `inst-proxy-24s1`
-    1. [x] - `p1` - **RETURN** the `authenticate` error mapping (401 AuthenticationFailed, 500 SecretNotFound, 400 invalid plugin config) or 504 RequestTimeout with `X-OAGW-Error-Source: gateway`; nothing is sent - `inst-proxy-24s1a`
+    1. [x] - `p1` - **RETURN** the `authenticate` error mapping (an output the gateway cannot send is a misconfiguration, 500) or 504 RequestTimeout with reason `REQUEST_NOT_SENT` with `X-OAGW-Error-Source: gateway`; nothing is sent - `inst-proxy-24s1a`
 27. [x] - `p1` - **IF** request contains `Upgrade: websocket` header - `inst-proxy-24`
-    1. [x] - `p1` - Perform the handshake on a dedicated upstream connection via the engine's upgrade; tunnel only after the upstream answers `101`, otherwise **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-24a`
+    1. [x] - `p1` - Perform the handshake on a dedicated upstream connection via the engine's upgrade; tunnel only after the upstream answers `101`, otherwise **RETURN** 502 ProtocolError with reason `REQUEST_MAY_HAVE_BEEN_SENT` and `X-OAGW-Error-Source: gateway` - `inst-proxy-24a`
 28. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path), method, headers, body - `inst-proxy-25`
 29. [x] - `p1` - Forward the request through the upstream engine via `cpt-cf-oagw-algo-upstream-forwarding` - `inst-proxy-26`
 30. [x] - `p1` - **IF** the engine reports an upstream connection failure (refused, DNS, TLS) - `inst-proxy-27`
-    1. [x] - `p1` - Map the engine error kind to `DomainError`; the REST layer writes the RFC 9457 Problem response with `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
-    2. [x] - `p1` - **RETURN** 502 DownstreamError (503 LinkUnavailable for no route) with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
+    1. [x] - `p1` - Map the engine error kind to `DomainError` and to its dispatch stage (DESIGN "Dispatch Reasons"); the REST layer writes the RFC 9457 Problem response with the stage as `context.reason` and `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
+    2. [x] - `p1` - **RETURN** 502 DownstreamError (503 LinkUnavailable for DNS failure, SSRF refusal or no route) with reason `REQUEST_NOT_SENT`, or 502 with `REQUEST_MAY_HAVE_BEEN_SENT` when the connection was lost after sending, with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
 31. [x] - `p1` - **IF** connection or request timeout (connect timeout, response-head or body read timeout) - `inst-proxy-28`
-    1. [x] - `p1` - **RETURN** 504 ConnectionTimeout or RequestTimeout via `cpt-cf-oagw-algo-error-source-classification` - `inst-proxy-28a`
+    1. [x] - `p1` - **RETURN** 504 ConnectionTimeout (reason `REQUEST_NOT_SENT`) or RequestTimeout (reason `REQUEST_MAY_HAVE_BEEN_SENT`) via `cpt-cf-oagw-algo-error-source-classification` - `inst-proxy-28a`
 32. [x] - `p1` - **IF** the engine reports an HTTP/2 protocol error - `inst-proxy-29`
-    1. [x] - `p1` - **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-29a`
+    1. [x] - `p1` - **RETURN** 502 ProtocolError with reason `REQUEST_MAY_HAVE_BEEN_SENT` and `X-OAGW-Error-Source: gateway` - `inst-proxy-29a`
 33. [x] - `p1` - Receive the upstream response head; the body streams - `inst-proxy-30`
 34. [x] - `p1` - **IF** the exchange fails on the gateway side (connection failure, timeout, protocol error, request body limit, response guard rejection) - `inst-proxy-31`
     1. [x] - `p1` - Execute transform plugins: `on_error` phase, with the status the client gets; `on_error` runs only for these gateway-originated errors (errors raised before forwarding, such as validation, auth, guard or rate-limit rejections, return without it, and so does a failed WebSocket upgrade) - `inst-proxy-31a`
@@ -183,7 +183,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 4. [x] - `p1` - **IF** at least one visible enabled match - `inst-alias-2`
    1. [x] - `p1` - **RETURN** the closest one as resolved UpstreamConfig (shadowing); visible ancestors form the merge chain - `inst-alias-4b2`
 5. [x] - `p1` - **IF** a disabled match was recorded - `inst-alias-4b1-ret`
-   1. [x] - `p1` - **RETURN** error: upstream disabled (503 LinkUnavailable) - `inst-alias-4b1a`
+   1. [x] - `p1` - **RETURN** error: upstream disabled (503 UpstreamDisabled, reason `UPSTREAM_DISABLED`) - `inst-alias-4b1a`
 6. [x] - `p1` - **RETURN** error: upstream not found for alias (404 RouteNotFound) - `inst-alias-5`
 
 ### Credential Resolution
@@ -248,9 +248,9 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
    4. [x] - `p1` - **IF** plugin not found - `inst-chain-4d`
       1. [x] - `p1` - **RETURN** 503 PluginNotFound with `X-OAGW-Error-Source: gateway` - `inst-chain-4d1`
 5. [x] - `p1` - Resolve upstream auth plugin from the upstream's auth configuration (`auth_plugin_ref` / `auth_plugin_uuid` when a database is configured) - `inst-chain-5`
-6. [x] - `p1` - Execute auth plugin: resolve credentials from `cred_store` via secret_ref; the plugin lists the headers to set, and each replaces the request's lines of that name, marked sensitive. Other headers, repeated or non-UTF-8 ones included, pass unchanged. A header name or value that is not valid fails the request with 400 (invalid plugin config) instead of sending it without credentials - `inst-chain-6`
+6. [x] - `p1` - Execute auth plugin: resolve credentials from `cred_store` via secret_ref; the plugin lists the headers to set, and each replaces the request's lines of that name, marked sensitive. Other headers, repeated or non-UTF-8 ones included, pass unchanged. A header name or value that is not valid fails the request with 500 (plugin misconfiguration) instead of sending it without credentials - `inst-chain-6`
 7. [x] - `p1` - **IF** secret not found or credential resolution fails - `inst-chain-7`
-   1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound, naming the auth config key, not the reference - `inst-chain-7a`
+   1. [x] - `p1` - **RETURN** the credential-failure mapping (401 `AUTH_CREDENTIAL_NOT_FOUND`, 503 `CREDENTIAL_STORE_UNAVAILABLE`, 503 `IDENTITY_PROVIDER_UNAVAILABLE`, 502 invalid identity provider response, 500 misconfiguration, 401 AuthenticationFailed otherwise), naming the auth config key, not the reference - `inst-chain-7a`
 8. [x] - `p1` - **FOR EACH** guard plugin in chain (type = guard) - `inst-chain-8`
    1. [x] - `p1` - Execute guard: validate request against guard rules (method allowlist, query allowlist, path suffix, timeout) - `inst-chain-8a`
    2. [x] - `p1` - **IF** guard rejects - `inst-chain-8b`
@@ -288,12 +288,12 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 1. [x] - `p1` - **IF** Content-Length header present - `inst-body-1`
    1. [x] - `p1` - **IF** Content-Length is not a valid non-negative integer - `inst-body-1a`
       1. [x] - `p1` - **RETURN** 400 ValidationError - `inst-body-1a1`
-   2. [x] - `p1` - **IF** Content-Length exceeds 100MB (104,857,600 bytes) - `inst-body-1b`
+   2. [x] - `p1` - **IF** Content-Length exceeds `max_body_size_bytes` (at most and by default 100 MiB, 104,857,600 bytes; the api-gateway's `body_limit_bytes`, 16 MiB by default, rejects larger bodies before OAGW sees them) - `inst-body-1b`
       1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (reject before buffering per `cpt-cf-oagw-constraint-body-limit`) - `inst-body-1b1`
 2. [x] - `p1` - **IF** Transfer-Encoding header present - `inst-body-2`
    1. [x] - `p1` - **IF** encoding is not `chunked` - `inst-body-2a`
       1. [x] - `p1` - **RETURN** 400 ValidationError (only `chunked` supported) - `inst-body-2a1`
-3. [x] - `p1` - **IF** actual body size exceeds 100MB during streaming read - `inst-body-3`
+3. [x] - `p1` - **IF** actual body size exceeds `max_body_size_bytes` during streaming read - `inst-body-3`
    1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (abort read) - `inst-body-3a`
 4. [x] - `p1` - **RETURN** validation passed - `inst-body-4`
 
@@ -311,10 +311,10 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 3. [x] - `p1` - **IF** request body is buffered - `inst-fwd-3`
    1. [x] - `p1` - Send it with `Content-Length` framing derived by the engine - `inst-fwd-3a`
 4. [x] - `p1` - **ELSE IF** request body is streaming - `inst-fwd-4`
-   1. [x] - `p1` - Forward chunks as they arrive, enforcing `max_body_size`; on breach or stream error abort the upstream request without completing its framing and **RETURN** 413 PayloadTooLarge or 502 DownstreamError - `inst-fwd-4a`
+   1. [x] - `p1` - Forward chunks as they arrive, enforcing `max_body_size`; on breach or stream error abort the upstream request without completing its framing and **RETURN** 413 PayloadTooLarge or 502 DownstreamError (reason `REQUEST_MAY_HAVE_BEEN_SENT`) - `inst-fwd-4a`
 5. [x] - `p1` - Engine reuses a pooled connection or connects (ALPN `h2`/`http/1.1` for TLS), rewrites framing and hop-by-hop headers, and sends the request; the engine sends it again at most once, on another connection, only in the cases of ADR-0019 (a request that never left, `REFUSED_STREAM`, `HTTP_1_1_REQUIRED`, and for idempotent methods a stale keep-alive connection or a graceful `GOAWAY`) - `inst-fwd-5`
 6. [x] - `p1` - **IF** the engine fails - `inst-fwd-6`
-   1. [x] - `p1` - Map the engine error kind to `DomainError` (see [ADR-0019](../ADR/0019-upstream-proxy-engine.md)) - `inst-fwd-6a`
+   1. [x] - `p1` - Map the engine error kind to `DomainError` (see [ADR-0019](../ADR/0019-upstream-proxy-engine.md)) and to its dispatch stage: only the connect and TLS kinds are `REQUEST_NOT_SENT`, unless the engine resent the request after a first attempt the upstream may have processed; every other kind, a future one included, is `REQUEST_MAY_HAVE_BEEN_SENT` - `inst-fwd-6a`
 7. [x] - `p1` - Strip every `x-oagw-*` header from the upstream response head - `inst-fwd-7`
 8. [x] - `p1` - **RETURN** response head and streaming body - `inst-fwd-8`
 
@@ -361,7 +361,7 @@ The system **MUST** implement `DataPlaneService::proxy_request(...)` that orches
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-alias-resolution`
 
-The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierarchy walk from descendant to root. The closest enabled match wins (shadowing); a disabled upstream is skipped, and when only disabled upstreams match the alias resolution **MUST** return 503 LinkUnavailable. Private upstreams (sharing = `private`) **MUST NOT** be visible to descendant tenants. The upstreams for the whole tenant chain **MUST** be fetched with one `list_by_alias_for_tenants` call; the walk then runs in memory, so the number of queries does not grow with hierarchy depth. With the proxy configuration cache, that call's result is cached per alias and tenant chain and the walk still runs on every request, so a cached lookup returns what an uncached one does.
+The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierarchy walk from descendant to root. The closest enabled match wins (shadowing); a disabled upstream is skipped, and when only disabled upstreams match the alias resolution **MUST** return 503 with reason `UPSTREAM_DISABLED`. Private upstreams (sharing = `private`) **MUST NOT** be visible to descendant tenants. The upstreams for the whole tenant chain **MUST** be fetched with one `list_by_alias_for_tenants` call; the walk then runs in memory, so the number of queries does not grow with hierarchy depth. With the proxy configuration cache, that call's result is cached per alias and tenant chain and the walk still runs on every request, so a cached lookup returns what an uncached one does.
 
 **Implements**:
 - `cpt-cf-oagw-algo-alias-resolution`
@@ -412,7 +412,7 @@ The system **MUST** strip hop-by-hop headers (Connection, Keep-Alive, Proxy-Auth
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-body-validation`
 
-The system **MUST** validate Content-Length (valid non-negative integer), enforce 100MB hard limit (reject before buffering per `cpt-cf-oagw-constraint-body-limit`), and reject unsupported Transfer-Encoding (only `chunked` supported). Invalid requests **MUST** return 400 ValidationError or 413 PayloadTooLarge.
+The system **MUST** validate Content-Length (valid non-negative integer), enforce `max_body_size_bytes` (at most 100 MiB; reject before buffering per `cpt-cf-oagw-constraint-body-limit`), and reject unsupported Transfer-Encoding (only `chunked` supported). Invalid requests **MUST** return 400 ValidationError or 413 PayloadTooLarge.
 
 **Implements**:
 - `cpt-cf-oagw-algo-body-validation`
@@ -454,7 +454,7 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] Proxy requests via `{METHOD} /api/oagw/v1/proxy/{alias}/{path}` are forwarded to the correct upstream and response is returned
 - [x] Requests without valid Bearer token return 401; requests without `gts.cf.core.oagw.proxy.v1~:invoke` permission return 403
 - [x] Alias resolution walks tenant hierarchy from descendant to root and returns closest match (shadowing)
-- [x] Disabled upstreams return 503 LinkUnavailable with `X-OAGW-Error-Source: gateway`
+- [x] Disabled upstreams return 503 `service_unavailable` with reason `UPSTREAM_DISABLED`, `Retry-After: 300` and `X-OAGW-Error-Source: gateway`
 - [x] Private upstreams are not visible to descendant tenants during alias resolution
 - [x] Route matching selects the longest path prefix match, then the higher priority number
 - [x] A route path prefix ends on a segment boundary (`/v1/chat` does not cover `/v1/chatty` or `/v1/chat-x`, but covers `/v1/chat.json`, `/v1/chat:verb` and `/v1/chat%2Fx`; the rule is for ASCII names, so an escaped non-ASCII character also ends the segment and `/v1/chat%C3%A9` is covered), and route `/` matches the bare `/oagw/v1/proxy/{alias}`; a request that would select another route with `%2F`, `%5C`, `\` and the fullwidth and small solidi `%EF%BC%8F`, `%EF%BC%BC` and `%EF%B9%A8`, which NFKC folds to `/` and `\` read as `/` (routes `/v1` and `/v1/admin`, request `/v1%2Fadmin`), or the reverse (routes `/v3` and `/v3/a%2Fb`, request `/v3/a/b`), is rejected with 400 `INVALID_PROXY_PATH`
@@ -464,18 +464,18 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] Unmatched routes return 404 RouteNotFound with `X-OAGW-Error-Source: gateway`
 - [x] Plugin chain executes in deterministic order: Auth → Guards → Transform(on_request) → upstream → Transform(on_response/on_error)
 - [x] Upstream plugins execute before route plugins in the composed chain
-- [x] Auth plugin resolves credentials from `cred_store` via `secret_ref` at request time; failure returns 401 or 500
+- [x] Auth plugin resolves credentials from `cred_store` via `secret_ref` at request time; a missing or inaccessible secret returns 401 `AUTH_CREDENTIAL_NOT_FOUND`, a credential store outage 503 `CREDENTIAL_STORE_UNAVAILABLE`, an identity provider outage 503 `IDENTITY_PROVIDER_UNAVAILABLE`, an invalid identity provider response 502, a plugin misconfiguration 500
 - [x] Guard plugins reject invalid requests (method, query, path suffix) before upstream forwarding
 - [x] Hop-by-hop headers (Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade) are stripped from outbound requests
 - [x] `X-OAGW-Target-Host` is consumed for endpoint selection and stripped before forwarding
 - [x] `Host` (HTTP/1.1) or `:authority` (HTTP/2) is replaced with upstream endpoint host
 - [x] Header set/add/remove operations from upstream/route config are applied in declared order
 - [x] Content-Length validation rejects non-integer or mismatched values with 400
-- [x] 100MB body limit is enforced before buffering (413 PayloadTooLarge)
+- [x] `max_body_size_bytes` (at most 100 MiB) is enforced before buffering (413 PayloadTooLarge); the effective limit is the smaller of it and the api-gateway's `body_limit_bytes` (16 MiB by default), whose `413` is an `about:blank` problem without `X-OAGW-Error-Source`
 - [x] Only `chunked` Transfer-Encoding is accepted; others return 400
 - [x] Gateway errors use RFC 9457 Problem Details (`application/problem+json`) with GTS type identifiers
 - [x] `X-OAGW-Error-Source: gateway` is set on all gateway-originated errors
-- [x] `X-OAGW-Error-Source: upstream` is set on upstream passthrough responses (body passed as-is)
+- [x] `X-OAGW-Error-Source: upstream` is set on upstream passthrough responses (body and headers passed as-is, the upstream's `Retry-After` and `WWW-Authenticate` included)
 - [x] Multi-endpoint upstreams distribute requests via round-robin
 - [x] `X-OAGW-Target-Host` selects specific endpoint in multi-endpoint upstreams
 - [x] Changing an upstream's endpoints rebuilds its cached pool on every replica without explicit invalidation
@@ -488,10 +488,11 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] Multi-endpoint upstream with common-suffix alias returns 400 MissingTargetHost when `X-OAGW-Target-Host` is absent
 - [x] Invalid `X-OAGW-Target-Host` format (not hostname or IP) returns 400 InvalidTargetHost
 - [x] `X-OAGW-Target-Host` value not matching any configured endpoint returns 400 UnknownTargetHost
-- [x] Upstream connection failures (refused, DNS, TLS) return 502 DownstreamError with `X-OAGW-Error-Source: gateway`
+- [x] Upstream connection failures return gateway errors with `X-OAGW-Error-Source: gateway` and reason `REQUEST_NOT_SENT`: refused and TLS 502 DownstreamError, DNS, SSRF refusal and no route 503 LinkUnavailable, connect timeout 504
+- [x] Failures after the request may have been sent (connection closed, read or write error, HTTP/2 or protocol error, read or write timeout) carry reason `REQUEST_MAY_HAVE_BEEN_SENT`
 - [x] No credentials appear in logs, error messages, or API responses
 - [x] Application layer does not add retries; only the engine's single connection-level resend (ADR-0019) is permitted
-- [x] WebSocket upgrade requests (`Upgrade: websocket`) are tunnelled only after the upstream answers `101`; a rejected upgrade returns 502 ProtocolError with `X-OAGW-Error-Source: gateway`
+- [x] WebSocket upgrade requests (`Upgrade: websocket`) are tunnelled only after the upstream answers `101`; a rejected upgrade returns 502 ProtocolError with reason `REQUEST_MAY_HAVE_BEEN_SENT` and `X-OAGW-Error-Source: gateway`
 - [x] Upstream engine errors produce RFC 9457 Problem Details body with GTS type identifiers and `X-OAGW-Error-Source: gateway`
 - [x] Upstream responses lose every `x-oagw-*` header, so `ErrorSource` defaults to `Upstream` for them; gateway-generated error responses always set `X-OAGW-Error-Source: gateway` explicitly
 

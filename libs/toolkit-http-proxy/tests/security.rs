@@ -1391,6 +1391,51 @@ async fn stale_keep_alive_connection_is_resent_for_idempotent_requests() {
     assert_eq!(conns.load(Ordering::SeqCst), 2);
 }
 
+/// The upstream retires a keep-alive connection as it is reused and then
+/// refuses new connections: the resend of a GET fails to connect. The first
+/// attempt may have been processed, and the error says so.
+#[tokio::test]
+async fn failed_resend_after_a_stale_connection_keeps_that_the_request_may_have_been_processed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = listener.accept().await else {
+            return;
+        };
+        // Later connections are refused.
+        drop(listener);
+        let Some(head) = read_head(&mut s).await else {
+            return;
+        };
+        let mut body = vec![0u8; head_content_length(&head)];
+        if s.read_exact(&mut body).await.is_err() {
+            return;
+        }
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await;
+        // Read the second request, then close without answering.
+        let _ = read_head(&mut s).await;
+    });
+    let c = client();
+    let target = plain(addr);
+    let get = || Request::get("/").body(empty_body()).unwrap();
+    assert_eq!(send_ok(&c, &target, get()).await, "ok");
+
+    let Err(err) = within(Duration::from_secs(2), c.send(&target, get())).await else {
+        panic!("the resend must fail to connect");
+    };
+    assert_eq!(err.kind(), ErrorKind::ConnectRefused);
+    assert!(err.earlier_attempt_may_have_been_processed());
+
+    // A first attempt that fails to connect has no such mark.
+    let Err(err) = within(Duration::from_secs(2), c.send(&target, get())).await else {
+        panic!("the connection must be refused");
+    };
+    assert_eq!(err.kind(), ErrorKind::ConnectRefused);
+    assert!(!err.earlier_attempt_may_have_been_processed());
+}
+
 type MakeRequest = fn() -> Request<ProxyBody>;
 
 #[tokio::test]

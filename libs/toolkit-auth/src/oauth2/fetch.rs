@@ -51,6 +51,7 @@ impl fmt::Debug for FetchedToken {
 ///
 /// Returns [`TokenError::ConfigError`] if the configuration is invalid.
 /// Returns [`TokenError::Http`] or [`TokenError::HttpStatus`] if the token (or discovery) request fails.
+/// Returns [`TokenError::InvalidResponse`] if the token response body cannot be parsed.
 /// Returns [`TokenError::UnsupportedTokenType`] if the server returns a
 /// non-Bearer token type.
 pub async fn fetch_token(config: OAuthClientConfig) -> Result<FetchedToken, TokenError> {
@@ -259,6 +260,26 @@ mod tests {
                 TokenError::HttpStatus { operation: HttpOperation::TokenRequest, .. } if err.status() == Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             ),
             "expected Http error, got: {err}"
+        );
+    }
+
+    /// A body that is not a token response is an invalid response, as in
+    /// discovery, not an HTTP error.
+    #[tokio::test]
+    async fn unparseable_token_response_is_invalid_response() {
+        let server = MockServer::start();
+
+        let _mock = server.mock(|when, then| {
+            when.method(POST).path("/token");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("not json");
+        });
+
+        let err = fetch_token(test_config(&server)).await.unwrap_err();
+        assert!(
+            matches!(err, TokenError::InvalidResponse(ref msg) if msg.contains("OAuth2 token JSON parse failed")),
+            "expected InvalidResponse, got: {err}"
         );
     }
 

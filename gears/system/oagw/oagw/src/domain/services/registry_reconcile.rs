@@ -371,7 +371,9 @@ fn reason_of(error: &DomainError) -> Option<&'static str> {
         | DomainError::IdleTimeout { .. }
         | DomainError::StreamAborted { .. }
         | DomainError::ProtocolError { .. }
-        | DomainError::CredentialStoreUnavailable { .. } => None,
+        | DomainError::CredentialStoreUnavailable { .. }
+        | DomainError::IdpUnavailable { .. }
+        | DomainError::IdpInvalidResponse { .. } => None,
         DomainError::Forbidden { reason, .. }
             if reason == reason::permission::TENANT_RESOLVER_UNAUTHORIZED =>
         {

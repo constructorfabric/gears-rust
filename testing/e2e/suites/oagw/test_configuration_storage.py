@@ -300,8 +300,8 @@ async def test_proxy_sees_each_write(
             alias=alias, enabled=False,
         )
         resp = await client.get(url, headers=oagw_headers)
-        assert_problem(resp, 503, category="service_unavailable")
-        assert resp.headers.get("retry-after") == "30"
+        assert_problem(resp, 503, category="service_unavailable", reason="UPSTREAM_DISABLED")
+        assert resp.headers.get("retry-after") == "300"
 
         await update_upstream(
             client, oagw_base_url, oagw_headers, upstream["id"], mock_upstream_url,

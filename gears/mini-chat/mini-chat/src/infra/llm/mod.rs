@@ -193,9 +193,10 @@ pub(crate) fn sanitize_provider_message(msg: &str) -> String {
 //
 // The pre-canonical split between `UpstreamDisabled` → ProviderUnavailable and
 // `DownstreamError` → ProviderError is collapsed: both upstream-disabled and
-// downstream-transport failures land on canonical `service_unavailable` and
-// are indistinguishable to consumers. ProviderUnavailable is the right
-// disposition because both are *retryable* gateway-side failures.
+// downstream-transport failures land on canonical `service_unavailable`.
+// Their `reason` tells them apart, but ProviderUnavailable is the right
+// disposition for all of them: they are gateway-side failures. The reason is
+// not used yet.
 #[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<ServiceGatewayError> for LlmProviderError {
     fn from(err: ServiceGatewayError) -> Self {
@@ -204,7 +205,7 @@ impl From<ServiceGatewayError> for LlmProviderError {
                 LlmProviderError::RateLimited { retry_after_secs }
             }
 
-            ServiceGatewayError::Timeout => LlmProviderError::Timeout,
+            ServiceGatewayError::Timeout { .. } => LlmProviderError::Timeout,
 
             // Both upstream-unavailable and gateway-side auth machinery
             // failures (plugin panic, transport) surface as transient

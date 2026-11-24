@@ -415,6 +415,48 @@ def assert_problem_body(resp: httpx.Response, expected: dict) -> None:
     assert body == expected, resp.text
 
 
+def assert_gateway_problem_body(resp: httpx.Response, expected: dict) -> None:
+    """Assert ``resp`` is a Problem Details response the proxy produced
+    (``X-OAGW-Error-Source: gateway``) whose body is exactly ``expected``
+    plus a ``trace_id``. Send the request with :func:`traced` headers."""
+    assert resp.status_code == expected["status"], (
+        f"expected {expected['status']}, got {resp.status_code}: {resp.text[:500]}"
+    )
+    ct = resp.headers.get("content-type", "")
+    assert ct.startswith("application/problem+json"), f"content-type {ct!r}: {resp.text[:300]}"
+    assert resp.headers.get("x-oagw-error-source") == "gateway", resp.headers
+    body = resp.json()
+    trace_id = body.pop("trace_id", None)
+    assert isinstance(trace_id, str) and re.fullmatch(r"[0-9a-f]{32}", trace_id), resp.text
+    assert body == expected, resp.text
+
+
+def service_unavailable(status: int, instance: str, retry_after: int, reason: str) -> dict:
+    """The gateway's 502/503 body: canonical ``service_unavailable`` with a
+    retry hint and a reason."""
+    return {
+        "type": err_type("service_unavailable"),
+        "title": "Service Unavailable",
+        "status": status,
+        "detail": "Service temporarily unavailable",
+        "instance": instance,
+        "context": {"retry_after_seconds": retry_after, "reason": reason},
+    }
+
+
+def credential_not_found(instance: str) -> dict:
+    """The gateway's 401 for a secret the upstream's auth config references
+    that is missing or not accessible."""
+    return {
+        "type": err_type("unauthenticated"),
+        "title": "Unauthenticated",
+        "status": 401,
+        "detail": "Authentication required",
+        "instance": instance,
+        "context": {"reason": "AUTH_CREDENTIAL_NOT_FOUND"},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Listing and cleanup
 # ---------------------------------------------------------------------------

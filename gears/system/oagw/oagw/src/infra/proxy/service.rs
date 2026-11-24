@@ -17,7 +17,7 @@ use toolkit_security::SecurityContext;
 
 use crate::config::TokenCacheConfig;
 use crate::domain::circuit_breaker::{CircuitBreakers, UpstreamPermit};
-use crate::domain::error::DomainError;
+use crate::domain::error::{Dispatch, DomainError};
 use crate::domain::model::{
     PassthroughMode, PathSuffixMode, ProxyTarget, RateLimitConfig, ResponseHeaderRules,
     ShadowedRouteLimit, Upstream,
@@ -354,6 +354,7 @@ impl DataPlaneServiceImpl {
             return Err(DomainError::DownstreamError {
                 detail: "upstream has no endpoints".into(),
                 instance: instance_uri.to_string(),
+                dispatch: Dispatch::NotSent,
             });
         }
 
@@ -420,6 +421,7 @@ impl DataPlaneServiceImpl {
             .map_err(|e| DomainError::DownstreamError {
                 detail: e.to_string(),
                 instance: instance_uri.to_string(),
+                dispatch: Dispatch::NotSent,
             })
     }
 }
@@ -1141,6 +1143,7 @@ impl DataPlaneServiceImpl {
             let auth_start = std::time::Instant::now();
             let auth_result = execute_auth_plugin(
                 &self.auth_registry,
+                &upstream,
                 auth,
                 &mut outbound_headers,
                 ctx,
@@ -1296,6 +1299,7 @@ impl DataPlaneServiceImpl {
                 self.request_timeout
             ),
             instance: instance_uri.clone(),
+            dispatch: Dispatch::NotSent,
         })??;
         let endpoint = &selected.endpoint;
 
@@ -1387,6 +1391,7 @@ impl DataPlaneServiceImpl {
                         endpoint.host, self.request_timeout
                     ),
                     instance: instance_uri.clone(),
+                    dispatch: Dispatch::NotSent,
                 });
             }
         };
@@ -1442,6 +1447,7 @@ impl DataPlaneServiceImpl {
                 .map_err(|e| DomainError::DownstreamError {
                     detail: format!("invalid upstream request: {e}"),
                     instance: instance_uri.clone(),
+                    dispatch: Dispatch::NotSent,
                 })?;
             // The handshake goes out without a body, whatever the caller sent.
             let body = if is_upgrade {
@@ -1482,8 +1488,11 @@ impl DataPlaneServiceImpl {
                         self.request_timeout
                     ),
                     instance: instance_uri.clone(),
+                    dispatch: Dispatch::NotSent,
                 })?
-                .map_err(|e| auth_plugin_error(e, &instance_uri))?;
+                .map_err(|e| {
+                    auth_plugin_error(e, &instance_uri, AuthScope::new(&upstream, auth, ctx))
+                })?;
             tracing::debug!(plugin = %auth.plugin_type, "request signed");
             if let Some(signed_url) = signed_url {
                 url = signed_url;
@@ -1646,6 +1655,7 @@ impl DataPlaneServiceImpl {
                         "upstream WebSocket upgrade timed out after {upgrade_timeout:?}"
                     ),
                     instance: instance_uri.to_string(),
+                    dispatch: Dispatch::MaybeSent,
                 });
             }
         };
@@ -1663,6 +1673,7 @@ impl DataPlaneServiceImpl {
                         resp.status()
                     ),
                     instance: instance_uri.to_string(),
+                    dispatch: Dispatch::MaybeSent,
                 });
             }
         };
@@ -1798,6 +1809,7 @@ impl DataPlaneServiceImpl {
                     // No URL: its query string may carry credentials.
                     detail: format!("upstream request timed out after {timeout:?}"),
                     instance: instance_uri.to_string(),
+                    dispatch: Dispatch::MaybeSent,
                 });
             }
         };
@@ -1838,6 +1850,7 @@ fn build_outbound_request(
         .map_err(|e| DomainError::DownstreamError {
             detail: format!("invalid upstream request: {e}"),
             instance: instance_uri.to_string(),
+            dispatch: Dispatch::NotSent,
         })?;
     *req.headers_mut() = headers;
     Ok(req)
@@ -1873,6 +1886,7 @@ impl StreamedBodyState {
             .map(|reason| DomainError::DownstreamError {
                 detail: format!("streaming request body failed mid-stream: {reason}"),
                 instance: instance_uri.to_string(),
+                dispatch: Dispatch::MaybeSent,
             })
     }
 }
@@ -1931,6 +1945,7 @@ fn limit_body_stream(
 /// values included, pass through as the client sent them.
 async fn execute_auth_plugin(
     auth_registry: &AuthPluginRegistry,
+    upstream: &Upstream,
     auth: &crate::domain::model::AuthConfig,
     outbound_headers: &mut HeaderMap,
     ctx: &SecurityContext,
@@ -1949,7 +1964,7 @@ async fn execute_auth_plugin(
         .authenticate(&mut auth_ctx)
         .await
         .and_then(|()| set_auth_headers(outbound_headers, auth_ctx.set_headers))
-        .map_err(|e| auth_plugin_error(e, instance_uri))?;
+        .map_err(|e| auth_plugin_error(e, instance_uri, AuthScope::new(upstream, auth, ctx)))?;
     tracing::debug!(plugin = %auth.plugin_type, "auth plugin succeeded");
     Ok(plugin)
 }
@@ -1975,28 +1990,126 @@ fn set_auth_headers(
     Ok(())
 }
 
-fn auth_plugin_error(e: PluginError, instance_uri: &str) -> DomainError {
+/// The request an auth plugin ran for, as its failure log names it.
+#[derive(Clone, Copy)]
+struct AuthScope<'a> {
+    caller_tenant_id: uuid::Uuid,
+    upstream_id: uuid::Uuid,
+    upstream_alias: &'a str,
+    plugin_type: &'a str,
+}
+
+impl<'a> AuthScope<'a> {
+    fn new(
+        upstream: &'a Upstream,
+        auth: &'a crate::domain::model::AuthConfig,
+        ctx: &SecurityContext,
+    ) -> Self {
+        Self {
+            caller_tenant_id: ctx.subject_tenant_id(),
+            upstream_id: upstream.id,
+            upstream_alias: &upstream.alias,
+            plugin_type: &auth.plugin_type,
+        }
+    }
+}
+
+/// The one mapping of auth plugin errors, for `authenticate` and `sign`
+/// alike. The detail names a config key at most, never a reference or a
+/// secret; it stays in the server log. A missing secret, a credential store
+/// outage, an identity provider outage and an invalid identity provider
+/// response are warned here, once, with `scope`; the REST mapping does not
+/// log them again.
+fn auth_plugin_error(e: PluginError, instance_uri: &str, scope: AuthScope<'_>) -> DomainError {
+    let instance = instance_uri.to_string();
     match e {
-        PluginError::SecretNotFound(_) => DomainError::SecretNotFound {
-            detail: e.to_string(),
-            instance: instance_uri.to_string(),
+        PluginError::SecretNotFound { key, kind } => {
+            tracing::warn!(
+                caller_tenant_id = %scope.caller_tenant_id,
+                upstream_id = %scope.upstream_id,
+                upstream_alias = scope.upstream_alias,
+                plugin = scope.plugin_type,
+                config_key = %format_args!("auth.config.{key}"),
+                error = kind,
+                "auth plugin: credential not accessible"
+            );
+            DomainError::SecretNotFound {
+                detail: e.to_string(),
+                instance,
+            }
+        }
+        PluginError::CredentialStoreUnavailable {
+            detail,
+            retry_after,
+        } => {
+            // `detail` names the config key being read.
+            tracing::warn!(
+                caller_tenant_id = %scope.caller_tenant_id,
+                upstream_id = %scope.upstream_id,
+                upstream_alias = scope.upstream_alias,
+                plugin = scope.plugin_type,
+                reason = %detail,
+                "auth plugin: credential store unavailable"
+            );
+            DomainError::CredentialStoreUnavailable {
+                detail,
+                retry_after,
+                instance,
+            }
+        }
+        PluginError::IdpUnavailable(_) => {
+            let detail = e.to_string();
+            tracing::warn!(
+                caller_tenant_id = %scope.caller_tenant_id,
+                upstream_id = %scope.upstream_id,
+                upstream_alias = scope.upstream_alias,
+                plugin = scope.plugin_type,
+                reason = %detail,
+                "auth plugin: OAuth2 identity provider unavailable"
+            );
+            DomainError::IdpUnavailable { detail, instance }
+        }
+        PluginError::IdpInvalidResponse(_) => {
+            let detail = e.to_string();
+            tracing::warn!(
+                caller_tenant_id = %scope.caller_tenant_id,
+                upstream_id = %scope.upstream_id,
+                upstream_alias = scope.upstream_alias,
+                plugin = scope.plugin_type,
+                reason = %detail,
+                "auth plugin: identity provider sent an invalid response"
+            );
+            DomainError::IdpInvalidResponse { detail, instance }
+        }
+        PluginError::AuthFailed(_) | PluginError::Rejected(_) => {
+            DomainError::AuthenticationFailed {
+                reason: reason::auth::PLUGIN_FAILED,
+                detail: e.to_string(),
+                instance,
+            }
+        }
+        PluginError::InvalidConfig(_) => DomainError::Internal {
+            message: format!("auth plugin misconfigured: {e}"),
         },
-        PluginError::Rejected(msg) | PluginError::InvalidConfig(msg) => DomainError::Validation {
-            field: "plugin",
-            reason: field::INVALID_PLUGIN_CONFIG,
-            detail: msg,
-            instance: instance_uri.to_string(),
-        },
-        PluginError::AuthFailed(_) => DomainError::AuthenticationFailed {
-            reason: reason::auth::PLUGIN_FAILED,
-            detail: e.to_string(),
-            instance: instance_uri.to_string(),
-        },
-        PluginError::Internal(_) => DomainError::AuthenticationFailed {
-            reason: reason::auth::PLUGIN_INTERNAL,
-            detail: e.to_string(),
-            instance: instance_uri.to_string(),
-        },
+        PluginError::Internal(_) => {
+            // A stored secret the header cannot carry, or an unexpected
+            // store error: logged as in `request_ref` mode, so an operator
+            // can find it. The detail names the config key, never the value.
+            let detail = e.to_string();
+            tracing::warn!(
+                caller_tenant_id = %scope.caller_tenant_id,
+                upstream_id = %scope.upstream_id,
+                upstream_alias = scope.upstream_alias,
+                plugin = scope.plugin_type,
+                reason = %detail,
+                "auth plugin failed"
+            );
+            DomainError::AuthenticationFailed {
+                reason: reason::auth::PLUGIN_INTERNAL,
+                detail,
+                instance,
+            }
+        }
     }
 }
 
@@ -2536,6 +2649,8 @@ fn domain_error_type_name(err: &DomainError) -> &'static str {
         DomainError::SecretNotFound { .. } => "SecretNotFound",
         DomainError::SecretRefNotAccessible { .. } => "SecretRefNotAccessible",
         DomainError::CredentialStoreUnavailable { .. } => "CredentialStoreUnavailable",
+        DomainError::IdpUnavailable { .. } => "IdpUnavailable",
+        DomainError::IdpInvalidResponse { .. } => "IdpInvalidResponse",
         DomainError::DownstreamError { .. } => "DownstreamError",
         DomainError::ProtocolError { .. } => "ProtocolError",
         DomainError::UpstreamDisabled { .. } => "UpstreamDisabled",
@@ -2572,6 +2687,7 @@ fn build_proxy_response(
         .map_err(|e| DomainError::DownstreamError {
             detail: format!("failed to build response: {e}"),
             instance: instance_uri,
+            dispatch: Dispatch::MaybeSent,
         })?;
     *resp.headers_mut() = resp_headers;
     resp.extensions_mut().insert(error_source);
@@ -4165,10 +4281,10 @@ pub(crate) mod tests {
     }
 
     /// A secret that is gone at proxy time, or a credential store failure,
-    /// names the auth config key. The reference reaches neither the error
-    /// returned to the caller nor the logs; that includes the canonical
-    /// diagnostic, which the canonical error middleware logs at ERROR
-    /// (#4989).
+    /// names the auth config key in the error and in the warn log of the auth
+    /// plugin step. The reference reaches neither the error returned to the
+    /// caller nor the logs (#4989). A missing secret's 401 carries no
+    /// diagnostic, so the warn log is where the key shows.
     #[tokio::test]
     #[tracing_test::traced_test]
     async fn proxy_time_secret_failures_do_not_reveal_the_ref() {
@@ -4203,21 +4319,107 @@ pub(crate) mod tests {
             assert!(!text.contains("leaked-ref-77"), "{text}");
             if i == 0 {
                 assert!(matches!(err, DomainError::SecretNotFound { .. }), "{err:?}");
+            } else {
+                assert!(
+                    matches!(err, DomainError::CredentialStoreUnavailable { .. }),
+                    "{err:?}"
+                );
             }
 
             let canonical = CanonicalError::from(err);
             let text = format!("{canonical:?}");
             assert!(!text.contains("leaked-ref-77"), "{text}");
             if i == 0 {
-                let diagnostic = canonical.diagnostic().unwrap_or_default();
                 assert!(
-                    diagnostic.contains("auth.config.secret_ref"),
-                    "{diagnostic}"
+                    matches!(&canonical, CanonicalError::Unauthenticated { ctx, .. }
+                        if ctx.reason.as_deref() == Some(oagw_sdk::reason::auth::CREDENTIAL_NOT_FOUND)),
+                    "{canonical:?}"
                 );
+                // One warn, naming the key and the store's error kind.
+                assert!(logs_contain("auth.config.secret_ref"));
+                assert!(logs_contain("secret not found"));
+                assert!(!logs_contain("leaked-ref-77"));
             }
+            // One warn line per failed request, however often the error is
+            // converted: so far one missing secret and `i` store outages.
+            logs_assert(|lines: &[&str]| {
+                assert_log_count(lines, "auth plugin: credential not accessible", 1)?;
+                assert_log_count(lines, "auth plugin: credential store unavailable", i)
+            });
         }
         assert!(logs_contain("executing auth plugin"));
         assert!(!logs_contain("leaked-ref-77"));
+    }
+
+    /// Fails unless exactly `expected` log lines contain `message`.
+    fn assert_log_count(lines: &[&str], message: &str, expected: usize) -> Result<(), String> {
+        let found: Vec<_> = lines.iter().filter(|l| l.contains(message)).collect();
+        if found.len() == expected {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected {expected} line(s) with {message:?}, got {found:#?}"
+            ))
+        }
+    }
+
+    /// An identity provider outage and an invalid IdP response are each
+    /// warned once, by the auth plugin step with the request's identifiers;
+    /// the REST conversions, which run more than once per error, only log at
+    /// debug.
+    #[test]
+    #[tracing_test::traced_test]
+    fn idp_failures_warn_once() {
+        use toolkit_canonical_errors::CanonicalError;
+
+        let scope = AuthScope {
+            caller_tenant_id: uuid::Uuid::nil(),
+            upstream_id: uuid::Uuid::nil(),
+            upstream_alias: "idp-upstream",
+            plugin_type: "oauth2-test",
+        };
+        let cases = [
+            (
+                PluginError::IdpUnavailable("token endpoint returned 503".into()),
+                "auth plugin: OAuth2 identity provider unavailable",
+                "token endpoint returned 503",
+            ),
+            (
+                PluginError::IdpInvalidResponse("unsupported token type: mac".into()),
+                "auth plugin: identity provider sent an invalid response",
+                "unsupported token type: mac",
+            ),
+        ];
+        let mut checks = Vec::new();
+        for (plugin_err, message, detail) in cases {
+            let err = auth_plugin_error(plugin_err, "/i", scope);
+            for _ in 0..3 {
+                let _ = CanonicalError::from(err.clone());
+            }
+            checks.push((message, detail));
+        }
+
+        logs_assert(|lines: &[&str]| {
+            for (message, detail) in &checks {
+                let warns: Vec<_> = lines
+                    .iter()
+                    .filter(|l| l.contains(" WARN ") && l.contains(detail))
+                    .collect();
+                match warns.as_slice() {
+                    [line]
+                        if line.contains(message)
+                            && line.contains("upstream_alias=\"idp-upstream\"")
+                            && line.contains("plugin=\"oauth2-test\"") => {}
+                    other => {
+                        return Err(format!(
+                            "expected one warn {message:?} with the scope, got {other:#?}"
+                        ));
+                    }
+                }
+                assert_log_count(lines, message, 1)?;
+            }
+            Ok(())
+        });
     }
 
     /// The auth plugin sets only its own header. Repeated client headers and
@@ -4235,7 +4437,7 @@ pub(crate) mod tests {
             )),
         );
         let (upstream, _) = apikey_target("cred://k");
-        let auth = upstream.auth.unwrap();
+        let auth = upstream.auth.clone().unwrap();
 
         let raw = HeaderValue::from_bytes(b"caf\xe9").unwrap();
         let mut headers = HeaderMap::new();
@@ -4245,9 +4447,16 @@ pub(crate) mod tests {
         headers.append("authorization", HeaderValue::from_static("Bearer client-1"));
         headers.append("authorization", HeaderValue::from_static("Bearer client-2"));
 
-        execute_auth_plugin(&svc.auth_registry, &auth, &mut headers, &test_ctx(), "/i")
-            .await
-            .unwrap();
+        execute_auth_plugin(
+            &svc.auth_registry,
+            &upstream,
+            &auth,
+            &mut headers,
+            &test_ctx(),
+            "/i",
+        )
+        .await
+        .unwrap();
 
         let multi: Vec<_> = headers.get_all("x-multi").iter().collect();
         assert_eq!(multi, ["a", "b"]);
@@ -4255,6 +4464,16 @@ pub(crate) mod tests {
         let auth_lines: Vec<_> = headers.get_all("authorization").iter().collect();
         assert_eq!(auth_lines, ["Bearer sk-1"]);
         assert!(auth_lines[0].is_sensitive());
+    }
+
+    /// A scope for calling `auth_plugin_error` directly.
+    fn test_auth_scope() -> AuthScope<'static> {
+        AuthScope {
+            caller_tenant_id: uuid::Uuid::nil(),
+            upstream_id: uuid::Uuid::nil(),
+            upstream_alias: "test",
+            plugin_type: "test",
+        }
     }
 
     /// A header the plugin cannot set fails the request instead of sending
@@ -4278,14 +4497,84 @@ pub(crate) mod tests {
         assert!(!msg.contains("sk-1"), "{msg}");
         assert!(headers.is_empty(), "{headers:?}");
 
-        match auth_plugin_error(err, "/i") {
-            DomainError::Validation {
-                field: f, reason, ..
-            } => {
-                assert_eq!(f, "plugin");
-                assert_eq!(reason, field::INVALID_PLUGIN_CONFIG);
+        match auth_plugin_error(err, "/i", test_auth_scope()) {
+            DomainError::Internal { message } => {
+                assert!(message.contains("authorization"), "{message}");
+                assert!(!message.contains("sk-1"), "{message}");
             }
-            other => panic!("expected a plugin config error, got {other:?}"),
+            other => panic!("expected a misconfiguration (internal), got {other:?}"),
+        }
+    }
+
+    /// Every auth plugin error goes through one mapping, whichever plugin
+    /// raised it: the status and reason the REST layer sends for each.
+    #[test]
+    fn auth_plugin_errors_have_one_mapping() {
+        use oagw_sdk::reason::{auth, unavailable};
+        use std::time::Duration;
+        use toolkit_canonical_errors::{CanonicalError, Problem};
+
+        let cases: Vec<(PluginError, u16, Option<&str>)> = vec![
+            (
+                PluginError::SecretNotFound {
+                    key: "secret_ref",
+                    kind: "secret not found",
+                },
+                401,
+                Some(auth::CREDENTIAL_NOT_FOUND),
+            ),
+            (
+                PluginError::CredentialStoreUnavailable {
+                    detail: "credential store unavailable for auth.config.secret_ref".into(),
+                    retry_after: Some(Duration::from_secs(9)),
+                },
+                503,
+                Some(unavailable::CREDENTIAL_STORE_UNAVAILABLE),
+            ),
+            (
+                PluginError::IdpUnavailable("token endpoint returned 503".into()),
+                503,
+                Some(unavailable::IDENTITY_PROVIDER_UNAVAILABLE),
+            ),
+            (
+                PluginError::IdpInvalidResponse("unsupported token type: mac".into()),
+                502,
+                Some(unavailable::REQUEST_NOT_SENT),
+            ),
+            (
+                PluginError::AuthFailed("identity provider rejected the client".into()),
+                401,
+                Some(auth::PLUGIN_FAILED),
+            ),
+            (
+                PluginError::Rejected("refused".into()),
+                401,
+                Some(auth::PLUGIN_FAILED),
+            ),
+            (
+                PluginError::InvalidConfig("missing client_id_ref".into()),
+                500,
+                None,
+            ),
+            (
+                PluginError::Internal("secret value is not valid UTF-8".into()),
+                401,
+                Some(auth::PLUGIN_INTERNAL),
+            ),
+        ];
+        for (err, status, reason) in cases {
+            let label = format!("{err:?}");
+            let problem = Problem::from(CanonicalError::from(auth_plugin_error(
+                err,
+                "/i",
+                test_auth_scope(),
+            )));
+            assert_eq!(problem.status, Some(status), "{label}");
+            assert_eq!(
+                problem.context.get("reason").and_then(|r| r.as_str()),
+                reason,
+                "{label}"
+            );
         }
     }
 
@@ -4305,16 +4594,23 @@ pub(crate) mod tests {
             )),
         );
         let (upstream, _) = apikey_target("cred://k");
-        let auth = upstream.auth.unwrap();
+        let auth = upstream.auth.clone().unwrap();
 
         let raw = HeaderValue::from_bytes(b"caf\xe9").unwrap();
         let mut headers = HeaderMap::new();
         headers.append("x-multi", HeaderValue::from_static("a"));
         headers.append("x-multi", HeaderValue::from_static("b"));
         headers.insert("x-raw", raw.clone());
-        execute_auth_plugin(&svc.auth_registry, &auth, &mut headers, &test_ctx(), "/i")
-            .await
-            .unwrap();
+        execute_auth_plugin(
+            &svc.auth_registry,
+            &upstream,
+            &auth,
+            &mut headers,
+            &test_ctx(),
+            "/i",
+        )
+        .await
+        .unwrap();
 
         let request_id = crate::domain::model::PluginBinding {
             plugin_ref: crate::domain::gts_helpers::REQUEST_ID_TRANSFORM_PLUGIN_ID.into(),
@@ -4441,9 +4737,17 @@ pub(crate) mod tests {
             sharing: SharingMode::Private,
             config: None,
         };
-        match execute_auth_plugin(&svc.auth_registry, &auth, &mut HeaderMap::new(), &ctx, "/i")
-            .await
-            .map(|_| ())
+        let (upstream, _) = apikey_target("cred://k");
+        match execute_auth_plugin(
+            &svc.auth_registry,
+            &upstream,
+            &auth,
+            &mut HeaderMap::new(),
+            &ctx,
+            "/i",
+        )
+        .await
+        .map(|_| ())
         {
             Err(DomainError::AuthenticationFailed { reason: r, .. }) => {
                 assert_eq!(r, reason::auth::PLUGIN_NOT_FOUND);
@@ -4738,6 +5042,70 @@ pub(crate) mod tests {
             Some(local_target(port)),
         )
         .with_allow_http_upstream(true)
+    }
+
+    /// An endpoint selection that does not answer by the request deadline
+    /// is a 504 that tells the client nothing was sent
+    /// (`REQUEST_NOT_SENT`), so any method may be retried.
+    #[tokio::test]
+    async fn a_hung_endpoint_selection_times_out_as_not_sent() {
+        use oagw_sdk::ServiceGatewayError;
+        use oagw_sdk::reason::timeout::TimeoutReason;
+        use toolkit_canonical_errors::CanonicalError;
+
+        struct Hangs;
+        #[async_trait]
+        impl EndpointSelector for Hangs {
+            async fn select(
+                &self,
+                _upstream_id: Uuid,
+                _endpoints: &[Endpoint],
+            ) -> Result<SelectedEndpoint, SelectionError> {
+                std::future::pending().await
+            }
+
+            fn invalidate(&self, _upstream_id: Uuid) {}
+        }
+
+        // Two endpoints, so the selector is asked.
+        let (mut upstream, route) = local_target(1);
+        upstream.server.endpoints.push(Endpoint {
+            scheme: Scheme::Http,
+            host: "127.0.0.2".into(),
+            port: 1,
+        });
+        let svc = build_svc_resolving(
+            Arc::new(Hangs),
+            Arc::new(crate::domain::ports::NoopMetrics),
+            Some((upstream, route)),
+        )
+        .with_allow_http_upstream(true)
+        .with_request_timeout(Duration::from_millis(50));
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DomainError::RequestTimeout {
+                    dispatch: Dispatch::NotSent,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let canonical = CanonicalError::from(err);
+        assert_eq!(canonical.status_code(), 504);
+        assert!(
+            matches!(
+                ServiceGatewayError::from(canonical),
+                ServiceGatewayError::Timeout {
+                    reason: Some(TimeoutReason::RequestNotSent)
+                }
+            ),
+            "selection timeout"
+        );
     }
 
     const CHUNKED_HEAD: &[u8] =

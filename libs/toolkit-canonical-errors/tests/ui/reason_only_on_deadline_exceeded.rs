@@ -9,6 +9,6 @@ fn main() {
     // with_reason is offered on deadline_exceeded only, not on other
     // categories without a context
     let _err = UserResourceError::unimplemented("Not implemented")
-        .with_reason("UPSTREAM_NOT_CONTACTED")
+        .with_reason("REQUEST_NOT_SENT")
         .create();
 }

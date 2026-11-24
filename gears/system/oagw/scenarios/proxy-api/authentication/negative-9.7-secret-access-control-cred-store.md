@@ -23,6 +23,7 @@ Expected:
 - `401 Unauthorized`
 - `Content-Type: application/problem+json`
 - `X-OAGW-Error-Source: gateway`
+- `type` = `...unauthenticated...`, `context.reason` = `AUTH_CREDENTIAL_NOT_FOUND`: a secret the tenant cannot read answers the same as a missing one (Scenario B).
 
 ## Scenario B: secret missing
 
@@ -33,9 +34,29 @@ Expected on create or update of the upstream:
 
 A reference the credential store refuses for another reason (for example access denied) is a `400` `...invalid_argument...` field violation on the key, reason `VALIDATION`; a store that is down or does not answer within 5 s is a `500`.
 
-The write-time check is best effort. If the secret is deleted after the write, expected at proxy time:
-- `500 Internal Server Error` with the canonical `type` = `...internal...` and a generic `detail`. (The status for a secret missing at proxy time is an open #4985 decision; xfail PLG-10 tracks a 401.)
-- The response does not contain the reference. The server log names the auth config key (`auth.config.secret_ref`, `auth.config.client_id_ref` or `auth.config.client_secret_ref`) and never the reference, nor the credential store's own error text, which may quote it. The same holds when the credential store fails at proxy time. Log content is covered by Rust tests; E2E checks the response.
+The write-time check is best effort. If the secret is deleted after the write, expected at proxy time, for every auth plugin (API key and OAuth2 alike):
+
+```http
+HTTP/1.1 401 Unauthorized
+Content-Type: application/problem+json
+X-OAGW-Error-Source: gateway
+```
+
+```json
+{
+  "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~",
+  "title": "Unauthenticated",
+  "status": 401,
+  "detail": "Authentication required",
+  "instance": "/oagw/v1/proxy/<alias>/<path>",
+  "context": { "reason": "AUTH_CREDENTIAL_NOT_FOUND" },
+  "trace_id": "<trace id>"
+}
+```
+
+- The upstream receives nothing.
+- The SDK gets `AuthFailed` with `FailureReason::CredentialNotFound`.
+- The response names neither the auth config key nor the reference. The server log names the auth config key (`auth.config.secret_ref`, `auth.config.client_id_ref` or `auth.config.client_secret_ref`) and never the reference, nor the credential store's own error text, which may quote it. The same holds when the credential store fails at proxy time. Log content is covered by Rust tests; E2E checks the response.
 
 ## Scenario C: malformed reference
 

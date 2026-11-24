@@ -181,7 +181,7 @@ async fn read_capped(body: Body) -> Result<Vec<u8>, ModelError> {
 fn gateway_error(error: &ServiceGatewayError) -> ModelError {
     let refused = |variant: &str| ModelError::Refused(format!("OAGW {variant}"));
     match error {
-        ServiceGatewayError::Timeout => ModelError::Timeout,
+        ServiceGatewayError::Timeout { .. } => ModelError::Timeout,
         ServiceGatewayError::RateLimited { .. } => {
             ModelError::Unavailable("OAGW RateLimited".to_owned())
         }

@@ -2003,6 +2003,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::DownstreamError {
                 detail: d(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             None,
         ),
@@ -2010,6 +2011,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::LinkUnavailable {
                 detail: d(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::NotSent,
             },
             None,
         ),
@@ -2025,6 +2027,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::ConnectionTimeout {
                 detail: d(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::NotSent,
             },
             None,
         ),
@@ -2032,6 +2035,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::RequestTimeout {
                 detail: d(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             None,
         ),
@@ -2043,9 +2047,24 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             None,
         ),
         (
+            DomainError::IdpUnavailable {
+                detail: d(),
+                instance: i(),
+            },
+            None,
+        ),
+        (
+            DomainError::IdpInvalidResponse {
+                detail: d(),
+                instance: i(),
+            },
+            None,
+        ),
+        (
             DomainError::StreamAborted {
                 detail: d(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             None,
         ),
@@ -2053,6 +2072,7 @@ fn every_domain_error_is_fatal_or_has_a_reason() {
             DomainError::ProtocolError {
                 detail: d(),
                 instance: i(),
+                dispatch: crate::domain::error::Dispatch::MaybeSent,
             },
             None,
         ),

@@ -1,4 +1,5 @@
 """E2E tests for OAGW error handling (gateway vs upstream error source)."""
+import socket
 import time
 
 import httpx
@@ -7,12 +8,26 @@ import pytest
 from .helpers import (
     ROUTE_SCHEMA,
     UPSTREAM_SCHEMA,
+    assert_gateway_problem_body,
     assert_problem,
     create_route,
     create_upstream,
+    service_unavailable,
+    traced,
     unique_alias,
     update_upstream,
 )
+
+REQUEST_NOT_SENT = "REQUEST_NOT_SENT"
+REQUEST_MAY_HAVE_BEEN_SENT = "REQUEST_MAY_HAVE_BEEN_SENT"
+UPSTREAM_DISABLED = "UPSTREAM_DISABLED"
+
+
+def _closed_port() -> int:
+    """A loopback port nothing listens on: bound, then released."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 @pytest.mark.scenario("negative-6.4-alias-not-found-returns-stable-404")
@@ -73,10 +88,9 @@ async def test_known_alias_without_matching_route_returns_404_gateway(
 async def test_disabled_upstream_returns_503_gateway(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
-    """Scenario 2.6: disabling a working upstream blocks proxy traffic with 503.
-
-    `Retry-After: 30` (the administrative delay) separates this from the
-    transient 503 an unreachable endpoint gets (`Retry-After: 5`).
+    """Scenario 2.6: disabling a working upstream blocks proxy traffic with a
+    503 whose reason says so. `Retry-After: 300` is long: only an operator
+    can enable the upstream again.
     """
     _ = mock_upstream
     alias = unique_alias("err-disabled")
@@ -95,9 +109,11 @@ async def test_disabled_upstream_returns_503_gateway(
             client, oagw_base_url, oagw_headers, upstream["id"], mock_upstream_url,
             alias=alias, enabled=False,
         )
-        resp = await client.get(url, headers=oagw_headers)
-        assert_problem(resp, 503, category="service_unavailable")
-        assert resp.headers.get("retry-after") == "30"
+        resp = await client.get(url, headers=traced(oagw_headers))
+        assert_gateway_problem_body(resp, service_unavailable(
+            503, f"/oagw/v1/proxy/{alias}/v1/models", 300, UPSTREAM_DISABLED,
+        ))
+        assert resp.headers.get("retry-after") == "300"
 
 
 @pytest.mark.scenario("negative-2.6-disable-upstream-blocks-proxy-traffic")
@@ -148,6 +164,94 @@ async def test_disabled_descendant_upstream_does_not_fall_through(
             url, headers=hierarchy_l1a_headers,
         )
         assert_problem(resp, 503, category="service_unavailable")
+
+
+@pytest.mark.scenario("negative-12.8-transport-failure-before-sending-request-not-sent")
+@pytest.mark.asyncio
+async def test_connection_refused_is_502_request_not_sent(
+    oagw_base_url, oagw_headers, cleanup,
+):
+    """Scenario 12.8: a refused connection is a 502 that says the request
+    never reached the upstream, so any method may be retried."""
+    alias = unique_alias("err-refused")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, f"http://127.0.0.1:{_closed_port()}",
+            alias=alias,
+        ))
+        await create_route(
+            client, oagw_base_url, oagw_headers, upstream["id"], ["POST"], "/v1/chat",
+        )
+        resp = await client.post(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/chat",
+            headers=traced(oagw_headers), json={"n": 1},
+        )
+        assert_gateway_problem_body(resp, service_unavailable(
+            502, f"/oagw/v1/proxy/{alias}/v1/chat", 5, REQUEST_NOT_SENT,
+        ))
+        assert resp.headers.get("retry-after") == "5"
+
+
+@pytest.mark.scenario("negative-12.9-transport-failure-after-sending-request-may-have-been-sent")
+@pytest.mark.asyncio
+async def test_peer_closed_is_502_request_may_have_been_sent(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 12.9: the upstream reads the request and closes the
+    connection without an answer: a 502 that says the request may have
+    been sent, so only an idempotent request may be retried."""
+    _ = mock_upstream
+    alias = unique_alias("err-dropped")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
+        await create_route(
+            client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], "/drop",
+        )
+        resp = await client.get(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/drop", headers=traced(oagw_headers),
+        )
+        assert_gateway_problem_body(resp, service_unavailable(
+            502, f"/oagw/v1/proxy/{alias}/drop", 5, REQUEST_MAY_HAVE_BEEN_SENT,
+        ))
+
+
+@pytest.mark.scenario("negative-12.2-upstream-error-passthrough-esrc-upstream")
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "status", "header", "value", "body"),
+    [
+        pytest.param("/busy", 503, "retry-after", "120", {"error": "busy"}, id="retry-after"),
+        pytest.param(
+            "/challenge", 401, "www-authenticate",
+            'Bearer realm="mock", error="invalid_token"', {"error": "invalid_token"},
+            id="www-authenticate",
+        ),
+    ],
+)
+async def test_upstream_error_headers_pass_through(
+    path, status, header, value, body,
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 12.2: an upstream error keeps its own `Retry-After` and
+    `WWW-Authenticate`; the gateway does not replace them with its own."""
+    _ = mock_upstream
+    alias = unique_alias("err-hdr")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
+        await create_route(
+            client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], path,
+        )
+        resp = await client.get(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}{path}", headers=oagw_headers,
+        )
+        assert resp.status_code == status, resp.text[:300]
+        assert resp.headers.get("x-oagw-error-source") == "upstream"
+        assert resp.headers.get_list(header) == [value], resp.headers
+        assert resp.json() == body
 
 
 @pytest.mark.scenario("negative-12.2-upstream-error-passthrough-esrc-upstream")

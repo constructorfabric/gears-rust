@@ -1731,8 +1731,14 @@ async fn proxy_upstream_timeout_returns_504() {
         .uri(format!("/timeout-upstream{}", guard.path("/timeout")))
         .body(Body::Empty)
         .unwrap();
+    // The request went out before the deadline: a retry is safe only for
+    // idempotent methods.
     match h.facade().proxy_request(ctx.clone(), req).await {
-        Err(err) => assert!(matches!(err, CanonicalError::DeadlineExceeded { .. })),
+        Err(CanonicalError::DeadlineExceeded { ctx, .. }) => assert_eq!(
+            ctx.reason.as_deref(),
+            Some(oagw_sdk::reason::timeout::REQUEST_MAY_HAVE_BEEN_SENT)
+        ),
+        Err(err) => panic!("expected DeadlineExceeded, got {err:?}"),
         Ok(_) => panic!("expected timeout error"),
     }
 }
@@ -2491,24 +2497,19 @@ async fn proxy_all_backends_unreachable() {
         .body(Body::Empty)
         .unwrap();
 
-    match h.facade().proxy_request(ctx.clone(), req).await {
-        Err(err) => assert!(
-            matches!(err, CanonicalError::ServiceUnavailable { .. }),
-            "expected DownstreamError for unreachable backend, got: {err:?}"
-        ),
-        Ok(resp) => {
-            // A gateway-generated error response. An unreachable backend maps to 502 (DownstreamError
-            // — connection refused/closed), 503 (LinkUnavailable — no route),
-            // or 504 (connect timeout), depending on how the connection fails.
-            assert!(
-                resp.status() == StatusCode::BAD_GATEWAY
-                    || resp.status() == StatusCode::SERVICE_UNAVAILABLE
-                    || resp.status() == StatusCode::GATEWAY_TIMEOUT,
-                "expected 502, 503, or 504, got: {}",
-                resp.status()
-            );
-        }
-    }
+    // Nothing listens on the port: the connection is refused, a 502 that
+    // says the upstream was not contacted.
+    let err = h
+        .facade()
+        .proxy_request(ctx.clone(), req)
+        .await
+        .expect_err("an unreachable backend is a gateway error");
+    assert_eq!(err.status_code(), 502, "{err:?}");
+    assert!(
+        matches!(&err, CanonicalError::ServiceUnavailable { ctx, .. }
+            if ctx.reason.as_deref() == Some(oagw_sdk::reason::unavailable::REQUEST_NOT_SENT)),
+        "{err:?}"
+    );
 }
 
 // positive-2.13 (upstreams): CRUD invalidation — update upstream endpoints, verify new endpoint used.

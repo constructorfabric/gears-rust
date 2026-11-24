@@ -47,9 +47,13 @@ X-OAGW-Error-Source: gateway
   "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
   "title": "Service Unavailable",
   "status": 503,
+  "detail": "Service temporarily unavailable",
+  "context": { "retry_after_seconds": 30, "reason": "REQUEST_NOT_SENT" },
   ...
 }
 ```
+
+- `context.reason` is `REQUEST_NOT_SENT`: the request was not sent, so a retry is safe for any method.
 
 - `Retry-After` is the time left until the circuit lets a probe through, in whole seconds rounded up (at least 1), so it counts down on later requests.
 - Any other status (`2xx`, `3xx`, `4xx`, `500`, `501`) is a success and resets the count: `503`, `200`, `503` does not open a circuit with `failure_threshold: 2`.

@@ -1,3 +1,4 @@
+use oagw_sdk::reason::{timeout::TimeoutReason, unavailable::UnavailableReason};
 use oagw_sdk::{field, reason};
 use toolkit_macros::domain_model;
 use uuid::Uuid;
@@ -14,6 +15,42 @@ pub enum DeniedOn {
     Upstream,
     /// The route resource (management).
     Route,
+}
+
+/// Whether a failed upstream exchange may have reached the upstream. Set
+/// from the engine's error kind (or the step that failed) where the error
+/// is raised; the REST mapping sends it as the `reason` of the 502, 503 or
+/// 504.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dispatch {
+    /// No byte of the request left the gateway in any attempt: no
+    /// connection, a failed TLS handshake, or a failure before sending.
+    /// Any method can be retried.
+    NotSent,
+    /// The request, or part of it, may have reached the upstream. Only an
+    /// idempotent request can be retried.
+    MaybeSent,
+}
+
+impl Dispatch {
+    /// The reason for a 502 or 503 at this stage.
+    #[must_use]
+    pub fn unavailable_reason(self) -> UnavailableReason {
+        match self {
+            Self::NotSent => UnavailableReason::RequestNotSent,
+            Self::MaybeSent => UnavailableReason::RequestMayHaveBeenSent,
+        }
+    }
+
+    /// The reason for a 504 at this stage.
+    #[must_use]
+    pub fn timeout_reason(self) -> TimeoutReason {
+        match self {
+            Self::NotSent => TimeoutReason::RequestNotSent,
+            Self::MaybeSent => TimeoutReason::RequestMayHaveBeenSent,
+        }
+    }
 }
 
 /// Domain-layer errors for OAGW control-plane and data-plane operations.
@@ -146,7 +183,9 @@ pub enum DomainError {
         reset_epoch: Option<u64>,
     },
 
-    /// A secret referenced by the upstream auth config could not be found at request time.
+    /// A secret referenced by the upstream auth config is missing from the
+    /// credential store, or not accessible to the tenant, at request time.
+    /// Canonical `unauthenticated` (401), reason `AUTH_CREDENTIAL_NOT_FOUND`.
     #[error("{detail}")]
     SecretNotFound {
         /// Human-readable explanation of the failure.
@@ -161,8 +200,7 @@ pub enum DomainError {
     /// succeeds once the secret becomes accessible, so in-process callers
     /// (gear provisioning loops) can distinguish it from `Validation` and
     /// retry. Maps to canonical `failed_precondition` (HTTP 400), unlike the
-    /// request-time [`DomainError::SecretNotFound`] which is a server-side
-    /// config failure (500).
+    /// request-time [`DomainError::SecretNotFound`] (401).
     #[error("{detail}")]
     SecretRefNotAccessible {
         /// The auth config key that holds the reference, for example
@@ -174,8 +212,9 @@ pub enum DomainError {
         instance: String,
     },
 
-    /// The credential store failed or timed out while a `request_ref`
-    /// request read its secret (ADR-0022). Canonical `service_unavailable`.
+    /// The credential store failed or timed out while a request read its
+    /// secret (an auth plugin, or `request_ref` mode, ADR-0022). Canonical
+    /// `service_unavailable` (503), reason `CREDENTIAL_STORE_UNAVAILABLE`.
     #[error("{detail}")]
     CredentialStoreUnavailable {
         /// Human-readable explanation of the failure; never names the
@@ -188,6 +227,29 @@ pub enum DomainError {
         instance: String,
     },
 
+    /// The token endpoint of the identity provider an auth plugin fetches a
+    /// token from failed: transport error, timeout, 408, 429 or 5xx.
+    /// Canonical `service_unavailable` (503), reason
+    /// `IDENTITY_PROVIDER_UNAVAILABLE`; the upstream was not contacted.
+    #[error("{detail}")]
+    IdpUnavailable {
+        /// Human-readable explanation of the failure; never names a secret.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
+
+    /// The identity provider an auth plugin fetches a token from answered
+    /// with an invalid response. Canonical `service_unavailable` with a 502
+    /// override; the upstream was not contacted.
+    #[error("{detail}")]
+    IdpInvalidResponse {
+        /// Human-readable explanation of the failure; never names a secret.
+        detail: String,
+        /// Request instance URI the error relates to (used as the problem `instance`).
+        instance: String,
+    },
+
     /// The upstream returned an invalid or failing response.
     #[error("{detail}")]
     DownstreamError {
@@ -195,6 +257,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Whether the request may have reached the upstream.
+        dispatch: Dispatch,
     },
 
     /// The upstream violated the protocol (e.g. malformed HTTP).
@@ -204,6 +268,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Whether the request may have reached the upstream.
+        dispatch: Dispatch,
     },
 
     /// Connecting to the upstream timed out.
@@ -213,6 +279,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Whether the request may have reached the upstream.
+        dispatch: Dispatch,
     },
 
     /// The upstream did not respond within the request timeout.
@@ -222,6 +290,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Whether the request may have reached the upstream.
+        dispatch: Dispatch,
     },
 
     /// A guard plugin rejected the request with a specific status and error code.
@@ -267,6 +337,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Whether the request may have reached the upstream.
+        dispatch: Dispatch,
     },
 
     /// The upstream link is unavailable (e.g. no healthy endpoint or connection refused).
@@ -276,6 +348,8 @@ pub enum DomainError {
         detail: String,
         /// Request instance URI the error relates to (used as the problem `instance`).
         instance: String,
+        /// Whether the request may have reached the upstream.
+        dispatch: Dispatch,
     },
 
     /// The circuit breaker for the upstream is open.

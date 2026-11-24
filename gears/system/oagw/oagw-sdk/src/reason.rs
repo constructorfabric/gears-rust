@@ -13,6 +13,8 @@
 //!
 //! * [`auth`] — values for `CanonicalError::Unauthenticated.ctx.reason`
 //! * [`permission`] — values for `CanonicalError::PermissionDenied.ctx.reason`
+//! * [`unavailable`] — values for `CanonicalError::ServiceUnavailable.ctx.reason`
+//! * [`timeout`] — values for `CanonicalError::DeadlineExceeded.ctx.reason`
 //!
 //! For field-violation reasons (which live in
 //! `CanonicalError::InvalidArgument.ctx.field_violations[].reason`) see
@@ -59,6 +61,12 @@ pub mod auth {
     /// can usually be retried.
     pub const PLUGIN_INTERNAL: &str = "AUTH_PLUGIN_INTERNAL";
 
+    /// A secret the upstream's auth config references is missing from the
+    /// credential store, or not accessible to the calling tenant. The
+    /// gateway log names the config key. Retrying does not help until the
+    /// secret is provisioned or shared.
+    pub const CREDENTIAL_NOT_FOUND: &str = "AUTH_CREDENTIAL_NOT_FOUND";
+
     use core::fmt;
 
     /// Typed view of the wire `reason` strings emitted alongside
@@ -75,6 +83,9 @@ pub mod auth {
         PluginFailed,
         /// See [`PLUGIN_INTERNAL`]. Transient — retry usually clears it.
         PluginInternal,
+        /// See [`CREDENTIAL_NOT_FOUND`]. Operator action needed (provision
+        /// or share the secret); retry won't help.
+        CredentialNotFound,
         /// Unknown / unmodeled reason — preserves the raw wire string.
         Unknown(String),
     }
@@ -89,6 +100,7 @@ pub mod auth {
                 PLUGIN_NOT_FOUND => Self::PluginNotFound,
                 PLUGIN_FAILED => Self::PluginFailed,
                 PLUGIN_INTERNAL => Self::PluginInternal,
+                CREDENTIAL_NOT_FOUND => Self::CredentialNotFound,
                 other => Self::Unknown(other.to_owned()),
             }
         }
@@ -100,6 +112,7 @@ pub mod auth {
                 Self::PluginNotFound => PLUGIN_NOT_FOUND,
                 Self::PluginFailed => PLUGIN_FAILED,
                 Self::PluginInternal => PLUGIN_INTERNAL,
+                Self::CredentialNotFound => CREDENTIAL_NOT_FOUND,
                 Self::Unknown(s) => s.as_str(),
             }
         }
@@ -228,6 +241,173 @@ pub mod permission {
     }
 
     impl fmt::Display for DenialReason {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_wire())
+        }
+    }
+}
+
+/// Wire `reason` values for [`CanonicalError::ServiceUnavailable`] emitted
+/// by the OAGW data plane (HTTP 502 and 503).
+///
+/// A 502 or 503 from the upstream exchange always carries one of the two
+/// dispatch reasons, [`REQUEST_NOT_SENT`] or
+/// [`REQUEST_MAY_HAVE_BEEN_SENT`], so a client can tell whether a retry of a
+/// non-idempotent request is safe. The other reasons also mean the request
+/// was not sent; [`crate::ServiceGatewayError::request_not_sent`] covers all
+/// of them.
+///
+/// [`CanonicalError::ServiceUnavailable`]: toolkit_canonical_errors::CanonicalError::ServiceUnavailable
+pub mod unavailable {
+    /// No byte of the HTTP request was sent, in any attempt: the
+    /// connection was refused, the host did not resolve or was refused by
+    /// the SSRF policy, the TLS handshake or certificate check failed, the
+    /// circuit breaker is open, or the gateway failed before sending. TCP
+    /// or TLS setup may have reached the upstream; the request did not.
+    /// Safe to retry for any method.
+    pub const REQUEST_NOT_SENT: &str = "REQUEST_NOT_SENT";
+
+    /// The request, or part of it, may have reached the upstream before the
+    /// exchange failed (connection closed, read or write error, HTTP/2 or
+    /// protocol error), or in an earlier attempt the gateway resent, even
+    /// when the resend failed to connect. Retry only an idempotent request.
+    pub const REQUEST_MAY_HAVE_BEEN_SENT: &str = "REQUEST_MAY_HAVE_BEEN_SENT";
+
+    /// The upstream is disabled by its configuration. Only an operator can
+    /// enable it again; `retry_after_seconds` is a long hint.
+    pub const UPSTREAM_DISABLED: &str = "UPSTREAM_DISABLED";
+
+    /// The credential store an auth plugin, or a `request_ref` secret
+    /// reference, reads secrets from is unavailable. `retry_after_seconds`
+    /// carries the store's own hint when it gave one. The upstream was not
+    /// contacted.
+    pub const CREDENTIAL_STORE_UNAVAILABLE: &str = "CREDENTIAL_STORE_UNAVAILABLE";
+
+    /// The OAuth2 identity provider's token endpoint an auth plugin calls
+    /// failed: transport error, timeout, 408, 429 or 5xx. Retry later. The
+    /// upstream was not contacted.
+    pub const IDENTITY_PROVIDER_UNAVAILABLE: &str = "IDENTITY_PROVIDER_UNAVAILABLE";
+
+    use core::fmt;
+
+    /// Typed view of the wire `reason` strings emitted alongside
+    /// `CanonicalError::ServiceUnavailable` by the OAGW data plane.
+    ///
+    /// Carried by [`crate::ServiceGatewayError::Unavailable::reason`].
+    /// [`Self::Unknown`] preserves any value the SDK does not specifically
+    /// model so the projection stays forward-compatible.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum UnavailableReason {
+        /// See [`REQUEST_NOT_SENT`].
+        RequestNotSent,
+        /// See [`REQUEST_MAY_HAVE_BEEN_SENT`].
+        RequestMayHaveBeenSent,
+        /// See [`UPSTREAM_DISABLED`].
+        UpstreamDisabled,
+        /// See [`CREDENTIAL_STORE_UNAVAILABLE`].
+        CredentialStoreUnavailable,
+        /// See [`IDENTITY_PROVIDER_UNAVAILABLE`].
+        IdentityProviderUnavailable,
+        /// Unmodeled reason — preserves the raw wire string.
+        Unknown(String),
+    }
+
+    impl UnavailableReason {
+        /// Project a wire `ServiceUnavailable.ctx.reason` string into the
+        /// typed discriminator.
+        #[must_use]
+        pub fn from_wire(s: &str) -> Self {
+            match s {
+                REQUEST_NOT_SENT => Self::RequestNotSent,
+                REQUEST_MAY_HAVE_BEEN_SENT => Self::RequestMayHaveBeenSent,
+                UPSTREAM_DISABLED => Self::UpstreamDisabled,
+                CREDENTIAL_STORE_UNAVAILABLE => Self::CredentialStoreUnavailable,
+                IDENTITY_PROVIDER_UNAVAILABLE => Self::IdentityProviderUnavailable,
+                other => Self::Unknown(other.to_owned()),
+            }
+        }
+
+        /// Render the discriminator back to its wire `reason` string.
+        #[must_use]
+        pub fn as_wire(&self) -> &str {
+            match self {
+                Self::RequestNotSent => REQUEST_NOT_SENT,
+                Self::RequestMayHaveBeenSent => REQUEST_MAY_HAVE_BEEN_SENT,
+                Self::UpstreamDisabled => UPSTREAM_DISABLED,
+                Self::CredentialStoreUnavailable => CREDENTIAL_STORE_UNAVAILABLE,
+                Self::IdentityProviderUnavailable => IDENTITY_PROVIDER_UNAVAILABLE,
+                Self::Unknown(s) => s.as_str(),
+            }
+        }
+    }
+
+    impl fmt::Display for UnavailableReason {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.as_wire())
+        }
+    }
+}
+
+/// Wire `reason` values for [`CanonicalError::DeadlineExceeded`] emitted
+/// by the OAGW data plane (HTTP 504).
+///
+/// The same two dispatch reasons as [`unavailable`](super::unavailable): whether
+/// the request may have reached the upstream before the timeout.
+///
+/// [`CanonicalError::DeadlineExceeded`]: toolkit_canonical_errors::CanonicalError::DeadlineExceeded
+pub mod timeout {
+    /// The timeout hit before any byte of the request was sent (connect
+    /// timeout, endpoint selection, DNS, signing). Safe to retry for any
+    /// method.
+    pub const REQUEST_NOT_SENT: &str = super::unavailable::REQUEST_NOT_SENT;
+
+    /// The timeout hit after the request, or part of it, may have been
+    /// sent (read or write timeout, request timeout). Retry only an
+    /// idempotent request.
+    pub const REQUEST_MAY_HAVE_BEEN_SENT: &str = super::unavailable::REQUEST_MAY_HAVE_BEEN_SENT;
+
+    use core::fmt;
+
+    /// Typed view of the wire `reason` strings emitted alongside
+    /// `CanonicalError::DeadlineExceeded` by the OAGW data plane.
+    ///
+    /// Carried by [`crate::ServiceGatewayError::Timeout::reason`].
+    /// [`Self::Unknown`] preserves any value the SDK does not specifically
+    /// model so the projection stays forward-compatible.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TimeoutReason {
+        /// See [`REQUEST_NOT_SENT`].
+        RequestNotSent,
+        /// See [`REQUEST_MAY_HAVE_BEEN_SENT`].
+        RequestMayHaveBeenSent,
+        /// Unmodeled reason — preserves the raw wire string.
+        Unknown(String),
+    }
+
+    impl TimeoutReason {
+        /// Project a wire `DeadlineExceeded.ctx.reason` string into the
+        /// typed discriminator.
+        #[must_use]
+        pub fn from_wire(s: &str) -> Self {
+            match s {
+                REQUEST_NOT_SENT => Self::RequestNotSent,
+                REQUEST_MAY_HAVE_BEEN_SENT => Self::RequestMayHaveBeenSent,
+                other => Self::Unknown(other.to_owned()),
+            }
+        }
+
+        /// Render the discriminator back to its wire `reason` string.
+        #[must_use]
+        pub fn as_wire(&self) -> &str {
+            match self {
+                Self::RequestNotSent => REQUEST_NOT_SENT,
+                Self::RequestMayHaveBeenSent => REQUEST_MAY_HAVE_BEEN_SENT,
+                Self::Unknown(s) => s.as_str(),
+            }
+        }
+    }
+
+    impl fmt::Display for TimeoutReason {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str(self.as_wire())
         }

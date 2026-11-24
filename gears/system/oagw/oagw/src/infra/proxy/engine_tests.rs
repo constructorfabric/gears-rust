@@ -256,6 +256,82 @@ fn error_mapping_matches_the_previous_engine() {
     }
 }
 
+/// Every engine error kind, its wire status and its dispatch reason
+/// (#4985). The status follows the `DomainError` variant; the reason comes
+/// from the kind alone. `ErrorKind` is `#[non_exhaustive]`, so the table is
+/// checked against `ErrorKind::ALL` instead of by the compiler: a kind the
+/// engine adds fails here until its status and dispatch stage are chosen.
+#[test]
+fn every_error_kind_has_a_status_and_a_dispatch_reason() {
+    use oagw_sdk::reason::unavailable::{
+        REQUEST_MAY_HAVE_BEEN_SENT as SENT, REQUEST_NOT_SENT as NOT,
+    };
+    use toolkit_canonical_errors::{CanonicalError, Problem};
+    use toolkit_http_proxy::ErrorKind as K;
+
+    let table: [(K, u16, Option<&str>); 16] = [
+        (K::ConnectTimeout, 504, Some(NOT)),
+        (K::ConnectRefused, 502, Some(NOT)),
+        (K::ConnectNoRoute, 503, Some(NOT)),
+        (K::Connect, 503, Some(NOT)),
+        (K::TlsHandshakeTimeout, 502, Some(NOT)),
+        (K::TlsHandshake, 502, Some(NOT)),
+        (K::InvalidCertificate, 502, Some(NOT)),
+        (K::ReadTimeout, 504, Some(SENT)),
+        (K::WriteTimeout, 504, Some(SENT)),
+        (K::ConnectionClosed, 502, Some(SENT)),
+        (K::Read, 502, Some(SENT)),
+        (K::Write, 502, Some(SENT)),
+        (K::Http2, 502, Some(SENT)),
+        (K::Protocol, 502, Some(SENT)),
+        // Refused before sending; not a transport failure, no reason.
+        (K::InvalidRequest, 400, None),
+        (K::Configuration, 500, None),
+    ];
+    let listed: std::collections::HashSet<_> = table.iter().map(|(k, ..)| *k).collect();
+    assert_eq!(listed.len(), table.len(), "each kind once");
+    let all: std::collections::HashSet<_> = K::ALL.iter().copied().collect();
+    assert_eq!(listed, all, "the table covers exactly ErrorKind::ALL");
+
+    for (kind, status, reason) in table {
+        let err = map_proxy_error(&test_error(kind), "/x");
+        let problem = Problem::from(CanonicalError::from(err));
+        assert_eq!(problem.status, Some(status), "{kind:?}");
+        assert_eq!(
+            problem.context.get("reason").and_then(|r| r.as_str()),
+            reason,
+            "{kind:?}"
+        );
+    }
+}
+
+/// The engine resent the request after a first attempt the upstream may
+/// have processed: whatever the resend failed with, a connect failure
+/// included, the reason is `REQUEST_MAY_HAVE_BEEN_SENT`.
+#[test]
+fn a_failed_resend_after_a_possibly_processed_attempt_may_have_been_sent() {
+    use oagw_sdk::reason::unavailable::REQUEST_MAY_HAVE_BEEN_SENT;
+    use toolkit_canonical_errors::{CanonicalError, Problem};
+    use toolkit_http_proxy::ErrorKind as K;
+
+    for kind in [
+        K::ConnectRefused,
+        K::ConnectTimeout,
+        K::Connect,
+        K::TlsHandshake,
+        K::ConnectionClosed,
+        K::ReadTimeout,
+    ] {
+        let err = test_error(kind).after_attempt_that_may_have_been_processed(true);
+        let problem = Problem::from(CanonicalError::from(map_proxy_error(&err, "/x")));
+        assert_eq!(
+            problem.context.get("reason").and_then(|r| r.as_str()),
+            Some(REQUEST_MAY_HAVE_BEEN_SENT),
+            "{kind:?}"
+        );
+    }
+}
+
 fn test_error(kind: toolkit_http_proxy::ErrorKind) -> ProxyError {
     toolkit_http_proxy::ProxyError::new(kind, "test")
 }
@@ -284,6 +360,9 @@ fn connect_failures_are_told_from_exchange_failures() {
         K::Write,
         K::Http2,
         K::Protocol,
+        // Refused by the engine: no connection was attempted.
+        K::InvalidRequest,
+        K::Configuration,
     ] {
         assert!(!is_connect_failure(&test_error(kind)), "{kind:?}");
     }

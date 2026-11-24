@@ -68,9 +68,13 @@ def _assert_upstream(resp: httpx.Response, status: int) -> None:
 
 def _assert_open(resp: httpx.Response, retry_after: int = 1) -> None:
     """The gateway's fail-fast 503 while the circuit is open; `Retry-After`
-    counts down from `timeout_seconds` in whole seconds."""
-    assert_problem(resp, 503, category="service_unavailable")
+    counts down from `timeout_seconds` in whole seconds. Nothing was sent,
+    which the reason says."""
+    body = assert_problem(
+        resp, 503, category="service_unavailable", reason="REQUEST_NOT_SENT",
+    )
     assert 1 <= int(resp.headers["retry-after"]) <= retry_after, resp.headers
+    assert body["context"]["retry_after_seconds"] == int(resp.headers["retry-after"]), body
 
 
 async def _open(client, base, headers, alias, path="/status/503", retry_after=1):

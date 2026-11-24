@@ -147,20 +147,44 @@ impl OAuthTokenSource {
             builder = builder.header(name, value);
         }
 
+        // A discovered endpoint the client cannot use (bad URL, forbidden
+        // scheme) is the identity provider's invalid response, not a
+        // configuration error.
+        let discovered = matches!(self.endpoint, TokenEndpoint::Issuer(_));
+        let send_error = |e: toolkit_http::HttpError| match e {
+            toolkit_http::HttpError::InvalidUri { .. }
+            | toolkit_http::HttpError::InvalidScheme { .. }
+                if discovered =>
+            {
+                TokenError::InvalidResponse(
+                    "token_endpoint in the discovery document cannot be used".into(),
+                )
+            }
+            _ => TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint),
+        };
         let response = builder
             .form(fields.as_slice())
-            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint))?
+            .map_err(send_error)?
             .send()
             .await
-            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint))?;
+            .map_err(send_error)?;
 
         // -- check status, then parse response ------------------------------------
-        let token_resp: super::types::TokenResponse = response
-            .error_for_status()
-            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint))?
-            .json()
-            .await
-            .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint))?;
+        // A body that is not a token response is an invalid response, as in
+        // discovery; a failure to read it stays an HTTP error.
+        let token_resp: super::types::TokenResponse =
+            response
+                .error_for_status()
+                .map_err(|e| TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint))?
+                .json()
+                .await
+                .map_err(|e| match e {
+                    toolkit_http::HttpError::Json(_)
+                    | toolkit_http::HttpError::BodyTooLarge { .. } => TokenError::InvalidResponse(
+                        crate::http_error::format_http_error(&e, "OAuth2 token"),
+                    ),
+                    _ => TokenError::from_http(&e, HttpOperation::TokenRequest, endpoint),
+                })?;
 
         // -- validate token_type -------------------------------------------------
         if let Some(ref tt) = token_resp.token_type
