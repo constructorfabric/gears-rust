@@ -6,3 +6,4 @@ cf-studio-path = ".cf-studio"
 ALWAYS resolve and enforce prerequisites of skills/workflows/commands BEFORE applying user intent.
 <!-- /@cf:root-agents -->
 
+@AGENTS.md
