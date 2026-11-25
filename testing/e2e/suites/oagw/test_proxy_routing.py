@@ -495,30 +495,34 @@ async def test_query_allowlist_checks_decoded_names(
 
 @pytest.mark.scenario("positive-7.8-raw-query-forwarded-as-sent", part="D")
 @pytest.mark.asyncio
-async def test_query_literal_semicolon_sent_encoded(
+async def test_query_literal_semicolon_raw_or_encoded(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
 ):
     """The allowlist splits on `&` only, so `model=x;admin=1` is the one
     parameter `model`. An upstream that also splits on `;` would read an
     `admin` nobody checked, so the gateway sends the checked pair
-    form-encoded, the `;` as `%3B`. An escaped `;` is forwarded as sent; an
-    empty allowlist admits no parameter."""
+    form-encoded, the `;` as `%3B`. A query whose `;`-split names are all
+    admitted and an escaped `;` are forwarded as sent; an empty allowlist
+    admits no parameter."""
     _ = mock_upstream
     async with httpx.AsyncClient(timeout=10.0) as client:
         alias = await _upstream_with_query_route(
             client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
-            "query-semi", "GET", "/echo-any", ["model"],
+            "query-semi", "GET", "/echo-any", ["model", "page"],
         )
         closed = await _upstream_with_query_route(
             client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup,
             "query-closed", "GET", "/echo-any", [],
         )
     for query, received in (("model=x;admin=1", "model=x%3Badmin%3D1"),
-                            ("model=x%3Badmin%3D1", "model=x%3Badmin%3D1")):
-        status, _, body = await _raw_get(
+                            ("model=x%3Badmin%3D1", "model=x%3Badmin%3D1"),
+                            ("model=x;page=2", "model=x;page=2"),
+                            ("model=x;page=2;", "model=x;page=2;")):
+        status, headers, body = await _raw_get(
             oagw_base_url, f"/oagw/v1/proxy/{alias}/echo-any?{query}", oagw_headers,
         )
         assert status == 200, (query, status, body[:300])
+        assert headers.get("x-oagw-error-source") == "upstream", query
         assert json.loads(body)["query"] == received, query
     status, headers, body = await _raw_get(
         oagw_base_url, f"/oagw/v1/proxy/{closed}/echo-any?model=x;admin=1", oagw_headers,

@@ -456,12 +456,10 @@ struct RequestQuery {
     /// `raw` decoded as `application/x-www-form-urlencoded`, in order,
     /// repeated keys kept: what the allowlist checks and transforms see.
     params: Vec<(String, String)>,
-    /// Send `params` form-encoded instead of `raw`: the allowlist admitted a
-    /// query with a literal `;`. The allowlist splits on `&` only, so
-    /// `model=x;admin=1` is the one parameter `model`, but Rack 2, older
-    /// Python `parse_qs` and older Go `net/url` also split on `;` and would
-    /// read an `admin` the allowlist never checked. Encoded, the `;` is
-    /// `%3B` and every reader sees the parameters the gateway checked.
+    /// Send `params` re-encoded: splitting on `;` too gives a name the
+    /// allowlist does not admit (which a `;`-splitting upstream such as Rack 2
+    /// or old `parse_qs`/`net/url` would read unchecked), or a transform
+    /// reads the values.
     reencode: bool,
 }
 
@@ -481,9 +479,19 @@ impl RequestQuery {
         }
     }
 
-    /// Called once the allowlist admitted `params`.
-    fn allowlist_admitted(&mut self) {
-        self.reencode = self.raw.as_deref().is_some_and(|q| q.contains(';'));
+    /// Decides whether a query with a literal `;` is re-encoded. Called once
+    /// the allowlist admitted `params` and the route's transforms are known.
+    /// It stays raw only when no transform is bound (transforms read the
+    /// `&`-split values, which a `;`-splitting upstream could read
+    /// differently) and splitting on `;` too yields only admitted names.
+    /// Empty pieces are skipped, as the `&` split does.
+    fn allowlist_admitted(&mut self, admits: impl Fn(&str) -> bool, transforms_bound: bool) {
+        self.reencode = self.raw.as_deref().is_some_and(|q| {
+            q.contains(';')
+                && (transforms_bound
+                    || form_urlencoded::parse(q.replace(';', "&").as_bytes())
+                        .any(|(key, _)| !admits(&key)))
+        });
     }
 
     /// The query to send upstream. `params` is form-encoded only when a
@@ -1096,23 +1104,25 @@ impl DataPlaneServiceImpl {
         )?;
 
         // 3. Validate query parameters against route's allowlist.
-        if let Some(ref http_match) = route.match_rules.http
-            && !query.params.is_empty()
-        {
-            for (key, _) in &query.params {
-                if !http_match.query_allowlist.contains(key) {
-                    return Err(DomainError::Validation {
-                        field: "query",
-                        reason: field::QUERY_NOT_ALLOWED,
-                        detail: format!(
-                            "query parameter '{}' is not in the route's query_allowlist",
-                            key
-                        ),
-                        instance: instance_uri,
-                    });
-                }
+        let admits = |key: &str| {
+            route
+                .match_rules
+                .http
+                .as_ref()
+                .is_none_or(|m| m.query_allowlist.iter().any(|k| k == key))
+        };
+        for (key, _) in &query.params {
+            if !admits(key) {
+                return Err(DomainError::Validation {
+                    field: "query",
+                    reason: field::QUERY_NOT_ALLOWED,
+                    detail: format!(
+                        "query parameter '{}' is not in the route's query_allowlist",
+                        key
+                    ),
+                    instance: instance_uri,
+                });
             }
-            query.allowlist_admitted();
         }
 
         // 3b. Enforce path_suffix_mode.
@@ -1316,6 +1326,7 @@ impl DataPlaneServiceImpl {
         // 5c. Collect transform plugin bindings (upstream then route).
         let transform_bindings =
             collect_plugin_bindings(&upstream, TransformPluginRegistry::is_transform_plugin);
+        query.allowlist_admitted(admits, !transform_bindings.is_empty());
 
         // 5d. Apply header rules.
         if let Some(ref hc) = upstream.headers
@@ -2822,6 +2833,88 @@ pub(crate) mod tests {
     use crate::domain::services::{EndpointSelector, SelectionError};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
+
+    fn admitted_outbound(raw: &str, allowlist: &[&str]) -> Option<String> {
+        let mut query = RequestQuery::parse(Some(raw));
+        query.allowlist_admitted(|key| allowlist.contains(&key), false);
+        query.outbound(false)
+    }
+
+    #[test]
+    fn semicolon_query_stays_raw_for_odd_but_admitted_names() {
+        for (raw, allowlist) in [
+            ("model=x;p%61ge=1", &["model", "page"][..]),
+            ("model=x;model=y", &["model"][..]),
+            ("b=x;a", &["a", "b"][..]),
+        ] {
+            assert_eq!(admitted_outbound(raw, allowlist).as_deref(), Some(raw));
+        }
+    }
+
+    #[test]
+    fn semicolon_query_is_reencoded_when_a_transform_is_bound() {
+        // Names are admitted, but a transform reads the `&`-split values,
+        // which a `;`-splitting upstream would read differently.
+        let mut query = RequestQuery::parse(Some("a=1;model=gpt-4&model=mini"));
+        query.allowlist_admitted(|key| ["a", "model"].contains(&key), true);
+        assert_eq!(
+            query.outbound(false).as_deref(),
+            Some("a=1%3Bmodel%3Dgpt-4&model=mini")
+        );
+        // Without a literal `;` the raw query is kept either way.
+        let mut query = RequestQuery::parse(Some("a=1&model=mini"));
+        query.allowlist_admitted(|key| ["a", "model"].contains(&key), true);
+        assert_eq!(query.outbound(false).as_deref(), Some("a=1&model=mini"));
+    }
+
+    #[test]
+    fn presigned_query_is_raw_only_with_sdk_encoding_or_admitted_names() {
+        let sdk = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host%3Bx-amz-date&X-Amz-Signature=abc";
+        let names = ["X-Amz-Algorithm", "X-Amz-SignedHeaders", "X-Amz-Signature"];
+        assert_eq!(admitted_outbound(sdk, &names).as_deref(), Some(sdk));
+        // A literal `;` makes `x-amz-date` a name the allowlist must admit.
+        let literal = sdk.replace("%3B", ";");
+        assert_eq!(
+            admitted_outbound(&literal, &names).as_deref(),
+            Some(
+                "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-SignedHeaders=host%3Bx-amz-date&X-Amz-Signature=abc"
+            )
+        );
+        let mut with_date = names.to_vec();
+        with_date.push("x-amz-date");
+        assert_eq!(
+            admitted_outbound(&literal, &with_date).as_deref(),
+            Some(literal.as_str())
+        );
+    }
+
+    #[test]
+    fn semicolon_query_with_admitted_keys_is_forwarded_as_sent() {
+        for raw in [
+            "b=x;a=1",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&b=c;a=d%3Be;a=%2B;;",
+            "b=x;",
+        ] {
+            assert_eq!(
+                admitted_outbound(raw, &["a", "b", "X-Amz-Algorithm"]).as_deref(),
+                Some(raw),
+            );
+        }
+    }
+
+    #[test]
+    fn semicolon_query_with_an_unadmitted_key_is_reencoded() {
+        for (raw, sent) in [
+            ("model=x;admin=1", "model=x%3Badmin%3D1"),
+            ("model=x;=1", "model=x%3B%3D1"),
+            ("model=x&model=y;admin", "model=x&model=y%3Badmin"),
+            ("model=x;Page=1", "model=x%3BPage%3D1"),
+            ("model=x;adm+in=1", "model=x%3Badm+in%3D1"),
+            ("model=x;adm%69n=1", "model=x%3Badmin%3D1"),
+        ] {
+            assert_eq!(admitted_outbound(raw, &["model"]).as_deref(), Some(sent));
+        }
+    }
 
     #[test]
     fn normalize_collapses_double_slashes() {
