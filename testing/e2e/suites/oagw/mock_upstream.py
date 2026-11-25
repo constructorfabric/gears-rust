@@ -4,7 +4,8 @@ Provides endpoints that simulate an upstream service (OpenAI-compatible JSON,
 SSE streaming, echo, configurable errors). Started as a session-scoped pytest
 fixture so the OAGW service under test can proxy to it.
 
-Uses only stdlib asyncio — no aiohttp dependency.
+Uses only stdlib asyncio — no aiohttp dependency. `/oauth2/token-jwt` verifies
+client assertion signatures with `cryptography`, imported on first use.
 """
 from __future__ import annotations
 
@@ -177,6 +178,13 @@ _endpoint_call_counts: dict[str, int] = {}
 
 # Credentials /oauth2/token accepts; they match the secrets conftest provisions.
 _OAUTH2_CLIENT = ("test-client-id", "test-client-secret")
+
+# private_key_jwt (RFC 7523 §2.2): public keys registered through
+# /oauth2/jwt-keys, by `kid`, as (alg, PEM, expected aud or None for this
+# endpoint's URL), and the `jti`s already used.
+_JWT_BEARER = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+_JWT_CLIENT_KEYS: dict[str, tuple[str, bytes, str | None]] = {}
+_JWT_SEEN_JTI: set[str] = set()
 
 # Gap between SSE events (/sse/events, /v1/chat/completions/stream): wide enough
 # that buffering is visible over a busy CI runner's scheduling jitter.
@@ -443,6 +451,86 @@ async def _ws_echo_loop(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         pass
 
 
+def _b64url_decode(part: str) -> bytes:
+    return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+
+def _check_client_assertion(headers: dict, path: str, form: dict) -> str:
+    """Check a private_key_jwt token request. Returns the error description,
+    or "" when the assertion is valid: form fields, the JWS header (alg and a
+    registered kid), the signature with the registered public key, and the
+    claims (iss = sub = the client, aud = the audience registered with the
+    key or else this endpoint, exp, iat, a fresh jti)."""
+    import time
+
+    if form.get("client_assertion_type") != _JWT_BEARER:
+        return "client_assertion_type is not jwt-bearer"
+    if "client_secret" in form or headers.get("authorization"):
+        return "a client secret was sent along with the assertion"
+    parts = form.get("client_assertion", "").split(".")
+    if len(parts) != 3:
+        return "client_assertion is not a compact JWS"
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        claims = json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except ValueError:
+        return "client_assertion does not decode"
+    alg, kid = header.get("alg"), header.get("kid")
+    registered = _JWT_CLIENT_KEYS.get(kid or "")
+    if registered is None:
+        return "unknown kid"
+    if alg != registered[0]:
+        return f"alg {alg} does not match the key registered for the kid"
+    signing_input = f"{parts[0]}.{parts[1]}".encode()
+    # Imported here so the other endpoints work without `cryptography`.
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, padding
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+
+    public_key = serialization.load_pem_public_key(registered[1])
+    try:
+        if alg == "ES256":
+            if len(signature) != 64:
+                return "ES256 signature is not 64 bytes"
+            der = encode_dss_signature(
+                int.from_bytes(signature[:32], "big"), int.from_bytes(signature[32:], "big"),
+            )
+            public_key.verify(der, signing_input, ec.ECDSA(hashes.SHA256()))
+        elif alg == "RS256":
+            public_key.verify(signature, signing_input, padding.PKCS1v15(), hashes.SHA256())
+        elif alg == "PS256":
+            public_key.verify(
+                signature, signing_input,
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                hashes.SHA256(),
+            )
+        else:
+            return f"unsupported alg {alg}"
+    except InvalidSignature:
+        return "signature does not verify"
+    client_id = _OAUTH2_CLIENT[0]
+    if claims.get("iss") != client_id or claims.get("sub") != client_id:
+        return "iss and sub must be the client id"
+    if form.get("client_id", client_id) != client_id:
+        return "client_id does not match the assertion"
+    expected_aud = registered[2] or f"http://{headers.get('host', '')}{path}"
+    if claims.get("aud") != expected_aud:
+        return "aud is not the expected audience"
+    now = time.time()
+    exp, iat = claims.get("exp"), claims.get("iat")
+    if not isinstance(exp, int) or not isinstance(iat, int):
+        return "exp and iat must be numbers"
+    if exp <= now or iat > now + 60 or exp - iat > 300:
+        return "assertion is expired or too long-lived"
+    jti = claims.get("jti")
+    if not isinstance(jti, str) or not jti or jti in _JWT_SEEN_JTI:
+        return "jti is missing or replayed"
+    _JWT_SEEN_JTI.add(jti)
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
@@ -492,6 +580,44 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
         else:
             writer.write(_json_response({
                 "access_token": f"mock-e2e-token-{mode}",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            }))
+
+    # GET /counters/{key} — the call count of a stateful endpoint.
+    elif method == "GET" and path.startswith("/counters/"):
+        key = path[len("/counters/"):]
+        writer.write(_json_response({"key": key, "count": _endpoint_call_counts.get(key, 0)}))
+
+    # POST /oauth2/jwt-keys — register the public key a private_key_jwt
+    # client signs with: {"kid", "alg", "public_key_pem"}, and optionally the
+    # "aud" its assertions must carry instead of the token endpoint URL.
+    elif method == "POST" and path == "/oauth2/jwt-keys":
+        key = json.loads(body)
+        _JWT_CLIENT_KEYS[key["kid"]] = (
+            key["alg"], key["public_key_pem"].encode(), key.get("aud"),
+        )
+        writer.write(_json_response({"registered": key["kid"]}))
+
+    # POST /oauth2/token-jwt — token endpoint for private_key_jwt clients.
+    # Issues `mock-e2e-token-jwt-<kid>` for a valid assertion, else 401;
+    # counts the tokens issued per kid under `token-jwt:<kid>`.
+    elif method == "POST" and path == "/oauth2/token-jwt":
+        parsed = parse_qs(body.decode("utf-8", errors="replace"))
+        form_params = {k: v[0] for k, v in parsed.items() if v}
+        if form_params.get("grant_type") != "client_credentials":
+            problem = "grant_type must be client_credentials"
+        else:
+            problem = _check_client_assertion(headers, path, form_params)
+        if problem:
+            writer.write(_json_response(
+                {"error": "invalid_client", "error_description": problem}, status=401,
+            ))
+        else:
+            kid = json.loads(_b64url_decode(form_params["client_assertion"].split(".")[0]))["kid"]
+            _bump_count(f"token-jwt:{kid}")
+            writer.write(_json_response({
+                "access_token": f"mock-e2e-token-jwt-{kid}",
                 "expires_in": 3600,
                 "token_type": "Bearer",
             }))

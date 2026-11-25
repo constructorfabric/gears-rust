@@ -135,6 +135,9 @@ http-body-util = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 httpmock = { workspace = true }
+# Verify the private_key_jwt client assertions the OAuth2 plugin signs.
+jsonwebtoken = { workspace = true }
+toolkit-security = { workspace = true, features = ["jwt"] }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 futures-util = { workspace = true }
@@ -142,6 +145,8 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
 tracing-test = { workspace = true }
+# Capture every crate's events in the private_key_jwt leak tests.
+tracing-subscriber = { workspace = true }
 # Seeded random writes for the proxy cache's model test (ADR-0020).
 rand = { workspace = true }
 # Properties of the proxy cache's change-log decoder (ADR-0020).

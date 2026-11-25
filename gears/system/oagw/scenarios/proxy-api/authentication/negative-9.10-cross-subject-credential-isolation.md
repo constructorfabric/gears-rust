@@ -67,3 +67,13 @@ Expected:
 - Subject B's request MUST NOT use Subject A's cached token.
 - The cache key includes `subject_tenant_id`, ensuring full tenant isolation
   even if the upstream config is identical.
+
+## Signing keys (`private_key_jwt`)
+
+The same holds for the `private_key_jwt` plugin
+([9.15](positive-9.15-oauth2-client-credentials-private-key-jwt.md)): the key
+under `private_key_ref` resolves per subject like the client id. Each subject's
+token request is signed with its own key and names its own client, and a
+subject that cannot read the key gets `401` `AUTH_CREDENTIAL_NOT_FOUND`, never
+a token cached for another subject. Configs that differ only in the key
+reference, `signing_alg`, `kid` or `audience` have separate cache entries.

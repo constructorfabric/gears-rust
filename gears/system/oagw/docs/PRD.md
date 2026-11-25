@@ -304,6 +304,7 @@ The system **MUST** include the following built-in plugins:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1` — OAuth2 client credentials flow
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1` — OAuth2 with Basic auth
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1` — AWS Signature Version 4 request signing with IAM access keys (Bedrock, S3, other AWS APIs); signs the final outbound request ([ADR-0023](./ADR/0023-request-signing.md))
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_private_key_jwt.v1` — OAuth2 with `private_key_jwt` client authentication (RFC 7523): a JWT signed by a key from `cred_store` (`ES256`, `RS256`, `PS256`) instead of a client secret
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1` — HTTP Basic authentication; catalog identifier only, no backing `AuthPlugin` implementation
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.bearer.v1` — Bearer token injection; catalog identifier only, no backing `AuthPlugin` implementation
 

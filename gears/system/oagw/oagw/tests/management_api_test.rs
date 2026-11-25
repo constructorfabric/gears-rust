@@ -698,6 +698,7 @@ async fn rejected_writes_and_lists_return_the_documented_bodies() {
         gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1"),
         gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1"),
         gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1"),
+        gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_private_key_jwt.v1"),
     ];
     assert_eq!(
         resp.json(),

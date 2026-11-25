@@ -125,7 +125,7 @@ Content-Type: application/problem+json
       {
         "field": "auth.type",
         "reason": "NOT_IMPLEMENTED",
-        "description": "auth plugin 'gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1' is not implemented; use one of [\"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1\"]"
+        "description": "auth plugin 'gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.basic.v1' is not implemented; use one of [\"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.noop.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1\", \"gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_private_key_jwt.v1\"]"
       }
     ],
     "resource_type": "gts.cf.core.oagw.proxy.v1~"
@@ -144,7 +144,7 @@ There is one violation: the first rule that fails.
 | an auth plugin in `plugins.items` | `plugins.items.plugin_ref`, `VALIDATION` |
 | a guard or transform plugin in `auth.type` | `auth.type`, `VALIDATION` |
 
-Implemented plugins: auth `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `aws_sigv4`; guard `required_headers`; transform `request_id`.
+Implemented plugins: auth `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `aws_sigv4`, `oauth2_client_cred_private_key_jwt`; guard `required_headers`; transform `request_id`.
 
 ## Scenario D: plain HTTP upstream
 

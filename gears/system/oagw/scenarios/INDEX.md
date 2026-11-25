@@ -51,6 +51,7 @@ Configure how OAGW authenticates to the external service.
 - [API key injection](proxy-api/authentication/positive-9.2-api-key-injection.md) — header-based key injection from `cred_store`
 - [OAuth2 client credentials](proxy-api/authentication/positive-9.5-oauth2-client-credentials.md) — automatic token fetch + cache + refresh
 - [AWS SigV4](proxy-api/authentication/positive-9.11-aws-sigv4-signed-request.md) — Signature Version 4 with IAM access keys (Bedrock, S3, other AWS APIs)
+- [OAuth2 client credentials with `private_key_jwt`](proxy-api/authentication/positive-9.15-oauth2-client-credentials-private-key-jwt.md) — the client signs a JWT assertion with a key from `cred_store` instead of sending a secret
 - [Noop (public APIs)](proxy-api/authentication/positive-9.1-noop-auth-plugin-forwards-credential-injection.md) — no credential injection
 - See → [Injecting authentication](#injecting-authentication)
 
@@ -200,6 +201,9 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 #### AWS SigV4: client signing headers
 - **Scenario**: [positive-9.13-aws-sigv4-client-amz-headers.md](proxy-api/authentication/positive-9.13-aws-sigv4-client-amz-headers.md)
 - **Mechanism**: A client's `X-Amz-Date`, `X-Amz-Content-Sha256` and `X-Amz-Security-Token` are replaced by the plugin's; other `x-amz-*` headers are signed as sent. Without `session_token_ref`, a client `X-Amz-Security-Token` cannot be removed by the signer and the request is refused (`400 VALIDATION` on field `x-amz-security-token`); `headers.request.remove` drops it.
+#### OAuth2 client credentials (`private_key_jwt` client)
+- **Scenario**: [positive-9.15-oauth2-client-credentials-private-key-jwt.md](proxy-api/authentication/positive-9.15-oauth2-client-credentials-private-key-jwt.md)
+- **Mechanism**: The client authenticates with a JWT assertion (RFC 7523 §2.2) signed with `ES256`, `RS256` or `PS256` by a PKCS#8 key read from `cred_store` (`private_key_ref`); no secret is sent. The access token is cached as for 9.5. An optional `audience` replaces the token endpoint as the assertion's `aud`; `x5t` / `x5t#S256` headers are not supported. An unusable key (wrong type, or an `id-RSASSA-PSS` RSA key) is a `500`; a config with neither or both of `token_endpoint` and `issuer_url`, both `client_secret_ref` and `private_key_ref`, no key reference, an unknown `signing_alg` or a bad `kid` or `audience` is refused on write (`400`).
 
 #### Per-request secret references (`X-OAGW-Secret-Ref`)
 - **Scenario**: [positive-31.1-inject-requested-secret.md](request-secret-refs/positive-31.1-inject-requested-secret.md)
@@ -735,7 +739,7 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Secret access control via cred_store → 401
 - **Scenario**: [negative-9.7-secret-access-control-cred-store.md](proxy-api/authentication/negative-9.7-secret-access-control-cred-store.md)
-- **What happens**: A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key). At proxy time a secret `cred_store` denies, or one deleted after the write, returns `401 PD` (`unauthenticated`, reason `AUTH_CREDENTIAL_NOT_FOUND`), for every auth plugin. A credential store outage is `503` (`CREDENTIAL_STORE_UNAVAILABLE`), an identity provider outage `503` (`IDENTITY_PROVIDER_UNAVAILABLE`, 9.11), an invalid identity provider response `502`, a plugin misconfiguration `500`. The response contains neither the reference nor the key; the server log names the key.
+- **What happens**: A missing secret is rejected when the upstream is written (`400 failed_precondition` naming the key). At proxy time a secret `cred_store` denies, or one deleted after the write, returns `401 PD` (`unauthenticated`, reason `AUTH_CREDENTIAL_NOT_FOUND`), for every auth plugin. A credential store outage is `503` (`CREDENTIAL_STORE_UNAVAILABLE`), an identity provider outage `503` (`IDENTITY_PROVIDER_UNAVAILABLE`, 9.11), an invalid identity provider response `502`, a plugin misconfiguration (for example a `private_key_jwt` key of the wrong type) `500`. The response contains neither the reference nor the key; the server log names the key.
 
 #### OAuth2 identity provider unavailable → 503
 - **Scenario**: [negative-9.11-oauth2-identity-provider-unavailable.md](proxy-api/authentication/negative-9.11-oauth2-identity-provider-unavailable.md)

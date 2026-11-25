@@ -47,6 +47,10 @@ pub const OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID: &str =
     gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1");
 /// GTS instance ID of the built-in AWS Signature Version 4 auth plugin.
 pub use oagw_sdk::gts::AWS_SIGV4_AUTH_PLUGIN_ID;
+/// GTS instance ID of the OAuth2 client-credentials auth plugin variant
+/// authenticating the client with a signed JWT (`private_key_jwt`, RFC 7523).
+pub const OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID: &str =
+    gts_id!("cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_private_key_jwt.v1");
 
 // -- Builtin guard plugin instances --
 /// GTS instance ID of the built-in request-timeout guard plugin.
@@ -77,6 +81,7 @@ pub const IMPLEMENTED_AUTH_PLUGIN_IDS: &[&str] = &[
     OAUTH2_CLIENT_CRED_AUTH_PLUGIN_ID,
     OAUTH2_CLIENT_CRED_BASIC_AUTH_PLUGIN_ID,
     AWS_SIGV4_AUTH_PLUGIN_ID,
+    OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID,
 ];
 /// Guard plugins the gateway runs.
 pub const IMPLEMENTED_GUARD_PLUGIN_IDS: &[&str] = &[REQUIRED_HEADERS_GUARD_PLUGIN_ID];

@@ -14,7 +14,8 @@ use crate::domain::model::{
 };
 use crate::domain::plugin::aws_sigv4::AwsSigV4AuthConfig;
 use crate::domain::plugin::credentials::{
-    ApiKeyAuthConfig, AuthConfigError, parse_credential_mode, parse_request_secret_types,
+    ApiKeyAuthConfig, AuthConfigError, PrivateKeyJwtConfig, parse_credential_mode,
+    parse_request_secret_types,
 };
 use crate::domain::repo::RowKey;
 use crate::domain::ssrf::SsrfGuard;
@@ -116,13 +117,15 @@ fn validate_upstream_content(
     Ok(())
 }
 
-/// `credential_mode` and `request_secret_types` (ADR-0022), and the API-key
-/// and AWS SigV4 plugins' own keys. The API-key plugin's config goes through
+/// `credential_mode` and `request_secret_types` (ADR-0022), and the
+/// plugin-specific keys of the API-key, AWS SigV4 and `private_key_jwt`
+/// plugins. The API-key plugin's config goes through
 /// [`ApiKeyAuthConfig::parse`], the parser the plugin and the proxy use,
 /// plus the write-only [`ApiKeyAuthConfig::check_write_policy`]; the AWS
-/// SigV4 plugin's through [`AwsSigV4AuthConfig::parse`], the parser the
-/// plugin uses, so a required key is checked even when absent (the
-/// credential reference loop sees only the keys present). Another
+/// SigV4 plugin's through [`AwsSigV4AuthConfig::parse`] and the
+/// `private_key_jwt` plugin's through [`PrivateKeyJwtConfig::parse`], the
+/// parsers the plugins use, so a required key is checked even when absent
+/// (the credential reference loop sees only the keys present). Another
 /// plugin may carry `credential_mode` and `request_secret_types` (they mean
 /// nothing there), but they must still be well-formed. A `request_ref`
 /// default `secret_ref` is a credential reference like any other and gets
@@ -137,6 +140,11 @@ fn validate_credential_mode(auth: &AuthConfig) -> Result<(), DomainError> {
     }
     if auth.plugin_type == crate::domain::gts_helpers::AWS_SIGV4_AUTH_PLUGIN_ID {
         AwsSigV4AuthConfig::parse(config).map_err(to_domain)?;
+    }
+    if auth.plugin_type
+        == crate::domain::gts_helpers::OAUTH2_CLIENT_CRED_PRIVATE_KEY_JWT_AUTH_PLUGIN_ID
+    {
+        PrivateKeyJwtConfig::parse(config).map_err(to_domain)?;
     }
     let mode = parse_credential_mode(config).map_err(to_domain)?;
     parse_request_secret_types(config, mode)

@@ -280,7 +280,10 @@ Built-in auth plugins:
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.apikey.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_basic.v1`
+- `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.oauth2_client_cred_private_key_jwt.v1`
 - `gts.cf.core.oagw.auth_plugin.v1~cf.core.oagw.aws_sigv4.v1` — AWS Signature Version 4, signed in the signing phase ([ADR-0023](./ADR/0023-request-signing.md)); config in [F0003](./features/0003-cpt-cf-oagw-feature-plugin-system.md#aws-sigv4-auth-plugin)
+
+The three OAuth2 plugins differ only in client authentication: the secret under `client_secret_ref` in the form body or in a Basic header, or a JWT assertion signed with the key under `private_key_ref` (`private_key_jwt`, config `signing_alg` `ES256` / `RS256` / `PS256`, optional `kid` and optional `audience`, the assertion's `aud`, which defaults to the token endpoint). See [ADR: OAuth2 Client Credentials Auth Plugin](./ADR/0016-oauth2-client-credentials-auth-plugin.md). The `private_key_jwt` config is checked on write: neither or both of `token_endpoint` and `issuer_url`, both `client_secret_ref` and `private_key_ref`, no `private_key_ref`, an unknown `signing_alg`, or a bad `kid` or `audience` is a 400 field violation. The assertion header carries no `x5t` / `x5t#S256` certificate thumbprint, so identity providers that require one (Microsoft Entra ID, for example) cannot use the plugin yet.
 
 `basic.v1` and `bearer.v1` are reserved GTS identifiers cataloged in the types-registry with no backing `AuthPlugin` implementation in `AuthPluginRegistry`: setting either as `auth.type` is rejected on write with 400 `invalid_argument` (reason `NOT_IMPLEMENTED`).
 
@@ -406,7 +409,7 @@ Execution order: Auth → Guards → Transform(on_request) → Auth signing → 
 Plugin chain composition: upstream plugins execute before route plugins (`[U1, U2] + [R1, R2] => [U1, U2, R1, R2]`).
 
 **Built-in Plugins** (registered and resolvable via their plugin registry):
-- Auth: `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `aws_sigv4`
+- Auth: `noop`, `apikey`, `oauth2_client_cred`, `oauth2_client_cred_basic`, `oauth2_client_cred_private_key_jwt`, `aws_sigv4`
 - Guard: `required_headers`
 - Transform: `request_id`
 
@@ -859,7 +862,7 @@ The 502 cases send `retry_after_seconds: 5`. Statuses did not change with the re
 
 #### Credential Failures
 
-All auth plugins (`authenticate` and `sign`) use one mapping. Errors and logs name the auth config key, never the reference or the secret. A missing secret, a credential store outage, an identity provider outage and an invalid identity provider response are each logged once, at WARN, with the upstream id and alias, the plugin type and the caller's tenant; a missing secret also logs the credential store's error kind (not found, access denied, invalid reference). None of these failures counts toward the upstream's circuit breaker.
+All auth plugins (`authenticate` and `sign`) use one mapping. Errors and logs name the auth config key, never the reference or the secret. A missing secret, a credential store outage, an identity provider outage, an invalid identity provider response and a plugin misconfiguration are each logged once, at WARN, with the upstream id and alias, the plugin type and the caller's tenant; a missing secret also logs the credential store's error kind (not found, access denied, invalid reference). None of these failures counts toward the upstream's circuit breaker.
 
 The two backends an auth plugin depends on have their own reasons: `CREDENTIAL_STORE_UNAVAILABLE` for the platform credential store, `IDENTITY_PROVIDER_UNAVAILABLE` for the OAuth2 identity provider's token endpoint the tenant configured. The first is a platform fault, the second a fault of a third party.
 
@@ -870,7 +873,7 @@ The two backends an auth plugin depends on have their own reasons: `CREDENTIAL_S
 | Identity provider unreachable, timing out or answering 408, 429 or 5xx (discovery or token request), or the connection dropped while reading its answer | 503 `service_unavailable`, `retry_after_seconds: 5` | `IDENTITY_PROVIDER_UNAVAILABLE` |
 | Identity provider rejects the client: 400, 401 or 403 to the token request | 401 `unauthenticated` | `AUTH_PLUGIN_FAILED` |
 | Identity provider answers with an invalid response: any other status (discovery 400, 401 and 403 included), unparseable body, unsupported token type, invalid or zero lifetime, an access token that is empty or not a valid header value | 502 `service_unavailable` | `REQUEST_NOT_SENT` |
-| Plugin misconfiguration (bad config, an endpoint URL or scheme the HTTP client cannot use, header the gateway cannot set, signing output the gateway cannot send) | 500 `internal` | |
+| Plugin misconfiguration (bad config, an endpoint URL or scheme the HTTP client cannot use, a `private_key_jwt` key that is not a PKCS#8 PEM key of the type `signing_alg` needs, header the gateway cannot set, signing output the gateway cannot send) | 500 `internal` | |
 | Other plugin failure (secret value not UTF-8 or not a header value, in `config` and `request_ref` mode alike; an `aws_sigv4` secret that is not an access key id, an empty secret key or a session token that is not visible ASCII; unexpected credential store error) | 401 `unauthenticated` | `AUTH_PLUGIN_INTERNAL` |
 
 A signer that has a valid config but cannot sign the request as the caller sent it (`PluginError::InvalidRequest`: an `aws_sigv4` streamed body without `unsigned_payload`, a client `X-Amz-Security-Token` without `session_token_ref`, an S3 path the gateway rewrote) is not a credential failure: 400 `invalid_argument`, reason `VALIDATION`, on the field the plugin names.
