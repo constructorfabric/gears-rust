@@ -458,7 +458,7 @@ the dated unit, entry and requested dimension, policy projection and complete in
 
 **Phase:** 4, not built (D-415). **Source:** spec §2.2, §5–§7, §12–§13; phase 2 plan for delivery details.
 
-Not built (D-415): the owner dropped quote and the Studio wiring; consumers read resolve and GET /bss-pricing/v1/prices/{id}, and Rating owns the minimum-fee floor arithmetic. GET /pricing/v1/quote is the Studio preview with quantities, returning totals (since D-467 no plan item is optional or carries an included quantity). Apply price selection, half-open tiers, per-price prorated min_fee and promotions in that order. Recurring slices prorate by calendar days; usage readings use their timestamps and counters restart per slice. Quote is separate from the consumer resolve contract.
+Not built (D-415): the owner dropped quote and the Studio wiring; consumers read resolve and GET /bss-pricing/v1/prices/{id}, and Rating owns the minimum-fee floor arithmetic. GET /pricing/v1/quote is the Studio preview with quantities, returning totals (since D-467 no plan item is optional or carries an included quantity). Apply price selection, half-open tiers, per-price prorated min_fee and promotions in that order. Recurring slices prorate by covered UTC seconds over the billing period's UTC seconds, and Rating computes that proration (D-388, D-415); usage readings use their timestamps and counters restart per slice. Quote is separate from the consumer resolve contract.
 
 ## 6. Non-Functional Requirements
 

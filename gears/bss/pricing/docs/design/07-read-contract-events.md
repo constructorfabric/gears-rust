@@ -71,7 +71,7 @@ Feature algorithm: `cpt-cf-bss-pricing-algo-read-contract-events-renewal-walk`.
 Feature algorithm: `cpt-cf-bss-pricing-algo-read-contract-events-period-slices-and-quote`. Not built (D-415): the owner dropped quote and the Studio wiring; consumers read resolve and GET /bss-pricing/v1/prices/{id}, and Rating owns the minimum-fee floor arithmetic.
 
 1. [ ] - `p1` - Split the period at every price boundary inside the bound chain, including a temporary end. - `inst-read-contract-events-period-slices-and-quote-1`
-2. [ ] - `p1` - Prorate recurring slices by calendar days; rate usage by reading timestamp with tier counters per slice. - `inst-read-contract-events-period-slices-and-quote-2`
+2. [ ] - `p1` - Prorate recurring slices by covered UTC seconds over the billing period's UTC seconds, exactly; proration belongs to Rating, not Pricing (D-388, D-415); rate usage by reading timestamp with tier counters per slice. - `inst-read-contract-events-period-slices-and-quote-2`
 3. [ ] - `p1` - Aggregate per price/subscription/period (no plan carries an included quantity to deduct since D-467) and apply the coverage-prorated min_fee once per price; not built in pricing, Rating applies the floor (D-415). - `inst-read-contract-events-period-slices-and-quote-3`
 4. [ ] - `p1` - Apply period-start promotion after floors, then HALF_EVEN rounding at the bound price's currency scale (D-533, D-535); quote returns totals while resolve never does; quote is not built (D-415). - `inst-read-contract-events-period-slices-and-quote-4`
 

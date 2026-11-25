@@ -24,7 +24,7 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-385 | H | One registered dimension, independent value chains | DECIDED 2026-09-25 · §2 decision 4; §5; §14 |
 | D-386 | H | SKU type defines the entry key and allowed models | DECIDED 2026-09-25 · §2 decision 5; §5; amended by D-427 |
 | D-387 | H | Tier bands are half-open | DECIDED 2026-09-25 · §5 tier bands; §10 |
-| D-388 | H | Minimum fee is per price per subscription per period | DECIDED 2026-09-25 · §2 decision 13; §5; amended by D-467 |
+| D-388 | H | Minimum fee is per price per subscription per period | DECIDED 2026-09-25 · §2 decision 13; §5; amended by D-467; amended 2026-11-25 (proration by covered UTC seconds, Rating's) |
 | D-389 | H | Descriptors bind from durable SKU versions | DECIDED 2026-09-25 · §2 decision 14; §2.2; §7.1 |
 | D-390 | H | Windows normalize per chain and preserve usage structure | DECIDED 2026-09-25 · §2 decision 16; §5; amended by D-520, D-521 |
 | D-391 | H | Temporary changes keep pair identity or resume fallback | DECIDED 2026-09-25 · §5 temporary pairs; amended by D-443 |
@@ -203,7 +203,9 @@ Aggregate every bound value and slice rated by the same price, deduct included q
 
 D-467 amends this entry: no plan carries an included quantity any more, so no quantity is deducted before the floor; the floor and proration stay Rating's.
 
-**Source:** §2 decision 13; §5. Amended by D-467.
+Amended 2026-11-25: proration is Rating's, by the covered UTC seconds over the billing period's UTC seconds, exactly (Rating T-D-77, D-415), never by calendar days; the floor's covered fraction is the same fraction.
+
+**Source:** §2 decision 13; §5. Amended by D-467; amended 2026-11-25 (owner: Rating's proration rule).
 
 #### D-389 [H] Descriptors bind from durable SKU versions
 
