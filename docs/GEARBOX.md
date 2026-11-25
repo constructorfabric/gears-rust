@@ -36,20 +36,22 @@ a matter of design rather than of linkage. That is what a `gear.gdl` holds.
 **One fact, one author.** A descriptor may not restate what the attributes already say.
 Six fields are refused outright: `id`, `runtime_caps`, `colocated_deps`, `lifecycle`,
 `client` and `cluster_providers`. Restating one is diagnostic `GBX0210`, which names the
-attribute that owns it. Each descriptor's header comment records what its own crate projects.
-From `gears/system/api-gateway/gear.gdl`:
+attribute that owns it. The one overlap allowed is `deps`: a descriptor may list the gear's
+co-location dependencies as a mirror of the attribute's `deps`, and the two are checked
+against each other (a mismatch is `GBX0214`). Each descriptor's header comment records what
+its own crate projects. From `gears/system/api-gateway/gear.gdl`:
 
 ```
 # Under ADR cpt-gearbox-adr-macro-projected-catalogue the Rust attributes keep
-# every fact they already express. Projected from #[toolkit::gear] in
-# src/gear.rs, and therefore NOT written here:
+# identity, capabilities and lifecycle. Projected from #[toolkit::gear] in
+# src/gear.rs; deps below is an exact checked mirror:
 #
 #   id             <- name = "api-gateway"
 #   runtime_caps   <- capabilities = [rest_host, rest, stateful]
 #   colocated_deps <- deps = [grpc_hub, authn_resolver]   (link-time; uncuttable)
 #   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 #
-# Declaring any of them here is GBX0210, which names the owning attribute.
+# Other projected fields are refused by GBX0210; deps drift is GBX0214.
 ```
 
 ## Four levels, and which one was renamed
@@ -78,10 +80,14 @@ waits.
 
 ## What one looks like
 
-The smallest descriptor in this repository, `gears/system/service-discovery/gear.gdl`,
+One of the smallest descriptors for a gear with code, `gears/system/service-discovery/gear.gdl`,
 complete:
 
 ```python
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
 # Gearbox product metadata for the service-discovery gear.
 #
 # Projected from #[toolkit::gear]: id, runtime_caps (grpc, system, rest),
@@ -89,6 +95,8 @@ complete:
 # slice declaring a client trait -- and `one_per_installation`.
 
 gear(
+    deps = [],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/service-discovery"),
     maturity = "preview",
     name = "Service Discovery",
     description = "Service discovery and gear directory for the runtime: instance registration, tracking, and resolution.",
@@ -140,11 +148,12 @@ gates its own tests.
 
 ## Where this stands
 
-There are 64 descriptors: 55 for gears in the workspace and nine for designs that have no code
-yet. Every gear carries one except four examples (`hello`, `users-info`, `calculator`,
-`calculator-gateway`), which stay invisible to composition until someone writes theirs.
+Descriptors cover the gears in the workspace plus several designs that have no code yet
+(`find . -name gear.gdl` lists them). Every gear carries one except four examples (`hello`,
+`users-info`, `calculator`, `calculator-gateway`) and `gears/bss/orders` (the `bss-orders` gear
+and its test AuthZ plugin), which stay invisible to composition until someone writes theirs.
 
-Eleven descriptors curate features and fourteen declare none and need none; the rest are not
+Some descriptors curate features and some declare `cargo_features = []`; the rest are not
 curated, so the tool offers their whole feature table.
 
 On the Gearbox side, the vertical slice works end to end: catalogue load, resolution across the
@@ -170,7 +179,7 @@ join it. `Installation` exists in no type, no GDL construct and no lock field to
 ## What is asked of gear authors
 
 - **A new gear needs a descriptor.** Without one it is invisible to composition. The
-  neighbouring files are the template; the smallest is 18 lines.
+  neighbouring files are the template.
 - **Curate the features that matter.** If your crate has features an integrator should choose
   between, list them. If it has none, write `cargo_features = []` and say so explicitly.
 - **Do not restate what the attribute says.** If you find yourself typing an id or a

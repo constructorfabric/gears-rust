@@ -2,11 +2,31 @@
 
 This project uses **Constructor Studio** for AI-powered PR reviews and status reports.
 
+## Two review systems
+
+The repository has two independent AI review flows that share no files:
+
+- **Constructor Studio PR review** (this document): `/cf-gears-pr-review` and `/cf-gears-pr-status`, driven by
+  `cfs`. It reviews code, DESIGN, ADR and PRD changes against the kit
+  checklists, writes reports to `.prs/{ID}/`, and produces PR status reports (unreplied comments, severity). It works
+  with any agent that `cfs` supports.
+- **toolkit-pr-review**: the `/toolkit-pr-review` Claude Code skill (`.claude/skills/toolkit-pr-review/SKILL.md`;
+  a Devin variant is `.devin/workflows/toolkit-pr-review.md`), with rules in
+  [docs/toolkit-pr-review](../toolkit-pr-review/README.md).
+  It reviews Rust changes only, against idiomatic Rust and ToolKit rules, with one agent per rule module. PR mode
+  posts inline comments on GitHub; local mode writes a markdown report for a branch.
+
+Use toolkit-pr-review for a Rust code change, and the Constructor Studio flow for spec documents (PRD, DESIGN, ADR)
+and for PR status reports.
+
 ## Quick Start
 
 Gears have integrated Constructor Studio automation for PR review assistance. Use any supported agent
 (Windsurf, Cursor, Claude, Copilot) — each has thin stubs that redirect to
 the canonical workflows via `/cf-gears-pr-review` and `/cf-gears-pr-status` commands.
+
+The stubs are generated and gitignored: they appear only after the `cfs` CLI is installed and `cfs init` has run in
+your clone. `make cfs-validate` (part of `make check`) installs `cfs` with pipx if it is missing and runs `cfs init`.
 
 You can use the following prompts in your IDE to review PRs or get status:
 

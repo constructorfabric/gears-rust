@@ -6,13 +6,12 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 - Status: `[x]` implemented, `[ ]` planned, `N/A` out of scope
 - Phase: `p1` foundation, `p2` standardize, `p3` harden, `p4` scale, `p5` optimize
-- ID format: `rpb-<category>-<slug>`
 
 ---
 
 ## 1) Product & Strategy
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Project vision | [x] `p1` | [README.md](../README.md), [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md) | Keep aligned with gear-level PRDs |
 | Goals | [x] `p1` | [README.md](../README.md) | Add measurable annual goals in roadmap artifact |
@@ -24,7 +23,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 2) Architecture & System
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | System overview | [x] `p1` | [README.md](../README.md), [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md) | Keep synced with gears inventory |
 | Architecture overview | [x] `p1` | [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md), [docs/GEARS.md ](./GEARS.md ) | Add “current vs target” split blocks |
@@ -36,7 +35,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 3) Repository, Structure & Naming
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Repository structure | [x] `p1` | [README.md](../README.md), [docs/ARCHITECTURE_MANIFEST.md](./ARCHITECTURE_MANIFEST.md), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Keep in sync with workspace changes |
 | Folder conventions | [x] `p1` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Add root-level `REPO_STRUCTURE.md` |
@@ -47,7 +46,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 4) Coding Standards & Static Quality
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Coding standards | [x] `p1` | [guidelines/README.md](../guidelines/README.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add short one-page standards index |
 | Style guide | [x] `p1` | clippy rules in [clippy.toml](../clippy.toml) and [Cargo.toml](../Cargo.toml), `cargo fmt` in [Makefile](../Makefile), architecture lint rules via `cargo gears lint` | Expand language-agnostic style section |
@@ -61,19 +60,20 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 5) Git Workflow & Reviews
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Commit conventions | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md) | Add commit-lint gate |
 | Branch strategy | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md) | Add long-lived branch policy details |
 | Pull request process | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md), [docs/pr-review/README.md](./pr-review/README.md) | Add machine-readable PR checklist |
 | Merge rules | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md) | Add branch-protection policy doc |
 | Code review guidelines | [x] `p2` | [docs/pr-review/README.md](./pr-review/README.md), [studio-kit-gears/codebase/checklist.md](../studio-kit-gears/codebase/checklist.md) | Add severity SLA for findings |
+| Automated Rust PR review | [x] `p2` | `/toolkit-pr-review` skill ([.claude/skills/toolkit-pr-review/SKILL.md](../.claude/skills/toolkit-pr-review/SKILL.md), [.devin/workflows/toolkit-pr-review.md](../.devin/workflows/toolkit-pr-review.md)), per-pass sub-agents in [.claude/agents/](../.claude/agents) (`toolkit-pr-review-*.md`), scripts in [tools/scripts/toolkit-pr-review/](../tools/scripts/toolkit-pr-review), rules in [docs/toolkit-pr-review/](./toolkit-pr-review/README.md) | Run it from CI |
 
 ## 6) Governance & Roadmap
 
 > Governance, roadmap, and maintainer processes are controlled in a separate global repository to cover cross-repo dependencies.
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Governance model | N/A | Managed in external global governance repository | Controlled externally for cross-repo dependencies |
 | Decision authority | N/A | Managed in external global governance repository | Controlled externally for cross-repo dependencies |
@@ -84,7 +84,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 7) Release, Versioning & Change Management
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Release workflow | [x] `p1` | [docs/RELEASING.md](./RELEASING.md), `.github/workflows/release-plz.yml` | Add release rollback drills |
 | Versioning policy | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md), [docs/RELEASING.md](./RELEASING.md) | Add semver check gate per crate type |
@@ -94,7 +94,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 8) Local Development & Tooling
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Local development setup | [x] `p1` | [README.md](../README.md), [CONTRIBUTING.md](../CONTRIBUTING.md), [docs/QUICKSTART_GUIDE.md](./QUICKSTART_GUIDE.md) | Add one-command bootstrap doc |
 | Environment setup | [x] `p1` | [README.md](../README.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add env matrix by scenario |
@@ -104,7 +104,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 9) CI & Quality Pipeline
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | CI/CD pipeline | [x] `p1` | [.github/workflows/](../.github/workflows), [tools/scripts/ci.py](../tools/scripts/ci.py) | Add pipeline architecture diagram |
 | Required checks | [x] `p1` | [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py), [.github/workflows/](../.github/workflows) | Add required-checks policy doc |
@@ -113,19 +113,19 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 10) Testing & Quality Gates
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
-| Testing strategy | [x] `p1` | [README.md](../README.md), [CONTRIBUTING.md](../CONTRIBUTING.md), [docs/security/SECURITY.md](./security/SECURITY.md) | Add single consolidated testing policy |
+| Testing strategy | [x] `p1` | [Testing, Coverage and CI](./toolkit_unified_system/15_testing_and_ci.md), [README.md](../README.md), [CONTRIBUTING.md](../CONTRIBUTING.md), [docs/security/SECURITY.md](./security/SECURITY.md) | Keep [Testing, Coverage and CI](./toolkit_unified_system/15_testing_and_ci.md) aligned with CI lanes |
 | Unit testing rules | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md), [tools/scripts/ci.py](../tools/scripts/ci.py) | Add unit-test layout examples |
 | Integration testing rules | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md), `ci.py all` flow | Add integration test standards page |
 | End-to-end testing rules | [x] `p1` | [README.md](../README.md), [tools/scripts/ci.py](../tools/scripts/ci.py), `.github/workflows/e2e.yml` | Add e2e flakiness policy |
-| Coverage expectations | [x] `p1` | [README.md](../README.md), [CONTRIBUTING.md](../CONTRIBUTING.md), [Makefile](../Makefile) | Enforce threshold gates in CI |
+| Coverage expectations | [x] `p1` | [Testing, Coverage and CI](./toolkit_unified_system/15_testing_and_ci.md) §2, [Makefile](../Makefile); CI gates: Codecov patch target 85% in [.codecov.yml](../.codecov.yml), `--fail-under-lines 85` in the graph-storage and github-mirror coverage jobs of [.github/workflows/ci.yml](../.github/workflows/ci.yml) | Extend the line-coverage floor to the workspace coverage job |
 | Test structure | [x] `p2` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), architecture lints via `cargo gears lint` | Add repository-wide test taxonomy |
 | Test data management | [ ] `p3` | Not centralized | Add test-fixture lifecycle guide |
 
 ## 11) Debugging, Logging & Observability
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Debugging guidelines | [x] `p2` | [CONTRIBUTING.md](../CONTRIBUTING.md) env hints, [docs/TRACING_SETUP.md](./TRACING_SETUP.md) | Add debugging playbook by failure type |
 | Logging standards | [x] `p2` | [README.md](../README.md) config examples, [docs/security/SECURITY.md](./security/SECURITY.md) | Add log field schema standard |
@@ -137,7 +137,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 > Dedicated security coverage (phase-ordered) is tracked here. See [docs/security/SECURITY.md](./security/SECURITY.md) for full implementation detail.
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Rust language safety baseline | [x] `p1` | [docs/security/SECURITY.md](./security/SECURITY.md), workspace Rust/clippy settings | Keep baseline aligned with toolchain policy |
 | Authentication & authorization architecture | [x] `p1` | [docs/security/SECURITY.md](./security/SECURITY.md), [docs/arch/authorization/](./arch/authorization/) | Add cross-gear authz test matrix |
@@ -158,21 +158,21 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 > Basic performance requirements are part of the NFR (non-functional requirements) in every PRD and DESIGN.
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Basic performance requirements | [x] `p1` | [studio-kit-gears/artifacts/PRD/template.md](../studio-kit-gears/artifacts/PRD/template.md), [studio-kit-gears/artifacts/DESIGN/template.md](../studio-kit-gears/artifacts/DESIGN/template.md) | Keep NFR performance criteria mandatory in every feature spec |
 | Optimization guidelines | [x] `p2` | Rust + clippy guidance in [README.md](../README.md), [docs/security/SECURITY.md](./security/SECURITY.md) | Add hotspot optimization playbook |
 | Caching strategies | [ ] `p3` | Scattered examples only | Add standard caching guidance |
 | Performance standards | [ ] `p3` | Partially in architecture manifest/perf checks | Add explicit performance SLO policy |
 | Performance budgets | [ ] `p4` | Not formalized | Add endpoint/gear budgets |
-| Benchmarking rules | [ ] `p4` | Not centralized | Add benchmark harness + reporting standard |
+| Benchmarking rules | [ ] `p4` | No shared rules. Per-crate harnesses exist: `[[bench]]` targets, criterion or custom (event-broker and its plugins, oagw, quota-enforcement, oidc-authn-plugin, toolkit-db, toolkit-http-proxy, toolkit-taskward), and `make bench-*` targets in [gears-rust.mk](../gears-rust.mk) | Add benchmark rules + reporting standard |
 | Token / compute budgets | [ ] `p4` | Not formalized | Add GenAI token/compute governance |
 
 ## 14) Agents, Prompts & AI Automation
 
 > Agents, prompts, and AI workflows are managed by **Constructor Studio** — see [.cf-studio/](../.cf-studio) (skills, scripts, templates, workflows) and [.cf-studio/config/](../.cf-studio/config) (project-specific configuration, `artifacts.toml`, `AGENTS.md`).
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Scripts usage | [x] `p1` | [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py) | Add script catalog document |
 | Automation rules | [x] `p2`| [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py), workflow files | Add automation safety policy |
@@ -193,14 +193,14 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 15) Templates, Examples & Checklists
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Templates (overall) | [x] `p1` | [studio-kit-gears/artifacts/README.md](../studio-kit-gears/artifacts/README.md), [studio-kit-gears/artifacts/CHECKLISTS.md](../studio-kit-gears/artifacts/CHECKLISTS.md), [docs/pr-review/README.md](./pr-review/README.md) | Expand reusable template index |
 | PR checklist | [x] `p1` | [CONTRIBUTING.md](../CONTRIBUTING.md), [studio-kit-gears/codebase/checklist.md](../studio-kit-gears/codebase/checklist.md) | Add enforceable checklist bot |
 | Documentation templates | [x] `p1` | [studio-kit-gears/artifacts/README.md](../studio-kit-gears/artifacts/README.md) and template files | Add docs template quick-selector |
 | Examples | [x] `p1` | [examples/](../examples), [docs/QUICKSTART_GUIDE.md](./QUICKSTART_GUIDE.md) | Expand reference examples per gear type |
 | Code templates | [x] `p2` | [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) gear skeletons/patterns | Add dedicated starter templates folder |
-| PR templates | [x] `p2` | [CONTRIBUTING.md](../CONTRIBUTING.md) PR description template, [docs/pr-review/code-review-template.md](./pr-review/code-review-template.md) | Add `.github/PULL_REQUEST_TEMPLATE.md` |
+| PR templates | [x] `p2` | [.github/pull_request_template.md](../.github/pull_request_template.md), [CONTRIBUTING.md](../CONTRIBUTING.md) PR description template, [docs/pr-review/code-review-template.md](./pr-review/code-review-template.md) | Keep the GitHub template and CONTRIBUTING.md in sync |
 | Reference implementations | [x] `p2` | [examples/toolkit](../examples/toolkit), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md) | Curate “golden reference gears” list |
 | Good examples | [x] `p2` | Lint/gear examples in `cargo gears lint` rules, [examples/](../examples) | Add explicit tagged good examples index |
 | Bad examples | [x] `p2` | Architecture lint bad patterns + UI tests (in `cargo-gears` CLI) | Add cross-domain anti-pattern examples |
@@ -210,7 +210,7 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 16) API, Data, Config & Error Contracts
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | API guidelines | [x] `p1` | [guidelines/README.md](../guidelines/README.md), [docs/toolkit_unified_system/](./toolkit_unified_system/README.md), ToolKit docs | Add API design quick-reference |
 | API versioning | [x] `p1` | Architecture lint DE0801 (via `cargo gears lint`), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add auto-check for docs/version sync |
@@ -225,21 +225,21 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 
 ## 17) Deployment & Operations
 
-> Gears is a collection of libraries and gears, not a standalone deployable component. Deployment, rollback, cost management, and resource limits are the responsibility of downstream applications that consume these libraries.
+> Gears is a collection of libraries and gears, not a standalone deployable component. The repository does ship container images and Helm charts for its gears ([deploy/](../deploy/README.md), published by [.github/workflows/publish-artifacts.yml](../.github/workflows/publish-artifacts.yml)); rollback, cost management, and production operations remain the responsibility of downstream applications that consume these libraries.
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
-| Infrastructure overview | N/A | Out of scope for this library repository | Downstream responsibility |
-| Deployment process | N/A | Out of scope for this library repository | Downstream responsibility |
+| Infrastructure overview | [x] `p2` | [deploy/README.md](../deploy/README.md) (Dockerfiles, `toolkit-common` library chart, `toolkit-platform` umbrella chart, per-gear charts) | Downstream infrastructure stays out of scope |
+| Deployment process | [x] `p2` | [deploy/README.md](../deploy/README.md), [.github/workflows/publish-artifacts.yml](../.github/workflows/publish-artifacts.yml), called from [.github/workflows/release-plz.yml](../.github/workflows/release-plz.yml) | Downstream rollout stays out of scope |
 | Migration guides | N/A | Out of scope for this library repository | Downstream responsibility |
 | Rollback procedures | N/A | Out of scope for this library repository | Downstream responsibility |
 | Deployment checklist | N/A | Out of scope for this library repository | Downstream responsibility |
 | Cost management | N/A | Out of scope for this library repository | Downstream responsibility |
-| Resource limits | N/A | Out of scope for this library repository | Downstream responsibility |
+| Resource limits | [x] `p2` | Per-gear `resources` in Helm values presets ([deploy/helm/toolkit-platform/](../deploy/helm/toolkit-platform)) | Production sizing is a downstream responsibility |
 
 ## 18) Documentation IA, Onboarding, Knowledge Base
 
-| Item | Status / Phase / ID | Implemented (where) | Planned |
+| Item | Status / Phase | Implemented (where) | Planned |
 |---|---|---|---|
 | Documentation structure | [x] `p1` | [docs/](./), [studio-kit-gears/artifacts/README.md](../studio-kit-gears/artifacts/README.md), [guidelines/README.md](../guidelines/README.md) | Add docs navigation index page |
 | Onboarding guide | [x] `p1` | [README.md](../README.md), [docs/QUICKSTART_GUIDE.md](./QUICKSTART_GUIDE.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add role-based onboarding tracks |
@@ -249,11 +249,11 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 | Decision records (ADR) | [x] `p1` | [studio-kit-gears/artifacts/ADR/template.md](../studio-kit-gears/artifacts/ADR/template.md), [docs/adrs/](./adrs) | Add ADR index by domain |
 | Design documents | [x] `p1` | [studio-kit-gears/artifacts/DESIGN/template.md](../studio-kit-gears/artifacts/DESIGN/template.md), gear docs | Add quality gates for design docs |
 | Common workflows | [x] `p2` | [Makefile](../Makefile), [tools/scripts/ci.py](../tools/scripts/ci.py), [docs/pr-review/README.md](./pr-review/README.md) | Add workflow cookbook |
-| Anti-patterns | [x] `p2` | [studio-kit-gears/artifacts/](../studio-kit-gears/artifacts), [architecture lints via cargo gears lint | Add unified anti-pattern catalog |
-| Common mistakes | [x] `p2` | [architecture lint rules and checklists (in cargo-gears CLI) | Add “top mistakes” short guide |
+| Anti-patterns | [x] `p2` | [studio-kit-gears/artifacts/](../studio-kit-gears/artifacts), architecture lints via `cargo gears lint` | Add unified anti-pattern catalog |
+| Common mistakes | [x] `p2` | Architecture lint rules and checklists (in the `cargo-gears` CLI) | Add “top mistakes” short guide |
 | Support / escalation paths | [x] `p2` | [SECURITY.md](../SECURITY.md), [CONTRIBUTING.md](../CONTRIBUTING.md) | Add general (non-security) escalation flow |
 | Proposal process | [x] `p2` | Spec-driven flow in [studio-kit-gears/artifacts/README.md](../studio-kit-gears/artifacts/README.md) | Add formal RFC/proposal workflow |
-| Glossary | [ ] `p3` | Not centralized | Add glossary document |
+| Glossary | [x] `p3` | [docs/web-docs/introduction/glossary.md](./web-docs/introduction/glossary.md) | Keep in sync with new terms |
 | Terminology | [ ] `p3` | Partial in architecture/spec docs | Add terminology canon |
 | Acronyms | [ ] `p3` | Scattered only | Add acronyms appendix |
 | Known limitations | [ ] `p3` | Partially implied in architecture notes | Add limitations register |
@@ -266,9 +266,9 @@ Purpose: one concise map of repository artifacts that improve developer + AI pro
 ## Coverage Summary
 
 - Implemented (`[x]`): strong coverage for architecture, standards, CI, testing, release, security, examples, Constructor Studio-managed AI automation.
-- Planned (`[ ]`): most gaps are performance benchmarking, AI prompt governance, glossary/FAQ.
-- Out of scope (`N/A`): deployment, rollback, cost/resource limits — downstream responsibility.
+- Planned (`[ ]`): most gaps are performance budgets and benchmark rules, AI prompt governance, FAQ.
+- Out of scope (`N/A`): rollback, cost management, deployment checklists — downstream responsibility.
 - Highest-value next phase (`p2`/`p3`) additions:
   1. Performance budgets + benchmark policy
   2. AI prompt/agent boundary contracts
-  3. Central glossary/FAQ/known-issues pages
+  3. Central FAQ/known-issues pages

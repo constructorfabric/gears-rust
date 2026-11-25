@@ -16,7 +16,7 @@ Constructor Fabric Gears is not a ready-to-use service — it is a set of well-i
 
 1. Constructor Fabric Gears doesn't optimize for **minimalism** or the lowest barrier to entry
 
-Constructor Fabric Gears does not aim to be the simplest or smallest framework for building SaaS or AI applications. It intentionally prioritizes explicit structure, security, scalability,governance, composability, and long-term evolvability over quick-start simplicity or minimal configuration.
+Constructor Fabric Gears does not aim to be the simplest or smallest framework for building SaaS or AI applications. It intentionally prioritizes explicit structure, security, scalability, governance, composability, and long-term evolvability over quick-start simplicity or minimal configuration.
 
 2. Constructor Fabric Gears doesn't provide a **rich catalog of end-user services** out of the box
 
@@ -65,8 +65,8 @@ This is a shift-left quality mechanism: the repository pushes correctness, consi
 Constructor Fabric Gears organizes its codebase into three tiers:
 
 - **Toolkit** (`libs/`) — a set of libraries providing the low-level substrate: API middleware, DB access, error definitions, transport abstractions, security primitives, observability, macros, and shared utilities.
-- **Core gears** (`gears/system/`) — Pre-built core gears that form the control plane: inbound/outbound API gateway, authn/authz resolvers, tenant resolver, resource groups, type registry, node registry, usage collection, and related cross-cutting services.
-- **Service gears** (`gears/`) — Ready-to-use and vendor-developed business gears built on top of the platform: serverless runtime, GenAI subsystems, event system, chat engine, file parser, and domain-specific services.
+- **Core gears** (`gears/system/`) — Pre-built core gears that form the control plane: inbound/outbound API gateway, authn/authz resolvers, tenant resolver, resource groups, type registry, node registry, service discovery, cluster coordination, event broker, usage collection, and related cross-cutting services.
+- **Service gears** (`gears/`) — Ready-to-use and vendor-developed business gears built on top of the platform: GenAI subsystems, chat engine, file parser, and domain-specific services.
 
 **Core gears** means all gears under `gears/system/`, including their plugins. The directory
 may be renamed to `gears/core/` in the future. The **system gear group** contains gears with
@@ -119,7 +119,7 @@ Constructor Fabric Gears does not ship ready-to-use services. It ships a set of 
 
 These are the three profiles named in [ADR-0001](arch/toolkit-oop/ADR/0001-cpt-cf-adr-deployment-profiles.md), and `embedded` / `self_hosted` / `kubernetes` is how a `product.gdl` spells them.
 
-Gears talk to each other through a Rust-native SDK that facades the communication interface (local vs. remote) and encapsulates internal logic. The platform provides DB-agnostic persistence (SeaORM-based) and infrastructure-agnostic cluster primitives (distributed cache, distributed locks, leader election, service discovery).
+Gears talk to each other through a Rust-native SDK that facades the communication interface (local vs. remote) and encapsulates internal logic. The platform provides DB-agnostic persistence (SeaORM-based), infrastructure-agnostic cluster primitives (distributed cache, distributed locks, leader election), and a service-discovery gear (`gears/system/service-discovery/`).
 
 #### 3.3.1. SDK-first contract separation
 
@@ -133,7 +133,7 @@ Every gear's public API lives in a dedicated SDK package (`<gear>-sdk/`) contain
 
 Constructor Fabric Gears separates service logic from service packaging. Gear logic lives in libraries; final service binaries compose those libraries for a specific deployment shape.
 
-**How.** Gear contracts are transport-agnostic: in-process gears register local adapters in `ClientHub`; out-of-process gears register REST/gRPC clients implementing the same SDK interface. A YAML config field (`runtime.type: local | oop`) switches modes without code changes. The platform provides DB-agnostic persistence through a SeaORM-based `SecureConn` abstraction and infrastructure-agnostic cluster primitives (distributed cache, distributed locks, leader election, service discovery) that resolve against operator-selected backends at startup.
+**How.** Gear contracts are transport-agnostic: in-process gears register local adapters in `ClientHub`; out-of-process gears register REST/gRPC clients implementing the same SDK interface. A YAML config field (`runtime.type: local | oop`) switches modes without code changes. The platform provides DB-agnostic persistence through a SeaORM-based `SecureConn` abstraction and infrastructure-agnostic cluster primitives (distributed cache, distributed locks, leader election) that resolve against operator-selected backends at startup. Service location is a separate gear, `gears/system/service-discovery/` (`DirectoryClient` in-process, `DirectoryService` over gRPC).
 
 **Why.** This makes Constructor Fabric Gears not just cloud-provider-agnostic, but deployment-topology-agnostic. Teams develop and test locally in single-node mode, deploy bare-metal services for on-prem or edge products, and scale to Kubernetes when needed — all from the same gear code and contracts.
 
@@ -150,7 +150,7 @@ This produces one recognizable API dialect across gears:
 - Shared pagination/filter/order conventions
 - OData-style filtering for collection resources where applicable
 - Consistent auth, rate-limit, timeout, and observability behavior at the gateway
-- [x] Rate limiting — governor-based rate limiter with policy headers and inflight semaphores is implemented in the API Gateway middleware stack (`gears/system/api-gateway/src/middleware/rate_limit.rs`). OAGW has a separate rate-limiting implementation for outbound traffic.
+- [x] Rate limiting — governor-based rate limiter with policy headers and inflight semaphores is implemented in the API Gateway middleware stack (`gears/system/api-gateway/src/middleware/throttling.rs`). OAGW has a separate rate-limiting implementation for outbound traffic.
 - [~] License posture declaration — OperationBuilder declaration and base-license gate implemented; per-feature entitlement validation against license resolver pending.
 
 **Why.** Consumers, SDK authors, tests, docs, and gateway behavior all stay predictable. A gear does not invent its own filtering language, pagination rules, or error envelope, so cross-gear tooling and client generation remain feasible.
@@ -161,13 +161,13 @@ Constructor Fabric Gears is converging on one platform-wide error vocabulary ins
 
 **Status.** Foundation implemented; repository-wide migration still in progress.
 
-**How.** `libs/toolkit-canonical-errors/` defines `CanonicalError` with the following 16 categories: `Cancelled`, `Unknown`, `InvalidArgument`, `DeadlineExceeded`, `NotFound`, `AlreadyExists`, `PermissionDenied`, `ResourceExhausted`, `FailedPrecondition`, `Aborted`, `OutOfRange`, `Unimplemented`, `Internal`, `ServiceUnavailable`, `DataLoss`, and `Unauthenticated`. Each category has typed context, an HTTP mapping, and a stable GTS type identifier. The canonical error stack then renders these errors as RFC-9457 `Problem` responses for HTTP while keeping the underlying category model suitable for future gRPC and internal SDK alignment.
+**How.** `libs/toolkit-canonical-errors/` defines `CanonicalError` with the following 16 categories: `Cancelled`, `Unknown`, `InvalidArgument`, `DeadlineExceeded`, `NotFound`, `AlreadyExists`, `PermissionDenied`, `ResourceExhausted`, `FailedPrecondition`, `Aborted`, `OutOfRange`, `Unimplemented`, `Internal`, `ServiceUnavailable`, `DataLoss`, and `Unauthenticated`. Each category has typed context, an HTTP mapping, and a stable GTS type identifier. The canonical error stack then renders these errors as RFC-9457 `Problem` responses for HTTP and carries the same `Problem` over gRPC in the `x-toolkit-problem-bin` trailer (`toolkit_transport_grpc::PROBLEM_METADATA_KEY`), which `toolkit-contract` converts back into `CanonicalError` on the client side.
 
 This gives the platform one error taxonomy across:
 
 - REST wire responses
 - gear and SDK boundaries
-- future gRPC transport
+- gRPC transport
 - observability and retry classification
 - schema registration and contract validation
 
@@ -177,11 +177,11 @@ See more: [docs/arch/errors/DESIGN.md](arch/errors/DESIGN.md)
 
 #### 3.3.5. Distributed coordination primitives
 
-The next major architectural addition is a unified cluster coordination capability for distributed Constructor Fabric Gears deployments. The intent is to make cross-instance coordination a first-class platform concern rather than something each gear reinvents with ad-hoc locks, local registries, or deployment-specific glue.
+The cluster gear (`gears/system/cluster/`) makes cross-instance coordination a platform concern rather than something each gear reinvents with ad-hoc locks, local registries, or deployment-specific glue.
 
-**How.** The cluster gear is intended to provide four platform-level primitives behind stable contracts: distributed cache, leader election, distributed locks, and service discovery. Consumer gears will declare what they need and the platform will resolve those primitives against operator-selected backends. The design direction already visible in repository docs is that backends may vary by primitive, capability requirements will be validated at startup, cache-backed defaults will exist for other primitives, and watch/lifecycle semantics will be standardized across the coordination surface.
+**How.** `cluster-sdk` defines three primitives behind stable contracts: distributed cache, leader election, and distributed locks. A consumer gear declares a named cluster profile (`ClusterProfile`) and the capabilities it requires; the cluster gear resolves each primitive against an operator-selected backend plugin (`gears/system/cluster/plugins/`: standalone in-process, PostgreSQL, Redis, Kubernetes). Backends may differ per primitive, an unbound lock or leader-election primitive defaults to an implementation over the profile's cache, and unmet capability requirements fail `resolve()` or block readiness. Service discovery is not a cluster primitive; it is the separate `gears/system/service-discovery/` gear.
 
-**Why.** Existing gears already show the need for shared coordination patterns such as node discovery, leader-elected background work, distributed rate limiting, and backend-dependent service location. Elevating these into one platform primitive keeps gear contracts stable across deployment shapes and prevents each gear from inventing incompatible coordination behavior.
+**Why.** Gears need shared coordination patterns such as leader-elected background work, distributed rate limiting, and cross-instance caching. One platform primitive keeps gear contracts stable across deployment shapes and prevents each gear from inventing incompatible coordination behavior.
 
 ### 3.4. Pre-integrated XaaS backbone
 
@@ -215,7 +215,7 @@ New data types are added without modifying existing gears or endpoints.
 
 **Why.** Incompatible schema changes are caught at registration time. The type surface grows without code changes to existing gears, and contracts stay machine-verifiable.
 
-See more in: [docs/REPO_PLAYBOOK.md](REPO_PLAYBOOK.md)
+See more in: [guidelines/GTS.md](../guidelines/GTS.md)
 
 ## 4. Why Rust
 
@@ -261,11 +261,11 @@ The repository maps directly to the three-tier gear hierarchy described in §3.2
   - This layer defines the engineering rules and runtime substrate that higher tiers reuse.
 
 - **`gears/system/` — Core gears**
-  - Control-plane and cross-cutting core gears: API ingress, gear orchestration, authn/authz, tenancy, resource groups, types registry, nodes registry, outbound API gateway, and related services.
+  - Control-plane and cross-cutting core gears: API ingress, gear orchestration, authn/authz, tenancy, resource groups, types registry, nodes registry, service discovery, cluster coordination, event broker, usage collection, outbound API gateway, and related services.
   - These gears carry much of the architectural weight of the repository because they establish the runtime model and platform guarantees.
 
 - **`gears/` — Service gears**
-  - Outside `gears/system/`, the broader `gears/` tree contains business and domain gears that deliver product functionality: serverless runtime, GenAI subsystems, event system, chat engine, file parser, and more (see [GEARS.md ](GEARS.md ) for the full inventory and roadmap).
+  - Outside `gears/system/`, the broader `gears/` tree contains business and domain gears that deliver product functionality: GenAI subsystems, chat engine, file parser, and more (serverless runtime is designed, not yet implemented) (see [GEARS.md ](GEARS.md ) for the full inventory and roadmap).
   - All service gears follow the same ToolKit patterns, SDK conventions, and security model established by the toolkit and core gear tiers.
 
 Additional assembly lives in `apps/`, where executable applications compose gears into examples of runnable systems.
@@ -343,7 +343,7 @@ sequenceDiagram
     GW-->>C: HTTP Response
 ```
 
-> The API Gateway owns authentication (token → `SecurityContext`) and license validation. Gear domain services own authorization: they call `PolicyEnforcer`, which queries the AuthZ Resolver and compiles the result into an `AccessScope`. The gear then passes that scope to `SecureConn` for row-level database filtering. Gear code never performs token parsing or tenant resolution directly. License validation is currently implemented at the base-license level; per-feature entitlement is pending. Usage collection (`gears/system/usage-collector/`) is planned but not yet implemented.
+> The API Gateway owns authentication (token → `SecurityContext`) and license validation. Gear domain services own authorization: they call `PolicyEnforcer`, which queries the AuthZ Resolver and compiles the result into an `AccessScope`. The gear then passes that scope to `SecureConn` for row-level database filtering. Gear code never performs token parsing or tenant resolution directly. License validation is currently implemented at the base-license level; per-feature entitlement is pending. Usage collection is not a step of this pipeline: it is a separate gear (`gears/system/usage-collector/`, with ClickHouse, TimescaleDB and no-op storage plugins) that gears call through `usage-collector-sdk` (`UsageCollectorClientV1`).
 
 ## 8. Gear model
 
@@ -504,18 +504,18 @@ This is the non-HTTP counterpart to OpenAPI generation. OpenAPI describes REST e
 - [x] The canonical error foundation covers the 16 gRPC-aligned categories used as the platform-wide failure vocabulary.
 - [ ] Repository-wide migration to canonical errors is not complete yet.
 
-The canonical error model stabilizes failure semantics, improves machine-readability, reduces ad-hoc error drift, and aligns REST, future gRPC, and internal domain errors. It also connects failure semantics to GTS-backed type identity, so error categories become part of the platform contract surface rather than just human-readable messages.
+The canonical error model stabilizes failure semantics, improves machine-readability, reduces ad-hoc error drift, and aligns REST, gRPC, and internal domain errors. It also connects failure semantics to GTS-backed type identity, so error categories become part of the platform contract surface rather than just human-readable messages.
 
 ## 12. Observability and operations
 
 - [x] OpenTelemetry tracing initialization exists in `libs/toolkit/src/telemetry/`.
 - [x] API Gateway implements request IDs, tracing, timeout layers, body limits, and structured access logging.
-- [x] API Gateway exposes `/health` and `/healthz`.
+- [x] API Gateway exposes `/health`, `/healthz` and `/readyz`.
 - [x] Rate limiting — governor-based rate limiter is implemented in the API Gateway middleware stack. OAGW has a separate rate-limiting implementation for outbound traffic.
 - [x] The repo contains CI workflows and test infrastructure aligned with operational quality.
 
 ## 13. Testing architecture
 
-Constructor Fabric Gears defines a dual-layer testing strategy with an explicit zero-overlap rule between tiers. **Unit and integration tests** run in-process against SQLite `:memory:` with mocked AuthZ, covering domain invariants, validation, error chains, DTO conversions, and seeding logic — no HTTP, no real database. **End-to-end tests** (pytest against a running `cf-gears-server` with real Database) verify only integration seams that unit tests cannot see: JSON wire format, real AuthZ wiring, DB-specific SQL, and cross-gear SDK boundaries. Each unit test must pass three gating questions: (1) does it verify deterministic domain logic, (2) is it atomic and fast, and (3) does removing it reduce confidence in domain correctness.
+Constructor Fabric Gears defines a dual-layer testing strategy with an explicit zero-overlap rule between tiers. **Unit and integration tests** run in-process against SQLite `:memory:` with mocked AuthZ, covering domain invariants, validation, error chains, DTO conversions, and seeding logic — no HTTP, no real database. **End-to-end tests** (pytest against a running `cf-gears-example-server` with a real database) verify only integration seams that unit tests cannot see: JSON wire format, real AuthZ wiring, DB-specific SQL, and cross-gear SDK boundaries. Each unit test must pass three gating questions: (1) does it verify deterministic domain logic, (2) is it atomic and fast, and (3) does removing it reduce confidence in domain correctness.
 
 See more: [docs/toolkit_unified_system/12_unit_testing.md](toolkit_unified_system/12_unit_testing.md) and [docs/toolkit_unified_system/13_e2e_testing.md](toolkit_unified_system/13_e2e_testing.md)
