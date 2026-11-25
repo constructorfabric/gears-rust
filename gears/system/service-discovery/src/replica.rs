@@ -76,6 +76,7 @@ pub struct DirectoryReplica {
 }
 
 impl DirectoryReplica {
+    /// Create a replica over `manager` with no versions recorded yet.
     pub fn new(manager: Arc<GearManager>) -> Self {
         Self {
             manager,
@@ -83,6 +84,7 @@ impl DirectoryReplica {
         }
     }
 
+    /// The [`GearManager`] read model this replica updates.
     pub fn manager(&self) -> &Arc<GearManager> {
         &self.manager
     }

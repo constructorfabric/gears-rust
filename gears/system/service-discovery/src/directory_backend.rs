@@ -1,3 +1,6 @@
+//! Persistence and replication contract ([`DirectoryBackend`]) shared by
+//! service-discovery replicas, and the records and changes it exchanges.
+
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -9,6 +12,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+/// Change feed returned by [`DirectoryBackend::changes`].
 pub type DirectoryChangeStream = std::pin::Pin<
     Box<dyn futures_util::Stream<Item = Result<DirectoryChange, DirectoryBackendError>> + Send>,
 >;
@@ -53,9 +57,13 @@ pub enum DirectoryBackendError {
 ///   generation may restart them.
 #[derive(Clone, Debug)]
 pub struct DirectoryRecord {
+    /// The registered instance.
     pub instance: Arc<GearInstance>,
+    /// Registration lifetime this record belongs to.
     pub generation: u64,
+    /// Write counter within [`generation`](Self::generation).
     pub revision: u64,
+    /// When the registration's lease expires unless renewed.
     pub lease_expires_at: SystemTime,
 }
 
@@ -67,12 +75,19 @@ pub struct DirectoryRecord {
         reason = "the production backend that emits these changes is implemented separately"
     )
 )]
+/// A change published on the [`DirectoryBackend::changes`] feed.
 pub enum DirectoryChange {
+    /// A record was registered or re-registered.
     Upsert(DirectoryRecord),
+    /// A record's lease was renewed by a heartbeat.
     Renew(DirectoryRecord),
+    /// A registration was deregistered.
     Remove {
+        /// Gear the removed instance belongs to.
         gear: String,
+        /// Identifier of the removed instance.
         instance_id: Uuid,
+        /// Generation of the removed registration.
         generation: u64,
     },
 }

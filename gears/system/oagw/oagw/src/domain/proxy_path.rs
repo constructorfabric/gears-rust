@@ -4,6 +4,7 @@
 
 use oagw_sdk::field;
 use std::borrow::Cow;
+use toolkit_macros::domain_model;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::domain::error::DomainError;
@@ -19,6 +20,7 @@ pub(crate) fn canonical_path(raw: &str, instance: &str) -> Result<String, Domain
 
 /// What [`canonical_path`] removes from a path besides percent-encoding
 /// changes, which keep the resource the path names.
+#[domain_model]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PathRewrite {
     /// An empty, `.` or `..` segment was removed.

@@ -1,3 +1,6 @@
+//! In-process [`DirectoryClient`] backed by the host's [`GearManager`], plus
+//! request-validation and error helpers shared with the replicated client.
+
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -18,16 +21,19 @@ pub struct LocalDirectoryClient {
 }
 
 impl LocalDirectoryClient {
+    /// Create a client that reads and writes `manager` directly.
     #[must_use]
     pub fn new(manager: Arc<GearManager>) -> Self {
         Self { manager }
     }
 }
 
+/// Convert a gRPC service-name conflict into a [`DirectoryServiceNameConflict`] error.
 pub fn conflict_error(conflict: GrpcServiceNameConflict) -> anyhow::Error {
     DirectoryServiceNameConflict::from(conflict).into()
 }
 
+/// Parse an instance ID, mapping malformed input to an invalid-argument error.
 pub fn parse_instance_id(instance_id: &str) -> Result<Uuid> {
     Uuid::parse_str(instance_id).map_err(|error| {
         DirectoryInvalidArgument::new(format!("invalid instance_id '{instance_id}': {error}"))
@@ -35,6 +41,7 @@ pub fn parse_instance_id(instance_id: &str) -> Result<Uuid> {
     })
 }
 
+/// Build the not-found error for the instance `gear`/`instance_id`.
 pub fn not_found(gear: &str, instance_id: &str) -> anyhow::Error {
     DirectoryNotFound::new(format!("instance {gear}/{instance_id}")).into()
 }
