@@ -1,0 +1,52 @@
+{
+  "items": [
+    {
+      "definition_id": "0f1e2d3c-4b5a-4697-8a1b-00000000b001",
+      "version": "1",
+      "definition_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "sku_id": "0f1e2d3c-4b5a-4697-8a1b-00000000c001",
+      "sku_version": "3",
+      "service_type_ref": {
+        "id": "gts.cf.bss.products.service_type.v1~cf.backup.resource_adapter.managed_backup.v1",
+        "version": "1",
+        "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "profile_ref": {
+        "id": "0f1e2d3c-4b5a-4697-8a1b-00000000a001",
+        "version": "1",
+        "digest": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "units": {
+        "min": "1",
+        "step": "1",
+        "max": "100"
+      },
+      "supported_bases": [
+        "fixed",
+        "per_plan_unit"
+      ],
+      "target_rules": [
+        "resource_tenant"
+      ],
+      "access_policy": {
+        "on_restricted": "pause",
+        "on_revoked": "service_stop"
+      },
+      "display_name": "Managed backup for the Backup SKU",
+      "profile_conditions": "One unit protects one workload. Pausing keeps the backup copies.",
+      "locale": "en",
+      "qualification_ref": null,
+      "availability": {
+        "state": "disabled",
+        "revision": "1",
+        "observed_at": "2026-11-25T12:00:00Z",
+        "reason_code": "qualification_pending"
+      }
+    }
+  ],
+  "page_info": {
+    "next_cursor": null,
+    "prev_cursor": null,
+    "limit": 50
+  }
+}

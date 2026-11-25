@@ -1,0 +1,108 @@
+{
+  "receipt_service": {
+    "selected_service_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "service_snapshot_digest": "6666666666666666666666666666666666666666666666666666666666666666",
+    "original_quantity": "5",
+    "binding_count": "1",
+    "bindings": [
+      {
+        "binding": {
+          "binding_id": "0f1e2d3c-4b5a-4697-8a1b-00000000e001",
+          "service_key": "backup",
+          "definition_ref": {
+            "id": "0f1e2d3c-4b5a-4697-8a1b-00000000b001",
+            "version": "1",
+            "digest": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "item_id": "0f1e2d3c-4b5a-4697-8a1b-00000000d001",
+          "dimension_value": null,
+          "basis": "per_plan_unit",
+          "coefficient": "1",
+          "target_rule": "resource_tenant",
+          "parameters": {
+            "encrypt": true,
+            "frequency": "daily",
+            "keep_copies": "14"
+          },
+          "policies": {
+            "disposal": {
+              "kind": "not_applicable"
+            },
+            "export": {
+              "kind": "not_applicable"
+            },
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        "evidence": {
+          "sku_id": "0f1e2d3c-4b5a-4697-8a1b-00000000c001",
+          "sku_version": "3",
+          "service_type": {
+            "id": "gts.cf.bss.products.service_type.v1~cf.backup.resource_adapter.managed_backup.v1",
+            "version": "1",
+            "digest": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          "unit_code": "protected_workload",
+          "parameters_schema_ref": "gts.cf.bss.products.service_parameters.v1~cf.backup.resource_adapter.managed_backup_parameters.v1~",
+          "parameters_schema_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+          "profile": {
+            "id": "0f1e2d3c-4b5a-4697-8a1b-00000000a001",
+            "version": "1",
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "units_min": "1",
+          "units_step": "1",
+          "units_max": "100",
+          "access_policy": {
+            "on_restricted": "pause",
+            "on_revoked": "service_stop"
+          },
+          "initial_set_supported": true,
+          "increase_supported": true,
+          "preparation_supported": true
+        },
+        "binding_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+        "execution_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "sku_version": "4",
+        "service_units": "5",
+        "availability_revision": "2"
+      }
+    ]
+  },
+  "posture_grant": {
+    "componentId": "0f1e2d3c-4b5a-4697-8a1b-0000000a0001",
+    "lineKey": "plan#1",
+    "planId": "0f1e2d3c-4b5a-4697-8a1b-00000000f001",
+    "planRevisionId": "0f1e2d3c-4b5a-4697-8a1b-00000000f002",
+    "quantity": "5",
+    "skus": [
+      {
+        "itemId": "0f1e2d3c-4b5a-4697-8a1b-00000000d001",
+        "skuId": "0f1e2d3c-4b5a-4697-8a1b-00000000c001",
+        "skuVersion": 4,
+        "skuCode": "BACKUP",
+        "charge": "recurring"
+      }
+    ],
+    "acceptance": {
+      "acceptanceId": "0f1e2d3c-4b5a-4697-8a1b-0000000a0101",
+      "termsDigest": "8888888888888888888888888888888888888888888888888888888888888888"
+    },
+    "evidenceDigest": "9999999999999999999999999999999999999999999999999999999999999999",
+    "lotIds": [
+      "0f1e2d3c-4b5a-4697-8a1b-0000000a0201"
+    ],
+    "serviceBindingRefs": [
+      {
+        "acceptance": {
+          "acceptanceId": "0f1e2d3c-4b5a-4697-8a1b-0000000a0101",
+          "termsDigest": "8888888888888888888888888888888888888888888888888888888888888888"
+        },
+        "bindingId": "0f1e2d3c-4b5a-4697-8a1b-00000000e001",
+        "bindingDigest": "7777777777777777777777777777777777777777777777777777777777777777"
+      }
+    ]
+  }
+}
