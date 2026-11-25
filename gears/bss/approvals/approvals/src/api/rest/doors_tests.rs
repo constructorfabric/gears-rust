@@ -114,6 +114,7 @@ impl ApprovalSourceV1 for Fake {
                     UnitState::Withdrawn => counts.by_state.withdrawn += 1,
                 }
                 match unit.kind {
+                    bss_approvals_sdk::InboxKind::Order => counts.by_kind.order += 1,
                     bss_approvals_sdk::InboxKind::Prices => counts.by_kind.prices += 1,
                     bss_approvals_sdk::InboxKind::PlanRevision => {
                         counts.by_kind.plan_revision += 1;
@@ -240,6 +241,54 @@ async fn bytes(response: axum::response::Response) -> (StatusCode, axum::http::H
         .await
         .unwrap();
     (status, headers, body.to_vec())
+}
+
+#[tokio::test]
+async fn an_order_source_serves_the_order_kind_and_its_filtered_count() {
+    let mut unit = test_support::unit("orders", 2, 2);
+    unit.kind = bss_approvals_sdk::InboxKind::Order;
+    let app = inbox(
+        &["pricing", "orders"],
+        &[
+            (
+                "pricing",
+                Arc::new(Fake::serving(vec![test_support::unit("pricing", 1, 1)])),
+            ),
+            ("orders", Arc::new(Fake::serving(vec![unit]))),
+        ],
+    );
+    let (status, _, body) = bytes(
+        call(
+            &app,
+            "GET",
+            "/bss-approvals/v1/approval-units?kind=order",
+            b"",
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["kind"], "order");
+    let (status, _, body) = bytes(
+        call(
+            &app,
+            "GET",
+            "/bss-approvals/v1/approval-units/counts?kind=order",
+            b"",
+            true,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let counts: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(counts["by_kind"]["order"], 1);
+    assert_eq!(counts["by_kind"]["prices"], 0);
+    assert_eq!(counts["total"], 1);
 }
 
 #[tokio::test]

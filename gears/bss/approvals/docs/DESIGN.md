@@ -66,7 +66,7 @@ The gear has no tables. Startup does not call `db_required`. A missing configura
 
 `InboxUnit` is the unit the inbox serves. It has no version. Concurrency is the generation in the vote body. `subject_live` is the products card's live SKU head; pricing serves null. `impact` is the live impact, or null when the caller skips it.
 
-The kind is the closed set `prices`, `plan_revision`, `sku_publish`, `sku_change`, `sku_retire`.
+The kind is the closed set `order`, `prices`, `plan_revision`, `sku_publish`, `sku_change`, `sku_retire`.
 
 A `SortKey` is `(submitted_at, id)`. The id order is the lower-case hex order.
 

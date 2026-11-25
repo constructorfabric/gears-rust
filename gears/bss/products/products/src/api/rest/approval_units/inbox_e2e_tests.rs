@@ -599,7 +599,7 @@ async fn the_inbox_walks_both_gears_in_both_orders_each_unit_once() {
     assert_eq!(counts["total"], 11);
     assert_eq!(
         counts["by_kind"],
-        json!({"prices":3,"plan_revision":2,"sku_publish":2,"sku_change":2,"sku_retire":2})
+        json!({"order":0,"prices":3,"plan_revision":2,"sku_publish":2,"sku_change":2,"sku_retire":2})
     );
 }
 

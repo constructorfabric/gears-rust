@@ -231,6 +231,8 @@ impl StateCounts {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KindCounts {
+    /// Order versions submitted for review.
+    pub order: u64,
     /// Pricing: a price submission.
     pub prices: u64,
     /// Pricing: a plan revision.
@@ -246,6 +248,7 @@ pub struct KindCounts {
 impl KindCounts {
     /// Adds another source's kind counts into this one.
     pub fn add(&mut self, other: &Self) {
+        self.order = self.order.saturating_add(other.order);
         self.prices = self.prices.saturating_add(other.prices);
         self.plan_revision = self.plan_revision.saturating_add(other.plan_revision);
         self.sku_publish = self.sku_publish.saturating_add(other.sku_publish);
@@ -258,6 +261,8 @@ impl KindCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxKind {
+    /// An order version submitted for review.
+    Order,
     /// Pricing records this.
     Prices,
     /// Pricing records this.
@@ -275,6 +280,7 @@ impl InboxKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Order => "order",
             Self::Prices => "prices",
             Self::PlanRevision => "plan_revision",
             Self::SkuPublish => "sku_publish",
@@ -439,6 +445,7 @@ mod kind_counts_tests {
     fn a_missing_kind_is_zero_and_an_unknown_kind_does_not_decode() {
         let counts: KindCounts = serde_json::from_str(r#"{"sku_retire":4}"#).expect("known kind");
         assert_eq!(counts.sku_retire, 4);
+        assert_eq!(counts.order, 0);
         assert_eq!(counts.prices, 0);
         assert_eq!(counts.plan_revision, 0);
         assert!(

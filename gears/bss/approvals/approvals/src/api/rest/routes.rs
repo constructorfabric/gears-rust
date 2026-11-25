@@ -128,7 +128,7 @@ fn list_route(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param_typed(
             "kind",
             false,
-            "prices, plan_revision, sku_publish, sku_change or sku_retire",
+            "order, prices, plan_revision, sku_publish, sku_change or sku_retire",
             "string",
         )
         .query_param_typed("ref_id", false, "Referenced aggregate id", "string")
@@ -192,7 +192,7 @@ fn counts_route(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .query_param_typed(
             "kind",
             false,
-            "prices, plan_revision, sku_publish, sku_change or sku_retire",
+            "order, prices, plan_revision, sku_publish, sku_change or sku_retire",
             "string",
         )
         .query_param_typed("ref_id", false, "Referenced aggregate id", "string")
