@@ -61,8 +61,8 @@
 | P-D-226 | M | The SDK's SKU types serialize as the wire carries them | DECIDED 2026-09-30 · Whole-branch review RS-22, RS-23, RS-24 (fix run W1b) |
 | P-D-227 | M | The approval units are counted by state and kind and list newest first on request (twin of pricing D-470) | DECIDED 2026-09-30 · Owner, 2026-09-30 (the approvals option 1, "ok"); pricing phase 9 plan rev 2 (decision 10; plan review M4, L11); amends P-D-224; amended by the phase 9 review (C, R32; fix run 9.5d-1; I, fix run 9.5d-2); amended by P-D-250 |
 | P-D-228 | M | A unit says whether its reader may approve it (twin of pricing D-471) | DECIDED 2026-09-30 · Owner, 2026-09-30 (validation 3 item 4, "ok"); pricing phase 9 plan rev 2 (decision 11; W2; plan review H1, M2); amends P-D-224; amended by the phase 9 review (E, fix run 9.5d-1) |
-| P-D-229 | H | A derived usage meter is a catalog declaration that Rating evaluates | DECIDED 2026-10-01 · Owner, 2026-10-01 (who computes a cloudlet from RAM and CPU); supersedes the PriceBook spec §3 item 11 disposition for derived meters; rating T-D-39 |
-| P-D-230 | H | A derived usage type is versioned data with one evaluator, in the SDK | DECIDED 2026-10-01 · Derived usage types plan rev 3 (design decisions 1–4, run 1); implements P-D-229 and its amendment; amended by P-D-251 |
+| P-D-229 | H | A derived usage meter is a catalog declaration that Rating evaluates | DECIDED 2026-10-01 · Owner, 2026-10-01 (who computes a cloudlet from RAM and CPU); supersedes the PriceBook spec §3 item 11 disposition for derived meters; rating T-D-39; amended 2026-11-25 (only `Sum` inputs are chargeable at launch) |
+| P-D-230 | H | A derived usage type is versioned data with one evaluator, in the SDK | DECIDED 2026-10-01 · Derived usage types plan rev 3 (design decisions 1–4, run 1); implements P-D-229 and its amendment; amended by P-D-251; amended 2026-11-25 (`Peak` and `TimeWeighted` stay valid at write, not chargeable at launch) |
 | P-D-231 | H | Derived usage types are stored append-only and served by five doors | DECIDED 2026-10-01 · Owner, 2026-10-01 (O-1, O-2, O-3); derived usage types plan rev 3 (design decisions 4, 8, 9, run 2); implements P-D-229 and P-D-230; amended by P-D-257; extended by P-D-262 |
 | P-D-232 | H | A usage SKU pins a derived usage type at its first publish | DECIDED 2026-10-01 · Owner, 2026-10-01 (M1, O-2); derived usage types plan rev 3 (design decision 7, run 3); implements P-D-229's pin; amends P-D-184, P-D-207, P-D-231; amended by P-D-251, P-D-258 |
 | P-D-233 | H | Products answers pricing's meter semantics for its derived usage types (E1b) | DECIDED 2026-10-01 · Derived usage types plan rev 3 (design decisions 5 and 6, run 4); implements P-D-229's pricing reference; amends P-D-229, P-D-230, P-D-231, P-D-232; pricing D-503 and D-510 amended; amended by P-D-277 |
@@ -1403,6 +1403,18 @@ derived types.
 **Amended by P-D-251 (2026-10-02).** A declaration may name one raw input. The "at least two" line above is the
 original cloudlet; one input is a wrapper of a raw meter (P-D-230 amended).
 
+**Amended 2026-11-25 (owner: level folds are not chargeable at launch).**
+- **The rule.** The usage collector makes only a `SUM` meter chargeable: a level is integrated at the emitter, and `MAX`,
+  `MIN` and `LATEST` are descriptive (its ADR-0009 and PRD `fr-quantity-semantics`). At launch Products follows that
+  rule: only the `Sum` inputs of a derived declaration are chargeable. `Peak` and `TimeWeighted` inputs stay
+  descriptive until a joint ruling with the usage collector's owner (Rating's R-06).
+- **Docs only.** Products does not refuse `Peak` or `TimeWeighted` at write in this change: the SDK's `validate`
+  (P-D-230), the REST endpoints and the SKU pin accept, store and serve both folds as before, and no stored declaration
+  changes. Rating does not rate them at launch.
+- **What follows for a tariff.** The cloudlet above, with `Peak` inputs, is not chargeable at launch as written. A level
+  product is sold from `SUM` meters instead: storage GB-month from a byte-seconds `SUM` meter, and an hourly peak from a
+  `SUM` meter that the emitter writes once per hour, so that a `Sum` input of that hour is the hour's peak.
+
 #### P-D-230 [H] A derived usage type is versioned data with one evaluator, in the SDK
 
 **Status:** DECIDED 2026-10-01.
@@ -1469,6 +1481,9 @@ the declaration Rating computes.
 
 **Amended by P-D-233 (2026-10-01).** The "Not built yet" line above is done: versions are stored and served (P-D-231), a
 usage SKU pins one (P-D-232), and Products answers pricing's meter semantics for them (P-D-233).
+
+**Amended 2026-11-25 (P-D-229's amendment of the same day).** `validate` still accepts `Peak` and `TimeWeighted` inputs,
+and `evaluate` still takes their folded quantities; at launch only `Sum` inputs are chargeable.
 
 **Amended by P-D-251 (2026-10-02).** A declaration may name one input. Zero inputs is still refused
 (`too_few_inputs`). A one-input declaration is valid with any formula the grammar already allows; the identity
