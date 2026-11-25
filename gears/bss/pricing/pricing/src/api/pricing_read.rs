@@ -26,7 +26,7 @@ use bss_pricing_sdk::{
     read::{
         AcceptedBinding, BindingSelection, ChargeKind, ImmutablePrice, IncompleteCommercialInputs,
         PlanQuery, PriceModel, PriceQuery, PriceState, PricingReadV1, ResolveQuery,
-        ResolvedBindings, ResolvedCell, RevisionRef, Tier,
+        ResolvedBindings, ResolvedCell, RevisionRef,
     },
     terms::{BillingCycle, BillingTiming, InputSource, InvoiceInputs, Rounding},
 };
@@ -171,36 +171,13 @@ fn corrupt(detail: impl Into<String>) -> CanonicalError {
 fn price_model(
     price_id: Uuid,
     model: Model,
-    data: PriceData,
+    data: &PriceData,
 ) -> Result<PriceModel, CanonicalError> {
-    if let Some(e) = money::validate(model, &data).first() {
+    if let Some(e) = money::validate(model, data).first() {
         return Err(corrupt(format!("price {price_id}: {}", e.code)));
     }
-    Ok(match data {
-        PriceData::Flat { amount } => PriceModel::Flat { amount },
-        PriceData::PerUnit { rate } => PriceModel::PerUnit { unit_amount: rate },
-        PriceData::Package {
-            package_size,
-            package_price,
-        } => PriceModel::Package {
-            package_size,
-            package_price,
-        },
-        PriceData::Tiers { tiers } => {
-            let tiers = tiers
-                .into_iter()
-                .map(|t| Tier {
-                    up_to: t.up_to,
-                    rate: t.rate,
-                })
-                .collect();
-            if model == Model::Volume {
-                PriceModel::Volume { tiers }
-            } else {
-                PriceModel::Graduated { tiers }
-            }
-        }
-    })
+    money::price_model(model, data)
+        .ok_or_else(|| corrupt(format!("price {price_id}: PRICE_MISSING")))
 }
 /// The price as the contract serves it, read as every other read reads a stored price
 /// (`price_repo::in_book`): money and fee in canonical text, and the currency spec stored on the
@@ -220,7 +197,7 @@ fn immutable(
         price_book_entry_id: row.price_book_entry_id,
         money_digest: [0; 32],
         currency: price.currency,
-        model: price_model(row.id, model, data)?,
+        model: price_model(row.id, model, &data)?,
         minimum_fee: price.min_fee,
         effective_from: row.effective_from,
         ends_on: row

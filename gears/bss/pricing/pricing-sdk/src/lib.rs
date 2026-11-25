@@ -1,4 +1,6 @@
-//! Infrastructure-free pricing reads and the Products browse contract.
+//! Infrastructure-free pricing reads and the Products browse contract, and the reference amount
+//! function over a read price (D-549).
+pub mod amount;
 pub mod digest;
 pub mod product_catalog;
 pub mod read;

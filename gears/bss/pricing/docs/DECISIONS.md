@@ -169,6 +169,7 @@ and the sold-as bundle and grants (D-411), and drops quote and the Studio wiring
 | D-546 | M | Migration 000024 stores quota rules and their set | DECIDED 2026-11-21 · quotas DESIGN §3.7 |
 | D-547 | H | The preview carries the quota terms and the selected quota digest | DECIDED 2026-11-21 · quotas DESIGN §3.3.1.2; extends D-501; amended 2026-11-22 (owner: the default rule); amended 2026-11-25 (owner: the unit grid and the quota kind) |
 | D-548 | H | An acceptance freezes the selected quota rules with the price terms | DECIDED 2026-11-21 · Owner, 2026-11-21 (shapes in place); extends D-505, D-510 |
+| D-549 | M | The reference amount function lives in pricing-sdk | DECIDED 2026-11-25 · Owner, 2026-11-25 (Rating's ask for a public arithmetic oracle); extends D-527 |
 
 ## Entries
 
@@ -3117,3 +3118,45 @@ feature 2 §3.3, amended in the same change. Extends D-450 to quota rules.
 
 **Source:** Owner, 2026-11-21 (the three commercial structs change in place). Quotas DESIGN §3.3.1.2. Extends D-505
 and D-510.
+
+#### D-549 [M] The reference amount function lives in pricing-sdk
+
+**Status:** DECIDED 2026-11-25.
+
+- **The function.** `bss_pricing_sdk::amount::amount_for(&PriceModel, quantity)` is a reference function: it prices
+  one price over one quantity, exactly (`bss_money::exact::ExactAmount`), in major currency units. It works on the
+  SDK's read model, `read::PriceModel`, not on the gear's stored `PriceData`. It judges the price first, then refuses
+  a quantity below zero, then evaluates: a flat amount, a per-unit amount times the quantity, whole packages
+  (`ceil(quantity / package_size)`) times the package price, a volume band's rate times the whole quantity, and each
+  graduated band's rate times its own part. Bands are half-open (D-387).
+- **The content rules.** `amount::price_violations` and `amount::tier_violations` are the rules the function judges:
+  each decimal within its field's limit (`numeric`, D-527), a positive package size, at least one band, bounds that
+  rise from above zero, and one open top band. `AmountError` names the first rule broken (`Price`), a negative
+  quantity, or a failed exact step, which a valid price never reaches.
+- **What it leaves out.** No allowance, proration, minimum-fee floor, promotion or rounding: D-415 keeps those with
+  Rating, and an invoice line rounds downstream (D-535). It is not a quote (D-415). Nothing prices with it outside
+  tests and arithmetic oracles; the doc comment says so.
+- **One implementation.** The gear's `domain::money::amount_for` maps its stored price to the SDK's `PriceModel`
+  (`domain::money::price_model`, which the in-process price read also uses) and calls the SDK function.
+  `domain::money::validate` and `validate_tiers` judge a price by the same SDK rules and keep their codes:
+  `AMOUNT_INVALID`, `AMOUNT_OUT_OF_RANGE`, `TIER_BAND_EMPTY`, `TIER_TOP_CLOSED`, `TIER_BANDS_ORDER`, and
+  `PRICE_MISSING` for a shape its model does not take. `pricing-sdk` turns on the `exact` feature of `bss-money`.
+- **Why.** Rating checks its own model arithmetic against Pricing's. With the function in the SDK, that check no
+  longer depends on the gear crate, whose modules are hidden. A change to a formula is now an SDK change that every
+  consumer sees.
+- **Not moved.** The decoding of a stored price body (`domain::money::decode`) stays in the gear. A consumer builds
+  the `PriceModel` itself, as the read contract serves it.
+- **The tests.** `pricing-sdk/src/amount_tests.rs`: `a_flat_price_is_its_amount_at_any_quantity`,
+  `a_per_unit_price_is_the_quantity_times_the_unit_amount`,
+  `a_per_unit_product_keeps_every_place_and_every_digit`, `a_package_price_counts_whole_packages`,
+  `a_volume_price_changes_band_exactly_at_the_bound`, `a_graduated_price_prices_each_band_on_its_own_part`,
+  `a_negative_quantity_is_refused_after_the_price`, `each_model_refuses_a_decimal_off_its_limit`,
+  `a_package_reports_its_size_before_its_price_and_only_one`,
+  `tiered_prices_refuse_no_band_a_closed_top_and_bands_out_of_order` and
+  `the_band_rules_report_every_violation_in_band_order`. The gear's money tests (`src/domain/money_tests.rs`), the
+  golden cases (`tests/golden.rs`) and the seam contract (`tests/pricing_seam_contract.rs`) pass through the SDK
+  function; `an_exact_step_that_fails_is_a_typed_rule_refusal` now maps the SDK's arithmetic error, because the
+  gear's exact steps moved.
+
+**Source:** Owner, 2026-11-25 (Rating's ask for a public arithmetic oracle, accepted and built in this change).
+Extends D-527.

@@ -196,19 +196,15 @@ fn a_product_past_the_decimal_carrier_is_exact() {
 }
 #[test]
 fn an_exact_step_that_fails_is_a_typed_rule_refusal() {
+    // The exact steps run in the SDK's reference function (D-549); its arithmetic error maps here.
     assert_eq!(
-        exact_step(Err(ExactError::ArithmeticLimit))
-            .unwrap_err()
-            .code,
+        RuleError::from(AmountError::Arithmetic(ExactError::ArithmeticLimit)).code,
         "AMOUNT_OUT_OF_RANGE"
     );
     assert_eq!(
-        exact_step(Err(ExactError::DivisionByZero))
-            .unwrap_err()
-            .code,
+        RuleError::from(AmountError::Arithmetic(ExactError::DivisionByZero)).code,
         "AMOUNT_INVALID"
     );
-    assert_eq!(exact_step(Ok(exact("1"))).unwrap(), exact("1"));
 }
 #[test]
 fn money_sent_as_json_numbers_is_refused_never_rounded() {

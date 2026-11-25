@@ -8,9 +8,11 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-tier-bands-half-open:p1
 use super::{RuleError, price_book_entry::Model};
 use bss_money::exact::{ExactAmount, ExactError};
+use bss_pricing_sdk::amount::{self, AmountError, PriceViolation};
 use bss_pricing_sdk::numeric::{
     self, NumericError, QUANTITY_FRACTIONAL_DIGITS, RATE_FRACTIONAL_DIGITS,
 };
+use bss_pricing_sdk::read::{self as contract, PriceModel};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -194,20 +196,6 @@ impl PriceField {
             Self::PackageSize => numeric::parse_positive_quantity(text),
             Self::UpTo => numeric::parse_threshold(text),
         }
-    }
-    /// Check a value the caller already holds against the field's limit.
-    fn check(self, value: Decimal) -> Result<Decimal, NumericError> {
-        match self {
-            Self::Amount | Self::Rate | Self::PackagePrice => numeric::validate_rate(value),
-            Self::PackageSize => numeric::validate_positive_quantity(value),
-            Self::UpTo => numeric::validate_threshold(value),
-        }
-    }
-    /// The refusal of a value the caller already holds, if any.
-    fn refusal(self, value: Decimal) -> Option<RuleError> {
-        self.check(value)
-            .err()
-            .map(|error| RuleError::new(numeric_code(error)))
     }
 }
 
@@ -424,133 +412,113 @@ fn shape_matches(model: Model, data: &PriceData) -> bool {
             | (Model::Graduated | Model::Volume, PriceData::Tiers { .. })
     )
 }
-/// Validate rates, thresholds and ascending bounds with one open top band.
-#[must_use]
-pub fn validate_tiers(tiers: &[Tier]) -> Vec<RuleError> {
-    let mut errors = Vec::new();
-    if tiers.is_empty() {
-        return vec![RuleError::new("TIER_BAND_EMPTY")];
-    }
-    let mut previous = Decimal::ZERO;
-    for (index, tier) in tiers.iter().enumerate() {
-        errors.extend(PriceField::Rate.refusal(tier.rate));
-        errors.extend(tier.up_to.and_then(|top| PriceField::UpTo.refusal(top)));
-        if index + 1 == tiers.len() {
-            if tier.up_to.is_some() {
-                errors.push(RuleError::new("TIER_TOP_CLOSED"));
-            }
-        } else if let Some(top) = tier.up_to.filter(|top| *top > previous) {
-            previous = top;
-        } else {
-            errors.push(RuleError::new("TIER_BANDS_ORDER"));
-        }
-    }
-    errors
+/// The bands as the SDK reads them.
+fn contract_tiers(tiers: &[Tier]) -> Vec<contract::Tier> {
+    tiers
+        .iter()
+        .map(|tier| contract::Tier {
+            up_to: tier.up_to,
+            rate: tier.rate,
+        })
+        .collect()
 }
-/// Validate prices without computing a period minimum or consumer allowances. Each decimal
-/// follows its field's limit (`bss_pricing_sdk::numeric`).
+/// The price as the SDK's [`PriceModel`]; `None` when the content is not in the shape of its
+/// model.
 #[must_use]
-pub fn validate(model: Model, data: &PriceData) -> Vec<RuleError> {
-    if !shape_matches(model, data) {
-        return vec![RuleError::new("PRICE_MISSING")];
-    }
-    match data {
-        PriceData::Flat { amount } => PriceField::Amount.refusal(*amount).into_iter().collect(),
-        PriceData::PerUnit { rate } => PriceField::Rate.refusal(*rate).into_iter().collect(),
-        PriceData::Package {
-            package_size,
-            package_price,
-        } => PriceField::PackageSize
-            .refusal(*package_size)
-            .or_else(|| PriceField::PackagePrice.refusal(*package_price))
-            .into_iter()
-            .collect(),
-        PriceData::Tiers { tiers } => validate_tiers(tiers),
-    }
+pub fn price_model(model: Model, data: &PriceData) -> Option<PriceModel> {
+    Some(match (model, data) {
+        (Model::Flat, PriceData::Flat { amount }) => PriceModel::Flat { amount: *amount },
+        (Model::PerUnit, PriceData::PerUnit { rate }) => PriceModel::PerUnit { unit_amount: *rate },
+        (
+            Model::Package,
+            PriceData::Package {
+                package_size,
+                package_price,
+            },
+        ) => PriceModel::Package {
+            package_size: *package_size,
+            package_price: *package_price,
+        },
+        (Model::Volume, PriceData::Tiers { tiers }) => PriceModel::Volume {
+            tiers: contract_tiers(tiers),
+        },
+        (Model::Graduated, PriceData::Tiers { tiers }) => PriceModel::Graduated {
+            tiers: contract_tiers(tiers),
+        },
+        _ => return None,
+    })
 }
-/// The exact value of a price decimal.
-fn exact_decimal(value: Decimal) -> ExactAmount {
-    ExactAmount::from_decimal(value)
+impl From<PriceViolation> for RuleError {
+    fn from(violation: PriceViolation) -> Self {
+        Self::new(match violation {
+            PriceViolation::Numeric(error) => numeric_code(error),
+            PriceViolation::NoBands => "TIER_BAND_EMPTY",
+            PriceViolation::TopBandClosed => "TIER_TOP_CLOSED",
+            PriceViolation::BandsOutOfOrder => "TIER_BANDS_ORDER",
+        })
+    }
 }
 /// A failed exact step as a rule refusal. Valid prices keep every step far inside the exact
 /// budget, so a valid price never reaches this.
-fn exact_step(result: Result<ExactAmount, ExactError>) -> Result<ExactAmount, RuleError> {
-    result.map_err(|error| match error {
-        ExactError::ArithmeticLimit => RuleError::new("AMOUNT_OUT_OF_RANGE"),
+const fn exact_code(error: &ExactError) -> &'static str {
+    match error {
+        ExactError::ArithmeticLimit => "AMOUNT_OUT_OF_RANGE",
         ExactError::Money(_)
         | ExactError::DivisionByZero
         | ExactError::EmptyWeights
         | ExactError::NegativeWeight
-        | ExactError::TooManyTerms => RuleError::new("AMOUNT_INVALID"),
-    })
+        | ExactError::TooManyTerms => "AMOUNT_INVALID",
+    }
+}
+impl From<AmountError> for RuleError {
+    fn from(error: AmountError) -> Self {
+        match error {
+            AmountError::Price(violation) => violation.into(),
+            AmountError::NegativeQuantity => Self::new("AMOUNT_INVALID"),
+            AmountError::Arithmetic(error) => Self::new(exact_code(&error)),
+        }
+    }
+}
+/// Validate rates, thresholds and ascending bounds with one open top band, by the SDK's band
+/// rules (D-549), reporting every violation in band order.
+#[must_use]
+pub fn validate_tiers(tiers: &[Tier]) -> Vec<RuleError> {
+    amount::tier_violations(&contract_tiers(tiers))
+        .into_iter()
+        .map(RuleError::from)
+        .collect()
+}
+/// Validate prices without computing a period minimum or consumer allowances. Each decimal
+/// follows its field's limit (`bss_pricing_sdk::numeric`); the content rules are the SDK's
+/// (`bss_pricing_sdk::amount::price_violations`, D-549), and a shape the model does not take is
+/// `PRICE_MISSING`.
+#[must_use]
+pub fn validate(model: Model, data: &PriceData) -> Vec<RuleError> {
+    price_model(model, data).map_or_else(
+        || vec![RuleError::new("PRICE_MISSING")],
+        |price| {
+            amount::price_violations(&price)
+                .into_iter()
+                .map(RuleError::from)
+                .collect()
+        },
+    )
 }
 /// Evaluate one quantity in major currency units. No allowance, proration or floor.
 ///
-/// The result is exact: nothing is rounded and nothing is narrowed to a `Decimal`. A flat,
-/// per-unit, volume or graduated price only adds, subtracts and multiplies. A package price
-/// counts whole packages, `ceil(quantity / package_size)`, then multiplies that count by the
-/// package price. The count is a number of packages, not money.
-///
-/// The bounds all fit the 256-digit budget of [`ExactAmount`]:
-/// - an input (a quantity, a threshold or a package size) is below 10^28 and has at most 28
-///   places;
-/// - a product is below 10^56 and has at most 56 places;
-/// - a package count is at most 10^56;
-/// - a package amount is below 10^84.
-///
-/// A rate has at most 12 places, so an amount has at most 40. A `quantity` is any `Decimal`
-/// that is not negative; one above 10^28 also fits.
+/// The evaluation is the SDK's reference function, `bss_pricing_sdk::amount::amount_for`
+/// (D-549), over this price as the SDK reads it; its doc gives the formulas and the exact bounds.
+/// The result is exact: nothing is rounded and nothing is narrowed to a `Decimal`.
 /// # Errors
-/// Invalid model content and negative quantities are refused.
+/// Invalid model content and negative quantities are refused: a shape the model does not take is
+/// `PRICE_MISSING`, a content rule its code, and a negative quantity `AMOUNT_INVALID`.
 pub fn amount_for(
     model: Model,
     data: &PriceData,
     quantity: Decimal,
 ) -> Result<ExactAmount, RuleError> {
-    if let Some(error) = validate(model, data).first() {
-        return Err(*error);
-    }
-    if quantity < Decimal::ZERO {
-        return Err(RuleError::new("AMOUNT_INVALID"));
-    }
-    let units = exact_decimal(quantity);
-    match data {
-        PriceData::Flat { amount } => Ok(exact_decimal(*amount)),
-        PriceData::PerUnit { rate } => exact_step(units.checked_mul(&exact_decimal(*rate))),
-        PriceData::Package {
-            package_size,
-            package_price,
-        } => {
-            let packages = exact_step(units.checked_div(&exact_decimal(*package_size)))?;
-            let packages = exact_step(packages.ceil())?;
-            exact_step(packages.checked_mul(&exact_decimal(*package_price)))
-        }
-        PriceData::Tiers { tiers } if model == Model::Volume => {
-            let band = tiers
-                .iter()
-                .find(|tier| tier.up_to.is_none_or(|top| quantity < top))
-                .ok_or_else(|| RuleError::new("TIER_TOP_CLOSED"))?;
-            exact_step(units.checked_mul(&exact_decimal(band.rate)))
-        }
-        PriceData::Tiers { tiers } => {
-            let mut total = exact_decimal(Decimal::ZERO);
-            let mut lower = Decimal::ZERO;
-            for tier in tiers {
-                let upper = tier.up_to.unwrap_or(quantity).min(quantity);
-                if upper > lower {
-                    let width =
-                        exact_step(exact_decimal(upper).checked_sub(&exact_decimal(lower)))?;
-                    let charge = exact_step(width.checked_mul(&exact_decimal(tier.rate)))?;
-                    total = exact_step(total.checked_add(&charge))?;
-                }
-                if upper == quantity {
-                    break;
-                }
-                lower = upper;
-            }
-            Ok(total)
-        }
-    }
+    let price = price_model(model, data).ok_or(RuleError::new("PRICE_MISSING"))?;
+    amount::amount_for(&price, quantity).map_err(RuleError::from)
 }
 #[cfg(test)]
 #[path = "money_tests.rs"]

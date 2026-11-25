@@ -1256,6 +1256,12 @@ they are. A sale of a plan with rules needs the preview's `selected_quota_digest
 selected rules, their evidence, each final limit and availability revision, the original quantity and the selected
 and snapshot digests.
 
+**The reference amount function (D-549).** `bss_pricing_sdk::amount::amount_for(&PriceModel, quantity)` prices one
+price over one quantity, exactly, in major currency units, for tests and arithmetic oracles. It applies no allowance,
+proration, minimum-fee floor, promotion or rounding (D-415), and it is not a quote. The gear's
+`domain::money::amount_for` and its price validation call the SDK, so the arithmetic and the content rules have one
+implementation.
+
 PDP-derived scope and explicit catalog tenant qualify every lookup, including replay. Caller tenant
 and subject come from SecurityContext, never the idempotency key or a system-looking actor name.
 Malformed/unsupported terms retain typed `CommercialReason` metadata and 400; `ResolutionChanged`,

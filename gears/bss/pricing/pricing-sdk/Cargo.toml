@@ -19,7 +19,8 @@ toolkit-security = { workspace = true }
 uuid = { workspace = true }
 time = { workspace = true }
 rust_decimal = { workspace = true }
-bss-money = { workspace = true }
+# `exact`: the reference amount function prices exactly (D-549).
+bss-money = { workspace = true, features = ["exact"] }
 
 [dev-dependencies]
 proptest = { workspace = true }
