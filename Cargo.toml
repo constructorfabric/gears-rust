@@ -411,8 +411,8 @@ toolkit-contract = { package = "cf-gears-toolkit-contract", version = "0.5.2", p
 toolkit-contract-macros = { package = "cf-gears-toolkit-contract-macros", version = "0.2.3", path = "libs/toolkit-contract-macros" }
 toolkit-contract-protogen = { package = "cf-gears-toolkit-contract-protogen", version = "0.1.18", path = "libs/toolkit-contract-protogen" }
 
-cf-gears-system-sdks = { version = "0.1.54", path = "libs/system-sdks" }
-cf-gears-system-sdk-directory = { version = "0.4.0", path = "libs/system-sdks/sdks/directory" }
+cf-gears-system-sdks = { version = "0.1.55", path = "libs/system-sdks" }
+cf-gears-system-sdk-directory = { version = "0.5.0", path = "libs/system-sdks/sdks/directory" }
 
 # System gears
 types-registry = { package = "cf-gears-types-registry", version = "0.8.1", path = "gears/system/types-registry/types-registry" }
