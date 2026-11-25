@@ -9,6 +9,48 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-flight-control-v0.1.8...cf-gears-flight-control-v0.1.9) - 2026-11-25
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-service-discovery-v0.4.4...cf-gears-service-discovery-v0.4.5) - 2026-11-25
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.4.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-storage-plugin-v0.4.4...cf-gears-quota-enforcement-storage-plugin-v0.4.5) - 2026-11-25
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-v0.5.1...cf-gears-file-storage-v0.5.2) - 2026-11-25
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-v0.4.1...cf-gears-graph-storage-v0.4.2) - 2026-11-25
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.4.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-v0.4.6...cf-gears-cluster-v0.4.7) - 2026-11-25
+
+### Other
+
+- update Cargo.lock dependencies
+
+## [0.7.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-api-gateway-v0.7.6...cf-gears-api-gateway-v0.7.7) - 2026-11-25
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-le-issue-admission-plugin-v0.1.4...cf-gears-le-issue-admission-plugin-v0.1.5) - 2026-11-24
 
 ### Other
