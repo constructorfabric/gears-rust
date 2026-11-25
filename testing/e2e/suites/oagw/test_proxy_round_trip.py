@@ -69,11 +69,11 @@ async def test_get_proxy_returns_upstream_response(
         assert [m["id"] for m in body["data"]] == ["gpt-4", "gpt-3.5-turbo"]
 
 
-@pytest.mark.scenario("positive-7.2-hop-hop-headers-stripped")
 # ---------------------------------------------------------------------------
 # Header verification via /echo
 # ---------------------------------------------------------------------------
 
+@pytest.mark.scenario("positive-7.2-hop-hop-headers-stripped")
 @pytest.mark.asyncio
 async def test_hop_by_hop_headers_stripped(
     oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
@@ -84,6 +84,8 @@ async def test_hop_by_hop_headers_stripped(
     absence checks would pass whether or not stripping works. The control
     header proves client headers do reach the upstream in this config, and
     `x-conn-nominated` is hop-by-hop only because `Connection` names it.
+    `Upgrade: h2c` is not a WebSocket handshake, so the request stays a
+    plain one and `Upgrade` must be stripped.
     """
     _ = mock_upstream
     alias = unique_alias("proxy-hop")
@@ -101,7 +103,8 @@ async def test_hop_by_hop_headers_stripped(
             headers={
                 **oagw_headers,
                 "content-type": "application/json",
-                "connection": "keep-alive, x-conn-nominated",
+                "connection": "keep-alive, upgrade, x-conn-nominated",
+                "upgrade": "h2c",
                 "x-conn-nominated": "x",
                 "keep-alive": "timeout=5",
                 "te": "trailers",
@@ -115,7 +118,7 @@ async def test_hop_by_hop_headers_stripped(
         echoed = resp.json()["headers"]
 
         assert echoed.get("x-e2e-control") == "arrives"
-        for h in ("keep-alive", "te", "trailer", "x-conn-nominated", "proxy-authorization"):
+        for h in ("keep-alive", "te", "trailer", "upgrade", "x-conn-nominated", "proxy-authorization"):
             assert h not in echoed, f"hop-by-hop header {h!r} was forwarded upstream"
         # OAGW may set its own Connection, but not relay the client's.
         assert "x-conn-nominated" not in echoed.get("connection", "").lower()

@@ -126,10 +126,10 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 15. [x] - `p1` - Execute auth plugin: inject credentials into outbound request - `inst-proxy-14`
 16. [x] - `p1` - **IF** auth plugin fails (secret not found, credential error) - `inst-proxy-15`
     1. [x] - `p1` - **RETURN** the credential-failure mapping (DESIGN "Credential Failures"): 401 `AUTH_CREDENTIAL_NOT_FOUND` when the secret is missing or not accessible, 503 `CREDENTIAL_STORE_UNAVAILABLE` with the store's retry hint when the credential store is unavailable, 503 `IDENTITY_PROVIDER_UNAVAILABLE` when the identity provider's token endpoint is unreachable or answers 408, 429 or 5xx, 502 when the identity provider answers with an invalid response, 500 for a plugin misconfiguration, 401 `AUTH_PLUGIN_FAILED` / `AUTH_PLUGIN_INTERNAL` otherwise, with `X-OAGW-Error-Source: gateway`. The error and the server log name the auth config key (`auth.config.secret_ref`, `auth.config.client_id_ref`, `auth.config.client_secret_ref`), never the reference or the credential store's own text, which may quote it - `inst-proxy-15a`
-17. [x] - `p1` - Execute guard plugins: validate method, query params, path suffix, CORS origin (actual requests only; preflight returns permissive 204 at handler level; see [ADR: CORS](../ADR/0006-cors.md)) - `inst-proxy-16`
+17. [x] - `p1` - Execute guard plugins: validate method, query params (names decoded as `application/x-www-form-urlencoded`), path suffix, CORS origin (actual requests only; a preflight, `OPTIONS` with `Origin` and `Access-Control-Request-Method`, returns a permissive 204 at handler level, and any other `OPTIONS` is routed; see [ADR: CORS](../ADR/0006-cors.md)) - `inst-proxy-16`
 18. [x] - `p1` - **IF** any guard rejects - `inst-proxy-17`
     1. [x] - `p1` - **RETURN** guard-specific error code with `X-OAGW-Error-Source: gateway` - `inst-proxy-17a`
-19. [x] - `p1` - Execute transform plugins: `on_request` phase: mutate outbound request - `inst-proxy-18`
+19. [x] - `p1` - Execute transform plugins: `on_request` phase: mutate outbound request. They see the decoded query pairs; the query is rebuilt from the pairs, form-encoded, only when a transform changed them or the query has a literal `;` (step 28) - `inst-proxy-18`
 20. [x] - `p1` - Apply header transformation via `cpt-cf-oagw-algo-header-transformation` - `inst-proxy-19`
 21. [x] - `p1` - Select target endpoint via `X-OAGW-Target-Host` header or round-robin - `inst-proxy-20`
 22. [x] - `p1` - **IF** multi-endpoint upstream with common-suffix alias AND `X-OAGW-Target-Host` header missing - `inst-proxy-21`
@@ -143,7 +143,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
     1. [x] - `p1` - **RETURN** the `authenticate` error mapping (an output the gateway cannot send is a misconfiguration, 500) or 504 RequestTimeout with reason `REQUEST_NOT_SENT` with `X-OAGW-Error-Source: gateway`; nothing is sent - `inst-proxy-24s1a`
 27. [x] - `p1` - **IF** request contains `Upgrade: websocket` header - `inst-proxy-24`
     1. [x] - `p1` - Perform the handshake on a dedicated upstream connection via the engine's upgrade; tunnel only after the upstream answers `101`, otherwise **RETURN** 502 ProtocolError with reason `REQUEST_MAY_HAVE_BEEN_SENT` and `X-OAGW-Error-Source: gateway` - `inst-proxy-24a`
-28. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path), method, headers, body - `inst-proxy-25`
+28. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path + query), method, headers, body. The query is the client's, byte for byte, unless a transform changed it (step 19) or it has a literal `;`: the allowlist splits pairs on `&` only, and an upstream that also splits on `;` (Rack 2, older Python `parse_qs`, older Go `net/url`) would read parameters the allowlist never checked, so such a query goes out form-encoded (`model=x;admin=1` as `model=x%3Badmin%3D1`). The method is the one the route matched, in upper case - `inst-proxy-25`
 29. [x] - `p1` - Forward the request through the upstream engine via `cpt-cf-oagw-algo-upstream-forwarding` - `inst-proxy-26`
 30. [x] - `p1` - **IF** the engine reports an upstream connection failure (refused, DNS, TLS) - `inst-proxy-27`
     1. [x] - `p1` - Map the engine error kind to `DomainError` and to its dispatch stage (DESIGN "Dispatch Reasons"); the REST layer writes the RFC 9457 Problem response with the stage as `context.reason` and `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
@@ -466,6 +466,10 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] Upstream plugins execute before route plugins in the composed chain
 - [x] Auth plugin resolves credentials from `cred_store` via `secret_ref` at request time; a missing or inaccessible secret returns 401 `AUTH_CREDENTIAL_NOT_FOUND`, a credential store outage 503 `CREDENTIAL_STORE_UNAVAILABLE`, an identity provider outage 503 `IDENTITY_PROVIDER_UNAVAILABLE`, an invalid identity provider response 502, a plugin misconfiguration 500
 - [x] Guard plugins reject invalid requests (method, query, path suffix) before upstream forwarding
+- [x] Routes match `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` and `OPTIONS`, each only when listed (`GET` does not imply `HEAD`); a `HEAD` response carries the upstream's headers, `Content-Length` included, and no body; an `OPTIONS` that is not a CORS preflight is proxied
+- [x] The upstream receives the client's query byte for byte (escapes, `+` vs `%2B`, repeated keys, empty values, keys without `=`, order); the allowlist checks the decoded names; a transform that changes the parameters gets them form-encoded
+- [x] A query with a literal `;` reaches the upstream form-encoded (`;` as `%3B`), so an upstream that splits on `;` sees the parameters the allowlist checked
+- [x] A method sent in lower case (`head`) reaches the upstream as the method the route matched (`HEAD`)
 - [x] Hop-by-hop headers (Connection, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, TE, Trailer, Transfer-Encoding, Upgrade) are stripped from outbound requests
 - [x] `X-OAGW-Target-Host` is consumed for endpoint selection and stripped before forwarding
 - [x] `Host` (HTTP/1.1) or `:authority` (HTTP/2) is replaced with upstream endpoint host

@@ -19,7 +19,7 @@ use crate::config::TokenCacheConfig;
 use crate::domain::circuit_breaker::{CircuitBreakers, UpstreamPermit};
 use crate::domain::error::{Dispatch, DomainError};
 use crate::domain::model::{
-    PassthroughMode, PathSuffixMode, ProxyTarget, RateLimitConfig, ResponseHeaderRules,
+    HttpMethod, PassthroughMode, PathSuffixMode, ProxyTarget, RateLimitConfig, ResponseHeaderRules,
     ShadowedRouteLimit, Upstream,
 };
 use crate::domain::plugin::credentials::CredentialMode;
@@ -35,7 +35,7 @@ use crate::domain::rate_limit::{
     build_rate_limit_key, pool_config,
 };
 use crate::domain::repo::Tags;
-use crate::domain::route_matching::path_after_route_prefix;
+use crate::domain::route_matching::{parse_method, path_after_route_prefix};
 use crate::domain::services::management::forbid_http_endpoints;
 use crate::domain::services::{
     ControlPlaneService, DataPlaneService, EndpointSelector, ProxyGrant, SelectedEndpoint,
@@ -433,7 +433,7 @@ struct ParsedRequest {
     path_suffix: String,
     /// What normalizing the client's path suffix removed.
     path_rewrite: PathRewrite,
-    query_params: Vec<(String, String)>,
+    query: RequestQuery,
     method: http::Method,
     req_headers: HeaderMap,
     is_upgrade: bool,
@@ -442,6 +442,81 @@ struct ParsedRequest {
     /// Client address from the API gateway's `ClientIp` extension; `None`
     /// for requests that did not come through it (in-process SDK calls).
     client_ip: Option<std::net::IpAddr>,
+}
+
+/// The query of a proxied request.
+///
+/// The upstream gets `raw`, the client's bytes, unless a transform changed
+/// `params` or `reencode` is set: decoding and re-encoding would rewrite
+/// `%2B` vs `+`, `%20` vs `+`, reserved characters left unescaped and `k`
+/// vs `k=`, which signed URLs and some APIs depend on.
+struct RequestQuery {
+    /// After the `?`, as the client sent it; `None` without a `?`.
+    raw: Option<String>,
+    /// `raw` decoded as `application/x-www-form-urlencoded`, in order,
+    /// repeated keys kept: what the allowlist checks and transforms see.
+    params: Vec<(String, String)>,
+    /// Send `params` form-encoded instead of `raw`: the allowlist admitted a
+    /// query with a literal `;`. The allowlist splits on `&` only, so
+    /// `model=x;admin=1` is the one parameter `model`, but Rack 2, older
+    /// Python `parse_qs` and older Go `net/url` also split on `;` and would
+    /// read an `admin` the allowlist never checked. Encoded, the `;` is
+    /// `%3B` and every reader sees the parameters the gateway checked.
+    reencode: bool,
+}
+
+impl RequestQuery {
+    fn parse(raw: Option<&str>) -> Self {
+        let params = raw
+            .map(|q| {
+                form_urlencoded::parse(q.as_bytes())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            raw: raw.map(str::to_owned),
+            params,
+            reencode: false,
+        }
+    }
+
+    /// Called once the allowlist admitted `params`.
+    fn allowlist_admitted(&mut self) {
+        self.reencode = self.raw.as_deref().is_some_and(|q| q.contains(';'));
+    }
+
+    /// The query to send upstream. `params` is form-encoded only when a
+    /// transform changed it or `reencode` is set; an empty list then means
+    /// no query.
+    fn outbound(self, transformed: bool) -> Option<String> {
+        if !transformed && !self.reencode {
+            return self.raw;
+        }
+        if self.params.is_empty() {
+            return None;
+        }
+        Some(
+            form_urlencoded::Serializer::new(String::new())
+                .extend_pairs(&self.params)
+                .finish(),
+        )
+    }
+}
+
+/// The standard method a route matched `method` as (routing ignores case),
+/// or `method` itself when it names none.
+fn routed_method(method: http::Method) -> http::Method {
+    match parse_method(method.as_str()) {
+        Some(HttpMethod::Get) => http::Method::GET,
+        Some(HttpMethod::Post) => http::Method::POST,
+        Some(HttpMethod::Put) => http::Method::PUT,
+        Some(HttpMethod::Delete) => http::Method::DELETE,
+        Some(HttpMethod::Patch) => http::Method::PATCH,
+        Some(HttpMethod::Head) => http::Method::HEAD,
+        Some(HttpMethod::Options) => http::Method::OPTIONS,
+        None => method,
+    }
 }
 
 /// Decompose and validate an inbound proxy request.
@@ -472,16 +547,7 @@ fn parse_proxy_request(
         )
     };
 
-    // Parse query parameters with proper URL decoding.
-    let query_params: Vec<(String, String)> = req
-        .uri()
-        .query()
-        .map(|q| {
-            form_urlencoded::parse(q.as_bytes())
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect()
-        })
-        .unwrap_or_default();
+    let query = RequestQuery::parse(req.uri().query());
 
     // Decompose request into parts. Keep body as-is for conditional handling.
     let (parts, body) = req.into_parts();
@@ -524,7 +590,7 @@ fn parse_proxy_request(
         alias,
         path_suffix,
         path_rewrite,
-        query_params,
+        query,
         method,
         req_headers,
         is_upgrade,
@@ -907,8 +973,9 @@ impl DataPlaneServiceImpl {
         mut auth: Authorization,
         req: http::Request<Body>,
     ) -> Result<http::Response<Body>, DomainError> {
-        let request_method = req.method().clone();
-        let method = crate::infra::metrics::normalize_method(&request_method);
+        // The client's method until a route matches, then the one it matched.
+        let mut routed = req.method().clone();
+        let method = crate::infra::metrics::normalize_method(&routed);
         let mut guard = RequestMetricsGuard::new(Arc::clone(&self.metrics), method);
         if let Authorization::Granted(grant) = &mut auth {
             // The guard counts the request from here on.
@@ -935,7 +1002,7 @@ impl DataPlaneServiceImpl {
                 alias,
                 path_suffix,
                 path_rewrite,
-                mut query_params,
+                mut query,
                 method,
                 req_headers,
                 is_upgrade,
@@ -975,6 +1042,14 @@ impl DataPlaneServiceImpl {
                     return Err(e);
                 }
             };
+
+            // Routing ignores the method's case; RFC 9110 methods do not. Sent
+            // as is, `head` reaches the upstream as an unknown method, and a
+            // HEAD answer read as one to such a method waits for a body that
+            // never comes. Every later step uses the method the route matched.
+            let method = routed_method(method);
+            guard.method = crate::infra::metrics::normalize_method(&method);
+            routed.clone_from(&method);
 
             // Capture metric labels now that upstream + route are known, and
             // move the in-flight count to the upstream's alias.
@@ -1022,9 +1097,9 @@ impl DataPlaneServiceImpl {
 
         // 3. Validate query parameters against route's allowlist.
         if let Some(ref http_match) = route.match_rules.http
-            && !query_params.is_empty()
+            && !query.params.is_empty()
         {
-            for (key, _) in &query_params {
+            for (key, _) in &query.params {
                 if !http_match.query_allowlist.contains(key) {
                     return Err(DomainError::Validation {
                         field: "query",
@@ -1037,6 +1112,7 @@ impl DataPlaneServiceImpl {
                     });
                 }
             }
+            query.allowlist_admitted();
         }
 
         // 3b. Enforce path_suffix_mode.
@@ -1254,11 +1330,11 @@ impl DataPlaneServiceImpl {
         // outbound headers. Errors are logged and skipped — transforms use
         // log-and-continue semantics. Compare with guards (step 5b) which
         // fail-hard.
-        execute_transform_requests(
+        let query_transformed = execute_transform_requests(
             &self.transform_registry,
             &transform_bindings,
             &mut outbound_headers,
-            &mut query_params,
+            &mut query.params,
             method.as_str(),
             &path_suffix,
             ctx,
@@ -1349,7 +1425,7 @@ impl DataPlaneServiceImpl {
             endpoint,
             route_path,
             remaining_suffix,
-            &query_params,
+            query.outbound(query_transformed).as_deref(),
         )?;
 
         // 8a. Circuit breaker permit. It covers target resolution and the
@@ -1570,7 +1646,7 @@ impl DataPlaneServiceImpl {
         match result {
             Ok(resp) => {
                 guard.set_success(resp.status().as_u16());
-                Ok(guard.observe_body(resp, &request_method))
+                Ok(guard.observe_body(resp, &routed))
             }
             Err(err) => {
                 guard.set_error(&err);
@@ -2204,6 +2280,8 @@ async fn execute_guard_requests(
 /// Placed after header rules so transforms have the final word on outbound
 /// headers. Errors are logged and skipped — transforms use log-and-continue
 /// semantics so a single misbehaving transform cannot block the pipeline.
+///
+/// Returns whether the transforms changed the query parameters.
 async fn execute_transform_requests(
     transform_registry: &TransformPluginRegistry,
     transform_bindings: &[&crate::domain::model::PluginBinding],
@@ -2212,9 +2290,9 @@ async fn execute_transform_requests(
     method: &str,
     path_suffix: &str,
     ctx: &SecurityContext,
-) {
+) -> bool {
     if transform_bindings.is_empty() {
-        return;
+        return false;
     }
 
     let original_headers = headers::header_map_to_vec(outbound_headers);
@@ -2258,7 +2336,11 @@ async fn execute_transform_requests(
     // Apply only what the transforms changed: other lines, credentials set by
     // the auth plugin included, keep their bytes and sensitive flag.
     headers::apply_header_edits(outbound_headers, &original_headers, &transform_headers);
+    if transform_query == *query_params {
+        return false;
+    }
     *query_params = transform_query;
+    true
 }
 
 /// Enforce CORS origin and method constraints for actual (non-preflight) requests.

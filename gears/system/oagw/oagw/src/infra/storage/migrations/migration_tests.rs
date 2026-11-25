@@ -904,6 +904,8 @@ fn column_sizes_cover_the_field_limits_and_stored_texts() {
         HttpMethod::Put,
         HttpMethod::Delete,
         HttpMethod::Patch,
+        HttpMethod::Head,
+        HttpMethod::Options,
     ];
     let texts = sharing
         .into_iter()

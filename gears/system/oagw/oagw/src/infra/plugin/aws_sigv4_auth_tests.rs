@@ -524,7 +524,7 @@ async fn query_without_pairs_is_removed() {
     assert_eq!(plugin().sign(&ctx).await.unwrap().query, QueryChange::Keep);
 }
 
-/// The form-urlencoded pairs of `query` as the gateway builds it (`+` for a
+/// The form-urlencoded pairs of `query` as the gateway reads it (`+` for a
 /// space), fully decoded, in order.
 fn form_pairs(query: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
     query

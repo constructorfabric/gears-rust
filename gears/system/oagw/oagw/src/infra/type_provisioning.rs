@@ -290,6 +290,8 @@ enum HttpMethod {
     Put,
     Delete,
     Patch,
+    Head,
+    Options,
 }
 
 #[derive(Deserialize, Default)]
@@ -632,6 +634,8 @@ impl From<HttpMethod> for domain::HttpMethod {
             HttpMethod::Put => Self::Put,
             HttpMethod::Delete => Self::Delete,
             HttpMethod::Patch => Self::Patch,
+            HttpMethod::Head => Self::Head,
+            HttpMethod::Options => Self::Options,
         }
     }
 }
@@ -1183,7 +1187,7 @@ mod tests {
             "upstream_id": upstream_id,
             "match": {
                 "http": {
-                    "methods": ["POST", "PUT"],
+                    "methods": ["POST", "PUT", "HEAD", "OPTIONS"],
                     "path": "/v1/chat/completions",
                     "query_allowlist": ["model"],
                     "path_suffix_mode": "disabled"
@@ -1224,7 +1228,12 @@ mod tests {
         let http = req.match_rules.http.as_ref().unwrap();
         assert_eq!(
             http.methods,
-            vec![domain::HttpMethod::Post, domain::HttpMethod::Put]
+            vec![
+                domain::HttpMethod::Post,
+                domain::HttpMethod::Put,
+                domain::HttpMethod::Head,
+                domain::HttpMethod::Options,
+            ]
         );
         assert_eq!(http.path, "/v1/chat/completions");
         assert_eq!(http.query_allowlist, vec!["model"]);

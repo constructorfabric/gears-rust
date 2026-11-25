@@ -583,9 +583,10 @@ fn remove_dot_segments(path: &str) -> String {
 
 /// The canonical query string of the query as sent, and the query to send:
 /// the same pairs in their order, each name and value in SigV4 encoding
-/// (`None` when there are no pairs). The gateway builds the outbound query
-/// form-urlencoded (`+` for a space), so that is how it is decoded; AWS
-/// reads `+` as a literal plus, hence the rewrite.
+/// (`None` when there are no pairs). The query is the client's as received,
+/// or form-encoded by the gateway after a transform changed it; either way
+/// the gateway reads it as form-urlencoded (`+` for a space), so that is how
+/// it is decoded. AWS reads `+` as a literal plus, hence the rewrite.
 pub(crate) fn canonical_query(query: Option<&str>) -> (String, Option<String>) {
     let mut pairs: Vec<(String, String)> = Vec::new();
     for pair in query.unwrap_or_default().split('&') {

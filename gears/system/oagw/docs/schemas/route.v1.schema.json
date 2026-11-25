@@ -72,9 +72,9 @@
           "minItems": 1,
           "items": {
             "type": "string",
-            "enum": [ "GET", "POST", "PUT", "DELETE", "PATCH" ]
+            "enum": [ "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS" ]
           },
-          "description": "HTTP methods supported by this route."
+          "description": "HTTP methods the route matches. Only the listed methods match: GET does not imply HEAD."
         },
         "path": {
           "type": "string",
@@ -85,7 +85,7 @@
           "type": "array",
           "items": { "type": "string" },
           "default": [ ],
-          "description": "White-listed query parameters. If empty, allow none."
+          "description": "Allowed query parameter names, compared after form decoding (my%20key and my+key are \"my key\"). If empty, allow none. The query is forwarded as sent."
         },
         "path_suffix_mode": {
           "type": "string",

@@ -317,6 +317,8 @@ pub enum HttpMethod {
     Put,
     Delete,
     Patch,
+    Head,
+    Options,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
@@ -745,6 +747,8 @@ impl From<HttpMethod> for domain::HttpMethod {
             HttpMethod::Put => Self::Put,
             HttpMethod::Delete => Self::Delete,
             HttpMethod::Patch => Self::Patch,
+            HttpMethod::Head => Self::Head,
+            HttpMethod::Options => Self::Options,
         }
     }
 }
@@ -1042,6 +1046,8 @@ impl From<domain::HttpMethod> for HttpMethod {
             domain::HttpMethod::Put => Self::Put,
             domain::HttpMethod::Delete => Self::Delete,
             domain::HttpMethod::Patch => Self::Patch,
+            domain::HttpMethod::Head => Self::Head,
+            domain::HttpMethod::Options => Self::Options,
         }
     }
 }

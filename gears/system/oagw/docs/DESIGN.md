@@ -565,11 +565,11 @@ Validation rules that can reject requests:
 
 | Inbound | Rule |
 |---|---|
-| Method | Must be in `match.http.methods`; reject if not allowed |
-| Query params | Validate against `match.http.query_allowlist`; reject if unknown |
+| Method | Must be in `match.http.methods` (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`); otherwise no route matches (`404`). A route matches only the methods it lists: `GET` does not imply `HEAD`. Routes that do not list the method are dropped before the longest prefix is chosen: with routes `/v1` (`GET`, `HEAD`) and `/v1/admin` (`GET`), `HEAD /v1/admin/x` is served by `/v1`, with its plugins, query allowlist and limits |
+| Query params | The parameter names, decoded as `application/x-www-form-urlencoded` (`my%20key` and `my+key` are `my key`), must be in `match.http.query_allowlist`; reject if unknown. Because names are decoded, allowlisting `my key` also admits `my+key`, which an upstream that reads the query per RFC 3986 (`+` is a plus) sees as the name `my+key`. Pairs are split on `&` only; a query with a literal `;` is forwarded form-encoded (see Transformation Rules) |
 | Path suffix | Reject if `path_suffix_mode`: `disabled` and suffix provided |
 | Body | See body validation rules below |
-| CORS origin | Reject if origin is not in upstream's `allowed_origins` (actual cross-origin requests only; preflight returns permissive 204 at handler level — see [ADR: CORS](./ADR/0006-cors.md)) |
+| CORS origin | Reject if origin is not in upstream's `allowed_origins` (actual cross-origin requests only; a preflight, `OPTIONS` with `Origin` and `Access-Control-Request-Method`, returns a permissive 204 at handler level — see [ADR: CORS](./ADR/0006-cors.md)) |
 | CORS method | Reject if method is not in upstream's `allowed_methods` (actual cross-origin requests only) |
 
 #### Body Validation Rules
@@ -597,9 +597,9 @@ Rules that mutate inbound → outbound:
 
 | Inbound | Outbound | Rule |
 |---|---|---|
-| Method | Method | Passthrough |
+| Method | Method | The method the route matched. Routing compares method names case-insensitively, but methods are case-sensitive (RFC 9110): `head` matches a `HEAD` route and goes upstream as `HEAD`, so the gateway and the upstream both treat it as `HEAD` and neither waits for a body. A `HEAD` response has the upstream's status and headers, `Content-Length` included, and no body |
 | Path suffix | Path | Append to `match.http.path` if `path_suffix_mode`: `append`; plugin mutable |
-| Query params | Query | Passthrough allowed params; plugin mutable |
+| Query params | Query | The client's query string, byte for byte (escapes, `+`, repeated keys, empty values, keys without `=`, order). This includes what the gateway used to escape: `\|`, `{`, `}`, `[`, `]`, `\`, `^`, a backtick, raw non-ASCII UTF-8 bytes and malformed escapes such as `%zz`; a strict upstream (Tomcat, for one) may reject them with 400. Transforms see the decoded pairs. The query is rebuilt from the pairs, form-encoded, when a transform changes them, or when the query has a literal `;`: the allowlist splits pairs on `&` only, while Rack 2, older Python `parse_qs` and older Go `net/url` also split on `;`, so `model=x;admin=1` (one parameter, `model`) would give them an `admin` the allowlist never checked; it goes out as `model=x%3Badmin%3D1`. A rebuilt query encodes every pair again from its decoded form: pairs a transform left alone lose their original encoding, and an invalid escape such as `%FF` becomes `%EF%BF%BD` |
 | Headers | Headers | Apply `upstream.headers` transformation rules; plugin mutable |
 | Body | Body | Passthrough by default; plugin mutable |
 
@@ -665,7 +665,7 @@ Built-in denied ranges:
 - IPv6: every block of the IANA IPv6 Special-Purpose Address Registry (2025-10-09) that is not globally reachable: `::1/128`, `::/128`, `64:ff9b:1::/48`, `100::/64`, `100:0:0:1::/64`, `2001::/23` except its globally reachable entries (`2001:1::1`, `2001:1::2`, `2001:1::3`, `2001:3::/32`, `2001:4:112::/48`, `2001:20::/28`, `2001:30::/28`), so with `2001:2::/48` and `2001:10::/28`, Teredo `2001::/32`, `2001:db8::/32`, `3fff::/20`, `5f00::/16`, `fc00::/7`, `fe80::/10`; plus the deprecated site-local `fec0::/10`, the deprecated IPv4-compatible `::/96` whatever IPv4 address it carries (a Linux host with `sit0` up tunnels it to that IPv4 address, other stacks send it as IPv6 outside `2000::/3`), multicast `ff00::/8`, and every other address outside `2000::/3`, the only space allocated for global unicast. A block IANA assigns outside `2000::/3` later is therefore denied already.
 - IPv6 addresses that carry an IPv4 address are judged by it: IPv4-mapped `::ffff:0:0/96`, IPv4-translated `::ffff:0:0:0/96`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`.
 
-**Cross-Origin Resource Sharing (CORS)**: Built-in, configured per upstream/route. Preflight OPTIONS requests return a permissive 204 at the handler level (no upstream resolution or tenant context required). Origin validation happens on actual requests after upstream resolution, before forwarding. See [ADR: CORS](./ADR/0006-cors.md).
+**Cross-Origin Resource Sharing (CORS)**: Built-in, configured per upstream/route. A preflight (`OPTIONS` with `Origin` and `Access-Control-Request-Method`) returns a permissive 204 at the handler level (no upstream resolution or tenant context required: the API gateway does not authenticate preflights). Any other `OPTIONS` is routed like other methods and reaches the upstream when the route lists `OPTIONS`. With the API gateway's `cors_enabled`, the gateway answers every `OPTIONS` itself and OAGW sees none. Origin validation happens on actual requests after upstream resolution, before forwarding. See [ADR: CORS](./ADR/0006-cors.md).
 
 **HTTP Version Negotiation**: OAGW uses adaptive per-host HTTP version detection:
 1. **First request**: Attempt HTTP/2 via ALPN during TLS handshake
@@ -802,6 +802,8 @@ Planned: OData query parameters `$filter`, `$select`, `$orderby`, `$top`, `$skip
 Request classification uses `upstream.protocol` to determine match strategy:
 - HTTP: method allowlist + longest path prefix match, ending on a segment boundary (`/v1/chat` covers `/v1/chat/x` and `/v1/chat.json`, not `/v1/chatty`; route `/` covers the bare alias). Matching runs on the normalized path: percent-encoded unreserved characters decoded (`/v1/ch%61t` is `/v1/chat`), other escapes uppercased, `.` and `..` resolved; a segment that is a dot-segment once decoded (also through `;` parameters or double encoding) is rejected with 400. An encoded `/` or `\` (`%2F`, `%5C`) ends a segment without starting a new one (`/v1%2Fadmin` is under `/v1`); the candidates are also ranked with `%2F`, `%5C`, `\` and the fullwidth and small solidi `%EF%BC%8F`, `%EF%BC%BC` and `%EF%B9%A8`, which NFKC folds to `/` and `\` read as `/`, and a request for which that picks another route (routes `/v1` and `/v1/admin`, request `/v1%2Fadmin`) is rejected with 400 `INVALID_PROXY_PATH`, so an upstream that decodes them cannot be reached past the narrower route's policy
 - gRPC (planned/Phase 3): `(service, method)` match from gRPC request path (no gRPC proxy code path is currently implemented or reachable)
+
+HTTP routes match `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD` and `OPTIONS`, each only when the route lists it; other methods match no route. Method names match case-insensitively, and the upstream gets the method the route matched (`head` goes out as `HEAD`). The query is forwarded as the client sent it, unless it has a literal `;` or a transform changed it; the allowlist check and transforms work on a decoded copy (see Transformation Rules).
 
 #### Error Response Format
 

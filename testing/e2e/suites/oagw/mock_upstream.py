@@ -130,10 +130,18 @@ def _json_response(data: object, status: int = 200) -> bytes:
     ).encode() + body
 
 
-def _with_header(response: bytes, name: str, value: str) -> bytes:
-    """``response`` with one more header line after the status line."""
+def _with_headers(response: bytes, extra: dict[str, str]) -> bytes:
+    """``response`` with ``extra`` header lines added after the status line."""
     status_line, _, rest = response.partition(b"\r\n")
-    return status_line + f"\r\n{name}: {value}".encode() + b"\r\n" + rest
+    lines = "".join(f"{k}: {v}\r\n" for k, v in extra.items()).encode()
+    return status_line + b"\r\n" + lines + rest
+
+
+def _head_only(response: bytes) -> bytes:
+    """The head of ``response``: what a server answers to HEAD, its
+    ``Content-Length`` included."""
+    head, _, _ = response.partition(b"\r\n\r\n")
+    return head + b"\r\n\r\n"
 
 
 def _sse_header() -> bytes:
@@ -523,6 +531,22 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
             "body": body.decode("utf-8", errors="replace"),
         }))
 
+    # Any method on /echo-any: the request as received, for routing tests of
+    # methods other than POST. HEAD gets the GET answer's head and no body.
+    elif path == "/echo-any":
+        echoed = _with_headers(_json_response({
+            "method": method,
+            "path": path,
+            "query": query,
+            "headers": headers,
+            "body": body.decode("utf-8", errors="replace"),
+        }), {"Allow": "GET, HEAD, OPTIONS, POST", "X-Echo-Method": method})
+        writer.write(_head_only(echoed) if method == "HEAD" else echoed)
+
+    # HEAD /sse/events — the event stream's head; no events follow.
+    elif method == "HEAD" and path == "/sse/events":
+        writer.write(_sse_header())
+
     # POST /echo-lines — every request header line, repeated ones included
     elif method == "POST" and path == "/echo-lines":
         writer.write(_json_response({
@@ -651,15 +675,15 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
 
     # GET /busy — 503 with the upstream's own Retry-After.
     elif method == "GET" and path == "/busy":
-        writer.write(_with_header(
-            _json_response({"error": "busy"}, status=503), "Retry-After", "120",
+        writer.write(_with_headers(
+            _json_response({"error": "busy"}, status=503), {"Retry-After": "120"},
         ))
 
     # GET /challenge — 401 with the upstream's own WWW-Authenticate.
     elif method == "GET" and path == "/challenge":
-        writer.write(_with_header(
+        writer.write(_with_headers(
             _json_response({"error": "invalid_token"}, status=401),
-            "WWW-Authenticate", 'Bearer realm="mock", error="invalid_token"',
+            {"WWW-Authenticate": 'Bearer realm="mock", error="invalid_token"'},
         ))
 
     # GET /ws/echo — WebSocket echo endpoint
@@ -686,10 +710,12 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
         await _ws_echo_loop(reader, writer)
         return  # Connection fully handled — don't close in _client.
 
-    # 404 fallback; names the path as received, so a test can check the
-    # outbound path of a route the mock has no handler for.
+    # 404 fallback; names the path and query as received, so a test can
+    # check the outbound URL of a route the mock has no handler for.
     else:
-        writer.write(_json_response({"error": "not found", "method": method, "path": path}, status=404))
+        writer.write(_json_response(
+            {"error": "not found", "method": method, "path": path, "query": query}, status=404,
+        ))
 
 
 # ---------------------------------------------------------------------------

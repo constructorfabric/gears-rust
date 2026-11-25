@@ -9,6 +9,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::{ControlPlaneService, DataPlaneService, EndpointSelector};
+use crate::domain::error::DomainError;
 use crate::domain::model;
 
 /// Facade that implements the public `ServiceGatewayClientV1` trait by
@@ -110,7 +111,7 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         ctx: SecurityContext,
         req: oagw_sdk::CreateRouteRequest,
     ) -> Result<oagw_sdk::Route, CanonicalError> {
-        let internal_req = sdk_create_route_to_domain(req);
+        let internal_req = sdk_create_route_to_domain(req).map_err(CanonicalError::from)?;
         self.cp
             .create_route(&ctx, internal_req)
             .await
@@ -153,7 +154,7 @@ impl ServiceGatewayClientV1 for ServiceGatewayClientV1Facade {
         id: Uuid,
         req: oagw_sdk::UpdateRouteRequest,
     ) -> Result<oagw_sdk::Route, CanonicalError> {
-        let internal_req = sdk_update_route_to_domain(req);
+        let internal_req = sdk_update_route_to_domain(req).map_err(CanonicalError::from)?;
         self.cp
             .update_route(&ctx, id, internal_req)
             .await
@@ -248,30 +249,34 @@ fn sdk_update_upstream_to_domain(
     }
 }
 
-fn sdk_create_route_to_domain(req: oagw_sdk::CreateRouteRequest) -> model::CreateRouteRequest {
-    model::CreateRouteRequest {
+fn sdk_create_route_to_domain(
+    req: oagw_sdk::CreateRouteRequest,
+) -> Result<model::CreateRouteRequest, DomainError> {
+    Ok(model::CreateRouteRequest {
         id: None,
         upstream_id: req.upstream_id(),
-        match_rules: match_rules_to_domain(req.match_rules().clone()),
+        match_rules: match_rules_to_domain(req.match_rules().clone())?,
         plugins: req.plugins().cloned().map(plugins_config_to_domain),
         rate_limit: req.rate_limit().cloned().map(rate_limit_config_to_domain),
         cors: req.cors().cloned().map(cors_config_to_domain),
         tags: req.tags().to_vec(),
         priority: req.priority(),
         enabled: req.enabled(),
-    }
+    })
 }
 
-fn sdk_update_route_to_domain(req: oagw_sdk::UpdateRouteRequest) -> model::UpdateRouteRequest {
-    model::UpdateRouteRequest {
-        match_rules: match_rules_to_domain(req.match_rules().clone()),
+fn sdk_update_route_to_domain(
+    req: oagw_sdk::UpdateRouteRequest,
+) -> Result<model::UpdateRouteRequest, DomainError> {
+    Ok(model::UpdateRouteRequest {
+        match_rules: match_rules_to_domain(req.match_rules().clone())?,
         plugins: req.plugins().cloned().map(plugins_config_to_domain),
         rate_limit: req.rate_limit().cloned().map(rate_limit_config_to_domain),
         cors: req.cors().cloned().map(cors_config_to_domain),
         tags: req.tags().to_vec(),
         priority: req.priority(),
         enabled: req.enabled(),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -456,26 +461,41 @@ fn cors_config_to_domain(v: oagw_sdk::CorsConfig) -> model::CorsConfig {
     }
 }
 
-fn http_method_to_domain(v: oagw_sdk::HttpMethod) -> model::HttpMethod {
-    match v {
+/// The SDK enum is `#[non_exhaustive]`: a method a newer SDK adds that this
+/// gateway does not route is refused, not dropped from the route.
+fn http_method_to_domain(v: oagw_sdk::HttpMethod) -> Result<model::HttpMethod, DomainError> {
+    Ok(match v {
         oagw_sdk::HttpMethod::Get => model::HttpMethod::Get,
         oagw_sdk::HttpMethod::Post => model::HttpMethod::Post,
         oagw_sdk::HttpMethod::Put => model::HttpMethod::Put,
         oagw_sdk::HttpMethod::Delete => model::HttpMethod::Delete,
         oagw_sdk::HttpMethod::Patch => model::HttpMethod::Patch,
-    }
+        oagw_sdk::HttpMethod::Head => model::HttpMethod::Head,
+        oagw_sdk::HttpMethod::Options => model::HttpMethod::Options,
+        _ => {
+            return Err(DomainError::validation_for(
+                "match.http.methods",
+                oagw_sdk::field::INVALID_VALUE,
+                "match.http.methods lists a method the gateway does not route",
+            ));
+        }
+    })
 }
 
-fn http_match_to_domain(v: oagw_sdk::HttpMatch) -> model::HttpMatch {
-    model::HttpMatch {
-        methods: v.methods.into_iter().map(http_method_to_domain).collect(),
+fn http_match_to_domain(v: oagw_sdk::HttpMatch) -> Result<model::HttpMatch, DomainError> {
+    Ok(model::HttpMatch {
+        methods: v
+            .methods
+            .into_iter()
+            .map(http_method_to_domain)
+            .collect::<Result<_, _>>()?,
         path: v.path,
         query_allowlist: v.query_allowlist,
         path_suffix_mode: match v.path_suffix_mode {
             oagw_sdk::PathSuffixMode::Disabled => model::PathSuffixMode::Disabled,
             oagw_sdk::PathSuffixMode::Append => model::PathSuffixMode::Append,
         },
-    }
+    })
 }
 
 fn grpc_match_to_domain(v: oagw_sdk::GrpcMatch) -> model::GrpcMatch {
@@ -485,11 +505,11 @@ fn grpc_match_to_domain(v: oagw_sdk::GrpcMatch) -> model::GrpcMatch {
     }
 }
 
-fn match_rules_to_domain(v: oagw_sdk::MatchRules) -> model::MatchRules {
-    model::MatchRules {
-        http: v.http.map(http_match_to_domain),
+fn match_rules_to_domain(v: oagw_sdk::MatchRules) -> Result<model::MatchRules, DomainError> {
+    Ok(model::MatchRules {
+        http: v.http.map(http_match_to_domain).transpose()?,
         grpc: v.grpc.map(grpc_match_to_domain),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +610,8 @@ fn route_to_sdk(r: model::Route) -> oagw_sdk::Route {
                         model::HttpMethod::Put => oagw_sdk::HttpMethod::Put,
                         model::HttpMethod::Delete => oagw_sdk::HttpMethod::Delete,
                         model::HttpMethod::Patch => oagw_sdk::HttpMethod::Patch,
+                        model::HttpMethod::Head => oagw_sdk::HttpMethod::Head,
+                        model::HttpMethod::Options => oagw_sdk::HttpMethod::Options,
                     })
                     .collect(),
                 path: h.path,

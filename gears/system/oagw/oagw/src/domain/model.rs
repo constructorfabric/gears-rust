@@ -479,7 +479,8 @@ pub struct PluginsConfig {
 // ---------------------------------------------------------------------------
 
 /// HTTP methods a route can match. Declaration order is the canonical order
-/// in which stored routes return their methods.
+/// in which stored routes return their methods. A route matches only the
+/// methods it lists: `GET` does not imply `HEAD`.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HttpMethod {
@@ -493,6 +494,10 @@ pub enum HttpMethod {
     Delete,
     /// `PATCH`.
     Patch,
+    /// `HEAD`.
+    Head,
+    /// `OPTIONS`.
+    Options,
 }
 
 /// How the path suffix of the proxy URL is handled.
