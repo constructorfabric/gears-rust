@@ -540,6 +540,26 @@ macro_rules! plane_tests {
                 );
             }
 
+            /// A get answered with a consistent snapshot of another entity fails
+            /// rather than return it under the asked key.
+            #[tokio::test]
+            async fn a_get_answered_with_another_entitys_snapshot_fails() {
+                let client = Recording::seeded();
+                *client.answered_uuid.lock().expect("lock") = Some(Uuid::from_u128(0xA5));
+                let api: &dyn $contract = &client;
+                let ctx = $context;
+                assert_kind(
+                    $ext::get_type_schema_by_uuid(
+                        api,
+                        &ctx,
+                        uuid(TYPE),
+                        crate::ReadOptions::default(),
+                    )
+                    .await,
+                    internal,
+                );
+            }
+
             #[tokio::test]
             async fn an_empty_resolution_needs_no_transport() {
                 let client = Recording::default();

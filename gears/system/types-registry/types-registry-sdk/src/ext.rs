@@ -252,11 +252,14 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         )
     }
 
-    /// Registry References of Type Schemas, read as [`Self::batch_get_type_schemas`];
-    /// `None` when not registered.
+    /// Registry References of Type Schemas, Active or deleted, resolved through
+    /// [`PlatformTypesRegistryApi::batch_resolve_identities`] in batches of up to
+    /// [`MAX_BATCH_GET_KEYS`] distinct identifiers; `None` when not registered.
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// The error of a resolution that failed; the call then sends no further batch.
+    /// `InvalidArgument`, before any request, for an identifier that is not a Type
+    /// Schema's.
     async fn resolve_type_uuids(
         &self,
         ctx: &PlatformSecurityContext,
@@ -285,11 +288,11 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         )
     }
 
-    /// Type Schema identifiers by Registry Reference, read as
-    /// [`Self::batch_get_type_schemas_by_uuid`]; `None` when absent or an Instance.
+    /// Type Schema identifiers by Registry Reference, Active or deleted, resolved as
+    /// [`Self::resolve_type_uuids`]; `None` when absent or an Instance.
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// The error of a resolution that failed; the call then sends no further batch.
     async fn resolve_type_ids(
         &self,
         ctx: &PlatformSecurityContext,
@@ -321,7 +324,7 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// Registry References of Instances, as [`Self::resolve_type_uuids`].
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// As [`Self::resolve_type_uuids`], for an Instance.
     async fn resolve_instance_uuids(
         &self,
         ctx: &PlatformSecurityContext,
@@ -355,7 +358,7 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
     /// `None` when absent or a Type Schema.
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// As [`Self::resolve_type_ids`].
     async fn resolve_instance_ids(
         &self,
         ctx: &PlatformSecurityContext,
@@ -924,6 +927,7 @@ fn resolved<T: Kinded>(identity: &EntityIdentity) -> Result<Option<Resolved<T>>,
 }
 
 /// Adapt a batch reader, such as a test double, to `batch_resolve_identities`.
+/// Requires the `test-util` feature.
 /// Read the mandatory fields in one bounded batch and validate each distinct result.
 ///
 /// ```ignore
@@ -939,6 +943,7 @@ fn resolved<T: Kinded>(identity: &EntityIdentity) -> Result<Option<Resolved<T>>,
 /// # Errors
 /// The read's error; `Internal` when it leaves a key unanswered or answers it with a
 /// snapshot its own data contradicts.
+#[cfg(any(test, feature = "test-util"))]
 pub async fn resolve_through_batch_get<F, Fut>(
     keys: Vec<EntityKey>,
     read: F,
@@ -955,6 +960,7 @@ where
 
 /// Read active or deleted identities in one unconditional mandatory-field batch.
 /// Refuse missing, `Unchanged` or inconsistent replies.
+#[cfg(any(test, feature = "test-util"))]
 fn identities(
     keys: &[EntityKey],
     mut read: BatchGetEntitiesResponse,
@@ -1047,6 +1053,7 @@ fn unresolved(key: &EntityKey) -> CanonicalError {
 }
 
 /// Extract the identity after checking the exact key and kind-specific fields.
+#[cfg(any(test, feature = "test-util"))]
 fn identity_of(key: &EntityKey, entity: Entity) -> Result<EntityIdentity, CanonicalError> {
     check_snapshot(key, &entity)?;
     let identity = EntityIdentity {

@@ -15,7 +15,34 @@ use gts::GtsId;
 use lru::LruCache;
 use uuid::Uuid;
 
-use crate::models::{EntityIdentity, EntityKey};
+use crate::models::{EntityIdentity, EntityKey, Ownership};
+
+/// Whether an entity is global or tenant-owned: the part of its [`Ownership`] that
+/// does not depend on the reader, so every read context agrees on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnershipScope {
+    Global,
+    Tenant,
+}
+
+impl std::fmt::Display for OwnershipScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Global => "global",
+            Self::Tenant => "tenant-owned",
+        })
+    }
+}
+
+impl OwnershipScope {
+    /// The scope of an entity a reader sees as `ownership`.
+    pub fn of(ownership: Ownership) -> Self {
+        match ownership {
+            Ownership::Global => Self::Global,
+            Ownership::ContextTenant | Ownership::AncestorTenant => Self::Tenant,
+        }
+    }
+}
 
 /// Each confirmed pair has one LRU position. Both indexes share its parsed identifier.
 pub struct Identities {
@@ -25,9 +52,9 @@ pub struct Identities {
 
 struct Record {
     gts_id: Arc<GtsId>,
-    /// Whether the entity is global, once a reply carrying the entity said so.
-    /// A bare resolution leaves it unknown; a contradiction makes it unknown again.
-    global: Option<bool>,
+    /// The entity's scope, once a reply carrying the entity said so. A bare
+    /// resolution leaves it unknown; a contradiction makes it unknown again.
+    scope: Option<OwnershipScope>,
     /// Identifies this residency. Proofs hold it weakly, so eviction retires them
     /// even if the pair is learned again.
     incarnation: Arc<()>,
@@ -65,21 +92,21 @@ impl Identities {
         store.contains(&gts_uuid).then_some(gts_uuid)
     }
 
-    /// Whether the pair for `gts_uuid` is known to be global, without promoting it.
-    pub fn is_global(&self, gts_uuid: Uuid) -> Option<bool> {
-        self.by_uuid.as_ref()?.peek(&gts_uuid)?.global
+    /// The known scope of the pair for `gts_uuid`, without promoting it.
+    pub fn scope(&self, gts_uuid: Uuid) -> Option<OwnershipScope> {
+        self.by_uuid.as_ref()?.peek(&gts_uuid)?.scope
     }
 
     /// Record what an entity-carrying reply said of a resident pair's ownership.
-    pub fn classify(&mut self, gts_uuid: Uuid, global: bool) {
+    pub fn classify(&mut self, gts_uuid: Uuid, scope: OwnershipScope) {
         if let Some(record) = self
             .by_uuid
             .as_mut()
             .and_then(|store| store.peek_mut(&gts_uuid))
         {
-            record.global = match record.global {
-                None => Some(global),
-                Some(known) if known == global => Some(known),
+            record.scope = match record.scope {
+                None => Some(scope),
+                Some(known) if known == scope => Some(known),
                 Some(_) => None,
             };
         }
@@ -131,7 +158,7 @@ impl Identities {
             gts_uuid,
             Record {
                 gts_id: Arc::clone(&id),
-                global: None,
+                scope: None,
                 incarnation: Arc::default(),
             },
         );

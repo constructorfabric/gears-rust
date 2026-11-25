@@ -352,13 +352,13 @@ fn register_exact_read(router: Router, openapi: &dyn OpenApiRegistry, plane: Pla
             "Return one entity, projected by `$select`. The key is either a canonical GTS \
              identifier or the Registry Reference UUID derived from it; a key over 1024 \
              bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is \
-             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; \
+             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status,ownership`; \
              documents are selected individually from `content`, \
              `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
              three Type Schemas only), plus the `provenance` group of a Type Schema \
              (omitted on an Instance). Names are \
              case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
-             `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, \
+             `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always returned, \
              whether or not `$select` names them, so a deleted entity is still readable and \
              reports it. No other query parameter is accepted. The `ETag` names the entity's \
              state and is the same under every `$select`; `If-None-Match` with a current one \
@@ -420,7 +420,8 @@ fn register_batch_get(router: Router, openapi: &dyn OpenApiRegistry, plane: Plan
              per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry \
              Reference in canonical lowercase hyphenated form: `found` \
              with the selected fields, exactly as the exact read returns them and always \
-             including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. \
+             including `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership`, or \
+             `not_found`. \
              Every result but `not_found` carries the key's `etag`; an item whose \
              `if_none_match` is still current answers `unchanged` without the entity. \
              Query parameters are refused, `$select` included. A key \
@@ -518,8 +519,8 @@ fn register_discovery(
              `lifecycle_status` is `active` (default), `deleted` \
              (tombstones only) or `all`. Each item is projected by `$select` \
              exactly as GET {base}/entities/{{entity_key}} projects it; absent, the \
-             document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are \
-             always returned. A page never carries a validator. `depth` bounds the number of \
+             document-free default; `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and \
+             `ownership` are always returned. A page never carries a validator. `depth` bounds the number of \
              identifier segments and `kind` narrows to Type Schemas or Instances; \
              `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page \
              limit. `limit` (alias `$top`) \

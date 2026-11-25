@@ -17,7 +17,7 @@ use crate::models::{
     Projection, PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOperation,
     Validator,
 };
-use crate::models::{DeleteItem, EntityKind, Provenance, RegistrationOutcome};
+use crate::models::{DeleteItem, EntityKind, Ownership, Provenance, RegistrationOutcome};
 use crate::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 const TYPE: &str = "gts.cf.cache.client.entity.v1~";
@@ -542,9 +542,39 @@ async fn a_conflicting_pair_rejects_the_whole_discovery_page() {
         "{error:?}"
     );
     assert!(
-        format!("{error:?}").contains("this batch pairs"),
+        error
+            .diagnostic()
+            .is_some_and(|diagnostic| diagnostic.contains("this batch pairs")),
         "{error:?}"
     );
+    assert!(f.cache.identity(&gts_key(TYPE)).is_none());
+}
+
+/// A page that gives one entity two scopes names it, both scopes and where the
+/// first came from.
+#[tokio::test]
+async fn an_ownership_contradiction_within_a_discovery_page_rejects_it() {
+    let f = fixture(WINDOW);
+    f.registry.seed(TYPE, json!({}));
+    f.recorder.tamper_next_page(|page| {
+        let mut twin = page.items[0].clone();
+        twin.ownership = Ownership::ContextTenant;
+        page.items.push(twin);
+    });
+    let error = f
+        .cache
+        .list_entities(&ctx(), ListEntitiesRequest::default())
+        .await
+        .expect_err("one entity, two scopes");
+    let diagnostic = error.diagnostic().expect("internal diagnostic");
+    let uuid = gts::GtsId::try_new(TYPE).expect("identifier").to_uuid();
+    for part in [
+        uuid.to_string().as_str(),
+        "as tenant-owned",
+        "an earlier item of this reply has it as global",
+    ] {
+        assert!(diagnostic.contains(part), "{part}: {diagnostic}");
+    }
     assert!(f.cache.identity(&gts_key(TYPE)).is_none());
 }
 
@@ -607,9 +637,9 @@ async fn discovery_checks_both_stores_before_learning_any_pairs() {
             "{error:?}"
         );
         // Names where the known pair is held, and its counterpart there.
-        let error = format!("{error:?}");
-        assert!(error.contains(source), "{error}");
-        assert!(error.contains(&ISSUED.to_string()), "{error}");
+        let diagnostic = error.diagnostic().expect("internal diagnostic");
+        assert!(diagnostic.contains(source), "{diagnostic}");
+        assert!(diagnostic.contains(&ISSUED.to_string()), "{diagnostic}");
         assert!(f.cache.identity(&gts_key(OTHER)).is_none());
         let known = f
             .cache
@@ -2020,6 +2050,28 @@ async fn an_answer_contradicting_a_resident_pair_fails_and_leaves_the_entry() {
         f.recorder.batch_count(),
         2,
         "the entry still serves both spellings"
+    );
+}
+
+/// A read of a resident entry answered under another pair names the asked key, the
+/// pair answered and the resident pair.
+#[tokio::test(start_paused = true)]
+async fn an_answer_contradicting_the_resident_entry_of_its_key_names_both_pairs() {
+    let f = fixture(WINDOW);
+    f.title(gts_key(TYPE), full(), false).await;
+    let resident = gts::GtsId::try_new(TYPE).expect("identifier").to_uuid();
+    let forged = snapshot_under(&f.registry, FORGED).await;
+    answer_next(&f, gts_key(TYPE), forged);
+    let error = f
+        .read_with(vec![gts_key(TYPE).into()], full(), true)
+        .await
+        .expect_err("a contradicting identity");
+    let diagnostic = error.diagnostic().expect("internal diagnostic");
+    assert!(
+        diagnostic.contains(&format!(
+            "read of {TYPE} with {TYPE} ({FORGED}), contradicting the resident {TYPE} ({resident})"
+        )),
+        "{diagnostic}"
     );
 }
 

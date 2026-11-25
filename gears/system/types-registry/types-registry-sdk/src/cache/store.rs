@@ -12,9 +12,10 @@ use std::time::Duration;
 use gts::GtsId;
 use lru::LruCache;
 use tokio::time::Instant;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::identity::Identities;
+use super::identity::{Identities, OwnershipScope};
 use crate::models::{
     Entity, EntityField, EntityIdentity, EntityKey, FieldSelection, JsonDocument, Ownership,
     Validator,
@@ -36,12 +37,13 @@ pub struct ReadContext {
 }
 
 impl ReadContext {
-    pub fn new(subject: Uuid, subject_type: Option<&str>, tenant: Uuid, scopes: &[String]) -> Self {
+    /// The read context of an authenticated `ctx`.
+    pub fn of(ctx: &SecurityContext) -> Self {
         Self {
-            subject,
-            subject_type: subject_type.map(Arc::from),
-            tenant,
-            scopes: scopes.into(),
+            subject: ctx.subject_id(),
+            subject_type: ctx.subject_type().map(Arc::from),
+            tenant: ctx.subject_tenant_id(),
+            scopes: ctx.token_scopes().into(),
         }
     }
 
@@ -92,13 +94,19 @@ pub struct Held {
 
 impl Held {
     pub fn new(mut entity: Entity) -> Self {
-        // A new document field must be held apart.
+        // Every field is named so that a new document field must be held apart.
         let Entity {
+            gts_id: _,
+            gts_uuid: _,
+            kind: _,
+            lifecycle_status: _,
+            ownership: _,
+            origin: _,
             content,
             resolved_schema,
             effective_traits,
             effective_traits_schema,
-            ..
+            provenance: _,
         } = &mut entity;
         let documents = [
             content.take(),
@@ -466,14 +474,23 @@ impl Ticket {
     }
 }
 
+/// What one held document costs the store: it is charged once, when the first
+/// snapshot holds it, and released when the last one lets go.
+struct Charge {
+    /// The snapshots holding it.
+    holders: usize,
+    /// Its charge against the byte budget.
+    bytes: usize,
+}
+
 /// Snapshot LRU with per-key read tickets. Registry-issued pairs index resident
 /// snapshots and let either key fence in-flight reads.
 pub struct Store {
     entries: LruCache<(Uuid, Scope), Entry>,
     /// The scopes each resident entity has a snapshot in.
     scopes: HashMap<Uuid, Vec<Scope>>,
-    /// Held documents by address: how many snapshots hold each, and its charge.
-    documents: HashMap<usize, (usize, usize)>,
+    /// Held documents by address.
+    documents: HashMap<usize, Charge>,
     /// Validate both stores atomically while keeping their recency independent.
     pub identities: Identities,
     /// Keyed by (entity, read context).
@@ -564,7 +581,7 @@ impl Store {
     /// snapshot, or from what an entity-carrying reply said of its remembered pair.
     pub fn known_global(&self, gts_uuid: Uuid) -> bool {
         self.any(gts_uuid).map_or_else(
-            || self.identities.is_global(gts_uuid) == Some(true),
+            || self.identities.scope(gts_uuid) == Some(OwnershipScope::Global),
             |entry| entry.snapshot.meta().ownership == Ownership::Global,
         )
     }
@@ -575,13 +592,13 @@ impl Store {
         Some((self.identities.peek_id(uuid)?.clone(), uuid))
     }
 
-    /// Whether `key` names an entity known to be global (`Some(true)`) or tenant-owned,
-    /// from any of its snapshots or its remembered pair.
-    pub fn class(&self, key: &EntityKey) -> Option<bool> {
+    /// The scope of the entity `key` names, if known from any of its snapshots or
+    /// its remembered pair.
+    pub fn class(&self, key: &EntityKey) -> Option<OwnershipScope> {
         let uuid = self.reference(key)?;
         self.any(uuid).map_or_else(
-            || self.identities.is_global(uuid),
-            |entry| Some(entry.snapshot.meta().ownership == Ownership::Global),
+            || self.identities.scope(uuid),
+            |entry| Some(OwnershipScope::of(entry.snapshot.meta().ownership)),
         )
     }
 
@@ -591,15 +608,27 @@ impl Store {
             .is_some_and(|uuid| self.known_global(uuid))
     }
 
-    /// Whether a reply saying the entity `gts_uuid` is `global` (or not) contradicts
-    /// what its resident snapshot or remembered pair already says.
-    pub fn class_conflict(&self, gts_uuid: Uuid, global: bool) -> bool {
-        self.any(gts_uuid)
-            .is_some_and(|entry| (entry.snapshot.meta().ownership == Ownership::Global) != global)
-            || self
-                .identities
-                .is_global(gts_uuid)
-                .is_some_and(|known| known != global)
+    /// What contradicts a reply giving the entity `gts_uuid` the `scope`: the scope its
+    /// resident snapshot or remembered pair already gives it, and which of them says so.
+    pub fn class_conflict(
+        &self,
+        gts_uuid: Uuid,
+        scope: OwnershipScope,
+    ) -> Option<(OwnershipScope, &'static str)> {
+        let resident = self.any(gts_uuid).map(|entry| {
+            (
+                OwnershipScope::of(entry.snapshot.meta().ownership),
+                "a resident snapshot",
+            )
+        });
+        let remembered = self
+            .identities
+            .scope(gts_uuid)
+            .map(|known| (known, "the identity store"));
+        resident
+            .into_iter()
+            .chain(remembered)
+            .find(|(known, _)| *known != scope)
     }
 
     /// The pair `key` names if it is known to be global: any authenticated reader may
@@ -980,9 +1009,9 @@ impl Store {
         self.used += weight.own(&etag);
         for (address, bytes) in snapshot.charged(&weight) {
             match self.documents.entry(address) {
-                MapEntry::Occupied(mut held) => held.get_mut().0 += 1,
+                MapEntry::Occupied(mut held) => held.get_mut().holders += 1,
                 MapEntry::Vacant(first) => {
-                    first.insert((1, bytes));
+                    first.insert(Charge { holders: 1, bytes });
                     self.used += bytes;
                 }
             }
@@ -1075,10 +1104,10 @@ impl Store {
     fn forget(&mut self, (gts_uuid, scope): &(Uuid, Scope), entry: &Entry) {
         self.used -= entry.weight.own(&entry.etag);
         for (address, _) in entry.snapshot.charged(&entry.weight) {
-            if let Some((holders, bytes)) = self.documents.get_mut(&address) {
-                *holders -= 1;
-                if *holders == 0 {
-                    self.used -= *bytes;
+            if let Some(charge) = self.documents.get_mut(&address) {
+                charge.holders -= 1;
+                if charge.holders == 0 {
+                    self.used -= charge.bytes;
                     self.documents.remove(&address);
                 }
             }

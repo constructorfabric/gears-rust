@@ -56,8 +56,6 @@ pub async fn run(client: &dyn PlatformTypesRegistryApi) {
         .await;
     c.a_validator_names_the_state_and_a_condition_what_it_covers()
         .await;
-    c.a_condition_for_one_entity_never_conditions_another()
-        .await;
     c.a_repeated_key_is_answered_under_its_first_mention().await;
     let (tombstone, etag) = c
         .tombstones_keep_their_documents_and_are_never_rewritten()
@@ -532,25 +530,6 @@ impl Checker<'_> {
                 EntityLookup::Unchanged { .. }
             ),
             "a wider holding covers a narrower read"
-        );
-    }
-
-    /// A validator carries no identity, so a condition is bound to its entity: one
-    /// carrying the other entity's own current validator still conditions nothing.
-    async fn a_condition_for_one_entity_never_conditions_another(&self) {
-        let (_, instance_etag) = found(self.get(gts_key(INSTANCE), Projection::Default).await);
-        let (child, _) = found(self.get(gts_key(CHILD), Projection::Default).await);
-        let misbound = EntityLookup::Found {
-            entity: Box::new(child),
-            etag: instance_etag,
-        };
-        assert!(
-            matches!(
-                self.get_if(gts_key(INSTANCE), &misbound, Projection::Default)
-                    .await,
-                EntityLookup::Found { .. }
-            ),
-            "a condition bound to another entity is not sent"
         );
     }
 

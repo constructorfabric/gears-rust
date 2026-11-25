@@ -1425,7 +1425,7 @@ Both contracts expose `batch_resolve_identities` as a `SafeRead` at
 for both key forms in one snapshot, using the batch read's bounds, key
 classification, deduplication and scope. The SDK validates replies and uses
 cached identities as described in §8.3. Test doubles with only a batch read
-can use `ext::resolve_through_batch_get`.
+can use `ext::resolve_through_batch_get` under the SDK's `test-util` feature.
 
 Deploy the registry with `:batchResolve` before its remote SDK consumers.
 The in-process SDK ships with the registry.

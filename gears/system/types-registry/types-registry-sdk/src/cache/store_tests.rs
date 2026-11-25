@@ -5,7 +5,8 @@ use serde_json::json;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::{ENTRY_ALLOWANCE_BYTES, Held, Scope, Store, union};
+use super::{ENTRY_ALLOWANCE_BYTES, Held, ReadContext, Scope, Store, union};
+use crate::cache::identity::OwnershipScope;
 use crate::models::{
     Entity, EntityField, EntityKey, EntityKind, FieldSelection, JsonDocument, LifecycleStatus,
     Origin, Provenance, Validator,
@@ -685,7 +686,6 @@ fn entry_limit_evicts_the_lru_and_zero_keeps_no_snapshots() {
 fn a_resolution_neither_erases_nor_extends_a_read_proof() {
     use std::time::Duration;
 
-    use super::ReadContext;
     use crate::models::EntityIdentity;
 
     let window = Duration::from_secs(30);
@@ -706,7 +706,7 @@ fn a_resolution_neither_erases_nor_extends_a_read_proof() {
         Scope::Tenant(Uuid::from_u128(1)),
     );
     store.identities.learn(&snapshot.gts_id, snapshot.gts_uuid);
-    let reader = ReadContext::new(Uuid::from_u128(10), None, Uuid::from_u128(1), &[]);
+    let reader = reader(10, 1);
     let pair = EntityIdentity {
         gts_id: snapshot.gts_id.clone(),
         gts_uuid: snapshot.gts_uuid,
@@ -888,13 +888,11 @@ fn documents_equal_as_values_but_not_as_bytes_are_held_apart() {
 
 #[test]
 fn a_reinserted_snapshot_does_not_revive_proofs_through_a_sibling() {
-    use super::ReadContext;
-
     let window = std::time::Duration::from_secs(30);
     let mut store = Store::new(1024 * 1024, 2);
     store.track_visibility();
     let snapshot = owned(TYPE);
-    let alice = ReadContext::new(Uuid::from_u128(10), None, Uuid::from_u128(1), &[]);
+    let alice = reader(10, 1);
     let at = Instant::now();
     put_in(&mut store, &snapshot, tenant(1));
     store.confirm_visible(&key(&snapshot), &alice, &etag("v1"), at);
@@ -911,13 +909,11 @@ fn a_reinserted_snapshot_does_not_revive_proofs_through_a_sibling() {
 
 #[test]
 fn a_read_proof_resolves_from_the_readers_own_snapshot() {
-    use super::ReadContext;
-
     let window = std::time::Duration::from_secs(30);
     let mut store = Store::new(1024 * 1024, 4);
     store.track_visibility();
     let snapshot = owned(TYPE);
-    let bob = ReadContext::new(Uuid::from_u128(20), None, Uuid::from_u128(2), &[]);
+    let bob = reader(20, 2);
     let at = Instant::now();
     put_in(&mut store, &snapshot, tenant(1));
     put_in(&mut store, &snapshot, tenant(2));
@@ -935,7 +931,7 @@ fn a_shared_tenant_owned_snapshot_is_not_known_global() {
     let snapshot = owned(TYPE);
     put_in(&mut store, &snapshot, Scope::Shared);
     assert!(!store.known_global(snapshot.gts_uuid));
-    assert_eq!(store.class(&key(&snapshot)), Some(false));
+    assert_eq!(store.class(&key(&snapshot)), Some(OwnershipScope::Tenant));
 }
 
 #[test]
@@ -998,4 +994,22 @@ fn documents_of_one_size_but_different_bytes_are_held_apart() {
         serde_json::to_string(&*content_of(&store, &key(&second), 2)).expect("json"),
         "[0.0,-0.0]"
     );
+}
+
+/// A read context for `subject` in home tenant `tenant`, built as the cache builds one.
+fn reader(subject: u128, tenant: u128) -> ReadContext {
+    ReadContext::of(
+        &toolkit_security::SecurityContext::builder()
+            .subject_id(Uuid::from_u128(subject))
+            .subject_tenant_id(Uuid::from_u128(tenant))
+            .build()
+            .expect("tenant context"),
+    )
+}
+
+#[test]
+fn a_read_context_takes_its_subject_and_tenant_from_the_security_context() {
+    let context = reader(10, 1);
+    assert_eq!(context.subject, Uuid::from_u128(10));
+    assert_eq!(context.tenant(), Uuid::from_u128(1));
 }

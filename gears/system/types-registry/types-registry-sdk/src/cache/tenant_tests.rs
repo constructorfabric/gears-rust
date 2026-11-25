@@ -811,6 +811,31 @@ fn identity(id: &str) -> EntityIdentity {
     EntityIdentity { gts_id, gts_uuid }
 }
 
+/// An empty or over-long resolution goes to the registry whole, known keys and
+/// repeats included, so the registry refuses it rather than the cache answering
+/// part of it.
+#[tokio::test(start_paused = true)]
+async fn an_over_long_or_empty_tenant_resolution_is_sent_whole_for_the_registry_to_refuse() {
+    let registry = Arc::new(TenantRegistry::new([]));
+    registry.registry.seed(TYPE, schema(TYPE, "v1"));
+    let cache = CachedTypesRegistry::new(registry.clone(), CacheSettings::default());
+    let reader = tenant(1);
+    resolve(&cache, &reader, &[gts_key(TYPE)])
+        .await
+        .expect("known");
+    let mut keys = vec![gts_key(TYPE); crate::models::MAX_BATCH_GET_KEYS];
+    keys.push(gts_key(OTHER));
+    for keys in [keys, Vec::new()] {
+        let error = resolve(&cache, &reader, &keys).await.expect_err("refused");
+        assert!(
+            matches!(error, CanonicalError::InvalidArgument { .. }),
+            "{error:?}"
+        );
+        let sent = registry.resolutions().last().map(|(_, sent)| sent.clone());
+        assert_eq!(sent, Some(keys));
+    }
+}
+
 /// A fresh read resolves either key. Other read contexts and expired confirmations
 /// go to the registry, and a registry resolution shows the pair to its context.
 #[tokio::test(start_paused = true)]
@@ -1383,6 +1408,47 @@ async fn a_contradictory_ownership_is_refused() {
         matches!(error, CanonicalError::Internal { .. }),
         "{error:?}"
     );
+    let diagnostic = error.diagnostic().expect("internal diagnostic");
+    let other = gts::GtsId::try_new(OTHER).expect("identifier").to_uuid();
+    assert!(
+        diagnostic.contains(&format!(
+            "{other} as tenant-owned, but a resident snapshot has it as global"
+        )),
+        "{diagnostic}"
+    );
+}
+
+/// With no snapshot retained, the remembered pair's scope still refuses a
+/// contradicting reply, and the diagnostic says that is where it is known.
+#[tokio::test(start_paused = true)]
+async fn a_contradictory_ownership_against_a_remembered_pair_is_refused() {
+    let registry = global_registry();
+    let cache = CachedTypesRegistry::new(
+        registry.clone(),
+        CacheSettings {
+            max_entries: 0,
+            ..CacheSettings::default()
+        },
+    );
+    let bob = subject(11, None);
+    get(&cache, &bob, &[OTHER]).await;
+    registry
+        .global
+        .lock()
+        .expect("global")
+        .remove(&gts::GtsId::try_new(OTHER).expect("identifier").to_uuid());
+    let error = cache
+        .list_entities(&bob, ListEntitiesRequest::default())
+        .await
+        .expect_err("contradiction");
+    let diagnostic = error.diagnostic().expect("internal diagnostic");
+    let other = gts::GtsId::try_new(OTHER).expect("identifier").to_uuid();
+    assert!(
+        diagnostic.contains(&format!(
+            "{other} as tenant-owned, but the identity store has it as global"
+        )),
+        "{diagnostic}"
+    );
 }
 
 /// Global answers keep no per-entity proofs, so they never evict a usable one.
@@ -1643,6 +1709,15 @@ async fn a_reply_contradicting_another_tenants_evicted_snapshot_is_refused() {
     assert!(
         matches!(error, CanonicalError::Internal { .. }),
         "{error:?}"
+    );
+    let diagnostic = error.diagnostic().expect("internal diagnostic");
+    assert!(
+        diagnostic.contains(&format!("answered {TYPE} with ")),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("as global, but the read started with it known as tenant-owned"),
+        "{diagnostic}"
     );
 }
 

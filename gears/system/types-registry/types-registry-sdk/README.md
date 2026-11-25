@@ -467,7 +467,8 @@ reading snapshots, validators or documents.
 
 Clients reject incomplete, unexpected or contradictory results as `Internal`.
 Deploy the registry with `:batchResolve` before remote SDK consumers. Test doubles
-with only batch reads can use `types_registry_sdk::ext::resolve_through_batch_get`.
+with only batch reads can use `types_registry_sdk::ext::resolve_through_batch_get`,
+under the `test-util` feature.
 Use the registry-issued UUID returned by `resolve_*_uuid` or already held in
 `EntityKey::GtsUuid` (ADR-0001).
 

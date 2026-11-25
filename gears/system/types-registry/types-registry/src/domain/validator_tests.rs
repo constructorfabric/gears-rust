@@ -112,8 +112,10 @@ fn a_malformed_token_is_not_a_match() {
         String::new(),
         "not base64!".to_owned(),
         URL_SAFE_NO_PAD.encode([1_u8]),
-        token(2, &[0; 8]),
-        token(2, &[0; 17]),
+        // Current-version tokens, so only the digest length refuses them.
+        token(VERSION, &[]),
+        token(VERSION, &[0; 8]),
+        token(VERSION, &[0; 17]),
     ] {
         assert_eq!(Validator::decode(&bad), None, "{bad:?}");
     }

@@ -159,11 +159,10 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::Storage(inner) => opaque_internal(&inner, "storage read"),
             ServiceError::Blocking(inner) => opaque_internal(&inner, "blocking task"),
             ServiceError::Db(inner) => opaque_internal(&inner, "database read"),
-            // A stored document that will not parse is corruption, not input, so
-            // the offending value goes to the operator log and not to the caller.
-            ServiceError::CorruptDocument(detail) => {
-                opaque_internal(&detail, "stored document parse")
-            }
+            // A stored entity that is not valid (a document that will not parse,
+            // missing state, a row P0 never stores) is corruption, not input, so the
+            // offending value goes to the operator log and not to the caller.
+            ServiceError::CorruptDocument(detail) => opaque_internal(&detail, "stored entity"),
             // Report the request field and its bound without exposing configuration keys.
             ServiceError::BatchReadOutOfRange { count } => invalid_field(
                 field::ITEMS_FIELD,

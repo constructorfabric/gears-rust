@@ -215,7 +215,7 @@ pub enum ServiceError {
     Storage(#[from] ScopeError),
     #[error("database failure: {0}")]
     Db(#[from] DbError),
-    #[error("a stored document could not be read as JSON: {0}")]
+    #[error("a stored entity is invalid: {0}")]
     CorruptDocument(String),
     /// A blocking task panicked or was cancelled; the source says which.
     #[error("a blocking task did not complete: {0}")]
@@ -519,7 +519,8 @@ impl RegistryService {
     ///
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure, or
-    /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
+    /// [`ServiceError::CorruptDocument`] for a stored entity that is not valid: a
+    /// document that is not JSON, missing current state, or a tenant-owned row.
     pub async fn entity(
         &self,
         caller: CallerContext<'_>,
@@ -572,7 +573,8 @@ impl RegistryService {
     /// [`ServiceError::KeyTooLong`] for a key over [`MAX_KEY_LEN`] bytes,
     /// [`ServiceError::ValidatorTooLong`] for a validator over [`MAX_VALIDATOR_LEN`] bytes,
     /// [`ServiceError::Storage`] for a read failure, or
-    /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
+    /// [`ServiceError::CorruptDocument`] for a stored entity that is not valid: a
+    /// document that is not JSON, missing current state, or a tenant-owned row.
     pub async fn batch_get(
         &self,
         _caller: CallerContext<'_>,
@@ -685,8 +687,9 @@ impl RegistryService {
     ///
     /// # Errors
     /// [`ServiceError::BatchReadOutOfRange`] for an empty or oversized batch,
-    /// [`ServiceError::KeyTooLong`] above [`MAX_KEY_LEN`], or
-    /// [`ServiceError::Storage`] for a read failure.
+    /// [`ServiceError::KeyTooLong`] above [`MAX_KEY_LEN`],
+    /// [`ServiceError::Storage`] for a read failure, or
+    /// [`ServiceError::CorruptDocument`] if a key reaches a tenant-owned row.
     pub async fn batch_resolve(
         &self,
         _caller: CallerContext<'_>,
@@ -751,7 +754,8 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::PageSizeOutOfRange`] for a refused `limit`,
     /// [`ServiceError::InvalidPattern`] for a pattern `gts-rust` will not compile,
-    /// or [`ServiceError::Storage`] for a read failure.
+    /// [`ServiceError::Storage`] for a read failure, or
+    /// [`ServiceError::CorruptDocument`] for a stored entity that is not valid.
     pub async fn discover(
         &self,
         _caller: CallerContext<'_>,
@@ -1096,7 +1100,7 @@ fn missing_state(gts_id: &str, what: &str) -> ServiceError {
 /// text that is not JSON must fail here rather than corrupt the body.
 fn raw_stored(text: String, gts_id: &str) -> Result<Box<RawValue>, ServiceError> {
     RawValue::from_string(text)
-        .map_err(|e| ServiceError::CorruptDocument(format!("'{gts_id}': {e}")))
+        .map_err(|e| ServiceError::CorruptDocument(format!("'{gts_id}' stored non-JSON text: {e}")))
 }
 
 #[cfg(test)]
@@ -1127,10 +1131,14 @@ mod tests {
             ownership(&row(OwnershipScope::Global, None)).ok(),
             Some(Ownership::Global)
         );
-        assert!(matches!(
-            ownership(&row(OwnershipScope::Tenant, Some(Uuid::from_u128(7)))),
-            Err(ServiceError::CorruptDocument(_))
-        ));
+        let refused = ownership(&row(OwnershipScope::Tenant, Some(Uuid::from_u128(7))))
+            .expect_err("P0 refuses a tenant-owned row");
+        assert!(matches!(refused, ServiceError::CorruptDocument(_)));
+        assert_eq!(
+            refused.to_string(),
+            "a stored entity is invalid: entity 'gts.cf.core.example.type.v1~' is tenant-owned, \
+             which P0 never stores"
+        );
     }
 
     const AT: OffsetDateTime = time::macros::datetime!(2026-09-23 10:00:00 UTC);

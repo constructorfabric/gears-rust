@@ -52,6 +52,7 @@ mod identity;
 mod metrics;
 mod store;
 
+use identity::OwnershipScope;
 use metrics::CacheMetrics;
 use store::{ContextTicket, Held, ReadContext, Scope, Store, Ticket, Usage, Weight};
 
@@ -149,11 +150,10 @@ enum Plan {
         sent: Option<Validator>,
         /// This read's ticket, taken with its lookup.
         ticket: Ticket,
-        /// Whether the entity was known global (`Some(true)`) or tenant-owned when the
-        /// read started, by any of its snapshots or its remembered pair — even another
-        /// tenant's, which the read may not use — any of which may be gone before the
-        /// answer arrives.
-        class: Option<bool>,
+        /// The entity's scope if known when the read started, by any of its snapshots
+        /// or its remembered pair — even another tenant's, which the read may not use —
+        /// any of which may be gone before the answer arrives.
+        class: Option<OwnershipScope>,
     },
 }
 
@@ -198,7 +198,7 @@ fn remote(
         .is_some_and(|r| r.covers.is_superset(selection));
     let class = resident
         .as_ref()
-        .map(|r| r.snapshot.meta().ownership == Ownership::Global)
+        .map(|r| OwnershipScope::of(r.snapshot.meta().ownership))
         .or_else(|| store.class(key));
     let ticket = store.ticket(key);
     held.push(ticket.clone());
@@ -400,7 +400,7 @@ impl ReadCache {
             .iter()
             .zip(verified)
             .filter_map(|((_, plan), answer)| identified(plan, answer.as_ref()))
-            .map(|snapshot| (snapshot.gts_uuid, snapshot.ownership == Ownership::Global));
+            .map(|snapshot| (snapshot.gts_uuid, OwnershipScope::of(snapshot.ownership)));
         // The pair a read's ticket started with may be evicted by now; it still binds both keys.
         for ((_, plan), answer) in plans.iter().zip(verified) {
             if let (Plan::Remote { ticket, .. }, Some(Verified::Found { snapshot, .. })) =
@@ -418,19 +418,20 @@ impl ReadCache {
         }
         // The snapshots and pair that told a read its class may be evicted by now; the
         // class still binds the answer.
-        for ((_, plan), answer) in plans.iter().zip(verified) {
+        for ((asked, plan), answer) in plans.iter().zip(verified) {
             if let (
                 Plan::Remote {
-                    class: Some(global),
-                    ..
+                    class: Some(class), ..
                 },
                 Some(Verified::Found { snapshot, .. }),
             ) = (plan, answer)
                 && let snapshot = snapshot.meta()
-                && (snapshot.ownership == Ownership::Global) != *global
+                && let scope = OwnershipScope::of(snapshot.ownership)
+                && scope != *class
             {
                 return Err(CanonicalError::internal(format!(
-                    "the registry returned a conflicting ownership for {}",
+                    "the registry answered {asked} with {} as {scope}, but the read started \
+                     with it known as {class}",
                     snapshot.gts_uuid
                 ))
                 .create());
@@ -439,8 +440,8 @@ impl ReadCache {
         let (identities, snapshots) = self.update_store(|store| {
             check_classes(store, classes.clone())?;
             let identities = Self::learn_identities(store, &[], found)?;
-            for (gts_uuid, global) in classes {
-                store.identities.classify(gts_uuid, global);
+            for (gts_uuid, scope) in classes {
+                store.identities.classify(gts_uuid, scope);
             }
             let snapshots = commit(store, plans, verified, sent_at, reader, context);
             Ok::<_, CanonicalError>((identities, snapshots))
@@ -478,7 +479,7 @@ impl ReadCache {
             let classes = page
                 .items
                 .iter()
-                .map(|entity| (entity.gts_uuid, entity.ownership == Ownership::Global));
+                .map(|entity| (entity.gts_uuid, OwnershipScope::of(entity.ownership)));
             check_classes(store, classes.clone())?;
             let evictions = Self::learn_identities(
                 store,
@@ -487,8 +488,8 @@ impl ReadCache {
                     .iter()
                     .map(|entity| (&entity.gts_id, entity.gts_uuid)),
             )?;
-            for (gts_uuid, global) in classes {
-                store.identities.classify(gts_uuid, global);
+            for (gts_uuid, scope) in classes {
+                store.identities.classify(gts_uuid, scope);
             }
             Ok::<_, CanonicalError>(evictions)
         })?;
@@ -737,14 +738,17 @@ impl CachedPlatformTypesRegistry {
 /// ownership of an admitted entity never changes.
 fn check_classes(
     store: &Store,
-    classes: impl Iterator<Item = (Uuid, bool)>,
+    classes: impl Iterator<Item = (Uuid, OwnershipScope)>,
 ) -> Result<(), CanonicalError> {
-    let mut seen: HashMap<Uuid, bool> = HashMap::new();
-    for (gts_uuid, global) in classes {
-        let in_reply = *seen.entry(gts_uuid).or_insert(global) != global;
-        if in_reply || store.class_conflict(gts_uuid, global) {
+    let mut seen: HashMap<Uuid, OwnershipScope> = HashMap::new();
+    for (gts_uuid, scope) in classes {
+        let earlier = *seen.entry(gts_uuid).or_insert(scope);
+        let conflict = (earlier != scope)
+            .then_some((earlier, "an earlier item of this reply"))
+            .or_else(|| store.class_conflict(gts_uuid, scope));
+        if let Some((known, source)) = conflict {
             return Err(CanonicalError::internal(format!(
-                "the registry returned a conflicting ownership for {gts_uuid}"
+                "the registry returned {gts_uuid} as {scope}, but {source} has it as {known}"
             ))
             .create());
         }
@@ -826,7 +830,7 @@ fn commit(
         // so its absence is everyone's.
         // What the plan held counts as much as what is resident now: an eviction in
         // flight must not turn a global absence back into a private one.
-        let global = *class == Some(true) || store.key_known_global(asked);
+        let global = *class == Some(OwnershipScope::Global) || store.key_known_global(asked);
         let absent = matches!(verified, Verified::NotFound);
         if context.is_some() && absent && !global {
             continue;
@@ -987,13 +991,15 @@ fn verify(
                     return Err(protocol_fault(key, "another or an inconsistent entity"));
                 }
                 // The entry the read started from is a pair the registry stated before.
-                if resident.as_ref().is_some_and(|r| {
-                    let held = r.snapshot.meta();
-                    held.gts_id != entity.gts_id || held.gts_uuid != entity.gts_uuid
-                }) {
+                if let Some(held) = resident.as_ref().map(|r| r.snapshot.meta())
+                    && (held.gts_id != entity.gts_id || held.gts_uuid != entity.gts_uuid)
+                {
                     return Err(protocol_fault(
                         key,
-                        "an identity contradicting one already known",
+                        &format!(
+                            "{} ({}), contradicting the resident {} ({})",
+                            entity.gts_id, entity.gts_uuid, held.gts_id, held.gts_uuid
+                        ),
                     ));
                 }
                 if !shaped(&entity, selection) {
@@ -1253,14 +1259,7 @@ impl CachedTypesRegistry {
     }
 
     fn context(ctx: &SecurityContext) -> Option<ReadContext> {
-        (!ctx.is_anonymous()).then(|| {
-            ReadContext::new(
-                ctx.subject_id(),
-                ctx.subject_type(),
-                ctx.subject_tenant_id(),
-                ctx.token_scopes(),
-            )
-        })
+        (!ctx.is_anonymous()).then(|| ReadContext::of(ctx))
     }
 }
 

@@ -270,16 +270,15 @@ impl Gear for TypesRegistryGear {
         );
 
         debug!(
+            local_client.cache.freshness_window = ?cfg.local_client.cache.freshness_window,
+            local_client.cache.max_size_bytes = cfg.local_client.cache.max_size_bytes.bytes(),
+            local_client.cache.max_entries = cfg.local_client.cache.max_entries,
+            local_client.cache.max_identity_entries = cfg.local_client.cache.max_identity_entries,
             "Loaded types_registry config: entity_id_fields={:?}, schema_id_fields={:?}, \
-             local_client.cache={{freshness_window={:?}, max_size_bytes={}, max_entries={}, max_identity_entries={}}}, \
              local_client.cache.type_schemas={{capacity={}, ttl={:?}}}, \
              local_client.cache.instances={{capacity={}, ttl={:?}}}",
             cfg.entity_id_fields,
             cfg.schema_id_fields,
-            cfg.local_client.cache.freshness_window,
-            cfg.local_client.cache.max_size_bytes,
-            cfg.local_client.cache.max_entries,
-            cfg.local_client.cache.max_identity_entries,
             cfg.local_client.cache.type_schemas.capacity,
             cfg.local_client.cache.type_schemas.ttl,
             cfg.local_client.cache.instances.capacity,
