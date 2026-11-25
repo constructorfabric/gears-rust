@@ -18,7 +18,9 @@
     reason = "integration-test fixture: a setup failure IS the test failure, and each test binary uses a different subset"
 )]
 
+use std::net::{Ipv4Addr, TcpListener};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -52,6 +54,91 @@ fn require_docker() -> bool {
     std::env::var_os(ENV_REQUIRE_DOCKER).is_some_and(|v| v != "0" && !v.is_empty())
 }
 
+/// Which of the [`CONTAINER_SLOTS`] each running fixture of this process holds.
+static IN_PROCESS_SLOTS: [AtomicBool; IN_PROCESS_SLOT_COUNT] =
+    [const { AtomicBool::new(false) }; IN_PROCESS_SLOT_COUNT];
+const IN_PROCESS_SLOT_COUNT: usize = 4;
+
+/// First host port of the fixture's range. The container's Vault port is not
+/// left to Docker: Docker Desktop picks it inside its VM without seeing the
+/// host's listeners, so it may hand out a port that a local process already
+/// holds on `127.0.0.1` (requests to the fixture then reach that process) or on
+/// every address (the port is then not published at all). The range lies below
+/// the ephemeral ports of Linux (32768 and up) and of macOS and Windows (49152
+/// and up), so neither an outgoing connection nor a container started by
+/// someone else takes a port of the range while a container starts.
+const PORT_RANGE_START: u32 = 20_000;
+/// Host ports per slot. A fixture uses the first one of its slot's block that
+/// nothing listens on: the container of the slot's previous test may still hold
+/// its port for a moment after it is removed.
+const PORTS_PER_SLOT: u32 = 16;
+
+/// A place among the fixtures that run at the same time: under nextest every
+/// test is its own process and `NEXTEST_TEST_GLOBAL_SLOT` tells them apart; under
+/// `cargo test` the tests of one binary are threads of one process and share
+/// [`CONTAINER_SLOTS`]. Each slot owns its own block of host ports, so two
+/// fixtures never pick the same one.
+struct Slot {
+    _permit: SemaphorePermit<'static>,
+    in_process: usize,
+}
+
+impl Slot {
+    async fn acquire() -> Self {
+        let permit = CONTAINER_SLOTS
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
+        let in_process = IN_PROCESS_SLOTS
+            .iter()
+            .position(|taken| {
+                taken
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+            .expect("a permit leaves one in-process slot free");
+        Self {
+            _permit: permit,
+            in_process,
+        }
+    }
+
+    /// The first port of this slot's block that nothing listens on.
+    fn free_port(&self) -> u16 {
+        let global: u32 = std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
+            .ok()
+            .and_then(|slot| slot.parse().ok())
+            .unwrap_or(0);
+        let per_process = u32::try_from(IN_PROCESS_SLOT_COUNT).expect("a handful of slots");
+        let in_process = u32::try_from(self.in_process).expect("a handful of slots");
+        let slot = global * per_process + in_process;
+        let first = PORT_RANGE_START + slot * PORTS_PER_SLOT;
+        let last = first + PORTS_PER_SLOT - 1;
+        assert!(last < 32_768, "slot {slot} has no ports below 32768");
+        (first..=last)
+            .map(|port| u16::try_from(port).expect("below 32768"))
+            .find(|&port| nothing_listens_on(port))
+            .unwrap_or_else(|| panic!("every port of {first}..={last} is in use"))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        IN_PROCESS_SLOTS[self.in_process].store(false, Ordering::Release);
+    }
+}
+
+/// Whether nothing listens on `port`, neither on every address (Docker could
+/// not publish the port) nor on `127.0.0.1` (requests to the fixture would
+/// reach that listener and not the container). Two separate binds, each
+/// released before the next: a listener on every address keeps a later bind
+/// of `127.0.0.1` out on Linux.
+fn nothing_listens_on(port: u16) -> bool {
+    let any = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok();
+    let loopback = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok();
+    any && loopback
+}
+
 /// The minimal ACL policy of `docs/DESIGN.md` (section 4.3), for `mount` and
 /// `prefix`. The tests run the plugin with a token holding exactly this, so
 /// the documented policy is the one that is verified.
@@ -73,8 +160,9 @@ path "{mount}/destroy/{prefix}/*" {{
 
 /// A running Vault dev server plus the settings to reach it.
 pub struct VaultFixture {
+    // Dropped before the slot: the container gives its port back first.
     _container: ContainerAsync<GenericImage>,
-    _slot: SemaphorePermit<'static>,
+    _slot: Slot,
     http: reqwest::Client,
     /// `http://127.0.0.1:<mapped port>`.
     pub address: String,
@@ -88,19 +176,17 @@ impl VaultFixture {
     /// Starts a dev server, configures the mount, the policy and a token.
     /// `None` when Docker is not reachable (after printing why).
     pub async fn start() -> Option<Self> {
-        let slot = CONTAINER_SLOTS
-            .acquire()
-            .await
-            .expect("semaphore is never closed");
+        let slot = Slot::acquire().await;
         // The image and its tag come from `libs/test-containers`; they can be
         // overridden with `GEARS_TEST_VAULT_IMAGE` (for example
         // `openbao/openbao`) and `GEARS_TEST_VAULT_TAG`. Each server reads its
         // own `VAULT_DEV_*` or `BAO_DEV_*` variables and ignores the other set.
         let image = test_containers::vault();
         let image_ref = format!("{}:{}", image.name(), image.tag());
+        let port = slot.free_port();
         let request = image
-            .with_exposed_port(8200.tcp())
             .with_wait_for(WaitFor::message_on_stdout(DEV_SERVER_READY))
+            .with_mapped_port(port, 8200.tcp())
             .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", ROOT_TOKEN)
             .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
             .with_env_var("BAO_DEV_ROOT_TOKEN_ID", ROOT_TOKEN)
@@ -121,10 +207,6 @@ impl VaultFixture {
                 return None;
             }
         };
-        let port = container
-            .get_host_port_ipv4(8200.tcp())
-            .await
-            .expect("the container maps the Vault port");
         let mut fixture = Self {
             _container: container,
             _slot: slot,

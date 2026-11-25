@@ -647,10 +647,7 @@ lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
 ## `--test-threads 4`: under nextest every test is its own process, so the
 ## fixture's semaphore of 4 containers does not apply; the thread limit keeps at
 ## most 4 containers running at once.
-## `--retries 1`: a test whose container did not start (seen locally as "Vault did
-## not become healthy" after a failed `docker pull`) runs once more; a real defect
-## fails the retry too. Same as the Kafka lane.
-lane_args_credstore-vault = -p cf-gears-vault-credstore-plugin-v2 --run-ignored ignored-only --no-fail-fast --test-threads 4 --retries 1
+lane_args_credstore-vault = -p cf-gears-vault-credstore-plugin-v2 --run-ignored ignored-only --no-fail-fast --test-threads 4
 lane_env_credstore-vault = VAULT_CREDSTORE_REQUIRE_DOCKER=1
 
 ## Construct's erasure storage on PostgreSQL (Docker required; spins up its own
