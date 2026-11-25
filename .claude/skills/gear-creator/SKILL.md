@@ -1,6 +1,6 @@
 ---
 name: gear-creator
-description: Interactive workflow for creating new ToolKit gears and editing existing ones. Use when adding a new gear to the platform, adding features to an existing gear (REST endpoints, DB entities, OData filtering, plugins, lifecycle/background tasks, SSE events, error types), refactoring gear layer structure, or creating SDK crates. Covers the full DDD-light stack — SDK pattern, contract/API/domain/infra layers, OperationBuilder, SecureORM, ClientHub, error handling, and testing.
+description: Interactive workflow for creating new ToolKit gears and editing existing ones. Use when adding a new gear to the platform, adding features to an existing gear (REST endpoints, DB entities, OData filtering, plugins, lifecycle/background tasks, SSE events, error types), refactoring gear layer structure, or creating SDK crates. Covers the full DDD-light stack — SDK pattern, API/domain/infra layers, OperationBuilder, SecureORM, ClientHub, error handling, and testing.
 user-invocable: true
 ---
 
@@ -17,23 +17,7 @@ Interactive workflow for creating and editing ToolKit gears.
 
 ## Document routing
 
-Read the minimum set of docs needed for the task. Start with the routing table below; do NOT load all docs at once.
-
-| When you need to... | Read this |
-|---|---|
-| Understand ToolKit concepts, golden path | `docs/toolkit_unified_system/01_overview.md` |
-| Create gear structure, SDK crate, naming, layers | `docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md` |
-| Wire ClientHub, inter-gear clients, plugins | `docs/toolkit_unified_system/03_clienthub_and_plugins.md` |
-| Add REST endpoints, OperationBuilder, SSE, auth | `docs/toolkit_unified_system/04_rest_operation_builder.md` |
-| Implement errors, RFC-9457 Problem, From impls | `docs/toolkit_unified_system/05_errors_rfc9457.md` |
-| Add DB entities, SecureORM, AuthZ PEP | `docs/toolkit_unified_system/06_authn_authz_secure_orm.md` |
-| Add repositories, migrations, transactions | `docs/toolkit_unified_system/11_database_patterns.md` |
-| Add OData filtering, pagination, $select, $orderby | `docs/toolkit_unified_system/07_odata_pagination_select_filter.md` |
-| Configure lifecycle, background tasks, cancellation | `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md` |
-| Create out-of-process gear, gRPC, OoP SDK | `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md` |
-| Get checklists, code templates, test patterns | `docs/toolkit_unified_system/10_checklists_and_templates.md` |
-| Write unit tests, test file layout, mocks, fixtures | `docs/toolkit_unified_system/12_unit_testing.md` |
-| Write E2E tests, cross-gear integration tests | `docs/toolkit_unified_system/13_e2e_testing.md` |
+Read the minimum set of docs for the task. The routing table is in `docs/toolkit_unified_system/README.md` (Task → Document routing); start there and do not load all docs at once.
 
 ## Workflow: Create a new gear
 
@@ -44,7 +28,7 @@ Ask the user (one message, not a wall of questions) or infer from the task or de
 1. **Gear name** (kebab-case, e.g. `file-storage`)
 2. **Purpose** — what does this gear do?
 3. **Capabilities needed** — which apply: `db`, `rest`, `stateful`?
-4. **Dependencies** — does it depend on other gears? (e.g. `authz-resolver`)
+4. **Dependencies** — does it depend on other gears? (e.g. `authz-resolver`, declared as `deps = [authz_resolver]` or `#[toolkit::consumes(...)]`)
 5. **SDK needed?** — will other gears consume its API?
 
 Use the answers to determine which docs to load next.
@@ -52,7 +36,7 @@ Use the answers to determine which docs to load next.
 ### Phase 2 — Design
 
 1. Read `docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md`
-2. Read `docs/toolkit_unified_system/10_checklists_and_templates.md` — use the "Adding a New Gear" checklist
+2. Read `docs/toolkit_unified_system/10_checklists_and_templates.md` — use the new-gear checklist
 3. If capabilities include `rest` — also read `docs/toolkit_unified_system/04_rest_operation_builder.md`
 4. If capabilities include `db` — also read `docs/toolkit_unified_system/06_authn_authz_secure_orm.md` and `docs/toolkit_unified_system/11_database_patterns.md`
 5. Study corresponding files in `examples/toolkit/users-info/` for the layers being created
@@ -70,27 +54,27 @@ Get approval before writing code.
 
 Create files in this order (each layer builds on the previous):
 
-1. **SDK crate** (if needed): `<gear>-sdk/` with `Cargo.toml`, `src/lib.rs`, `src/client.rs`, `src/models.rs`, `src/errors.rs`
-2. **Gear crate**: `<gear>/Cargo.toml`, `src/lib.rs`, `src/gear.rs`, `src/config.rs`
-3. **Contract layer**: `src/contract/` — re-export from SDK or define inline
-4. **Domain layer**: `src/domain/error.rs`, `src/domain/service/`, `src/domain/repos/`
-5. **Infra layer** (if db): `src/infra/storage/entity/`, `src/infra/storage/mapper.rs`, `src/infra/storage/migrations/`
-6. **API layer** (if rest): `src/api/rest/dto.rs`, `src/api/rest/handlers/`, `src/api/rest/routes/`, `src/api/rest/error.rs`
-7. **Local client**: `src/domain/local_client/`
+1. **SDK crate** (if needed): `<gear>-sdk/` with `Cargo.toml`, `src/lib.rs` (re-exports `CanonicalError` under a gear alias), `src/client.rs`, `src/models.rs`; `src/gts.rs` and `src/odata/` when the gear has GTS types or OData queries
+2. **Gear crate**: `<gear>/Cargo.toml`, `src/lib.rs`, `src/gear.rs`, `src/config.rs`, and `gear.gdl` next to `Cargo.toml` (`docs/GEARBOX.md`)
+3. **Domain layer**: `src/domain/error.rs`, `src/domain/service/`, `src/domain/repos/`
+4. **Infra layer** (if db): `src/infra/storage/entity/`, `src/infra/storage/mapper.rs`, `src/infra/storage/migrations/`
+5. **API layer** (if rest): `src/api/rest/dto.rs`, `src/api/rest/handlers/`, `src/api/rest/routes/`, `src/api/rest/error.rs`
+6. **Local client**: `src/domain/local_client/`
+
+Tests go in sibling `*_tests.rs` files (`docs/toolkit_unified_system/12_unit_testing.md`).
 
 ### Phase 4 — Wire and register
 
-1. Add gear crate(s) to workspace `Cargo.toml`
-2. Register gear in `apps/cf-gears-example-server/src/main.rs`
-3. Register client in `init()` via ClientHub
-4. Add feature flag if needed (see existing `static-authn` / `static-authz` pattern)
+1. Add the crate(s) to workspace `members` in the root `Cargo.toml`; if another gear lists this one in `deps`, add it to `[workspace.metadata.cargo-shear] ignored`
+2. To run it in the example server: optional dependency + Cargo feature in `apps/cf-gears-example-server/Cargo.toml`, and `#[cfg(feature = "...")] use <crate> as _;` in `apps/cf-gears-example-server/src/registered_gears.rs`
+3. Register the local client in `init()` via ClientHub
+4. Add an entry to `docs/GEARS.md`
 
 ### Phase 5 — Verify
 
-1. `cargo build -p <gear-crate>` — must compile
-2. `cargo clippy -p <gear-crate>` — no warnings
-3. `cargo gears lint --dylint` — architecture lints pass
-4. `cargo test -p <gear-crate>` — tests pass
+1. `make gear-ci GEAR=<gear>` — fmt, clippy (`-D warnings`) and tests for the gear, its SDK and the crates that depend on them
+2. `make dylint` — architecture lints
+3. `make e2e-local GEAR=<gear>` — if the gear has E2E suites
 
 ## Workflow: Edit an existing gear
 
@@ -108,7 +92,7 @@ Ask the user what they want to change. Common tasks:
 
 ### Step 2 — Load relevant docs
 
-Use the document routing table above. Load only what's needed for the specific change.
+Use the routing table in `docs/toolkit_unified_system/README.md`. Load only what's needed for the specific change.
 
 ### Step 3 — Study existing code
 
@@ -118,12 +102,12 @@ Read the gear's current implementation. Compare with `examples/toolkit/users-inf
 
 Follow the DDD-light layer rules:
 
-- **Contract**: NO serde, NO utoipa, NO HTTP types
+- **SDK models**: NO utoipa, NO HTTP types
 - **API/REST DTOs**: MUST have `Serialize`, `Deserialize`, `ToSchema`; MUST be in `api/rest/`
 - **Domain**: All non-module-private structs/enums (`pub`/`pub(crate)`/`pub(super)`) MUST have `#[domain_model]` (strictly module-private helpers are exempt)
-- **Entities**: Use `#[derive(Scopable)]` with `#[secure(tenant_col = "...")]`
+- **Entities**: Use `#[derive(Scopable)]`; `#[secure(...)]` must decide all four dimensions (tenant, resource, owner, type), e.g. `#[secure(tenant_col = "tenant_id", resource_col = "id", no_owner, no_type)]`, or `#[secure(unrestricted)]` for global tables
 - **Endpoints**: MUST follow `/{service-name}/v{N}/{resource}` pattern
-- **Errors**: Use `Problem` (RFC-9457), implement `From<DomainError> for Problem`
+- **Errors**: handlers return `ApiResult<T>` (`CanonicalError`); implement `From<DomainError> for CanonicalError` in `api/rest/error.rs` with `#[resource_error]` types
 
 ### Step 5 — Verify
 
@@ -134,8 +118,8 @@ Same as Phase 5 of the create workflow.
 These rules apply to ALL gear work. Violating them will fail CI:
 
 - SDK pattern is the public API — use `<gear>-sdk` crate
-- `SecureConn` + `AccessScope` for all DB access — no raw connections
-- `OperationBuilder` for all REST routes — with `.authenticated()` and `.standard_errors()`
+- `DBProvider` (`.conn()` / `.transaction(..)`) with `.secure().scope_with(&scope)` for all DB access — no raw connections
+- `OperationBuilder` for all REST routes — with an auth call (`.authenticated()`), a license call (`.require_license_features(..)` or `.no_license_required()`) and declared errors (`.standard_errors()`)
 - `#[domain_model]` on all non-module-private domain structs/enums (DE0309 lint; strictly private helpers exempt)
 - No `unwrap()` / `expect()` — use proper Result types
 - AuthZ via `PolicyEnforcer` PEP pattern — never construct `AccessScope` manually
