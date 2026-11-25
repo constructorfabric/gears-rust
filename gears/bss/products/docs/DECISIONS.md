@@ -65,7 +65,7 @@
 | P-D-230 | H | A derived usage type is versioned data with one evaluator, in the SDK | DECIDED 2026-10-01 · Derived usage types plan rev 3 (design decisions 1–4, run 1); implements P-D-229 and its amendment; amended by P-D-251 |
 | P-D-231 | H | Derived usage types are stored append-only and served by five doors | DECIDED 2026-10-01 · Owner, 2026-10-01 (O-1, O-2, O-3); derived usage types plan rev 3 (design decisions 4, 8, 9, run 2); implements P-D-229 and P-D-230; amended by P-D-257; extended by P-D-262 |
 | P-D-232 | H | A usage SKU pins a derived usage type at its first publish | DECIDED 2026-10-01 · Owner, 2026-10-01 (M1, O-2); derived usage types plan rev 3 (design decision 7, run 3); implements P-D-229's pin; amends P-D-184, P-D-207, P-D-231; amended by P-D-251, P-D-258 |
-| P-D-233 | H | Products answers pricing's meter semantics for its derived usage types (E1b) | DECIDED 2026-10-01 · Derived usage types plan rev 3 (design decisions 5 and 6, run 4); implements P-D-229's pricing reference; amends P-D-229, P-D-230, P-D-231, P-D-232; pricing D-503 and D-510 amended |
+| P-D-233 | H | Products answers pricing's meter semantics for its derived usage types (E1b) | DECIDED 2026-10-01 · Derived usage types plan rev 3 (design decisions 5 and 6, run 4); implements P-D-229's pricing reference; amends P-D-229, P-D-230, P-D-231, P-D-232; pricing D-503 and D-510 amended; amended by P-D-277 |
 | P-D-245 | M | The reference registry reads many SKUs in one call | DECIDED 2026-10-01 · phase 9 plan rev 4 (run 9.7); amends P-D-222 |
 | P-D-246 | M | The SKU pickers narrow by one book or one plan revision (`priced_in`, `not_priced_in`, `not_in_revision`) through the port's scoped sets | DECIDED 2026-10-01 · Owner, 2026-10-01 (asks v4, 52 and 46); phase 9 plan rev 4 (run 9.8; review M5, M6, M8); amends P-D-210, P-D-212 |
 | P-D-247 | L | A usage-type picker page may be kept privately for a minute | DECIDED 2026-10-01 · Owner, 2026-10-01 (asks v4, 56); phase 9 plan rev 4 (run 9.8); extends P-D-207; extended by P-D-261 |
@@ -84,7 +84,7 @@
 | P-D-262 | M | Every actor id a read shows carries its current name (twin of pricing D-519) | DECIDED 2026-10-03 · Owner, 2026-10-02 (ask 32: names on the server, through AM); extends P-D-213, P-D-224, P-D-231; amended 2026-10-03 (one lookup per inbox card); amended 2026-10-04 (a resolved name is reused for five minutes per caller) |
 | P-D-263 | M | A retired SKU or category can be archived, and its list hides it by default (twin of pricing D-522) | DECIDED 2026-10-03 · Owner, 2026-10-03 ("archived"; ask 58b); extends P-D-208, P-D-210, P-D-211, P-D-215; amended 2026-10-03 (branch review) |
 | P-D-264 | M | A text function on `lifecycle` filters by the lifecycles it matches | DECIDED 2026-10-03 · Owner, 2026-10-03 ("yes, add it"); amends P-D-249 |
-| P-D-265 | M | The PEP gate asks the PDP for the caller's tenant only (twin of pricing D-523) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant) |
+| P-D-265 | M | The PEP gate asks the PDP for the caller's tenant only (twin of pricing D-523) | DECIDED 2026-10-04 · Owner, 2026-10-04 (the approval lists under a root tenant); amended by P-D-277 |
 | P-D-266 | H | Products owns the commercial quota catalog | DECIDED 2026-11-19 · Owner, 2026-11-19 (quotas programme); quotas ADR 0001 |
 | P-D-267 | H | The quota GTS contract lives in products-sdk; adapter owners register its instances | DECIDED 2026-11-19 · Owner, 2026-11-19 (the adapter brings its instances); quotas DESIGN §3.3.1 (amended) |
 | P-D-268 | H | Quota intake: adapter targets, complete snapshots, per-record verdicts | DECIDED 2026-11-19 · Owner, 2026-11-19; quotas feature 1 |
@@ -96,6 +96,7 @@
 | P-D-274 | M | Migration 000015 creates the quota catalog store | DECIDED 2026-11-19 · quotas DESIGN §3.7 |
 | P-D-275 | H | Products validates a complete quota set for Pricing | DECIDED 2026-11-21 · Owner, 2026-11-21 (the `read` grant); quotas DESIGN §3.3.1.1 (amended); extends P-D-272 |
 | P-D-276 | H | The quota-set judgement: rule checks, set checks and change kinds | DECIDED 2026-11-21 · quotas DESIGN §3.3.1.1 (amended), §3.3.1.3; quotas feature 2 |
+| P-D-277 | H | A ClientHub read serves a stored derived usage declaration in a named catalog tenant | DECIDED 2026-11-25 · Owner, 2026-11-25 (Rating's ask R-31, accepted with an explicit catalog tenant and `sku:read`); amends P-D-233, P-D-265 |
 
 ## Entries
 
@@ -1738,6 +1739,10 @@ plan. `infra/meter_semantics.rs` and `gear.rs` carry it; pricing's checks do not
 **Source:** The derived usage types implementation plan, rev 3: design decisions 5 and 6 and run 4. Implements P-D-229's
 pricing reference (its amendment) and the E1b half of pricing's E1 (D-503).
 
+**Amended by P-D-277 (2026-11-25).** The stored declaration is no longer served by REST only: `DerivedUsageTypeReadV1`
+reads one stored version through `ClientHub`, in a catalog tenant the caller names, with the version read's refusals and
+stored digest. The meter semantics above are unchanged and still read in the caller's tenant.
+
 #### P-D-245 [M] The reference registry reads many SKUs in one call
 
 **Status:** DECIDED 2026-10-01.
@@ -2206,6 +2211,11 @@ P-D-215. Amended by the branch review, 2026-10-03.
 - **The tests.** `authz_tests::every_request_asks_for_the_callers_tenant_only`: a read and a write each ask for `RootOnly`.
 
 **Source:** Owner, 2026-10-04, after the approval lists measured 1.5–4 s under a root tenant. Twin of pricing D-523.
+
+**Amended by P-D-277 (2026-11-25).** One read names a tenant other than the subject's own: the `ClientHub` read of a
+stored derived usage declaration asks `RootOnly` with the named catalog tenant as the context's root
+(`authz::access_scope_in`), so the PDP judges the subject's grant in that tenant. Every other request still asks for the
+subject's tenant.
 
 #### P-D-266 [H] Products owns the commercial quota catalog
 
@@ -2924,3 +2934,50 @@ P-D-272.
 **Source:** Quotas DESIGN §3.3.1.1, amended in the same change (the rules of one logical binding need equal profile
 content and one adapter target), §3.3.1.3 and feature 2 §3.4. Implements the Products half of the package's feature
 2 step `inst-select` and algorithm step `inst-validate`.
+
+#### P-D-277 [H] A ClientHub read serves a stored derived usage declaration in a named catalog tenant
+
+**Status:** DECIDED 2026-11-25.
+
+Rating evaluates a derived usage type with the SDK's evaluator (P-D-230) and freezes the declaration it rated with. Until
+now the stored declaration was served only by `GET /derived-usage-types/{code}/versions/{n}`; the meter semantics
+(P-D-233) carry its digest but not its inputs or formula. Rating asked for an in-process read (its R-31). The owner
+accepted it with two changes: the read names its catalog tenant, and it is a general read under `sku:read`, not a method
+for Rating's identity.
+- **The contract.** `bss_products_sdk::derived_read::DerivedUsageTypeReadV1::declaration(ctx, catalog_tenant_id,
+  &MeterId)` answers `StoredDerivedDeclaration`: the meter asked for, the stored `DerivedUsageDeclaration`, the STORED
+  `digest` (64 lowercase hex digits, never recomputed), `canonical_unit` (the output unit) and `accrual_policy_version`
+  (`derived-v1:<digest>`). These are the fields of the REST version read that a consumer needs.
+- **The registration.** At init the gear registers ONE `dyn DerivedUsageTypeReadV1` in `ClientHub`
+  (`register_derived_usage_type_read`), over the runtime the REST endpoints use, as it registers `UsageMeterSemanticsV1`.
+  It is not wired through `#[toolkit::provides]`.
+- **The authorization.** `sku:read` (O-3) in the NAMED catalog tenant, through the PDP. The request asks `RootOnly` with
+  that tenant as the context's root and as the `OWNER_TENANT_ID` property (`authz::access_scope_in`), so the PDP judges
+  the subject's grant in that tenant: a service homed at the platform root reads a seller tenant in which it holds
+  `sku:read`. The compiled scope must hold the named tenant, else the read is 403: a degraded flat-`In` decision of the
+  caller's own tenant does not reach another. The SQL filter is `tenant_only()` of that scope, beside the named tenant as
+  the store's key. No subject type is trusted: every caller goes through the PDP, as for the meter semantics.
+- **The refusals** are the REST version read's, because both call one function (`derived_usage_types::version_in`):
+  - a nil subject, a nil subject tenant or a nil catalog tenant: 403 before the PDP is asked (an in-process caller has no
+    401);
+  - a denied `sku:read` in the catalog tenant: 403; an unreachable PDP: 503;
+  - a catalog tenant that holds no type with the meter's code, or a type without that version: the REST read's 404, one
+    body for both;
+  - a store failure: the REST read's mapping; a stored row that does not read: the REST read's data-loss 500, detail
+    `a stored derived meter row does not read`.
+- **Tenant isolation.** `cpt-cf-bss-products-nfr-tenant-isolation` holds: the read stays inside the scope the PDP grants
+  in the named tenant, and a tenant the caller holds no grant in answers nothing. Only this read names a tenant;
+  P-D-265 stands for every other request.
+- **Not built here.** The grants: the platform gives a consumer's service identity `sku:read` in each seller tenant it
+  reads. No REST endpoint is added, and the OpenAPI document does not change.
+- **The tests.** `infra/derived_read_tests.rs`: `the_hub_answers_the_read_after_the_gears_init` (nothing before the init;
+  a root service reads a seller's stored version through the hub, with the STORED digest; a tenant without the grant is
+  403), `a_root_service_reads_the_sellers_declaration_with_the_rest_digest` (the PDP asked `RootOnly` with the seller
+  tenant as the root; the digest, unit, accrual and declaration equal the REST version read's; the digest is the one the
+  canonical bytes give), `a_tenant_without_the_grant_is_refused` (another tenant that holds the meter, and a grant of the
+  caller's own tenant only: both 403), `an_unknown_meter_is_not_found` (an unknown code and an unknown version: one 404
+  body), `a_nil_caller_or_catalog_tenant_is_403_before_the_pdp` and `an_unreachable_pdp_is_503_and_a_corrupt_row_500`.
+  `authz_tests.rs`: `a_read_in_a_named_tenant_asks_that_root_and_must_hold_it`.
+
+**Source:** Owner, 2026-11-25 (Rating's ask R-31, accepted in this shape and built in this change). Amends P-D-233 (the
+declaration is also served in process) and P-D-265 (this read names a tenant other than the subject's own).

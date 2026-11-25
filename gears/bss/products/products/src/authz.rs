@@ -117,7 +117,8 @@ pub enum AuthzError {
 /// only cost an `IN` list of every descendant tenant, deleted ones included, on every scope
 /// check — thousands of bind parameters under a root tenant with thousands of descendants,
 /// and a deny once the PDP's expansion cap is crossed. An `EQ` also stays decidable in memory,
-/// which `scope_holds` needs for `caller_can_approve`.
+/// which `scope_holds` needs for `caller_can_approve`. The one read in a tenant the caller names
+/// is [`access_scope_in`] (P-D-277).
 ///
 /// # Errors
 ///
@@ -130,9 +131,47 @@ pub async fn access_scope(
     action: &str,
     owner_tenant_id: Option<Uuid>,
 ) -> Result<AccessScope, AuthzError> {
+    ask(enforcer, ctx, resource, action, owner_tenant_id, None).await
+}
+
+/// The PEP gate of a read in a tenant the caller names, which may be other than its own (P-D-277,
+/// amending P-D-265 for that read): a service homed at the platform root reads a seller tenant's
+/// catalog, for example.
+///
+/// The request is still [`TenantMode::RootOnly`], with `tenant` as the context's root and as the
+/// `OWNER_TENANT_ID` property, so the PDP judges the subject's grant in that tenant and answers
+/// `EQ(owner_tenant_id, tenant)` or denies. As on a write, the compiled scope must hold `tenant`,
+/// else the read is denied: a degraded flat-`In` decision is not trusted to have checked it.
+///
+/// # Errors
+///
+/// As [`access_scope`].
+pub async fn access_scope_in(
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    resource: &ResourceType,
+    action: &str,
+    tenant: Uuid,
+) -> Result<AccessScope, AuthzError> {
+    ask(enforcer, ctx, resource, action, Some(tenant), Some(tenant)).await
+}
+
+/// [`access_scope`] and [`access_scope_in`]: `context_tenant` is the root the PDP judges in;
+/// `None` leaves it to the PDP, which takes the subject's tenant.
+async fn ask(
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    resource: &ResourceType,
+    action: &str,
+    owner_tenant_id: Option<Uuid>,
+    context_tenant: Option<Uuid>,
+) -> Result<AccessScope, AuthzError> {
     let mut request = AccessRequest::new()
         .require_constraints(true)
         .tenant_mode(TenantMode::RootOnly);
+    if let Some(tenant) = context_tenant {
+        request = request.context_tenant_id(tenant);
+    }
     if let Some(tenant) = owner_tenant_id {
         request = request.resource_property(pep_properties::OWNER_TENANT_ID, tenant);
     }
@@ -187,12 +226,19 @@ pub async fn access_scope(
     // the compiled scope here — a target outside the caller's authorized tenants
     // is a cross-tenant write and is denied. Reads pass `owner_tenant_id = None`
     // and use the scope as the SQL filter, so this membership check is
-    // write-only, and `Some(target)` is the whole of what selects it.
+    // write-only, and `Some(target)` is the whole of what selects it. The one
+    // exception is a read in a named tenant (`access_scope_in`, P-D-277), which
+    // must hold that tenant in the same way.
     if let Some(target) = owner_tenant_id
         && !scope.contains_uuid(pep_properties::OWNER_TENANT_ID, target)
     {
+        let verb = if context_tenant.is_some() {
+            "read"
+        } else {
+            "write"
+        };
         return Err(denial(format!(
-            "subject not authorized to write resources owned by tenant {target}"
+            "subject not authorized to {verb} resources owned by tenant {target}"
         )));
     }
     Ok(scope)

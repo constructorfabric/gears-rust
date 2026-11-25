@@ -113,6 +113,22 @@ fn register_pricing_ports(
     ));
 }
 
+/// Register the read of a stored derived usage declaration in a named catalog tenant (P-D-277), as the meter
+/// semantics are registered: one `dyn DerivedUsageTypeReadV1` over the runtime the REST endpoints use. It is a general
+/// read, judged by `sku:read` in the named tenant, not a port of one consumer.
+fn register_derived_usage_type_read(
+    hub: &toolkit::ClientHub,
+    api_state: &Arc<crate::api::rest::ApiState>,
+    enforcer: &Arc<authz_resolver_sdk::PolicyEnforcer>,
+) {
+    hub.register::<dyn bss_products_sdk::DerivedUsageTypeReadV1>(Arc::new(
+        crate::infra::derived_read::LocalDerivedUsageTypeRead::new(
+            Arc::clone(api_state),
+            Arc::clone(enforcer),
+        ),
+    ));
+}
+
 /// The products gear.
 #[toolkit::gear(name = "bss-products", deps = [authz_resolver, types_registry, usage_collector], capabilities = [db, rest, stateful], lifecycle(entry = "serve", stop_timeout = "30s"))]
 #[toolkit::provides(
@@ -452,6 +468,7 @@ impl Gear for BssProductsGear {
         });
         register_products_client(&ctx.client_hub(), api_state.db.db(), Arc::clone(&enforcer));
         register_pricing_ports(&ctx.client_hub(), &api_state, &enforcer);
+        register_derived_usage_type_read(&ctx.client_hub(), &api_state, &enforcer);
         let quota = build_quota_state(&ctx.client_hub(), &api_state, &cfg);
         register_quota_catalog_client(&ctx.client_hub(), &quota, &enforcer);
         // No discovery adapter is built in: a target's discovery is closed until a plugin gear

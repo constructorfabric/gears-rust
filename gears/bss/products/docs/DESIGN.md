@@ -617,7 +617,7 @@ function that reports every failure:
 | toolkit-db / SecureORM | SecureConn and scoped transactions; PolicyEnforcer-derived AccessScope on all reads/writes, including audit, replay and child records. Conditional writes, no raw unscoped connection. |
 | toolkit-db outbox | State, audit and outbox records share the same transaction; dispatch happens after commit, and the outbox's sequencer is woken only after it (P-D-221). No success event escapes a rollback. |
 | toolkit REST / PolicyEnforcer | OperationBuilder, authenticated operations, RFC-9457 errors and deny-by-default resource/action checks. |
-| products-sdk / ClientHub | Public SKU/version/catalog contracts, usage-type port, and the derived usage declaration with its pure evaluator (P-D-230); consumers resolve typed clients without importing gear internals. Its `quota` module holds the five quota GTS schemas and the discovery plugin specification, which the toolkit inventory seeds into types-registry, the exact units, the canonical digests, `ProductsQuotaDiscoveryPluginClientV1` and `ProductsQuotaCatalogClientV1` (P-D-267), and the quota-set validation contract in `quota::validation` (P-D-275). |
+| products-sdk / ClientHub | Public SKU/version/catalog contracts, usage-type port, the derived usage declaration with its pure evaluator (P-D-230), and `DerivedUsageTypeReadV1`, the read of one stored declaration in a named catalog tenant (P-D-277); consumers resolve typed clients without importing gear internals. Its `quota` module holds the five quota GTS schemas and the discovery plugin specification, which the toolkit inventory seeds into types-registry, the exact units, the canonical digests, `ProductsQuotaDiscoveryPluginClientV1` and `ProductsQuotaCatalogClientV1` (P-D-267), and the quota-set validation contract in `quota::validation` (P-D-275). |
 | types-registry / `TypesRegistryApi` | The quota intake resolves schemas, instances and ancestry and validates records through `TypesRegistryApi`, resolved from the ClientHub on every call (a remote registry is wired after init) and read as the caller. Not found or deleted is unknown; any other error, or no registry in the hub, is an outage (P-D-268). |
 
 Outbound events are `SkuPublished`, `SkuChanged`, `SkuRetired`, `ApprovalUnitDecided` and
@@ -663,6 +663,14 @@ canonical or disagrees with `@<n>` is 400 `METER_POLICY_MISMATCH`; an unknown co
 `METER_VERSION_UNKNOWN`; a store failure is 503, a stored row that does not read is a data-loss 500 whose detail is `a stored derived meter row does not read` (the cause is logged and is not on the wire; pricing forwards that 500 and remaps every other provider 5xx to 503), and a denied `sku:read` 403. Every other meter answers exactly as an absent
 provider does (`UNCONFIGURED_DEPENDENCY`). The raw-meter provider (E1a) is not built: when it exists, it registers under a
 `products-sdk` trait that this dispatcher calls for every non-derived id.
+
+Products also registers at its init the ClientHub's one `dyn DerivedUsageTypeReadV1` (P-D-277), over the same runtime. It
+answers one stored version of a derived usage type, named by its meter id, in a catalog tenant the caller names: the stored
+declaration, the stored digest, the output unit as `canonical_unit` and `derived-v1:<digest>`. It is the REST version
+read in process, with the same 404, 403, 503 and 500 rules. It asks `sku:read` in the named tenant, `RootOnly` with that
+tenant as the context's root, and the compiled scope must hold it; this is the one read that may name a tenant other than
+the subject's own (amending P-D-265). It is a general read: a consumer such as Rating needs `sku:read` in each seller
+tenant it reads, granted by the platform.
 
 `SkuUsageV1` is the second port in `products-sdk`, and pricing fills it (P-D-197; pricing D-428). Pricing
 registers it in `ClientHub` at its init; Products resolves it at each `GET /skus` and `GET /skus/{id}`, calls

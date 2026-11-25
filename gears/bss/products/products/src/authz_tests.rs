@@ -23,7 +23,10 @@ use toolkit_gts::gts_id;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use uuid::Uuid;
 
-use super::{AuthzError, access_scope, actions, authz_label_type_schemas, labels, resource_types};
+use super::{
+    AuthzError, access_scope, access_scope_in, actions, authz_label_type_schemas, labels,
+    resource_types,
+};
 use crate::test_support::flat_in_enforcer;
 
 /// RT-09: every label `mod labels` declares joins `labels::ALL`, and every resource type names one
@@ -408,4 +411,86 @@ async fn every_request_asks_for_the_callers_tenant_only() {
         vec![Some(TenantMode::RootOnly); 2],
         "every PDP request names the caller's tenant only"
     );
+}
+
+/// The context root and the tenant mode of one PDP request.
+type Asked = (Option<Uuid>, Option<TenantMode>);
+
+/// Allows under `In([tenant])` and records the context root and the tenant mode of every request.
+struct RootRecording {
+    tenant: Uuid,
+    asked: std::sync::Mutex<Vec<Asked>>,
+}
+
+#[async_trait]
+impl AuthZResolverApi for RootRecording {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        self.asked.lock().unwrap().push((
+            request
+                .context
+                .tenant_context
+                .as_ref()
+                .and_then(|tc| tc.root_id),
+            request.context.tenant_context.map(|tc| tc.mode),
+        ));
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![authz_resolver_sdk::Constraint {
+                    predicates: vec![authz_resolver_sdk::Predicate::In(
+                        authz_resolver_sdk::InPredicate::new(
+                            pep_properties::OWNER_TENANT_ID,
+                            vec![self.tenant],
+                        ),
+                    )],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// P-D-277: a read in a named tenant asks `RootOnly` with that tenant as the context's root (the caller's own reads
+/// leave the root to the PDP), and its compiled scope must hold the tenant: a scope of the caller's own tenant is
+/// denied.
+#[tokio::test]
+async fn a_read_in_a_named_tenant_asks_that_root_and_must_hold_it() {
+    let own = Uuid::now_v7();
+    let named = Uuid::now_v7();
+    let ctx = ctx_for(own);
+    let resolver = Arc::new(RootRecording {
+        tenant: named,
+        asked: std::sync::Mutex::new(Vec::new()),
+    });
+    let enforcer = PolicyEnforcer::new(resolver.clone());
+    let scope = access_scope_in(&enforcer, &ctx, &resource_types::SKU, actions::READ, named)
+        .await
+        .expect("the named tenant's grant is a read scope");
+    assert!(scope.contains_uuid(pep_properties::OWNER_TENANT_ID, named));
+    access_scope(&enforcer, &ctx, &resource_types::SKU, actions::READ, None)
+        .await
+        .expect("the caller's own read is allowed");
+    assert_eq!(
+        *resolver.asked.lock().unwrap(),
+        vec![
+            (Some(named), Some(TenantMode::RootOnly)),
+            (None, Some(TenantMode::RootOnly))
+        ]
+    );
+    let denied = access_scope_in(
+        &flat_in_enforcer(own),
+        &ctx,
+        &resource_types::SKU,
+        actions::READ,
+        named,
+    )
+    .await;
+    match denied {
+        Err(AuthzError::Denied(reason)) => assert!(reason.contains("to read"), "{reason}"),
+        other => panic!("a scope without the named tenant must deny, got {other:?}"),
+    }
 }
