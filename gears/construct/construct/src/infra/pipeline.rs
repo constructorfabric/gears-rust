@@ -39,6 +39,7 @@ use crate::domain::review_queue::{ReviewQueueService, ReviewRequests};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
 use crate::domain::subject_settings::SubjectSettingsReader;
+use crate::domain::tenant_exit::{TenantExit, TenantExitPorts, TenantStatuses};
 use crate::infra::admin_facts_events::LogAdminFactsEvents;
 use crate::infra::admission_events::LogAdmissionEvents;
 use crate::infra::admission_rules::{ConfigAdmissionRules, warn_open_lists};
@@ -56,11 +57,13 @@ use crate::infra::retention_periods::ConfigRetentionPeriods;
 use crate::infra::review_queue_events::LogReviewQueueEvents;
 use crate::infra::storage::deletion_repo::DeletionTables;
 use crate::infra::storage::graph::directory::GraphProfileDirectory;
+use crate::infra::storage::graph::offboarding::GraphTenantOffboarding;
 use crate::infra::storage::graph::reader::GraphProfileSource;
 use crate::infra::storage::graph::root::PayloadCounter;
 use crate::infra::storage::graph::types::GraphTypes;
 use crate::infra::storage::graph::writer::{GraphPlanWriter, SoftDelete, WriterPorts};
 use crate::infra::subject_control_events::LogSubjectControlEvents;
+use crate::infra::tenant_statuses::HubTenantStatuses;
 
 /// [`ProcessingContexts`] for a deployment without a processing identity:
 /// Construct has no identity to read or write the profiles as.
@@ -222,6 +225,7 @@ pub fn build(
         reviews,
         deletion,
         policy_enforcer,
+        Arc::new(HubTenantStatuses::new(Arc::clone(hub))),
     )
 }
 
@@ -230,6 +234,10 @@ pub fn build(
 /// # Errors
 ///
 /// When the person types cannot be read, a defect in the gear.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the gear's collaborators, each given once; a test replaces any of them"
+)]
 pub fn assemble(
     cfg: &ValidConfig,
     model: Option<Arc<dyn ModelClient>>,
@@ -238,6 +246,7 @@ pub fn assemble(
     reviews: Arc<dyn ReviewRequests>,
     deletion: Arc<DeletionTables>,
     policy_enforcer: PolicyEnforcer,
+    statuses: Arc<dyn TenantStatuses>,
 ) -> anyhow::Result<Pipeline> {
     let configured = Configured::of(cfg, model.as_ref());
     let identity = cfg
@@ -358,6 +367,17 @@ pub fn assemble(
     // identity an erasure is marked, serves nothing, and stays marked until
     // one is configured.
     let deletion_events = Arc::new(LogDeletionEvents);
+    // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-wire
+    // A deleted tenant's exit runs as Construct too, and asks the tenant
+    // resolver and graph storage's offboarding.
+    let exit = Arc::new(TenantExit::new(TenantExitPorts {
+        contexts: Arc::clone(&contexts),
+        statuses,
+        graph: Arc::new(GraphTenantOffboarding::new(Arc::clone(&graph))),
+        tables: Arc::clone(&deletion) as _,
+        events: Arc::clone(&deletion_events) as _,
+    }));
+    // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-wire
     let runner = Arc::new(Deletion::new(DeletionPorts {
         writes: profile_writes,
         roots: graph_writer,
@@ -376,6 +396,7 @@ pub fn assemble(
         runner,
         Arc::clone(&deletion) as _,
         Arc::clone(&periods) as _,
+        exit,
         &cfg.config().deletion,
     ));
     // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-deletion

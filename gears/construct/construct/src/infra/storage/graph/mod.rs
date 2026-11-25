@@ -18,6 +18,7 @@ use crate::domain::error::{DomainError, is_retryable};
 mod context;
 pub mod directory;
 pub mod fact;
+pub mod offboarding;
 pub mod reader;
 pub mod root;
 pub mod types;

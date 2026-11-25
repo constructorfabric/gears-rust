@@ -65,6 +65,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     let gear = ConstructGear::default();
@@ -263,6 +264,7 @@ async fn router_of(
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(resolver),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     let gear = ConstructGear::default();
@@ -454,6 +456,7 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
         stopped: std::sync::atomic::AtomicBool::new(false),
     });
     let gear = ConstructGear::default();
+    let exit = crate::test_support::tenant_exit_without_resolver(Arc::clone(&store));
     *gear.deletion.lock() = Some(DeletionTasks {
         job: Arc::new(DeletionJob {
             deletion,
@@ -465,6 +468,7 @@ fn gear_deleting(leads: Leads) -> DeletingGear {
             ),
             interval: std::time::Duration::from_secs(60),
             retention_interval: std::time::Duration::from_secs(60),
+            exit,
         }),
         leadership: Arc::clone(&leadership) as _,
     });

@@ -16,6 +16,7 @@ use crate::domain::DbProvider;
 use crate::domain::deletion::{DeletionStore, ExpiredRows, KnownTenants, Mark, ProfileGenerations};
 use crate::domain::error::DomainError;
 use crate::domain::subject_settings::{SettingsWrite, SubjectKey};
+use crate::domain::tenant_exit::{TenantRows, TenantTables};
 
 use super::record_ids_entity::{self as record_ids, Entity as RecordIdEntity};
 use super::review_requests_entity::{self as review_requests, Entity as ReviewRequestEntity};
@@ -126,6 +127,60 @@ struct RecordKeyRow {
 /// run after a period is set does not hold the table intake writes to in
 /// one long delete.
 pub(crate) const EXPIRE_BATCH: u64 = 1000;
+
+/// Remove the tenant's record identities that also match `which`,
+/// [`EXPIRE_BATCH`] at a time, so a tenant with many does not hold the table
+/// intake writes to in one long delete; how many.
+async fn remove_record_ids(
+    conn: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    which: Condition,
+) -> Result<u64, DomainError> {
+    let mut removed = 0;
+    loop {
+        let batch: Vec<RecordKeyRow> = RecordIdEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(record_ids::Column::TenantId.eq(tenant_id))
+                    .add(which.clone()),
+            )
+            .limit(EXPIRE_BATCH)
+            .project_all(conn, |query| {
+                query
+                    .select_only()
+                    .column(record_ids::Column::RecordKey)
+                    .into_model()
+            })
+            .await
+            .map_err(map_scope_error)?;
+        let found = batch.len();
+        if found == 0 {
+            break;
+        }
+        removed += RecordIdEntity::delete_many()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                Condition::all()
+                    .add(record_ids::Column::TenantId.eq(tenant_id))
+                    .add(
+                        record_ids::Column::RecordKey
+                            .is_in(batch.into_iter().map(|row| row.record_key)),
+                    ),
+            )
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?
+            .rows_affected;
+        if u64::try_from(found).unwrap_or(u64::MAX) < EXPIRE_BATCH {
+            break;
+        }
+    }
+    Ok(removed)
+}
 
 #[async_trait]
 impl DeletionStore for DeletionTables {
@@ -366,48 +421,13 @@ impl DeletionStore for DeletionTables {
             .await
             .map_err(map_scope_error)?
             .rows_affected;
-        let mut record_ids = 0;
-        loop {
-            let batch: Vec<RecordKeyRow> = RecordIdEntity::find()
-                .secure()
-                .scope_with(scope)
-                .filter(
-                    Condition::all()
-                        .add(record_ids::Column::TenantId.eq(tenant_id))
-                        .add(record_ids::Column::ReceivedAt.lt(before)),
-                )
-                .limit(EXPIRE_BATCH)
-                .project_all(&conn, |query| {
-                    query
-                        .select_only()
-                        .column(record_ids::Column::RecordKey)
-                        .into_model()
-                })
-                .await
-                .map_err(map_scope_error)?;
-            let found = batch.len();
-            if found == 0 {
-                break;
-            }
-            record_ids += RecordIdEntity::delete_many()
-                .secure()
-                .scope_with(scope)
-                .filter(
-                    Condition::all()
-                        .add(record_ids::Column::TenantId.eq(tenant_id))
-                        .add(
-                            record_ids::Column::RecordKey
-                                .is_in(batch.into_iter().map(|row| row.record_key)),
-                        ),
-                )
-                .exec(&conn)
-                .await
-                .map_err(map_scope_error)?
-                .rows_affected;
-            if u64::try_from(found).unwrap_or(u64::MAX) < EXPIRE_BATCH {
-                break;
-            }
-        }
+        let record_ids = remove_record_ids(
+            &conn,
+            scope,
+            tenant_id,
+            Condition::all().add(record_ids::Column::ReceivedAt.lt(before)),
+        )
+        .await?;
         Ok(ExpiredRows {
             review_requests,
             record_ids,
@@ -482,6 +502,74 @@ impl DeletionStore for DeletionTables {
         }
         tenants.extend(known);
         Ok(tenants)
+    }
+}
+
+#[async_trait]
+impl TenantTables for DeletionTables {
+    async fn remove_tenant(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<TenantRows, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-rows
+        // Each table on its own: a run that stops between them leaves rows
+        // the next run removes, and no row of the tenant matters once the
+        // platform deleted it.
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let subject_settings = SubjectSettingsEntity::delete_many()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(settings::Column::TenantId.eq(tenant_id)))
+            .exec(&conn)
+            .await
+            .map_err(map_scope_error)?
+            .rows_affected;
+        // Open requests too: the tenant's profiles go with its graph, so no
+        // fact is left for a request to close on.
+        let review_requests = ReviewRequestEntity::delete_many()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(review_requests::Column::TenantId.eq(tenant_id)))
+            .exec(&conn)
+            .await
+            .map_err(map_scope_error)?
+            .rows_affected;
+        let record_ids = remove_record_ids(&conn, scope, tenant_id, Condition::all()).await?;
+        Ok(TenantRows {
+            subject_settings,
+            review_requests,
+            record_ids,
+        })
+        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-rows
+    }
+
+    async fn forget_tenant(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<bool, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        let forgotten = TenantEntity::delete_many()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(tenants::Column::TenantId.eq(tenant_id)))
+            .exec(&conn)
+            .await
+            .map_err(map_scope_error)?
+            .rows_affected;
+        // Only this instance's cache: another instance that noted the tenant
+        // does not note it again. Nothing needs it to: a record that lands
+        // later leaves a row the job finds the tenant by, and graph storage
+        // refuses every profile write of an offboarded tenant. Forgetting it
+        // here keeps this instance's cache true to the table.
+        self.noted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&tenant_id);
+        Ok(forgotten > 0)
+        // @cpt-end:cpt-cf-construct-algo-retention-tenant-exit:p2:inst-exit-forget
     }
 }
 

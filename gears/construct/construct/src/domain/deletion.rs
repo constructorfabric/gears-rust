@@ -216,6 +216,17 @@ pub enum DeletionEvent {
         review_requests: u64,
         record_ids: u64,
     },
+    /// Tenant exit removed this many rows of a deleted tenant's from
+    /// Construct's tables.
+    TenantRowsRemoved {
+        tenant_id: Uuid,
+        subject_settings: u64,
+        review_requests: u64,
+        record_ids: u64,
+    },
+    /// A deleted tenant is gone from Construct's tables and from graph
+    /// storage, and Construct no longer keeps it among its tenants.
+    TenantExited { tenant_id: Uuid },
 }
 
 /// Where Deletion's events go: the structured log until the Audit gear

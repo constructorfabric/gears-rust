@@ -31,3 +31,4 @@ pub mod subject_control_events;
 pub mod tenant_defaults;
 #[cfg(test)]
 mod tenant_defaults_test;
+pub mod tenant_statuses;

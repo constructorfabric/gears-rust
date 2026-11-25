@@ -100,6 +100,7 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
     let worker = pipeline.worker.expect("processing is wired");
@@ -214,6 +215,7 @@ async fn manage_facts_gets_the_manage_budget() {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
 
@@ -257,6 +259,7 @@ async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
     let worker = pipeline.worker.expect("processing is wired");
@@ -330,6 +333,7 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     let intake = IntakeFixture {
@@ -369,6 +373,7 @@ async fn without_a_processing_identity_the_profile_read_is_not_configured() {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     let tenant = Uuid::new_v4();
@@ -440,6 +445,7 @@ async fn the_configured_category_check_reaches_the_profile_read() {
             Arc::new(crate::test_support::MemoryReviews::default()),
             crate::test_support::deletion_tables(&db),
             PolicyEnforcer::new(Arc::clone(&asked) as Arc<dyn AuthZResolverApi>),
+            Arc::new(crate::test_support::NoTenantResolver),
         )
         .unwrap();
 
@@ -470,6 +476,7 @@ async fn without_a_processing_identity_even_an_empty_profile_is_not_configured()
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
 
@@ -507,6 +514,7 @@ async fn without_the_opt_in_to_run_unchecked_no_worker_runs_and_it_warns() {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
 
@@ -543,6 +551,7 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .unwrap();
     assert!(pipeline.worker.is_none(), "no model, no processing");
@@ -642,6 +651,7 @@ async fn a_correction_needs_the_opt_in_to_store_values_unchecked() {
                 reviews,
                 crate::test_support::deletion_tables(&db),
                 PolicyEnforcer::new(Arc::new(AllowResolver)),
+                Arc::new(crate::test_support::NoTenantResolver),
             )
             .unwrap();
             pipeline
@@ -699,6 +709,7 @@ async fn an_administrators_add_needs_the_opt_in_to_store_values_unchecked() {
                 Arc::new(crate::test_support::MemoryReviews::default()),
                 crate::test_support::deletion_tables(&db),
                 PolicyEnforcer::new(Arc::new(AllowResolver)),
+                Arc::new(crate::test_support::NoTenantResolver),
             )
             .unwrap();
             pipeline
@@ -760,6 +771,7 @@ async fn an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_
         Arc::new(crate::test_support::MemoryReviews::default()),
         crate::test_support::deletion_tables(&db),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
     let worker = pipeline.worker.expect("processing is wired");
@@ -897,4 +909,91 @@ async fn an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_
     assert_eq!(skills.facts.len(), 1);
     cancel.cancel();
     running.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_tenant_the_platform_deleted_leaves_construct_and_graph_storage_through_the_assembled_job()
+ {
+    use crate::domain::deletion::DeletionStore;
+    use crate::domain::subject_settings::SubjectKey;
+    use crate::domain::tenant_exit::TenantStatus;
+
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let (graph, graph_store) = crate::test_support::fake_graph_storage_where_every_tenant_is(true);
+    let statuses = Arc::new(crate::test_support::ScriptedStatuses::default());
+    let tables = crate::test_support::deletion_tables(&db);
+    let pipeline = assemble(
+        &cfg,
+        None,
+        graph,
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        Arc::clone(&tables),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::clone(&statuses) as _,
+    )
+    .expect("the pipeline assembles");
+    let (leaving, staying) = (
+        SubjectKey {
+            tenant_id: Uuid::new_v4(),
+            subject_id: Uuid::new_v4(),
+        },
+        SubjectKey {
+            tenant_id: Uuid::new_v4(),
+            subject_id: Uuid::new_v4(),
+        },
+    );
+    statuses.set(leaving.tenant_id, TenantStatus::Deleted);
+    for key in [leaving, staying] {
+        tables
+            .mark(
+                &toolkit_security::AccessScope::for_tenant(key.tenant_id),
+                key,
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap();
+    }
+    let marked = |key: SubjectKey| {
+        let tables = Arc::clone(&tables);
+        async move {
+            tables
+                .marked(
+                    &toolkit_security::AccessScope::for_tenant(key.tenant_id),
+                    key,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    // Graph storage fences the tenant and starts removing its graph; the
+    // tenant's rows here go, and it stays kept until the graph is gone.
+    pipeline.deletion_job.run_once().await;
+    assert_eq!(
+        marked(leaving).await,
+        None,
+        "the leaving tenant's rows are gone"
+    );
+    assert!(
+        marked(staying).await.is_some(),
+        "another tenant keeps its rows"
+    );
+    assert!(tables.tenants().await.unwrap().contains(&leaving.tenant_id));
+
+    crate::test_support::run_graph_offboarding(&graph_store).await;
+    pipeline.deletion_job.run_once().await;
+    let kept = tables.tenants().await.unwrap();
+    assert!(
+        !kept.contains(&leaving.tenant_id),
+        "the tenant is no longer kept"
+    );
+    assert!(kept.contains(&staying.tenant_id));
 }
