@@ -4719,7 +4719,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-system-sdk-directory"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4734,7 +4734,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-system-sdks"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "cf-gears-system-sdk-directory",
 ]
