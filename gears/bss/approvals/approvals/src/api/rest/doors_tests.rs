@@ -1432,3 +1432,31 @@ async fn the_nil_actor_reads_system_and_is_never_asked() {
         "{asked:?}"
     );
 }
+
+#[tokio::test]
+async fn a_restored_source_resumes_after_its_last_visible_unit() {
+    let pricing = Arc::new(Fake::serving(vec![test_support::unit("pricing", 3, 3)]));
+    let products = Arc::new(Fake::serving(vec![
+        test_support::unit("products", 2, 2),
+        test_support::unit("products", 1, 1),
+    ]));
+    let app = inbox(
+        &["pricing", "products"],
+        &[("pricing", pricing.clone()), ("products", products)],
+    );
+    let mut uri = "/bss-approvals/v1/approval-units?limit=1".to_owned();
+    for (mode, expected) in [(Mode::Serve, 3), (Mode::Forbidden, 2), (Mode::Serve, 1)] {
+        *pricing.mode.lock().unwrap() = mode;
+        let (status, _, body) = bytes(call(&app, "GET", &uri, b"", true).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            page["items"][0]["id"],
+            Uuid::from_u128(expected).to_string()
+        );
+        if expected > 1 {
+            let cursor = page["next_cursor"].as_str().unwrap();
+            uri = format!("/bss-approvals/v1/approval-units?limit=1&cursor={cursor}");
+        }
+    }
+}
