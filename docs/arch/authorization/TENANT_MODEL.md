@@ -86,7 +86,7 @@ See [ADR 0004](./ADR/0004-single-root-tenant-model-topology.md) for the rational
 |----------|------|-------------|
 | `id` | UUID | Unique tenant identifier |
 | `parent_id` | UUID? | Parent tenant. `NULL` for exactly one tenant: the root. |
-| `status` | enum | `active`, `suspended`, `deleted` |
+| `status` | SMALLINT | 0 = provisioning (internal, pre-activation), 1 = active, 2 = suspended, 3 = deleted |
 | `self_managed` | bool | If true, creates a barrier — parent cannot access this subtree |
 
 **Status semantics:**
@@ -239,14 +239,14 @@ T1
 
 | ancestor_id | descendant_id | barrier | descendant_status (label) |
 |-------------|---------------|---------|-------------------|
-| T1 | T1 | 0 | active |
-| T1 | T2 | 1 | active |
-| T1 | T3 | 1 | active |
-| T1 | T4 | 0 | active |
-| T2 | T2 | 0 | active |
-| T2 | T3 | 0 | active |
-| T3 | T3 | 0 | active |
-| T4 | T4 | 0 | active |
+| T1 | T1 | 0 | 1 (active) |
+| T1 | T2 | 1 | 1 (active) |
+| T1 | T3 | 1 | 1 (active) |
+| T1 | T4 | 0 | 1 (active) |
+| T2 | T2 | 0 | 1 (active) |
+| T2 | T3 | 0 | 1 (active) |
+| T3 | T3 | 0 | 1 (active) |
+| T4 | T4 | 0 | 1 (active) |
 
 **Key observations:**
 - `T1 → T2`: barrier = 1 because the descendant endpoint `T2` is self-managed and the descendant endpoint is included in `(ancestor, descendant]`

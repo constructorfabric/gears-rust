@@ -192,9 +192,17 @@ Two independent gears with separate plugin interfaces.
 - Azure: Separate Authentication (Azure AD) and Authorization (Azure RBAC, resource policies)
 - Kubernetes: Separate Authentication (various providers) and Authorization (RBAC, ABAC, Webhook)
 
-**Implementation Notes:**
+**Implementation Notes:** (where these differ from the current code, the [Implementation note](#implementation-note) below takes precedence)
 
 - SecurityContext flows from AuthN Resolver to PEP to AuthZ Resolver
-- bearer_token in SecurityContext enables AuthZ plugin to call vendor APIs requiring authentication
+- bearer_token in SecurityContext enables AuthZ plugin to call vendor APIs requiring authentication (in-process only — see the note below)
 - In-process deployment: both resolvers are function calls (no network latency)
-- Out-of-process deployment: AuthN on edge (low latency), AuthZ can be centralized (shared across instances)
+- Out-of-process deployment: AuthZ can be centralized (shared across instances) behind the internal `POST /authz-resolver/v1/evaluate` route. "AuthN on edge" is not implemented: the AuthN Resolver has no REST projection and runs in-process only (see the note below)
+
+## Implementation note
+
+The decision to separate AuthN Resolver and AuthZ Resolver stands; the current code differs from parts of this record:
+
+- **No unified plugin support.** There is no `UnifiedAuthPlugin` trait, no unified plugin wrapper and no shared cache between AuthN and AuthZ plugins. Each resolver selects its own plugin from a single `vendor` string in its gear config (`authz-resolver/src/config.rs`, `authn-resolver/src/config.rs`); there is no combined `auth:` configuration section.
+- **Plugins are in-process only.** Resolver plugins register as scoped ClientHub clients of their gear. Only PEP → AuthZ Resolver can cross a process boundary, over the internal `POST /authz-resolver/v1/evaluate` route; the AuthN Resolver has no REST projection.
+- **`bearer_token`.** `EvaluationRequestContext.bearer_token` is `#[serde(skip)]`, so it never crosses REST and reaches AuthZ plugins only in-process. Neither shipped AuthZ plugin reads it.

@@ -24,7 +24,7 @@ for its startup guarantees and restrictions.
 | **API Gateway** | Public ingress: routing, auth middleware, rate limiting, OpenAPI publication, health endpoints | Application gear group | ✓ |
 | **Service Discovery** | Service discovery, module loading, runtime coordination | System gear group | ✓ |
 | **AuthN Resolver** | Token validation (JWT/OIDC); produces `SecurityContext`. Plugins: static, OIDC | Application gear group | ✓ |
-| **AuthZ Resolver (PDP)** | Authorization decisions + row-level constraints → `AccessScope`. Plugins: static, tenant-rules | Application gear group | ✓ |
+| **AuthZ Resolver (PDP)** | Authorization decisions + row-level constraints (the gear's `PolicyEnforcer` compiles them into an `AccessScope`). Plugins: static, tr-authz (tenant hierarchy via Tenant Resolver) | Application gear group | ✓ |
 | **Tenant Resolver** | Tenant tree traversal, ancestor/descendant queries, barrier semantics. Plugins: static, single-tenant, resource-group | Application gear group | ✓ |
 | **Outbound API Gateway (OAGW)** | Centralized egress: credential resolution, auth plugins, rate limiting | Application gear group | ✓ |
 | **Types Registry** | [GTS](https://github.com/GlobalTypeSystem/gts-rust) schema storage, lookup, instance validation | System gear group | ✓ |

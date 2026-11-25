@@ -192,8 +192,8 @@ pub struct EvaluationRequestContext {
     #[serde(default)]
     pub supported_properties: Vec<String>,
     /// Original bearer token for PDP forwarding. Wrapped in `SecretString` to prevent
-    /// accidental logging. Skipped during serialization - the PDP receives the token
-    /// through a separate channel if needed.
+    /// accidental logging. Skipped during serialization, so it never crosses REST:
+    /// the `PolicyEnforcer` fills it, and only an in-process PDP or plugin sees it.
     #[serde(skip)]
     pub bearer_token: Option<SecretString>,
 }

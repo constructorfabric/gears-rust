@@ -43,26 +43,26 @@ use authz_resolver_sdk::AuthZResolverApi;
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
 use toolkit_security::pep_properties;
 
-const USER: ResourceType = ResourceType {
-    name: "gts.cf.core.users.user.v1~",
-    supported_properties: &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
-};
+const USER: ResourceType = ResourceType::from_static(
+    "gts.cf.core.users.user.v1~",
+    &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
+);
 
 let authz = hub.get::<dyn AuthZResolverApi>()?;
 let enforcer = PolicyEnforcer::new(authz.clone());
 
-// Get access scope for a CRUD operation
-let scope = enforcer.access_scope(&ctx, &USER, "list", None).await?;
+// Get access scope for a single-resource operation (`access_scope` refuses an empty scope)
+let scope = enforcer.access_scope(&ctx, &USER, "get", Some(user_id)).await?;
 // Use scope with SecureORM for row-level filtering
 ```
 
 ## Configuration
 
-The gear is configured via the server's YAML config. Plugin selection is automatic based on GTS registration. Use the `static-authz` feature flag to compile in the development plugin.
+The gear is configured via the server's YAML config. Plugin selection is automatic based on GTS registration. The development plugin is compiled into the example server by the `static-authz` feature of `apps/cf-gears-example-server` (this crate has no such feature).
 
 ## Writing a Plugin
 
-Implement the `AuthZResolverPluginClient` trait from `cf-gears-authz-resolver-sdk` and register it with a GTS instance ID derived from the `AuthZResolverPluginSpecV1` schema.
+Implement the `AuthZResolverPluginClient` trait from `cf-gears-authz-resolver-sdk`, publish a `PluginV1<AuthZResolverPluginSpecV1>` instance into the platform types-registry catalogue, and bind the client scoped to that instance's GTS ID. The resolver selects only from the platform catalogue; instances registered through the legacy `TypesRegistryClient` are never consulted.
 
 ## Testing
 

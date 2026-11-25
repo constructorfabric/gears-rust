@@ -15,6 +15,8 @@ pub trait AuthZResolverPluginClient: Send + Sync {
     ///
     /// # Errors
     ///
+    /// - `NoPluginAvailable` if no plugin can handle the request
+    /// - `ServiceUnavailable` if the plugin is not available yet
     /// - `Internal` for unexpected errors
     async fn evaluate(
         &self,

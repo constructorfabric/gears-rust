@@ -44,8 +44,8 @@ cpt:
   - [Contract: GTS Registry](#contract-gts-registry)
   - [Entity: PluginBinding](#entity-pluginbinding)
   - [Entity: SecurityContext](#entity-securitycontext)
-  - [Entity: PdpDecision](#entity-pdpdecision)
-  - [Entity: PdpConstraint](#entity-pdpconstraint)
+  - [Entity: EvaluationResponse](#entity-evaluationresponse)
+  - [Entity: AccessScope](#entity-accessscope)
   - [Component: Plugin Host](#component-plugin-host)
   - [Observability: Instrument Bootstrap and Naming Convention](#observability-instrument-bootstrap-and-naming-convention)
   - [Observability: Plugin-Host Instruments](#observability-plugin-host-instruments)
@@ -144,7 +144,7 @@ This feature exists so safety-critical behavior — fail-closed authentication, 
 
 **Success Scenarios**:
 
-- With the inbound `SecurityContext` (resolved upstream by the ToolKit gateway on REST or supplied by the caller on the in-process SDK) and the operation's attribution, the domain component handling the call invokes the applicable per-operation PDP authorization helper in `domain/authz.rs` (for example `authorize` for catalog ops or `authorize_usage_record` for the ingestion surface), which calls `cpt-cf-usage-collector-contract-authz-resolver` with the attributes that apply to the operation's resource type (per ADR-0012 / PRD §5.8: the catalog helper uses `require_constraints(false)`, so an unconstrained permit, `allow_all`, is a legitimate happy-path outcome; the ingestion helper uses `require_constraints(true)` and gates the returned scope against the record's attribution tuple — the owning tenant must be pinned by a returned constraint, so an unconstrained `allow_all` permit is denied fail-closed). The helper returns `Ok(())` to the caller on permit and never caches the decision; downstream constraint-intersection lands in Usage Query when its first caller arrives.
+- With the inbound `SecurityContext` (resolved upstream by the ToolKit gateway on REST or supplied by the caller on the in-process SDK) and the operation's attribution, the domain component handling the call invokes the applicable per-operation PDP authorization helper in `domain/authz.rs` (for example `authorize` for catalog ops or `authorize_usage_record` for the ingestion surface), which calls `cpt-cf-usage-collector-contract-authz-resolver` with the attributes that apply to the operation's resource type (per ADR-0012 / PRD §5.8: the catalog helper uses `require_constraints(false)`, so an unconstrained permit, `allow_all`, is a legitimate happy-path outcome; the ingestion helper uses `require_constraints(true)` and gates the returned scope against the record's attribution tuple — the owning tenant must be pinned by a returned constraint, so an unconstrained `allow_all` permit is denied fail-closed). The helper returns `Ok(())` to the caller on permit and never caches the decision; downstream constraint-intersection is owned by Usage Query (`compose_query_with_scope`).
 
 **Error Scenarios**:
 
@@ -159,8 +159,8 @@ This feature exists so safety-critical behavior — fail-closed authentication, 
 3. [x] - `p1` - **TRY** invoke `cpt-cf-usage-collector-contract-authz-resolver` via the shared PDP helper (`enforcer.access_scope_with(...)`) - `inst-pdp-resolver-call`
 4. [x] - `p1` - **CATCH** transport-or-evaluation failure (`EnforcerError::EvaluationFailed`) - `inst-pdp-resolver-catch`
    1. [x] - `p1` - **RETURN** `AuthorizationUnavailable` (no cached decision, no permissive fallback) - `inst-pdp-fail-closed`
-5. [x] - `p1` - **IF** the returned `PdpDecision` is deny **RETURN** `AuthorizationDenied` so the operation is rejected at the boundary - `inst-pdp-deny`
-6. [x] - `p1` - **RETURN** `Ok(())` to the bound domain component without caching the result; the helper does not propagate constraint sets (intersection with user-supplied read filters lands in the read-path features when their first caller arrives) - `inst-pdp-return`
+5. [x] - `p1` - **IF** the returned `EvaluationResponse` decision is deny **RETURN** `AuthorizationDenied` so the operation is rejected at the boundary - `inst-pdp-deny`
+6. [x] - `p1` - **RETURN** `Ok(())` to the bound domain component without caching the result; the helper does not propagate constraint sets (intersection with user-supplied read filters is done on the Usage Query read path: `authorize_list_usage_records` returns the scope and `compose_query_with_scope` AND-merges it into the caller filter) - `inst-pdp-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -191,7 +191,7 @@ This feature exists so safety-critical behavior — fail-closed authentication, 
 
 **Input**: a reference to the `SecurityContext` (resolved upstream by the ToolKit gateway on REST or supplied by the in-process SDK caller), the operation descriptor, and the operation's attribution (catalog ops carry no resource attributes; usage-record submission adds `OWNER_TENANT_ID`, optional `OWNER_ID`, `resource_type`, `resource_id`).
 
-**Output**: `Ok(())` surfaced to the bound domain component on permit, or `AuthorizationDenied` / `AuthorizationUnavailable` on deny / transport failure. The helper does not propagate a constraint set — constraint intersection with user-supplied read filters lands in Usage Query when its first caller arrives. As a side effect, the helper is the single realization point for the four PDP-helper instruments inventoried in [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) (`uc_pdp_duration_seconds`, `uc_authz_decisions_total`, `uc_pdp_failures_total`, `uc_pdp_ready`) so every capability feature inherits them without respecifying; the `operation` label derives from the caller-supplied operation descriptor (nine-value gateway set: `ingest`, `query_raw`, `query_aggregated`, `get_record`, `deactivate`, `usage_type_create`, `usage_type_get`, `usage_type_list`, `usage_type_delete`).
+**Output**: `Ok(())` surfaced to the bound domain component on permit, or `AuthorizationDenied` / `AuthorizationUnavailable` on deny / transport failure. The helper does not propagate a constraint set — constraint intersection with user-supplied read filters is done on the Usage Query read path (`authorize_list_usage_records` → `scope_to_odata_filter` → `compose_query_with_scope`). As a side effect, the helper is the single realization point for the four PDP-helper instruments inventoried in [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) (`uc_pdp_duration_seconds`, `uc_authz_decisions_total`, `uc_pdp_failures_total`, `uc_pdp_ready`) so every capability feature inherits them without respecifying; the `operation` label derives from the caller-supplied operation descriptor (nine-value gateway set: `ingest`, `query_raw`, `query_aggregated`, `get_record`, `deactivate`, `usage_type_create`, `usage_type_get`, `usage_type_list`, `usage_type_delete`).
 
 **Steps**:
 
@@ -202,7 +202,7 @@ This feature exists so safety-critical behavior — fail-closed authentication, 
    1. [x] - `p1` - Observe the elapsed round-trip on `uc_pdp_duration_seconds` (label: `operation`) — failure completions are still completions — and increment `uc_pdp_failures_total` (labels: `operation`, `cause`). **v1 `cause` projection:** the caught `EnforcerError::EvaluationFailed` wraps `AuthZResolverError` (`NoPluginAvailable` / `ServiceUnavailable` / `Internal`), which carries no timeout discriminator, and no host-side PDP-dispatch deadline exists, so every such failure maps to `cause="unreachable"`; `cause="timeout"` is reserved per [§3.11.5](../DESIGN.md#3115-operational-metric-inventory-ops-design-002) and is not emitted until a host-side deadline is introduced (see the limitations note on the PDP-helper DoD). PDP denials are decisions, not failures, and never land on this counter - `inst-algo-pdp-failure-metrics`
    2. [x] - `p1` - **RETURN** `AuthorizationUnavailable`; never serve a cached or permissive decision - `inst-algo-pdp-fail-closed`
 5. [x] - `p1` - Observe the elapsed round-trip on `uc_pdp_duration_seconds` (label: `operation`) and increment `uc_authz_decisions_total` (labels: `operation`, `decision` ∈ `permit` | `deny`) for the **effective** decision: `permit` only once the caller-supplied post-permit gate admits the returned scope (an always-admitting gate on the catalog path; the per-record attribution gate / the LIST scope→OData projection on the `require_constraints(true)` paths), and `deny` when a hard PDP deny OR a gate rejection of a permit-with-constraints (e.g. cross-tenant attribution outside the granted scope) fails the request closed — so the reconnaissance signal is not mislabeled `permit`. Exactly one of this counter or `uc_pdp_failures_total` fires per authorization; failures and timeouts are not decisions and land on `uc_pdp_failures_total` via `inst-algo-pdp-failure-metrics` instead - `inst-algo-pdp-decision-metrics`
-6. [x] - `p1` - **IF** the returned `PdpDecision` is deny (`EnforcerError::AccessDenied` or fail-closed `EnforcerError::CompileFailed`) **RETURN** `AuthorizationDenied` - `inst-algo-pdp-deny`
+6. [x] - `p1` - **IF** the returned `EvaluationResponse` decision is deny (`EnforcerError::AccessDenied` or fail-closed `EnforcerError::CompileFailed`) **RETURN** `AuthorizationDenied` - `inst-algo-pdp-deny`
 7. [x] - `p1` - **RETURN** `Ok(())` to the bound domain component without caching the result - `inst-algo-pdp-return`
 
 ### Plugin SPI Dispatch Instrumentation
@@ -342,7 +342,7 @@ The system **MUST** fail closed whenever the inbound `SecurityContext` is missin
 **Touches**:
 
 - API: `cpt-cf-usage-collector-interface-rest-api`
-- Entities: `SecurityContext`, `PdpDecision`, `PluginBinding`
+- Entities: `SecurityContext`, `EvaluationResponse`, `PluginBinding`
 
 ### Principle: Pluggable Storage
 
@@ -384,7 +384,7 @@ The system **MUST** evolve every published contract surface — `cpt-cf-usage-co
 
 - [x] `p2` - **ID**: `cpt-cf-usage-collector-dod-foundation-principle-pdp-centric-authorization`
 
-The system **MUST** dispatch every read and write operation through `cpt-cf-usage-collector-contract-authz-resolver` for a permit/deny `PdpDecision` plus the `PdpConstraint` set, never serving a cached decision and never deriving authorization locally.
+The system **MUST** dispatch every read and write operation through `cpt-cf-usage-collector-contract-authz-resolver` for a permit/deny `EvaluationResponse` plus the constraint set it compiles into an `AccessScope`, never serving a cached decision and never deriving authorization locally.
 
 **Implements**:
 
@@ -396,7 +396,7 @@ The system **MUST** dispatch every read and write operation through `cpt-cf-usag
 **Touches**:
 
 - API: `cpt-cf-usage-collector-interface-rest-api`
-- Entities: `PdpDecision`, `PdpConstraint`, `SecurityContext`
+- Entities: `EvaluationResponse`, `AccessScope`, `SecurityContext`
 
 ### Principle: Plugin Resolution via ClientHub
 
@@ -542,7 +542,7 @@ The system **MUST** route every authorization decision through `cpt-cf-usage-col
 **Touches**:
 
 - API: `cpt-cf-usage-collector-interface-rest-api`
-- Entities: `PdpDecision`, `PdpConstraint`
+- Entities: `EvaluationResponse`, `AccessScope`
 
 ### ADR: Pluggable Storage
 
@@ -584,7 +584,7 @@ The system **MUST** publish `cpt-cf-usage-collector-contract-storage-plugin` as 
 
 - [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-foundation-contract-authz-resolver`
 
-The system **MUST** dispatch every operation through `cpt-cf-usage-collector-contract-authz-resolver`, propagate the audit-correlation context on the call (ambient W3C TraceContext via ToolKit's `init_tracing`), and emit a deterministic platform-authorization error envelope on resolver transport failure (`AuthorizationUnavailable`) or PDP deny (`AuthorizationDenied`). The `domain/authz.rs` helpers split by resource type per ADR-0012 / PRD §5.8: the catalog helper (`authorize`) uses `require_constraints(false)` (catalog is platform-global), so an unconstrained permit (`allow_all`) is a legitimate happy-path outcome; the usage-record and list helpers (`authorize_usage_record` / `authorize_list_usage_records`) use `require_constraints(true)` and gate the returned scope against the operation's attribution, so an unconstrained `allow_all` permit is denied fail-closed. Constraint-set intersection with user-supplied read filters lands in Usage Query when its first caller arrives.
+The system **MUST** dispatch every operation through `cpt-cf-usage-collector-contract-authz-resolver`, propagate the audit-correlation context on the call (ambient W3C TraceContext via ToolKit's `init_tracing`), and emit a deterministic platform-authorization error envelope on resolver transport failure (`AuthorizationUnavailable`) or PDP deny (`AuthorizationDenied`). The `domain/authz.rs` helpers split by resource type per ADR-0012 / PRD §5.8: the catalog helper (`authorize`) uses `require_constraints(false)` (catalog is platform-global), so an unconstrained permit (`allow_all`) is a legitimate happy-path outcome; the usage-record and list helpers (`authorize_usage_record` / `authorize_list_usage_records`) use `require_constraints(true)` and gate the returned scope against the operation's attribution, so an unconstrained `allow_all` permit is denied fail-closed. Constraint-set intersection with user-supplied read filters is owned by Usage Query (`compose_query_with_scope`).
 
 **Implements**:
 
@@ -596,7 +596,7 @@ The system **MUST** dispatch every operation through `cpt-cf-usage-collector-con
 **Touches**:
 
 - API: `cpt-cf-usage-collector-interface-rest-api`
-- Entities: `PdpDecision`, `PdpConstraint`
+- Entities: `EvaluationResponse`, `AccessScope`
 
 ### Contract: GTS Registry
 
@@ -653,41 +653,41 @@ The system **MUST** carry the inbound `SecurityContext` (resolved by the ToolKit
 - API: `cpt-cf-usage-collector-interface-rest-api`
 - Entities: `SecurityContext`
 
-### Entity: PdpDecision
+### Entity: EvaluationResponse
 
 - [x] `p1` - **ID**: `cpt-cf-usage-collector-dod-foundation-entity-pdp-decision`
 
-The system **MUST** lift the `PdpDecision` returned by `cpt-cf-usage-collector-contract-authz-resolver` into the appropriate outcome on every call: a permit returns `Ok(())` to the bound domain component, a deny (or fail-closed `CompileFailed`) returns `AuthorizationDenied`, and a transport-or-evaluation failure returns `AuthorizationUnavailable`. The decision is never cached and never derived locally; the explicit `PdpDecision` value type is not materialized in the foundation surface because the shared `domain/authz.rs` helpers collapse the outcome into `Result<(), DomainError>` at the call site.
+The system **MUST** lift the `EvaluationResponse` returned by `cpt-cf-usage-collector-contract-authz-resolver` into the appropriate outcome on every call: a permit returns `Ok(())` to the bound domain component, a deny (or fail-closed `CompileFailed`) returns `AuthorizationDenied`, and a transport-or-evaluation failure returns `AuthorizationUnavailable`. The decision is never cached and never derived locally; the `EvaluationResponse` is not surfaced past the `PolicyEnforcer` because the shared `domain/authz.rs` helpers collapse the outcome into `Result<(), DomainError>` at the call site.
 
 **Implements**:
 
 - `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
 - `cpt-cf-usage-collector-algo-foundation-pdp-authorize`
 
-**Constraints**: `PdpDecision`
+**Constraints**: `EvaluationResponse`
 
 **Touches**:
 
 - API: `cpt-cf-usage-collector-interface-rest-api`
-- Entities: `PdpDecision`
+- Entities: `EvaluationResponse`
 
-### Entity: PdpConstraint
+### Entity: AccessScope
 
 - [ ] `p1` - **ID**: `cpt-cf-usage-collector-dod-foundation-entity-pdp-constraint`
 
-The foundation **MUST NOT** materialize the `PdpConstraint` set as a propagated value type in v1. Per ADR-0012 / PRD §5.8 the catalog helper (`authorize`) calls the resolver with `require_constraints(false)` (catalog is platform-global), so an unconstrained permit (`allow_all`) is a legitimate happy-path outcome; the usage-record / deactivation helper calls with `require_constraints(true)` and consumes the returned scope in place through the `scope_admits_attribution_tuple` gate (a returned constraint must pin the owning tenant; an `allow_all` permit is denied fail-closed). In neither case is a constraint payload propagated to downstream code as a value type. Constraint-set materialization, intersection with user-supplied read filters, and widen-rejection all land in Usage Query when its first caller arrives — that feature owns the surfacing and propagation seam. This DoD remains unchecked until then.
+The foundation **MUST NOT** propagate the returned `AccessScope` as a value type in v1. Per ADR-0012 / PRD §5.8 the catalog helper (`authorize`) calls the resolver with `require_constraints(false)` (catalog is platform-global), so an unconstrained permit (`allow_all`) is a legitimate happy-path outcome; the usage-record / deactivation helper calls with `require_constraints(true)` and consumes the returned scope in place through the `scope_admits_attribution_tuple` gate (a returned constraint must pin the owning tenant; an `allow_all` permit is denied fail-closed). In neither case is a constraint payload propagated to downstream code as a value type. Constraint-set materialization, intersection with user-supplied read filters, and widen-rejection are owned by Usage Query: its `authorize_list_usage_records` helper returns the `AccessScope` to the query path, `scope_to_odata_filter` projects it to an OData predicate, and `compose_query_with_scope` AND-merges that predicate into the caller's `$filter` (intersection-only, so user input cannot widen it).
 
 **Implements**:
 
 - `cpt-cf-usage-collector-flow-foundation-pdp-authorize`
 - `cpt-cf-usage-collector-algo-foundation-pdp-authorize`
 
-**Constraints**: `PdpConstraint`
+**Constraints**: `AccessScope`
 
 **Touches**:
 
 - API: `cpt-cf-usage-collector-interface-rest-api`
-- Entities: `PdpConstraint`
+- Entities: `AccessScope`
 
 ### Component: Plugin Host
 
@@ -775,7 +775,7 @@ The instrumentation is traced solely through `cpt-cf-usage-collector-algo-founda
 **Touches**:
 
 - Telemetry (specified; **not yet wired** in gear source): `uc_pdp_duration_seconds` histogram, `uc_authz_decisions_total` counter, `uc_pdp_failures_total` counter, `uc_pdp_ready` gauge
-- Entities: `PdpDecision`, `SecurityContext`
+- Entities: `EvaluationResponse`, `SecurityContext`
 
 ### Observability: Label-Cardinality Policy
 
@@ -813,7 +813,7 @@ The system **MUST** provide the **foundation-owned** backing series for the aler
 **Touches**:
 
 - Telemetry (specified; **not yet wired** in gear source): the foundation-owned alert-backing series per [§3.11.6](../DESIGN.md#3116-alerting-and-error-budget-architecture-ops-design-005)
-- Entities: `PluginBinding`, `PdpDecision`
+- Entities: `PluginBinding`, `EvaluationResponse`
 
 ### §2.1-item → DoD-ID Coverage Matrix
 
@@ -844,8 +844,8 @@ Coverage of every DECOMPOSITION §2.1 catalog item:
 | `cpt-cf-usage-collector-contract-gts-registry`                          | Contract          | `cpt-cf-usage-collector-dod-foundation-contract-gts-registry`                          |
 | `PluginBinding`                          | Domain entity     | `cpt-cf-usage-collector-dod-foundation-entity-plugin-binding`                          |
 | `SecurityContext`                        | Domain entity     | `cpt-cf-usage-collector-dod-foundation-entity-security-context`                        |
-| `PdpDecision`                            | Domain entity     | `cpt-cf-usage-collector-dod-foundation-entity-pdp-decision`                            |
-| `PdpConstraint`                          | Domain entity     | `cpt-cf-usage-collector-dod-foundation-entity-pdp-constraint`                          |
+| `EvaluationResponse`                     | Domain entity     | `cpt-cf-usage-collector-dod-foundation-entity-pdp-decision`                            |
+| `AccessScope`                            | Domain entity     | `cpt-cf-usage-collector-dod-foundation-entity-pdp-constraint`                          |
 | `cpt-cf-usage-collector-component-plugin-host`                          | Design component  | `cpt-cf-usage-collector-dod-foundation-component-plugin-host`                          |
 
 Coverage totals: FR=6, NFR=13, Principle=7, Design constraint=4, ADR-derived=3, Contract=3, Domain entity=4, Design component=1 — total 41 DoD entries, zero duplicates. `cpt-cf-usage-collector-fr-tenant-isolation` is intentionally not realized in foundation: tenant-isolation enforcement (PDP-constraint intersection with user-supplied read filters and widen-rejection) lands in the Usage Query feature alongside its first read-path caller; the foundation contract is the surfacing and propagation seam only.

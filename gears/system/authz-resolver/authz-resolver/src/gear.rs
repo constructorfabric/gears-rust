@@ -28,7 +28,7 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 /// `AuthZResolverApi` is exposed as a `#[toolkit::contract]`: `provides`
 /// auto-wires the local impl into `ClientHub`, and the `rest` capability hosts
 /// the contract's REST projection (`/authz-resolver/v1/evaluate`, an internal
-/// tenant-plane authenticated route that is not edge-exposed) so out-of-process
+/// platform-plane authenticated route that is not edge-exposed) so out-of-process
 /// PEPs can reach the PDP over HTTP via directory resolution.
 #[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(

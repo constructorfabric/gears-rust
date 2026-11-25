@@ -1,7 +1,8 @@
 # Orders Test AuthZ Plugin
 
-> **Orders test and isolated development hosts only — never production.** This plugin answers authorization from a policy written in
-> the host's config file. It exists so end-to-end suites can exercise constraint-bearing
+> **Orders test and isolated development hosts only — never production.** This plugin is designed to answer authorization from a policy
+> written in the host's config file (it is not selected by the resolver; see
+> [Selection](#selection)). It exists so end-to-end suites can exercise constraint-bearing
 > decisions without an external policy engine.
 
 Declarative policy decision point (PDP) for the AuthZ Resolver gateway.
@@ -17,8 +18,9 @@ proofs and property-less permits. This plugin reads those decisions from configu
 - anything else is denied.
 
 This fixture is owned by Orders and lives under `gears/bss/orders/test-authz-plugin`.
-It also answers permission checks from Pricing, Products and Event Broker when those gears
-participate in Orders scenarios. It is linked into the example server only through the
+It is designed to also answer permission checks from Pricing, Products and Event Broker when
+those gears participate in Orders scenarios (see [Selection](#selection) for why it is
+not selected). It is linked into the example server only through the
 explicit `bss-orders-test-authz` feature, which enables Orders and is disabled by default.
 The normal Orders gear uses this crate only as a dev-dependency.
 
@@ -28,11 +30,14 @@ in a production composition. It is not a general-purpose system authorization pl
 ## Selection
 
 The plugin registers a `cf.builtin.bss_orders_test_authz_resolver.plugin.v1` instance under its
-configured `vendor`. The AuthZ resolver uses the plugin with the **lowest `priority`** among the
-vendor's registered AuthZ plugins, so on a host that also links the static plugin (priority 100)
-this one (default priority 10) answers. Wherever the feature is linked, the gear block must
-declare a policy: a block with no `rules` and no `unconditional_grants` (or no block at all) fails
-the gear init rather than registering a deny-all plugin that outranks the static one.
+configured `vendor` in `init`, through the legacy `TypesRegistryClient::register` only (no
+`gts_publication`, no seed). The AuthZ resolver picks the **lowest `priority`** plugin, but only
+among instances it lists from the platform (database) catalogue, and legacy writes made after
+seeding are not copied there. So the resolver never sees this instance: on a host that also links
+the static plugin (as the Orders e2e suite does), the static plugin (priority 100) answers, and
+without it the resolver finds no plugin and evaluation fails. Wherever the feature is linked, the
+gear block must declare a policy: a block with no `rules` and no `unconditional_grants` (or no
+block at all) fails the gear init.
 
 ## Configuration
 

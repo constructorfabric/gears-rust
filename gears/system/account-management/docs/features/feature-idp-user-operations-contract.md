@@ -367,7 +367,7 @@ available for platform resource metadata and references.
 
 - [x] `p1` - **ID**: `cpt-cf-account-management-dod-idp-user-operations-contract-authenticated-tenant-scoped-invocation`
 
-Every REST endpoint layered over the contract **MUST** require a valid `SecurityContext` provided by the platform AuthN pipeline per `nfr-authentication-context`; unauthenticated calls **MUST** return 401 without invoking the contract. Every contract invocation **MUST** carry a resolved `tenant_id` scoped to an `active` tenant per `feature-tenant-hierarchy-management`; operations against a non-existent, `provisioning`, `suspended`, or `deleted` tenant **MUST** fail before the IdP call is issued. Cross-tenant reads and writes **MUST NOT** traverse the barrier through this feature's endpoints; AuthZ policy evaluation is inherited from `PolicyEnforcer` at the REST layer.
+Every REST endpoint layered over the contract **MUST** require a valid `SecurityContext` provided by the platform AuthN pipeline per `nfr-authentication-context`; unauthenticated calls **MUST** return 401 without invoking the contract. Every contract invocation **MUST** carry a resolved `tenant_id` scoped to an `active` tenant per `feature-tenant-hierarchy-management`; operations against a non-existent, `provisioning`, `suspended`, or `deleted` tenant **MUST** fail before the IdP call is issued. Cross-tenant reads and writes **MUST NOT** traverse the barrier through this feature's endpoints; AuthZ policy evaluation is delegated to `PolicyEnforcer`, which `UserService` calls (via `domain::authz::authz_scope`) before invoking the contract.
 
 **Implements**:
 
@@ -379,7 +379,7 @@ Every REST endpoint layered over the contract **MUST** require a valid `Security
 **Touches**:
 
 - Entities: `TenantId`
-- Sibling integration: platform AuthN middleware (`SecurityContext`) and `PolicyEnforcer` at the REST layer (external to this feature's surface)
+- Sibling integration: platform AuthN middleware (`SecurityContext`) and `PolicyEnforcer`, called from `UserService` (policy evaluation is external to this feature's surface)
 - Error taxonomy: delegated to `feature-errors-observability` (catalog owner).
 
 ## 6. Acceptance Criteria
@@ -400,6 +400,6 @@ Every REST endpoint layered over the contract **MUST** require a valid `Security
 - **User-tenant reassignment via `update_user`** — *v1 non-goal* (PRD §1.4 / §13, `adr-idp-user-tenant-binding`). `update_user` mutates only profile / credential / `username` attributes; it **MUST NOT** move a user between tenants. Reassignment requires cross-platform coordination (Resource Group membership migration, AuthZ cache invalidation, session revocation) and is deferred.
 - **Token validation, session renewal, federation, credential policy, MFA policy** — *Inherited from the platform AuthN layer and the configured IdP provider* (DESIGN §4.2; PRD §6.2). AM does not validate tokens, enforce MFA, rotate credentials, or manage federation; `SecurityContext` validation is a platform-layer precondition for every endpoint.
 - **User-group orchestration, user-group membership, nested user groups** — *Owned by `cpt-cf-account-management-feature-user-groups`* (DECOMPOSITION §2.6). That feature depends on this one for authoritative user-existence checks but owns the group hierarchy, membership writes, and Resource Group delegation itself.
-- **AuthZ policy evaluation for user-level operations** — *Owned by `PolicyEnforcer` / AuthZ Resolver* (DESIGN §4.2; out of AM domain logic). This feature delegates policy evaluation to the platform AuthZ surface at the REST layer; no authorization decisions are made inside the contract or the handlers beyond tenant-scope resolution.
+- **AuthZ policy evaluation for user-level operations** — *Owned by `PolicyEnforcer` / AuthZ Resolver* (DESIGN §4.2; out of AM domain logic). This feature delegates policy evaluation to the platform AuthZ surface via `PolicyEnforcer`, called from `UserService`; no authorization decisions are made inside the contract or the handlers beyond tenant-scope resolution.
 - **Cross-cutting error taxonomy, RFC 9457 envelope, audit pipeline, metric catalog** — *Owned by `cpt-cf-account-management-feature-errors-observability`* (DECOMPOSITION §2.8). Sub-codes `idp_unavailable` and `idp_unsupported_operation` are catalogued authoritatively there; this feature emits them by name and defers envelope formatting, HTTP status mapping, audit emission, and metric sample naming to that feature.
 - **AM-side user table, user projection cache, user-tenant binding table, or membership cache** — *Forbidden by `cpt-cf-account-management-constraint-no-user-storage`.* AM persists no local user state; every user operation is a live pass-through to the IdP through the contract.

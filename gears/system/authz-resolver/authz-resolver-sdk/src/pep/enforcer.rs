@@ -117,9 +117,9 @@ impl EnforcerError {
     ///
     /// True only for [`EnforcerError::EvaluationFailed`] carrying
     /// [`CanonicalError::ServiceUnavailable`] or
-    /// [`CanonicalError::DeadlineExceeded`], including the enforcer's own
-    /// evaluation deadline. Any other evaluation failure (`Internal` among
-    /// them), a refusal and a compile failure are false.
+    /// [`CanonicalError::DeadlineExceeded`]. The enforcer's own evaluation
+    /// deadline surfaces as `ServiceUnavailable`. Any other evaluation failure
+    /// (`Internal` among them), a refusal and a compile failure are false.
     ///
     /// It describes the cause, not whether a retry is safe: that depends on
     /// the operation and its idempotency. Recommended mapping for new or
@@ -183,6 +183,8 @@ pub enum AccessDenial {
 ///
 /// ```ignore
 /// use authz_resolver_sdk::pep::{AccessRequest, PolicyEnforcer, ResourceType};
+/// use authz_resolver_sdk::{BarrierMode, TenantMode};
+/// use toolkit_security::pep_properties;
 ///
 /// // CREATE with target tenant + resource properties (constrained scope)
 /// let scope = enforcer.access_scope_with(
@@ -419,6 +421,7 @@ pub const DEFAULT_EVAL_DEADLINE: Duration = Duration::from_secs(30);
 ///
 /// ```ignore
 /// use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
+/// use toolkit_gts::gts_id;
 /// use toolkit_security::pep_properties;
 ///
 /// const USER: ResourceType = ResourceType::from_static(
@@ -734,8 +737,10 @@ impl PolicyEnforcer {
         // credential-free plane marker; the caller identity (`ctx`) is conveyed
         // to the PDP as `req.subject`, built above (`cpt-cf-adr-two-plane-auth`).
         // Bound the PDP call: `evaluate` gates every request and is a network
-        // round-trip out-of-process, so a slow/unresponsive PDP must fail fast
-        // (retryable) rather than cascade into blocked consumers.
+        // round-trip out-of-process, so a hung PDP must not block consumers
+        // indefinitely. `self.deadline` is a hang guard (see
+        // `DEFAULT_EVAL_DEADLINE`); on expiry the call fails with
+        // `ServiceUnavailable`.
         let response = match tokio::time::timeout(
             self.deadline,
             authz.evaluate(PlatformSecurityContext::outbound_marker(), eval_request),

@@ -1,14 +1,16 @@
 //! TR `AuthZ` Resolver Plugin
 //!
 //! `AuthZ` plugin that resolves tenant hierarchy via `TenantResolverClient`.
-//! Produces `In(owner_tenant_id)` predicates for tenant scoping and
-//! optional `InGroup`/`InGroupSubtree` predicates from request context.
+//! Produces `In(owner_tenant_id)` predicates for tenant scoping,
+//! plus `InGroup`/`InGroupSubtree` predicates from the `group_ids` /
+//! `ancestor_group_ids` resource properties when the PEP advertises the
+//! matching group capabilities (otherwise, or on empty/malformed input, it denies).
 //!
 //! ## Configuration
 //!
 //! ```yaml
 //! gears:
-//!   tr_authz_plugin:
+//!   tr-authz-plugin:
 //!     config:
 //!       vendor: "constructorfabric"
 //!       priority: 50

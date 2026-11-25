@@ -982,10 +982,11 @@ The **owning gear** declares the crates it publishes in its attribute:
 ```rust
 #[toolkit::gear(
     name = "authz-resolver",
+    capabilities = [rest],
     gts_publication(crates = [authz_resolver_sdk]),
-    // …
 )]
-pub struct AuthzResolver;
+#[toolkit::provides(contract = authz_resolver_sdk::AuthZResolverApi, /* … */)]
+pub(crate) struct AuthZResolver;
 ```
 
 The macro records ownership, generates the descriptor that the runtime and the deployment job read, and wires the default adapter `types_registry_sdk::publication` as a consumed contract. The gear writes no publication task or readiness code.

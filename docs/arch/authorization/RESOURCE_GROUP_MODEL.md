@@ -36,7 +36,7 @@ For topology details (forest invariants, type system, query profiles), see [RG D
 
 ## How AuthZ Uses Resource Groups
 
-AuthZ consumes RG data as a **PIP (Policy Information Point)** source. RG is policy-agnostic — it stores hierarchy and membership data without evaluating access decisions. AuthZ plugin reads this data to resolve group-based predicates.
+AuthZ consumes RG data as a **PIP (Policy Information Point)** source. RG is policy-agnostic — it stores hierarchy and membership data without evaluating access decisions. A PDP may read this data to resolve group-based predicates; the shipped `tr-authz-plugin` does not read RG directly (see [Integration Path](#integration-path)).
 
 ### Projection Tables
 
@@ -143,7 +143,7 @@ generic toolkit cannot create this index on behalf of arbitrary entities.
 
 ### Integration Path
 
-AuthZ plugin reads RG hierarchy via `ResourceGroupReadHierarchy` trait (narrow, hierarchy-only read contract). In monolith deployments (current `p1` reality), it's a direct in-process call via `ClientHub` and the trait surface itself bypasses `PolicyEnforcer` (the plugin cannot evaluate itself). In a future microservice deployment (`p2`, deferred / not implemented yet), the same trait will be backed by an MTLS-authenticated request to the RG service. See [RG DESIGN §RG Authentication Modes: JWT vs MTLS](../../../gears/system/resource-group/docs/DESIGN.md#rg-authentication-modes-jwt-vs-mtls).
+RG exposes the `ResourceGroupReadHierarchy` trait (narrow, hierarchy-only read contract) for an in-process AuthZ PDP that needs to read RG hierarchy. The shipped AuthZ plugins do not depend on RG: `tr-authz-plugin` uses only `TenantResolverClient` and takes group IDs from the request's resource properties. The in-process consumer is the Tenant Resolver's `rg-tr-plugin`, which backs tenant hierarchy with RG. It is reached indirectly when `tr-authz-plugin` calls `TenantResolverClient` only if `rg-tr-plugin` is the selected Tenant Resolver plugin; the other plugins (`static-tr-plugin`, `single-tenant-tr-plugin`, Account Management's `tr_plugin`) do not read RG. In monolith deployments (current `p1` reality), it's a direct in-process call via `ClientHub` and the trait surface itself bypasses `PolicyEnforcer`, because its callers run on the PDP's evaluation path and re-entering the enforcer would be circular. In a future microservice deployment (`p2`, deferred / not implemented yet), the same trait will be backed by an MTLS-authenticated request to the RG service. See [RG DESIGN §RG Authentication Modes: JWT vs MTLS](../../../gears/system/resource-group/docs/DESIGN.md#rg-authentication-modes-jwt-vs-mtls).
 
 ---
 

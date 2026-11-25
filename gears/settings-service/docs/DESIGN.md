@@ -234,7 +234,7 @@ C4Container
  ContainerDb(postgres, "PostgreSQL", "Database", "Declarations, categories, values, audit")
  Container(cache, "Effective-Value Cache", "In-memory + local invalidation", "Hot-path read cache keyed by (key, scope)")
  Container_Ext(types_registry, "GTS Schema Registry", "ClientHub", "Type + trait validation")
- Container_Ext(authz, "AuthZ Resolver", "ClientHub", "Fail-closed access gating via AuthZResolverClient")
+ Container_Ext(authz, "AuthZ Resolver", "ClientHub", "Fail-closed access gating via AuthZResolverApi")
  Container_Ext(tenant_resolver, "Tenant Resolver", "ClientHub", "Org-hierarchy ancestry")
  Container_Ext(idp, "IdP / AuthN Resolver", "ClientHub", "Step-up token validation through the platform's AuthN resolver; the IdP is not called per write")
  Container_Ext(audit, "Audit Subsystem", "Audit API", "Mutation records — R2, reached through the ToolKit outbox")
@@ -469,7 +469,7 @@ OIDC bearer via the AuthN Resolver / IdP. A value write requires **step-up = re-
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
 
-The AuthZ Resolver gates read/mutate against `gts.cf.core.settings.*` resources. The gear resolves `AuthZResolverClient` through `ClientHub` and builds the SDK's `PolicyEnforcer` over it — the enforcer is a struct from that SDK, not a separately resolvable trait — then adapts it behind a gear-local port so the domain layer never imports infra. A category may additionally be **restricted**, and then reaching its settings needs a grant on that category (§4.8 *Category access*).
+The AuthZ Resolver gates read/mutate against `gts.cf.core.settings.*` resources. The gear resolves `AuthZResolverApi` through `ClientHub` and builds the SDK's `PolicyEnforcer` over it — the enforcer is a struct from that SDK, not a separately resolvable trait — then calls it from the API layer: the REST handlers (`api/rest/handlers.rs` and `api/rest/*_handlers.rs`) call `api::authz::access_scope` before invoking the domain services and pass them only what they derive from the returned `AccessScope`, so the domain layer never imports the enforcer. The one domain port on this path is `SecretResolveGate`, implemented by `infra::secret_manager::PepSecretGate` over the same helper for secret resolution. A category may additionally be **restricted**, and then reaching its settings needs a grant on that category (§4.8 *Category access*).
 
 #### Feature/licence entitlement
 
@@ -746,7 +746,7 @@ graph TD
 
  subgraph External["External Dependencies"]
  types[("GTS Registry<br/><small>ClientHub</small>")]
- authz[/"AuthZ Resolver<br/><small>ClientHub · AuthZResolverClient</small>"/]
+ authz[/"AuthZ Resolver<br/><small>ClientHub · AuthZResolverApi</small>"/]
  tenant[("Tenant Resolver<br/><small>ClientHub</small>")]
  idp[/"IdP / AuthN Resolver<br/><small>step-up token (AuthN resolver)</small>"/]
  audit[/"Audit Subsystem<br/><small>R2 — via ToolKit outbox</small>"/]
@@ -807,7 +807,7 @@ graph TD
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-component-category-management`
 
-**Dependencies:** PostgreSQL, `AuthZResolverClient` (with `PolicyEnforcer` built over it), `LicenseResolverApi` (License Resolver — feature/licence entitlement), Audit Emitter
+**Dependencies:** PostgreSQL, `AuthZResolverApi` (with `PolicyEnforcer` built over it), `LicenseResolverApi` (License Resolver — feature/licence entitlement), Audit Emitter
 
 **Operations:**
 
@@ -1015,7 +1015,7 @@ Stores tenant restrictions and resolves effective access (`cpt-cf-settings-servi
 
 Validates and stores value changes (`cpt-cf-settings-service-fr-set-value`, `cpt-cf-settings-service-fr-validate-before-set`, `cpt-cf-settings-service-fr-live-read-activation`, `cpt-cf-settings-service-fr-tenant-overrides`, `cpt-cf-settings-service-nfr-reliability-validated-set`).
 
-**Dependencies:** `TypeValidator`, `ScopeClassEngine`, Declaration Management, Secret Manager, `AuthZResolverClient` (with `PolicyEnforcer` built over it), IdP (step-up), Cache, Change Publisher (Settings Activation), Audit Emitter, PostgreSQL
+**Dependencies:** `TypeValidator`, `ScopeClassEngine`, Declaration Management, Secret Manager, `AuthZResolverApi` (with `PolicyEnforcer` built over it), IdP (step-up), Cache, Change Publisher (Settings Activation), Audit Emitter, PostgreSQL
 
 **Operations:**
 
@@ -1063,7 +1063,7 @@ The upper-right cell is a rule, not an omission: a setting that needs a person t
 
 The `step_up_assertion` input carries this fresh token. Because the token itself is the assertion (RFC 9470: a `401` challenge with `error="insufficient_user_authentication"`, `acr_values`, `max_age` drives the re-auth), the parameter MAY be folded into the bearer token in implementation. **The step-up contract itself is owned by the `authn-resolver` gear** — this service references it rather than defining its own. **IdP integration prerequisites** (record against IAM): the IdP MUST be configured to emit `auth_time`/`acr`/`amr` in tokens (often off by default), and the freshness window MUST be agreed. No IdP runtime dependency is added to the gear (§4.9) — the AuthN resolver is fetched from `ClientHub` at first use and validates the token from its own key cache — so there is **no per-set IdP-outage failure mode**; the C4 IdP relationship (§1.3) denotes token trust through the resolver, not a synchronous IdP call on the write path.
 
-**Step-up verification is a swappable `StepUpVerifier` plugin.** The check above is the **default binding** — a `StepUpVerifier` over the platform's AuthN resolver. Unlike `TenantResolverClient` or `AuthZResolverClient` this trait is **defined by this gear**, not consumed from another — it exists so the domain layer states the rule (*setting a value requires a fresh re-authentication*) without importing token handling, which the layering lint forbids. Its shape follows the platform precedent for such ports: declared in the domain, adapted in infra, injected at construction. Because verification is a resolved trait, not hard-coded gear logic, a deployment can — **without editing the gear** — bind a **non-OIDC** verifier (SAML/LDAP/…) or an **added-factor** verifier. What a deployment may **not** bind is a verifier that does not verify: `cpt-cf-settings-service-fr-validate-before-set` requires credential re-verification wherever a declaration demands it, and carries no environment carve-out, so an always-satisfied binding does not implement this contract — it removes it, and a deployment running one is non-conformant however convenient it is in a sandbox. The default binding over the AuthN resolver is exactly what this contract specifies; the trait makes the *mechanism* pluggable, **never the requirement** — every binding must be capable of failing. The one sanctioned non-verifying binding is `MockStepUpVerifier`, and it exists only inside the test harness (§7 *Testing Architecture*).
+**Step-up verification is a swappable `StepUpVerifier` plugin.** The check above is the **default binding** — a `StepUpVerifier` over the platform's AuthN resolver. Unlike `TenantResolverClient` or `AuthZResolverApi` this trait is **defined by this gear**, not consumed from another — it exists so the domain layer states the rule (*setting a value requires a fresh re-authentication*) without importing token handling, which the layering lint forbids. Its shape follows the platform precedent for such ports: declared in the domain, adapted in infra, injected at construction. Because verification is a resolved trait, not hard-coded gear logic, a deployment can — **without editing the gear** — bind a **non-OIDC** verifier (SAML/LDAP/…) or an **added-factor** verifier. What a deployment may **not** bind is a verifier that does not verify: `cpt-cf-settings-service-fr-validate-before-set` requires credential re-verification wherever a declaration demands it, and carries no environment carve-out, so an always-satisfied binding does not implement this contract — it removes it, and a deployment running one is non-conformant however convenient it is in a sandbox. The default binding over the AuthN resolver is exactly what this contract specifies; the trait makes the *mechanism* pluggable, **never the requirement** — every binding must be capable of failing. The one sanctioned non-verifying binding is `MockStepUpVerifier`, and it exists only inside the test harness (§7 *Testing Architecture*).
 
 **What the port is actually for: the R2 successor.** R1's binding reads `auth_time` from the token presented with the set — the check above, implemented here. **R2 waits on the platform-wide elevated session** ("sudo"): one re-authentication ceremony, then a bounded window during which privileged operations proceed without repeating it. It becomes the binding behind this same port: the verifier stops inspecting claims and asks the session one question instead. The requirement does not move, the write path does not change, and no call site is touched — which is the concrete substitution this trait exists to permit, rather than a speculative one.
 
@@ -1126,7 +1126,7 @@ What isolates tenants, then, is two checks: the entry's tenant, which the store 
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-component-search`
 
-**Dependencies:** PostgreSQL, `AuthZResolverClient` (with `PolicyEnforcer` built over it), `LicenseResolverApi` (License Resolver — feature/licence entitlement)
+**Dependencies:** PostgreSQL, `AuthZResolverApi` (with `PolicyEnforcer` built over it), `LicenseResolverApi` (License Resolver — feature/licence entitlement)
 
 **Operations:**
 
@@ -2167,7 +2167,7 @@ A point read asks about one setting and is answered by one decision. A list — 
 
 **First, one ask on the base type.** Allowed means the caller holds a grant covering every setting derived from it (GTS §3.6), so the page needs no further question. This is the ordinary case — an administrator holding the plain settings right — and it costs one decision, as it did before settings were nameable individually.
 
-**Otherwise, per setting, in batches.** A narrower grant is a pattern, and patterns are the platform's to match, not ours — the gear cannot tell from its own tables which settings a grant covers. So the page is assembled the way the platform's PEP guidance describes (`docs/arch/authorization/DESIGN.md`): fetch a candidate batch wider than the page, evaluate the candidates in **one** request (`POST /access/v1/evaluations`, the AuthZEN batch endpoint), keep what is allowed, refill until the page is full or the candidates run out.
+**Otherwise, per setting, in batches.** A narrower grant is a pattern, and patterns are the platform's to match, not ours — the gear cannot tell from its own tables which settings a grant covers. So the page is assembled the way the platform's PEP guidance describes (`docs/arch/authorization/DESIGN.md`): fetch a candidate batch wider than the page, evaluate the candidates in **one** request (an AuthZEN batch evaluation — not yet exposed: `AuthZResolverApi` currently offers only the single-request `evaluate`, `POST /authz-resolver/v1/evaluate`), keep what is allowed, refill until the page is full or the candidates run out.
 
 Three properties hold whichever step answers:
 
@@ -2179,7 +2179,7 @@ Three properties hold whichever step answers:
 
 #### The Data Path: What Is Scoped, and the One Read That Is Not
 
-Every query this gear issues goes through `SecureConn`, which takes an `AccessScope` and compiles it into automatic `WHERE` clauses; the platform states plainly that there is no unscoped shortcut, and a lint rejects raw SQL outside migrations. Authorization therefore does not end at a yes/no: `PolicyEnforcer`, built over `AuthZResolverClient`, compiles the decision into the `AccessScope` that narrows the query. This section maps every access this design performs onto that path, and names the one that steps outside it — which is what makes the exception reviewable rather than incidental.
+Every query this gear issues goes through `SecureConn`, which takes an `AccessScope` and compiles it into automatic `WHERE` clauses; the platform states plainly that there is no unscoped shortcut, and a lint rejects raw SQL outside migrations. Authorization therefore does not end at a yes/no: `PolicyEnforcer`, built over `AuthZResolverApi`, compiles the decision into the `AccessScope` that narrows the query. This section maps every access this design performs onto that path, and names the one that steps outside it — which is what makes the exception reviewable rather than incidental.
 
 | Access | Entity | Scope | |
 |--------|--------|-------|---|
@@ -2271,7 +2271,7 @@ The Settings Service is **supplied as a Constructor Fabric Gear** — a composab
 
 **A registry that accepts the publication.** Because the gear publishes its GTS declarations through `gts_publication(...)` before any application `init`, the process needs a types registry that can take a publication at that point. An embedded registry advertised in the directory (full mode) must have its database: without it the runtime refuses to start, since publication would call the same process forever. An embedded registry in `legacy_only` mode is not advertised, so the publication goes to a registry endpoint (`gears.settings-service.clients.consumes.types-registry.endpoint`, or one found through discovery); with none to reach, the publication is not admitted and the application gear group does not start.
 
-**Everything else via `#[toolkit::consumes]`** — `authz-resolver` (`AuthZResolverClient`, with the SDK's `PolicyEnforcer` built over it), `tenant-resolver` (`TenantResolverClient`), `event-broker` (`EventBrokerApi`) in R1, and `simple-user-settings` (`SimpleUserSettingsClientV1`, the per-user mode preference — §4.3) plus `license-resolver` from R2. All are used on the **request** path, never during our init, so the client is resolved when first needed rather than eagerly. `consumes` wires it without an ordering edge, and — unlike simply omitting the name — keeps the dependency's `inventory::submit!` registration linked and registers a directory-resolving proxy in the out-of-process profiles. In R1, which is Embedded-only (§2.3), the wiring short-circuits to the co-located implementation and readiness flips immediately.
+**Everything else via `#[toolkit::consumes]`** — `authz-resolver` (`AuthZResolverApi`, with the SDK's `PolicyEnforcer` built over it), `tenant-resolver` (`TenantResolverClient`), `event-broker` (`EventBrokerApi`) in R1, and `simple-user-settings` (`SimpleUserSettingsClientV1`, the per-user mode preference — §4.3) plus `license-resolver` from R2. All are used on the **request** path, never during our init, so the client is resolved when first needed rather than eagerly. `consumes` wires it without an ordering edge, and — unlike simply omitting the name — keeps the dependency's `inventory::submit!` registration linked and registers a directory-resolving proxy in the out-of-process profiles. In R1, which is Embedded-only (§2.3), the wiring short-circuits to the co-located implementation and readiness flips immediately.
 
 **Must be built first:** `license-resolver` — the gear is documentation only, there is no crate to depend on, and the platform implements licence validation at base-licence level with per-feature entitlement still pending. A platform **audit** gear exists under no name at all. R1 waits on neither (§2.3): licence gating ships in R2, and audit is a gear-local store written inside the mutation's own transaction (§4.2 *Audit Emitter*). **No IdP gear dependency** — the step-up re-authentication happens **browser ↔ IdP** (the apply request arrives already bearing a fresh token); the gear hands that token to the **platform's AuthN resolver** — fetched from `ClientHub` at first use, never during init, and deliberately not in `deps` — and reads its claims once the resolver has vouched for it (§4.2 *Value Writer*), so the IdP is not a per-write runtime dependency and the gear configures no key-set address at all. Step-up verification is a **`StepUpVerifier`** port this gear declares — default binding = the AuthN-resolver verifier (§4.2 *Value Writer*); a deployment may bind a non-OIDC or added-factor verifier **without gear code** — but never an always-satisfied one: the mechanism is pluggable, the requirement is not (§4.2 *Value Writer*). |
 | Capabilities | `db`, `rest`, `stateful` — the last for the one long-running task this gear owns, the managed-lifecycle tick that sweeps staged secrets nobody claimed (§4.7 *Table `pending_secrets`*) |
@@ -2621,7 +2621,7 @@ The targets above are validated against these order-of-magnitude bounds. They ar
 
 | Dependency | Mock | Why |
 |---|---|---|
-| `AuthZResolverClient` (under `PolicyEnforcer`) | `MockAuthZClient` (Allow) / `DenyingAuthZClient` | Isolate from AuthZ infra — the enforcer is a struct, so the substitution point is the client beneath it |
+| `AuthZResolverApi` (under `PolicyEnforcer`) | `AllowAll` / `AllowButMasked` / `AllowButValues` / `DenyAction` / `DenyAll` (`test_support.rs`) | Isolate from AuthZ infra — the enforcer is a struct, so the substitution point is the client beneath it |
 | License Resolver (licence/feature) | `MockLicenseResolverApi` (allow/deny, fail-closed) | Deterministic entitlement gating without the License Resolver |
 | Audit sink | `MockAuditSink` | Capture audit records to assert mutations are audited |
 | GTS Registry | `MockGtsValidator` | Deterministic type validation |

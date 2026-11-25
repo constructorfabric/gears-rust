@@ -17,6 +17,7 @@
 //!     AuthZResolverApi,
 //!     pep::{AccessRequest, PolicyEnforcer, ResourceType},
 //! };
+//! use toolkit_gts::gts_id;
 //!
 //! const USER: ResourceType = ResourceType::from_static(
 //!     gts_id!("cf.core.users.user.v1~"),
@@ -29,7 +30,8 @@
 //! // Create an enforcer (once, during init - serves all resource types)
 //! let enforcer = PolicyEnforcer::new(authz);
 //!
-//! // All CRUD operations return AccessScope (PDP always returns constraints)
+//! // All CRUD operations return AccessScope. `require_constraints` defaults to
+//! // true for every action, CREATE included: the PDP must return constraints.
 //! let scope = enforcer.access_scope(&ctx, &USER, "get", Some(id)).await?;
 //!
 //! // CREATE - also returns AccessScope with constraints from PDP

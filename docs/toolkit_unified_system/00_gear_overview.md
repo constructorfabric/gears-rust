@@ -30,7 +30,7 @@ A Gear is intentionally a **DDD-light** structure with clear layers:
 
 | Layer | Path | Responsibility |
 |-------|------|----------------|
-| **API** | `src/api/rest/` | HTTP DTOs, Axum handlers, `OperationBuilder` route + OpenAPI wiring. Acts as the **PEP entry point**. |
+| **API** | `src/api/rest/` | HTTP DTOs, Axum handlers, `OperationBuilder` route + OpenAPI wiring. Extracts `SecurityContext` and passes it to the domain service, which performs PEP enforcement. |
 | **Domain** | `src/domain/` | Business logic, the SDK trait implementation (local client), `#[domain_model]` types, and **PEP enforcement** via `PolicyEnforcer`. |
 | **Infra** | `src/infra/` | SeaORM entities, repositories, migrations, adapters — everything "low-level" (DB, IO, external clients). |
 
@@ -92,7 +92,7 @@ representative of the golden path.
   middleware stack; hosts the **AuthN middleware**.
 - **AuthN Resolver** (`gears/system/authn-resolver`) — validates the bearer
   token via a vendor plugin and produces a `SecurityContext`.
-- **Gear Handler (PEP)** — the Gear's Axum handler in `src/api/rest/handlers/`,
+- **Gear Handler** — the Gear's Axum handler in `src/api/rest/handlers/`,
   which extracts `Extension<SecurityContext>` and delegates to the domain service.
 - **Domain Service** — business logic that uses `PolicyEnforcer` (the PEP) to ask
   the PDP for an `AccessScope`.
@@ -131,7 +131,7 @@ sequenceDiagram
     participant Client
     participant GW as API Gateway<br/>(middleware stack)
     participant AuthN as AuthN Resolver<br/>(+ vendor plugin → IdP)
-    participant Handler as Gear Handler<br/>(api/rest, PEP entry)
+    participant Handler as Gear Handler<br/>(api/rest)
     participant Svc as Domain Service
     participant PEP as PolicyEnforcer (PEP)
     participant AuthZ as AuthZ Resolver (PDP)<br/>(+ vendor plugin)
@@ -166,8 +166,10 @@ sequenceDiagram
     PEP->>AuthZ: EvaluationRequest (subject, action, resource, context, token_scopes)
     AuthZ->>AuthZ: vendor plugin (PDP) evaluates policies<br/>(+ tenant/RG hierarchy)
     AuthZ-->>PEP: decision + constraints
-    alt decision = false (or constraints required but missing)
-        PEP-->>Svc: EnforcerError::AccessDenied → 403 Forbidden (fail-closed)
+    alt decision = false
+        PEP-->>Svc: EnforcerError::AccessDenied (fail-closed; recommended 403)
+    else constraints required but missing
+        PEP-->>Svc: EnforcerError::CompileFailed (fail-closed; recommended 500)
     else allowed
         PEP->>PEP: compile constraints → AccessScope
         PEP-->>Svc: AccessScope
@@ -199,7 +201,7 @@ sequenceDiagram
 3. **Scope + license gates** — Optional coarse `token_scopes` enforcement and
    per-route license-feature checks (`require_license_features`) run next, before
    the handler.
-4. **Handler (PEP entry)** — The Gear's Axum handler extracts
+4. **Handler** — The Gear's Axum handler extracts
    `Extension<SecurityContext>`, the shared `Arc<AppServices>`, path params, the
    JSON body, and/or the parsed `OData` query, then calls the domain service.
    Example: `create_chat` / `list_chats` in
@@ -210,12 +212,18 @@ sequenceDiagram
    builds an `EvaluationRequest` and calls the AuthZ Resolver. See
    `@gears/mini-chat/mini-chat/src/domain/service/chat_service.rs:66-111`
    and the enforcer at
-   `@gears/system/authz-resolver/authz-resolver-sdk/src/pep/enforcer.rs:356-409`.
+   `@gears/system/authz-resolver/authz-resolver-sdk/src/pep/enforcer.rs`
+   (`access_scope` / `access_scope_with`).
 6. **Authorization (PDP)** — The AuthZ Resolver delegates to a vendor plugin (the
    PDP), which evaluates policies (optionally querying tenant / resource-group
    hierarchies) and returns a `decision` plus query-level `constraints`.
-7. **Fail-closed / compile to scope** — If `decision = false` (or constraints are
-   required but absent), the enforcer returns `Denied` → `403`. Otherwise it
+7. **Fail-closed / compile to scope** — If `decision = false`, the enforcer
+   returns `EnforcerError::AccessDenied(..)`; if constraints are required but
+   absent, it returns `EnforcerError::CompileFailed(..)`. Neither lets the
+   operation proceed. Each gear maps these to HTTP itself; the recommended
+   mapping (*EnforcerError* in `06_authn_authz_secure_orm.md`) is `403` for
+   `AccessDenied` and `500` for `CompileFailed`, while mini-chat uses a different
+   mapping (`CompileFailed` → `403`, `EvaluationFailed` → `503`). Otherwise it
    compiles the constraints into an `AccessScope` (predicates within a constraint
    are AND'd; multiple constraints are OR'd; unknown predicates fail closed). See
    *Fail-Closed Rules* in `docs/arch/authorization/DESIGN.md`.
