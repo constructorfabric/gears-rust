@@ -12,6 +12,8 @@ use crate::domain::read::{SourceHealth, SourceRow};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
 pub enum InboxKindDto {
+    #[serde(rename = "order")]
+    Order,
     #[serde(rename = "prices")]
     Prices,
     #[serde(rename = "plan_revision")]
@@ -27,6 +29,7 @@ pub enum InboxKindDto {
 impl From<InboxKind> for InboxKindDto {
     fn from(kind: InboxKind) -> Self {
         match kind {
+            InboxKind::Order => Self::Order,
             InboxKind::Prices => Self::Prices,
             InboxKind::PlanRevision => Self::PlanRevision,
             InboxKind::SkuPublish => Self::SkuPublish,
@@ -250,6 +253,7 @@ pub struct InboxKindCountsDto {
     pub sku_publish: u64,
     pub sku_change: u64,
     pub sku_retire: u64,
+    pub order: u64,
 }
 
 impl From<KindCounts> for InboxKindCountsDto {
@@ -260,6 +264,7 @@ impl From<KindCounts> for InboxKindCountsDto {
             sku_publish: counts.sku_publish,
             sku_change: counts.sku_change,
             sku_retire: counts.sku_retire,
+            order: counts.order,
         }
     }
 }

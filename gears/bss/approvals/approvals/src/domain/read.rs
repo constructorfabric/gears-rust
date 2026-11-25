@@ -149,7 +149,16 @@ pub async fn list_page(
             has_more: page.has_more,
         })
         .collect();
-    let merged = merge::merge(prepared.order, prepared.limit, &prepared.keys, views);
+    let mut merged = merge::merge(prepared.order, prepared.limit, &prepared.keys, views);
+    // A forbidden source can become readable again on a continuation. Preserve its
+    // last returned unit so restoring the grant cannot replay an earlier page.
+    for source in &sources {
+        if source.status == SourceHealth::Forbidden
+            && let Some(key) = prepared.keys.get(&source.name)
+        {
+            merged.keys.insert(source.name.clone(), *key);
+        }
+    }
     let unavailable: Vec<String> = sources
         .iter()
         .filter(|row| row.status == SourceHealth::Unavailable)
