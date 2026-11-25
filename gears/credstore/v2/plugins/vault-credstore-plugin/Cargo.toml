@@ -65,7 +65,7 @@ serde-saphyr = { workspace = true }
 httpmock = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
-# Docker-backed integration tests (ignored by default, run by hand; see docs/TESTING.md)
+# Docker-backed integration tests (ignored by default, run by the CI lane credstore-vault or by hand; see docs/TESTING.md)
 testcontainers = { workspace = true }
 # The Vault image and its pinned tag; never `GenericImage::new` in a test
 # (`cargo xtask check-test-container-pins`).

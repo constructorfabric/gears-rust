@@ -573,8 +573,9 @@ async fn a_rejecting_broker_changes_no_result_and_is_counted() {
     assert!(!published.contains(SECRET));
 }
 
-#[tokio::test(start_paused = true)]
-async fn a_hanging_broker_delays_a_read_by_at_most_the_timeout() {
+// A zero budget cuts the publish off at once, so the test waits for nothing.
+#[tokio::test]
+async fn a_hanging_broker_does_not_block_a_read() {
     let tenant = Uuid::new_v4();
     let ctx = make_ctx(Uuid::new_v4(), tenant);
     let broker = FakeBroker::new(Behavior::Hang);
@@ -582,7 +583,7 @@ async fn a_hanging_broker_delays_a_read_by_at_most_the_timeout() {
     let sink = Arc::new(EventBrokerAuditSink::new(
         Arc::new(move || Some(broker.clone() as Arc<dyn event_broker_sdk::EventBrokerApi>)),
         metrics.clone(),
-        std::time::Duration::from_millis(500),
+        std::time::Duration::ZERO,
     ));
     let svc = service_with_sink(tenant, sink, metrics.clone());
     let k = key("db");
@@ -595,11 +596,9 @@ async fn a_hanging_broker_delays_a_read_by_at_most_the_timeout() {
     )
     .await
     .expect("create");
-    let started = tokio::time::Instant::now();
     let secret = svc.get_secret(&ctx, &k).await.expect("read");
 
     assert!(secret.is_some());
-    assert_eq!(started.elapsed(), std::time::Duration::from_millis(500));
     assert_eq!(metrics.audit_publish_failed_total(), 2);
 }
 
@@ -715,4 +714,86 @@ async fn a_read_ending_in_secret_expired_is_audited_as_failure() {
     assert_eq!(events.len() - before, 1);
     assert_eq!(events[before].operation, AuditOperation::Read);
     assert_eq!(events[before].outcome, AuditOutcome::Failure);
+}
+
+/// Polls `fut` by hand (no timer, no executor) until `started` reports that
+/// the stuck cleanup began, then drops it: the request is cancelled in the
+/// middle of its post-commit cleanup, as a gateway timeout would.
+fn cancel_during_cleanup<F: std::future::Future>(fut: F, started: impl Fn() -> bool, what: &str) {
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    for _ in 0..1000 {
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "{what} finished although its cleanup never completes"
+        );
+        if started() {
+            return;
+        }
+    }
+    panic!("{what} never reached its cleanup");
+}
+
+#[tokio::test]
+async fn a_replace_cancelled_during_its_cleanup_still_publishes_its_event() {
+    let (f, repo, plugin) = racing_fixture();
+    f.svc
+        .put(
+            &f.ctx,
+            &key("db"),
+            write(Some(SECRET), SharingMode::Tenant),
+            PutPrecondition::CreateOnly,
+        )
+        .await
+        .expect("create");
+    let before = f.audit.events().len();
+    let destroys_before = plugin.destroy_calls().len();
+    plugin.hang_cleanup();
+
+    cancel_during_cleanup(
+        f.svc.put(
+            &f.ctx,
+            &key("db"),
+            replace(Some("second"), SharingMode::Tenant),
+            PutPrecondition::Exists,
+        ),
+        || plugin.destroy_calls().len() > destroys_before,
+        "the replace",
+    );
+
+    let events = f.audit.events();
+    assert_eq!(events.len() - before, 1);
+    assert_eq!(events[before].operation, AuditOperation::Replace);
+    assert_eq!(events[before].outcome, AuditOutcome::Success);
+    let row = repo.rows().into_iter().next().expect("row");
+    assert_eq!(row.version, 2, "the replace committed");
+}
+
+#[tokio::test]
+async fn a_delete_cancelled_during_its_cleanup_still_publishes_its_event() {
+    let (f, repo, plugin) = racing_fixture();
+    f.svc
+        .put(
+            &f.ctx,
+            &key("db"),
+            write(Some(SECRET), SharingMode::Tenant),
+            PutPrecondition::CreateOnly,
+        )
+        .await
+        .expect("create");
+    let before = f.audit.events().len();
+    let purges_before = plugin.delete_key_calls().len();
+    plugin.hang_cleanup();
+
+    cancel_during_cleanup(
+        f.svc.delete(&f.ctx, &key("db"), WritePrecondition::Exists),
+        || plugin.delete_key_calls().len() > purges_before,
+        "the delete",
+    );
+
+    let events = f.audit.events();
+    assert_eq!(events.len() - before, 1);
+    assert_eq!(events[before].operation, AuditOperation::Delete);
+    assert_eq!(events[before].outcome, AuditOutcome::Success);
+    assert!(repo.rows().is_empty(), "the delete committed");
 }

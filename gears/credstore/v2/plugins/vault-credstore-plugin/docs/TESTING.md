@@ -5,8 +5,8 @@ Updated:  2026-10-03 by Constructor Tech
 
 > **Status: implemented.** The suite is **206 tests** — 168 unit tests that run in
 > every `cargo test`, and 38 Docker-backed integration tests (21 SDK conformance
-> checks and 17 Vault behaviour tests) that are ignored by default, are run by hand and
-> never run in CI. This is the test plan for `cf-gears-vault-credstore-plugin-v2`,
+> checks and 17 Vault behaviour tests) that are ignored by default (they need Docker) and
+> run explicitly by the CI lane `credstore-vault`. This is the test plan for `cf-gears-vault-credstore-plugin-v2`,
 > paired with [DESIGN.md](./DESIGN.md).
 
 > **Companion documents:**
@@ -18,8 +18,8 @@ Updated:  2026-10-03 by Constructor Tech
 
 - [1. Overview](#1-overview)
 - [2. Layer 1 — Unit Tests (in-crate)](#2-layer-1--unit-tests-in-crate)
-- [3. Layer 2 — Conformance Suite (Docker, manual)](#3-layer-2--conformance-suite-docker-manual)
-- [4. Layer 3 — Vault Behaviour Tests (Docker, manual)](#4-layer-3--vault-behaviour-tests-docker-manual)
+- [3. Layer 2 — Conformance Suite (Docker)](#3-layer-2--conformance-suite-docker)
+- [4. Layer 3 — Vault Behaviour Tests (Docker)](#4-layer-3--vault-behaviour-tests-docker)
   - [4.1 Container Setup](#41-container-setup)
   - [4.2 Scenarios](#42-scenarios)
 - [5. Running the Tests](#5-running-the-tests)
@@ -32,8 +32,8 @@ Updated:  2026-10-03 by Constructor Tech
 ## 1. Overview
 
 ```
-L3  Vault behaviour tests  (hashicorp/vault in Docker)        — manual, ignored
-L2  SDK conformance suite  (hashicorp/vault in Docker)        — manual, ignored
+L3  Vault behaviour tests  (hashicorp/vault in Docker)        — CI lane, ignored by default
+L2  SDK conformance suite  (hashicorp/vault in Docker)        — CI lane, ignored by default
 L1  Unit tests             (scripted transport, HTTP mock)    — every PR, sub-second
 ```
 
@@ -45,10 +45,12 @@ what the author believes; the integration tests pin the beliefs to a real
 server, so a Vault release that changes an answer shows up as a failing test
 instead of a wrong secret.
 
-The integration tests are **manual by decision**: they need Docker and a
-~180 MB image, they are never part of CI, and every one of them is ignored
-with a reason string. A default `cargo test` (and CI) therefore runs layer 1
-only and never starts a container.
+The integration tests need Docker and a ~180 MB image, so every one of them is
+ignored by default with a reason string: a plain `cargo test` runs layer 1 only
+and never starts a container. The CI lane `credstore-vault` (section 5) runs
+layers 2 and 3 explicitly on the pinned `hashicorp/vault` image, with
+`VAULT_CREDSTORE_REQUIRE_DOCKER=1` so that a broken Docker daemon fails the job
+instead of passing it green.
 
 ## 2. Layer 1 — Unit Tests (in-crate)
 
@@ -66,7 +68,7 @@ Docker. 168 tests:
 | `infra::http_tests` | 18 | Token and namespace headers, body and content type, verbs, connect failure; **403 handling**: token file re-read and one resend with the new token (and its body), no resend for an unchanged file, an unreadable file or an inline token, a second `403` is final, the new token is cached afterwards; a missing token file is a credentials error that sends nothing, and a file that appears later is used; `Retry-After` parsing (seconds, cap, ignored forms) |
 | `infra::token_tests` | 17 | Source selection from the config; trimming; unusable tokens (empty, spaces, tabs, non-ASCII) fail startup without echoing the token; environment source (set, unset, empty); lazy file source; caching until a rejection; rotation, unchanged, truncated and deleted file; a cache that another request already refreshed |
 
-## 3. Layer 2 — Conformance Suite (Docker, manual)
+## 3. Layer 2 — Conformance Suite (Docker)
 
 `tests/conformance.rs` runs every check of `credstore_sdk::conformance` against
 the plugin and a real `hashicorp/vault` dev server: one test per check, 21 in
@@ -96,7 +98,7 @@ starts a Vault container and returns a small wrapper that owns both the containe
 and the plugin, so the server lives as long as the test (and a test returns early
 when Docker is unreachable, unless `VAULT_CREDSTORE_REQUIRE_DOCKER` is set).
 
-## 4. Layer 3 — Vault Behaviour Tests (Docker, manual)
+## 4. Layer 3 — Vault Behaviour Tests (Docker)
 
 `tests/vault_behaviour.rs`: tests of what is specific to Vault and to this
 plugin, each with its own server and the minimal-policy token (the root token
@@ -113,7 +115,7 @@ HTTP API with the root token.
   Pull happens on first use.
 - **Server**: `vault server -dev` with root token `root`, listening on
   `0.0.0.0:8200`, `IPC_LOCK` capability, through `testcontainers`
-  (`GenericImage`). The fixture polls `/v1/sys/health` until the server answers.
+  (`GenericImage`). The fixture waits for the dev server's last startup line, "Development mode should NOT be used in production installations!" (printed on stdout by both `Vault` and `OpenBao`), and checks `/v1/sys/health` once.
 - **Mount**: a KV v2 mount `credstore-it` configured as production prescribes
   (`delete_version_after = 0s`, `cas_required = false`); the plugin sets the
   key's own `max_versions` to 100 before every `put`, so the mount's value is
@@ -140,7 +142,7 @@ HTTP API with the root token.
 | `entries_not_written_by_the_plugin_are_internal` | A hand-written entry without `value`, and one whose `value` is not base64, are a permanent `Internal` error |
 | `put_sets_the_key_limit_to_100_whatever_the_mount_says` | With a mount limit of 3 and five `put`s, the key's metadata shows `max_versions = 100` and all five versions read back exactly |
 | `exceeding_100_versions_evicts_the_oldest_and_reads_as_none` | 101 `put`s: version 1 answers `404 {"errors":[]}` and reads as `None`, versions 2 and 101 are exact, the metadata lists 100, and `destroy(Below)` still works |
-| `a_per_key_max_versions_can_only_raise_the_mount_limit` | Vault's own rule, written with raw calls: the effective limit is the larger of the mount's and the key's `max_versions` (why the plugin's 100 holds under any lower mount value) |
+| `the_per_key_max_versions_rule_of_each_backend` | The retention rule of the backend under test, written with raw calls: Vault keeps the larger of the mount's and the key's `max_versions`, OpenBao lets a non-zero key value win (the plugin's 100 holds under both) |
 | `default_retention_without_max_versions_is_ten_versions` | Vault's own rule with raw writes: mount `max_versions = 0` and no key limit keep 10 versions; a key written by the plugin on the same mount keeps all 12 |
 | `destroy_below_over_many_versions` | 30 versions: `Below(25)` destroys 1 to 24 (a soft-deleted one among them) and keeps 25 to 30 byte-exact; repeated and raised cuts are idempotent; `Exactly` for one version, for a destroyed one and for one never issued |
 | `destroy_and_delete_on_missing_keys_succeed` | `destroy` and `delete_key` of a key that was never written succeed, repeatedly |
@@ -158,7 +160,7 @@ Always through the stable toolchain wrapper this repository uses, one cargo
 command at a time:
 
 ```bash
-# Layer 1 (what CI runs): unit tests only, the integration tests are ignored
+# Layer 1 (what the unit-test job runs): the integration tests are ignored
 cargo test -p cf-gears-vault-credstore-plugin-v2
 
 # Layers 2 and 3: needs a running Docker daemon (first run pulls the image)
@@ -171,14 +173,26 @@ cargo test -p cf-gears-vault-credstore-plugin-v2 --test vault_behaviour -- --ign
 # One test
 cargo test -p cf-gears-vault-credstore-plugin-v2 --test vault_behaviour -- --ignored soft_deleted
 
+# The CI lane: layers 2 and 3 on the pinned image (Docker required)
+make test-integration LANE=credstore-vault
+
 # Another Vault version; fail instead of skipping when Docker is missing
 GEARS_TEST_VAULT_TAG=1.21 VAULT_CREDSTORE_REQUIRE_DOCKER=1 \
   cargo test -p cf-gears-vault-credstore-plugin-v2 -- --ignored
+
+# OpenBao instead of hashicorp/vault (use a concrete tag, not `latest`)
+GEARS_TEST_VAULT_IMAGE=openbao/openbao GEARS_TEST_VAULT_TAG=2.7.3 \
+  VAULT_CREDSTORE_REQUIRE_DOCKER=1 \
+  cargo test -p cf-gears-vault-credstore-plugin-v2 -- --ignored
 ```
 
-There is deliberately no `make` target for the integration tests: the Makefile's
-integration targets belong to the CI `integration` job, and these tests are not
-part of it.
+The lane (`lane_args_credstore-vault` in `gears-rust.mk`) runs the same tests
+through nextest with `--run-ignored ignored-only` and `--test-threads 4`: under
+nextest every test is its own process, so the fixture's limit of 4 containers
+does not apply and the thread limit enforces it. The image and tag come from
+`libs/test-containers`; `GEARS_TEST_VAULT_IMAGE` and `GEARS_TEST_VAULT_TAG`
+override them for the lane as well. The fixture sets both the `VAULT_DEV_*` and
+the `BAO_DEV_*` variables, and each server reads its own.
 
 ## 6. Static Analysis
 
@@ -197,16 +211,25 @@ The domain layer imports no HTTP types; `reqwest` is confined to
 | Layer | When |
 |---|---|
 | L1 unit | Every PR (CI) |
-| L2 conformance and L3 behaviour | By hand: before releasing the plugin, when `cf-gears-credstore-v2-sdk`'s conformance suite or this plugin's wire logic changes, and when moving to a new Vault major version |
+| L2 conformance and L3 behaviour | Every PR (CI lane `credstore-vault`, pinned `hashicorp/vault` image). By hand, before releasing the plugin and when moving to a new Vault major version or a new production backend version: the same tests with the override variables |
 
 Qualified on `hashicorp/vault` **2.1.1** and **1.21**: all 37 integration tests
 pass on both (2026-10-03).
+
+Qualified on `openbao/openbao` **2.7.3**, the newest stable tag on 2026-11-25:
+all 38 integration tests pass (21 conformance checks and 17 behaviour
+tests). One test depends on the backend: `the_per_key_max_versions_rule_of_each_backend`
+expects, with the mount at `max_versions = 3` and a key at 2, 3 versions on
+Vault (the larger of the two) and 2 on OpenBao (a non-zero key value wins over
+the mount's). The fixture picks the expectation by the image name. It does not
+affect the plugin: the key's own limit of 100 is set before every `put` and
+holds under both rules.
 
 ## 8. Coverage Gaps and Follow-ups
 
 | Gap | Why | Mitigation |
 |---|---|---|
-| OpenBao is not run | Decision: only the `hashicorp/vault` image is used; OpenBao shares the KV v2 implementation | The response shapes are Vault's; run the same tests against an OpenBao image by hand before relying on it |
+| OpenBao is run by hand only | CI runs the pinned `hashicorp/vault` image; OpenBao 2.7.3 was run once (section 7) | Re-run with `GEARS_TEST_VAULT_IMAGE=openbao/openbao` before relying on a new OpenBao release; the retention test expects the rule of each backend (section 7) |
 | TLS and certificate handling | The plugin has no TLS settings; the HTTP client's defaults apply | Operator's choice of an `https://` address; not tested here |
 | A real Vault Agent sidecar | The tests rotate the token file by hand | The mechanism under test is "the file changes, Vault answers `403`", which is what an agent causes |
 | Token expiry by TTL | Tests revoke tokens instead of waiting for a TTL | Revocation and expiry look the same to Vault clients (`403`) |

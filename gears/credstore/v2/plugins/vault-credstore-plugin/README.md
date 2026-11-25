@@ -56,7 +56,7 @@ provides a **KV v2** mount with:
 
 The mount's `max_versions` is not an operator obligation: before every `put`
 the plugin sets the key's own `max_versions` to 100. Vault keeps the larger of
-the mount's and the key's limit (10 when both are `0` or unset; `0` is not
+the mount's and the key's limit (`OpenBao` lets a non-zero key value win; 10 when both are `0` or unset; `0` is not
 unlimited) and counts destroyed versions, so a lower value on the mount is
 harmless. Superseded versions are destroyed after each commit, so a key
 normally holds one or two. If more than 100 versions pile up above a record's
@@ -148,57 +148,48 @@ writes versions the gear cannot read.
 
 ## Trying it locally
 
-A dev-mode server is enough to try the plugin by hand (it is **not** a
+The plugin is not wired into the example server yet: v2 is connected to the
+server at the switch (step S1 of `gears/credstore/v2/plan.md`). Until then its
+behaviour is checked by the integration tests (see [Tests](#tests) and
+[docs/TESTING.md](docs/TESTING.md)), which start their own Vault or `OpenBao`
+dev server in Docker.
+
+To poke at a server by hand, a dev-mode server is enough (it is **not** a
 production setup: in-memory storage, a known root token):
 
 ```bash
 docker run -d --name credstore-vault -p 8200:8200 \
   -e VAULT_DEV_ROOT_TOKEN_ID=root -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
-  --cap-add=IPC_LOCK hashicorp/vault:latest server -dev
+  --cap-add=IPC_LOCK hashicorp/vault:2.1.1 server -dev
 ```
 
 (`openbao/openbao` works the same way with `BAO_DEV_ROOT_TOKEN_ID` and
 `BAO_DEV_LISTEN_ADDRESS`.) The dev server mounts a KV v2 engine at `secret/`.
-Run the example server against it with `config/credstore-vault-demo.yaml`,
-which selects this plugin and uses the dev root token:
+Check that it answers:
 
 ```bash
-cargo run -p cf-gears-example-server \
-  --features vault-credstore,static-tenants,static-authn,static-authz \
-  -- --config config/credstore-vault-demo.yaml run
-```
-
-The demo config sets `auth_disabled: true`, so calls need no `Authorization`
-header. Create a credential and read its secret back:
-
-```bash
-curl -s -X PUT "http://127.0.0.1:8087/cf/credstore/v1/credentials/hello-world" \
-  -H 'Content-Type: application/json' \
-  -H 'If-None-Match: *' \
-  -d '{"type": "gts.cf.core.credstore.credential.v1~cf.core.credstore.api_key.v1~", "sharing": "tenant", "secret": "hello-from-vault"}'
-
-curl -si "http://127.0.0.1:8087/cf/credstore/v1/credentials/hello-world?\$select=reference,secret"
-```
-
-To see what is stored directly in Vault (base64, at the KV v2 path this plugin
-writes to), list the tenants, then read a record's current version:
-
-```bash
-curl -s -X LIST -H "X-Vault-Token: root" "http://127.0.0.1:8200/v1/secret/metadata/credstore/"
-curl -s -H "X-Vault-Token: root" \
-  "http://127.0.0.1:8200/v1/secret/data/credstore/<tenant_id>/<record_id>" \
-  | jq -r '.data.data.value' | base64 -d
+curl -s -H "X-Vault-Token: root" "http://127.0.0.1:8200/v1/sys/health"
 ```
 
 ## Tests
 
 Unit tests run with a plain `cargo test -p cf-gears-vault-credstore-plugin-v2`.
-The integration tests start a `hashicorp/vault` dev server in Docker, run the
-SDK conformance suite and check the Vault-specific behaviour. They are
-ignored by default, are meant to be run by hand and never run in CI:
+The integration tests start a `hashicorp/vault` dev server in Docker (or
+`OpenBao`, see below), run the SDK conformance suite and check the Vault-specific
+behaviour. They are ignored by default because they need Docker; the CI lane
+`credstore-vault` runs them:
 
 ```bash
+make test-integration LANE=credstore-vault
+# or by hand
 cargo test -p cf-gears-vault-credstore-plugin-v2 -- --ignored
+```
+
+To run them against `OpenBao`, override the image and tag:
+
+```bash
+GEARS_TEST_VAULT_IMAGE=openbao/openbao GEARS_TEST_VAULT_TAG=2.7.3 \
+  cargo test -p cf-gears-vault-credstore-plugin-v2 -- --ignored
 ```
 
 See [docs/TESTING.md](docs/TESTING.md).

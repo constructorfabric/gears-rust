@@ -1,11 +1,19 @@
 // Created: 2026-10-04 by Constructor Tech
 // Updated: 2026-10-06 by Constructor Tech
 //! Runs the SDK's `CredStorePluginClientV2` conformance suite against the
-//! plugin and a real `hashicorp/vault` dev server in Docker: one test per
-//! check, each with its own server and a plugin that authenticates with a
-//! token holding only the minimal ACL policy of `docs/DESIGN.md`.
+//! plugin and a real Vault dev server (`hashicorp/vault` by default, `OpenBao`
+//! on request) in Docker: one test per check, each with its own server and a
+//! plugin that authenticates with a token holding only the minimal ACL policy
+//! of `docs/DESIGN.md`.
 //!
-//! All tests are `#[ignore]`d (they need Docker and never run in CI):
+//! All tests are ignored by default (they need Docker); the CI lane
+//! `credstore-vault` runs them with:
+//!
+//! ```text
+//! make test-integration LANE=credstore-vault
+//! ```
+//!
+//! or by hand with:
 //!
 //! ```text
 //! cargo test -p cf-gears-vault-credstore-plugin-v2 --test conformance -- --ignored
@@ -104,7 +112,7 @@ impl CredStorePluginDestroyerV2 for PluginWithServer {
 // test early when Docker is not reachable (the fixture prints why; with
 // `VAULT_CREDSTORE_REQUIRE_DOCKER=1` it fails instead).
 credstore_sdk::credstore_plugin_conformance!(
-    #[ignore = "requires Docker (starts a hashicorp/vault container); run manually with `-- --ignored`"]
+    #[ignore = "requires Docker (starts a Vault container); run by the credstore-vault CI lane or with `-- --ignored`"]
     {
         let Some(server) = VaultFixture::start().await else {
             return;

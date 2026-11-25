@@ -10,7 +10,14 @@
 //! only the minimal ACL policy of `docs/DESIGN.md`; Vault's own state is
 //! inspected and changed through its HTTP API with the root token.
 //!
-//! All tests are `#[ignore]`d (they need Docker and never run in CI):
+//! All tests are ignored by default (they need Docker); the CI lane
+//! `credstore-vault` runs them with:
+//!
+//! ```text
+//! make test-integration LANE=credstore-vault
+//! ```
+//!
+//! or by hand with:
 //!
 //! ```text
 //! cargo test -p cf-gears-vault-credstore-plugin-v2 --test vault_behaviour -- --ignored
@@ -32,7 +39,7 @@ use vault_credstore_plugin_v2::domain::Service;
 macro_rules! docker_test {
     ($(#[$meta:meta])* async fn $name:ident($vault:ident) $body:block) => {
         #[tokio::test]
-        #[ignore = "requires Docker (starts a hashicorp/vault container); run manually with `-- --ignored`"]
+        #[ignore = "requires Docker (starts a Vault container); run by the credstore-vault CI lane or with `-- --ignored`"]
         $(#[$meta])*
         async fn $name() {
             let Some($vault) = VaultFixture::start().await else {
@@ -268,11 +275,14 @@ docker_test! {
 }
 
 docker_test! {
-    async fn a_per_key_max_versions_can_only_raise_the_mount_limit(vault) {
-        // Vault's own rule: the effective limit is the larger of the mount's
-        // and the key's `max_versions` (0 = unset; 10 when both are unset). A
-        // smaller per-key value does not shrink the mount's limit, which is
-        // why the plugin's key limit of 100 holds under any lower mount value.
+    async fn the_per_key_max_versions_rule_of_each_backend(vault) {
+        // The two backends differ. Vault applies the larger of the mount's and
+        // the key's `max_versions` (0 = unset; 10 when both are unset), so a
+        // smaller per-key value does not shrink the mount's limit. OpenBao
+        // lets a non-zero per-key value win, so a smaller one does shrink it.
+        // The plugin's key limit of 100 holds under both rules: it is set on
+        // every key before each `put`; on Vault a lower mount value is
+        // harmless (the larger wins), on OpenBao the key's 100 applies as is.
         // Written with raw calls: a plugin `put` would reset the key to 100.
         set_mount_max_versions(&vault, 3).await;
 
@@ -290,7 +300,11 @@ docker_test! {
             raw_write(&vault, &smaller, &format!("v{i}")).await;
             raw_write(&vault, &larger, &format!("v{i}")).await;
         }
-        assert_eq!(metadata_versions(&vault, &smaller).await.as_object().unwrap().len(), 3);
+        let expected_smaller = if VaultFixture::is_openbao() { 2 } else { 3 };
+        assert_eq!(
+            metadata_versions(&vault, &smaller).await.as_object().unwrap().len(),
+            expected_smaller
+        );
         assert_eq!(metadata_versions(&vault, &larger).await.as_object().unwrap().len(), 5);
     }
 }

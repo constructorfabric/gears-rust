@@ -251,7 +251,7 @@ A soft-deleted version has `destroyed = false` and a `deletion_time`: it is incl
 
 #### Vault answers the plugin relies on
 
-Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server) and pinned by the integration tests (`tests/vault_behaviour.rs`); OpenBao shares the KV v2 implementation.
+Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server) and pinned by the integration tests (`tests/vault_behaviour.rs`); the same suites were run against OpenBao 2.7.3 (2026-11-25) and all pass; the retention test pins the rule of each backend: Vault keeps the larger of the mount's and the key's `max_versions`, OpenBao lets a non-zero key value win over the mount's, and the plugin's key limit of 100 holds under both (see [TESTING.md](./TESTING.md)).
 
 | Situation | Vault's answer |
 |---|---|
@@ -272,7 +272,7 @@ Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server) and pinned by the
 | `POST destroy/...` with an empty version list | `400`, `{"errors":["no version number provided"]}` (the plugin never sends one) |
 | After `DELETE metadata/...`, a new `POST data/...` | Numbering restarts at version 1 |
 
-Retention: the effective number of versions Vault keeps per key is the larger of the mount's and the key's own `max_versions` (the key's value can raise the limit but not lower it below the mount's); both `0`/unset means 10, not unlimited. Destroyed versions count. Versions beyond the limit are removed oldest first and then answer as "never written". Lowering the effective limit removes, at the key's next write, every version older than the new window.
+Retention: the effective number of versions Vault keeps per key is the larger of the mount's and the key's own `max_versions` (the key's value can raise the limit but not lower it below the mount's; on OpenBao a non-zero key value wins over the mount's); both `0`/unset means 10, not unlimited. Destroyed versions count. Versions beyond the limit are removed oldest first and then answer as "never written". Lowering the effective limit removes, at the key's next write, every version older than the new window.
 
 #### Constructing the client outside the gear
 
@@ -520,7 +520,7 @@ The plugin needs a **KV v2** mount (`vault secrets enable -path=secret -version=
 vault write secret/config delete_version_after=0s cas_required=false
 ```
 
-**Retention.** Vault keeps **10 versions per key by default**; `max_versions = 0` or unset also means 10, not unlimited. The effective limit of a key is the larger of the mount's `max_versions` and the key's own; destroyed versions count, and lowering the limit removes at the key's next write every version beyond the new window. The plugin sets the key's own `max_versions` to 100 (`POST {mount}/metadata/{path_prefix}/{tenant_id}/{record_id}` with `{"max_versions":100}`) before every `put`: the call needs no knowledge of whether the key exists, is idempotent, and works before the first write (`options.max_versions` in a data write is ignored by Vault). If it fails, the `put` fails and nothing is written. A lower `max_versions` on the mount is harmless, since the key's 100 is larger; a higher one raises the limit for all keys. 100 is a constant of the plugin and **MUST NOT** be lowered in a later version, because the next write to every existing key would remove the versions beyond the new window.
+**Retention.** Vault keeps **10 versions per key by default**; `max_versions = 0` or unset also means 10, not unlimited. The effective limit of a key on Vault is the larger of the mount's `max_versions` and the key's own (on OpenBao a non-zero key value wins); destroyed versions count, and lowering the limit removes at the key's next write every version beyond the new window. The plugin sets the key's own `max_versions` to 100 (`POST {mount}/metadata/{path_prefix}/{tenant_id}/{record_id}` with `{"max_versions":100}`) before every `put`: the call needs no knowledge of whether the key exists, is idempotent, and works before the first write (`options.max_versions` in a data write is ignored by Vault). If it fails, the `put` fails and nothing is written. A lower `max_versions` on the mount is harmless, since the key's 100 is larger; a higher one raises the limit for all keys on Vault, and has no effect on OpenBao, where the key's 100 applies. 100 is a constant of the plugin and **MUST NOT** be lowered in a later version, because the next write to every existing key would remove the versions beyond the new window.
 
 What exceeding it means for CredStore: a key normally holds one or two versions, because the gear destroys superseded versions right after each commit. If more than 100 versions pile up above the version a record points at (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not, since destroyed versions still count; versions below the pointer are evicted first and are harmless), Vault removes the oldest ones, which may include the referenced version. The plugin then answers "no value" for it, the gear finds that the pointer did not move, and the record answers an internal error (500) until it is rewritten (CredStore DESIGN §4.6). The plugin does not check the mount settings, at startup or later.
 
@@ -592,15 +592,15 @@ Enablement gates before production use:
 | Token delivery | A sidecar writing `token_file`, or a deliberately long-lived `token` / `token_env` with a rotation procedure |
 | Transport security | An `https://` address and the platform's trust roots, or an intermediary that provides TLS |
 | Vault availability | Highly available Vault behind one address; Vault's own backup and unseal procedures |
-| Qualification | The manual integration run of [TESTING.md](./TESTING.md) on the Vault version in use |
+| Qualification | The integration run of [TESTING.md](./TESTING.md) on the Vault version in use (CI runs it on the pinned `hashicorp/vault` image; the production version is a manual pre-release run) |
 
 ### 4.4 Verification Architecture and Observability
 
 | Level | Purpose |
 |---|---|
 | Unit (in-crate) | Config parsing and validation; wire logic and the error mapping table; retry policy and backoff; service behaviour through a scripted fake transport (retry counts, `put` never retried, `destroy(Below)` selection) and an HTTP mock server (headers, bodies, `Retry-After`); the transport's 403 re-read; token sources |
-| SDK conformance | `credstore_sdk::conformance` against a real `hashicorp/vault` with a minimal-policy token (manual, Docker) |
-| Vault behaviour | Soft-deleted, destroyed, evicted and absent version shapes, `version=0`, foreign entries, `destroy(Below)` over many versions, token-file rotation, a missing mount, a sealed server, the policy's scope (manual, Docker) |
+| SDK conformance | `credstore_sdk::conformance` against a real `hashicorp/vault` with a minimal-policy token (Docker; CI lane `credstore-vault`) |
+| Vault behaviour | Soft-deleted, destroyed, evicted and absent version shapes, `version=0`, foreign entries, `destroy(Below)` over many versions, token-file rotation, a missing mount, a sealed server, the policy's scope (Docker; CI lane `credstore-vault`) |
 
 [TESTING.md](./TESTING.md) lists the tests and the commands.
 

@@ -11,12 +11,14 @@ use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
 use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::PlatformTypesRegistryApi;
 use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 
 use super::{DISCOVERY_BUDGET, GtsCredStorePluginSelector};
 use crate::domain::error::DomainError;
 use crate::domain::ports::plugin::PluginSelector;
 use crate::domain::secret::test_support::FakePlugin;
+use crate::infra::stalled_registry::StalledRegistry;
 
 /// Publishes `segment` under `vendor`/`priority` in `registry`, and returns its id.
 fn publish(registry: &MockTypesRegistry, segment: &str, vendor: &str, priority: i16) -> String {
@@ -153,24 +155,31 @@ async fn without_the_platform_api_the_selection_fails_closed() {
     );
 }
 
-/// The selector applies its discovery budget and maps expiry to a 503.
-#[tokio::test(start_paused = true)]
-async fn a_stalled_registry_fails_the_selection_at_the_discovery_budget() {
-    let registry = Arc::new(MockTypesRegistry::new());
-    let hub = hub_with(&registry);
-    registry.inject(Fault::on(Call::List).delay(Duration::from_secs(3600)));
-    let started = tokio::time::Instant::now();
+/// The selector applies its discovery budget and maps expiry to a 503. A zero
+/// budget against a registry that never answers expires at once, with no wait.
+#[tokio::test]
+async fn a_stalled_registry_fails_the_selection_when_the_discovery_budget_expires() {
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn PlatformTypesRegistryApi>(Arc::new(StalledRegistry));
 
     let err = selector(hub)
+        .with_discovery_budget(Duration::ZERO)
         .resolve()
         .await
         .err()
         .expect("the budget expires");
 
-    assert_eq!(started.elapsed(), DISCOVERY_BUDGET);
     assert!(
         matches!(err, DomainError::ServiceUnavailable { .. }),
         "got: {err:?}"
+    );
+}
+
+#[test]
+fn a_new_selector_uses_the_default_discovery_budget() {
+    assert_eq!(
+        selector(Arc::new(ClientHub::new())).discovery_budget,
+        DISCOVERY_BUDGET
     );
 }
 

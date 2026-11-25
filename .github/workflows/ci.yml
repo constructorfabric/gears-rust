@@ -503,6 +503,14 @@ jobs:
           CREDSTORE_PG_REQUIRE_DOCKER: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=credstore-pg
 
+      - name: Test credstore v2 Vault plugin (Docker, integration)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        # Same shape as credstore above: Docker is on this runner, so a
+        # skip here would be a broken daemon passing green.
+        env:
+          VAULT_CREDSTORE_REQUIRE_DOCKER: "1"
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=credstore-vault
+
       - name: Test construct (pg erasure storage, integration)
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         # Same shape as credstore above: Docker is on this runner, so a skip

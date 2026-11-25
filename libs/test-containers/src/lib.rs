@@ -32,6 +32,7 @@
 //! | `GEARS_TEST_CLICKHOUSE_TAG` | [`CLICKHOUSE_TAG`] |
 //! | `GEARS_TEST_REDIS_TAG` | [`REDIS_TAG`] |
 //! | `GEARS_TEST_KAFKA_TAG` | [`KAFKA_TAG`] |
+//! | `GEARS_TEST_VAULT_IMAGE` | [`VAULT_IMAGE`] |
 //! | `GEARS_TEST_VAULT_TAG` | [`VAULT_TAG`] |
 //!
 //! An unset *or empty* variable means "use the constant".
@@ -158,9 +159,9 @@ pub const VAULT_IMAGE: &str = "hashicorp/vault";
 
 /// Tag of the `Vault` server image.
 ///
-/// Used only by the manual (ignored by default) `Docker` suites of the `CredStore`
-/// `Vault` plugin; no `E2E` sidecar pins it, so
-/// there is no second copy to keep in sync.
+/// Used by the `Docker` suites of the `CredStore` `Vault` plugin, which the CI
+/// lane `credstore-vault` runs on this tag; no `E2E` sidecar pins it, so there
+/// is no second copy to keep in sync.
 pub const VAULT_TAG: &str = "2.1.1";
 
 /// Environment variable overriding [`POSTGRES_TAG`].
@@ -181,6 +182,8 @@ pub const ENV_REDIS_TAG: &str = "GEARS_TEST_REDIS_TAG";
 pub const ENV_KAFKA_TAG: &str = "GEARS_TEST_KAFKA_TAG";
 /// Environment variable overriding [`NETSHOOT_TAG`].
 pub const ENV_NETSHOOT_TAG: &str = "GEARS_TEST_NETSHOOT_TAG";
+/// Environment variable overriding [`VAULT_IMAGE`].
+pub const ENV_VAULT_IMAGE: &str = "GEARS_TEST_VAULT_IMAGE";
 /// Environment variable overriding [`VAULT_TAG`].
 pub const ENV_VAULT_TAG: &str = "GEARS_TEST_VAULT_TAG";
 
@@ -274,6 +277,13 @@ pub fn netshoot_image() -> String {
         "{NETSHOOT_IMAGE}:{}",
         tag_from(env_override(ENV_NETSHOOT_TAG), NETSHOOT_TAG)
     )
+}
+
+/// `Vault` image repository in effect, honoring `GEARS_TEST_VAULT_IMAGE`
+/// (for example `openbao/openbao`).
+#[must_use]
+pub fn vault_image() -> String {
+    tag_from(env_override(ENV_VAULT_IMAGE), VAULT_IMAGE)
 }
 
 /// `Vault` tag in effect, honoring `GEARS_TEST_VAULT_TAG`.
@@ -397,10 +407,12 @@ pub fn clickhouse() -> GenericImage {
 /// the caller supplies the exposed port, wait strategy, environment and command
 /// (`server -dev` for a throwaway dev server).
 ///
-/// Only the manual (ignored by default) suites start it, so a CI version matrix never
-/// reaches it; the override exists to qualify another `Vault` release by hand.
+/// The `Docker` suites of the `Vault` plugin start it, and the CI lane
+/// `credstore-vault` runs them on the pinned image. `GEARS_TEST_VAULT_IMAGE`
+/// and `GEARS_TEST_VAULT_TAG` let a person qualify another `Vault` release or
+/// `OpenBao` (`GEARS_TEST_VAULT_IMAGE=openbao/openbao`) by hand.
 pub fn vault() -> GenericImage {
-    GenericImage::new(VAULT_IMAGE.to_owned(), vault_tag())
+    GenericImage::new(vault_image(), vault_tag())
 }
 
 /// Whether an unavailable `PostgreSQL` 19 beta image must fail the run rather
@@ -568,6 +580,7 @@ mod tests {
         assert_eq!(ENV_CLICKHOUSE_TAG, "GEARS_TEST_CLICKHOUSE_TAG");
         assert_eq!(ENV_REDIS_TAG, "GEARS_TEST_REDIS_TAG");
         assert_eq!(ENV_KAFKA_TAG, "GEARS_TEST_KAFKA_TAG");
+        assert_eq!(ENV_VAULT_IMAGE, "GEARS_TEST_VAULT_IMAGE");
         assert_eq!(ENV_VAULT_TAG, "GEARS_TEST_VAULT_TAG");
         assert_eq!(ENV_GRAPH_LANE_REQUIRED, "GEARS_TEST_PG_GRAPH_REQUIRED");
     }
@@ -580,7 +593,7 @@ mod tests {
         /// (environment variable, accessor it must reach, constant it falls back to)
         type AccessorCase = (&'static str, fn() -> String, &'static str);
 
-        let cases: [AccessorCase; 9] = [
+        let cases: [AccessorCase; 10] = [
             (ENV_POSTGRES_TAG, postgres_tag, POSTGRES_TAG),
             (
                 ENV_POSTGRES_GRAPH_TAG,
@@ -593,6 +606,7 @@ mod tests {
             (ENV_CLICKHOUSE_TAG, clickhouse_tag, CLICKHOUSE_TAG),
             (ENV_REDIS_TAG, redis_tag, REDIS_TAG),
             (ENV_KAFKA_TAG, kafka_tag, KAFKA_TAG),
+            (ENV_VAULT_IMAGE, vault_image, VAULT_IMAGE),
             (ENV_VAULT_TAG, vault_tag, VAULT_TAG),
         ];
         for (var, accessor, default) in cases {
@@ -679,7 +693,7 @@ mod tests {
         assert_eq!(mariadb().tag(), mariadb_tag());
         assert_eq!(clickhouse().name(), CLICKHOUSE_IMAGE);
         assert_eq!(clickhouse().tag(), clickhouse_tag());
-        assert_eq!(vault().name(), VAULT_IMAGE);
+        assert_eq!(vault().name(), vault_image());
         assert_eq!(vault().tag(), vault_tag());
     }
 

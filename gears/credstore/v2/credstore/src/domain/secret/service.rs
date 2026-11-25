@@ -103,6 +103,19 @@ struct AuditTarget {
     secret_type: String,
 }
 
+/// Cleanup a confirmed write leaves behind, run after the write's audit
+/// event is published, so a request cancelled during the cleanup still has
+/// its event. Best effort, like the cleanup itself.
+#[domain_model]
+#[derive(Default)]
+struct PostCommit {
+    /// Debts recorded by the commit, executed in order.
+    debts: Vec<CleanupDebt>,
+    /// Records whose debts became pending rows (an ambiguous commit
+    /// verified as committed): healed from the DB.
+    heal: Vec<StoreKey>,
+}
+
 /// Selection-aware answer to the point read (`Service::get_item`, ADR-0004,
 /// "Read actions follow the projection"): the resolved [`Credential`], its decrypted value when the
 /// projection named `secret` and the winner had one to serve, that value's
@@ -985,11 +998,12 @@ impl Service {
     /// cleanup the outcome implies (older versions after a rotation, this
     /// attempt's version after a lost write) is recorded as a debt in that
     /// same transaction and executed by this request after the confirmed
-    /// commit. The plugin is resolved (fail-fast) only on this path. A lost
-    /// compare-and-set under an `If-Match: *` precondition re-reads the row
-    /// and retries once from the start, as a new attempt, before returning
-    /// `VersionConflict`. Debts and expired intents the row read reported are
-    /// healed on the way (DESIGN section 6.2, "Heal on access").
+    /// commit and the publication of the audit event. The plugin is resolved
+    /// (fail-fast) only on this path. A lost compare-and-set under an
+    /// `If-Match: *` precondition re-reads the row and retries once from the
+    /// start, as a new attempt, before returning `VersionConflict`. Debts and
+    /// expired intents the row read reported are healed on the way (DESIGN
+    /// section 6.2, "Heal on access").
     /// A create-only `PUT` over an expired own row is a conflict like any
     /// other existing row (the expired record is visible: renew or delete it).
     /// `value: None` never touches the plugin at all on create
@@ -1037,10 +1051,12 @@ impl Service {
         precondition: PutPrecondition,
     ) -> Result<PutOutcome, DomainError> {
         let mut audit = None;
+        let mut post = PostCommit::default();
         let result = self
-            .put_attempts(ctx, key, &write, &precondition, &mut audit)
+            .put_attempts(ctx, key, &write, &precondition, &mut audit, &mut post)
             .await;
         self.audit_write(ctx, key, audit, &result).await;
+        self.run_post_commit(post).await;
         result
     }
 
@@ -1053,6 +1069,7 @@ impl Service {
         write: &CredentialWrite,
         precondition: &PutPrecondition,
         audit: &mut Option<AuditTarget>,
+        post: &mut PostCommit,
     ) -> Result<PutOutcome, DomainError> {
         // `If-Match: *` is last-writer-wins: a lost pointer switch re-reads
         // the row and retries once from step 1 (the value is re-copied for
@@ -1063,7 +1080,10 @@ impl Service {
             1
         };
         for _ in 0..attempts {
-            if let Some(outcome) = self.put_once(ctx, key, write, precondition, audit).await? {
+            if let Some(outcome) = self
+                .put_once(ctx, key, write, precondition, audit, post)
+                .await?
+            {
                 return Ok(outcome);
             }
         }
@@ -1085,6 +1105,7 @@ impl Service {
         write: &CredentialWrite,
         precondition: &PutPrecondition,
         audit: &mut Option<AuditTarget>,
+        post: &mut PostCommit,
     ) -> Result<Option<PutOutcome>, DomainError> {
         let secret_type = write.secret_type.as_ref();
         let sharing = write.sharing;
@@ -1258,7 +1279,7 @@ impl Service {
                     let plugin = self.plugins.resolve().await?;
                     let Some(validator) = self
                         .overwrite_existing(
-                            ctx, &plugin, &scope, &existing, sharing, fallback, expires_at, v,
+                            ctx, &plugin, &scope, &existing, sharing, fallback, expires_at, v, post,
                         )
                         .await?
                     else {
@@ -1285,7 +1306,7 @@ impl Service {
                         .await?
                         .ok_or(DomainError::VersionConflict)?;
                     self.count_recorded(&debts);
-                    self.execute_debts(&debts).await;
+                    post.debts.extend(debts);
                     Validator {
                         id: row.id,
                         version: row.version,
@@ -1394,6 +1415,7 @@ impl Service {
                 },
                 v,
                 &scope,
+                post,
             )
             .await?
         } else {
@@ -1489,10 +1511,12 @@ impl Service {
         precondition: WritePrecondition,
     ) -> Result<Validator, DomainError> {
         let mut audit = None;
+        let mut post = PostCommit::default();
         let result = self
-            .patch_attempts(ctx, key, &patch, &precondition, &mut audit)
+            .patch_attempts(ctx, key, &patch, &precondition, &mut audit, &mut post)
             .await;
         self.audit_write(ctx, key, audit, &result).await;
+        self.run_post_commit(post).await;
         result
     }
 
@@ -1505,6 +1529,7 @@ impl Service {
         patch: &CredentialPatch,
         precondition: &WritePrecondition,
         audit: &mut Option<AuditTarget>,
+        post: &mut PostCommit,
     ) -> Result<Validator, DomainError> {
         // `If-Match: *` is last-writer-wins: a lost pointer switch re-reads
         // the row and retries once from step 1.
@@ -1515,7 +1540,7 @@ impl Service {
         };
         for _ in 0..attempts {
             if let Some(validator) = self
-                .patch_once(ctx, key, patch, precondition, audit)
+                .patch_once(ctx, key, patch, precondition, audit, post)
                 .await?
             {
                 return Ok(validator);
@@ -1539,6 +1564,7 @@ impl Service {
         patch: &CredentialPatch,
         precondition: &WritePrecondition,
         audit: &mut Option<AuditTarget>,
+        post: &mut PostCommit,
     ) -> Result<Option<Validator>, DomainError> {
         let tenant = TenantId(ctx.subject_tenant_id());
         let owner = OwnerId(ctx.subject_id());
@@ -1687,6 +1713,7 @@ impl Service {
                     merged_fallback,
                     merged_expires_at,
                     new_value,
+                    post,
                 )
                 .await
             }
@@ -1704,7 +1731,7 @@ impl Service {
                     .await?
                     .ok_or(DomainError::VersionConflict)?;
                 self.count_recorded(&debts);
-                self.execute_debts(&debts).await;
+                post.debts.extend(debts);
                 Ok(Some(Validator {
                     id: row.id,
                     version: row.version,
@@ -1827,9 +1854,9 @@ impl Service {
     /// uniqueness conflict is a definite loss: the transaction commits the
     /// intent deletion together with the `purge` debt for the fresh key
     /// (nothing can ever reference it), the debt is executed after the
-    /// commit, and the caller answers `Conflict`. An ambiguous failure (the
-    /// commit may have happened) is a 503 and leaves the intent for a later
-    /// heal; nothing is executed. An intent found already healed is a
+    /// commit and the audit event, and the caller answers `Conflict`. An
+    /// ambiguous failure (the commit may have happened) is a 503 and leaves
+    /// the intent for a later heal; nothing is executed. An intent found already healed is a
     /// 503 and nothing else.
     async fn create_new(
         &self,
@@ -1838,6 +1865,7 @@ impl Service {
         params: NewRecordParams<'_>,
         value: &SecretValue,
         scope: &AccessScope,
+        post: &mut PostCommit,
     ) -> Result<Validator, DomainError> {
         // Heal on access: an earlier create of this reference that failed
         // after announcing itself left an intent and maybe an orphan key.
@@ -1869,16 +1897,16 @@ impl Service {
         };
         match self.repo.insert_active(scope, &new, &attempt).await {
             Ok(IntentCommit::Committed { debts, healed, .. }) => {
-                self.after_commit(&debts, healed).await;
+                self.after_commit(post, debts, healed);
                 Ok(Validator { id, version: 1 })
             }
             Ok(IntentCommit::Lost { debts }) => {
-                self.after_commit(&debts, 0).await;
+                self.after_commit(post, debts, 0);
                 Err(DomainError::Conflict)
             }
             Ok(IntentCommit::IntentLost) => Err(Self::write_intent_expired()),
             // Ambiguous: resolve it under a lock before answering.
-            Err(_) => self.verify_create(scope, &new, &attempt).await,
+            Err(_) => self.verify_create(scope, &new, &attempt, post).await,
         }
     }
 
@@ -1891,9 +1919,9 @@ impl Service {
     /// together with a `destroy(Exactly(own))` debt (row still exists) or a
     /// `purge(key)` debt (row gone). On a win the same transaction records
     /// `destroy(Below(new))` and deletes the record's expired intents when
-    /// the row read reported any; the debts are executed after the commit.
-    /// Any other repo failure is ambiguous: 503, the intent stays for a later
-    /// heal and nothing is executed. An intent found already healed is a
+    /// the row read reported any; the debts are executed after the commit and
+    /// the audit event. Any other repo failure is ambiguous: 503, the intent
+    /// stays for a later heal and nothing is executed. An intent found already healed is a
     /// 503 and nothing else. Shared by `put`'s replace leg and
     /// `patch {"secret": ...}` (ADR-0007); accepts a `declared` row too,
     /// switching it back to `active`.
@@ -1912,6 +1940,7 @@ impl Service {
         fallback: Fallback,
         expires_at: Option<OffsetDateTime>,
         value: &SecretValue,
+        post: &mut PostCommit,
     ) -> Result<Option<Validator>, DomainError> {
         let store_key = existing.store_key();
         let attempt = WriteAttempt {
@@ -1948,7 +1977,7 @@ impl Service {
                 debts,
                 healed,
             }) => {
-                self.after_commit(&debts, healed).await;
+                self.after_commit(post, debts, healed);
                 Ok(Some(Validator {
                     id: row.id,
                     version: row.version,
@@ -1958,7 +1987,7 @@ impl Service {
             // row is gone); this version's debt was recorded with the intent
             // deletion.
             Ok(IntentCommit::Lost { debts }) => {
-                self.after_commit(&debts, 0).await;
+                self.after_commit(post, debts, 0);
                 Ok(None)
             }
             Ok(IntentCommit::IntentLost) => Err(Self::write_intent_expired()),
@@ -1972,6 +2001,7 @@ impl Service {
                     expires_at,
                     value_version,
                     &attempt,
+                    post,
                 )
                 .await?
                 .map(|row| Validator {
@@ -2046,12 +2076,13 @@ impl Service {
         scope: &AccessScope,
         new: &NewSecret,
         attempt: &WriteAttempt,
+        post: &mut PostCommit,
     ) -> Result<Validator, DomainError> {
         match self.repo.verify_insert_active(scope, new, attempt).await {
             Ok(WriteVerification::Committed { row }) => {
                 self.verified(VerifyOp::Write, VerifyOutcome::Committed);
                 // The commit's own debts are pending rows now.
-                self.heal_record_debts(&attempt.key).await;
+                post.heal.push(attempt.key.clone());
                 Ok(Validator {
                     id: row.id,
                     version: row.version,
@@ -2061,14 +2092,14 @@ impl Service {
                 self.verified(VerifyOp::Write, VerifyOutcome::NotCommitted);
                 match commit {
                     IntentCommit::Committed { debts, healed, .. } => {
-                        self.after_commit(&debts, healed).await;
+                        self.after_commit(post, debts, healed);
                         Ok(Validator {
                             id: new.id,
                             version: 1,
                         })
                     }
                     IntentCommit::Lost { debts } => {
-                        self.after_commit(&debts, 0).await;
+                        self.after_commit(post, debts, 0);
                         Err(DomainError::Conflict)
                     }
                     IntentCommit::IntentLost => Err(Self::write_intent_expired()),
@@ -2076,7 +2107,7 @@ impl Service {
             }
             Ok(WriteVerification::NotApplied { debts }) => {
                 self.verified(VerifyOp::Write, VerifyOutcome::NotApplied);
-                self.after_commit(&debts, 0).await;
+                self.after_commit(post, debts, 0);
                 Err(Self::write_not_applied())
             }
             Err(e) => {
@@ -2102,6 +2133,7 @@ impl Service {
         expires_at: Option<OffsetDateTime>,
         value_version: ValueVersion,
         attempt: &WriteAttempt,
+        post: &mut PostCommit,
     ) -> Result<Option<SecretRow>, DomainError> {
         match self
             .repo
@@ -2119,7 +2151,7 @@ impl Service {
         {
             Ok(WriteVerification::Committed { row }) => {
                 self.verified(VerifyOp::Write, VerifyOutcome::Committed);
-                self.heal_record_debts(&attempt.key).await;
+                post.heal.push(attempt.key.clone());
                 Ok(Some(row))
             }
             Ok(WriteVerification::Retried(commit)) => {
@@ -2130,11 +2162,11 @@ impl Service {
                         debts,
                         healed,
                     } => {
-                        self.after_commit(&debts, healed).await;
+                        self.after_commit(post, debts, healed);
                         Ok(Some(row))
                     }
                     IntentCommit::Lost { debts } => {
-                        self.after_commit(&debts, 0).await;
+                        self.after_commit(post, debts, 0);
                         Ok(None)
                     }
                     IntentCommit::IntentLost => Err(Self::write_intent_expired()),
@@ -2142,7 +2174,7 @@ impl Service {
             }
             Ok(WriteVerification::NotApplied { debts }) => {
                 self.verified(VerifyOp::Write, VerifyOutcome::NotApplied);
-                self.after_commit(&debts, 0).await;
+                self.after_commit(post, debts, 0);
                 Err(Self::write_not_applied())
             }
             Err(e) => {
@@ -2172,14 +2204,27 @@ impl Service {
     }
 
     /// Step 6, after a CONFIRMED commit of a secret write's commit
-    /// transaction: counts what it healed and recorded, then executes the
-    /// debts it recorded. Never called after an ambiguous commit.
-    async fn after_commit(&self, debts: &[CleanupDebt], healed: u64) {
+    /// transaction: counts what it healed and recorded, then leaves the
+    /// debts in `post` for [`Self::run_post_commit`], which runs after the
+    /// write's audit event is published. Never called after an ambiguous
+    /// commit.
+    fn after_commit(&self, post: &mut PostCommit, debts: Vec<CleanupDebt>, healed: u64) {
         if healed > 0 {
             self.metrics.write_intents_healed(healed);
         }
-        self.count_recorded(debts);
-        self.execute_debts(debts).await;
+        self.count_recorded(&debts);
+        post.debts.extend(debts);
+    }
+
+    /// Runs the cleanup a write left in `post`, after its audit event was
+    /// published: the debts in order, then the heal of each record whose
+    /// debts became pending rows. Runs for every outcome of the write, a
+    /// lost attempt's debts included.
+    async fn run_post_commit(&self, post: PostCommit) {
+        self.execute_debts(&post.debts).await;
+        for key in &post.heal {
+            self.heal_record_debts(key).await;
+        }
     }
 
     /// The service principal that executes cleanup debts: the debts belong to
@@ -2362,9 +2407,9 @@ impl Service {
     /// reuse the instant that transaction commits (ADR-0006: no name
     /// retention - a successor mints its own record id and key, so it can
     /// never collide with this delete's lagging purge). After the confirmed
-    /// commit the same request executes the debt (`plugin.delete_key`) and
-    /// deletes its row; a failed execution leaves the debt and does not
-    /// change the reply. The purge also removes any orphan version a crashed
+    /// commit and the audit event the same request executes the debt
+    /// (`plugin.delete_key`) and deletes its row; a failed execution leaves
+    /// the debt and does not change the reply. The purge also removes any orphan version a crashed
     /// or ambiguous write left above the record's pointer.
     ///
     /// # Errors
@@ -2417,6 +2462,7 @@ impl Service {
         // One transaction: delete the row, record the key purge. 0 rows
         // (version mismatch, or a concurrent delete/write already moved the
         // row) maps to the existing not-found/conflict semantics.
+        let mut post = PostCommit::default();
         let result = match self
             .repo
             .delete_by_id(&scope, &row.store_key(), expected_version)
@@ -2424,14 +2470,14 @@ impl Service {
         {
             Ok(debts) => {
                 self.count_recorded(&debts);
-                self.execute_debts(&debts).await;
+                post.debts.extend(debts);
                 Ok(())
             }
             Err(DomainError::NotFound) => Err(Self::delete_not_found(expected_version)),
             // The commit may or may not have happened: resolve it under a
             // lock before answering.
             Err(DomainError::ServiceUnavailable { .. } | DomainError::Internal { .. }) => {
-                self.verify_delete(&scope, &row.store_key(), expected_version)
+                self.verify_delete(&scope, &row.store_key(), expected_version, &mut post)
                     .await
             }
             Err(e) => Err(e),
@@ -2442,6 +2488,7 @@ impl Service {
             secret_type: resolved.gts_id.clone(),
         });
         self.audit_write(ctx, key, target, &result).await;
+        self.run_post_commit(post).await;
         result
     }
 }
@@ -2468,17 +2515,18 @@ impl Service {
         scope: &AccessScope,
         key: &StoreKey,
         expected_version: Option<i64>,
+        post: &mut PostCommit,
     ) -> Result<(), DomainError> {
         match self.repo.verify_delete(scope, key, expected_version).await {
             Ok(DeleteVerification::Committed) => {
                 self.verified(VerifyOp::Delete, VerifyOutcome::Committed);
-                self.heal_record_debts(key).await;
+                post.heal.push(key.clone());
                 Ok(())
             }
             Ok(DeleteVerification::Retried { debts }) => {
                 self.verified(VerifyOp::Delete, VerifyOutcome::NotCommitted);
                 self.count_recorded(&debts);
-                self.execute_debts(&debts).await;
+                post.debts.extend(debts);
                 Ok(())
             }
             Ok(DeleteVerification::PreconditionFailed) => {

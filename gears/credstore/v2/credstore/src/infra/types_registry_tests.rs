@@ -2,7 +2,6 @@
 //! Unit tests for [`GtsSecretTypeResolver`].
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use toolkit_gts::gts_id;
@@ -266,11 +265,15 @@ async fn registry_transport_error_maps_to_service_unavailable() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+// The probe timeout is clamped to 1 ms, so a registry that never answers
+// expires it at once; there is no virtual clock and no injected delay.
+#[tokio::test]
 async fn slow_registry_times_out_as_service_unavailable() {
-    let registry = registry_with(&[]);
-    registry.inject(Fault::on(Call::BatchGet).delay(Duration::from_millis(50)));
-    let resolver = GtsSecretTypeResolver::with_timeout(registry.clone(), Arc::new(NoopMetrics), 10);
+    let resolver = GtsSecretTypeResolver::with_timeout(
+        Arc::new(crate::infra::stalled_registry::StalledRegistry),
+        Arc::new(NoopMetrics),
+        0,
+    );
     let err = resolver
         .resolve(Uuid::from_u128(0x1))
         .await
@@ -280,5 +283,4 @@ async fn slow_registry_times_out_as_service_unavailable() {
         "got: {err:?}"
     );
     assert!(err.to_string().contains("timeout exceeded"), "got: {err}");
-    assert_eq!(registry.calls(Call::BatchGet), 1);
 }

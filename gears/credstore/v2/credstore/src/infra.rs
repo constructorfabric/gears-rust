@@ -5,6 +5,8 @@ mod canonical_mapping;
 pub mod metrics;
 pub mod plugin_select;
 pub mod sdk_error_mapping;
+#[cfg(test)]
+mod stalled_registry;
 pub mod storage;
 pub mod tenant_resolver;
 pub mod types_registry;

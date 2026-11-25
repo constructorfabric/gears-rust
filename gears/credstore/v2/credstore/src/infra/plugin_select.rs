@@ -37,6 +37,7 @@ pub struct GtsCredStorePluginSelector {
     hub: Arc<ClientHub>,
     vendor: String,
     selector: GtsPluginSelector,
+    discovery_budget: Duration,
 }
 
 impl GtsCredStorePluginSelector {
@@ -47,7 +48,16 @@ impl GtsCredStorePluginSelector {
             hub,
             vendor,
             selector: GtsPluginSelector::new(),
+            discovery_budget: DISCOVERY_BUDGET,
         }
+    }
+
+    /// Overrides the discovery budget so a test can expire it without waiting.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_discovery_budget(mut self, budget: Duration) -> Self {
+        self.discovery_budget = budget;
+        self
     }
 
     /// An availability failure of the registry is a retryable outage; anything
@@ -132,7 +142,7 @@ impl PluginSelector for GtsCredStorePluginSelector {
         let instance_id = self
             .selector
             .get_or_init_with_timeout(
-                DISCOVERY_BUDGET,
+                self.discovery_budget,
                 || self.resolve_instance(),
                 |detail| {
                     tracing::warn!(%detail, "credstore plugin discovery timed out");

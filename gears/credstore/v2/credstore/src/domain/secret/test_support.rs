@@ -2,7 +2,7 @@
 //! Shared test infrastructure for domain-layer unit tests (ADR-0006).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -689,6 +689,9 @@ pub struct FakePlugin {
     destroy_log: Mutex<Vec<(StoreKey, DestroySelector)>>,
     /// Every `delete_key` call received, in order.
     delete_key_log: Mutex<Vec<StoreKey>>,
+    /// When set, `destroy` and `delete_key` log the call and then never
+    /// complete (a cleanup stuck on a slow backend).
+    hang_cleanup: AtomicBool,
 }
 
 impl FakePlugin {
@@ -709,6 +712,20 @@ impl FakePlugin {
             get_calls: AtomicUsize::new(0),
             destroy_log: Mutex::new(Vec::new()),
             delete_key_log: Mutex::new(Vec::new()),
+            hang_cleanup: AtomicBool::new(false),
+        }
+    }
+
+    /// Makes every later `destroy` and `delete_key` start (it is logged, see
+    /// [`Self::destroy_calls`] and [`Self::delete_key_calls`]) and then never
+    /// complete, with no timer involved.
+    pub fn hang_cleanup(&self) {
+        self.hang_cleanup.store(true, Ordering::SeqCst);
+    }
+
+    async fn hang_if_requested(&self) {
+        if self.hang_cleanup.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
         }
     }
 
@@ -1065,6 +1082,7 @@ impl CredStorePluginClientV2 for FakePlugin {
         key: &StoreKey,
     ) -> Result<(), CredStorePluginError> {
         self.delete_key_log.lock().expect("lock").push(key.clone());
+        self.hang_if_requested().await;
         if Self::take_one(&self.delete_key_failures) {
             return Err(CredStorePluginError::internal(
                 "simulated backend delete_key failure",
@@ -1091,6 +1109,7 @@ impl CredStorePluginDestroyerV2 for FakePlugin {
             .lock()
             .expect("lock")
             .push((key.clone(), selector.clone()));
+        self.hang_if_requested().await;
         if !self.destroy_supported {
             return Err(CredStorePluginError::internal(
                 "destroy called on a plugin that does not support it",

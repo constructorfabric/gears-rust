@@ -137,7 +137,7 @@ flowchart LR
 
 - The deployment provides a Vault or OpenBao server with a **KV v2** mount reachable from the host process, and a token whose policy covers the plugin's key space (the minimal policy is in [DESIGN §4.1](./DESIGN.md#41-security-and-data-protection)).
 - The mount **MUST** have `delete_version_after = 0s` (no version expires by age) and `cas_required = false` (the plugin writes without compare-and-set; the gear's PostgreSQL compare-and-set decides the winner of concurrent writes).
-- The plugin **MUST** set the key's own `max_versions` to 100 before every `put` (not the mount's: the mount's `max_versions` is not an operator obligation). Vault keeps the larger of the mount's and the key's limit, 10 when both are `0` or unset (`0` is not unlimited), and destroyed versions count, so a lower mount value is harmless. Superseded versions are destroyed by the gear right after each commit, so a key normally holds one or two; when more than 100 pile up above the record's pointer (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not; versions below the pointer are evicted first and are harmless), Vault drops the oldest, possibly the version a record points at, and that record answers an internal error (500) until it is rewritten. 100 is a constant of the plugin and **MUST NOT** be lowered in a later version: the next write to each existing key would remove every version beyond the new limit at once.
+- The plugin **MUST** set the key's own `max_versions` to 100 before every `put` (not the mount's: the mount's `max_versions` is not an operator obligation). Vault keeps the larger of the mount's and the key's limit (OpenBao lets a non-zero key value win), 10 when both are `0` or unset (`0` is not unlimited), and destroyed versions count, so a lower mount value is harmless. Superseded versions are destroyed by the gear right after each commit, so a key normally holds one or two; when more than 100 pile up above the record's pointer (orphans of failed or ambiguous writes and the versions of writers that lost the CAS, destroyed or not; versions below the pointer are evicted first and are harmless), Vault drops the oldest, possibly the version a record points at, and that record answers an internal error (500) until it is rewritten. 100 is a constant of the plugin and **MUST NOT** be lowered in a later version: the next write to each existing key would remove every version beyond the new limit at once.
 - The token's policy **MUST** give `create` and `update` on the key's metadata path, because setting `max_versions` is a `POST` to the metadata endpoint (`create` while the metadata does not exist yet, `update` afterwards).
 - The plugin does not verify any of this at startup or later: these are operator obligations.
 - Exactly one backend plugin serves a CredStore instance; this plugin is selected by its configured vendor (default `openbao`) and cannot serve the same instance as `static-credstore-plugin`.
@@ -280,7 +280,7 @@ The plugin **MUST NOT** write secret bytes, their encoded form or the Vault toke
 
 The plugin **MUST** pass every check of the SDK conformance suite (`credstore_sdk::conformance`) against a real `hashicorp/vault` server, using a token that holds only the minimal ACL policy of this document set.
 
-- **Threshold**: 100% of the checks pass on every Vault version the suite is qualified on (see [TESTING.md](./TESTING.md)); the run is a manual, pre-release step (never part of CI).
+- **Threshold**: 100% of the checks pass on every Vault version the suite is qualified on (see [TESTING.md](./TESTING.md)); the suite runs in CI (lane `credstore-vault`) on the pinned `hashicorp/vault` image, and the run on the version and configuration of the production backend remains a manual, pre-release step.
 - **Rationale**: The conformance suite is the executable form of the backend contract; running it with the minimal policy also proves the documented policy sufficient.
 - **Architecture Allocation**: See [TESTING.md](./TESTING.md).
 
@@ -347,7 +347,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 
 - **Direction**: required from external provider
 - **Protocol/Format**: Vault / OpenBao KV v2 HTTP API (`data`, `metadata`, `destroy` endpoints), JSON, `X-Vault-Token` and optional `X-Vault-Namespace` headers
-- **Compatibility**: Qualified against `hashicorp/vault` (see [TESTING.md](./TESTING.md)); OpenBao exposes the same API. The behaviour of Vault the plugin depends on (the answers for soft-deleted, destroyed and absent versions, `version=0`, a missing mount) is pinned by integration tests.
+- **Compatibility**: Qualified against `hashicorp/vault` (see [TESTING.md](./TESTING.md)); the suite was also run on OpenBao 2.7.3 (2026-11-25): all 38 integration tests pass (21 conformance checks and 17 behaviour tests); the retention test pins the rule of each backend (Vault: the larger of the mount's and the key's `max_versions`; OpenBao: a non-zero key value wins), see [TESTING.md](./TESTING.md). The plugin's own key limit of 100 holds under both rules. The behaviour of Vault the plugin depends on (the answers for soft-deleted, destroyed and absent versions, `version=0`, a missing mount) is pinned by integration tests.
 
 ## 8. Use Cases
 

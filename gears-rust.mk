@@ -512,7 +512,7 @@ test-eb-kafka: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg construct-pg \
+	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg credstore-vault construct-pg \
 	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg license-enforcement-pg model-registry-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
@@ -633,6 +633,25 @@ lane_args_settings-service-pg = -p cf-gears-settings-service --features integrat
 ## otherwise the test skips silently.
 lane_args_credstore-pg = -p cf-gears-credstore-v2 --features integration --test pg_migrations_test
 lane_env_credstore-pg = CREDSTORE_PG_REQUIRE_DOCKER=1
+
+## The credstore v2 Vault plugin's Docker suites: the SDK conformance suite and
+## the plugin's own behaviour tests against a real `hashicorp/vault` dev server
+## (Docker required; every test starts its own container via testcontainers --
+## see gears/credstore/v2/plugins/vault-credstore-plugin/docs/TESTING.md).
+## `--run-ignored ignored-only` because every test in them is ignored by default
+## (a plain `cargo test` has no Docker); `ignored-only` runs exactly those and
+## nothing else, as in the pricing-pg and coord-pg lanes.
+## VAULT_CREDSTORE_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure;
+## otherwise each test returns early and the lane reports `ok` on a run that
+## tested nothing.
+## `--test-threads 4`: under nextest every test is its own process, so the
+## fixture's semaphore of 4 containers does not apply; the thread limit keeps at
+## most 4 containers running at once.
+## `--retries 1`: a test whose container did not start (seen locally as "Vault did
+## not become healthy" after a failed `docker pull`) runs once more; a real defect
+## fails the retry too. Same as the Kafka lane.
+lane_args_credstore-vault = -p cf-gears-vault-credstore-plugin-v2 --run-ignored ignored-only --no-fail-fast --test-threads 4 --retries 1
+lane_env_credstore-vault = VAULT_CREDSTORE_REQUIRE_DOCKER=1
 
 ## Construct's erasure storage on PostgreSQL (Docker required; spins up its own
 ## postgres container via testcontainers -- see

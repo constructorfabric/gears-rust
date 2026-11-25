@@ -1,13 +1,15 @@
 // Created: 2026-10-04 by Constructor Tech
 // Updated: 2026-10-06 by Constructor Tech
-//! Shared fixture of the Docker-backed integration tests: a `hashicorp/vault`
-//! dev server per test, a KV v2 mount configured the way `docs/DESIGN.md`
-//! prescribes, and a token holding only the minimal ACL policy of the docs.
+//! Shared fixture of the Docker-backed integration tests: a `Vault` (or
+//! `OpenBao`) dev server per test, `hashicorp/vault` by default, a KV v2
+//! mount configured the way `docs/DESIGN.md` prescribes, and a token holding
+//! only the minimal ACL policy of the docs.
 //!
-//! Every test that uses it is `#[ignore]`d and never runs in CI; see
-//! `docs/TESTING.md`. Without a reachable Docker daemon the fixture prints a
-//! notice and the test returns early (set `VAULT_CREDSTORE_REQUIRE_DOCKER=1`
-//! to turn that into a failure).
+//! Every test that uses it is ignored by default (it needs Docker); the CI
+//! lane `credstore-vault` runs them explicitly, see `docs/TESTING.md`.
+//! Without a reachable Docker daemon the fixture prints a notice and the test
+//! returns early (set `VAULT_CREDSTORE_REQUIRE_DOCKER=1` to turn that into a
+//! failure).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,7 +19,6 @@
 )]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
@@ -42,20 +43,10 @@ const POLICY: &str = "credstore-it";
 /// one test per check.
 static CONTAINER_SLOTS: Semaphore = Semaphore::const_new(4);
 
-/// The host port Docker mapped to the container's Vault port. Right after `start` (nothing is
-/// waited for) the runtime may not have published the mapping yet, so it is asked again for a
-/// few seconds before the setup fails.
-async fn mapped_vault_port(container: &ContainerAsync<GenericImage>) -> u16 {
-    let mut last = String::new();
-    for _ in 0..100 {
-        match container.get_host_port_ipv4(8200.tcp()).await {
-            Ok(port) => return port,
-            Err(e) => last = e.to_string(),
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("the container does not map the Vault port: {last}");
-}
+/// Printed on stdout by both `Vault` and `OpenBao` dev servers once the server
+/// is unsealed and the root token is created, which is the last thing the dev
+/// mode prints.
+const DEV_SERVER_READY: &str = "Development mode should NOT be used in production installations!";
 
 fn require_docker() -> bool {
     std::env::var_os(ENV_REQUIRE_DOCKER).is_some_and(|v| v != "0" && !v.is_empty())
@@ -101,15 +92,19 @@ impl VaultFixture {
             .acquire()
             .await
             .expect("semaphore is never closed");
-        // The image and its tag come from `libs/test-containers`; the tag can be
-        // overridden with `GEARS_TEST_VAULT_TAG`.
+        // The image and its tag come from `libs/test-containers`; they can be
+        // overridden with `GEARS_TEST_VAULT_IMAGE` (for example
+        // `openbao/openbao`) and `GEARS_TEST_VAULT_TAG`. Each server reads its
+        // own `VAULT_DEV_*` or `BAO_DEV_*` variables and ignores the other set.
         let image = test_containers::vault();
         let image_ref = format!("{}:{}", image.name(), image.tag());
         let request = image
             .with_exposed_port(8200.tcp())
-            .with_wait_for(WaitFor::Nothing)
+            .with_wait_for(WaitFor::message_on_stdout(DEV_SERVER_READY))
             .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", ROOT_TOKEN)
             .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
+            .with_env_var("BAO_DEV_ROOT_TOKEN_ID", ROOT_TOKEN)
+            .with_env_var("BAO_DEV_LISTEN_ADDRESS", "0.0.0.0:8200")
             .with_cap_add("IPC_LOCK")
             .with_cmd(["server", "-dev"]);
         let container = match request.start().await {
@@ -126,7 +121,10 @@ impl VaultFixture {
                 return None;
             }
         };
-        let port = mapped_vault_port(&container).await;
+        let port = container
+            .get_host_port_ipv4(8200.tcp())
+            .await
+            .expect("the container maps the Vault port");
         let mut fixture = Self {
             _container: container,
             _slot: slot,
@@ -135,25 +133,29 @@ impl VaultFixture {
             prefix: format!("it-{}", Uuid::new_v4().simple()),
             token: String::new(),
         };
-        fixture.wait_until_ready().await;
+        fixture.assert_ready().await;
         fixture.configure().await;
         Some(fixture)
     }
 
-    async fn wait_until_ready(&self) {
-        for _ in 0..300 {
-            if let Ok(r) = self
-                .http
-                .get(format!("{}/v1/sys/health", self.address))
-                .send()
-                .await
-                && r.status().is_success()
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        panic!("Vault did not become healthy within 60 s");
+    /// Whether the server under test is `OpenBao` rather than `Vault`.
+    pub fn is_openbao() -> bool {
+        test_containers::vault_image().contains("openbao")
+    }
+
+    /// The dev server has already said it is ready; one request confirms it.
+    async fn assert_ready(&self) {
+        let response = self
+            .http
+            .get(format!("{}/v1/sys/health", self.address))
+            .send()
+            .await
+            .expect("the dev server answers the health check");
+        assert!(
+            response.status().is_success(),
+            "the dev server is not healthy: {}",
+            response.status()
+        );
     }
 
     /// The mount, the policy and the plugin's token, as `docs/DESIGN.md`
