@@ -1674,11 +1674,16 @@ pub fn test_limits() -> crate::domain::quotas::QuotaLimits {
     }
 }
 
-/// The configured policy bounds every test runs with: the shipped defaults.
+/// The configured policy bounds every test runs with: the shipped defaults,
+/// except the evaluation clamp. The 5 ms default is wall time, so a test
+/// thread descheduled on a loaded CI runner would see `DeadlineExceeded`.
 pub fn policy_limits() -> crate::domain::policies::PolicyRuntimeLimits {
-    crate::config::PoliciesSection::default()
-        .to_limits()
-        .expect("the default policy section is valid")
+    crate::config::PoliciesSection {
+        evaluation_timeout_upper_ms: crate::config::PoliciesSection::MAX_EVALUATION_TIMEOUT_MS,
+        ..crate::config::PoliciesSection::default()
+    }
+    .to_limits()
+    .expect("the default policy section is valid")
 }
 
 /// A service whose dependencies are not bound: every lifecycle call is
