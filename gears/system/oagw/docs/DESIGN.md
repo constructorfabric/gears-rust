@@ -179,7 +179,7 @@ Multi-SQL backend portability: PostgreSQL, MySQL, SQLite. The OAGW build compile
 
 **ID**: `cpt-cf-oagw-constraint-body-limit`
 
-Body size hard limit: 100 MiB (`max_body_size_bytes` cannot be set higher). Prevent resource exhaustion; reject before buffering. The effective limit is the smaller of OAGW's `max_body_size_bytes` and the api-gateway's `body_limit_bytes` (16 MiB by default), see [Body Validation Rules](#body-validation-rules).
+Body size hard limit: 100 MiB (`max_body_size_bytes` cannot be set higher). Prevent resource exhaustion: a declared `Content-Length` over the limit is rejected before the body is read, and a body without one is cut as it streams past the limit. The effective limit is the smaller of OAGW's `max_body_size_bytes` and the api-gateway's `body_limit_bytes` (16 MiB by default), see [Body Validation Rules](#body-validation-rules).
 
 **ID**: `cpt-cf-oagw-constraint-https-only`
 
@@ -581,16 +581,29 @@ Default validation checks (no configuration required):
 
 | Check | Rule | Error |
 |---|---|---|
-| Content-Length | Must be valid integer if present; must match actual size | `400 ValidationError` |
-| Max size | `max_body_size_bytes`; a larger `Content-Length` is rejected before buffering, a body without one while buffering | `413 PayloadTooLarge` |
-| Body read | Reading the body fails for another reason (for example the client aborts the upload) | `400 BODY_READ_FAILED` |
+| Content-Length value | Must be a valid integer if present (SDK path; over REST hyper rejects it first, see below) | `400 INVALID_VALUE` |
+| Content-Length match | A streamed body must have exactly as many bytes as its `Content-Length`. If the upstream answered before the mismatch, its response is returned instead and the failure is logged | `400 INVALID_CONTENT_LENGTH` |
+| Max size | `max_body_size_bytes`; a larger `Content-Length` is rejected before the body is read, a body without one is cut while it streams, and so is a body that runs past both the limit and its `Content-Length` (`413`, not `INVALID_CONTENT_LENGTH`). If the upstream answered before the cut, its response is returned instead and the failure is logged | `413 PayloadTooLarge` |
+| Body read | Reading the body fails for another reason (for example the client aborts the upload, or an SDK stream returns an error). If bytes of a streamed body already went out, the upstream may have received the head and part of the body, never a complete request; the detail says so. If the upstream answered before the failure, its response is returned instead and the failure is logged | `400 BODY_READ_FAILED` |
 | Transfer-Encoding | Reject unsupported encodings (only `chunked` supported) | `400 ValidationError` |
 
 These checks run after the `proxy:invoke` permission check, so a caller without it gets `403` before any body is read.
 
-**Effective body limit.** The api-gateway in front of OAGW enforces its own `body_limit_bytes` (default 16 MiB) before OAGW sees the request. The effective limit is the smaller of the two:
-- A body over the api-gateway limit is rejected by the outer layer: `413` with an `about:blank` `application/problem+json` body and no `X-OAGW-Error-Source` header.
-- OAGW's own `413` (canonical `out_of_range` with the 413 override, field violation reason `PAYLOAD_TOO_LARGE`, `X-OAGW-Error-Source: gateway`) is returned only when `max_body_size_bytes` is the smaller limit. With both defaults (100 MiB and 16 MiB) the outer `413` comes first.
+**REST framing errors.** Over REST, hyper (the HTTP server) parses the framing before OAGW runs: a `Content-Length` that is not an integer, conflicting `Content-Length` lines, or a `Transfer-Encoding` other than `chunked` get hyper's bare `400` (no `problem+json` body, no `X-OAGW-Error-Source`). OAGW's own Content-Length and Transfer-Encoding checks answer with `problem+json` only for the in-process SDK and for values hyper accepts. hyper ends a REST body at its `Content-Length`; a client that closes early fails the read (`BODY_READ_FAILED`). On the SDK path a `Body::Bytes` is sent with its own length whatever `Content-Length` says; a `Body::Stream` is bound to it.
+
+**Request body streaming.** Request bodies are not buffered: the REST handler and SDK callers (`Body::Stream`) hand OAGW a stream, and OAGW forwards it as it arrives, enforcing `max_body_size_bytes` on the way. A body with a `Content-Length` goes upstream with that `Content-Length` (HTTP/1.1) or `content-length` (HTTP/2); one without is chunked (HTTP/1.1) or plain DATA frames (HTTP/2). A stream that yields more or fewer bytes than declared fails the request without completing its framing. A failure on the caller's side of the body (limit, length, read error) before the upstream's response head arrives wins over whatever the upstream made of the aborted request; once the head arrived, the upstream's response is relayed and the body failure only logged. A REST client gone mid-upload (the REST handler's read of its body fails because the connection closed or reset, or the HTTP/2 stream was cancelled) is counted as `Cancelled`, even if the upstream's response head had already arrived. An SDK caller's stream error is never read as the caller gone, whatever its kind: that caller still receives the response, which is counted with its status. An upstream that answers before reading the whole body (an early `401` or `413`) has its response relayed (`X-OAGW-Error-Source: upstream`) while the upload is still open. If it closes the connection right away with the upload unread, TCP may reset it and destroy that answer before OAGW reads it; the client then gets a gateway `502`.
+
+The body is read whole before dispatch only when a stage needs its bytes: an auth plugin's signing phase whose `signs_body` is true for the upstream's config and the declared length (`aws_sigv4` without `unsigned_payload`, or with it and no `Content-Length`), an SDK stream declared `Content-Length: 0`, or any streamed body while the upstream's circuit breaker is not closed (an upload streamed inside the permit would hold a half-open probe slot for as long as the client keeps it open, and keep the circuit from closing for every caller; see [ADR-0005](ADR/0005-circuit-breaker.md)). The read is bounded by `max_body_size_bytes` and the request deadline (`504`, reason `REQUEST_NOT_SENT`). Guard and transform plugins never see the request body. Consequences:
+
+- The upload runs at the client's pace inside the request timeout: a slow upload to an upstream that answers only after the whole body counts against it. A trickling upload does not count against the upstream's circuit breaker, and a deadline hit after the upload ends counts only if what was left of the request timeout was the upstream's full budget.
+- Resend of a streamed body: while it is sent, its first `request_retry_buffer_bytes` (default 1 MiB, at most 16 MiB, `0` turns it off) are copied. Where the engine resends a request (stale keep-alive connection for an idempotent method, graceful `GOAWAY` for an idempotent method, refused HTTP/2 stream, `HTTP_1_1_REQUIRED`), it sends the copy and then the rest of the body the first attempt had not read, still checked against the `Content-Length`. A body longer than the buffer is not resendable: its copy is freed as soon as it passes the limit, and such a request fails with `502` where a buffered one would be resent. No copy is kept where the engine cannot resend (an HTTP/1.1 request that is not both on a reused connection and idempotent, or one declaring `Trailer`), and the copy is freed once the upstream's response head arrives.
+- AWS `aws-chunked` streaming signatures are not implemented: on a SigV4 route a body is read whole to be hashed, or streamed as `UNSIGNED-PAYLOAD`.
+
+**Effective body limit.** The api-gateway in front of OAGW enforces its own `body_limit_bytes` (default 16 MiB). The effective limit is the smaller of the two; which `413` the client gets depends on whether the body declares its length:
+- A declared `Content-Length` over the api-gateway limit is rejected by the outer layer before OAGW sees the request: `413` with an `about:blank` `application/problem+json` body and no `X-OAGW-Error-Source` header.
+- A body without a declared length (chunked on HTTP/1.1, no `content-length` on HTTP/2) is cut by the api-gateway limit as it streams. OAGW reads the cut from the body stream and returns its own `413` (canonical `out_of_range` with the 413 override, field violation reason `PAYLOAD_TOO_LARGE`, `X-OAGW-Error-Source: gateway`), as for a body over `max_body_size_bytes`.
+- A body over `max_body_size_bytes` within the api-gateway limit gets OAGW's `413` too. With both defaults (100 MiB and 16 MiB) a declared length over 16 MiB gets the outer `413`.
+- A streamed body cut at either limit after the upstream's response head arrived gets the upstream's response, not the `413`; the cut is logged.
 
 Additional validation (JSON Schema, content-type checks, custom rules) implemented via guard plugins.
 
@@ -604,7 +617,7 @@ Rules that mutate inbound → outbound:
 | Path suffix | Path | Append to `match.http.path` if `path_suffix_mode`: `append`; plugin mutable |
 | Query params | Query | The client's query string, byte for byte (escapes, `+`, repeated keys, empty values, keys without `=`, order). This includes what the gateway used to escape: `\|`, `{`, `}`, `[`, `]`, `\`, `^`, a backtick, raw non-ASCII UTF-8 bytes and malformed escapes such as `%zz`; a strict upstream (Tomcat, for one) may reject them with 400. Transforms see the decoded pairs. The query is rebuilt from the pairs, form-encoded, when a transform changes them, or when the query has a literal `;`: the allowlist splits pairs on `&` only, while Rack 2, older Python `parse_qs` and older Go `net/url` also split on `;`, so `model=x;admin=1` (one parameter, `model`) would give them an `admin` the allowlist never checked; it goes out as `model=x%3Badmin%3D1`. A rebuilt query encodes every pair again from its decoded form: pairs a transform left alone lose their original encoding, and an invalid escape such as `%FF` becomes `%EF%BF%BD` |
 | Headers | Headers | Apply `upstream.headers` transformation rules; plugin mutable |
-| Body | Body | Passthrough by default; plugin mutable |
+| Body | Body | Passthrough, streamed; guard and transform plugins do not see or change the request body. An auth plugin's signing phase may read it whole (see Request body streaming) |
 
 #### Plugin Lifecycle Management
 
@@ -846,7 +859,7 @@ On the wire the 502, 503 and 504 rows are the canonical `service_unavailable` (5
 
 Every gateway 502, 503 or 504 from the upstream exchange carries a dispatch reason. It is set from the engine error kind (or the gateway step that failed), not from the error type, and tells the client whether a retry of a non-idempotent request is safe.
 
-`REQUEST_NOT_SENT` means no byte of the HTTP request left the gateway; TCP or TLS setup may have reached the upstream. The reason covers the whole exchange: when the engine resends a request after a first attempt the upstream may have processed (a stale keep-alive connection, a graceful HTTP/2 `GOAWAY`) and the resend fails, even to connect, the reason is `REQUEST_MAY_HAVE_BEEN_SENT`.
+`REQUEST_NOT_SENT` means no byte of the HTTP request left the gateway; TCP or TLS setup may have reached the upstream. A request whose streamed body fails on the caller's side gets `400` (`BODY_READ_FAILED`, `INVALID_CONTENT_LENGTH`) or `413` without a dispatch reason, even though the upstream may have received the head and part of the body; it never receives a complete request, and the error detail says when bytes went out. The reason covers the whole exchange: when the engine resends a request after a first attempt the upstream may have processed (a stale keep-alive connection, a graceful HTTP/2 `GOAWAY`) and the resend fails, even to connect, the reason is `REQUEST_MAY_HAVE_BEEN_SENT`.
 
 | Reason | Cases | Status | Retry |
 |---|---|---|---|
@@ -855,7 +868,7 @@ Every gateway 502, 503 or 504 from the upstream exchange carries a dispatch reas
 | | Circuit breaker open | 503, `Retry-After` until the probe | |
 | | Connect timeout; endpoint selection, resolution or signing timed out | 504 | |
 | | Upstream without endpoints; outbound request that cannot be built | 502 | |
-| `REQUEST_MAY_HAVE_BEEN_SENT` | Connection closed by the upstream, read or write error, HTTP/2 error, invalid response (`Protocol`), WebSocket upgrade rejected, streamed request body failed mid-stream, any engine error kind added later | 502 | Idempotent requests only |
+| `REQUEST_MAY_HAVE_BEEN_SENT` | Connection closed by the upstream, read or write error, HTTP/2 error, invalid response (`Protocol`), WebSocket upgrade rejected, any engine error kind added later | 502 | Idempotent requests only |
 | | Read or write timeout; request timeout; WebSocket upgrade timeout | 504 | |
 
 The 502 cases send `retry_after_seconds: 5`. Statuses did not change with the reasons.
@@ -876,7 +889,7 @@ The two backends an auth plugin depends on have their own reasons: `CREDENTIAL_S
 | Plugin misconfiguration (bad config, an endpoint URL or scheme the HTTP client cannot use, a `private_key_jwt` key that is not a PKCS#8 PEM key of the type `signing_alg` needs, header the gateway cannot set, signing output the gateway cannot send) | 500 `internal` | |
 | Other plugin failure (secret value not UTF-8 or not a header value, in `config` and `request_ref` mode alike; an `aws_sigv4` secret that is not an access key id, an empty secret key or a session token that is not visible ASCII; unexpected credential store error) | 401 `unauthenticated` | `AUTH_PLUGIN_INTERNAL` |
 
-A signer that has a valid config but cannot sign the request as the caller sent it (`PluginError::InvalidRequest`: an `aws_sigv4` streamed body without `unsigned_payload`, a client `X-Amz-Security-Token` without `session_token_ref`, an S3 path the gateway rewrote) is not a credential failure: 400 `invalid_argument`, reason `VALIDATION`, on the field the plugin names.
+A signer that has a valid config but cannot sign the request as the caller sent it (`PluginError::InvalidRequest`: a client `X-Amz-Security-Token` without `session_token_ref`, an S3 path the gateway rewrote) is not a credential failure: 400 `invalid_argument`, reason `VALIDATION`, on the field the plugin names.
 
 An invalid identity provider response is logged and reported by a fixed class (for example "unsupported token type"), never with text from its body. An unusable token is never sent or cached.
 
@@ -1068,7 +1081,7 @@ The endpoint selector (`PoolEndpointSelector`) caches each upstream's endpoint p
 Prometheus metrics at `/metrics` (admin-only):
 
 - `oagw_requests_total{host, http.request.method, http.route, http.response.status_code, credential_mode}` — counter, one per request with a response: the upstream's status, or for a gateway error the status the client gets (a denied `proxy:invoke` check, and a granted request the REST handler rejects before the Data Plane runs, under `host` and `http.route` `unknown`); a request the client dropped before its response head is only in `oagw_errors_total` as `Cancelled` (label keys follow OTel HTTP semantic conventions; numeric status; method normalized to a standard verb or `_OTHER`; aligned with the inbound API Gateway; `credential_mode` is `config` or `request_ref`, see [ADR-0022](ADR/0022-request-secret-refs.md), and `unknown` before the upstream resolves)
-- `oagw_request_duration_seconds{host, http.route, phase}` — histogram (`phase`: `total` from request start to the response head or the gateway error, the body not included; `resolve` for the upstream and route lookup; `auth` for the auth plugin; `sign` for its signing phase ([ADR-0023](ADR/0023-request-signing.md)), only for a plugin that signs; a request that does not resolve records `resolve` with `host` and `http.route` set to `unknown`)
+- `oagw_request_duration_seconds{host, http.route, phase}` — histogram (`phase`: `total` from request start to the response head or the gateway error, the response body not included; for a streamed request body it includes the client's upload up to the response head; `resolve` for the upstream and route lookup; `auth` for the auth plugin; `sign` for its signing phase ([ADR-0023](ADR/0023-request-signing.md)), only for a plugin that signs; a request that does not resolve records `resolve` with `host` and `http.route` set to `unknown`)
 - `oagw_stream_duration_seconds{host, http.route, outcome}` — histogram, request start to the end of the response body (`outcome`: `completed` at the end of the body or once its `Content-Length` went through, `error` for an upstream failure or idle timeout, `shutdown` for a gateway stop, `cancelled` when the client went away); every upstream body, SSE or not; none for a response without a body
 - `oagw_requests_in_flight{host}` — gauge, from the start of the Data Plane pipeline until the response body ends, fails or is dropped (`host` `unknown` until the upstream is resolved)
 - `oagw_errors_total{host, http.route, error_type, credential_mode}` — counter (gateway errors, and `Cancelled`; upstream error responses are not errors here; `credential_mode` is `unknown` before the upstream resolves)

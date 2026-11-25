@@ -654,56 +654,41 @@ mod methods {
 mod cancelled_uploads {
     use futures_util::StreamExt as _;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use tower::ServiceExt as _;
 
-    use super::super::client_gone;
+    use super::addressing::{ok_text, route, unique_alias, upstream};
     use crate::infra::proxy::service::tests::RequestRecorder;
-    use crate::test_support::AppHarness;
+    use crate::test_support::{AppHarness, MockGuard};
 
-    fn io_error(kind: std::io::ErrorKind) -> axum::Error {
-        axum::Error::new(std::io::Error::new(kind, "test"))
-    }
-
-    #[test]
-    fn a_closed_or_reset_connection_is_the_client_gone() {
-        use std::io::ErrorKind;
-        for kind in [
-            ErrorKind::ConnectionReset,
-            ErrorKind::ConnectionAborted,
-            ErrorKind::BrokenPipe,
-            ErrorKind::UnexpectedEof,
-        ] {
-            assert!(client_gone(&io_error(kind)), "{kind:?}");
-        }
-        assert!(!client_gone(&io_error(ErrorKind::InvalidData)));
-        assert!(!client_gone(&axum::Error::new("bad chunk")));
-    }
-
-    /// An HTTP/2 stream the client cancelled is the client gone; a protocol
-    /// error is not. `h2` must be the version hyper uses, or the downcast in
-    /// `client_gone` never matches.
-    #[test]
-    fn a_cancelled_http2_stream_is_the_client_gone() {
-        let h2_error = |reason| axum::Error::new(h2::Error::from(reason));
-        assert!(client_gone(&h2_error(h2::Reason::CANCEL)));
-        assert!(!client_gone(&h2_error(h2::Reason::PROTOCOL_ERROR)));
-    }
-
-    async fn harness() -> (AppHarness, Arc<RequestRecorder>) {
+    /// A harness recording metrics, and the proxy URL of a `POST` route on
+    /// the mock upstream.
+    async fn harness() -> (AppHarness, Arc<RequestRecorder>, MockGuard, String) {
         let metrics = Arc::new(RequestRecorder::default());
         let h = AppHarness::builder()
             .with_metrics(metrics.clone())
             .build()
             .await;
-        (h, metrics)
+        let mut guard = MockGuard::new();
+        guard.mock("POST", "/v1/test", ok_text("ok"));
+        let alias = unique_alias("upload");
+        let id = upstream(&h, &alias, h.mock_port(), None).await;
+        route(&h, &id, &["POST"], &guard.path("/v1/test"), &[]).await;
+        let url = format!("/oagw/v1/proxy/{alias}{}", guard.path("/v1/test"));
+        (h, metrics, guard, url)
+    }
+
+    fn cancelled(events: &[String]) -> bool {
+        events
+            .iter()
+            .any(|e| e.starts_with("error ") && e.ends_with(" Cancelled"))
+            && !events.iter().any(|e| e.starts_with("request "))
     }
 
     /// A client gone mid-upload is counted as `Cancelled`, not as a 400.
     #[tokio::test]
     async fn a_client_gone_mid_upload_is_counted_as_cancelled() {
-        let (h, metrics) = harness().await;
+        let (h, metrics, guard, url) = harness().await;
         let body = axum::body::Body::from_stream(futures_util::stream::iter([
             Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"partial ")),
             Err(std::io::Error::new(
@@ -711,40 +696,177 @@ mod cancelled_uploads {
                 "client went away",
             )),
         ]));
-        let request = http::Request::post("/oagw/v1/proxy/any-alias/v1/test")
-            .body(body)
-            .unwrap();
+        let request = http::Request::post(url).body(body).unwrap();
         let resp = h.router().clone().oneshot(request).await.unwrap();
         assert_eq!(resp.status(), http::StatusCode::BAD_REQUEST);
-        assert_eq!(
-            metrics.events(),
-            ["duration total", "error unknown Cancelled"]
-        );
+        let events = metrics.events();
+        assert!(cancelled(&events), "{events:?}");
+        assert!(guard.recorded_requests().await.is_empty());
     }
 
-    /// A handler dropped while it reads the body (the gateway's request
+    /// A handler dropped while the body streams (the gateway's request
     /// timeout, a shutdown) is counted as `Cancelled`.
     #[tokio::test]
     async fn a_handler_dropped_mid_upload_is_counted_as_cancelled() {
-        let (h, metrics) = harness().await;
+        use tokio::io::AsyncReadExt as _;
+
+        let metrics = Arc::new(RequestRecorder::default());
+        let h = AppHarness::builder()
+            .with_metrics(metrics.clone())
+            .build()
+            .await;
+        // An upstream that reports the request head and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (head_tx, head_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            let mut head_tx = Some(head_tx);
+            while let Ok(n) = conn.read(&mut buf).await {
+                if n == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n")
+                    && let Some(tx) = head_tx.take()
+                {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        let alias = unique_alias("upload-head");
+        let id = upstream(&h, &alias, port, None).await;
+        route(&h, &id, &["POST"], "/v1/head", &[]).await;
+        let url = format!("/oagw/v1/proxy/{alias}/v1/head");
+
         let body = axum::body::Body::from_stream(
             futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
                 b"partial ",
             ))])
             .chain(futures_util::stream::pending()),
         );
-        let request = http::Request::post("/oagw/v1/proxy/any-alias/v1/test")
-            .body(body)
+        let request = http::Request::post(url).body(body).unwrap();
+        let handler = h.router().clone().oneshot(request);
+        // Dropped once the upload is under way at the upstream.
+        tokio::select! {
+            resp = handler => panic!("the upstream never answers: {resp:?}"),
+            head = head_rx => head.expect("upstream got the request head"),
+        }
+        let events = metrics.events();
+        assert!(cancelled(&events), "{events:?}");
+    }
+}
+
+/// Request bodies over REST are streamed to the upstream, not buffered.
+mod streamed_bodies {
+    use bytes::Bytes;
+    use tower::ServiceExt as _;
+
+    use super::addressing::{ok_text, route, unique_alias, upstream};
+    use crate::test_support::{AppHarness, MockGuard, RecordedRequest, TestResponse};
+
+    /// A harness (with `max_body`, if any) and the proxy URL of a `POST`
+    /// route on the mock upstream.
+    async fn setup(max_body: Option<usize>) -> (AppHarness, MockGuard, String) {
+        let mut builder = AppHarness::builder();
+        if let Some(max) = max_body {
+            builder = builder.with_max_body_size(max);
+        }
+        let h = builder.build().await;
+        let mut guard = MockGuard::new();
+        guard.mock("POST", "/v1/upload", ok_text("ok"));
+        let alias = unique_alias("upload");
+        let id = upstream(&h, &alias, h.mock_port(), None).await;
+        route(&h, &id, &["POST"], &guard.path("/v1/upload"), &[]).await;
+        let url = format!("/oagw/v1/proxy/{alias}{}", guard.path("/v1/upload"));
+        (h, guard, url)
+    }
+
+    fn header<'a>(r: &'a RecordedRequest, name: &str) -> Option<&'a str> {
+        r.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `POST url` with `chunks` as a streamed body and `content_length`, if
+    /// any.
+    async fn post(
+        h: &AppHarness,
+        url: &str,
+        chunks: Vec<Bytes>,
+        content_length: Option<usize>,
+    ) -> TestResponse {
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(
+            chunks.into_iter().map(Ok::<_, std::io::Error>),
+        ));
+        let mut req = http::Request::post(url).header("content-type", "application/octet-stream");
+        if let Some(len) = content_length {
+            req = req.header("content-length", len);
+        }
+        let resp = h
+            .router()
+            .clone()
+            .oneshot(req.body(body).unwrap())
+            .await
             .unwrap();
-        let timed_out = tokio::time::timeout(
-            Duration::from_millis(50),
-            h.router().clone().oneshot(request),
-        )
-        .await;
-        assert!(timed_out.is_err());
-        assert_eq!(
-            metrics.events(),
-            ["duration total", "error unknown Cancelled"]
+        TestResponse::from_response(resp).await
+    }
+
+    fn chunks(n: usize, size: usize) -> Vec<Bytes> {
+        (0..n)
+            .map(|i| Bytes::from(vec![b'a' + (i % 26) as u8; size]))
+            .collect()
+    }
+
+    /// The client's `Content-Length` reaches the upstream with the body; a
+    /// body without one is chunked.
+    #[tokio::test]
+    async fn the_body_streams_with_the_clients_framing() {
+        let (h, guard, url) = setup(None).await;
+        let body = chunks(16, 64 * 1024);
+        let expected: Vec<u8> = body.concat();
+        for content_length in [Some(expected.len()), None] {
+            let resp = post(&h, &url, body.clone(), content_length).await;
+            assert_eq!(resp.status(), 200, "{content_length:?}");
+            let rec = guard.recorded_requests().await;
+            let last = rec.last().unwrap();
+            assert_eq!(last.body, expected);
+            let declared = content_length.map(|n| n.to_string());
+            assert_eq!(header(last, "content-length"), declared.as_deref());
+            let chunked = content_length.is_none().then_some("chunked");
+            assert_eq!(header(last, "transfer-encoding"), chunked);
+        }
+    }
+
+    /// A chunked body over `max_body_size` is cut while it streams: 413, and
+    /// the upstream gets no complete request.
+    #[tokio::test]
+    async fn a_body_over_the_limit_is_cut_mid_stream() {
+        let (h, guard, url) = setup(Some(100 * 1024)).await;
+        let resp = post(&h, &url, chunks(4, 64 * 1024), None).await;
+        assert_eq!(resp.status(), 413);
+        assert!(guard.recorded_requests().await.is_empty());
+    }
+
+    /// A body that ends short of its `Content-Length` fails with 400
+    /// `INVALID_CONTENT_LENGTH`. Over a real connection hyper sees this
+    /// first and the stream fails instead (`BODY_READ_FAILED`).
+    #[tokio::test]
+    async fn a_body_short_of_its_content_length_is_rejected() {
+        let (h, guard, url) = setup(None).await;
+        let resp = post(&h, &url, chunks(1, 10), Some(20)).await;
+        assert_eq!(resp.status(), 400);
+        let problem = resp.json();
+        let violations = problem["context"]["field_violations"].to_string();
+        assert!(
+            violations.contains(oagw_sdk::field::INVALID_CONTENT_LENGTH),
+            "{problem}"
         );
+        assert!(guard.recorded_requests().await.is_empty());
     }
 }

@@ -289,13 +289,19 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
    1. [x] - `p1` - **IF** Content-Length is not a valid non-negative integer - `inst-body-1a`
       1. [x] - `p1` - **RETURN** 400 ValidationError - `inst-body-1a1`
    2. [x] - `p1` - **IF** Content-Length exceeds `max_body_size_bytes` (at most and by default 100 MiB, 104,857,600 bytes; the api-gateway's `body_limit_bytes`, 16 MiB by default, rejects larger bodies before OAGW sees them) - `inst-body-1b`
-      1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (reject before buffering per `cpt-cf-oagw-constraint-body-limit`) - `inst-body-1b1`
+      1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (reject before reading the body per `cpt-cf-oagw-constraint-body-limit`) - `inst-body-1b1`
 2. [x] - `p1` - **IF** Transfer-Encoding header present - `inst-body-2`
    1. [x] - `p1` - **IF** encoding is not `chunked` - `inst-body-2a`
       1. [x] - `p1` - **RETURN** 400 ValidationError (only `chunked` supported) - `inst-body-2a1`
 3. [x] - `p1` - **IF** actual body size exceeds `max_body_size_bytes` during streaming read - `inst-body-3`
    1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (abort read) - `inst-body-3a`
-4. [x] - `p1` - **RETURN** validation passed - `inst-body-4`
+4. [x] - `p1` - **IF** a streamed body yields more or fewer bytes than its Content-Length - `inst-body-5`
+   1. [x] - `p1` - **RETURN** 400 `INVALID_CONTENT_LENGTH` (abort read) - `inst-body-5a`
+5. [x] - `p1` - **IF** reading the body fails otherwise (client abort, SDK stream error) - `inst-body-6`
+   1. [x] - `p1` - **RETURN** 400 `BODY_READ_FAILED`; a REST client gone mid-upload is counted as `Cancelled` (an SDK stream error never is) - `inst-body-6a`
+6. [x] - `p1` - **RETURN** validation passed - `inst-body-4`
+
+Steps 3 to 5 run while the body streams to the upstream (see `cpt-cf-oagw-algo-upstream-forwarding`). If the upstream's response head arrived before the failure, that response is returned and the failure is logged; otherwise the upstream may have received the head and part of the body, never a complete request. Over REST, hyper parses the framing first: a `Content-Length` that is not an integer or a `Transfer-Encoding` other than `chunked` gets hyper's bare `400` (no `problem+json`, no `X-OAGW-Error-Source`); steps 1 and 2 answer with `problem+json` for in-process SDK requests. On the SDK path a `Body::Bytes` is sent with its own length whatever its `Content-Length` header says.
 
 ### Upstream Forwarding
 
@@ -308,11 +314,12 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 **Steps**:
 1. [x] - `p1` - Build the engine target: the load balancer's pre-resolved address, or resolve the endpoint host (retries 100/500/2500 ms) and take the first address the SSRF policy allows - `inst-fwd-1`
 2. [x] - `p1` - Choose transport and protocol policy: TLS for `https`/`wss`/`wt`, HTTP/1.1 only for `wss`, cleartext HTTP/1.1 for `http` - `inst-fwd-2`
-3. [x] - `p1` - **IF** request body is buffered - `inst-fwd-3`
+3. [x] - `p1` - **IF** request body is buffered (an SDK `Body::Bytes`, or a stream read whole because the auth plugin's signing phase hashes it: `signs_body`, `aws_sigv4` without `unsigned_payload`; or read whole because the upstream's circuit breaker is not closed) - `inst-fwd-3`
    1. [x] - `p1` - Send it with `Content-Length` framing derived by the engine - `inst-fwd-3a`
-4. [x] - `p1` - **ELSE IF** request body is streaming - `inst-fwd-4`
-   1. [x] - `p1` - Forward chunks as they arrive, enforcing `max_body_size`; on breach or stream error abort the upstream request without completing its framing and **RETURN** 413 PayloadTooLarge or 502 DownstreamError (reason `REQUEST_MAY_HAVE_BEEN_SENT`) - `inst-fwd-4a`
-5. [x] - `p1` - Engine reuses a pooled connection or connects (ALPN `h2`/`http/1.1` for TLS), rewrites framing and hop-by-hop headers, and sends the request; the engine sends it again at most once, on another connection, only in the cases of ADR-0019 (a request that never left, `REFUSED_STREAM`, `HTTP_1_1_REQUIRED`, and for idempotent methods a stale keep-alive connection or a graceful `GOAWAY`) - `inst-fwd-5`
+4. [x] - `p1` - **ELSE IF** request body is streaming (every REST body, an SDK `Body::Stream`) - `inst-fwd-4`
+   1. [x] - `p1` - Forward chunks as they arrive, with the client's `Content-Length` when it sent one and chunked framing otherwise, enforcing `max_body_size` and the declared length; on breach, length mismatch or stream error abort the upstream request without completing its framing and **RETURN** 413 PayloadTooLarge, 400 `INVALID_CONTENT_LENGTH` or 400 `BODY_READ_FAILED` - `inst-fwd-4a`
+   2. [x] - `p1` - An upstream response that arrives before the body is fully sent (an early `401` or `413`) is returned as the response - `inst-fwd-4b`
+5. [x] - `p1` - Engine reuses a pooled connection or connects (ALPN `h2`/`http/1.1` for TLS), rewrites framing and hop-by-hop headers, and sends the request; the engine sends it again at most once, on another connection, only in the cases of ADR-0019 (a request that never left, `REFUSED_STREAM`, `HTTP_1_1_REQUIRED`, and for idempotent methods a stale keep-alive connection or a graceful `GOAWAY`). A buffered body is resent from its bytes; a streamed body from the copy of its first `request_retry_buffer_bytes` (default 1 MiB) kept while it is sent, followed by the rest of the stream, with its `Content-Length` still checked. A streamed body longer than that is not resent: its copy is freed once it passes the limit - `inst-fwd-5`
 6. [x] - `p1` - **IF** the engine fails - `inst-fwd-6`
    1. [x] - `p1` - Map the engine error kind to `DomainError` (see [ADR-0019](../ADR/0019-upstream-proxy-engine.md)) and to its dispatch stage: only the connect and TLS kinds are `REQUEST_NOT_SENT`, unless the engine resent the request after a first attempt the upstream may have processed; every other kind, a future one included, is `REQUEST_MAY_HAVE_BEEN_SENT` - `inst-fwd-6a`
 7. [x] - `p1` - Strip every `x-oagw-*` header from the upstream response head - `inst-fwd-7`
@@ -475,7 +482,7 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] `Host` (HTTP/1.1) or `:authority` (HTTP/2) is replaced with upstream endpoint host
 - [x] Header set/add/remove operations from upstream/route config are applied in declared order
 - [x] Content-Length validation rejects non-integer or mismatched values with 400
-- [x] `max_body_size_bytes` (at most 100 MiB) is enforced before buffering (413 PayloadTooLarge); the effective limit is the smaller of it and the api-gateway's `body_limit_bytes` (16 MiB by default), whose `413` is an `about:blank` problem without `X-OAGW-Error-Source`
+- [x] `max_body_size_bytes` (at most 100 MiB) is enforced before buffering (413 PayloadTooLarge); the effective limit is the smaller of it and the api-gateway's `body_limit_bytes` (16 MiB by default); a declared length over the api-gateway limit gets its `413`, an `about:blank` problem without `X-OAGW-Error-Source`, while a body without one is cut as it streams and gets OAGW's `413`
 - [x] Only `chunked` Transfer-Encoding is accepted; others return 400
 - [x] Gateway errors use RFC 9457 Problem Details (`application/problem+json`) with GTS type identifiers
 - [x] `X-OAGW-Error-Source: gateway` is set on all gateway-originated errors

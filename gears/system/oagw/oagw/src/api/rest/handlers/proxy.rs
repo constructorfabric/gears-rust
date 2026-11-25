@@ -22,8 +22,12 @@ use crate::gear::AppState;
 /// Parses the alias and path suffix from the URL, validates the request,
 /// builds an `http::Request<oagw_sdk::Body>`, and delegates to the Data Plane service.
 ///
+/// The request body is streamed to the Data Plane, which forwards it as it
+/// arrives (or reads it whole when a stage needs its bytes, such as a
+/// payload-hashing signer).
+///
 /// For WebSocket upgrade requests (`Upgrade: websocket`), extracts the
-/// `hyper::upgrade::OnUpgrade` handle, skips body buffering, and spawns a
+/// `hyper::upgrade::OnUpgrade` handle, ignores the body, and spawns a
 /// bidirectional byte-forwarding task after receiving a 101 response.
 pub async fn proxy_handler(
     Extension(state): Extension<AppState>,
@@ -31,78 +35,6 @@ pub async fn proxy_handler(
     req: Request,
 ) -> Response {
     proxy(state, ctx, req).await.unwrap_or_else(error_response)
-}
-
-/// Map a failure to buffer the request body. Only the size limit
-/// (`http_body_util::LengthLimitError` somewhere in the source chain) is a
-/// 413; any other failure, such as an aborted upload, is a gateway 400.
-fn body_read_error(err: &axum::Error, max_body_size: usize, path: &str) -> DomainError {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(cause) = source {
-        if cause.is::<http_body_util::LengthLimitError>() {
-            return DomainError::PayloadTooLarge {
-                detail: format!("request body exceeds maximum of {max_body_size} bytes"),
-                instance: path.to_owned(),
-            };
-        }
-        source = cause.source();
-    }
-    tracing::debug!(error = %err, path, "reading the proxied request body failed");
-    DomainError::Validation {
-        field: "body",
-        reason: field::BODY_READ_FAILED,
-        detail: "failed to read the request body".into(),
-        instance: path.to_owned(),
-    }
-}
-
-/// Whether a failed body read means the client went away mid-upload: the
-/// connection closed or reset, or the HTTP/2 stream cancelled. Such a request
-/// is counted as `Cancelled`, not as a 400 nobody receives.
-fn client_gone(err: &axum::Error) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
-    while let Some(cause) = source {
-        if let Some(e) = cause.downcast_ref::<hyper::Error>()
-            && (e.is_incomplete_message() || e.is_canceled())
-        {
-            return true;
-        }
-        if let Some(e) = cause.downcast_ref::<h2::Error>()
-            && (e.reason() == Some(h2::Reason::CANCEL) || e.is_go_away() || e.is_io())
-        {
-            return true;
-        }
-        if let Some(e) = cause.downcast_ref::<std::io::Error>()
-            && matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        {
-            return true;
-        }
-        source = cause.source();
-    }
-    false
-}
-
-/// A request [`granted_request`] refused.
-struct Rejected {
-    /// The error the client gets.
-    err: DomainError,
-    /// The client went away while its body was read.
-    client_gone: bool,
-}
-
-impl From<DomainError> for Rejected {
-    fn from(err: DomainError) -> Self {
-        Self {
-            err,
-            client_gone: false,
-        }
-    }
 }
 
 /// The body of [`proxy_handler`]. A failure stays a [`DomainError`] until the
@@ -164,16 +96,13 @@ async fn proxy(
     // (WebSocket, path, body): a caller without `proxy:invoke` gets 403, not
     // a 400 from a request check (#4981).
     //
-    // The grant counts the request as `Cancelled` if it is dropped here: the
-    // handler dropped while it reads the body (the gateway's request
-    // timeout, a shutdown), or the client gone mid-upload.
+    // The body is read by the Data Plane; a client gone mid-upload is
+    // counted there as `Cancelled`.
     let grant = state.dp.authorize_proxy(ctx, &parts.method).await?;
-    let (proxy_req, on_upgrade) = match granted_request(parts, body, max_body_size).await {
+    let (proxy_req, on_upgrade) = match granted_request(parts, body, max_body_size) {
         Ok(prepared) => prepared,
-        Err(Rejected { err, client_gone }) => {
-            if !client_gone {
-                state.dp.reject_granted(grant, &err);
-            }
+        Err(err) => {
+            state.dp.reject_granted(grant, &err);
             return Err(err);
         }
     };
@@ -272,9 +201,9 @@ async fn proxy(
     Ok(response)
 }
 
-/// Validate a granted request and read its body: the request for the Data
-/// Plane, and the upgrade handle of a WebSocket upgrade.
-async fn granted_request(
+/// Validate a granted request: the request for the Data Plane, with the
+/// body as a stream, and the upgrade handle of a WebSocket upgrade.
+fn granted_request(
     mut parts: http::request::Parts,
     body: Body,
     max_body_size: usize,
@@ -283,7 +212,7 @@ async fn granted_request(
         http::Request<oagw_sdk::Body>,
         Option<hyper::upgrade::OnUpgrade>,
     ),
-    Rejected,
+    DomainError,
 > {
     // Detect WebSocket upgrade and extract the hyper upgrade handle.
     // This must happen before body consumption — the OnUpgrade future is
@@ -299,8 +228,7 @@ async fn granted_request(
                 reason: field::WS_UPGRADE_REQUIRES_GET,
                 detail: "WebSocket upgrade requires GET method".into(),
                 instance: path,
-            }
-            .into());
+            });
         }
         if parts.headers.contains_key(http::header::CONTENT_LENGTH)
             || parts.headers.contains_key(http::header::TRANSFER_ENCODING)
@@ -310,8 +238,7 @@ async fn granted_request(
                 reason: field::WS_UPGRADE_BODY_FORBIDDEN,
                 detail: "WebSocket upgrade request must not contain a body".into(),
                 instance: path,
-            }
-            .into());
+            });
         }
     }
 
@@ -341,8 +268,7 @@ async fn granted_request(
             reason: field::MISSING_ALIAS,
             detail: "missing alias in proxy path".into(),
             instance: path.to_string(),
-        }
-        .into());
+        });
     }
 
     // Validate Content-Length if present (skip for WebSocket — no body).
@@ -365,22 +291,25 @@ async fn granted_request(
                     "request body of {cl_val} bytes exceeds maximum of {max_body_size} bytes"
                 ),
                 instance: path.to_string(),
-            }
-            .into());
+            });
         }
     }
 
-    // Read body bytes (limited to max_body_size).
-    // WebSocket upgrade requests have no body — skip buffering.
-    let body_bytes = if is_upgrade {
-        Bytes::new()
+    // A WebSocket handshake has no body. A body hyper knows is empty (no
+    // framing, `Content-Length: 0`) is not streamed. The rest is streamed
+    // with the client's `Content-Length`, if any, as its length: hyper has
+    // already checked its framing and ends the body there. `max_body_size`
+    // is enforced while it streams.
+    let sdk_body = if is_upgrade || axum::body::HttpBody::is_end_stream(&body) {
+        oagw_sdk::Body::Empty
     } else {
-        axum::body::to_bytes(body, max_body_size)
-            .await
-            .map_err(|e| Rejected {
-                err: body_read_error(&e, max_body_size, path),
-                client_gone: client_gone(&e),
-            })?
+        use futures_util::TryStreamExt as _;
+        // A failed read here is this client's connection: one that closed
+        // or reset is marked so the Data Plane counts it as `Cancelled`.
+        let stream = body
+            .into_data_stream()
+            .map_err(|e| crate::infra::proxy::request_body::client_read_error(Box::new(e)));
+        oagw_sdk::Body::Stream(Box::pin(stream))
     };
 
     // Strip the proxy prefix from the URI so the DP receives /{alias}/{path}?query.
@@ -396,8 +325,6 @@ async fn granted_request(
         instance: path.to_string(),
     })?;
 
-    // Build http::Request<Body> for the DP service.
-    let sdk_body = oagw_sdk::Body::from(body_bytes);
     Ok((http::Request::from_parts(parts, sdk_body), on_upgrade))
 }
 

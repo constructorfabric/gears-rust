@@ -221,3 +221,128 @@ async def test_unauthorized_caller_gets_403_before_body_checks(
     assert status == 400, (status, body[:300])
     reasons = [v["reason"] for v in json.loads(body)["context"]["field_violations"]]
     assert reasons == ["WS_UPGRADE_BODY_FORBIDDEN"], body[:300]
+
+
+# Under OAGW_MAX_BODY_BYTES, so OAGW streams it rather than refusing it.
+STREAMED_UPLOAD_BYTES = 1_000_000
+
+
+@pytest.mark.scenario("positive-8.3-streaming-request-bodies-not-buffered", part="A")
+@pytest.mark.asyncio
+async def test_streamed_upload_keeps_its_content_length(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 8.3-A: a large upload with a Content-Length reaches the
+    upstream intact with that Content-Length, not re-framed as chunked.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-stream-cl",
+        )
+        payload = b"x" * STREAMED_UPLOAD_BYTES
+        resp = await client.post(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
+            headers={**oagw_headers, "content-type": "application/octet-stream"},
+            content=payload,
+        )
+    assert resp.status_code == 200, resp.text[:300]
+    echoed = resp.json()
+    assert echoed["headers"].get("content-length") == str(STREAMED_UPLOAD_BYTES), echoed["headers"]
+    assert "transfer-encoding" not in echoed["headers"], echoed["headers"]
+    assert len(echoed["body"]) == STREAMED_UPLOAD_BYTES
+
+
+@pytest.mark.scenario("positive-8.3-streaming-request-bodies-not-buffered", part="B")
+@pytest.mark.asyncio
+async def test_chunked_upload_streams_chunked(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 8.3-B: an upload without a Content-Length is forwarded
+    chunked, intact.
+    """
+    async def chunks():
+        for _ in range(STREAMED_UPLOAD_BYTES // 10_000):
+            yield b"y" * 10_000
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-stream-chunked",
+        )
+        resp = await client.post(
+            f"{oagw_base_url}/oagw/v1/proxy/{alias}/echo",
+            headers={**oagw_headers, "content-type": "application/octet-stream"},
+            content=chunks(),
+        )
+    assert resp.status_code == 200, resp.text[:300]
+    echoed = resp.json()
+    assert echoed["headers"].get("transfer-encoding") == "chunked", echoed["headers"]
+    assert "content-length" not in echoed["headers"], echoed["headers"]
+    assert len(echoed["body"]) == STREAMED_UPLOAD_BYTES
+
+
+@pytest.mark.scenario("positive-8.3-streaming-request-bodies-not-buffered", part="C")
+@pytest.mark.scenario("negative-8.1-maximum-body-size-limit-enforced", part="A")
+@pytest.mark.asyncio
+async def test_chunked_upload_over_limit_is_cut_with_413(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """Scenario 8.3-C: a chunked upload with no length to check up front is
+    cut once it streams past OAGW's limit: a gateway 413.
+
+    Raw socket: the gateway may answer and close while the upload is still
+    being written, so writing and reading run side by side and a write error
+    is expected.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        alias = await _echo_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, cleanup, "body-stream-big",
+        )
+    parsed = urlparse(oagw_base_url)
+    host, port = parsed.hostname or "127.0.0.1", parsed.port or 80
+    head = (
+        f"POST /oagw/v1/proxy/{alias}/echo HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        + "".join(f"{k}: {v}\r\n" for k, v in oagw_headers.items())
+        + "\r\n"
+    ).encode()
+    chunk = b"z" * 65_536
+    framed = f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n"
+
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10.0)
+
+    async def upload():
+        try:
+            writer.write(head)
+            for _ in range(OAGW_MAX_BODY_BYTES // len(chunk) + 4):
+                writer.write(framed)
+                await writer.drain()
+            writer.write(b"0\r\n\r\n")
+            await writer.drain()
+        except (ConnectionError, OSError):
+            # The gateway answers 413 and closes mid-upload; the write
+            # failing then is expected.
+            pass
+
+    sender = asyncio.create_task(upload())
+    try:
+        response_head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=15.0)
+        lines = response_head.decode("latin-1").split("\r\n")
+        status = int(lines[0].split(" ", 2)[1])
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            if name:
+                headers[name.strip().lower()] = value.strip()
+        body = await asyncio.wait_for(
+            reader.readexactly(int(headers.get("content-length", "0"))), timeout=10.0,
+        )
+    finally:
+        sender.cancel()
+        writer.close()
+    assert status == 413, (status, body[:300])
+    assert headers.get("x-oagw-error-source") == "gateway"
+    problem = json.loads(body)
+    reasons = [v["reason"] for v in problem["context"]["field_violations"]]
+    assert reasons == ["PAYLOAD_TOO_LARGE"], problem

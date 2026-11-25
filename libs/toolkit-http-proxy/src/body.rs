@@ -111,11 +111,179 @@ where
     StreamBody::new(stream.map_ok(Frame::data).map_err(Into::into)).boxed_unsync()
 }
 
+/// A streaming request body of exactly `len` bytes: framed with
+/// `Content-Length` on HTTP/1.1 and a `content-length` field on HTTP/2,
+/// where [`stream_body`] would be chunked.
+///
+/// A stream that ends short of `len` or yields a byte past it fails the body
+/// with an [`ErrorKind::InvalidRequest`] error, which aborts the request: the
+/// upstream never gets a complete message of the wrong length.
+///
+/// The body ends with the byte that completes `len`, without waiting for
+/// the stream to end: a stream kept open after its last byte (a channel
+/// whose sender lives on, an HTTP/2 client that sends `END_STREAM` late)
+/// does not stall the request. Excess data is caught only if the stream has
+/// it ready at that moment; the stream is polled once more without waiting,
+/// then dropped. So the stream should end right after its last byte.
+///
+/// `len == 0` gets the same single look, here: HTTP/1.1 sends no body and
+/// never polls one. Data or an error ready now fails the body; otherwise the
+/// stream is dropped and the body is empty ([`empty_body`]).
+pub fn sized_stream_body<S, E>(stream: S, len: u64) -> ProxyBody
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: Into<BoxError> + 'static,
+{
+    let mut inner = Box::pin(stream);
+    if len == 0 {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        return match peek_past_end(inner.as_mut(), &mut cx, 0) {
+            Some(err) => failed_body(err),
+            None => empty_body(),
+        };
+    }
+    SizedStream {
+        inner: Some(inner),
+        len,
+        remaining: len,
+    }
+    .boxed_unsync()
+}
+
+/// A body whose first frame is `err`. Its size is unknown, so HTTP/1.1
+/// polls it (an exact size of zero would not be).
+fn failed_body(err: BoxError) -> ProxyBody {
+    stream_body(futures_util::stream::once(std::future::ready(Err::<
+        Bytes,
+        BoxError,
+    >(err))))
+}
+
+/// The error for a body that yields a byte past its declared `len`.
+fn too_long(len: u64) -> BoxError {
+    Box::new(ProxyError::new(
+        ErrorKind::InvalidRequest,
+        format!("request body is longer than its declared length of {len} bytes"),
+    ))
+}
+
+/// Most empty chunks a [`sized_stream_body`] skips in one go: a stream that
+/// keeps yielding empty chunks must not spin its task.
+const MAX_EMPTY_CHUNKS: usize = 32;
+
+/// One look, without waiting, past the declared end of a stream of `len`
+/// bytes: the error for data or a stream error already queued there, if any.
+/// The look gives up after [`MAX_EMPTY_CHUNKS`] empty chunks, as if the
+/// stream were not ready.
+fn peek_past_end<S, E>(mut stream: Pin<&mut S>, cx: &mut Context<'_>, len: u64) -> Option<BoxError>
+where
+    S: Stream<Item = Result<Bytes, E>> + ?Sized,
+    E: Into<BoxError>,
+{
+    for _ in 0..MAX_EMPTY_CHUNKS {
+        match stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(data))) if data.is_empty() => {}
+            Poll::Ready(Some(Ok(_))) => return Some(too_long(len)),
+            Poll::Ready(Some(Err(e))) => return Some(e.into()),
+            Poll::Ready(None) | Poll::Pending => return None,
+        }
+    }
+    None
+}
+
+/// See [`sized_stream_body`]. `len > 0`.
+struct SizedStream<S> {
+    /// Dropped once the body has ended or failed: nothing more is polled,
+    /// and the caller's stream is released without waiting for the request.
+    inner: Option<Pin<Box<S>>>,
+    len: u64,
+    /// Bytes still owed.
+    remaining: u64,
+}
+
+impl<S, E> Body for SizedStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+    E: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        let mut empty = 0;
+        loop {
+            let Some(inner) = this.inner.as_mut() else {
+                return Poll::Ready(None);
+            };
+            let item = ready!(inner.as_mut().poll_next(cx));
+            let frame: Result<Frame<Bytes>, BoxError> = match item {
+                Some(Ok(data)) if data.is_empty() => {
+                    empty += 1;
+                    if empty == MAX_EMPTY_CHUNKS {
+                        // Yield to the executor; the stream is ready, so
+                        // poll again right away.
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                    continue;
+                }
+                Some(Ok(data)) => {
+                    let n = data.len() as u64;
+                    if n > this.remaining {
+                        Err(too_long(this.len))
+                    } else {
+                        this.remaining -= n;
+                        if this.remaining > 0 {
+                            return Poll::Ready(Some(Ok(Frame::data(data))));
+                        }
+                        match peek_past_end(inner.as_mut(), cx, this.len) {
+                            Some(err) => Err(err),
+                            None => Ok(Frame::data(data)),
+                        }
+                    }
+                }
+                Some(Err(e)) => Err(e.into()),
+                None if this.remaining > 0 => Err(Box::new(ProxyError::new(
+                    ErrorKind::InvalidRequest,
+                    format!(
+                        "request body ended after {} of its declared {} bytes",
+                        this.len - this.remaining,
+                        this.len
+                    ),
+                ))),
+                None => {
+                    this.inner = None;
+                    return Poll::Ready(None);
+                }
+            };
+            // The last byte, or a failure: the body ends here.
+            this.inner = None;
+            return Poll::Ready(Some(frame));
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        if self.inner.is_none() {
+            return SizeHint::with_exact(0);
+        }
+        SizeHint::with_exact(self.remaining)
+    }
+}
+
 /// Request extension holding a copy of the request body, so the engine may
 /// send the request again after a failure that provably happened before the
 /// upstream processed it (see [`crate::ProxyClient::send`]). The bytes must
 /// be exactly the request's body; cloning [`Bytes`] does not copy data.
-/// Requests with an empty body are resendable without it.
+/// Requests with an empty body are resendable without it. For a streamed
+/// body, [`crate::replay_tee`] keeps a bounded copy instead.
 ///
 /// The copy holds data only. Do not attach it to a body that ends with
 /// trailers: a resend would go out without them. A request that declares
@@ -468,6 +636,7 @@ impl std::fmt::Debug for ResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt as _;
 
     #[test]
     fn a_stashed_frame_grows_an_exact_hint() {
@@ -479,5 +648,160 @@ mod tests {
         }
         let open = grown(&SizeHint::default(), 5);
         assert_eq!((open.lower(), open.upper()), (5, None));
+    }
+
+    fn chunks(parts: &[&'static str]) -> impl Stream<Item = Result<Bytes, BoxError>> + Send {
+        let items: Vec<Result<Bytes, BoxError>> = parts
+            .iter()
+            .map(|p| Ok(Bytes::from_static(p.as_bytes())))
+            .collect();
+        futures_util::stream::iter(items)
+    }
+
+    /// The body's data, or the message of the error that ended it.
+    async fn drain(mut body: ProxyBody) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => out.extend_from_slice(&frame.into_data().unwrap_or_default()),
+                Err(e) => {
+                    let kind = e.downcast_ref::<ProxyError>().map(ProxyError::kind);
+                    assert_eq!(kind, Some(ErrorKind::InvalidRequest), "{e}");
+                    return Err(e.to_string());
+                }
+            }
+        }
+        assert!(body.is_end_stream());
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn sized_stream_of_the_declared_length_is_exact() {
+        let body = sized_stream_body(chunks(&["ab", "", "cde"]), 5);
+        assert_eq!(body.size_hint().exact(), Some(5));
+        assert!(!body.is_end_stream());
+        assert_eq!(drain(body).await.as_deref(), Ok(&b"abcde"[..]));
+    }
+
+    #[tokio::test]
+    async fn sized_stream_shorter_than_declared_fails() {
+        let err = drain(sized_stream_body(chunks(&["ab", "c"]), 5)).await;
+        let err = err.expect_err("short body must fail");
+        assert!(
+            err.contains("ended after 3 of its declared 5 bytes"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sized_stream_longer_than_declared_fails() {
+        // Within the chunk that crosses the length, and in a later chunk.
+        for parts in [&["ab", "cdef"][..], &["abcde", "f"][..]] {
+            let err = drain(sized_stream_body(chunks(parts), 5)).await;
+            let err = err.expect_err("long body must fail");
+            assert!(
+                err.contains("longer than its declared length of 5"),
+                "{err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sized_stream_ends_with_its_last_byte() {
+        // The stream stays open after the declared bytes (a channel whose
+        // sender lives on): the body must not wait for its end.
+        let open = chunks(&["ab", "cde"]).chain(futures_util::stream::pending());
+        let body = sized_stream_body(open, 5);
+        let drained = tokio::time::timeout(Duration::from_secs(1), drain(body)).await;
+        assert_eq!(drained.expect("no stall").as_deref(), Ok(&b"abcde"[..]));
+    }
+
+    #[tokio::test]
+    async fn sized_stream_of_zero_bytes_is_checked_up_front() {
+        let ended = sized_stream_body(chunks(&[]), 0);
+        assert!(ended.is_end_stream());
+        assert_eq!(ended.size_hint().exact(), Some(0));
+
+        // Data that is ready fails the body, which HTTP/1.1 then polls.
+        let long = sized_stream_body(chunks(&["", "x"]), 0);
+        assert_eq!(long.size_hint().exact(), None);
+        let err = drain(long).await.expect_err("data in a zero-length body");
+        assert!(err.contains("declared length of 0"), "{err}");
+
+        // Not ready yet: an empty body all the same (`Content-Length: 0`),
+        // and the stream is dropped.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, BoxError>>();
+        let body = sized_stream_body(UnboundedReceiverStream(rx), 0);
+        assert!(body.is_end_stream());
+        assert_eq!(body.size_hint().exact(), Some(0));
+        assert!(tx.is_closed());
+    }
+
+    /// A channel as a stream; tests check its sender for a dropped receiver.
+    struct UnboundedReceiverStream(tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, BoxError>>);
+
+    impl Stream for UnboundedReceiverStream {
+        type Item = Result<Bytes, BoxError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.0.poll_recv(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn sized_stream_drops_the_stream_at_its_end() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, BoxError>>();
+        let mut body = sized_stream_body(UnboundedReceiverStream(rx), 3);
+        tx.send(Ok(Bytes::from_static(b"ab")))
+            .expect("receiver alive");
+        assert!(body.frame().await.is_some_and(|f| f.is_ok()));
+        assert!(!tx.is_closed());
+        tx.send(Ok(Bytes::from_static(b"c")))
+            .expect("receiver alive");
+        assert!(body.frame().await.is_some_and(|f| f.is_ok()));
+        // The sender lives on, yet the body has ended and let the stream go.
+        assert!(body.is_end_stream());
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn sized_stream_bounds_runs_of_empty_chunks() {
+        let empties = || futures_util::stream::repeat_with(|| Ok::<_, BoxError>(Bytes::new()));
+
+        // Past the declared end, and for a zero length up front: endless
+        // empty chunks end the look as if the stream were not ready.
+        let body = sized_stream_body(empties(), 0);
+        assert!(body.is_end_stream());
+        let tail = chunks(&["abc"]).chain(empties());
+        let drained =
+            tokio::time::timeout(Duration::from_secs(1), drain(sized_stream_body(tail, 3)));
+        assert_eq!(drained.await.expect("no spin").as_deref(), Ok(&b"abc"[..]));
+
+        // Within the body: the task yields and is woken to read on.
+        let mut endless = sized_stream_body(empties(), 3);
+        let first = futures_util::poll!(endless.frame());
+        assert!(first.is_pending());
+        let head = empties()
+            .take(10 * MAX_EMPTY_CHUNKS)
+            .chain(chunks(&["abc"]));
+        let drained =
+            tokio::time::timeout(Duration::from_secs(1), drain(sized_stream_body(head, 3)));
+        assert_eq!(drained.await.expect("woken").as_deref(), Ok(&b"abc"[..]));
+    }
+
+    #[tokio::test]
+    async fn sized_stream_passes_on_stream_errors() {
+        let items: Vec<Result<Bytes, BoxError>> = vec![
+            Ok(Bytes::from_static(b"ab")),
+            Err("client went away".into()),
+        ];
+        let mut body = sized_stream_body(futures_util::stream::iter(items), 5);
+        assert!(body.frame().await.is_some_and(|f| f.is_ok()));
+        let err = body.frame().await.and_then(Result::err);
+        assert_eq!(
+            err.map(|e| e.to_string()).as_deref(),
+            Some("client went away")
+        );
+        assert!(body.frame().await.is_none());
     }
 }

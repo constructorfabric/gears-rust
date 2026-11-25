@@ -473,7 +473,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Streaming request bodies are not buffered
 - **Scenario**: [positive-8.3-streaming-request-bodies-not-buffered.md](proxy-api/body-validation/positive-8.3-streaming-request-bodies-not-buffered.md)
-- **Mechanism**: For endpoints supporting streaming body, memory does not grow with body size.
+- **Mechanism**: Every request body streams to the upstream as it arrives, with the client's `Content-Length` when it sent one (chunked otherwise); `max_body_size_bytes` is enforced on the way. An upstream answer that arrives before the body ends is relayed. The gateway reads the body whole first only for a signer that hashes the payload (`aws_sigv4` without `unsigned_payload`, or with it and no `Content-Length`) and while the upstream's circuit breaker is not closed, so an open upload never holds a half-open probe slot.
 
 ---
 
@@ -635,15 +635,15 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 
 #### Well-known header validation errors → 400
 - **Scenario**: [negative-7.4-well-known-header-validation-errors-400.md](proxy-api/request-transforms/negative-7.4-well-known-header-validation-errors-400.md)
-- **What happens**: Invalid `Content-Length` or mismatch with actual body returns `400 PD`.
+- **What happens**: Over REST, hyper answers an invalid `Content-Length` with a bare `400` before OAGW runs; a body that ends before its `Content-Length` is `400 PD` `BODY_READ_FAILED`. An SDK stream of another length than its `Content-Length` is `400` `INVALID_CONTENT_LENGTH`.
 
 #### Maximum body size limit enforced → 413
 - **Scenario**: [negative-8.1-maximum-body-size-limit-enforced.md](proxy-api/body-validation/negative-8.1-maximum-body-size-limit-enforced.md)
-- **What happens**: The smaller of OAGW's `max_body_size_bytes` (default and maximum 100 MiB) and the api-gateway's `body_limit_bytes` (default 16 MiB) applies. Over OAGW's limit → `413 PD` (`PAYLOAD_TOO_LARGE`), `ESrc=gateway`, rejected early. Over the api-gateway's limit → `413` `about:blank` PD from the outer layer, no `ESrc`.
+- **What happens**: The smaller of OAGW's `max_body_size_bytes` (default and maximum 100 MiB) and the api-gateway's `body_limit_bytes` (default 16 MiB) applies. Over OAGW's limit → `413 PD` (`PAYLOAD_TOO_LARGE`), `ESrc=gateway`, rejected early. A `Content-Length` over the api-gateway's limit → `413` `about:blank` PD from the outer layer, no `ESrc`; a body without a declared length over it is cut as it streams → OAGW's `413 PD`, `ESrc=gateway`.
 
 #### Transfer-Encoding support limited to chunked → 400
 - **Scenario**: [negative-8.2-transfer-encoding-support-limited-chunked.md](proxy-api/body-validation/negative-8.2-transfer-encoding-support-limited-chunked.md)
-- **What happens**: Unsupported transfer-encoding rejected with `400 PD`.
+- **What happens**: Over REST, hyper answers an unsupported transfer-encoding with a bare `400` before OAGW runs; an SDK request gets `400` `UNSUPPORTED_VALUE`.
 
 ---
 
@@ -745,9 +745,9 @@ Full integration walkthroughs — each demonstrates the complete journey (upstre
 - **Scenario**: [negative-9.11-oauth2-identity-provider-unavailable.md](proxy-api/authentication/negative-9.11-oauth2-identity-provider-unavailable.md)
 - **What happens**: The OAuth2 token endpoint is unreachable, times out or answers `408`, `429` or `5xx`: `503` `service_unavailable`, reason `IDENTITY_PROVIDER_UNAVAILABLE`, `Retry-After: 5`. The upstream is not contacted. A credential store outage keeps `CREDENTIAL_STORE_UNAVAILABLE`.
 
-#### AWS SigV4 with a streamed request body → 400
+#### AWS SigV4 with a streamed request body
 - **Scenario**: [negative-9.12-aws-sigv4-streamed-body.md](proxy-api/authentication/negative-9.12-aws-sigv4-streamed-body.md)
-- **What happens**: A body streamed by an in-process SDK caller cannot be hashed: `400 VALIDATION` on field `body`, naming `auth.config.unsigned_payload`, nothing sent. With `unsigned_payload: true` it is signed as `UNSIGNED-PAYLOAD`. REST callers are always buffered.
+- **What happens**: A streamed body (REST or SDK) is read whole, hashed and signed, and sent with `Content-Length`. With `unsigned_payload: true` a body with a `Content-Length` streams on, signed as `UNSIGNED-PAYLOAD`; one without is still read whole.
 
 #### AWS SigV4 for S3 on a path the gateway rewrote → 400
 - **Scenario**: [negative-9.14-aws-sigv4-s3-rewritten-path.md](proxy-api/authentication/negative-9.14-aws-sigv4-s3-rewritten-path.md)

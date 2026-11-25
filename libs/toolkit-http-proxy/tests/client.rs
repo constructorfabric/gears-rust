@@ -22,7 +22,8 @@ use support::{Wire, body_string, client, echo, test_config, text, upstream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use toolkit_http_proxy::{
     CachedProtocol, ConnectionInfo, ErrorKind, Observer, ProtocolPolicy, ProxyClient, RootStore,
-    Target, Transport, UpgradeOutcome, empty_body, full_body, stream_body,
+    Target, Transport, UpgradeOutcome, empty_body, full_body, replay_tee, sized_stream_body,
+    stream_body,
 };
 
 fn get(path: &str) -> Request<toolkit_http_proxy::ProxyBody> {
@@ -216,6 +217,80 @@ async fn streaming_request_bodies_are_forwarded() {
         let req = Request::post("/upload").body(stream_body(chunks)).unwrap();
         let body = body_string(c.send(&up.target(wire), req).await.unwrap()).await;
         assert!(body.ends_with("len=10000"), "{wire:?}: {body}");
+    }
+}
+
+/// An upstream that answers with the framing it received and the body length.
+async fn framing_echo(wire: Wire) -> support::Upstream {
+    upstream(wire, |req: Request<Incoming>| async move {
+        let field = |name: &str| {
+            req.headers()
+                .get(name)
+                .map_or("none".to_owned(), |v| v.to_str().unwrap().to_owned())
+        };
+        let framing = format!(
+            "cl={} te={}",
+            field("content-length"),
+            field("transfer-encoding")
+        );
+        let body = req.into_body().collect().await;
+        text(match body {
+            Ok(body) => format!("{framing} len={}", body.to_bytes().len()),
+            Err(_) => format!("{framing} incomplete"),
+        })
+    })
+    .await
+}
+
+fn sized_post(parts: &[&'static str], len: u64) -> Request<toolkit_http_proxy::ProxyBody> {
+    let chunks = stream::iter(parts.to_vec())
+        .map(|p| Ok::<_, std::io::Error>(Bytes::from_static(p.as_bytes())));
+    Request::post("/upload")
+        .body(sized_stream_body(chunks, len))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn sized_streams_are_sent_with_content_length() {
+    for wire in [Wire::Plain, Wire::TlsH2] {
+        let up = framing_echo(wire).await;
+        let c = client();
+        let resp = c
+            .send(&up.target(wire), sized_post(&["hello ", "world"], 11))
+            .await
+            .unwrap();
+        assert_eq!(body_string(resp).await, "cl=11 te=none len=11", "{wire:?}");
+    }
+}
+
+#[tokio::test]
+async fn sized_streams_of_the_wrong_length_never_complete() {
+    for wire in [Wire::Plain, Wire::TlsH2] {
+        for (name, parts) in [
+            ("short", &["hello"][..]),
+            ("long", &["hello ", "world!"][..]),
+        ] {
+            let up = framing_echo(wire).await;
+            let c = client();
+            let err = c
+                .send(&up.target(wire), sized_post(parts, 11))
+                .await
+                .expect_err("a body of the wrong length must fail the request");
+            // hyper reports a failed body as a user error and keeps it as
+            // the source; the HTTP/2 upload task logs it and aborts.
+            if wire == Wire::Plain {
+                assert_eq!(err.kind(), ErrorKind::InvalidRequest, "{name}: {err}");
+                let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+                let mut declared = false;
+                while let Some(e) = cause {
+                    declared |= e.to_string().contains("declared");
+                    cause = e.source();
+                }
+                assert!(declared, "{name}: {err:?}");
+            } else {
+                assert_eq!(err.kind(), ErrorKind::Write, "{name}: {err}");
+            }
+        }
     }
 }
 
@@ -1062,15 +1137,38 @@ async fn http_version_of_response_is_reported() {
 /// stream with `HTTP_1_1_REQUIRED` (counting them); its HTTP/1.1 side answers
 /// `h1`, followed by `:` and the request body when there is one.
 async fn h2_requires_h1() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let (addr, streams, _) = h2_requires_h1_observed(0).await;
+    (addr, streams)
+}
+
+/// What the HTTP/1.1 side of [`h2_requires_h1_observed`] saw.
+#[derive(Default)]
+struct H1Side {
+    /// Request heads read.
+    requests: AtomicUsize,
+    head_read: tokio::sync::Notify,
+    /// Body data frames, in order.
+    frames: parking_lot::Mutex<Vec<Bytes>>,
+    /// Signalled after each frame is recorded.
+    frame_read: tokio::sync::Notify,
+}
+
+/// [`h2_requires_h1`], also reporting what its HTTP/1.1 side saw. Its
+/// HTTP/2 side resets a stream only once it has read more than
+/// `read_before_reset` body bytes (or the body ended).
+async fn h2_requires_h1_observed(
+    read_before_reset: usize,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>, Arc<H1Side>) {
     let acceptor =
         tokio_rustls::TlsAcceptor::from(Arc::new(support::server_tls(&[b"h2", b"http/1.1"])));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let streams = Arc::new(AtomicUsize::new(0));
-    let seen = streams.clone();
+    let h1 = Arc::new(H1Side::default());
+    let (seen, h1_seen) = (streams.clone(), h1.clone());
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
-            let (acceptor, streams) = (acceptor.clone(), streams.clone());
+            let (acceptor, streams, h1) = (acceptor.clone(), streams.clone(), h1.clone());
             tokio::spawn(async move {
                 let Ok(tls) = acceptor.accept(tcp).await else {
                     return;
@@ -1079,19 +1177,43 @@ async fn h2_requires_h1() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
                     let Ok(mut conn) = h2::server::handshake(tls).await else {
                         return;
                     };
-                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
                         streams.fetch_add(1, Ordering::SeqCst);
-                        respond.send_reset(h2::Reason::HTTP_1_1_REQUIRED);
+                        tokio::spawn(async move {
+                            let mut body = req.into_body();
+                            let mut read = 0;
+                            while read_before_reset > 0 && read <= read_before_reset {
+                                let Some(Ok(chunk)) = body.data().await else {
+                                    break;
+                                };
+                                let _ = body.flow_control().release_capacity(chunk.len());
+                                read += chunk.len();
+                            }
+                            respond.send_reset(h2::Reason::HTTP_1_1_REQUIRED);
+                        });
                     }
                 } else {
-                    let svc = hyper::service::service_fn(|req: Request<Incoming>| async {
-                        let body = req.into_body().collect().await.unwrap().to_bytes();
-                        let answer = if body.is_empty() {
-                            "h1".to_owned()
-                        } else {
-                            format!("h1:{}", String::from_utf8_lossy(&body))
-                        };
-                        Ok::<_, std::convert::Infallible>(text(answer))
+                    let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let h1 = h1.clone();
+                        async move {
+                            h1.requests.fetch_add(1, Ordering::SeqCst);
+                            h1.head_read.notify_one();
+                            let mut body = req.into_body();
+                            let mut all = Vec::new();
+                            while let Some(frame) = body.frame().await {
+                                if let Ok(data) = frame.unwrap().into_data() {
+                                    all.extend_from_slice(&data);
+                                    h1.frames.lock().push(data);
+                                    h1.frame_read.notify_one();
+                                }
+                            }
+                            let answer = if all.is_empty() {
+                                "h1".to_owned()
+                            } else {
+                                format!("h1:{}", String::from_utf8_lossy(&all))
+                            };
+                            Ok::<_, std::convert::Infallible>(text(answer))
+                        }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
@@ -1100,7 +1222,7 @@ async fn h2_requires_h1() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
             });
         }
     });
-    (addr, seen)
+    (addr, seen, h1_seen)
 }
 
 fn replayable_post(data: &'static [u8]) -> Request<toolkit_http_proxy::ProxyBody> {
@@ -1166,6 +1288,177 @@ async fn http_1_1_required_never_resends_a_streamed_body() {
     assert_eq!(c.cached_protocol(&target), Some(CachedProtocol::Http1Only));
     let resp = c.send(&target, get("/")).await.unwrap();
     assert_eq!(body_string(resp).await, "h1");
+}
+
+#[tokio::test]
+async fn http_1_1_required_resends_a_teed_stream_from_its_copy() {
+    // The refusal comes only after the upstream read the whole body, so the
+    // resend can only come from the copy.
+    let (addr, streams, _) = h2_requires_h1_observed(7).await;
+    let c = client();
+    let target = Target::new(addr, "localhost", Transport::Tls);
+    let chunks = stream::iter(["pay", "load"].map(|p| Ok::<_, std::io::Error>(Bytes::from(p))));
+    let (body, tee) = replay_tee(sized_stream_body(chunks, 7), 1024);
+    let mut post = Request::post("/").body(body).unwrap();
+    post.extensions_mut().insert(tee.clone());
+    let resp = c.send(&target, post).await.expect("resent over HTTP/1.1");
+    assert_eq!(resp.version(), Version::HTTP_11);
+    assert_eq!(body_string(resp).await, "h1:payload");
+    assert_eq!(streams.load(Ordering::SeqCst), 1);
+    assert_eq!(tee.retained_bytes(), 0, "the copy is freed once answered");
+}
+
+/// A sized body fed by the test, chunk by chunk.
+fn channel_body(
+    len: u64,
+) -> (
+    tokio::sync::mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
+    toolkit_http_proxy::ProxyBody,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let rx = stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    (tx, sized_stream_body(rx, len))
+}
+
+/// Bounds every wait: generous, as a TLS key share on macOS can stall for
+/// seconds while many tests handshake at once.
+const WAIT: Duration = Duration::from_secs(30);
+
+#[tokio::test]
+async fn a_resend_sends_the_rest_of_a_body_still_uploading() {
+    // The refusal arrives while the client is still sending: the resend
+    // carries the copy, then the rest as it comes. The refusal comes only
+    // after the upstream read `pay`, so `pay` can only come from the copy.
+    let (addr, streams, h1) = h2_requires_h1_observed(1).await;
+    let c = client();
+    let target = Target::new(addr, "localhost", Transport::Tls);
+    let (tx, body) = channel_body(7);
+    let (body, tee) = replay_tee(body, 1024);
+    let mut post = Request::post("/").body(body).unwrap();
+    post.extensions_mut().insert(tee.clone());
+    tx.send(Ok(Bytes::from_static(b"pay"))).unwrap();
+    let head_read = h1.head_read.notified();
+    let sent = tokio::spawn(async move { c.send(&target, post).await });
+    // The rest goes only once the HTTP/1.1 resend is under way, so the copy
+    // it started from cannot hold it.
+    tokio::time::timeout(WAIT, head_read)
+        .await
+        .expect("the resend reached the HTTP/1.1 side");
+    assert_eq!(streams.load(Ordering::SeqCst), 1);
+    assert!(!tee.is_replayable(), "the resend took the copy");
+    // `load` goes only once the upstream recorded `pay`, so the two cannot
+    // arrive in one read.
+    tokio::time::timeout(WAIT, h1.frame_read.notified())
+        .await
+        .expect("the copy reached the HTTP/1.1 side");
+    tx.send(Ok(Bytes::from_static(b"load"))).unwrap();
+    let resp = tokio::time::timeout(WAIT, sent)
+        .await
+        .expect("no hang")
+        .unwrap()
+        .expect("resent over HTTP/1.1");
+    assert_eq!(body_string(resp).await, "h1:payload");
+    assert_eq!(h1.requests.load(Ordering::SeqCst), 1);
+    // The resend sent the copy, `pay`, on its own, then the rest.
+    let frames = h1.frames.lock().clone();
+    assert_eq!(
+        frames.first().map(|f| &f[..]),
+        Some(&b"pay"[..]),
+        "{frames:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_http1_post_on_a_new_connection_frees_the_copy_before_sending() {
+    // Only a stale keep-alive connection resends on HTTP/1.1, and only an
+    // idempotent request: a POST on a fresh connection never needs the copy.
+    let head_read = Arc::new(tokio::sync::Notify::new());
+    let notify = head_read.clone();
+    let up = upstream(Wire::Plain, move |req: Request<Incoming>| {
+        let notify = notify.clone();
+        async move {
+            notify.notify_one();
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            text(body)
+        }
+    })
+    .await;
+    let c = client();
+    let (tx, body) = channel_body(7);
+    let (body, tee) = replay_tee(body, 1024);
+    let mut post = Request::post("/").body(body).unwrap();
+    post.extensions_mut().insert(tee.clone());
+    tx.send(Ok(Bytes::from_static(b"pay"))).unwrap();
+    let target = up.target(Wire::Plain);
+    let sent = tokio::spawn(async move { c.send(&target, post).await });
+    tokio::time::timeout(WAIT, head_read.notified())
+        .await
+        .expect("the upstream read the head");
+    // The upstream is still reading the body.
+    assert_eq!(tee.retained_bytes(), 0);
+    assert!(!tee.is_replayable());
+    tx.send(Ok(Bytes::from_static(b"load"))).unwrap();
+    let resp = tokio::time::timeout(WAIT, sent)
+        .await
+        .expect("no hang")
+        .unwrap()
+        .unwrap();
+    assert_eq!(body_string(resp).await, "payload");
+}
+
+#[tokio::test]
+async fn a_tee_on_a_request_declaring_trailers_is_freed_at_once() {
+    let head_read = Arc::new(tokio::sync::Notify::new());
+    let notify = head_read.clone();
+    let up = upstream(Wire::TlsH2, move |req: Request<Incoming>| {
+        let notify = notify.clone();
+        async move {
+            notify.notify_one();
+            let _ = req.into_body().collect().await;
+            text("ok")
+        }
+    })
+    .await;
+    let c = client();
+    let (tx, body) = channel_body(7);
+    let (body, tee) = replay_tee(body, 1024);
+    let mut post = Request::post("/")
+        .header("trailer", "x-checksum")
+        .body(body)
+        .unwrap();
+    post.extensions_mut().insert(tee.clone());
+    tx.send(Ok(Bytes::from_static(b"pay"))).unwrap();
+    let target = up.target(Wire::TlsH2);
+    let sent = tokio::spawn(async move { c.send(&target, post).await });
+    tokio::time::timeout(WAIT, head_read.notified())
+        .await
+        .expect("the upstream read the head");
+    assert_eq!(tee.retained_bytes(), 0);
+    assert!(!tee.is_replayable());
+    tx.send(Ok(Bytes::from_static(b"load"))).unwrap();
+    let resp = tokio::time::timeout(WAIT, sent)
+        .await
+        .expect("no hang")
+        .unwrap()
+        .unwrap();
+    assert_eq!(body_string(resp).await, "ok");
+}
+
+#[tokio::test]
+async fn http_1_1_required_never_resends_a_teed_stream_over_its_limit() {
+    // The refusal comes only after the upstream read more than the copy's
+    // limit, so the copy has given up by then.
+    let (addr, streams, _) = h2_requires_h1_observed(4).await;
+    let c = client();
+    let target = Target::new(addr, "localhost", Transport::Tls);
+    let chunks = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"payload"))]);
+    let (body, tee) = replay_tee(stream_body(chunks), 4);
+    let mut post = Request::post("/").body(body).unwrap();
+    post.extensions_mut().insert(tee);
+    assert!(c.send(&target, post).await.is_err(), "the copy is gone");
+    assert_eq!(streams.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1251,7 +1544,7 @@ async fn goaway_http_1_1_required_during_setup_falls_back_to_http1() {
     let addr = h2_goaway_requires_h1().await;
     let c = client();
     let target = Target::new(addr, "localhost", Transport::Tls);
-    let resp = tokio::time::timeout(Duration::from_secs(5), c.send(&target, get("/")))
+    let resp = tokio::time::timeout(WAIT, c.send(&target, get("/")))
         .await
         .expect("no hang")
         .expect("connected again over HTTP/1.1");

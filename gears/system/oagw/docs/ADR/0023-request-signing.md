@@ -92,6 +92,10 @@ pub trait AuthPlugin: Send + Sync {
         false
     }
 
+    fn signs_body(&self, _config: &HashMap<String, String>, _declared_len: Option<u64>) -> bool {
+        true
+    }
+
     async fn sign(&self, _ctx: &SigningContext) -> Result<SigningOutput, PluginError> {
         Ok(SigningOutput::default())
     }
@@ -137,7 +141,7 @@ The plugin gets the same `config` and security context as `authenticate`. Header
 
 - **URL**: scheme, endpoint host and port, the path and the query exactly as they go on the request line. The query is the client's, byte for byte, or the form-encoded pairs when a transform changed them or the query has a literal `;`.
 - **Headers**: every line the request is sent with, names in lowercase. A repeated name keeps all its lines, in the order they are sent; order across names has no meaning in HTTP and is not kept. The view includes `Host`, with the port unless it is the scheme's default, the headers `authenticate` set, and, for a WebSocket handshake, `Connection`, `Upgrade` and `Sec-WebSocket-*`.
-- **Body**: the buffered bytes, or `Streamed` for a body streamed from an in-process SDK caller. REST callers are always buffered. A WebSocket handshake has an empty body.
+- **Body**: the buffered bytes, or `Streamed` for a body that stays streamed. Request bodies stream from the caller (REST and in-process SDK alike); when `signs_body` returns `true` for the upstream's auth config and the declared `Content-Length` (the default; `aws_sigv4` returns `false` only with `unsigned_payload` and a declared length), the gateway reads a streamed body whole first, within the body size limit and the request deadline, and the plugin gets `Buffered` (amended by [#4981](https://github.com/constructorfabric/gears-rust/issues/4981): before it, REST bodies were always buffered and an SDK stream always reached `sign` as `Streamed`). A WebSocket handshake has an empty body.
 
 Before building the view, the Data Plane applies the upstream engine's own request header sanitization (`toolkit_http_proxy::sanitize::sanitize_request_headers`, after the engine's handshake validation for a WebSocket upgrade), so the view does not show fields the engine drops (`Content-Length`, `Expect`, `Proxy-Connection`, `HTTP2-Settings`, hop-by-hop other than `TE: trailers`) or rewrites (`Upgrade` and `Connection` of a handshake, as `websocket` and `upgrade`). The engine sanitizes again when it sends the request; that pass then changes nothing. After signing, the engine still derives `Content-Length` and `Transfer-Encoding` from the body, joins `Cookie` lines into one on HTTP/1.1, and on HTTP/2 sends `Host` as `:authority` with the same value. A signer must not cover these fields. The path and query are sent as given.
 

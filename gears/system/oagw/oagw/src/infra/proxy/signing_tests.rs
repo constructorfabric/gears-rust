@@ -61,10 +61,12 @@ impl Seen {
 
 /// An auth plugin that sets `x-auth` and, in its signing phase, records the
 /// request and returns `output`, or fails when `output` is `None`, or never
-/// answers when `hang` is set. It signs only when `signs` is set.
+/// answers when `hang` is set. It signs only when `signs` is set, and
+/// takes a streamed body as is unless `signs_body` is set.
 struct Signer {
     output: Option<SigningOutput>,
     signs: bool,
+    signs_body: bool,
     hang: bool,
     seen: Mutex<Vec<Seen>>,
 }
@@ -74,6 +76,7 @@ impl Signer {
         Arc::new(Self {
             output,
             signs: true,
+            signs_body: true,
             hang: false,
             seen: Mutex::new(Vec::new()),
         })
@@ -93,6 +96,10 @@ impl AuthPlugin for Signer {
 
     fn signs(&self) -> bool {
         self.signs
+    }
+
+    fn signs_body(&self, _config: &HashMap<String, String>, _declared_len: Option<u64>) -> bool {
+        self.signs_body
     }
 
     async fn sign(&self, ctx: &SigningContext) -> Result<SigningOutput, PluginError> {
@@ -413,25 +420,40 @@ async fn signing_sees_the_raw_query_when_no_transform_changed_it() {
     assert_eq!(header_values(&rec[0], "x-signature"), ["sig"]);
 }
 
-/// A streamed body is not read for signing: the phase gets the marker, and
-/// the body still reaches the upstream.
+/// A streamed body is read whole for a signer that signs it, and sent with
+/// its length; a signer that does not gets the marker and the body stays
+/// streamed. Either way the body reaches the upstream as sent.
 #[tokio::test]
-async fn streamed_body_is_signed_as_streamed() {
-    let fx = Fx::new(Some(signed())).await;
-    let chunks = futures_util::stream::iter([
-        Ok::<_, oagw_sdk::body::BoxError>(Bytes::from_static(b"{\"k\":")),
-        Ok(Bytes::from_static(b"2}")),
-    ]);
-    let req = fx.post(Body::Stream(Box::pin(chunks)));
-    assert_eq!(fx.send(req).await.unwrap(), StatusCode::OK);
+async fn streamed_body_is_buffered_only_for_a_signer_that_signs_it() {
+    for signs_body in [true, false] {
+        let signer = Arc::new(Signer {
+            output: Some(signed()),
+            signs: true,
+            signs_body,
+            hang: false,
+            seen: Mutex::new(Vec::new()),
+        });
+        let fx = Fx::with(signer, Setup::default()).await;
+        let chunks = futures_util::stream::iter([
+            Ok::<_, oagw_sdk::body::BoxError>(Bytes::from_static(b"{\"k\":")),
+            Ok(Bytes::from_static(b"2}")),
+        ]);
+        let req = fx.post(Body::Stream(Box::pin(chunks)));
+        assert_eq!(fx.send(req).await.unwrap(), StatusCode::OK);
 
-    let seen = fx.signer.seen();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].body, SigningBody::Streamed);
-    let rec = fx.guard.recorded_requests().await;
-    assert_eq!(rec.len(), 1);
-    assert_eq!(rec[0].body, br#"{"k":2}"#);
-    assert_eq!(header_values(&rec[0], "x-signature"), ["sig"]);
+        let seen = fx.signer.seen();
+        assert_eq!(seen.len(), 1);
+        let expected = if signs_body {
+            SigningBody::Buffered(Bytes::from_static(br#"{"k":2}"#))
+        } else {
+            SigningBody::Streamed
+        };
+        assert_eq!(seen[0].body, expected, "signs_body={signs_body}");
+        let rec = fx.guard.recorded_requests().await;
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].body, br#"{"k":2}"#);
+        assert_eq!(header_values(&rec[0], "x-signature"), ["sig"]);
+    }
 }
 
 /// A WebSocket handshake is signed with an empty body, the transformed query
@@ -516,6 +538,7 @@ async fn refused_handshake_is_not_signed() {
         Arc::new(Signer {
             output: Some(signed()),
             signs: false,
+            signs_body: true,
             hang: false,
             seen: Mutex::new(Vec::new()),
         }),
@@ -580,6 +603,7 @@ async fn plugin_that_does_not_sign_is_not_called() {
     let signer = Arc::new(Signer {
         output: Some(signed()),
         signs: false,
+        signs_body: true,
         hang: false,
         seen: Mutex::new(Vec::new()),
     });
@@ -637,6 +661,7 @@ async fn signing_phase_is_timed() {
         let signer = Arc::new(Signer {
             output,
             signs,
+            signs_body: true,
             hang: false,
             seen: Mutex::new(Vec::new()),
         });
@@ -695,6 +720,7 @@ async fn hung_signing_times_out_and_sends_nothing() {
     let signer = Arc::new(Signer {
         output: Some(signed()),
         signs: true,
+        signs_body: true,
         hang: true,
         seen: Mutex::new(Vec::new()),
     });

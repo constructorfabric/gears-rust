@@ -79,9 +79,10 @@ OAGW checks these values at startup and does not start if one is out of range:
 | `websocket_idle_timeout_secs` | 1 to 86400 | 300 |
 | `websocket_close_timeout_secs` | 1 to 86400 | 5 |
 | `max_body_size_bytes` | 1 to 104857600 (100 MiB, the DESIGN hard limit) | 104857600 |
+| `request_retry_buffer_bytes` | 0 (off) to 16777216 (16 MiB): bytes of a streamed request body copied so the engine can resend it: a stale keep-alive connection or a graceful HTTP/2 `GOAWAY` (idempotent methods only), an HTTP/2 `REFUSED_STREAM` or the `HTTP_1_1_REQUIRED` fallback (any method); a longer body is not resendable | 1048576 |
 | `token_cache_capacity` | at least 1 | 10000 |
 
-The api-gateway in front of OAGW has its own request body limit, `body_limit_bytes` (16 MiB by default), so the effective limit is the smaller of the two. A body over the api-gateway limit gets a `413` with an `about:blank` problem body and no `X-OAGW-Error-Source` header; OAGW's own `413` (`PAYLOAD_TOO_LARGE`, `X-OAGW-Error-Source: gateway`) comes only when `max_body_size_bytes` is the smaller limit.
+The api-gateway in front of OAGW has its own request body limit, `body_limit_bytes` (16 MiB by default), so the effective limit is the smaller of the two. A `Content-Length` over the api-gateway limit gets a `413` with an `about:blank` problem body and no `X-OAGW-Error-Source` header, before OAGW sees the request. A body without a declared length is cut at the api-gateway limit as it streams and gets OAGW's own `413` (`PAYLOAD_TOO_LARGE`, `X-OAGW-Error-Source: gateway`), as does any body over `max_body_size_bytes`.
 
 ## Persistence
 

@@ -11,9 +11,20 @@ dispatcher). It replaces Cloudflare Pingora; see
   unless it is idempotent: unsent requests, refused HTTP/2 streams and
   `HTTP_1_1_REQUIRED` (then HTTP/1.1 for the host); after a graceful
   `GOAWAY` or a keep-alive race only idempotent ones. A body is resent only
-  if it is empty or attached as a `ReplayableBody` request extension.
+  if it is empty, attached as a `ReplayableBody` request extension, or
+  wrapped by `replay_tee(body, limit)` with the returned `ReplayTee`
+  attached: the body streams at once while up to `limit` bytes of it are
+  copied; a resend sends the copy, then the rest of the body the first
+  attempt had not read. Past `limit` (or after trailers or an error) the
+  copy is freed and the request is no longer resendable.
 - Pool limits: idle HTTP/1.1 connections per host and in total, the
   upstream's `Keep-Alive: timeout` honoured, HTTP/2 connections per host.
+- Request bodies: `empty_body`, `full_body` (`Content-Length`),
+  `stream_body` (chunked on HTTP/1.1) and `sized_stream_body`, a stream of a
+  known length sent with `Content-Length` that fails the request if it
+  yields more or fewer bytes. It ends with the declared last byte without
+  waiting for the stream to end, so excess data queued later is not seen:
+  a stream should end right after its last byte.
 - `sanitize`: outbound framing and hop-by-hop hygiene (request smuggling
   defences) and response header sanitization.
 - `balance`: `BackendPool` with pluggable `Resolver`, `AddressFilter` (SSRF),

@@ -3779,9 +3779,8 @@ async fn proxy_streaming_body_single_chunk() {
     );
 }
 
-// A stream error mid-body sends the cause on the abort channel so the chunked
-// terminator is NOT written.  The main select! receives the reason immediately,
-// returning a DownstreamError without waiting for the request timeout.
+// A stream error mid-body aborts the upload without the chunked terminator
+// and fails the request at once, without waiting for the request timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_streaming_body_error_mid_stream_does_not_send_terminator() {
     let mut guard = MockGuard::new();
@@ -3853,16 +3852,155 @@ async fn proxy_streaming_body_error_mid_stream_does_not_send_terminator() {
         .body(body)
         .unwrap();
 
+    // The caller's stream failed: a 400 about the body, not an upstream
+    // failure.
     match h.facade().proxy_request(ctx.clone(), req).await {
-        Err(err) => assert!(
-            matches!(err, CanonicalError::ServiceUnavailable { .. }),
-            "expected DownstreamError, got: {err:?}"
-        ),
+        Err(err) => assert_invalid_argument(err, "body", oagw_sdk::field::BODY_READ_FAILED),
         Ok(resp) => panic!(
-            "expected DownstreamError, got response with status {}",
+            "expected BODY_READ_FAILED, got response with status {}",
             resp.status()
         ),
     }
+    assert!(guard.recorded_requests().await.is_empty());
+}
+
+fn ok_mock() -> MockResponse {
+    MockResponse {
+        status: 200,
+        headers: vec![],
+        body: MockBody::Json(serde_json::json!({"received": true})),
+    }
+}
+
+fn sdk_stream(parts: &[&'static [u8]]) -> Body {
+    let chunks: Vec<Result<bytes::Bytes, oagw_sdk::body::BoxError>> = parts
+        .iter()
+        .map(|p| Ok(bytes::Bytes::from_static(p)))
+        .collect();
+    Body::Stream(Box::pin(futures_util::stream::iter(chunks)))
+}
+
+fn recorded_header<'a>(r: &'a oagw::test_support::RecordedRequest, name: &str) -> Option<&'a str> {
+    r.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// An SDK stream with a declared `Content-Length` reaches the upstream with
+/// that length; without one it is chunked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_streaming_body_keeps_the_declared_content_length() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/v1/upload", ok_mock());
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    setup_mock_route(
+        &h,
+        "stream-sized",
+        HttpMethod::Post,
+        guard.path("/v1/upload"),
+    )
+    .await;
+
+    for declared in [Some("20"), None] {
+        let mut req = http::Request::post(format!("/stream-sized{}/v1/upload", guard.prefix()))
+            .header(http::header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(len) = declared {
+            req = req.header(http::header::CONTENT_LENGTH, len);
+        }
+        let body = sdk_stream(&[b"hello ", b"streamed ", b"world"]);
+        let resp = h
+            .facade()
+            .proxy_request(ctx.clone(), req.body(body).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rec = guard.recorded_requests().await;
+        let last = rec.last().unwrap();
+        assert_eq!(last.body, b"hello streamed world");
+        assert_eq!(recorded_header(last, "content-length"), declared);
+        let chunked = declared.is_none().then_some("chunked");
+        assert_eq!(recorded_header(last, "transfer-encoding"), chunked);
+    }
+}
+
+/// A stream longer or shorter than its declared `Content-Length` fails with
+/// a 400 `INVALID_CONTENT_LENGTH`, and the upstream gets no complete request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_streaming_body_of_the_wrong_length_is_rejected() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/v1/upload", ok_mock());
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    setup_mock_route(
+        &h,
+        "stream-mismatch",
+        HttpMethod::Post,
+        guard.path("/v1/upload"),
+    )
+    .await;
+
+    for (declared, parts) in [
+        ("20", &[&b"hello "[..], b"streamed"][..]),
+        ("20", &[&b"hello "[..], b"streamed ", b"world", b"!"][..]),
+        ("5", &[&b"hello world"[..]][..]),
+        // Read whole before dispatch: HTTP/1.1 would never poll it.
+        ("0", &[&b"x"[..]][..]),
+    ] {
+        let req = http::Request::post(format!("/stream-mismatch{}/v1/upload", guard.prefix()))
+            .header(http::header::CONTENT_TYPE, "application/octet-stream")
+            .header(http::header::CONTENT_LENGTH, declared)
+            .body(sdk_stream(parts))
+            .unwrap();
+        let err = h
+            .facade()
+            .proxy_request(ctx.clone(), req)
+            .await
+            .unwrap_err();
+        assert_invalid_argument(
+            err,
+            "content-length",
+            oagw_sdk::field::INVALID_CONTENT_LENGTH,
+        );
+    }
+    assert!(guard.recorded_requests().await.is_empty());
+}
+
+/// A declared length over `max_body_size` is refused before the stream is
+/// read or the upstream contacted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_streaming_body_declared_over_the_limit_is_refused_up_front() {
+    let mut guard = MockGuard::new();
+    guard.mock("POST", "/v1/upload", ok_mock());
+    let h = AppHarness::builder().with_max_body_size(64).build().await;
+    let ctx = h.security_context().clone();
+    setup_mock_route(
+        &h,
+        "stream-declared-big",
+        HttpMethod::Post,
+        guard.path("/v1/upload"),
+    )
+    .await;
+
+    // Never yields: reading it would hang the request.
+    let body = Body::Stream(Box::pin(futures_util::stream::pending()));
+    let req = http::Request::post(format!("/stream-declared-big{}/v1/upload", guard.prefix()))
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, "65")
+        .body(body)
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        h.facade().proxy_request(ctx.clone(), req),
+    )
+    .await
+    .expect("the declared length alone must refuse the request");
+    assert!(
+        matches!(result, Err(CanonicalError::OutOfRange { .. })),
+        "{result:?}"
+    );
+    assert!(guard.recorded_requests().await.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -6855,6 +6993,202 @@ async fn circuit_breaker_ignores_a_slow_upload() {
         .assert_status(200);
 }
 
+/// Reading a REST client's body is the gateway's step, not the upstream's:
+/// an upload that has not finished does not hold the half-open circuit's
+/// probe slot, so another caller's request is the probe and closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_probe_is_not_held_by_an_unfinished_rest_upload() {
+    use futures_util::StreamExt as _;
+    let h = AppHarness::builder()
+        .with_request_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .await;
+    let upstream = breaker_upstream_at(
+        &h,
+        Some("cb-upload-probe"),
+        json!({"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}),
+        json!({"failure_threshold": 1, "timeout_seconds": 1, "success_threshold": 1}),
+    )
+    .await;
+    h.api_v1()
+        .post_route()
+        .with_body(json!({
+            "upstream_id": upstream["id"],
+            "match": {"http": {"methods": ["POST"], "path": "/echo"}}
+        }))
+        .expect_status(201)
+        .await;
+    let get = |code: u16| {
+        h.api_v1()
+            .proxy_get("cb-upload-probe", &format!("status/{code}"))
+            .send()
+    };
+    assert_from_upstream(&get(503).await, 503);
+    assert_circuit_open(&get(200).await, "1");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // A REST upload declaring 10 bytes sends 1 and holds the rest.
+    let (addr, server) = start_oagw_server(&h).await;
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let (hold, held) = tokio::sync::oneshot::channel::<()>();
+    let first = futures_util::stream::iter([Ok::<_, std::io::Error>(hyper::body::Frame::data(
+        bytes::Bytes::from_static(b"u"),
+    ))]);
+    let rest = futures_util::stream::once(async move {
+        let _ = held.await;
+        Err(std::io::Error::other("client gave up"))
+    });
+    let req = http::Request::post("/oagw/v1/proxy/cb-upload-probe/echo")
+        .header(http::header::HOST, addr.to_string())
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, 10)
+        .body(http_body_util::StreamBody::new(first.chain(rest)))
+        .unwrap();
+    let upload = tokio::spawn(async move { sender.send_request(req).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Another caller while the upload is open: the probe, answered 200.
+    let resp = get(200).await;
+    drop(hold);
+    let _ = upload.await;
+    server.abort();
+    resp.assert_status(200);
+}
+
+/// The same for an SDK caller's stream that has not ended: it is read whole
+/// before the permit while the circuit is not closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_probe_is_not_held_by_an_unfinished_sdk_stream() {
+    use futures_util::StreamExt as _;
+    let h = AppHarness::builder()
+        .with_request_timeout(std::time::Duration::from_secs(2))
+        .build()
+        .await;
+    let ctx = h.security_context().clone();
+    let upstream = breaker_upstream_at(
+        &h,
+        Some("cb-stream-probe"),
+        json!({"host": "127.0.0.1", "port": h.mock_port(), "scheme": "http"}),
+        json!({"failure_threshold": 1, "timeout_seconds": 1, "success_threshold": 1}),
+    )
+    .await;
+    h.api_v1()
+        .post_route()
+        .with_body(json!({
+            "upstream_id": upstream["id"],
+            "match": {"http": {"methods": ["POST"], "path": "/echo"}}
+        }))
+        .expect_status(201)
+        .await;
+    let get = |code: u16| {
+        h.api_v1()
+            .proxy_get("cb-stream-probe", &format!("status/{code}"))
+            .send()
+    };
+    assert_from_upstream(&get(503).await, 503);
+    assert_circuit_open(&get(200).await, "1");
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // One chunk, then nothing until the deadline.
+    let chunk: Result<bytes::Bytes, oagw_sdk::body::BoxError> = Ok(bytes::Bytes::from_static(b"u"));
+    let stream: oagw_sdk::body::BodyStream =
+        Box::pin(futures_util::stream::iter([chunk]).chain(futures_util::stream::pending()));
+    let req = http::Request::builder()
+        .method(Method::POST)
+        .uri("/cb-stream-probe/echo")
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::Stream(stream))
+        .unwrap();
+    let (upload, resp) = tokio::join!(h.facade().proxy_request(ctx, req), async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        get(200).await
+    });
+    upload.expect_err("the stream never ends");
+    resp.assert_status(200);
+}
+
+/// A deadline hit after a late upload counts against the upstream only if
+/// it still had its full budget once the body was in. An upload that ends
+/// at once leaves it that budget, so a silent upstream opens the circuit.
+#[tokio::test]
+async fn circuit_breaker_takes_a_late_upload_off_the_upstream_budget() {
+    use futures_util::StreamExt as _;
+    let h = AppHarness::builder()
+        .with_request_timeout(std::time::Duration::from_millis(300))
+        .build()
+        .await;
+    let ctx = h.security_context().clone();
+    // Reads every request and never answers.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = silent.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = silent.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while matches!(
+                    tokio::io::AsyncReadExt::read(&mut tcp, &mut buf).await,
+                    Ok(n) if n > 0
+                ) {}
+            });
+        }
+    });
+    for (alias, upload_ends_after_ms, circuit_opens) in [
+        ("cb-late-upload", 200, false),
+        ("cb-prompt-upload", 0, true),
+    ] {
+        let upstream = breaker_upstream_at(
+            &h,
+            Some(alias),
+            json!({"host": "127.0.0.1", "port": port, "scheme": "http"}),
+            json!({"failure_threshold": 1, "timeout_seconds": 60, "success_threshold": 1}),
+        )
+        .await;
+        h.api_v1()
+            .post_route()
+            .with_body(json!({
+                "upstream_id": upstream["id"],
+                "match": {"http": {"methods": ["POST"], "path": "/echo"}}
+            }))
+            .expect_status(201)
+            .await;
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            let chunk: Result<bytes::Bytes, oagw_sdk::body::BoxError> =
+                Ok(bytes::Bytes::from_static(b"part"));
+            let end = futures_util::stream::once(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(upload_ends_after_ms)).await;
+            })
+            .filter_map(|()| std::future::ready(None));
+            let stream: oagw_sdk::body::BodyStream =
+                Box::pin(futures_util::stream::iter([chunk]).chain(end));
+            let req = http::Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{alias}/echo"))
+                .header(http::header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::Stream(stream))
+                .unwrap();
+            let err = h
+                .facade()
+                .proxy_request(ctx.clone(), req)
+                .await
+                .expect_err("the upstream never answers");
+            statuses.push(err.status_code());
+        }
+        // 504: the deadline; 503: the open circuit.
+        let expected = if circuit_opens {
+            [504, 503]
+        } else {
+            [504, 504]
+        };
+        assert_eq!(statuses, expected, "{alias}");
+    }
+}
+
 /// A request pinned with `X-OAGW-Target-Host` to one endpoint of several
 /// says nothing about the others: failures on a dead endpoint leave the
 /// circuit closed (an open one would answer every request with its own
@@ -7016,4 +7350,198 @@ async fn circuit_breaker_counts_websocket_handshakes() {
     drop(tunnel);
     let tunnel = proxy(echo()).await.expect("the circuit is closed");
     assert_eq!(tunnel.status(), StatusCode::SWITCHING_PROTOCOLS);
+}
+
+// ---------------------------------------------------------------------------
+// Early upstream responses to streamed uploads (#4981)
+// ---------------------------------------------------------------------------
+
+/// An upstream that answers `413` as soon as it has the request head, never
+/// reads the body, and closes the connection soon after. Reports the head
+/// it got.
+async fn start_upstream_refusing_uploads() -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (heads, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            let heads = heads.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tcp.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = heads.send(String::from_utf8_lossy(&head).into_owned());
+                let _ = tcp
+                    .write_all(
+                        b"HTTP/1.1 413 Payload Too Large\r\ncontent-type: text/plain\r\n\
+                          content-length: 8\r\nconnection: close\r\n\r\ntoo big!",
+                    )
+                    .await;
+                // A lingering close, as servers do: closing with the upload
+                // unread would reset the connection and could destroy the
+                // answer in the gateway's receive buffer.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                let _ = tcp.shutdown().await;
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// An upstream on `addr` with a `POST` route on `/v1/upload`.
+async fn setup_raw_upload_route(h: &AppHarness, alias: &str, addr: std::net::SocketAddr) {
+    let ctx = h.security_context().clone();
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: addr.port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias(alias)
+            .build(),
+        )
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx,
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Post],
+                        path: "/v1/upload".into(),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+}
+
+const EARLY_UPLOAD_LEN: usize = 8 * 1024 * 1024;
+
+/// A body of `EARLY_UPLOAD_LEN` declared bytes: one 1 MiB chunk, then
+/// nothing until `rx` is dropped. The upstream must answer before it ends.
+fn held_open_upload(
+    hold: tokio::sync::oneshot::Receiver<()>,
+) -> impl futures_util::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + 'static {
+    use futures_util::StreamExt as _;
+    let first = futures_util::stream::iter([Ok(bytes::Bytes::from(vec![b'u'; 1024 * 1024]))]);
+    let rest = futures_util::stream::once(async move {
+        let _ = hold.await;
+        Err(std::io::Error::other("client gave up"))
+    });
+    first.chain(rest)
+}
+
+/// REST: the upstream answers 413 before reading a large upload and closes.
+/// The client gets the upstream's 413 while its upload is still open, not a
+/// gateway error, and the upstream got the client's `Content-Length`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proxy_rest_early_upstream_response_to_an_upload_is_relayed() {
+    let (upstream_addr, mut heads) = start_upstream_refusing_uploads().await;
+    let h = AppHarness::builder().build().await;
+    setup_raw_upload_route(&h, "early-413-rest", upstream_addr).await;
+    let (addr, server) = start_oagw_server(&h).await;
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
+            .await
+            .unwrap();
+    tokio::spawn(conn);
+    let (hold, held) = tokio::sync::oneshot::channel::<()>();
+    let body = http_body_util::StreamBody::new(futures_util::TryStreamExt::map_ok(
+        held_open_upload(held),
+        hyper::body::Frame::data,
+    ));
+    let req = http::Request::post("/oagw/v1/proxy/early-413-rest/v1/upload")
+        .header(http::header::HOST, addr.to_string())
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, EARLY_UPLOAD_LEN)
+        .body(body)
+        .unwrap();
+    let mut resp =
+        tokio::time::timeout(std::time::Duration::from_secs(10), sender.send_request(req))
+            .await
+            .expect("the upstream's answer must arrive while the upload is open")
+            .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.headers()
+            .get("x-oagw-error-source")
+            .and_then(|v| v.to_str().ok()),
+        Some(ErrorSource::Upstream.as_str())
+    );
+    let (data, _) = read_http_body(resp.body_mut()).await;
+    assert_eq!(data, b"too big!");
+
+    let head = heads.recv().await.unwrap().to_ascii_lowercase();
+    assert!(
+        head.contains(&format!("content-length: {EARLY_UPLOAD_LEN}")),
+        "{head}"
+    );
+    assert!(!head.contains("transfer-encoding"), "{head}");
+    drop(hold);
+    server.abort();
+}
+
+/// SDK: the same early 413 reaches an in-process caller whose stream is
+/// still open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_sdk_early_upstream_response_to_an_upload_is_relayed() {
+    use futures_util::TryStreamExt as _;
+
+    let (upstream_addr, mut heads) = start_upstream_refusing_uploads().await;
+    let h = AppHarness::builder().build().await;
+    setup_raw_upload_route(&h, "early-413-sdk", upstream_addr).await;
+
+    let (hold, held) = tokio::sync::oneshot::channel::<()>();
+    let stream = held_open_upload(held).map_err(|e| -> oagw_sdk::body::BoxError { Box::new(e) });
+    let req = http::Request::post("/early-413-sdk/v1/upload")
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(http::header::CONTENT_LENGTH, EARLY_UPLOAD_LEN)
+        .body(Body::Stream(Box::pin(stream)))
+        .unwrap();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        h.facade().proxy_request(h.security_context().clone(), req),
+    )
+    .await
+    .expect("the upstream's answer must arrive while the upload is open")
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        resp.into_body().into_bytes().await.unwrap(),
+        bytes::Bytes::from_static(b"too big!")
+    );
+    let head = heads.recv().await.unwrap().to_ascii_lowercase();
+    assert!(
+        head.contains(&format!("content-length: {EARLY_UPLOAD_LEN}")),
+        "{head}"
+    );
+    drop(hold);
 }

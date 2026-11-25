@@ -99,11 +99,12 @@ async fn non_ascii_content_length_returns_400() {
     );
 }
 
-// Without a `Content-Length` the limit is enforced while buffering the body.
+// Without a `Content-Length` the limit is enforced while the body streams.
 // A streamed body has no known length, so nothing sets the header for it.
 #[tokio::test]
 async fn body_over_limit_without_content_length_returns_413() {
     let h = AppHarness::builder().with_max_body_size(8).build().await;
+    upstream_with_routes(&h, "any-alias", HttpMethod::Post, &["/v1/test"]).await;
     let body = axum::body::Body::from_stream(futures_util::stream::iter([
         Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"streamed in chunks, ")),
         Ok(bytes::Bytes::from_static(b"longer than eight bytes")),
@@ -124,7 +125,7 @@ async fn body_over_limit_without_content_length_returns_413() {
         .expect("read response body");
     let text = String::from_utf8_lossy(&body);
     assert!(
-        text.contains("request body exceeds maximum of 8 bytes"),
+        text.contains("exceeds maximum of 8 bytes"),
         "unexpected body: {text}"
     );
 }
@@ -195,6 +196,11 @@ async fn websocket_upgrade_without_upgradable_connection_returns_502() {
 
 /// An upstream on the mock with a GET route at each of `paths`.
 async fn upstream_with_get_routes(h: &AppHarness, alias: &str, paths: &[&str]) {
+    upstream_with_routes(h, alias, HttpMethod::Get, paths).await;
+}
+
+/// An upstream on the mock with a `method` route at each of `paths`.
+async fn upstream_with_routes(h: &AppHarness, alias: &str, method: HttpMethod, paths: &[&str]) {
     let ctx = h.security_context().clone();
     let upstream = h
         .facade()
@@ -223,7 +229,7 @@ async fn upstream_with_get_routes(h: &AppHarness, alias: &str, paths: &[&str]) {
                     upstream.id,
                     MatchRules {
                         http: Some(HttpMatch {
-                            methods: vec![HttpMethod::Get],
+                            methods: vec![method],
                             path: (*path).into(),
                             query_allowlist: vec![],
                             path_suffix_mode: PathSuffixMode::Append,
@@ -422,6 +428,7 @@ async fn denied_caller_gets_403_before_body_checks() {
 #[tokio::test]
 async fn body_read_error_returns_400_not_413() {
     let h = AppHarness::builder().build().await;
+    upstream_with_routes(&h, "any-alias", HttpMethod::Post, &["/v1/test"]).await;
     let body = axum::body::Body::from_stream(futures_util::stream::iter([
         Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"partial ")),
         Err(std::io::Error::new(

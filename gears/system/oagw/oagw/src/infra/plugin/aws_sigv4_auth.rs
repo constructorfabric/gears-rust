@@ -17,7 +17,9 @@ use toolkit_security::SecurityContext;
 use toolkit_security::crypto::sigv4::{CredentialScope, SigningKey, sha256_hex};
 use zeroize::Zeroizing;
 
-use crate::domain::plugin::aws_sigv4::{AwsSigV4AuthConfig, UNSIGNED_PAYLOAD_FIELD, UriEncoding};
+use crate::domain::plugin::aws_sigv4::{
+    AwsSigV4AuthConfig, UNSIGNED_PAYLOAD_FIELD, UNSIGNED_PAYLOAD_KEY, UriEncoding,
+};
 use crate::domain::plugin::credentials::{
     ACCESS_KEY_ID_REF_KEY, SECRET_ACCESS_KEY_REF_KEY, SESSION_TOKEN_REF_KEY,
 };
@@ -241,6 +243,20 @@ impl AuthPlugin for AwsSigV4AuthPlugin {
 
     fn signs(&self) -> bool {
         true
+    }
+
+    /// Only `unsigned_payload` lets a streamed body stay streamed, and only
+    /// with a declared length: S3 refuses a chunked upload without
+    /// `x-amz-decoded-content-length`. Reads just that key, so the config is
+    /// parsed once per request (in `sign`); a value other than `true` buffers
+    /// and `sign` reports an invalid one.
+    fn signs_body(
+        &self,
+        config: &std::collections::HashMap<String, String>,
+        declared_len: Option<u64>,
+    ) -> bool {
+        declared_len.is_none()
+            || config.get(UNSIGNED_PAYLOAD_KEY).map(String::as_str) != Some("true")
     }
 
     async fn sign(&self, ctx: &SigningContext) -> Result<SigningOutput, PluginError> {

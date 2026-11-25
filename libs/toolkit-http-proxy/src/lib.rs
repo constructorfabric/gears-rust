@@ -27,7 +27,8 @@
 //!   upstream provably did not process it: it never left, the peer answered
 //!   `REFUSED_STREAM` or `HTTP_1_1_REQUIRED`, or, for idempotent requests
 //!   only, a graceful `GOAWAY` or a stale keep-alive connection. A non-empty
-//!   body is sent again only when attached as a [`ReplayableBody`].
+//!   body is sent again only when attached as a [`ReplayableBody`], or when
+//!   a [`replay_tee`] copy still holds all of it that was sent.
 //! - **Bounded uploads.** HTTP/2 bodies are queued only as fast as the
 //!   peer's flow-control window opens; a window closed for `write_timeout`
 //!   resets the stream, and a socket that stops accepting writes for
@@ -49,13 +50,15 @@ mod kill;
 mod observe;
 mod pool;
 mod protocol_cache;
+mod replay;
 pub mod sanitize;
 mod target;
 mod timer;
 mod tls;
 
 pub use body::{
-    BoxError, ProxyBody, ReplayableBody, ResponseBody, empty_body, full_body, stream_body,
+    BoxError, ProxyBody, ReplayableBody, ResponseBody, empty_body, full_body, sized_stream_body,
+    stream_body,
 };
 pub use client::{ProxyClient, UpgradeOutcome};
 pub use config::{
@@ -64,4 +67,5 @@ pub use config::{
 pub use error::{ErrorKind, ProxyError};
 pub use observe::{ConnectionInfo, NoopObserver, Observer};
 pub use protocol_cache::CachedProtocol;
+pub use replay::{ReplayTee, replay_tee};
 pub use target::{ProtocolPolicy, Target, Transport};
