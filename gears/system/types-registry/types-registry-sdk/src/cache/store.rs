@@ -1,7 +1,9 @@
 //! Snapshot LRU bounded by charged bytes and entry count. Both keys address
-//! one snapshot holding fields read under one validator.
+//! an entity's snapshots, each holding fields read under one validator for one
+//! [`Scope`]. Snapshots of one entity share equal documents, charged once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::hash_map::Entry as MapEntry;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Weak};
@@ -41,6 +43,199 @@ impl ReadContext {
             tenant,
             scopes: scopes.into(),
         }
+    }
+
+    /// The tenant a read's representation is relative to: the home tenant until the
+    /// SDK carries a Context Tenant, which then takes its place here.
+    pub fn tenant(&self) -> Uuid {
+        self.tenant
+    }
+}
+
+/// The readers one snapshot answers. `ownership` — and from P1 availability — is
+/// relative to the reader's Context Tenant, so a tenant-owned snapshot answers only the
+/// tenant it was read for. A global snapshot, and every snapshot of the platform
+/// cache, answers every reader. Ownership never changes, so an entity's snapshots are
+/// all `Shared` or all `Tenant`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scope {
+    Shared,
+    Tenant(Uuid),
+}
+
+impl Scope {
+    /// Where a snapshot read for `reader` (`None` on the platform plane) is kept.
+    pub fn of(entity: &Entity, reader: Option<Uuid>) -> Self {
+        match reader {
+            Some(tenant) if entity.ownership != Ownership::Global => Self::Tenant(tenant),
+            _ => Self::Shared,
+        }
+    }
+}
+
+/// The document fields, apart from the metadata, so that snapshots of one entity held
+/// for different tenants share equal documents.
+const DOCUMENTS: [EntityField; 4] = [
+    EntityField::Content,
+    EntityField::ResolvedSchema,
+    EntityField::EffectiveTraits,
+    EntityField::EffectiveTraitsSchema,
+];
+
+/// A snapshot as held: metadata, with every document `None`, and the documents apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Held {
+    meta: Arc<Entity>,
+    /// By position in [`DOCUMENTS`]; a selected JSON `null` is `Some`.
+    documents: [Option<Arc<JsonDocument>>; 4],
+}
+
+impl Held {
+    pub fn new(mut entity: Entity) -> Self {
+        // A new document field must be held apart.
+        let Entity {
+            content,
+            resolved_schema,
+            effective_traits,
+            effective_traits_schema,
+            ..
+        } = &mut entity;
+        let documents = [
+            content.take(),
+            resolved_schema.take(),
+            effective_traits.take(),
+            effective_traits_schema.take(),
+        ]
+        .map(|document| document.map(Arc::new));
+        Self {
+            meta: Arc::new(entity),
+            documents,
+        }
+    }
+
+    /// The held documents, by position in the document fields.
+    #[cfg(test)]
+    pub fn documents(&self) -> &[Option<Arc<JsonDocument>>; 4] {
+        &self.documents
+    }
+
+    /// Identity, kind, lifecycle, ownership and the non-document fields; its documents
+    /// are `None` whatever is held.
+    pub fn meta(&self) -> &Entity {
+        &self.meta
+    }
+
+    /// The snapshot as a read selecting `selection` is answered: every other field
+    /// dropped. Holds at least the applicable fields of `selection`.
+    pub fn project(&self, selection: &FieldSelection) -> Entity {
+        let keep = |field: EntityField| selection.contains(field);
+        let document = |at: usize| {
+            self.documents[at]
+                .as_deref()
+                .filter(|_| keep(DOCUMENTS[at]))
+                .cloned()
+        };
+        Entity {
+            gts_id: self.meta.gts_id.clone(),
+            gts_uuid: self.meta.gts_uuid,
+            kind: self.meta.kind,
+            lifecycle_status: self.meta.lifecycle_status,
+            ownership: self.meta.ownership,
+            origin: self.meta.origin.filter(|_| keep(EntityField::Origin)),
+            content: document(0),
+            resolved_schema: document(1),
+            effective_traits: document(2),
+            effective_traits_schema: document(3),
+            provenance: self
+                .meta
+                .provenance
+                .filter(|_| keep(EntityField::Provenance)),
+        }
+    }
+
+    /// `fresh`, read under `selection`, with the fields of `resident` it did not select.
+    /// Both must be one state, read under one validator for one scope.
+    pub fn merged(fresh: &Self, selection: &FieldSelection, resident: &Self) -> Self {
+        let take = |field: EntityField| !selection.contains(field);
+        let mut meta = (*fresh.meta).clone();
+        // A new non-document field needs an explicit merge rule.
+        let Entity {
+            gts_id: _,
+            gts_uuid: _,
+            kind: _,
+            lifecycle_status: _,
+            ownership: _,
+            origin,
+            content: _,
+            resolved_schema: _,
+            effective_traits: _,
+            effective_traits_schema: _,
+            provenance,
+        } = &mut meta;
+        if take(EntityField::Origin) {
+            *origin = resident.meta.origin;
+        }
+        if take(EntityField::Provenance) {
+            *provenance = resident.meta.provenance;
+        }
+        let documents = std::array::from_fn(|at| {
+            if take(DOCUMENTS[at]) {
+                resident.documents[at].clone()
+            } else {
+                fresh.documents[at].clone()
+            }
+        });
+        Self {
+            meta: Arc::new(meta),
+            documents,
+        }
+    }
+
+    /// Hold a sibling's copy of each document that serializes, in the same field, to the
+    /// same bytes as the one held here. Value equality is not enough: `serde_json` calls
+    /// `-0.0` and `0.0` equal, and object key order may differ. Each distinct sibling
+    /// document is compared at most once, and only when its measured size matches.
+    fn share(&mut self, weight: &Weight, siblings: &[(&Self, &Weight)]) {
+        for (at, field) in DOCUMENTS.into_iter().enumerate() {
+            let Some(held) = self.documents[at].as_mut() else {
+                continue;
+            };
+            let size = weight.documents.get(&field);
+            let mut mine = None;
+            let mut compared = HashSet::new();
+            for (sibling, sibling_weight) in siblings {
+                let Some(theirs) = &sibling.documents[at] else {
+                    continue;
+                };
+                if Arc::ptr_eq(held, theirs) {
+                    break;
+                }
+                if !compared.insert(Arc::as_ptr(theirs).addr())
+                    || sibling_weight.documents.get(&field) != size
+                {
+                    continue;
+                }
+                let mine = mine.get_or_insert_with(|| serde_json::to_vec(&**held).ok());
+                if mine.is_some() && *mine == serde_json::to_vec(&**theirs).ok() {
+                    *held = Arc::clone(theirs);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Each held document with its charge, by `weight`.
+    fn charged<'a>(&'a self, weight: &'a Weight) -> impl Iterator<Item = (usize, usize)> + 'a {
+        self.documents
+            .iter()
+            .zip(DOCUMENTS)
+            .filter_map(move |(document, field)| {
+                let document = document.as_ref()?;
+                Some((
+                    Arc::as_ptr(document).addr(),
+                    weight.documents.get(&field).copied().unwrap_or(0),
+                ))
+            })
     }
 }
 
@@ -83,11 +278,11 @@ impl Proof {
     }
 }
 
-/// A resident entity: the fields read of it so far, all under `etag`.
+/// A resident snapshot: the fields read of an entity so far for one scope, all under `etag`.
 #[derive(Debug, Clone)]
 pub struct Entry {
     /// Carries exactly the fields of `covers` that apply to its kind.
-    pub snapshot: Arc<Entity>,
+    pub snapshot: Held,
     /// The fields read under `etag`, the mandatory ones included. A read is answered
     /// from the entry only when these include every field it selects.
     pub covers: FieldSelection,
@@ -123,6 +318,12 @@ impl Weight {
     /// Total resident bytes, including the raw validator needed for revalidation.
     pub fn bytes_with_validator(&self, etag: &Validator) -> usize {
         self.total().saturating_add(etag.as_bytes().len())
+    }
+
+    /// The bytes charged per snapshot whatever its documents share: identifier,
+    /// allowance and validator.
+    fn own(&self, etag: &Validator) -> usize {
+        self.fixed.saturating_add(etag.as_bytes().len())
     }
 
     /// Whether a snapshot of this weight can be retained under `bound` at all.
@@ -175,80 +376,6 @@ pub fn weight(snapshot: &Entity) -> Weight {
         fixed: gts_id.as_ref().len().saturating_add(ENTRY_ALLOWANCE_BYTES),
         documents,
     }
-}
-
-/// `snapshot` as a read selecting `selection` is answered: every other field dropped.
-/// `snapshot` carries at least the applicable fields of `selection`.
-pub fn project(snapshot: &Entity, selection: &FieldSelection) -> Entity {
-    let keep = |field: EntityField| selection.contains(field);
-    Entity {
-        gts_id: snapshot.gts_id.clone(),
-        gts_uuid: snapshot.gts_uuid,
-        kind: snapshot.kind,
-        lifecycle_status: snapshot.lifecycle_status,
-        ownership: snapshot.ownership,
-        origin: snapshot.origin.filter(|_| keep(EntityField::Origin)),
-        content: kept(snapshot.content.as_ref(), keep(EntityField::Content)),
-        resolved_schema: kept(
-            snapshot.resolved_schema.as_ref(),
-            keep(EntityField::ResolvedSchema),
-        ),
-        effective_traits: kept(
-            snapshot.effective_traits.as_ref(),
-            keep(EntityField::EffectiveTraits),
-        ),
-        effective_traits_schema: kept(
-            snapshot.effective_traits_schema.as_ref(),
-            keep(EntityField::EffectiveTraitsSchema),
-        ),
-        provenance: snapshot
-            .provenance
-            .filter(|_| keep(EntityField::Provenance)),
-    }
-}
-
-/// Clones a document only when it is kept.
-fn kept(document: Option<&JsonDocument>, keep: bool) -> Option<JsonDocument> {
-    document.filter(|_| keep).cloned()
-}
-
-/// `fresh`, read under `selection`, with the fields of `resident` it did not select.
-/// Both must be one state, read under one validator.
-pub fn merge(mut fresh: Entity, selection: &FieldSelection, resident: &Entity) -> Entity {
-    let take = |field: EntityField| !selection.contains(field);
-    // A new field needs an explicit merge rule.
-    let Entity {
-        gts_id: _,
-        gts_uuid: _,
-        kind: _,
-        lifecycle_status: _,
-        ownership: _,
-        origin,
-        content,
-        resolved_schema,
-        effective_traits,
-        effective_traits_schema,
-        provenance,
-    } = &mut fresh;
-    if take(EntityField::Origin) {
-        *origin = resident.origin;
-    }
-    if take(EntityField::Content) {
-        content.clone_from(&resident.content);
-    }
-    if take(EntityField::ResolvedSchema) {
-        resolved_schema.clone_from(&resident.resolved_schema);
-    }
-    if take(EntityField::EffectiveTraits) {
-        effective_traits.clone_from(&resident.effective_traits);
-    }
-    if take(EntityField::EffectiveTraitsSchema) {
-        effective_traits_schema.clone_from(&resident.effective_traits_schema);
-    }
-    if take(EntityField::Provenance) {
-        *provenance = resident.provenance;
-    }
-    fresh
 }
 
 /// The fields of both selections.
@@ -342,7 +469,11 @@ impl Ticket {
 /// Snapshot LRU with per-key read tickets. Registry-issued pairs index resident
 /// snapshots and let either key fence in-flight reads.
 pub struct Store {
-    entries: LruCache<Uuid, Entry>,
+    entries: LruCache<(Uuid, Scope), Entry>,
+    /// The scopes each resident entity has a snapshot in.
+    scopes: HashMap<Uuid, Vec<Scope>>,
+    /// Held documents by address: how many snapshots hold each, and its charge.
+    documents: HashMap<usize, (usize, usize)>,
     /// Validate both stores atomically while keeping their recency independent.
     pub identities: Identities,
     /// Keyed by (entity, read context).
@@ -376,6 +507,8 @@ impl Store {
     pub fn new(bound: usize, max_entries: usize) -> Self {
         Self {
             entries: LruCache::unbounded(),
+            scopes: HashMap::new(),
+            documents: HashMap::new(),
             identities: Identities::new(0),
             confirmations: None,
             contexts_in_flight: HashMap::new(),
@@ -391,13 +524,30 @@ impl Store {
         }
     }
 
-    /// Where the entry `key` spells is resident.
+    /// The entity `key` spells, by a resident snapshot's identifier or by its UUID.
     fn resident(&self, key: &EntityKey) -> Option<Uuid> {
         let uuid = match key {
             EntityKey::GtsId(id) => *self.aliases.get(id)?,
             EntityKey::GtsUuid(uuid) => *uuid,
         };
         Some(uuid)
+    }
+
+    /// The resident snapshot of `gts_uuid` that answers `reader` (`None` on the platform
+    /// plane): the shared one, else the one read for that tenant.
+    fn slot(&self, gts_uuid: Uuid, reader: Option<Uuid>) -> Option<(Uuid, Scope)> {
+        let scopes = self.scopes.get(&gts_uuid)?;
+        if scopes.contains(&Scope::Shared) {
+            return Some((gts_uuid, Scope::Shared));
+        }
+        let tenant = Scope::Tenant(reader?);
+        scopes.contains(&tenant).then_some((gts_uuid, tenant))
+    }
+
+    /// Any resident snapshot of `gts_uuid`: all agree on its pair and its class.
+    fn any(&self, gts_uuid: Uuid) -> Option<&Entry> {
+        let scope = *self.scopes.get(&gts_uuid)?.first()?;
+        self.entries.peek(&(gts_uuid, scope))
     }
 
     /// Remember up to `bound` identity pairs for resolution.
@@ -413,9 +563,9 @@ impl Store {
     /// Whether the entity `gts_uuid` names is known to be global: from its resident
     /// snapshot, or from what an entity-carrying reply said of its remembered pair.
     pub fn known_global(&self, gts_uuid: Uuid) -> bool {
-        self.entries.peek(&gts_uuid).map_or_else(
+        self.any(gts_uuid).map_or_else(
             || self.identities.is_global(gts_uuid) == Some(true),
-            |entry| entry.snapshot.ownership == Ownership::Global,
+            |entry| entry.snapshot.meta().ownership == Ownership::Global,
         )
     }
 
@@ -423,6 +573,16 @@ impl Store {
     pub fn remembered_pair(&self, key: &EntityKey) -> Option<(GtsId, Uuid)> {
         let uuid = self.identities.peek_uuid(key)?;
         Some((self.identities.peek_id(uuid)?.clone(), uuid))
+    }
+
+    /// Whether `key` names an entity known to be global (`Some(true)`) or tenant-owned,
+    /// from any of its snapshots or its remembered pair.
+    pub fn class(&self, key: &EntityKey) -> Option<bool> {
+        let uuid = self.reference(key)?;
+        self.any(uuid).map_or_else(
+            || self.identities.is_global(uuid),
+            |entry| Some(entry.snapshot.meta().ownership == Ownership::Global),
+        )
     }
 
     /// Whether `key` names an entity known to be global.
@@ -434,9 +594,8 @@ impl Store {
     /// Whether a reply saying the entity `gts_uuid` is `global` (or not) contradicts
     /// what its resident snapshot or remembered pair already says.
     pub fn class_conflict(&self, gts_uuid: Uuid, global: bool) -> bool {
-        self.entries
-            .peek(&gts_uuid)
-            .is_some_and(|entry| (entry.snapshot.ownership == Ownership::Global) != global)
+        self.any(gts_uuid)
+            .is_some_and(|entry| (entry.snapshot.meta().ownership == Ownership::Global) != global)
             || self
                 .identities
                 .is_global(gts_uuid)
@@ -450,10 +609,10 @@ impl Store {
         if !self.known_global(uuid) {
             return None;
         }
-        if let Some(entry) = self.entries.get(&uuid) {
+        if let Some(entry) = self.entries.get(&(uuid, Scope::Shared)) {
             return Some(EntityIdentity {
-                gts_id: entry.snapshot.gts_id.clone(),
-                gts_uuid: entry.snapshot.gts_uuid,
+                gts_id: entry.snapshot.meta().gts_id.clone(),
+                gts_uuid: entry.snapshot.meta().gts_uuid,
             });
         }
         self.identities.get(&EntityKey::GtsUuid(uuid))
@@ -485,7 +644,7 @@ impl Store {
         };
         let version = self
             .entries
-            .peek(&uuid)
+            .peek(&(uuid, Scope::Tenant(context.tenant)))
             .and_then(|entry| entry.confirmed_version.as_ref());
         let Some(confirmations) = self.confirmations.as_mut() else {
             return false;
@@ -525,7 +684,7 @@ impl Store {
             let seen = self.confirmations.as_ref()?.peek(&key)?;
             let version = self
                 .entries
-                .peek(&uuid)
+                .peek(&(uuid, Scope::Tenant(context.tenant)))
                 .and_then(|entry| entry.confirmed_version.as_ref());
             let incarnation = self.identities.incarnation(uuid);
             (
@@ -544,7 +703,11 @@ impl Store {
         }
         confirmations.promote(&key);
         if by_read {
-            let snapshot = &self.entries.get(&uuid)?.snapshot;
+            let snapshot = self
+                .entries
+                .get(&(uuid, Scope::Tenant(context.tenant)))?
+                .snapshot
+                .meta();
             Some(EntityIdentity {
                 gts_id: snapshot.gts_id.clone(),
                 gts_uuid: snapshot.gts_uuid,
@@ -566,11 +729,12 @@ impl Store {
         let Some(uuid) = self.resident(key) else {
             return;
         };
-        // A global entity is served by its class alone; its own proof would only take a slot.
+        // A global entity is served by its class alone; its own proof would only take a
+        // slot. A tenant-owned one is confirmed only in the snapshot read for this tenant.
         let Some(version) = self
             .entries
-            .peek(&uuid)
-            .filter(|entry| entry.etag == *etag && entry.snapshot.ownership != Ownership::Global)
+            .peek(&(uuid, Scope::Tenant(context.tenant)))
+            .filter(|entry| entry.etag == *etag)
             .and_then(|entry| entry.confirmed_version.clone())
         else {
             return;
@@ -650,15 +814,15 @@ impl Store {
         self.contexts_in_flight.contains_key(context)
     }
 
-    /// The entry `key` spells, marked most recently used.
-    pub fn get(&mut self, key: &EntityKey) -> Option<&Entry> {
-        let at = self.resident(key)?;
+    /// The entry `key` spells that answers `reader`, marked most recently used.
+    pub fn get(&mut self, key: &EntityKey, reader: Option<Uuid>) -> Option<&Entry> {
+        let at = self.slot(self.resident(key)?, reader)?;
         self.entries.get(&at)
     }
 
-    /// The entry `key` spells, without marking it used.
-    pub fn peek(&self, key: &EntityKey) -> Option<&Entry> {
-        self.entries.peek(&self.resident(key)?)
+    /// The entry `key` spells that answers `reader`, without marking it used.
+    pub fn peek(&self, key: &EntityKey, reader: Option<Uuid>) -> Option<&Entry> {
+        self.entries.peek(&self.slot(self.resident(key)?, reader)?)
     }
 
     /// Return a conflicting resident counterpart without changing recency.
@@ -666,17 +830,20 @@ impl Store {
         if let Some(known) = self.aliases.get(gts_id).filter(|known| **known != gts_uuid) {
             return Some(EntityKey::GtsUuid(*known));
         }
-        self.entries
-            .peek(&gts_uuid)
-            .filter(|entry| entry.snapshot.gts_id != *gts_id)
-            .map(|entry| EntityKey::GtsId(entry.snapshot.gts_id.clone()))
+        self.any(gts_uuid)
+            .filter(|entry| entry.snapshot.meta().gts_id != *gts_id)
+            .map(|entry| EntityKey::GtsId(entry.snapshot.meta().gts_id.clone()))
     }
 
     /// Use the stated pair, then the resident pair, then `key` alone.
     fn spelling(&self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) -> Spelling {
         let resident = || {
-            self.peek(key)
-                .map(|entry| (&entry.snapshot.gts_id, entry.snapshot.gts_uuid))
+            self.any(self.resident(key)?).map(|entry| {
+                (
+                    &entry.snapshot.meta().gts_id,
+                    entry.snapshot.meta().gts_uuid,
+                )
+            })
         };
         if let Some((gts_id, gts_uuid)) = stated.or_else(resident) {
             return Spelling::Pair(gts_id.clone(), gts_uuid);
@@ -758,23 +925,25 @@ impl Store {
         self.max_entries > 0 && weight.fits(self.bound, etag)
     }
 
-    /// Replace the resident snapshot and return the number of capacity evictions.
-    /// An oversized replacement drops the stale entry. Measure `weight` before locking.
-    /// Callers check [identity conflicts](Self::conflict) first. Insertion still drops
-    /// a conflicting resident alias to preserve uniqueness.
+    /// Replace the snapshot resident in `scope` and return the number of capacity
+    /// evictions. An oversized replacement drops the stale entry. Measure `weight`
+    /// before locking. Callers check [identity conflicts](Self::conflict) first.
+    /// Insertion still drops a conflicting resident alias to preserve uniqueness.
     pub fn insert(
         &mut self,
-        snapshot: Arc<Entity>,
+        mut snapshot: Held,
         covers: FieldSelection,
         weight: Weight,
         etag: Validator,
         confirmed_at: Instant,
+        scope: Scope,
     ) -> u64 {
-        let key = snapshot.gts_uuid;
-        if let Some(other) = self.aliases.get(&snapshot.gts_id).copied()
-            && other != snapshot.gts_uuid
+        let uuid = snapshot.meta().gts_uuid;
+        let key = (uuid, scope);
+        if let Some(other) = self.aliases.get(&snapshot.meta().gts_id).copied()
+            && other != uuid
         {
-            self.remove(&other);
+            self.remove_entity(other);
         }
         let confirmed_version = self.confirmations.as_ref().map(|_| {
             self.entries
@@ -787,19 +956,39 @@ impl Store {
         if !self.fits(&weight, &etag) {
             return 0;
         }
-        let bytes = weight.bytes_with_validator(&etag);
+        let siblings: Vec<(&Held, &Weight)> = self
+            .scopes
+            .get(&uuid)
+            .into_iter()
+            .flatten()
+            .filter_map(|other| self.entries.peek(&(uuid, *other)))
+            .map(|entry| (&entry.snapshot, &entry.weight))
+            .collect();
+        snapshot.share(&weight, &siblings);
         let mut evictions = 0;
+        // Recharged each round: an eviction may leave a shared document to this one.
         // `used <= bound` holds throughout, so the subtraction cannot underflow.
-        while bytes > self.bound - self.used || self.entries.len() >= self.max_entries {
+        while self.charge(&snapshot, &weight, &etag) > self.bound - self.used
+            || self.entries.len() >= self.max_entries
+        {
             let Some((evicted, entry)) = self.entries.pop_lru() else {
                 break;
             };
             self.forget(&evicted, &entry);
             evictions += 1;
         }
-        self.used += bytes;
-        self.aliases
-            .insert(snapshot.gts_id.clone(), snapshot.gts_uuid);
+        self.used += weight.own(&etag);
+        for (address, bytes) in snapshot.charged(&weight) {
+            match self.documents.entry(address) {
+                MapEntry::Occupied(mut held) => held.get_mut().0 += 1,
+                MapEntry::Vacant(first) => {
+                    first.insert((1, bytes));
+                    self.used += bytes;
+                }
+            }
+        }
+        self.aliases.insert(snapshot.meta().gts_id.clone(), uuid);
+        self.scopes.entry(uuid).or_default().push(scope);
         self.entries.put(
             key,
             Entry {
@@ -814,39 +1003,95 @@ impl Store {
         evictions
     }
 
-    /// Advance confirmation time only for the matching resident validator.
-    pub fn confirm(&mut self, key: &EntityKey, etag: &Validator, at: Instant) {
-        let Some(resident) = self.resident(key) else {
+    /// What keeping `snapshot` would add: its own bytes and each document no resident
+    /// snapshot already holds.
+    fn charge(&self, snapshot: &Held, weight: &Weight, etag: &Validator) -> usize {
+        snapshot
+            .charged(weight)
+            .filter(|(address, _)| !self.documents.contains_key(address))
+            .fold(weight.own(etag), |sum, (_, bytes)| {
+                sum.saturating_add(bytes)
+            })
+    }
+
+    /// Advance confirmation time only for the matching validator of the snapshot that
+    /// answers `reader`.
+    pub fn confirm(
+        &mut self,
+        key: &EntityKey,
+        etag: &Validator,
+        at: Instant,
+        reader: Option<Uuid>,
+    ) {
+        let Some(slot) = self.resident(key).and_then(|uuid| self.slot(uuid, reader)) else {
             return;
         };
-        if let Some(entry) = self.entries.get_mut(&resident)
+        if let Some(entry) = self.entries.get_mut(&slot)
             && entry.etag == *etag
         {
             entry.confirmed_at = entry.confirmed_at.max(at);
         }
     }
 
-    fn remove(&mut self, key: &Uuid) {
+    fn remove(&mut self, key: &(Uuid, Scope)) {
         if let Some(entry) = self.entries.pop(key) {
             self.forget(key, &entry);
         }
     }
 
-    /// Drop the snapshot and fence older reads under either known key, or under
-    /// a possible unknown counterpart.
+    /// Drop every snapshot of the entity, whatever it was read for.
+    fn remove_entity(&mut self, gts_uuid: Uuid) {
+        for scope in self.scopes.get(&gts_uuid).cloned().unwrap_or_default() {
+            self.remove(&(gts_uuid, scope));
+        }
+    }
+
+    /// Drop the entity's snapshots other than the one that answers `reader`: its own
+    /// already carries the change that retires them.
+    pub fn retire_siblings(&mut self, key: &EntityKey, reader: Option<Uuid>) {
+        let Some(uuid) = self.resident(key) else {
+            return;
+        };
+        let keep = self.slot(uuid, reader).map(|(_, scope)| scope);
+        for scope in self.scopes.get(&uuid).cloned().unwrap_or_default() {
+            if Some(scope) != keep {
+                self.remove(&(uuid, scope));
+            }
+        }
+    }
+
+    /// Drop the entity's snapshots and fence older reads under either known key, or
+    /// under a possible unknown counterpart.
     pub fn invalidate(&mut self, key: &EntityKey, stated: Option<(&GtsId, Uuid)>) {
         let spelling = self.spelling(key, stated);
         if let (_, Some(uuid)) = spelling.parts() {
-            self.remove(&uuid);
+            self.remove_entity(uuid);
         }
         self.event(&spelling);
     }
 
-    /// Accounts for an entry that left the store, and with it its identifier.
-    fn forget(&mut self, key: &Uuid, entry: &Entry) {
-        self.used -= entry.weight.bytes_with_validator(&entry.etag);
-        if self.aliases.get(&entry.snapshot.gts_id) == Some(key) {
-            self.aliases.remove(&entry.snapshot.gts_id);
+    /// Accounts for an entry that left the store, its documents once no snapshot holds
+    /// them, and its identifier once no snapshot of the entity remains.
+    fn forget(&mut self, (gts_uuid, scope): &(Uuid, Scope), entry: &Entry) {
+        self.used -= entry.weight.own(&entry.etag);
+        for (address, _) in entry.snapshot.charged(&entry.weight) {
+            if let Some((holders, bytes)) = self.documents.get_mut(&address) {
+                *holders -= 1;
+                if *holders == 0 {
+                    self.used -= *bytes;
+                    self.documents.remove(&address);
+                }
+            }
+        }
+        if let Some(scopes) = self.scopes.get_mut(gts_uuid) {
+            scopes.retain(|resident| resident != scope);
+            if !scopes.is_empty() {
+                return;
+            }
+            self.scopes.remove(gts_uuid);
+        }
+        if self.aliases.get(&entry.snapshot.meta().gts_id) == Some(gts_uuid) {
+            self.aliases.remove(&entry.snapshot.meta().gts_id);
         }
     }
 
@@ -863,13 +1108,27 @@ impl Store {
         self.used
     }
 
+    /// Any snapshot of the entity `key` spells, whatever it was read for.
+    #[cfg(test)]
+    pub fn peek_any(&self, key: &EntityKey) -> Option<&Entry> {
+        self.any(self.resident(key)?)
+    }
+
+    /// The snapshots of the entity `key` spells, by scope.
+    #[cfg(test)]
+    pub fn scopes(&self, key: &EntityKey) -> Vec<Scope> {
+        self.resident(key)
+            .and_then(|uuid| self.scopes.get(&uuid).cloned())
+            .unwrap_or_default()
+    }
+
     /// Whether the store keeps any bookkeeping under the spelling `name`.
     #[cfg(test)]
     pub fn indexes(&self, name: &EntityKey) -> bool {
         match name {
             EntityKey::GtsId(id) => self.by_id.contains_key(id) || self.aliases.contains_key(id),
             EntityKey::GtsUuid(uuid) => {
-                self.by_uuid.contains_key(uuid) || self.entries.contains(uuid)
+                self.by_uuid.contains_key(uuid) || self.scopes.contains_key(uuid)
             }
         }
     }

@@ -1586,12 +1586,12 @@ async fn an_older_answer_does_not_fill_after_a_newer_one_was_evicted() {
         tokio::time::sleep(Duration::from_secs(6)).await;
         // A recorded v2; evict it before B, holding v1, commits.
         assert!(
-            f.cache.store().peek(&gts_key(TYPE)).is_some(),
+            f.cache.store().peek(&gts_key(TYPE), None).is_some(),
             "A filled v2"
         );
         f.title(gts_key(OTHER), full(), false).await;
         assert!(
-            f.cache.store().peek(&gts_key(TYPE)).is_none(),
+            f.cache.store().peek(&gts_key(TYPE), None).is_none(),
             "OTHER evicted v2 before B settles"
         );
         release.send(()).expect("held read");
@@ -1942,7 +1942,10 @@ async fn a_revalidation_contradicting_its_pinned_pair_fails_after_both_stores_ev
         f.read_with(vec![gts_key(TYPE).into()], full(), false),
         async {
             f.title(gts_key(OTHER), full(), false).await;
-            assert!(f.cache.store().peek(&gts_key(TYPE)).is_none(), "evicted");
+            assert!(
+                f.cache.store().peek(&gts_key(TYPE), None).is_none(),
+                "evicted"
+            );
             assert!(f.cache.identity(&gts_key(TYPE)).is_none(), "evicted");
             release.send(()).expect("held read");
         }
@@ -1959,9 +1962,9 @@ async fn a_revalidation_contradicting_its_pinned_pair_fails_after_both_stores_ev
     assert!(f.cache.identity(&EntityKey::GtsUuid(FORGED)).is_none());
     assert!(f.cache.identity(&gts_key(TYPE)).is_none());
     let store = f.cache.store();
-    assert!(store.peek(&EntityKey::GtsUuid(FORGED)).is_none());
-    assert!(store.peek(&gts_key(TYPE)).is_none());
-    assert!(store.peek(&pinned).is_none());
+    assert!(store.peek(&EntityKey::GtsUuid(FORGED), None).is_none());
+    assert!(store.peek(&gts_key(TYPE), None).is_none());
+    assert!(store.peek(&pinned, None).is_none());
 }
 
 /// Conflicting references within one batch fail before any fill, even without an identity LRU.
@@ -2029,7 +2032,10 @@ async fn an_answer_contradicting_a_remembered_pair_fails_after_its_snapshot_was_
     );
     f.title(gts_key(TYPE), full(), false).await;
     f.title(gts_key(OTHER), full(), false).await;
-    assert!(f.cache.store().peek(&gts_key(TYPE)).is_none(), "evicted");
+    assert!(
+        f.cache.store().peek(&gts_key(TYPE), None).is_none(),
+        "evicted"
+    );
 
     let forged = snapshot_under(&f.registry, FORGED).await;
     answer_next(&f, EntityKey::GtsUuid(FORGED), forged);
@@ -2037,7 +2043,12 @@ async fn an_answer_contradicting_a_remembered_pair_fails_after_its_snapshot_was_
         f.read_with(vec![EntityKey::GtsUuid(FORGED).into()], full(), false)
             .await,
     );
-    assert!(f.cache.store().peek(&EntityKey::GtsUuid(FORGED)).is_none());
+    assert!(
+        f.cache
+            .store()
+            .peek(&EntityKey::GtsUuid(FORGED), None)
+            .is_none()
+    );
     let known = f.cache.identity(&gts_key(TYPE)).expect("still remembered");
     assert_eq!(EntityKey::GtsUuid(known.gts_uuid), uuid_key(TYPE));
 }
@@ -2066,8 +2077,8 @@ async fn of_two_reads_answered_with_contradicting_pairs_the_later_settled_fails(
     assert_eq!(
         f.cache
             .store()
-            .peek(&gts_key(TYPE))
-            .map(|entry| entry.snapshot.gts_uuid),
+            .peek(&gts_key(TYPE), None)
+            .map(|entry| entry.snapshot.meta().gts_uuid),
         Some(FORGED),
         "the pair settled first stays"
     );
@@ -2137,7 +2148,7 @@ async fn an_issued_registry_reference_is_served_cached_under_either_spelling() {
             "{max_identity_entries}: one entry answered"
         );
         assert!(
-            f.cache.store().peek(&uuid_key(TYPE)).is_none(),
+            f.cache.store().peek(&uuid_key(TYPE), None).is_none(),
             "{max_identity_entries}: the derived Registry Reference names nothing resident"
         );
 
@@ -2145,7 +2156,7 @@ async fn an_issued_registry_reference_is_served_cached_under_either_spelling() {
         let held = f
             .cache
             .store()
-            .peek(&issued)
+            .peek(&issued, None)
             .expect("resident")
             .etag
             .clone();

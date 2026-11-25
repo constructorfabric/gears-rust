@@ -3021,7 +3021,7 @@ using the pair supplied by the registry. Platform identities have a separate LRU
 - [x] Never cached, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource
 - [x] An entry tracks the normalized set of fields it can serve. The tenant cache checks visibility separately from field coverage
 - [x] `freshness_window`, `max_size_bytes` and `max_entries` configure the snapshot cache; the four old keys become accepted-and-ignored in T38, when the old cache goes
-- [x] The tenant API shares snapshots across tenants and confirms visibility per tenant before serving cached reads (SPEC §8.3)
+- [x] The tenant API shares a global snapshot across tenants and keeps a tenant-owned snapshot per reader tenant, sharing equal documents; it serves a fresh global snapshot to every authenticated read context and other snapshots only after the registry confirms them for the same read context (SPEC §8.3)
 
 **Verification:**
 - [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (runs SDK cache tests), plus `cargo test -p cf-gears-types-registry` for adapter parity

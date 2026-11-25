@@ -141,7 +141,9 @@ impl BatchGetItem {
     }
 
     /// Revalidate a previous result. Only a `Found` snapshot supplies a validator.
-    /// After `Unchanged`, retain the original `Found` for subsequent reads.
+    /// After `Unchanged`, retain the original `Found` for subsequent reads. Pass a
+    /// result only for the tenant it was read for: `ownership` is relative to the
+    /// reader, and a P0 validator does not tell tenants apart.
     #[must_use]
     pub fn revalidate(mut self, previous: &EntityLookup) -> Self {
         self.condition = match previous {

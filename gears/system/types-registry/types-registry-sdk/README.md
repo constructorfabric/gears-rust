@@ -325,7 +325,7 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
   mixed-version publishers have no earlier guarantee.
 - Local clients trust both context types without validation or tenant scope (C2/C6).
 - Local and resolving REST clients use SDK caches. Each cache retains one snapshot
-  per entity. Reads reuse covered fields and return only the requested projection.
+  per entity and representation scope (below). Reads reuse covered fields and return only the requested projection.
   Matching validators let replies merge; a new validator replaces the snapshot.
   LRU limits default to 16 384 snapshots and 64 MiB. Each snapshot costs its compact
   JSON documents, GTS ID, raw validator and 256 bytes of metadata allowance. Setting
@@ -334,8 +334,11 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
   Use `fresh` to check immediately. Observed terminal successes invalidate affected
   platform entries. Unobserved changes may remain cached until expiry. The cache
   skips `NotFound`, failed reads, discovery pages and operation resources.
-- `CachedTypesRegistry` shares one snapshot across tenants. For tenant-owned and
-  unclassified entities, a tenant's first read can confirm it with its `ETag`. Up to
+- `CachedTypesRegistry` shares a global entity's snapshot across tenants and keeps a
+  tenant-owned entity's snapshot per subject tenant, since its `ownership` is relative
+  to the reader; tenants' snapshots of one entity share equal documents, charged once.
+  For tenant-owned and unclassified entities, a read context's first read can confirm
+  its tenant's snapshot with its `ETag`. Up to
   `max_entries` confirmations are retained for `freshness_window`, keyed by entity
   and read context: subject, subject type,
   subject tenant and the raw token scope list. Read contexts never share one,

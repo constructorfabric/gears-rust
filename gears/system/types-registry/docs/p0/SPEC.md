@@ -820,14 +820,24 @@ What P0 builds is DESIGN's cache minus what needs inputs P0 does not have:
 | Invalidation on an observed terminal mutation, across identifier and UUID keys | ✅ — a client observes a mutation when a poll or the reconciliation helper returns a terminal successful outcome, **not** when the `POST` is accepted |
 | Entries indexed by both identifier and UUID | ✅ — already true of the current cache |
 | `NotFound`, `Failed`, discovery pages and operation resources never cached | ✅ — all four are expressible in P0 |
-| Representation scope and projection coverage | ✅ One snapshot per entity in P0. Reuse requires field coverage. Merge replies with the same validator when they fit. A new validator discards the old snapshot even when its replacement is oversized. |
+| Representation scope and projection coverage | ✅ One snapshot per entity and scope: shared for global entities and the platform cache, per reader tenant for tenant-owned ones. Byte-identical documents in the same field are shared. Reuse requires field coverage. Merge replies with the same validator and scope when they fit. A new validator answering the read's own condition, or conflicting with the reader's own snapshot, discards the entity's other snapshots even when its replacement is oversized, and the reader's own unless it already carries the new validator; a cold read's reply leaves other tenants' snapshots to their windows. |
 | Batched conditional revalidation against validators, fail-closed | ✅ — §8.5 puts validators in P0, so expiry sends expired keys and their validators in one conditional `batchGet` and keeps an `unchanged` entry. A failed revalidation propagates and never extends the window |
 | No invalidated result accepted as current after the mutation is observed | ✅ — per-key generation advances on observed terminal outcomes or `fresh` validator changes; reads started earlier cannot refill the cache (P23) |
 
 The cache is not carried over as-is: it is typed on `GtsTypeSchema` / `GtsInstance`, which D6 deletes, so it is ported onto `Entity` when the new trait lands. It also moves out of the registry's local client into the SDK, as a decorator over any `dyn PlatformTypesRegistryApi`: a gear in another process reads through the REST client, and DESIGN's cache is per client, not per registry (D15). Until then the existing cache keeps serving the old trait untouched.
 
-**Tenant reads.** Each client shares snapshots and validators across tenants (C7) and,
-for tenant-owned and unclassified entities, keeps up to `max_entries` confirmations
+**Tenant reads.** `ownership` is relative to the reader's tenant, and the P0
+validator has no tenant input, so a registry serving tenant-owned rows would answer an
+owner (`context_tenant`) and its descendant (`ancestor_tenant`) under one validator
+(C7). The P0 registry refuses tenant-owned rows, so only the SDK test double exercises
+this today, but the cache does not rely on that: each client keeps one shared
+snapshot of a global entity for all tenants and a tenant-owned entity's snapshot per
+reader tenant (`subject_tenant_id`, replaced by the Context Tenant once the SDK carries
+one). A read never answers from, pins, merges into or confirms another tenant's
+snapshot. Byte-identical compact JSON in the same document field of an entity's
+snapshots is held once and charged once. The class a read knows when it
+starts, from any tenant's snapshot or the identity LRU, binds its reply. For
+tenant-owned and unclassified entities the client also keeps up to `max_entries` confirmations
 keyed by entity and **read context**:
 `subject_id`, `subject_type`, `subject_tenant_id` and the raw `token_scopes` list.
 From P1 the registry scopes reads per subject by ownership constraints the SDK cannot
@@ -887,8 +897,9 @@ invalidate a snapshot. Ordinary `batchGet` always follows snapshot freshness.
 Empty batches or batches over 100 items go to the registry intact for refusal.
 
 Each snapshot costs its compact JSON document bytes (including selected `null`),
-GTS ID bytes, raw validator bytes and a 256-byte metadata allowance. Merges reuse
-resident document weights. Oversized snapshots bypass retention. Heap usage can
+GTS ID bytes, raw validator bytes and a 256-byte metadata allowance. A document
+whose compact JSON matches, byte for byte, the same field of another tenant's
+snapshot of the entity is shared and charged once, until its last holder leaves. Merges reuse resident document weights. Oversized snapshots bypass retention. Heap usage can
 exceed this budget. All caches start empty on restart. Snapshot reads fail closed
 after expiry (C13), as do forwarded resolutions during an outage. A platform
 identity hit can still resolve offline. Publisher stamps (D18) do not affect
@@ -1121,7 +1132,7 @@ need the inputs tenancy supplies; DESIGN §3.3's own input table
 | `entity.resource_version` | ✓ | **yes** — compare-and-swap already maintains it |
 | `type_schema.resolution_fingerprint` | ✓, Type Schemas only | **yes** — materialized at admission (D3) |
 | subject visibility-chain version | ✓ **tenant plane only** | **no** — DESIGN: *"a platform read has no subject visibility chain"*, and §8.4 establishes every P0 read is platform-plane |
-| Context Tenant availability-chain version | ✓, whenever the read names a Context Tenant | **no** — availability is out of scope and a P0 read names no Context Tenant. In P1 it enters every projection of a read that names one, so one state keeps one validator per scope |
+| Context Tenant identifier and availability-chain version | ✓, whenever the read names a Context Tenant | **no** — availability is out of scope and a P0 read names no Context Tenant. In P1 both enter every projection of a read that names one, so one state keeps one validator per scope; the identifier because two tenants' chain versions can coincide |
 | routing generation | — external only | **no** — federation is out of scope |
 | `external_revision` | — external only | **no** — Externally Managed Entities are out of scope; managed revisions already move `resource_version` |
 | normalized projection | — | **no** — every projection of one state carries one validator (wire version 3; version 1 digested the selected-field set, and version 2 predates the mandatory `ownership` field, so neither token matches). Discovery pages carry no validator |
@@ -1134,8 +1145,10 @@ RFC 9110. A dependency refresh may also invalidate byte-identical `content`.
 Send a validator for the same entity and a projection the held snapshot covers.
 `BatchGetItem::revalidate(&previous_lookup)` binds both keys and coverage from a
 `Found` result. Transports use `item.if_none_match_for(&projection)`. A mismatch or
-a prior `Unchanged` or `NotFound` yields an unconditional read. Raw HTTP callers
-enforce key and projection coverage themselves.
+a prior `Unchanged` or `NotFound` yields an unconditional read. Reuse a result only
+for the tenant it was read for: until P1 adds the Context Tenant, the validator does
+not tell tenants apart, while `ownership` does. Raw HTTP callers enforce key,
+projection coverage and that same-tenant reuse themselves.
 
 The SDK stores opaque validator bytes. REST strips entity-tag quotes on receipt
 and restores them on send. The local client accepts up to 1024 raw bytes, while
@@ -1153,8 +1166,8 @@ cache holds one as authority.
 
 The wire token is base64url of a version byte and a 128-bit digest. Both REST
 surfaces quote the 23-character payload for 25 bytes total. The digest includes
-the version. V2 rejects V1's projection-scoped tokens, and a future version can
-add the chain inputs (C7).
+the version. V3 rejects V1's projection-scoped tokens and V2's pre-`ownership`
+tokens, and a future version can add the chain inputs (C7).
 
 **Where they apply.** Exact reads carry an `ETag`; a matching `If-None-Match` returns a bodyless
 `304`. Batch reads carry validators **beside individual keys**, because one header cannot
@@ -1289,7 +1302,7 @@ C1 and C4 are **struck** — resolved in P0 rather than deferred. C3 is narrowed
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
 | C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. DESIGN lets an authenticated platform workload bypass the tenant PDP; P0 authenticates every caller, tenant or workload (D17), but binds no permission to either — a tenant bearer cannot mutate on any host, but any platform workload holding a valid internal token can, on the registry's own listener or through the gateway (D20). From T45 `publisher` is required too, and refused from a tenant bearer (D18). `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. Exact, batch and discovery reads are authenticated only too. What `exposed = false` does and does not bound is C8 | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12). Reads take one decision per request — `read` for `batchGet` and `batchResolve`, `list` for discovery — that denies or allows under constraints over `ownership_scope`/`owner_tenant_id`, compiled inside the tenant-owned branch of the visibility fence; global entries stay readable on a deny, and an excluded key answers `not_found` (DESIGN *Read authorization*). `batchGet` and `batchResolve` must apply the same decision and visibility, tombstones and `Unchanged` included, because one SDK confirmation serves both (§8.3); discovery grants none. Before the SDK reuses PDP-backed confirmations, its key must cover every decision input (Context Tenant joins the read context; scope equivalence is defined or kept raw) and lookups must honour a trusted credential deadline, or bypass where uncertain; the SDK's window adds to the server's cached decision, so P1 either bounds it by that decision's remaining validity or budgets the extra staleness explicitly. Global entities stay readable by every authenticated subject; read decisions constrain tenant-owned rows only, and the SDK serves global snapshots to every authenticated reader (§8.3). That holds while no global key passes an extra per-key visibility gate (a federated source pre-filtering one global key) and an entity's ownership is stable — purge or a mutable source must first invalidate snapshots and pair classifications |
-| C7 | **Validators and snapshots are shared across tenants.** P0's validator digests `resource_version` and `resolution_fingerprint` (§8.5). The tenant client tracks time-limited visibility confirmations separately from shared snapshot content (§8.3). Each client keeps its own identity store; a tenant client answers a pair only to a read context the registry showed that pair to, or a known-global pair to any authenticated context (§8.3). | If a later phase introduces representations that vary by visibility context or Context Tenant, include those dimensions in snapshot selection and add the corresponding visibility inputs to a new validator version. `ownership` is one: `context_tenant` and `ancestor_tenant` depend on the Context Tenant, so a shared snapshot of a tenant-owned entity cannot carry one reader's value to another. P0 serves only `global`, which depends on no reader. |
+| C7 | **Validators are shared across tenants.** P0's validator digests `resource_version` and `resolution_fingerprint` (§8.5), so a registry serving tenant-owned rows would give an owner and its descendant one validator for representations that differ in `ownership`; the P0 registry refuses such rows. The SDK cache does not rely on the validator for that: it keys tenant-owned snapshots by reader tenant and shares only global ones (§8.3). The tenant client tracks time-limited visibility confirmations separately from snapshot content. Each client keeps its own identity store; a tenant client answers a pair only to a read context the registry showed that pair to, or a known-global pair to any authenticated context (§8.3). | A new validator version digests the Context Tenant identifier and chain versions (DESIGN §3.3), so raw HTTP callers and conditions carried across tenants also get the full result. When availability arrives, decide whether it can differ between tenants for a global entity (external sources' tenant enablement, P2 managed enablement); only then do global snapshots need a Context Tenant scope. The SDK carries an explicit Context Tenant in place of `subject_tenant_id`. |
 | C8 | **`exposed = false` is not an access boundary in Profile 1.** Every P0 operation is platform-plane (`plane = 1`), yet an embedded host registers every REST provider's routes on the gateway router regardless of `exposed` (`libs/toolkit/src/runtime/host_runtime.rs:753`). So in Profile 1 registration and deletion are reachable on the gateway's one listener by any caller holding a valid internal token — the gateway validates it per route (D20), but there is no separate platform listener and no workload policy, so every platform workload is equal (C6). A tenant bearer is refused there. Tenant reads are reachable by any authenticated tenant bearer, platform reads by any valid internal token (D17). `exposed = false` keeps mutations out of the gateway's external routing only when the registry runs out of process, where discovery publishes no platform route (§8.4) | A platform listener — the post-T38 `/types-registry/v1/platform/` routes move to it unchanged — and registry-side workload policy over the validated `PlatformIdentity` before mutation dispatch (C3) — not a PDP, which the platform plane bypasses (ADR-0006/0008). Only then may mutation routes be exposed through the gateway. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 | C9 | **Implementation sequencing.** T14 adds reverse-impact refresh; T17 adds compatibility checks and effective waiver provenance, replacing the temporary `skip_compatibility_check` refusal. ADR-0004 still permanently forbids content revisions of minor-bearing Type Schemas; creation is admissible (§8.1 step 4). C8 keeps mutations internal | Remove this row when Checkpoints 3 and 4 are complete, before T32 migrates existing consumers; T38 later rechecks the completed compatibility/refresh behavior. The ADR-0004 restriction remains |
 | C10 | **`batchGet` names at most 100 keys, not DESIGN §3.3's 500.** T22b's default and narrow projections reduce ordinary transfer cost, but `$select=content,resolved_schema,effective_traits,effective_traits_schema` can still request large documents for every key. The item limit is retained without claiming that it bounds aggregate response bytes; reconciliation inspecting more than 100 identifiers pages its reads | T29's reconciliation helper pages `batchGet`. A separately designed response-byte budget may justify lifting the key count later; discovery likewise limits items, and callers selecting documents should request smaller pages (§10.2) |

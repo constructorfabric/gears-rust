@@ -124,7 +124,10 @@ startup seed:
   Either retention limit set to zero disables snapshots. The platform client
   invalidates entries when it sees a successful registration or deletion reach
   its terminal outcome. Use `fresh` to check content and tenant visibility immediately.
-  Tenants share snapshots after the registry confirms visibility for each tenant.
+  A global entity's fresh snapshot serves every authenticated caller. A tenant-owned
+  one is kept per tenant, because its `ownership` is relative to the reader, and is
+  served only after the registry confirms it for the same read context (subject,
+  subject type, tenant and token scopes). Tenants' snapshots share equal documents.
   Platform reads and lists also teach the `resolve_*` helpers up to
   `max_identity_entries` identities (default 16 384) in both directions, with no
   expiry. Set it to zero to resolve from fresh snapshots or the registry.

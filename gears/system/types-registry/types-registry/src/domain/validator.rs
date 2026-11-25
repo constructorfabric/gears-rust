@@ -26,8 +26,9 @@ impl Validator {
     /// Instances pass no fingerprint: they have no derived form.
     #[must_use]
     pub fn compute(resource_version: i64, resolution_fingerprint: Option<&[u8]>) -> Self {
-        // TODO(P1): subject visibility-chain version, Context Tenant availability-chain
-        // version, routing generation.
+        // TODO(P1): subject visibility-chain version, the Context Tenant's identifier and
+        // availability-chain version (`ownership` is relative to it, and versions alone
+        // can coincide between tenants), routing generation.
         let mut ctx = Sha256::new();
         ctx.update([VERSION]);
         ctx.update(resource_version.to_be_bytes());

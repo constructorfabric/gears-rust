@@ -5,7 +5,7 @@ use serde_json::json;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use super::{ENTRY_ALLOWANCE_BYTES, Store, merge, project, union};
+use super::{ENTRY_ALLOWANCE_BYTES, Held, Scope, Store, union};
 use crate::models::{
     Entity, EntityField, EntityKey, EntityKind, FieldSelection, JsonDocument, LifecycleStatus,
     Origin, Provenance, Validator,
@@ -71,12 +71,24 @@ fn etag(s: &str) -> Validator {
 
 fn put(store: &mut Store, snapshot: &Arc<Entity>) {
     store.insert(
-        Arc::clone(snapshot),
+        Held::new((**snapshot).clone()),
         FieldSelection::full(),
         super::weight(snapshot),
         etag("v1"),
         Instant::now(),
+        Scope::Shared,
     );
+}
+
+/// `entity` as a read selecting `selection` is answered from a held snapshot of it.
+fn project(entity: &Entity, selection: &FieldSelection) -> Entity {
+    Held::new(entity.clone()).project(selection)
+}
+
+/// `fresh`, read under `selection`, merged with the held `resident`.
+fn merge(fresh: Entity, selection: &FieldSelection, resident: &Entity) -> Entity {
+    Held::merged(&Held::new(fresh), selection, &Held::new(resident.clone()))
+        .project(&FieldSelection::full())
 }
 
 fn fixed(gts_id: &str) -> usize {
@@ -130,11 +142,11 @@ fn a_snapshot_exactly_the_bound_fits_and_one_byte_more_does_not() {
     let snapshot = entity(TYPE, Some(json!({ "a": 1 })));
     let mut exact = Store::new(resident_bytes(&snapshot), usize::MAX);
     put(&mut exact, &snapshot);
-    assert!(exact.get(&key(&snapshot)).is_some());
+    assert!(exact.get(&key(&snapshot), None).is_some());
 
     let mut short = Store::new(resident_bytes(&snapshot) - 1, usize::MAX);
     put(&mut short, &snapshot);
-    assert!(short.get(&key(&snapshot)).is_none());
+    assert!(short.get(&key(&snapshot), None).is_none());
 }
 
 #[test]
@@ -147,11 +159,12 @@ fn replacing_and_removing_keep_the_byte_count_exact() {
     put(&mut store, &small);
     assert_eq!(store.used(), resident_bytes(&small));
     store.insert(
-        Arc::clone(&large),
+        Held::new((*large).clone()),
         FieldSelection::full(),
         super::weight(&large),
         etag("longer-v2"),
         Instant::now(),
+        Scope::Shared,
     );
     assert_eq!(
         store.used(),
@@ -161,7 +174,7 @@ fn replacing_and_removing_keep_the_byte_count_exact() {
 
     store.invalidate(&rep, None);
     assert_eq!(store.used(), 0);
-    assert!(store.get(&rep).is_none());
+    assert!(store.get(&rep, None).is_none());
 }
 
 #[test]
@@ -174,8 +187,8 @@ fn invalidating_an_entity_drops_its_entry_and_nothing_else() {
 
     store.invalidate(&key(&target), None);
 
-    assert!(store.get(&key(&target)).is_none());
-    assert!(store.get(&key(&other)).is_some());
+    assert!(store.get(&key(&target), None).is_none());
+    assert!(store.get(&key(&other), None).is_some());
     assert_eq!(store.used(), resident_bytes(&other));
 }
 
@@ -189,24 +202,24 @@ fn the_bound_is_bytes_a_thousand_small_entries_fit_and_one_megabyte_evicts() {
     }
     // The old entry-count bound of 1024 would also admit these; bytes are the point.
     assert!(
-        small.iter().all(|s| store.get(&key(s)).is_some()),
+        small.iter().all(|s| store.get(&key(s), None).is_some()),
         "a thousand small snapshots fit within one megabyte"
     );
     // Promote the first one: it is now the most recently used of the small ones.
-    assert!(store.get(&key(&small[0])).is_some());
+    assert!(store.get(&key(&small[0]), None).is_some());
 
     let large = entity(TYPE, Some(json!("x".repeat(1_000_000))));
     assert!(resident_bytes(&large) <= BOUND);
     put(&mut store, &large);
 
-    assert!(store.get(&key(&large)).is_some());
+    assert!(store.get(&key(&large), None).is_some());
     assert!(store.used() <= BOUND);
     assert!(
-        store.get(&key(&small[1])).is_none(),
+        store.get(&key(&small[1]), None).is_none(),
         "the least recently used entry is evicted first"
     );
     assert!(
-        store.get(&key(&small[0])).is_some(),
+        store.get(&key(&small[0]), None).is_some(),
         "the promoted entry outlives the eviction"
     );
 }
@@ -223,10 +236,10 @@ fn an_entry_larger_than_the_bound_is_not_retained_and_evicts_nothing() {
     put(&mut store, &oversized);
 
     assert!(
-        store.get(&key(&oversized)).is_none(),
+        store.get(&key(&oversized), None).is_none(),
         "neither the oversized snapshot nor the one it replaces stays resident"
     );
-    assert!(store.get(&key(&resident)).is_some());
+    assert!(store.get(&key(&resident), None).is_some());
     assert_eq!(store.used(), resident_bytes(&resident));
 }
 
@@ -261,8 +274,8 @@ fn a_ticket_keeps_its_entitys_history_through_eviction() {
     store.invalidate(&key(&target), None);
     put(&mut store, &target);
     put(&mut store, &filler);
-    assert!(store.get(&key(&target)).is_none(), "evicted");
-    assert!(store.get(&key(&filler)).is_some(), "retained");
+    assert!(store.get(&key(&target), None).is_none(), "evicted");
+    assert!(store.get(&key(&filler), None).is_some(), "retained");
 
     let later = store.ticket(&key(&target));
     assert!(store.quiet_since(&later));
@@ -279,20 +292,24 @@ fn a_confirmation_only_refreshes_the_validator_it_names() {
     let rep = key(&snapshot);
     let at = Instant::now();
     store.insert(
-        Arc::clone(&snapshot),
+        Held::new((*snapshot).clone()),
         FieldSelection::full(),
         super::weight(&snapshot),
         etag("v2"),
         at,
+        Scope::Shared,
     );
     let later = at + std::time::Duration::from_secs(5);
-    store.confirm(&rep, &etag("v1"), later);
-    assert_eq!(store.peek(&rep).expect("resident").confirmed_at, at);
-    store.confirm(&rep, &etag("v2"), later);
-    assert_eq!(store.peek(&rep).expect("resident").confirmed_at, later);
-    store.confirm(&rep, &etag("v2"), at);
+    store.confirm(&rep, &etag("v1"), later, None);
+    assert_eq!(store.peek(&rep, None).expect("resident").confirmed_at, at);
+    store.confirm(&rep, &etag("v2"), later, None);
     assert_eq!(
-        store.peek(&rep).expect("resident").confirmed_at,
+        store.peek(&rep, None).expect("resident").confirmed_at,
+        later
+    );
+    store.confirm(&rep, &etag("v2"), at, None);
+    assert_eq!(
+        store.peek(&rep, None).expect("resident").confirmed_at,
         later,
         "never moved back"
     );
@@ -312,13 +329,14 @@ fn a_saturated_weight_is_never_retained_even_under_an_unlimited_bound() {
     assert!(!saturated.fits(usize::MAX, &etag("")));
 
     store.insert(
-        Arc::clone(&snapshot),
+        Held::new((*snapshot).clone()),
         FieldSelection::full(),
         saturated,
         etag("v1"),
         Instant::now(),
+        Scope::Shared,
     );
-    assert!(store.get(&key(&snapshot)).is_none());
+    assert!(store.get(&key(&snapshot), None).is_none());
     assert_eq!(store.used(), resident_bytes(&ordinary));
 }
 
@@ -493,9 +511,9 @@ fn an_identifier_resolves_only_while_its_snapshot_is_resident() {
     assert!(store.indexes(&spelled(&snapshot)));
 
     put(&mut store, &filler);
-    assert!(store.get(&key(&snapshot)).is_none(), "evicted");
+    assert!(store.get(&key(&snapshot), None).is_none(), "evicted");
     assert!(!store.indexes(&spelled(&snapshot)));
-    assert!(store.get(&spelled(&snapshot)).is_none());
+    assert!(store.get(&spelled(&snapshot), None).is_none());
 }
 
 #[test]
@@ -533,8 +551,8 @@ fn invalidating_by_one_spelling_drops_the_entry_and_fences_reads_by_the_other() 
 
     store.invalidate(&spelled(&snapshot), None);
 
-    assert!(store.get(&key(&snapshot)).is_none());
-    assert!(store.get(&spelled(&snapshot)).is_none());
+    assert!(store.get(&key(&snapshot), None).is_none());
+    assert!(store.get(&spelled(&snapshot), None).is_none());
     assert!(!store.quiet_since(&by_uuid));
     store.release(&by_uuid);
     assert!(!store.indexes(&spelled(&snapshot)));
@@ -553,7 +571,7 @@ fn a_ticket_taken_with_both_spellings_is_fenced_by_either_after_eviction() {
     put(&mut store, &snapshot);
     let by_uuid = store.ticket(&key(&snapshot));
     put(&mut store, &filler);
-    assert!(store.get(&key(&snapshot)).is_none(), "evicted");
+    assert!(store.get(&key(&snapshot), None).is_none(), "evicted");
     assert!(store.quiet_since(&by_uuid));
 
     store.invalidate(&spelled(&snapshot), None);
@@ -584,12 +602,13 @@ fn an_insert_contradicting_a_resident_pair_drops_the_resident_entity() {
     let moved = issued(&first, Uuid::from_u128(8));
     put(&mut store, &moved);
 
-    assert!(store.get(&key(&first)).is_none());
+    assert!(store.get(&key(&first), None).is_none());
     assert_eq!(
         store
-            .get(&spelled(&moved))
+            .get(&spelled(&moved), None)
             .expect("resident")
             .snapshot
+            .meta()
             .gts_uuid,
         moved.gts_uuid
     );
@@ -646,18 +665,18 @@ fn entry_limit_evicts_the_lru_and_zero_keeps_no_snapshots() {
     let mut store = Store::new(usize::MAX, 2);
     put(&mut store, &a);
     put(&mut store, &b);
-    assert!(store.get(&key(&a)).is_some());
+    assert!(store.get(&key(&a), None).is_some());
     put(&mut store, &c);
-    assert!(store.peek(&key(&a)).is_some());
-    assert!(store.peek(&key(&b)).is_none());
+    assert!(store.peek(&key(&a), None).is_some());
+    assert!(store.peek(&key(&b), None).is_none());
     assert!(!store.indexes(&spelled(&b)));
-    assert!(store.peek(&key(&c)).is_some());
+    assert!(store.peek(&key(&c), None).is_some());
     assert_eq!(store.used(), resident_bytes(&a) + resident_bytes(&c));
 
     let mut disabled = Store::new(usize::MAX, 0);
     put(&mut disabled, &a);
     assert_eq!(disabled.used(), 0);
-    assert!(disabled.peek(&key(&a)).is_none());
+    assert!(disabled.peek(&key(&a), None).is_none());
 }
 
 /// A resolution shows only the pair. It never erases, extends or replaces a read
@@ -679,11 +698,12 @@ fn a_resolution_neither_erases_nor_extends_a_read_proof() {
     let snapshot = Arc::new(owned);
     let t0 = Instant::now();
     store.insert(
-        Arc::clone(&snapshot),
+        Held::new((*snapshot).clone()),
         FieldSelection::light(),
         super::weight(&snapshot),
         etag("v1"),
         t0,
+        Scope::Tenant(Uuid::from_u128(1)),
     );
     store.identities.learn(&snapshot.gts_id, snapshot.gts_uuid);
     let reader = ReadContext::new(Uuid::from_u128(10), None, Uuid::from_u128(1), &[]);
@@ -712,5 +732,270 @@ fn a_resolution_neither_erases_nor_extends_a_read_proof() {
         store.resolvable(&key(&snapshot), &reader, later + window, window),
         None,
         "until its own window ends"
+    );
+}
+
+fn put_in(store: &mut Store, snapshot: &Arc<Entity>, scope: Scope) -> u64 {
+    store.insert(
+        Held::new((**snapshot).clone()),
+        FieldSelection::full(),
+        super::weight(snapshot),
+        etag("v1"),
+        Instant::now(),
+        scope,
+    )
+}
+
+fn tenant(n: u128) -> Scope {
+    Scope::Tenant(Uuid::from_u128(n))
+}
+
+/// The content document `key` holds for `scope`'s reader.
+fn content_of(store: &Store, key: &EntityKey, reader: u128) -> Arc<JsonDocument> {
+    store
+        .peek(key, Some(Uuid::from_u128(reader)))
+        .expect("resident")
+        .snapshot
+        .documents()[0]
+        .clone()
+        .expect("content")
+}
+
+#[test]
+fn sibling_snapshots_hold_one_copy_of_an_equal_document_until_the_last_leaves() {
+    let mut store = Store::new(1024 * 1024, 2);
+    let snapshot = entity(TYPE, Some(json!({ "a": "b".repeat(100) })));
+    let own = fixed(TYPE) + 2;
+    let document = weight(&snapshot) - fixed(TYPE);
+    put_in(&mut store, &snapshot, tenant(1));
+    put_in(&mut store, &snapshot, tenant(2));
+    assert_eq!(
+        store.used(),
+        2 * own + document,
+        "the document is charged once"
+    );
+    assert!(Arc::ptr_eq(
+        &content_of(&store, &key(&snapshot), 1),
+        &content_of(&store, &key(&snapshot), 2)
+    ));
+    assert_ne!(
+        store
+            .peek(&key(&snapshot), Some(Uuid::from_u128(1)))
+            .map(std::ptr::from_ref),
+        store
+            .peek(&key(&snapshot), Some(Uuid::from_u128(2)))
+            .map(std::ptr::from_ref),
+        "each tenant keeps its own snapshot"
+    );
+
+    let first = entity(&instance_id(1), None);
+    assert_eq!(
+        put_in(&mut store, &first, Scope::Shared),
+        1,
+        "tenant 1's evicted"
+    );
+    assert_eq!(store.scopes(&key(&snapshot)), [tenant(2)]);
+    assert_eq!(
+        store.used(),
+        own + document + resident_bytes(&first),
+        "the survivor still holds the document"
+    );
+    assert!(
+        store
+            .peek(&spelled(&snapshot), Some(Uuid::from_u128(2)))
+            .is_some()
+    );
+
+    let second = entity(&instance_id(2), None);
+    put_in(&mut store, &second, Scope::Shared);
+    assert!(store.peek_any(&key(&snapshot)).is_none());
+    assert!(
+        !store.indexes(&spelled(&snapshot)),
+        "the last snapshot took its alias"
+    );
+    assert_eq!(
+        store.used(),
+        resident_bytes(&first) + resident_bytes(&second),
+        "the last holder took the document"
+    );
+}
+
+#[test]
+fn admitting_a_sibling_that_evicts_the_only_other_holder_charges_the_document() {
+    let mut store = Store::new(1024 * 1024, 1);
+    let snapshot = entity(TYPE, Some(json!({ "a": "b".repeat(100) })));
+    put_in(&mut store, &snapshot, tenant(1));
+    assert_eq!(put_in(&mut store, &snapshot, tenant(2)), 1);
+    assert_eq!(store.scopes(&key(&snapshot)), [tenant(2)]);
+    assert_eq!(store.used(), resident_bytes(&snapshot));
+}
+
+#[test]
+fn a_document_shared_at_the_byte_bound_admits_a_sibling_only_its_own_bytes_fit() {
+    let snapshot = entity(TYPE, Some(json!({ "a": "b".repeat(100) })));
+    let own = fixed(TYPE) + 2;
+    let mut store = Store::new(resident_bytes(&snapshot) + own, usize::MAX);
+    put_in(&mut store, &snapshot, tenant(1));
+    assert_eq!(
+        put_in(&mut store, &snapshot, tenant(2)),
+        0,
+        "no eviction needed"
+    );
+    assert_eq!(store.used(), resident_bytes(&snapshot) + own);
+}
+
+#[test]
+fn unequal_documents_are_held_and_charged_apart() {
+    let mut store = Store::new(1024 * 1024, usize::MAX);
+    let one = entity(TYPE, Some(json!({ "a": 1 })));
+    let two = entity(TYPE, Some(json!({ "a": 2 })));
+    put_in(&mut store, &one, tenant(1));
+    put_in(&mut store, &two, tenant(2));
+    assert_eq!(store.used(), resident_bytes(&one) + resident_bytes(&two));
+    assert_eq!(*content_of(&store, &key(&one), 1), json!({ "a": 1 }));
+    assert_eq!(*content_of(&store, &key(&two), 2), json!({ "a": 2 }));
+}
+
+#[test]
+fn invalidation_drops_every_tenants_snapshot() {
+    let mut store = Store::new(1024 * 1024, usize::MAX);
+    let snapshot = entity(TYPE, Some(json!({ "a": 1 })));
+    put_in(&mut store, &snapshot, tenant(1));
+    put_in(&mut store, &snapshot, tenant(2));
+    store.invalidate(&spelled(&snapshot), None);
+    assert!(store.scopes(&key(&snapshot)).is_empty());
+    assert_eq!(store.used(), 0);
+}
+
+/// Sharing never changes what a tenant's snapshot holds: values `serde_json` calls
+/// equal but that serialize differently are held apart.
+#[test]
+fn documents_equal_as_values_but_not_as_bytes_are_held_apart() {
+    let mut store = Store::new(1024 * 1024, 1);
+    let negative = entity(TYPE, Some(json!([-0.0])));
+    let positive = entity(TYPE, Some(json!([0.0])));
+    assert_eq!(negative.content, positive.content, "the case under test");
+    put_in(&mut store, &negative, tenant(1));
+    put_in(&mut store, &positive, tenant(2));
+    let held = content_of(&store, &key(&positive), 2);
+    assert_eq!(
+        serde_json::to_string(&*held).expect("json"),
+        "[0.0]",
+        "tenant 2 holds what it read"
+    );
+    assert_eq!(store.used(), resident_bytes(&positive));
+}
+
+#[test]
+fn a_reinserted_snapshot_does_not_revive_proofs_through_a_sibling() {
+    use super::ReadContext;
+
+    let window = std::time::Duration::from_secs(30);
+    let mut store = Store::new(1024 * 1024, 2);
+    store.track_visibility();
+    let snapshot = owned(TYPE);
+    let alice = ReadContext::new(Uuid::from_u128(10), None, Uuid::from_u128(1), &[]);
+    let at = Instant::now();
+    put_in(&mut store, &snapshot, tenant(1));
+    store.confirm_visible(&key(&snapshot), &alice, &etag("v1"), at);
+    put_in(&mut store, &snapshot, tenant(2));
+    // Evict tenant 1's snapshot, then read it back under the same validator.
+    put_in(&mut store, &entity(&instance_id(1), None), Scope::Shared);
+    assert_eq!(store.scopes(&key(&snapshot)), [tenant(2)]);
+    put_in(&mut store, &snapshot, tenant(1));
+    assert!(
+        !store.visible(&key(&snapshot), &alice, at, window),
+        "a proof of the evicted snapshot proves nothing of its replacement"
+    );
+}
+
+#[test]
+fn a_read_proof_resolves_from_the_readers_own_snapshot() {
+    use super::ReadContext;
+
+    let window = std::time::Duration::from_secs(30);
+    let mut store = Store::new(1024 * 1024, 4);
+    store.track_visibility();
+    let snapshot = owned(TYPE);
+    let bob = ReadContext::new(Uuid::from_u128(20), None, Uuid::from_u128(2), &[]);
+    let at = Instant::now();
+    put_in(&mut store, &snapshot, tenant(1));
+    put_in(&mut store, &snapshot, tenant(2));
+    store.confirm_visible(&key(&snapshot), &bob, &etag("v1"), at);
+    assert!(
+        store
+            .resolvable(&spelled(&snapshot), &bob, at, window)
+            .is_some()
+    );
+}
+
+#[test]
+fn a_shared_tenant_owned_snapshot_is_not_known_global() {
+    let mut store = Store::new(1024 * 1024, usize::MAX);
+    let snapshot = owned(TYPE);
+    put_in(&mut store, &snapshot, Scope::Shared);
+    assert!(!store.known_global(snapshot.gts_uuid));
+    assert_eq!(store.class(&key(&snapshot)), Some(false));
+}
+
+#[test]
+fn a_pinned_document_is_uncharged_once_no_snapshot_holds_it() {
+    let mut store = Store::new(1024 * 1024, usize::MAX);
+    let snapshot = entity(TYPE, Some(json!({ "a": 1 })));
+    put_in(&mut store, &snapshot, tenant(1));
+    let pin = store
+        .peek(&key(&snapshot), Some(Uuid::from_u128(1)))
+        .expect("resident")
+        .snapshot
+        .clone();
+    store.invalidate(&key(&snapshot), None);
+    assert_eq!(store.used(), 0, "a read's pin is not the store's");
+    drop(pin);
+}
+
+#[test]
+fn losing_a_sibling_during_admission_recharges_the_shared_document() {
+    let large = json!({ "a": "b".repeat(1000) });
+    let shared = entity(TYPE, Some(large));
+    let wider = {
+        let mut wider = (*shared).clone();
+        wider.resolved_schema = Some(json!({ "c": "d".repeat(20) }));
+        Arc::new(wider)
+    };
+    let other = entity(&instance_id(1), None);
+    let own = fixed(TYPE) + 2;
+    let document = weight(&shared) - fixed(TYPE);
+    let schema = weight(&wider) - weight(&shared);
+    let bound = own + document + resident_bytes(&other) + schema - 1;
+    let mut store = Store::new(bound, usize::MAX);
+    put_in(&mut store, &shared, tenant(1));
+    put_in(&mut store, &other, Scope::Shared);
+    // Tenant 1's snapshot is the least recent: losing it makes tenant 2 pay for the
+    // document, so the other entity must leave too.
+    assert_eq!(put_in(&mut store, &wider, tenant(2)), 2);
+    assert_eq!(store.scopes(&key(&shared)), [tenant(2)]);
+    assert!(store.peek_any(&key(&other)).is_none());
+    assert_eq!(store.used(), own + document + schema);
+    assert!(store.used() <= bound);
+}
+
+/// A tenant-owned snapshot of `gts_id`.
+fn owned(gts_id: &str) -> Arc<Entity> {
+    let mut owned = (*entity(gts_id, None)).clone();
+    owned.ownership = crate::models::Ownership::ContextTenant;
+    Arc::new(owned)
+}
+
+#[test]
+fn documents_of_one_size_but_different_bytes_are_held_apart() {
+    let mut store = Store::new(1024 * 1024, 2);
+    let first = entity(TYPE, Some(json!([-0.0, 0.0])));
+    let second = entity(TYPE, Some(json!([0.0, -0.0])));
+    assert_eq!(weight(&first), weight(&second), "the case under test");
+    put_in(&mut store, &first, tenant(1));
+    put_in(&mut store, &second, tenant(2));
+    assert_eq!(
+        serde_json::to_string(&*content_of(&store, &key(&second), 2)).expect("json"),
+        "[0.0,-0.0]"
     );
 }
