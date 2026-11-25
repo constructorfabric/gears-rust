@@ -26,7 +26,7 @@ use crate::domain::subject_settings::SubjectKey;
 /// The most nodes one profile read takes: the root and its facts. Graph
 /// storage's ceiling for a traversal, `traversal_max_nodes`, is 1000 by
 /// default and must not be set lower for Construct: graph storage refuses a
-/// read that asks for more, see [`read_refused`].
+/// read that asks for more, see `read_refused`.
 pub const MAX_PROFILE_NODES: u32 = 1000;
 
 /// The most facts one profile holds: every fact, the root besides, has to fit
