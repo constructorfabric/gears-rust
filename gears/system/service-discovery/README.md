@@ -21,6 +21,89 @@ read model and compiled gRPC ownership-pin authority; directory adapter
 selection, storage and replication are gear-owned. `GearManager` only exposes
 cluster-agnostic writes for complete records (upsert, remove, replace-all).
 
+## Shared storage
+
+The default `storage.backend: memory` preserves the existing single-process
+behavior. To share registrations across service-discovery replicas, select a
+cluster cache plugin and enable its feature on the host binary:
+
+```yaml
+gears:
+  service-discovery:
+    config:
+      storage:
+        backend: postgres
+        postgres:
+          connection_string: ${DATABASE_URL}
+          schema: public
+```
+
+Available choices are `k8s`, `postgres`, and `redis`; each requires its
+corresponding `storage-<backend>` Cargo feature and its own plugin configuration.
+The host forwards these as `service-discovery-storage-<backend>` features (for
+example, `--features service-discovery-storage-postgres`). A selected backend
+without its feature or configuration fails at startup. Shared mode requires a
+linearizable cache; Redis configurations that declare eventual consistency are
+rejected. Plugin config fields that support `${VAR}` expansion keep that
+behavior when configured through service-discovery.
+
+The gear owns the selected plugin's lifecycle and uses the existing local
+read model plus a cache-backed write-through/change-feed adapter. Heartbeats
+normally perform one value-fenced cache mutation; a cache-version miss or
+snapshot miss may require a read. Cache watches are key-only, so changed
+records/leases are fetched to construct replica updates. Replicas load a
+startup snapshot, consume the change feed, and periodically reload a full
+snapshot (every 30 seconds) to recover missed events; the lease/claim janitor
+reclaims expired directory data.
+
+The Flight Control Helm chart's `values-postgres.yaml` provides a PostgreSQL
+storage example. The Flight Control image must be built with the corresponding
+`service-discovery-storage-<backend>` feature for the selected backend.
+
+### Real-backend integration tests
+
+These opt-in tests start separate plugin instances against a disposable store
+and exercise the service-discovery cache adapter, including remote changes,
+service-name contention, heartbeat fencing, replica restart, lease expiry and
+janitor cleanup. A real-PostgreSQL gear-level test also starts two gear replicas,
+checks snapshot-gated readiness, forces the reader's first change feed to fail,
+and verifies that a fresh snapshot recovers the missed registration. It pauses
+and resumes its disposable PostgreSQL container to check that readiness retains
+the last snapshot and writes/feed updates recover, and exercises the scheduled
+janitor loop with a short test interval. These tests do not boot the full
+service-discovery server or verify database durability across a server-process
+restart. Docker must be running; the Kubernetes test also requires permission
+to run a privileged k3s container.
+
+All three are gated by the `integration` feature. From the repository root:
+
+```sh
+make test-integration LANE=service-discovery-storage  # PostgreSQL and Redis
+make test-service-discovery-k8s                        # k3s (privileged Docker)
+```
+
+Or run one backend directly:
+
+```sh
+cargo test -p cf-gears-service-discovery --features integration --lib cache_directory_backend::integration_tests::postgres_shared_directory
+cargo test -p cf-gears-service-discovery --features integration --lib cache_directory_backend::integration_tests::redis_shared_directory
+cargo test -p cf-gears-service-discovery --features integration --lib cache_directory_backend::integration_tests::k8s_shared_directory
+cargo test -p cf-gears-service-discovery --features integration --lib gear::tests::real_postgres_gears_recover_after_a_change_feed_disconnect
+```
+
+All three images come from the workspace test-container pins
+(`libs/test-containers`) and honor `GEARS_TEST_PG_TAG`, `GEARS_TEST_REDIS_TAG`
+and `GEARS_TEST_K3S_TAG`. Each test removes only its own container.
+
+The heartbeat assertion counts cache-interface calls: one mutation and zero
+reads on the steady-state writer path. It does not count internal backend
+requests; in particular, Kubernetes value-CAS performs an API read internally.
+Key-only change notifications still require reads to reconstruct remote records.
+Redis runs with AOF and `appendfsync always` because the plugin requires those
+settings to declare the cache linearizable. Its data directory is ephemeral, and
+the tests restart plugin instances rather than the Redis server, so they do not
+verify Redis data durability across a server restart.
+
 ## Registration authorization
 
 `RegisterInstance` / `DeregisterInstance` / `Heartbeat` authorize the

@@ -421,7 +421,7 @@ arch_status_svg_update: py-env
 
 # -------- Tests --------
 
-.PHONY: test-no-macros test-macros test-db test-integration test-graph-storage test-graph-storage-pg test-cluster-k8s coverage-cluster-k8s test-durable-execution-pg coverage-durable-execution-pg test-eb-pg test-eb-sqlite test-eb-mysql test-eb-mariadb test-eb-kafka test-github-mirror-db test-fips
+.PHONY: test-no-macros test-macros test-db test-integration test-graph-storage test-graph-storage-pg test-cluster-k8s test-service-discovery-k8s coverage-cluster-k8s test-durable-execution-pg coverage-durable-execution-pg test-eb-pg test-eb-sqlite test-eb-mysql test-eb-mariadb test-eb-kafka test-github-mirror-db test-fips
 
 # Run the workspace tests except the macro test crates (CI test job)
 test-no-macros: install-tools
@@ -512,7 +512,7 @@ test-eb-kafka: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg credstore-pg construct-pg \
+	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis service-discovery-storage rg-pg settings-service-pg credstore-pg construct-pg \
 	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg license-enforcement-pg model-registry-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
@@ -607,6 +607,14 @@ lane_args_cluster-pg = -p cf-postgres-cluster-plugin --features integration --re
 ## load-sensitive on a busy host, and a genuine logic regression fails both
 ## attempts, so this absorbs Docker churn without masking one.
 lane_args_cluster-redis = -p cf-redis-cluster-plugin --features integration --retries 1
+
+## service-discovery's shared-directory storage contract against PostgreSQL and
+## Redis, plus the real-PostgreSQL gear resubscription/readiness/janitor check
+## (Docker required; each test starts its own container via testcontainers).
+## The k3s contract needs privileged Docker and runs in
+## `test-service-discovery-k8s` instead.
+lane_args_service-discovery-storage = -p cf-gears-service-discovery --features integration \
+	-E 'test(/postgres_shared_directory$$|redis_shared_directory$$|real_postgres_gears_recover_after_a_change_feed_disconnect$$/)'
 
 ## resource-group gear PostgreSQL smoke tests (Docker required; spins up
 ## its own postgres container via testcontainers -- see
@@ -826,6 +834,14 @@ K8S_PROVIDER_REGISTRY_CHECK = echo "=== cf-gears-cluster: k8s provider registrat
 test-cluster-k8s: install-tools
 	$(call print_target_banner)
 	$(call k8s_cluster_suite,cargo test,,$(K8S_PROVIDER_REGISTRY_CHECK))
+
+## Run service-discovery's shared-storage contract against a real k3s (Docker, privileged)
+## The k3s sibling of the `service-discovery-storage` lane. One test starts and
+## removes its own unlabelled k3s container, so there is no label-based cleanup.
+test-service-discovery-k8s:
+	$(call print_target_banner)
+	cargo test -p cf-gears-service-discovery --features integration --lib \
+		cache_directory_backend::integration_tests::k8s_
 
 ## Add the k8s cluster plugin's L2/L3 coverage to the current cargo-llvm-cov session
 ## Accumulate the k8s plugin's L2/L3 coverage into the CURRENT cargo-llvm-cov

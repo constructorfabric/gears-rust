@@ -23,11 +23,12 @@ pub enum DirectoryBackendError {
     /// The backend could not complete the operation. Logged, then returned
     /// to the caller as a generic "backend unavailable" error.
     #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the production backend that returns this is implemented separately"
-        )
+        not(any(
+            feature = "storage-k8s",
+            feature = "storage-postgres",
+            feature = "storage-redis"
+        )),
+        allow(dead_code, reason = "constructed by feature-gated cache storage")
     )]
     #[error("directory backend unavailable: {0:#}")]
     Unavailable(anyhow::Error),
@@ -83,8 +84,12 @@ pub enum DirectoryChange {
 /// service-name claims and versions; every replica keeps a local read model
 /// and orders what it applies by [`DirectoryRecord`] versions. Each write
 /// below MUST be atomic with respect to every other write to the same
-/// `(gear, instance_id)`, and the claim check in
-/// [`register`](Self::register) MUST be atomic across keys.
+/// `(gear, instance_id)`. Service-name ownership is coordinated with
+/// per-name compare-and-swap reservations: records are not advertised until
+/// all claims are secured and revalidated, and readers expose a service only
+/// when its current claim names that record's gear. A crash may leave an
+/// orphan claim, which the backend janitor reclaims after confirming no live
+/// record backs it.
 #[async_trait]
 pub trait DirectoryBackend: Send + Sync {
     /// Register or re-register `instance`. Implementations MUST:
@@ -103,9 +108,11 @@ pub trait DirectoryBackend: Send + Sync {
     ///    record of a *different* gear whose lease has not lapsed past `grace`
     ///    advertises one of the merged record's gRPC service names, write
     ///    nothing and return [`DirectoryBackendError::Conflict`] with
-    ///    `recoverable: true`. The check and the write MUST be one atomic step
-    ///    across keys, for example a transaction over per-name claim keys, so
-    ///    two gears registering through different replicas cannot both win.
+    ///    `recoverable: true`. Reserve each new name with an atomic per-key
+    ///    compare-and-swap, then write the record and revalidate every claim
+    ///    before reporting success. Readers filter services against current
+    ///    claims, so competing registrations cannot both advertise a name.
+    ///    On conflict, release only reservations acquired by this call.
     /// 4. **Assign versions** per [`DirectoryRecord`]: keep the stored
     ///    generation for a live record, start a new one otherwise, and bump
     ///    the revision.
@@ -153,6 +160,12 @@ pub trait DirectoryBackend: Send + Sync {
         &self,
         grace: Duration,
     ) -> Result<Vec<DirectoryRecord>, DirectoryBackendError>;
+
+    /// Reclaim orphaned cache keys and service-name claims. Backends without
+    /// shared storage have nothing to sweep.
+    async fn janitor(&self, _grace: Duration) -> Result<(), DirectoryBackendError> {
+        Ok(())
+    }
 
     /// Subscribe to changes. The subscription MUST be established before the
     /// returned future resolves, so it delivers every change committed after

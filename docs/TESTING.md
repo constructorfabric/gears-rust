@@ -147,6 +147,7 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 | `cf-gears-toolkit-db` | `mysql,integration` | MySQL (requires running instance) |
 | `users-info` | `integration` | PostgreSQL |
 | `cf-gears-event-broker` | `integration` | Gear database on SQLite, PostgreSQL and MySQL (testcontainers, or `EB_TEST_POSTGRES_URL` / `EB_TEST_MYSQL_URL`; `make test-integration LANE=eb-gear-db`) |
+| `cf-gears-service-discovery` | `integration` | Shared directory storage on PostgreSQL and Redis (testcontainers; `make test-integration LANE=service-discovery-storage`, including a two-gear PostgreSQL feed/outage recovery check) and k3s (privileged testcontainers; `make test-service-discovery-k8s`) |
 
 ### 4.2 Running
 
@@ -200,7 +201,10 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`redis()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
+`redis()`, `k3s()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
+
+`k3s(conf_dir)` starts a privileged single-node Kubernetes API server and writes its kubeconfig
+into `conf_dir`; read it back with `container.image().read_kube_config()`.
 
 `timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
 `ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
@@ -222,6 +226,7 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
 | `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
 | `GEARS_TEST_REDIS_TAG` | `REDIS_TAG` |
+| `GEARS_TEST_K3S_TAG` | `K3S_TAG` (the deprecated `K8S_PLUGIN_K3S_TAG` is still honored when this is unset, with a warning) |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration

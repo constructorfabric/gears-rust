@@ -10,6 +10,23 @@ pub use gear::ServiceDiscoveryGear;
 
 // === INTERNAL MODULES (pub for integration tests) ===
 pub mod api;
+#[cfg(any(
+    test,
+    feature = "storage-k8s",
+    feature = "storage-postgres",
+    feature = "storage-redis"
+))]
+/// Shared-cache-backed directory and storage plugin management.
+mod cache_directory_backend;
+#[cfg(not(any(
+    test,
+    feature = "storage-k8s",
+    feature = "storage-postgres",
+    feature = "storage-redis"
+)))]
+#[path = "cache_directory_backend_stub.rs"]
+/// Storage selection when no shared backend is compiled in.
+mod cache_directory_backend;
 mod config;
 mod directory_backend;
 mod directory_client;

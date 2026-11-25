@@ -90,6 +90,9 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true, features = ["k3s"] }
 
 [dev-dependencies]
+# The workspace's pinned k3s image (`test_containers::k3s()`, docs/TESTING.md
+# 4.4), for the L2/L3 fixture in `tests/integration/common/mod.rs`.
+test-containers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # Parses the shipped `deploy/crd.yaml` in the L3 fixture so the *manifest* (not a
 # derived copy) is what gets applied and asserted `Established` — a broken manifest

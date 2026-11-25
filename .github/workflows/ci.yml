@@ -479,6 +479,10 @@ jobs:
         # test binary -- see gears-rust.mk.
         run: tools/scripts/with_rust_annotations.sh make test-cluster-k8s
 
+      - name: Test service-discovery shared storage (k3s)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-service-discovery-k8s
+
       - name: Test resource-group (pg smoke, integration)
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         # Fail if Docker is unreachable instead of letting the suite skip itself
@@ -575,6 +579,10 @@ jobs:
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-redis
+
+      - name: Test service-discovery shared storage (PostgreSQL, Redis)
+        if: ${{ !cancelled() && steps.cache.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=service-discovery-storage
 
       - name: Test durable-execution (PostgreSQL and subprocess recovery)
         if: ${{ !cancelled() && steps.cache.outcome == 'success' }}

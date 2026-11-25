@@ -43,8 +43,8 @@ use crate::config::WatchMode;
 use crate::observability::RedisSignals;
 use crate::redis_error::map_redis_error;
 use crate::scripts::{
-    CACHE_CAS, CACHE_COMPARE_AND_DELETE, CACHE_DELETE, CACHE_PUT, CACHE_PUT_IF_ABSENT,
-    PoolScriptExecutor, ScriptCache, eval,
+    CACHE_CAS, CACHE_CAS_VALUE, CACHE_COMPARE_AND_DELETE, CACHE_DELETE, CACHE_PUT,
+    CACHE_PUT_IF_ABSENT, PoolScriptExecutor, ScriptCache, eval,
 };
 use crate::wait::{self, WaitPolicy};
 
@@ -439,6 +439,43 @@ impl ClusterCacheBackend for RedisCache {
             &self.executor,
             &self.scripts,
             &CACHE_CAS,
+            &self.entry_key(key),
+            &args,
+            &self.signals,
+        )
+        .await?;
+        match decode_cas_reply(key, &reply)? {
+            CasOutcome::Swapped { version } => {
+                self.wait_for_replicas().await?;
+                Ok(CacheEntry {
+                    value: new_value.to_vec(),
+                    version,
+                })
+            }
+            CasOutcome::Conflict { current } => Err(ClusterError::CasConflict {
+                key: key.to_owned(),
+                current,
+            }),
+        }
+    }
+
+    async fn compare_and_swap_value(
+        &self,
+        key: &str,
+        expected_value: &[u8],
+        new_value: &[u8],
+        ttl: Ttl,
+    ) -> Result<CacheEntry, ClusterError> {
+        let args = vec![
+            Value::Bytes(expected_value.to_vec().into()),
+            Value::Bytes(new_value.to_vec().into()),
+            Value::String(ttl_argument(ttl).into()),
+            Value::String(self.event_channel(key).into()),
+        ];
+        let reply = eval(
+            &self.executor,
+            &self.scripts,
+            &CACHE_CAS_VALUE,
             &self.entry_key(key),
             &args,
             &self.signals,

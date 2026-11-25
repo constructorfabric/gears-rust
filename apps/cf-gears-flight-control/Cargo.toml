@@ -29,6 +29,9 @@ default = ["static-authn"]
 # authn-resolver backends
 static-authn = ["dep:static-authn-plugin"]
 oidc-authn = ["dep:oidc-authn-plugin"]
+service-discovery-storage-k8s = ["service_discovery/storage-k8s"]
+service-discovery-storage-postgres = ["service_discovery/storage-postgres"]
+service-discovery-storage-redis = ["service_discovery/storage-redis"]
 
 # FIPS-140-3: use the AWS-LC FIPS-validated crypto module for all crypto ops.
 fips = ["toolkit/fips"]
