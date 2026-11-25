@@ -4,7 +4,7 @@ use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
 /// The identity of one received record, kept as its `record_key`
-/// ([`crate::domain::record_intake::record_key`]) with the connector and the
+/// ([`crate::domain::record_intake::RecordKey`]) with the connector and the
 /// subject. The provenance and the version are not stored, since a provenance
 /// can hold record content.
 ///
