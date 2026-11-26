@@ -61,7 +61,7 @@ pub fn register_routes(
         .authenticated()
         .require_license_features::<License>([])
         .handler(handlers::resolve_model)
-        .json_response_with_schema::<dto::ModelDto>(openapi, StatusCode::OK, "The model")
+        .json_response_with_schema::<dto::RegistryModelDto>(openapi, StatusCode::OK, "The model")
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -74,7 +74,7 @@ pub fn register_routes(
         .authenticated()
         .require_license_features::<License>([])
         .handler(handlers::list_available_models)
-        .json_response_with_schema::<toolkit_odata::Page<dto::ModelDto>>(
+        .json_response_with_schema::<toolkit_odata::Page<dto::RegistryModelDto>>(
             openapi,
             StatusCode::OK,
             "A page of models",
