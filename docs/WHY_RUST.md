@@ -10,7 +10,7 @@
   - [A.3 No `nil` interfaces, no exceptions-from-anywhere](#a3-no-nil-interfaces-no-exceptions-from-anywhere)
   - [A.4 Sum types make illegal states unrepresentable](#a4-sum-types-make-illegal-states-unrepresentable)
   - [A.5 Exhaustive `match` makes state evolution safer](#a5-exhaustive-match-makes-state-evolution-safer)
-  - [A.6 Zero-cost abstractions and predictable performance](#a6-zero-cost-abstractions-and-predictable-performance)
+  - [A.6 Zero-cost abstractions and no GC pauses](#a6-zero-cost-abstractions-and-no-gc-pauses)
   - [A.7 Tooling and static analysis as a first-class citizen](#a7-tooling-and-static-analysis-as-a-first-class-citizen)
   - [A.8 Newtypes make identity mix-ups a compile error](#a8-newtypes-make-identity-mix-ups-a-compile-error)
   - [A.9 RAII, lifetimes, and scoped resources](#a9-raii-lifetimes-and-scoped-resources)
@@ -64,7 +64,7 @@ Gears takes a different position, in two layers:
 
 2. **Gears as the middleware** provides the platform layer around Rust: tenant-scoped data access, authentication/authorization contracts, consistent API construction, composable business capabilities, local-first testing, deployment options, supply-chain policy, and additional build-gated safety checks.
 
-The result is a solid technology stack for long-living, comprehensive XaaS systems: product teams get a common foundation for security, tenancy, APIs, observability, lifecycle, and deployment instead of assembling those pieces differently in every service. This structure is especially useful for AI-driven development: coding agents work better when correctness rules are not only written in prose, but also expressed as types, generated schemas, lints, tests, and CI checks that provide deterministic feedback.
+The result is a solid technology stack for long-living, comprehensive XaaS systems: product teams get a common foundation for security, tenancy, APIs, observability, lifecycle, and deployment instead of assembling those pieces differently in every service. This structure is designed with AI-driven development in mind: coding agents get clearer feedback when correctness rules are not only written in prose, but also expressed as types, generated schemas, lints, tests, and CI checks that provide deterministic feedback.
 
 ### At a glance: Go vs C# vs Rust vs Rust + Gears
 
@@ -72,12 +72,14 @@ For a long-living XaaS platform, Gears can provide advantages that are less visi
 
 A similar middleware could exist or be built for Go or C#, and mature teams often build parts of it successfully. However, this investment would still not close every Rust-specific advantage: ownership-based memory safety without a GC, `Send`/`Sync` data-race checks, exhaustive enums, zero-cost newtypes, and macro-generated code that remains type-checked by the compiler.
 
+Read the table as a comparison of starting points, not of what each ecosystem can achieve. The first three columns show a language with its usual libraries and tools; the last column shows a prebuilt platform. The difference in rows 12–18 is mostly platform work that Gears has already done for you, which a Go or .NET team would otherwise select, integrate, and maintain from existing libraries or its own code.
+
 | # | Concern | Go (typical) | C# / .NET | Rust (plain) | **Rust + Gears** |
 |---:|---|---|---|---|---|
-| 1 | **Runtime footprint** | small binary, GC pauses | larger runtime, GC | small, no GC | small, no GC |
+| 1 | **Runtime model** | single binary, GC pauses | larger runtime, GC | native binary, no GC | native binary, no GC |
 | 2 | **Deployment shapes** | per-service choices | per-service | per-service | **One code → edge / bare-metal / K8s** |
 | 3 | **Memory & data-race safety** | GC; memory races possible, detected only at runtime (`-race`) | GC; memory races possible | Compile-time ownership & `Send`/`Sync` | Compile-time, same as Rust |
-| 4 | **Error handling** | `if err != nil`, lint-gated in mature shops | exceptions / analyzer policy | `Result<T, E>`, `?` — must handle | `Result` + **canonical error taxonomy** (RFC-9457) |
+| 4 | **Error handling** | `if err != nil`, lint-gated in mature shops | exceptions / analyzer policy | `Result<T, E>`, `?`; an ignored `Result` is a warning | ignored `Result` fails the build + **canonical error taxonomy** (RFC-9457) |
 | 5 | **Null safety** | `nil` panics | NRT helps, policy-dependent | `Option<T>` — no null | `Option<T>` everywhere |
 | 6 | **Panics / unsafe shortcuts** | runtime panics possible | runtime exceptions possible | possible, but lintable | `unwrap`, `expect`, and `unsafe` [**denied by default at build time**](#b14-preconfigured-build-gated-safety), with narrow, explicit exceptions |
 | 7 | **State evolution** | `switch` may miss new constants | `switch` often needs analyzer support | exhaustive `match` over enums | exhaustive `match` + architecture lints |
@@ -85,13 +87,13 @@ A similar middleware could exist or be built for Go or C#, and mature teams ofte
 | 9 | **Scoped resource cleanup** | `defer` discipline | `using` / `IDisposable` discipline | `Drop` + lifetimes | scoped transactions, guards, spans, connections |
 | 10 | **Polymorphism** | interfaces + newer generics; less expressive type relationships | rich generics + interfaces; runtime framework costs vary | traits, associated types, monomorphization | typed SDKs and `ClientHub` across transports |
 | 11 | **Compile-time code generation** | generators / reflection / tags | source generators / attributes / reflection | procedural and declarative macros expand into type-checked Rust | derives and builders generate schemas, scopes, APIs, route metadata, and validation glue |
-| 12 | **Tenant isolation** | manual `WHERE tenant_id = ?` | manual / EF global filters | manual | **Standardized** via `SecureConn` + `AccessScope` |
-| 13 | **AuthN / AuthZ** | per-service middleware, bespoke | ASP.NET policies | bespoke | **Built-in** PDP/PEP (NIST SP 800-162) |
-| 14 | **API consistency** | per-team router conventions | attributes + filters | bespoke | **`OperationBuilder`** → uniform REST + OpenAPI |
-| 15 | **Pagination / filtering** | hand-rolled | OData libs | hand-rolled | **Built-in OData** `$filter`/`$select`/`$orderby` |
+| 12 | **Tenant isolation** | query helpers / ORM conventions, team-chosen | EF global filters / repository conventions | team-chosen helpers | **Standardized** via `SecureConn` + `AccessScope` |
+| 13 | **AuthN / AuthZ** | middleware + policy libraries, integrated per team | ASP.NET authentication + policies | auth libraries, integrated per team | **Built-in** PDP/PEP (NIST SP 800-162) |
+| 14 | **API consistency** | per-team router conventions | attributes + filters | per-team framework conventions | **`OperationBuilder`** → uniform REST + OpenAPI |
+| 15 | **Pagination / filtering** | libraries or hand-rolled | OData libs | libraries or hand-rolled | **Built-in OData** `$filter`/`$select`/`$orderby` |
 | 16 | **Architecture policy** | `go vet` / `golangci-lint` / custom checks | Roslyn analyzers / custom checks | Clippy / custom lints | Prewritten Clippy + architecture lints (via `cargo gears lint`) for Gears conventions |
-| 17 | **Multi-tenancy / licensing / quota / usage** | build it yourself | build it yourself | build it yourself | **Pre-integrated, replaceable gears** |
-| 18 | **Extensible API domain data types** | manual | manual | manual | **GTS** — versioned, schema-validated, autogenerated JSON schemas from Rust code |
+| 17 | **Multi-tenancy / licensing / quota / usage** | assemble from libraries / services | assemble from libraries / services | assemble from libraries / services | **Pre-integrated, replaceable gears** |
+| 18 | **Extensible API domain data types** | JSON Schema / OpenAPI tooling, team-defined | JSON Schema / OpenAPI tooling, team-defined | `schemars` / `serde`, team-defined | **GTS** — versioned, schema-validated, autogenerated JSON schemas from Rust code |
 
 Those benefits are not free. Rust and framework-heavy stacks have real adoption costs; Gears tries to make them visible, document where they matter, and reduce them with structure, tooling, templates, and automation rather than hiding them.
 
@@ -109,10 +111,10 @@ Those benefits are not free. Rust and framework-heavy stacks have real adoption 
 
 Gears Toolkit internals can be complex because they encode reusable XaaS infrastructure. Individual Gear libraries are usually simpler: they model a concrete business capability inside established platform boundaries, with tenancy, API wiring, validation, and safety checks already provided by the stack.
 
-(**) AI-assisted development changes the readability trade-off. Lints, generators, templates, examples, and deterministic validation help agents produce new Gear code faster and with fewer convention mistakes. Human reviewers still need to understand the code, but the generated result is usually ordinary business logic inside a familiar structure rather than a new service architecture invented from scratch.
+(**) AI-assisted development changes the readability trade-off. Lints, generators, templates, examples, and deterministic validation are designed to give agents fast, concrete feedback, so convention mistakes surface during generation rather than in review. Human reviewers still need to understand the code, but the generated result is usually ordinary business logic inside a familiar structure rather than a new service architecture invented from scratch.
 
 > **TL;DR for Go devs:** You keep some operational properties Go teams often value —
-> single binaries, fast startup, low runtime footprint, and explicit control flow.
+> single binaries, fast startup, no GC runtime, and explicit control flow.
 > You do **not** keep Go's simplicity or ecosystem breadth. Gears is a trade:
 > more language and framework complexity in exchange for stronger static checks
 > and a pre-integrated XaaS backbone.
@@ -138,10 +140,10 @@ caller := loadUser("42")
 fmt.Println(caller.Name) // nil pointer dereference at runtime
 ```
 
-In Rust, the error is part of the type. You must deal with it, and there is no `nil`.
+In Rust, the error is part of the type, and there is no `nil`. Ignoring a `Result` triggers the `unused_must_use` warning. The Gears Clippy gate runs with `-D warnings` and denies `let_underscore_must_use`, so a silently dropped `Result` fails the build. You can still discard an error on purpose, but the code must show it.
 
 ```rust
-// Rust — you cannot accidentally ignore the error or deref a null.
+// Rust — the error is in the type, and there is no null to deref.
 fn load_user(id: &str) -> Result<User, RepoError> {
     let user = db.find_user(id)?; // `?` propagates the error explicitly
     Ok(user)
@@ -160,16 +162,16 @@ match load_user("42") {
 Go's race detector is excellent — but it only finds races on code paths you actually execute under instrumentation. Races ship to production all the time.
 
 ```go
-// Go — compiles, runs, and corrupts the map under load. No compile error.
+// Go — compiles, but concurrent map writes may crash the process at runtime.
 counts := map[string]int{}
 for _, ev := range events {
     go func(e Event) {
-        counts[e.Key]++ // concurrent map write -> runtime panic / corruption
+        counts[e.Key]++ // unsynchronized map write; runtime may abort with a fatal error
     }(ev)
 }
 ```
 
-Rust's ownership model and the `Send`/`Sync` traits make unsynchronized shared mutable memory across threads a **compile error**. You're forced to use a proper synchronization primitive.
+In safe Rust, the ownership model and the `Send`/`Sync` traits make unsynchronized shared mutable memory across threads a **compile error**. You're forced to use a proper synchronization primitive.
 
 ```rust
 // Rust — won't compile unless the shared state is actually thread-safe.
@@ -185,13 +187,13 @@ for ev in events {
 }
 ```
 
-"If it compiles, it's free of memory data races" is not a slogan — it's enforced by the borrow checker. This does not eliminate logical races such as TOCTOU bugs, lost updates, deadlocks, or bad transaction boundaries; those still need design, tests, and database constraints. For a platform handling concurrent multi-tenant traffic, Rust shifts an important class of concurrency defects from runtime testing into compilation.
+In safe Rust, "if it compiles, it's free of memory data races" is not a slogan — the compiler enforces it. `unsafe` code and FFI can still introduce data races. Gears forbids `unsafe_code` across the workspace, and the few crates that need it opt out explicitly in their manifest. This does not eliminate logical races such as TOCTOU bugs, lost updates, deadlocks, or bad transaction boundaries; those still need design, tests, and database constraints. For a platform handling concurrent multi-tenant traffic, Rust shifts an important class of concurrency defects from runtime testing into compilation.
 
 ### A.3 No `nil` interfaces, no exceptions-from-anywhere
 
-C# gives you a rich runtime, but exceptions are invisible in signatures — any call can throw, and `NullReferenceException` remains the most common production failure. Go's `nil` interface trap (`err != nil` being true for a typed-nil) catches even experienced developers.
+C# gives you a rich runtime, but exceptions are invisible in signatures — any call can throw, and `NullReferenceException` remains a common production failure. Go's `nil` interface trap (`err != nil` being true for a typed-nil) catches even experienced developers.
 
-Rust has neither. Fallibility (`Result`) and absence (`Option`) are explicit in every signature, and exhaustive `match` means adding a new variant forces you to handle it everywhere.
+Rust has neither. Returned errors (`Result`) and absence (`Option`) are visible in the signature, and exhaustive `match` means adding a new variant breaks every match that lists variants explicitly. Panics are the exception: a Rust function can still panic without saying so in its signature.
 
 **Gears** goes further than plain Rust style advice: the workspace lints deny `unwrap`, `expect`, and `unsafe` code by default, so these shortcuts fail the build instead of waiting for review. Exceptions are narrow and visible: tests may use `unwrap`/`expect`, and every other exception is declared explicitly in the code or the crate manifest (see [B.14](#b14-preconfigured-build-gated-safety)). `panic!` itself is not lint-gated; avoiding it is a review rule. In Go or C#, teams can enforce similar rules with analyzers, linters, and review policy; in Gears, these Clippy and compiler lints are part of the standard build gate.
 
@@ -236,7 +238,7 @@ case StatusDone:
 }
 ```
 
-In Rust, matching an enum is exhaustive by default. If you later add `Cancelled`, every `match` that forgot it fails to compile until you decide what the new state means:
+In Rust, matching an enum is exhaustive by default. If you later add `Cancelled`, every `match` that lists the variants explicitly fails to compile until you decide what the new state means. A `match` with a catch-all `_ =>` arm still compiles and sends the new variant to that arm, so for state machines prefer listing every variant:
 
 ```rust
 // Rust — adding Job::Cancelled forces this match to be updated.
@@ -248,11 +250,11 @@ match job {
 }
 ```
 
-The same pattern appears everywhere: `Option` forces you to handle absence, `Result` forces you to handle failure, and enums force you to handle new states. This is exactly the kind of language support you want when platform APIs and workflows evolve over years.
+The same pattern appears everywhere: `Option` makes absence explicit, `Result` makes failure explicit (and the Gears lint gate rejects ignored results), and explicit enum matches surface new states. This is exactly the kind of language support you want when platform APIs and workflows evolve over years.
 
-### A.6 Zero-cost abstractions and predictable performance
+### A.6 Zero-cost abstractions and no GC pauses
 
-No garbage collector means no GC pauses and a small, predictable memory footprint — which is exactly what you want for edge/on-prem appliances and for running the *full* platform locally during development. You get C-like performance with high-level ergonomics, and the abstractions compile away.
+No garbage collector means no GC pauses, and memory is released deterministically when values go out of scope. That helps for edge/on-prem appliances and for running the *full* platform locally during development. Actual memory use and throughput still depend on allocations, caches, dependencies, and workload, so they need to be measured per deployment. Generics, iterators, and newtypes compile down to direct code, so these abstractions add no runtime overhead of their own.
 
 ### A.7 Tooling and static analysis as a first-class citizen
 
@@ -338,16 +340,18 @@ Serialization, hashing, equality, ordering, and many schema/DB integrations can 
 Rust also uses types to model resource lifetime. Values are dropped deterministically when they leave scope, so transactions, mutex guards, file handles, tracing spans, and pooled connections can release themselves through `Drop` even when a function returns early with `?`.
 
 ```rust
+// `instrument` keeps the span attached to this future across `.await`.
+// Holding an `.entered()` span guard across `.await` would tag other tasks.
+#[tracing::instrument(skip_all, fields(id = %id))]
 async fn update_document(repo: &Repo, id: DocumentId) -> Result<(), RepoError> {
     let tx = repo.begin().await?;
-    let _span = tracing::info_span!("update_document", %id).entered();
 
     repo.lock_document(&tx, id).await?;
     repo.write_document(&tx, id).await?;
 
     tx.commit().await?;
     Ok(())
-} // span exits; uncommitted guards/resources are dropped on every return path
+} // an uncommitted `tx` and other guards are dropped on every return path
 ```
 
 Go's `defer` and C#'s `using` / `IDisposable` are good mechanisms, and experienced teams use them successfully. Rust's advantage is that scoped ownership is the default shape of the language. You can still design a bad transaction boundary or hold a lock too long, but it is harder to forget cleanup code in ordinary control flow.
@@ -517,13 +521,13 @@ This gives gears one uniform place for pagination/filtering (**OData** `$filter`
 
 A **Gear** is a self-contained unit that owns its API (an SDK crate), owns its data (behind `SecureConn`), is discovered at link time via `inventory`, and composes through a typed `ClientHub` in-process — or the *same* SDK over gRPC out-of-process.
 
-The logical model is identical regardless of the physical boundary. Switching between in-process and out-of-process is a **YAML field** (`runtime.type`), not a code change:
+The logical model is identical regardless of the physical boundary. Running a gear out-of-process takes some one-time preparation, described in the [out-of-process guide](./toolkit_unified_system/09_oop_grpc_sdk_pattern.md): a gRPC client and wiring helpers in the gear's SDK crate, a gRPC server adapter in the gear, and a separate gear binary. Once that is in place, choosing the deployment mode is a **YAML field** (`runtime.type`), and the business logic does not change:
 
 - **Single-node** — all gears in one process → edge, on-prem appliances, dev/test.
 - **Multi-node** — gears across processes/machines over gRPC, no orchestrator.
 - **Kubernetes** — containerized, full orchestration, cloud-native ops.
 
-> Develop locally single-node → deploy bare-metal → scale to K8s — **no rewrites**.
+> Develop locally single-node → deploy bare-metal → scale to K8s — **no business-logic rewrites** once a gear's transport layer is prepared.
 
 ### B.9 Extensible domain model via the Global Type System (GTS)
 
@@ -570,7 +574,7 @@ Go and C# teams can enforce many of these rules with `golangci-lint`, `go vet`, 
 
 Because gears are composable libraries, the **full business logic — including scenarios that span multiple gears** — can be run and tested locally on a developer machine, without Jenkins, Ansible, or K8s. A single process can host many gears and exercise cross-gear flows end-to-end entirely in memory.
 
-Gears comes with integrated unit, integration, end-to-end, and fuzzing tests, plus coverage and diff-coverage to show exactly which changes are exercised. The same test suites can then be repeated by CI against a distributed deployment, where real networking, orchestration, and database backends are also exercised. This **local-first, fully testable runtime** lets developers and Agentic IDEs/LLMs catch logical and cross-gear issues early, *before* a pull request is opened, so most behavioral defects are found locally long before CI or a release stage.
+Gears comes with integrated unit, integration, end-to-end, and fuzzing tests, plus coverage and diff-coverage to show exactly which changes are exercised. The same test suites can then be repeated by CI against a distributed deployment, where real networking, orchestration, and database backends are also exercised. This **local-first, fully testable runtime** lets developers and Agentic IDEs/LLMs catch logical and cross-gear issues early, *before* a pull request is opened.
 
 ---
 
