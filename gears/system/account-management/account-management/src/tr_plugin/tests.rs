@@ -66,8 +66,9 @@ impl TestRegistry {
     /// Every read fails as the registry being unavailable.
     fn unavailable() -> Arc<dyn PlatformTypesRegistryApi> {
         let registry = MockTypesRegistry::new();
-        registry
-            .inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
+        for call in [Call::BatchGet, Call::BatchResolve] {
+            registry.inject(Fault::on(call).fail(CanonicalError::service_unavailable().create()));
+        }
         Arc::new(registry)
     }
 }

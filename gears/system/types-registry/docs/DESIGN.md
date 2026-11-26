@@ -57,7 +57,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-fr-gts-validation` | All GTS semantics come from `gts-rust`; the managed profile adds Draft-07 and identifier restrictions, while federation does not reinterpret source content. See §2.2, *Admission Pipeline*, and *Compatibility & Evolution Policy* in §3.2. |
 | `cpt-cf-types-registry-fr-ref-tracking` | Flat managed dependency edges for derivation, `$ref`, and Instance-to-schema relationships; used for deletion safety and impact analysis. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no edge. See *Dependency Graph & Deletion Safety* in §3.2. |
 | `cpt-cf-types-registry-fr-type-query-assistance` | Exact managed matching in SQL over stored parsed segments, GTS matcher confirmation of external results, source-major federation, and a bounded complete Registry Reference set. See *Query Assistance & Discovery* in §3.2. |
-| `cpt-cf-types-registry-fr-tenant-ownership` | Global or tenant ownership stored on each Managed Entity; tenant visibility follows the directed descendant relation, computed from the subject tenant; boolean `read`/`list` grants gate the operation without altering that relation. See *Visibility Resolver* and *Read authorization* in §3.2. |
+| `cpt-cf-types-registry-fr-tenant-ownership` | Global or tenant ownership stored on each Managed Entity; tenant visibility follows the directed descendant relation, computed from the subject tenant; `read`/`list` decisions narrow its tenant-owned part by ownership constraints, never widen it; a deny empties only that part, and global entries stay readable. See *Visibility Resolver* and *Read authorization* in §3.2. |
 | `cpt-cf-types-registry-fr-registration-authority` | Global writes use `PlatformSecurityContext`; tenant writes use PDP grants over the candidate identifier, evaluated before identifier availability. See *Tenant-plane authorization* and *Platform-plane authorization* in §3.2. |
 | `cpt-cf-types-registry-fr-registration-policy` | Closed-by-default creation policy over admitted vendors and tenant ownership, resolved exact-then-longest per parameter before authorization. See *Registration policy* in §3.2. |
 | `cpt-cf-types-registry-fr-tenant-availability` | Registry-computed verdict from entity state and the Context Tenant's ancestor chain; P1 requires no dependency-closure traversal. See *Availability Evaluator* in §3.2. |
@@ -79,7 +79,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-nfr-lookup-latency` | Exact lookup p95 < 10 ms | Identity, current-state read, availability | Derived references, keyed current-state joins, SQL availability evaluation, no plugin call on managed reads, and one cached authorization decision per request rather than per entity. | Benchmark profile in §4. |
 | `cpt-cf-types-registry-nfr-query-latency` | Bounded search p95 < 100 ms (P2) | Discovery and query assistance | Indexed exact managed filters before the page limit, GTS matching of external results, and bounded source-major federation. | Benchmark profile in §4. |
 | `cpt-cf-types-registry-nfr-multi-pod-correctness` | Every pod's first post-commit read sees the mutation | Database, outbox worker, derived caches | One authoritative database, leased outbox dispatch, idempotent guarded commits, and no process-local authority. | Integration tests for duplicate delivery, lease expiry, concurrent family admission, and cross-pod read-after-commit. |
-| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current after the client observes the mutation | SDK client cache | Projection-scoped validators, fail-closed revalidation, immediate invalidation of submitted keys, and bounded freshness for indirectly affected keys. | Integration tests in §3.3, *The client-side cache*. |
+| `cpt-cf-types-registry-nfr-cache-correctness` | No invalidated result accepted as current after the client observes the mutation | SDK client cache | Entity-state validators, projection-aware SDK conditions, fail-closed revalidation, immediate invalidation of committed keys, and bounded freshness for indirectly affected keys. | Integration tests in §3.3, *The client-side cache*. |
 
 #### Key ADRs
 
@@ -266,7 +266,7 @@ Types Registry becomes ready when its storage and seed set are ready; it never w
 
 Visibility of a tenant-owned entity is the directed descendant relation, so most reads require the requesting subject tenant's ancestor chain. It is obtained from `tenant-resolver` with barrier traversal disabled, cached within the 10 ms lookup budget, and versioned into the freshness validator.
 
-The tenant PDP is the second read-path dependency, added by `cpt-cf-types-registry-tech-read-authorization`: an unreachable one fails a read closed exactly as it fails a registration, and because this gear precedes every registrant, that outage is platform-wide rather than local. Both dependencies are cached, and neither is consulted on the platform plane.
+The tenant PDP is the second read-path dependency, added by `cpt-cf-types-registry-tech-read-authorization`: an unreachable one fails a tenant-plane read closed — a request that would return only global entries included — exactly as it fails a registration, while a completed deny or empty scope only empties the tenant-owned part, and because this gear precedes every registrant, that outage is platform-wide rather than local. Both dependencies are cached, and neither is consulted on the platform plane.
 
 **ADRs**: `cpt-cf-types-registry-adr-tenant-ownership-visibility-authority`, `cpt-cf-types-registry-adr-tenant-availability-evaluation`
 
@@ -638,18 +638,18 @@ The actions are `register` and `delete`. `register` covers creation and revision
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-pdp-resource-shape`
 
-Every registry evaluation, under either action set, names one resource type — `gts.cf.core.types_registry.entity.v1~` — and carries the identifier or pattern under discussion in the `gts_id` resource property, as `cpt-cf-types-registry-fr-registration-authority` already requires of writes.
+Every registry evaluation, under either action set, names one resource type — `gts.cf.core.types_registry.entity.v1~`. A write evaluation carries the candidate identifier in the `gts_id` resource property, as `cpt-cf-types-registry-fr-registration-authority` requires. A read or list evaluation carries no resource ID and no resource property: the requested keys, pattern and scope selector stay in the local query, so rule 12 of the authorization design (requested equalities) binds none of its constraints. A future read endpoint that supplies an advertised property must validate that equality.
 
 The metatype is load-bearing rather than a formality. A request naming `gts.acme.billing.invoice.v1~` as its resource type would be indistinguishable from the billing gear asking about an invoice object, so one grant would cover both the contract and the objects governed by it. Registry-specific verbs hid this: `register` and `delete` collide with nothing, while `read` and `list` are verbs every gear uses.
 
-A GTS Identifier Region therefore constrains that property rather than appearing as a wildcard in `resource_type`. It is the same notion registration policy and Source Claims use — one trailing wildcard on a token boundary, so any two Regions are nested or disjoint — applied here to a grant. Every declared permission carries the bare metatype, and the Region belongs to the grant binding an identity to one. Its form is a [GTS](https://github.com/GlobalTypeSystem/gts-spec/blob/main/README.md) §3.3 predicate over the property, `gts.cf.core.types_registry.entity.v1~[gts_id="gts.acme.*"]`: §3.5 gives exactly that shape for access control, and §3.3 admits predicates in policy evaluation while keeping them out of stored identifiers. One property name serves all four actions; a second name for the pattern case would force one grant per action.
+A GTS Identifier Region therefore constrains that property rather than appearing as a wildcard in `resource_type`. It is the same notion registration policy and Source Claims use — one trailing wildcard on a token boundary, so any two Regions are nested or disjoint — applied here to a grant. Every declared permission carries the bare metatype, and the Region belongs to the grant binding an identity to one. Its form is a [GTS](https://github.com/GlobalTypeSystem/gts-spec/blob/main/README.md) §3.3 predicate over the property, `gts.cf.core.types_registry.entity.v1~[gts_id="gts.acme.*"]`: §3.5 gives exactly that shape for access control, and §3.3 admits predicates in policy evaluation while keeping them out of stored identifiers. One property name serves `register` and `delete`, and would serve a future Region-scoped read; a second name for the pattern case would force one grant per action.
 
 Two obligations on the PDP follow. Both belong to the §4 binding prerequisite, because [`PERMISSION_GTS_TYPE.md`](../../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md) settles neither today:
 
 - **A Region predicate is resolved against the request property and never returned as a constraint.** That document's worked example compiles a predicate into a PEP constraint over an advertised property, which cannot work here: `supported_properties` declares what a PEP can map to **SQL**, an authorization check on one candidate identifier has no query to filter, and no standard predicate expresses a wildcard match at all. `gts_id` is therefore absent from `supported_properties` under both action sets, and a constraint carrying a Region is refused rather than applied.
 - **A decision resolves no registry state.** `resource.type` and a granted permission identifier are strings the PDP matches. Nothing on the authorization path looks either up here — otherwise a read would authorize by reading, and `cpt-cf-types-registry-constraint-boot-path` puts this gear ahead of every registrant.
 
-Only writes are Region-scoped in P1. `cpt-cf-types-registry-fr-registration-authority` requires it — a grant governs a Region, and registering first grants nothing — and registration policy cannot substitute, because it tests the vendor named by the candidate rather than the tenant writing. Reads carry `gts_id` for audit and for the upgrade below, but no read grant is evaluated against it.
+Only writes are Region-scoped in P1. `cpt-cf-types-registry-fr-registration-authority` requires it — a grant governs a Region, and registering first grants nothing — and registration policy cannot substitute, because it tests the vendor named by the candidate rather than the tenant writing. Reads are scoped by ownership constraints instead, and no read grant is evaluated against `gts_id` (*Read authorization*).
 
 The metatype is declared through the ordinary inventory path of §3.3, marked `x-gts-abstract` because nothing conforms to it at runtime: it names a resource class for the permission catalogue, not a wire object. Registration is what lets an administrative view resolve a declared `resource_type`; by the second obligation above, no decision waits on it, so neither the asynchronous admission window nor a purged metatype can close an authorization loop. Kind-specific narrowing would derive from it, which GTS §3.6 implicit derived-type coverage makes additive to grants already issued.
 
@@ -657,33 +657,42 @@ The metatype is declared through the ordinary inventory path of §3.3, marked `x
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-read-authorization`
 
-Reads are authorized under two actions of their own, `read` and `list`. `cpt-cf-types-registry-fr-tenant-ownership` makes a global entry readable subject to lifecycle, availability, **and authorization** and requires platform-plane reads to stay authorized while spanning tenants; `cpt-cf-types-registry-fr-externally-managed-entities` names authorization in the invariant list every result passes before exposure.
+On the tenant plane, `read` and `list` constrain tenant-owned entries. Global contracts are readable on both planes, subject to authentication, lifecycle and availability. These rules apply to managed and external results (`cpt-cf-types-registry-fr-tenant-ownership`, `cpt-cf-types-registry-fr-externally-managed-entities`).
 
-Visibility cannot stand in for that check because it is a property of the requesting **tenant**. Without a grant, every subject of a tenant — an ordinary end user, a narrowly scoped third-party token, a leaked service credential — reads every contract that tenant can see, and type names and schemas describe a product's structure. `cpt-cf-adr-two-plane-auth` also puts the `PolicyEnforcer` on the tenant-plane path for entity state; AuthZ exemption belongs to the platform plane alone.
+Visibility follows the tenant. A scoped third-party token would otherwise see every contract its tenant can see, including types that describe its product's structure. The tenant plane therefore applies the `PolicyEnforcer` per subject (`cpt-cf-adr-two-plane-auth`).
 
-**One evaluation covers one request, not one key.** A `batchGet` of 500 keys is a single `read` decision, because a Region-free grant cannot answer differently per key and 500 round trips would end `cpt-cf-types-registry-nfr-lookup-latency` outright. A denial is therefore one `403` for the request rather than a per-key outcome, and `EntityLookup` keeps its four states. The grant is evaluated before the ancestor chain is fetched and before any entity lookup, as on the write path and for the same reason: a refusal must not depend on what exists. Preceding existence is also what makes one denial shape cover a free, visible, invisible, or reserved identifier alike.
-
-A read decision is a bare boolean: `require_constraints` is `false`, and `capabilities` and `supported_properties` are both empty. `false` is the documented pattern for a read whose PEP wants no SQL-level enforcement, and here the fence is not PDP-derived at all — the registry builds it from the tenant hierarchy and applies it whatever the answer was, so the boolean gates the operation while the scope stays local. A constraint arriving anyway is refused rather than applied, by the ordinary rule that a constraint naming a property the PEP never advertised is a contract violation resolved as a denial. The cost is that a deployment cannot express a data-scoping read policy at all: such a policy can only come back as a whole-request deny.
+**One evaluation per request, enforced per row.** Before fetching ancestors or entities, evaluate `read` for exact reads, `batchGet` and `batchResolve`, or `list` for discovery. Set `require_constraints: true` and advertise `ownership_scope` and `owner_tenant_id` in `supported_properties`. Compile the full decision into the tenant-owned branch of the visibility predicate.
 
 ```text
-ownership_scope = GLOBAL OR owner_tenant_id IN ancestors_inclusive(subject_tenant)
+ownership_scope = GLOBAL
+OR (ownership_scope = TENANT
+    AND owner_tenant_id IN ancestors_inclusive(subject_tenant)
+    AND (<the PDP's whole DNF, compiled; FALSE on a deny>))
 ```
+
+Grouping the whole DNF inside the tenant branch preserves the ancestor check even when a branch constrains only `ownership_scope`. Global rows remain readable.
 
 The block is schematic over logical values; `database.sql` encodes the scope as a smallint and forces `owner_tenant_id` NULL for a global row. The chain comes from the Tenant Hierarchy Client of §3.2 — cached, barrier traversal disabled, its version in the freshness validator — and the predicate rides `idx_tr_entity_visibility` on `(ownership_scope, owner_tenant_id, lifecycle_status, gts_id)`, whose chunking that file already describes as one global range plus one range per ancestor. Lifecycle is not part of visibility: a deleted entity still resolves, carrying deleted state.
 
-**The chain is the subject's, never the Context Tenant's**, which `cpt-cf-types-registry-fr-tenant-ownership` states as a requirement rather than leaving to design. The two coincide by default on this plane, so the difference surfaces only when a caller names a descendant — and there, using the Context Tenant would hand an ancestor that descendant's private contracts for the asking. A boolean decision cannot express a tenant restriction to compensate, which is exactly why the rule lives here rather than in policy. The Context Tenant's chain is fetched only when one is named and availability is selected, cached separately, and used for availability alone (ADR-0010).
+Excluded, invisible and unissued keys all return `not_found`, preserving the four `EntityLookup` states. Even a 500-key `batchGet`, a batch resolution or a discovery page costs one evaluation (`cpt-cf-types-registry-nfr-lookup-latency`). Managed discovery filters before the page limit, keeping pages full. Federated results pass the same checks in memory before exposure and may yield short pages.
 
-P1 accepts what a boolean cannot say. A policy cannot restrict a subject to its own contracts while hiding inherited ones — that shape exists as the §3.3 discovery scope selector, but as caller intent the caller may drop, not as policy. Nor can it let an ancestor read a descendant's catalogue, which would take a vantage tenant of its own, capped locally at `descendants_inclusive(subject_tenant)`. Both are additive: the first restores `owner_tenant_id` to `supported_properties`, the second adds a property. ADR-0009 leaves cross-boundary reads to the platform plane and no requirement asks for either.
+The enforcer's fail-closed rules apply unchanged. An explicit deny excludes tenant-owned rows rather than refusing the request, so global entries stay readable. An allow without constraints is a compilation failure (500), never a fallback to the fence. An unknown operator rejects the response; a branch naming an unadvertised property is discarded and logged, and a response left without a valid branch is rejected. Reads opt into `allow_empty_scope`: a valid scope that matches nothing, such as `in(ownership_scope, [])`, excludes tenant-owned rows like a deny, so their keys answer `not_found` and discovery lists global entries only.
 
-`in_tenant_subtree` deserves one note, since it looks like the predicate this gear should be taking. It requires a `tenant_closure` projection the registry does not hold, and its direction is the opposite of the one needed: it scopes owners downward from a root, while contract visibility runs upward from the subject.
+The fence is never PDP-derived: constraints only narrow its tenant-owned branch. A policy can therefore scope one subject's data — a narrowly scoped token kept to global contracts, or to contracts owned by the subject tenant while those owned by its ancestors stay hidden, the shape the §3.3 discovery scope selector offers only as caller intent — but cannot widen it. An ancestor still cannot read a descendant's catalogue, which would take a vantage tenant of its own, capped locally at `descendants_inclusive(subject_tenant)`; ADR-0009 confines cross-boundary access to operator flows — a deletion Dry Run's dependents and purge reports — and no requirement asks for more.
 
-Both read actions are gear-wide: the grant says whether this subject may read the registry, not which Region of it. A `list` therefore needs no pattern reasoning at all, which is why P1 stops here — a Region-scoped read grant would have to decide whether a requested pattern is contained in a granted one, and then whether a wider request is refused or narrowed to the intersection. Adding it later is a binding and configuration change, not a protocol one. What P1 cannot express meanwhile is "this third-party token reads only `gts.acme.*`"; the grant closes the registry to a subject or opens it, and the subject's visible set stays the fence in between.
+Visibility always uses the **subject tenant's ancestor chain** (`cpt-cf-types-registry-fr-tenant-ownership`). Using a named descendant's chain would expose that descendant's private contracts to its ancestor. Fetch and cache the named Context Tenant's chain whenever a read names one, whatever it selects: its version enters every projection's validator (§3.3, *What a validator is made of*), and selecting `availability` only decides whether the verdict is evaluated (ADR-0010). When the Context Tenant is the subject tenant, the subject chain serves both roles.
 
-The decision is cached, because `cpt-cf-types-registry-nfr-lookup-latency` does not survive a PDP round trip per read. The key covers subject, `token_scopes`, action, and Context Tenant. This is the one authoritative decision the gear takes from process-local state, so §1.3's rule against that is bounded here rather than excepted: no entry outlives the presenting token, and allow and deny are cached alike, so a revoked grant keeps working and a freshly issued one stays inert until that token expires. `gts_id` joins the key only when a read grant becomes Region-scoped; keying on it while every decision is gear-wide would fragment the cache per identifier for one answer.
+`in_tenant_subtree` is not advertised, although it looks like the predicate this gear should take. It requires a `tenant_closure` projection the registry does not hold, and its direction is the opposite of the one needed: it scopes owners downward from a root, while contract visibility runs upward from the subject. `eq` and `in` over the two advertised properties express every restriction above.
 
-Naming a Context Tenant travels in `tenant_context.root_id` so that policy may condition on it. It does not move the relation check: the platform must authorize the subject-to-context relation, and §3.3 discharges that through the PDP-authorized `tenant-resolver.is_ancestor` call, which the read decision neither replaces nor duplicates. A cached boolean could not stand in for it anyway, because that call also yields the chain version the validator carries.
+**Reads are not Region-scoped in P1.** `gts_id` stays out of `supported_properties` (*The PDP resource shape*): a Region is a prefix match that no standard predicate expresses. P1 therefore cannot say "this third-party token reads only `gts.acme.*`". Adding it takes a prefix predicate in the AuthZ SDK, after which `gts_id` joins the advertised properties and the same compilation applies to exact reads and discovery alike, with no protocol change here.
 
-Planes divide as everywhere else. A platform gear's startup reconciliation batch-reads under `PlatformSecurityContext` and is exempt; a tenant-plane registrant's reconciliation read needs `read` like any other tenant read, which is why `cpt-cf-types-registry-tech-inventory-registration` step 1 is subject to this subsection.
+Cache allow and deny decisions under the platform rules (*Authorization Decision Caching*) to meet `cpt-cf-types-registry-nfr-lookup-latency`. The cache key covers subject and attributes, `token_scopes`, action, resource type, tenant context, supported properties, capabilities (empty for this PEP), `require_constraints` and credential-derived plugin inputs. Skip reuse when equivalence is uncertain. Constraints are entity-independent, so one decision serves all keys with the same inputs. This bounds the process-local authority allowed by §1.3. Cached decisions may delay new or revoked grants only until the earlier of PDP expiry and token expiry.
+
+The SDK sees neither owner IDs nor, over REST, PDP decisions. It can reuse a fresh global snapshot within its representation scope. For tenant-owned entities it needs a registry-confirmed read for the same entity and read context. Discovery supplies no such proof. See [The client-side cache](#the-client-side-cache) for scope and keying, and P0 SPEC C6 for credential equivalence and expiry before reusing PDP-backed answers.
+
+Pass a named Context Tenant in `tenant_context.root_id` for policy evaluation. Separately, the PDP-authorized `tenant-resolver.is_ancestor` call verifies the subject-to-context relation and supplies the validator's chain version (§3.3).
+
+Planes divide as everywhere else. A platform gear's startup reconciliation batch-reads under `PlatformSecurityContext` and is exempt; a tenant-plane registrant's reconciliation read sees its tenant-owned entities only under `read`, like any other tenant read, which is why `cpt-cf-types-registry-tech-inventory-registration` step 1 is subject to this subsection.
 
 ##### Declared permissions
 
@@ -693,10 +702,10 @@ Four Instances of `gts.cf.toolkit.authz.permission.v1~`, submitted through the s
 |---|---|---|
 | `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_register.v1` | `register` | per distinct candidate identifier, at acceptance step 4 |
 | `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_delete.v1` | `delete` | per distinct candidate identifier, at acceptance step 4 |
-| `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_read.v1` | `read` | once per request, Region-free in P1 |
-| `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_list.v1` | `list` | once per request, Region-free in P1 |
+| `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_read.v1` | `read` | once per request, constraints over ownership, Region-free in P1 |
+| `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_list.v1` | `list` | once per request, constraints over ownership, Region-free in P1 |
 
-`resource_type` is the bare metatype in all four. A write grant is narrowed to a Region through the binding; a read grant is not narrowed at all in P1. The release ships baseline `read` and `list` for every authenticated tenant subject, because a domain gear expanding a type filter under an end user's context would otherwise be refused. That baseline travels by the same deferred binding, so §4's prerequisite gates the documented default posture and not only the Region-scoped case. Once it lands the default is indistinguishable from a registry without read grants, and what the two actions add is a gate that exists — one a deployment can close for a subject, and later narrow by Region.
+All four permissions use the bare metatype as `resource_type`. Write grants bind a Region. P1 read grants constrain ownership. The release gives every authenticated tenant subject baseline `read` and `list` grants with `eq(ownership_scope, TENANT)`, so a gear expanding a type filter sees the user's visible subtree. Effective policy **replaces** this baseline. A subject limited to its own contracts receives only `eq(owner_tenant_id, <its tenant>)`. A subject limited to global contracts receives a deny. Unioning either restriction with the baseline would restore the full visible subtree. The baseline depends on the deferred binding in §4.
 
 Three absences are deliberate. `purge` has no permission because the grant-free platform plane gates it by deployment policy (ADR-0013). `GET /operations/{operation_id}` has none because it returns a request receipt rather than entity state, and its idempotency scope already binds plane, owning tenant, and principal more tightly than a grant would — the enforcer governs the entity-state reads above, not this receipt. Derivation has none because it is a `register` of the derived candidate, bounded by registration policy.
 
@@ -829,7 +838,7 @@ It resolves identity, not content or usability: the revision returned and the ve
 
 ##### Responsibility scope
 
-Gates every read on the `read` or `list` grant, then evaluates the directed descendant relation from the requesting **subject** tenant's ancestor chain, filters every read, discovery, and resolution result by it, and owns the shape of the responses that touch the disclosure boundary: an out-of-scope reverse resolution indistinguishable from an unissued reference, a registration conflict that reveals only that the name is unavailable, and a blocked deletion that reports a count without identities.
+Applies the `read` or `list` decision to every read's tenant-owned part, then evaluates the directed descendant relation from the requesting **subject** tenant's ancestor chain, filters every read, discovery, and resolution result by it, and owns the shape of the responses that touch the disclosure boundary: an out-of-scope reverse resolution indistinguishable from an unissued reference, a registration conflict that reveals only that the name is unavailable, and a blocked deletion that reports a count without identities.
 
 ##### Responsibility boundaries
 
@@ -995,6 +1004,7 @@ The tenant surface runs on the business listener with `SecurityContext`. `owner_
 | `GET` | `/types-registry/v1/entities/{entity_key}` | Read one visible current entity | `200` with the selected fields, or the default set; `404` when not visible or absent | unstable |
 | `GET` | `/types-registry/v1/entities` | Discover visible entities by pattern and filters | `200` with one page and a cursor | unstable |
 | `POST` | `/types-registry/v1/entities:batchGet` | Read an exact bounded set without GET-body or URL-length ambiguity | `200` with one result per requested key, keyed by that key | unstable |
+| `POST` | `/types-registry/v1/entities:batchResolve` | Translate an exact bounded set of visible keys between GTS Identifier and Registry Reference | `200` with one identity or `not_found` per requested key; no lifecycle or validator | unstable |
 | `POST` | `/types-registry/v1/entities` | Submit one tenant-owned registration batch with required `Idempotency-Key` | `202` with the operation, always; `200` only when replaying a key whose operation is already terminal | unstable |
 | `POST` | `/types-registry/v1/entities:batchDelete` | Submit one deletion batch, each item carrying its own precondition | `202` with the operation; `200` only when replaying a key whose operation is already terminal | unstable |
 | `DELETE` | `/types-registry/v1/entities/{entity_key}` | Delete exactly one entity, its precondition in the query | `202` with the operation; `200` only when replaying a key whose operation is already terminal | unstable |
@@ -1010,17 +1020,21 @@ Deletion has two spellings of one operation. `:batchDelete` is a body-based cust
 
 ##### Conditional reads
 
-For one read, the validator is both HTTP `ETag` and SDK `Validator`; matching `If-None-Match` returns a bodyless `304` **carrying the `ETag`**, per [RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified) and for the same reason the batch returns one on `unchanged`. Batch validators travel beside individual keys, in each item's `if_none_match`, because one header cannot represent them; each result may be `unchanged`, and the response remains `200` even when all are unchanged. The two body fields are the two header names, lowercased — `if_none_match` going out and `etag` coming back — so a reader who knows the single-read surface already knows this one, and a caller copying a value between them cannot misread which direction it travels. An `If-None-Match` **header** on `:batchGet` is refused rather than ignored, because a caller that sent one believes the batch is conditional and it is not. A validator is scoped to its projection, detected by recomputation rather than stored reader state.
+A matching `If-None-Match` on an exact read returns a bodyless `304` with the `ETag` ([RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified)).
+In `:batchGet`, each item carries its own `if_none_match` and each `unchanged` result returns its `etag`. The batch status stays `200`. The route refuses an `If-None-Match` header because it cannot express per-key conditions.
 
-**Where a client gets the validator it later sends back.** The loop closes inside each exact-read surface and never across two of them:
+The registry recomputes one validator per entity state across projections. Send it only for its entity and a projection the held snapshot covers. The SDK binds both in its typed condition. Raw HTTP callers track them.
+
+The same validator can move between an exact read and a `:batchGet` item for the same entity when the held representation covers the requested `$select`.
 
 | Surface | Hands the validator out as | Takes it back as |
 |---|---|---|
 | `GET /entities/{entity_key}` | `ETag` response header | `If-None-Match` request header → bodyless `304` |
 | `POST /entities:batchGet` | `etag` on each `found` result | `if_none_match` on each request item → `unchanged` |
 | `GET /entities` | **nothing** | — |
+| `POST /entities:batchResolve` | **nothing** | — |
 
-The third row is a decision, not a gap. A discovery page is a changing, paginated set rather than an answer about an exact key, so no token could describe "this page, still". A page may carry selected documents directly; a client that wants validators, or documents for only some keys, asks `:batchGet` for identifiers the page gave it. That second round trip is optional and suits selection and caching.
+The last two rows are decisions, not gaps. A resolution returns an immutable pair, not entity state, so there is nothing for a validator to describe. A discovery page is a changing, paginated set rather than an answer about an exact key, so no token could describe "this page, still". A page may carry selected documents directly; a client that wants validators, or documents for only some keys, asks `:batchGet` for identifiers the page gave it. That second round trip is optional and suits selection and caching.
 
 ##### What a validator is made of
 
@@ -1033,18 +1047,18 @@ Per `cpt-cf-types-registry-principle-derive-not-store`, validators are computed 
 | `entity.resource_version` | ✓ | — |
 | `type_schema.resolution_fingerprint` | ✓, Type Schemas only | — |
 | subject visibility-chain version | ✓, tenant plane only | ✓, tenant plane only |
-| Context Tenant availability-chain version | ✓, when availability is selected | ✓, when availability is selected |
+| Context Tenant identifier and availability-chain version | ✓, whenever the read names a Context Tenant | ✓, whenever the read names a Context Tenant |
 | routing generation | — | ✓ |
 | `external_revision` | — | ✓, verbatim |
-| normalized projection | ✓ | ✓ |
 
-Routing generation appears only externally: claim changes cannot affect managed results under ADR-0011, but must invalidate tokens tied to an old source. `resolution_fingerprint` appears only for Type Schemas, because Instances have no derived form. When subject and Context Tenant are the same, one chain version fills both roles; a platform read has no subject visibility chain and includes a Context Tenant chain only when it requests availability.
+External validators include routing generation to reject tokens from an old source (ADR-0011). Only Type Schemas have a `resolution_fingerprint`. Tenant-plane reads include the subject visibility chain. A named Context Tenant contributes its identifier and its chain to every projection, including those without availability: `ownership` and availability are relative to it, and a chain version alone could coincide between two tenants. One chain fills both roles when the tenants coincide.
 
 The plugin token must be scoped to `(entity, tenant)` and change whenever any source-owned response field that affects the platform-visible result changes: canonical content, the effective artifacts of a Type Schema, source lifecycle, ownership scope, or source-owned tenant enablement. It need not change for platform-owned availability or visibility, which the chain-version inputs above cover; equal tokens under equal platform inputs therefore identify an equal platform-visible result. A plugin unable to guarantee this must always answer conditional reads as changed. The registry cannot verify that source-owned state, so it delegates the comparison.
 
-##### Projection as a validator input
+##### Projection is not a validator input
 
-Projection prevents a narrow `$select` token from producing false `unchanged` for a wider representation, consistent with [RFC 9110 §8.8.3](https://www.rfc-editor.org/rfc/rfc9110#name-etag). The digest uses the normalized field set, not the query string: field order is irrelevant, and absent `$select` equals an explicit default set. A Type Schema's fingerprint enters every projection, so a dependency refresh can also cost an extra transfer for `$select=content`.
+A shared validator lets the client merge projections of one state and confirm them with one conditional read. It remains strong under RFC 9110. Each `$select` is a separate URI, and the validator changes whenever any projection's bytes change.
+A dependency refresh may also change the validator for byte-identical `content`, causing an extra transfer. Equal validators can occur on different entities, so each comparison uses the accompanying key.
 
 ##### Wire form
 
@@ -1150,9 +1164,10 @@ Served to authenticated platform workloads on the platform listener under [`cpt-
 
 | Method | Path | Description | Success | Stability |
 |---|---|---|---|---|
-| `GET` | `/types-registry/v1/entities/{entity_key}` | Read one entity, any owner | `200`; `404` only when genuinely absent | unstable |
-| `GET` | `/types-registry/v1/entities` | Discover across every tenant, not visibility-filtered | `200` with one page and a cursor | unstable |
-| `POST` | `/types-registry/v1/entities:batchGet` | Cross-tenant batch read | `200` with one result per requested key | unstable |
+| `GET` | `/types-registry/v1/entities/{entity_key}` | Read one global entity | `200`; `404` when absent or tenant-owned | unstable |
+| `GET` | `/types-registry/v1/entities` | Discover global entities | `200` with one page and a cursor | unstable |
+| `POST` | `/types-registry/v1/entities:batchGet` | Batch-read global entities | `200` with one result per requested key | unstable |
+| `POST` | `/types-registry/v1/entities:batchResolve` | Resolve identities of global entities | `200` with one identity or `not_found` per requested key | unstable |
 | `POST` | `/types-registry/v1/entities` | Submit one **global** registration batch | `202` with the operation; `200` on terminal replay | unstable |
 | `POST` | `/types-registry/v1/entities:batchDelete` | Submit one global deletion batch | `202` with the operation; `200` on terminal replay | unstable |
 | `DELETE` | `/types-registry/v1/entities/{entity_key}` | Delete one global entity, its precondition in the query | `202` with the operation; `200` on terminal replay | unstable |
@@ -1160,9 +1175,9 @@ Served to authenticated platform workloads on the platform listener under [`cpt-
 
 Paths match the tenant surface, but listeners, credentials, and OpenAPI documents are separate. Misrouting fails authentication because workload and tenant identities cannot cross planes. Semantics differ as follows:
 
-- Reads span owners without visibility filtering; `404` means absent.
+- Reads return global entities only; a tenant-owned one answers `404` like an absent one. The `ownership_scope = GLOBAL` predicate applies in the same query as the key, before conditional matching and page limits, and to federated source replies before exposure. Work on a tenant's data runs under that tenant's service account on the tenant plane.
 - Reads and batches may name a Context Tenant to obtain its exact Tenant Availability verdict.
-- `owned_by_context_tenant` is absent because no Context Tenant was supplied.
+- `ownership` is therefore always `global`.
 - Authoring is global-only. The separate operator purge job is the sole cross-tenant mutation.
 
 #### Parameters
@@ -1285,7 +1300,7 @@ The single-entity spelling: one item's worth of `:batchDelete`, with the item sp
 
 This spelling carries no `publisher`, so it is a tenant-plane route only; on the platform plane a deletion goes through `:batchDelete`.
 
-**The precondition is not `If-Match`,** even though one entity would fit in one header. `If-None-Match` on the read of this same resource already carries a *validator* — projection-scoped, and including `resolution_fingerprint`, which the caller's write precondition deliberately excludes (the worker's drift check includes it). Putting a `resource_version` in `If-Match` would give one resource two unrelated token vocabularies in two conditional headers, and a caller that reasonably fed the `ETag` back into `If-Match` would be refused for a reason the shape does not explain. So `If-Match` is not merely unused here: it is **refused** if sent on either deletion route, rather than ignored, because a caller that sent one believes the request is conditional in the RFC 9110 §13.1.1 sense — and it is not, per the next paragraph. `expected_resource_version` is the same name the batch body uses, taken from the entity body rather than from any response header.
+**Deletion uses `expected_resource_version` from the entity body.** The read validator includes `resolution_fingerprint`, which the write precondition omits and the worker's drift check still uses. Both deletion routes refuse `If-Match` to avoid giving one resource two incompatible token formats or accepting a condition they cannot enforce (RFC 9110 §13.1.1).
 
 **A precondition failure stays asynchronous.** The split is by mistake class, not by route:
 
@@ -1354,11 +1369,20 @@ pub trait TypesRegistryApi: Send + Sync {
         ctx: &SecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError>;
+
+    /// Identity only, under the same `read` gate and visibility as
+    /// `batch_get_entities`; `None` for an absent or invisible key. A pair does
+    /// not depend on the Context Tenant, so there is no `tenant_id`.
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 #[toolkit::contract(gear = "types-registry", version = "v1")]
 pub trait PlatformTypesRegistryApi: Send + Sync {
-    // Reads span every tenant. `tenant_id` names the Context Tenant an
+    // Reads see global entities only. `tenant_id` names the Context Tenant an
     // availability verdict is evaluated for; there is no default here.
     async fn batch_get_entities(
         &self,
@@ -1395,6 +1419,13 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
         ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError>;
+
+    // Global entities only, like the other platform reads.
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 /// Blanket-implemented for every `T: TypesRegistryApi + ?Sized`, `dyn` included.
@@ -1444,9 +1475,7 @@ pub struct BatchGetItem {
     /// One value, one field — `EntityKey` is an enum, and the wire spells it
     /// as the single string `entity_key`, classified exactly as the path segment is.
     pub key: EntityKey,
-    /// A validator makes the read conditional for that key alone; `None`
-    /// reads it unconditionally.
-    pub if_none_match: Option<Validator>,
+    // Private revalidation state, set through revalidate(&previous_lookup).
 }
 
 /// Default yields the service default set; Select yields exactly its fields.
@@ -1460,10 +1489,8 @@ pub enum Projection {
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
 pub enum EntityLookup {
-    /// `etag` is metadata outside `$select`, but is scoped to the normalized
-    /// projection and therefore changes when that projection does. Named for
-    /// the header it is carried in rather than for its `Validator` type, so
-    /// that it pairs by sight with `BatchGetItem::if_none_match`.
+    /// `etag` names the entity's state across projections. It is outside `$select`
+    /// and pairs with `BatchGetItem::if_none_match_for`.
     Found { snapshot: Box<EntitySnapshot>, etag: Validator },
     /// Validator matched; the snapshot was not transferred. The `etag` is
     /// still returned — RFC 9110 §15.4.5 — so every result but `NotFound`
@@ -1475,18 +1502,29 @@ pub enum EntityLookup {
     Failed(CanonicalError),
 }
 
-/// Identity, kind and lifecycle are always present; other fields only when selected.
+/// `global`, `context_tenant` (the Context Tenant owns it) or `ancestor_tenant`
+/// (an ancestor of the Context Tenant does). Platform reads see `Global` only.
+pub enum Ownership { Global, ContextTenant, AncestorTenant }
+
+/// A `batch_resolve_identities` answer: the stored pair, for active and deleted
+/// entities alike. No lifecycle, ownership or validator.
+pub struct EntityIdentity {
+    pub gts_id: GtsId,
+    pub gts_uuid: Uuid,
+}
+
+/// Identity, kind, lifecycle and ownership are always present; other fields only when selected.
 pub struct EntitySnapshot {
     pub gts_id: GtsId,
     pub gts_uuid: Uuid,
     pub kind: EntityKind,
     pub lifecycle_status: LifecycleStatus,
+    /// Relative to the Context Tenant; never an owning tenant identifier.
+    pub ownership: Ownership,
 
     // The rest of the default set.
     pub origin: Option<Origin>,
     pub availability: Option<Availability>,
-    /// Whether the Context Tenant owns it; absent without a Context Tenant.
-    pub owned_by_context_tenant: Option<bool>,
 
     // Explicitly selected; absent when not selected or inapplicable.
     /// The authored document, whichever kind it is. `content` and not
@@ -1663,7 +1701,7 @@ pub struct DeletionItemResult {
 
 ##### Platform trait differences
 
-Platform reads cross tenant visibility for diagnostics; the PDP is not substituted. Both planes use `EntitySnapshot`: `owned_by_context_tenant` exists only with a Context Tenant, while owning tenant is absent from SDK snapshots and appears only in the separate operator purge report defined by ADR-0013. Platform availability is present only when `tenant_id` is supplied; tenant calls default it to the subject tenant.
+Platform reads see global entities only; the PDP is not substituted. Both planes use `EntitySnapshot`: on the tenant plane `ownership` is `context_tenant` for an entity the Context Tenant owns and `ancestor_tenant` for an ancestor's, while owning tenant is absent from SDK snapshots and appears only in the separate operator purge report defined by ADR-0013. Platform availability is present only when `tenant_id` is supplied; tenant calls default it to the subject tenant.
 
 `cpt-cf-types-registry-fr-registration-authority` and `cpt-cf-adr-platform-plane-auth` separate planes by listener and context type, not path prefix. The same `PlatformTypesRegistryApi` signature supports embedded or remote use without exposing credentials. Callers are authenticated workloads; humans act through jobs.
 
@@ -1685,15 +1723,15 @@ They remain separate because filters cannot carry per-key validators, page absen
 
 Exact reads return deleted entities as deleted/unavailable rather than conflating them with never-issued IDs; discovery excludes them unless `lifecycle_status=deleted|all` asks, and expansion always excludes them. Their `content` and derived documents remain readable because live gear-owned data may still conform under `cpt-cf-types-registry-fr-lifecycle` and `cpt-cf-types-registry-principle-contract-not-object`.
 
-`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are mandatory on every returned entity, outside `$select` — like the freshness validator below. A projection that names only `content` still identifies the entity, says whether it is a Type Schema or an Instance, and carries its status, so a caller selecting documents knows which of them apply and can tell a retired contract from an active one; absence is already `404`/`not_found`.
+`gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are mandatory on every returned entity, outside `$select` — like the freshness validator below. A projection that names only `content` still identifies the entity, says whether it is a Type Schema or an Instance, carries its status, and says whether it is global — which lets a client cache serve global entities to every authenticated reader (*The client-side cache*) — so a caller selecting documents knows which of them apply and can tell a retired contract from an active one; absence is already `404`/`not_found`.
 
-Authorization runs first, then visibility, so a denial is uniform and out-of-scope remains indistinguishable from absent.
+The read decision precedes every lookup and its constraints join the visibility predicate, so an excluded or out-of-scope key is indistinguishable from an absent one.
 
 ##### Field selection
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-field-projection`
 
-`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`. Its document-free default is `gts_id`, `gts_uuid`, `kind`, `origin`, `lifecycle_status`, `availability` and reason, ownership view, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
+`$select` returns the named fields plus the mandatory `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership`. Its document-free default is those, `origin`, `availability` and reason, plus managed `resource_version` and timestamps. Callers may narrow further, for example to `availability` plus the mandatory fields.
 
 **Selectable documents are flat, with one group**, cut by transfer cost rather than by consumer:
 
@@ -1719,13 +1757,13 @@ No authored-content digest is selectable: reconciliation selects `content` and c
 
 SDK selection uses field constants and a value projection with `light()`, `with(&[…])`, and `full()`. A type parameter would break object-safe `hub.get::<dyn TypesRegistryApi>()`.
 
-Projection changes naturally cause validator mismatch and a full result. Inapplicable fields are absent; `kind` disambiguates them.
+The SDK sends a validator only when the held snapshot covers the requested projection. Inapplicable fields are absent and `kind` identifies which ones apply.
 
 ##### Resolution and availability
 
-Forward and reverse resolution are batch reads: `EntityKey` accepts either form and results carry both. `$select=gts_uuid` or `$select=availability` supplies the narrow form (identity is always returned) without another operation.
+`POST /entities:batchResolve` accepts GTS IDs and Registry References and returns the stored pair for each distinct key. The pair remains resolvable after deletion. Use a field read for lifecycle status or availability.
 
-Deleted reverse resolution succeeds with deleted state; invisible and never-issued references both return `not_found` (ADR-0009). Since references encode no source, unresolved ones walk plugins in order, batched once per plugin, without ADR-0007 memo or circuit breaker.
+Invisible and never-issued references both return `not_found` (ADR-0009). When P1 adds federation, unresolved references walk plugins in order in one batch per plugin without ADR-0007 memoization or circuit breaking.
 
 Availability is also a read and is in the default set. Tenant-plane `tenant_id` defaults to the subject tenant. Naming another calls `tenant-resolver.is_ancestor` with the propagated `SecurityContext`, subject tenant as ancestor, named Context Tenant as descendant, and barrier traversal disabled; `false`, authorization denial, absence, or resolver failure is a fail-closed refusal. This is the platform-authorized relation check required by the PRD, not a registry `read` grant. The platform plane has no default.
 
@@ -1733,7 +1771,7 @@ Visibility always uses the subject; availability uses the Context Tenant. Mixing
 
 ##### Extension methods
 
-Single and kind-narrowed reads compose `batch_get_entities`; `delete_entity` composes `delete_entities`. Helpers live on `…Ext` traits because contract default bodies denote optional methods. The API stays object-safe for `hub.get::<dyn TypesRegistryApi>()`, with one primitive implementation per plane.
+Single and kind-narrowed snapshot reads use `batch_get_entities`. Identity helpers use `batch_resolve_identities`, and `delete_entity` uses `delete_entities`. Helpers live on `…Ext` traits because contract default bodies denote optional methods. The API stays object-safe for `hub.get::<dyn TypesRegistryApi>()`.
 
 Kind narrowing costs no round trip: the kind is the trailing `~` of the identifier, so `get_type_schema` given an Instance identifier fails locally. Callers compare only canonical authored content when deciding whether a definition needs registration; dependency-derived effective content is not part of content equality.
 
@@ -1743,9 +1781,19 @@ Kind narrowing costs no round trip: the kind is the trailing `~` of the identifi
 
 The P1 SDK cache required by `cpt-cf-types-registry-fr-client-cache` lives in each consumer, not the registry. Server-side and replica caches validate against committed tokens before use. The SDK cache instead makes the explicit bounded-freshness trade below and offers authoritative reads through `fresh` or a zero window.
 
-Each client instance stores entries by `(EntityKey, visibility context, Context Tenant, normalized projection)`, containing snapshot, validator, and last-confirmed instant. Plane is implicit in the client instance. On the tenant plane, visibility context is the subject tenant from `SecurityContext`; on the platform plane it is a fixed unrestricted marker. Principal identity is otherwise absent because results are not grant-filtered: a `read` grant is gear-wide, so two subjects of one tenant that both hold it see identical content. The consequence is that this cache is not an authorization boundary — within the freshness window a subject whose grant was revoked may still be served an entry an authorized one populated, which is accepted because the consumer process legitimately holds that content already and a strict caller uses `fresh`. Keying by subject instead would multiply entries per end user for the same bytes. This prevents a shared client instance from serving a snapshot visible to one tenant subject to another subject that names the same Context Tenant.
+Each client indexes snapshots by the registry-issued ID/UUID pair (ADR-0001) and representation scope. In P0, global and platform snapshots are shared.
+Tenant-owned snapshots are per reader tenant because an owner sees `context_tenant` where a descendant sees `ancestor_tenant`, potentially under the same validator.
+Once availability is tenant-relative, selecting `availability` also scopes a snapshot to the Context Tenant, including global entities and platform reads naming one.
 
-Found entries are indexed by both identifier and UUID so either resolution direction hits the same snapshot.
+Reads, pins, merges and confirmations stay within one scope. A snapshot serves only covered fields and merges fields under the same validator if they fit.
+Across scopes, byte-identical compact JSON in the same document field of one entity is stored and charged once. A cold read in one scope leaves other snapshots to expire.
+A reply whose validator differs from the condition sent or the reader's resident snapshot invalidates sibling snapshots even when oversized. The reader's snapshot can survive if it already carries the new validator. Callers must likewise reuse a `BatchGetItem::revalidate` lookup only for its original tenant. The SDK checks entity and field coverage.
+
+A fresh global snapshot serves every authenticated context within its scope.
+A tenant read returning `NotFound` drops that snapshot. For other entities, subjects in the same Context Tenant share representation bytes, but visibility depends on registry-enforced read constraints. A separate LRU holds up to `max_entries` confirmations keyed by entity, subject, subject type, subject tenant and raw token scopes. Include the Context Tenant once the SDK carries it. `NotFound` revokes the affected confirmation and fences pending confirmations for that context. A bearer refusal leaves existing confirmations usable until expiry. Anonymous calls bypass the cache. Use `fresh` to check authorization and visibility at the registry.
+
+Identity pairs are shared across scopes. A bounded identity LRU learns positive pairs from checked reads, resolutions and discovery. Pairs have no expiry and survive mutations because tombstones still resolve. Resolution checks this LRU, then resident snapshots, then `:batchResolve`. Platform resolution requires a fresh snapshot on fallback. For tenant resolution, a pair classified as global by a read or discovery is visible to every authenticated context even from a stale snapshot.
+Other pairs require a read or resolution confirmed for the same context within the window. An ownership class known at lookup binds the reply even if its source is evicted. After purge or a logical registry change, recreate the client or restart its consumer.
 
 ##### Freshness window
 
@@ -1762,15 +1810,17 @@ Availability drives the default because ADR-0010 may change it without entity mu
 | Knob | Default | Why this value |
 |---|---|---|
 | Freshness window | 30 s | Bounds how long a retired contract can be served as available, while letting a hot path serving hundreds of requests a second revalidate a given entity twice a minute rather than on every call. `0` is meaningful and supported |
-| Store bound | 64 MB of cached snapshots, evicted least-recently-used | §3.2, *Bounded inputs*, caps one resolved document at 1 MB, so an entry-count bound would bound memory to nothing useful — sixty-four entries could be 64 KB or 64 MB |
-| `fresh` on a read | false | Bypasses the window for one call and revalidates unconditionally. One boolean, and it is what makes the cache safe to leave enabled for a caller that occasionally needs an authoritative verdict |
+| `max_size_bytes` | 64 MiB | Compact JSON documents, GTS ID, raw validator and 256 bytes per snapshot. Oversized snapshots are returned without caching. |
+| `max_entries` | 16 384 snapshots | Limits per-entry overhead for small snapshots. The store evicts least-recently-used entries to meet both limits. Zero disables snapshot retention. |
+| `max_identity_entries` | 16 384 identities | Bounds pairs of a Registry Reference and an identifier (up to 1 KiB). Set to zero to resolve via resident snapshots — a known-global pair whatever the snapshot's freshness, others only from a fresh confirmed one — or the registry. |
+| `fresh` on a read | false | Bypasses the window for one call and always asks the registry, conditionally on a covering snapshot's validator. One boolean, and it is what makes the cache safe to leave enabled for a caller that occasionally needs an authoritative verdict |
 
 ##### What is not cached
 
 - **`NotFound`.** Registration is followed by a read often enough that caching absence would make a newly admitted entity invisible for the length of the window.
 - **`Failed`.** A source that could not answer said nothing about the entity; retaining that as knowledge is the conversion of unavailability into absence that ADR-0002 forbids.
 - **A `ConcreteReferenceSet`.** It is not a snapshot, and a validator over it would have to cover the availability inputs of every member.
-- **A discovery page or its items.** A page is a changing, paginated set rather than an exact-key answer and carries no validators.
+- **Discovery pages and item snapshots.** Both caches learn their identity pairs. Discovery carries no snapshot validators; it classifies a pair as global, which then resolves for every authenticated reader, and shows other pairs to no read context.
 - **An operation resource.** `get_operation` reads progress that changes precisely because it is being polled.
 
 ##### Revalidation
@@ -1783,7 +1833,7 @@ Successful terminal mutations invalidate every cached projection of each returne
 
 ##### Known ceiling
 
-Content duplicates across Context Tenants even when only availability and ownership differ. The store bound turns this into a hit-rate ceiling, not exhaustion. If needed, add projection-specific windows or content-addressed sharing; neither is justified without measured tenant fan-out.
+Metadata duplicates across Context Tenants, byte-identical documents do not: each tenant reading a tenant-owned entity, or from P1 any entity with tenant-relative availability, costs one snapshot slot plus its metadata, its validator and any selected document not byte-identical to one already held in the same field, and its first unconditional read transfers the body, because another tenant's validator does not apply to it. The entry bound turns this into a hit-rate ceiling, not exhaustion. If measured tenant fan-out needs it, a tenant-independent content validator would let a tenant revalidate another's documents without a transfer; that is a protocol change.
 
 ##### Verification
 
@@ -1796,7 +1846,8 @@ Content duplicates across Context Tenants even when only availability and owners
 - a terminal `register_entities` or `delete_entities` drops the affected entries, so the next read reflects the mutation with no window elapsing;
 - a read that started before that terminal outcome does not refill the entry when it completes;
 - a batch read of cached and expired keys issues exactly one conditional `batchGet`, carrying validators only for the expired ones;
-- a validator or snapshot obtained under one projection, subject visibility context, or Context Tenant is never presented under another.
+- a snapshot never answers a projection it does not cover, and no caller condition is matched for another entity or for a projection its held fields do not cover;
+- a validator or snapshot obtained under one subject visibility context or Context Tenant is never presented under another.
 
 ##### Inventory and startup reconciliation
 
@@ -1870,7 +1921,7 @@ registry verification can establish this contract without a durable publication 
 
 `publisher_name` is the actual registrant, taken from `publisher.name` on first claim and fixed thereafter; another publisher gets `publisher_mismatch`. Together with `publisher_version` it forms the stamp (§3.2). Types Registry publishes its own types, seeds and configured entities under its own name/version. GTS namespaces never imply an owner.
 
-`publisher_name` is attribution, not authorization or visibility, until workload policy binds it to identity. It is required globally, unused for tenant-owned entities and absent externally. Publisher name/version remain absent from reads and SDK snapshots until the ownership view is designed.
+`publisher_name` is attribution, not authorization or visibility, until workload policy binds it to identity. It is required globally, unused for tenant-owned entities and absent externally. Publisher name/version remain absent from reads and SDK snapshots until workload policy binds them to identity; the `ownership` field does not carry them.
 
 ##### Platform identifiers and the lint
 
@@ -2090,7 +2141,7 @@ Consuming gears depend on Types Registry the same way, through `cpt-cf-types-reg
 
 - **Contract**: `cpt-cf-types-registry-contract-platform-auth`
 
-`SecurityContext` and `PlatformSecurityContext` carry the plane and the requesting subject. The platform PDP authorizes tenant-plane registration, deletion, and reads against the identifier or pattern carried in the `gts_id` resource property under the registry metatype of §3.2. For a tenant read naming another Context Tenant, the authorized `tenant-resolver.is_ancestor` call proves the subject→context relation described in §3.3. Every path fails closed on denial, absence, or infrastructure failure, and refuses a returned constraint the registry cannot enforce — on reads that is any constraint at all, since they advertise no properties.
+`SecurityContext` and `PlatformSecurityContext` carry the plane and the requesting subject. The platform PDP authorizes tenant-plane registration and deletion against the candidate identifier in the `gts_id` resource property under the registry metatype of §3.2, and tenant-plane reads under ownership constraints with no resource property (*Read authorization*). Platform-plane reads apply the global ownership predicate instead. For a tenant read naming another Context Tenant, the authorized `tenant-resolver.is_ancestor` call proves the subject→context relation described in §3.3. Write paths fail closed on denial; a read's denial (`AccessDenial::Pdp`, which the standard enforcer mapping turns into `403`) is handled on this path as an empty tenant-owned branch, so global entries stay readable. Every path fails closed on absence or infrastructure failure — the Context Tenant relation check included — and refuses a returned constraint the registry cannot enforce.
 
 #### ToolKit plugin architecture
 
@@ -2184,18 +2235,19 @@ sequenceDiagram
     C->>A: batch_get_entities(keys, $select, per-key validators)
     A->>G: Canonicalize, derive gts_uuid for every GTS Identifier key
     alt tenant plane
-        A->>Z: read, once for the request, registry metatype resource
-        Z-->>A: Allow or deny, boolean only
+        A->>Z: read, once for the request, registry metatype, no resource properties
+        Z-->>A: Deny, or allow under constraints over ownership_scope / owner_tenant_id
+        Note over A: A deny or an empty scope excludes tenant-owned rows;<br/>global rows stay readable
         Note over Z: Evaluated before any chain fetch or entity<br/>lookup, so refusal cannot depend on what exists
         A->>T: Subject ancestor chain, authorize named Context Tenant
-        opt Context Tenant differs and availability is selected
+        opt Context Tenant differs
             A->>T: Context Tenant ancestor chain (cached separately)
         end
-    else platform plane with availability selected
+    else platform plane naming a Context Tenant
         A->>T: Named Context Tenant ancestor chain
     end
-    A->>D: One keyed read per entity, no history scan
-    Note over A,D: Visibility uses the subject chain and never the Context<br/>Tenant one, availability uses the Context Tenant chain —<br/>platform visibility is unrestricted
+    A->>D: One keyed read per entity under visibility and constraints, no history scan
+    Note over A,D: Visibility uses the subject chain and never the Context<br/>Tenant one, availability uses the Context Tenant chain —<br/>platform reads add ownership_scope = GLOBAL instead
     opt keys not held locally
         A->>R: Unresolved keys
         alt key is a GTS Identifier
@@ -2215,6 +2267,7 @@ sequenceDiagram
         else
             R-->>A: Live result, nothing persisted
         end
+        A->>A: Apply the visibility fence and read constraints in memory
     end
     A-->>C: found (with etag) / unchanged / not_found / failed per key
 ```
@@ -2244,17 +2297,18 @@ sequenceDiagram
     loop until next_cursor is absent
         S->>A: GET /entities, $select=gts_uuid, lifecycle_status=active, availability=available, cursor
         opt tenant plane
-            A->>Z: list, registry metatype resource
-            Z-->>A: Allow or deny, gear-wide in P1
+            A->>Z: list, registry metatype, constraints required
+            Z-->>A: Deny, or constraints over ownership_scope / owner_tenant_id
+            Note over A: A deny excludes tenant-owned rows; global rows stay listed
         end
         A->>G: Parse the pattern
-        A->>D: Segment joins, visibility and availability in one statement
+        A->>D: Segment joins, visibility, read constraints and availability<br/>in one statement, before the page limit
         Note over A,D: Managed matching is exact in SQL,<br/>differentially tested against the GTS matcher
         opt managed rows exhausted and a claim intersects the pattern
             A->>R: Continue source-major, next plugin in priority order
             R->>P: list_entities(pattern, source cursor, projection)
             P-->>R: Bounded page, next source cursor, explicit exhaustion
-            R->>R: Validate and re-filter under platform semantics
+            R->>R: Validate and re-filter under platform semantics,<br/>visibility and read constraints
         end
         break a selected source cannot establish its contribution
             A-->>S: Source failure and no page at all
@@ -2423,7 +2477,7 @@ Five prerequisites block implementation: the benchmark profile above, one extern
 
 No ADR-0015 quarantine preflight is needed because the release introducing the check is also the first to persist Managed Entities. The rule must not be enabled over data admitted by a build that had storage but lacked the check.
 
-**Finalize the identity-to-permission binding used by the PDP.** [`PERMISSION_GTS_TYPE.md`](../../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md) currently defers the durable grant model, so it cannot yet serve as the P1 authority contract for namespace grants. The accepted binding must preserve GTS-pattern resource expressions and the per-identifier check in §3.2, and must additionally satisfy the two PDP obligations of *The PDP resource shape*: a Region predicate resolved against `resource.properties.gts_id` rather than returned as a constraint, and a decision that resolves no registry state. It is also what delivers the baseline `read` and `list` grants the release must ship, since a tenant subject holding none cannot resolve even a platform contract.
+**Finalize the identity-to-permission binding used by the PDP.** [`PERMISSION_GTS_TYPE.md`](../../../../docs/arch/authorization/PERMISSION_GTS_TYPE.md) currently defers the durable grant model, so it cannot yet serve as the P1 authority contract for namespace grants. The accepted binding must preserve GTS-pattern resource expressions and the per-identifier check in §3.2, and must additionally satisfy the two PDP obligations of *The PDP resource shape*: a Region predicate resolved against `resource.properties.gts_id` rather than returned as a constraint, and a decision that resolves no registry state. It is also what delivers the baseline `read` and `list` grants the release ships, without which a tenant subject sees global contracts only, and it must let the effective policy replace that baseline rather than union with it (*Declared permissions*).
 
 **Align operation principal persistence with the two authentication planes.** The audit and idempotency scope require a versioned canonical representation of either the tenant subject UUID or the full `PlatformIdentity` variant. `database.sql` currently exposes only UUID `principal_id`; before implementation it must gain a lossless tagged representation, and `idempotency_scope_hash` must cover those exact canonical bytes. This is a schema alignment with the accepted two-plane contract, not a new authorization choice.
 

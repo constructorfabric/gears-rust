@@ -5,8 +5,7 @@ use toolkit_canonical_errors::CanonicalError;
 use types_registry_sdk::field;
 
 use crate::api::error::{malformed_condition, validator_too_long};
-use crate::domain::registry_service::MAX_KEY_LEN;
-use crate::domain::validator::{IfNoneMatch, Validator};
+use crate::domain::validator::{IfNoneMatch, MAX_VALIDATOR_LEN, Validator};
 
 /// A strong entity-tag: the validator, quoted.
 pub fn entity_tag(etag: Validator) -> String {
@@ -24,11 +23,11 @@ fn opaque(tag: &str) -> Option<&str> {
         .then_some(inner)
 }
 
-/// One entity-tag, bounded like a key, as a validator token.
+/// Extract the validator token and check its byte length.
 pub fn token(tag: &str, field: &'static str) -> Result<String, CanonicalError> {
     let inner = opaque(tag)
         .ok_or_else(|| malformed_condition(field, "each value must be a quoted entity-tag"))?;
-    if inner.len() > MAX_KEY_LEN {
+    if inner.len() > MAX_VALIDATOR_LEN {
         return Err(validator_too_long(field, inner.len()));
     }
     Ok(inner.to_owned())

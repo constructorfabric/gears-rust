@@ -25,6 +25,22 @@ pub enum EntityKey {
 }
 
 impl EntityKey {
+    /// Whether the answer carries the exact identifier or Registry Reference requested.
+    pub(crate) fn names(&self, entity: &Entity) -> bool {
+        match self {
+            Self::GtsId(id) => *id == entity.gts_id,
+            Self::GtsUuid(uuid) => *uuid == entity.gts_uuid,
+        }
+    }
+
+    /// Whether the identity carries the exact identifier or Registry Reference requested.
+    pub(crate) fn identifies(&self, identity: &EntityIdentity) -> bool {
+        match self {
+            Self::GtsId(id) => *id == identity.gts_id,
+            Self::GtsUuid(uuid) => *uuid == identity.gts_uuid,
+        }
+    }
+
     /// Kind from the identifier’s trailing `~`; Registry References carry no kind.
     #[must_use]
     pub fn kind(&self) -> Option<EntityKind> {
@@ -82,12 +98,36 @@ impl fmt::Debug for Validator {
     }
 }
 
+/// The held validator, the keys it belongs to, and the fields it can revalidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Condition {
+    key: EntityKey,
+    registry_reference: Option<Uuid>,
+    etag: Validator,
+    covers: FieldSelection,
+}
+
+impl Condition {
+    fn from_snapshot(entity: &Entity, etag: &Validator) -> Self {
+        // A field that does not apply to the kind is covered: the registry never sends it.
+        let held: Vec<EntityField> = EntityField::ALL
+            .into_iter()
+            .filter(|field| entity.has(*field) || !field.applies_to(entity.kind))
+            .collect();
+        Self {
+            key: EntityKey::from(entity.gts_id.clone()),
+            registry_reference: Some(entity.gts_uuid),
+            etag: etag.clone(),
+            covers: FieldSelection::with(&held),
+        }
+    }
+}
+
 /// One key of a batch read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchGetItem {
     pub key: EntityKey,
-    /// Makes the read conditional for this key alone; `None` reads it unconditionally.
-    pub if_none_match: Option<Validator>,
+    condition: Option<Condition>,
 }
 
 impl BatchGetItem {
@@ -96,15 +136,45 @@ impl BatchGetItem {
     pub fn new(key: impl Into<EntityKey>) -> Self {
         Self {
             key: key.into(),
-            if_none_match: None,
+            condition: None,
         }
     }
 
-    /// Makes this key's read conditional on `validator`.
+    /// Revalidate a previous result. Only a `Found` snapshot supplies a validator.
+    /// After `Unchanged`, retain the original `Found` for subsequent reads. Pass a
+    /// result only for the tenant it was read for: `ownership` is relative to the
+    /// reader, and a P0 validator does not tell tenants apart.
     #[must_use]
-    pub fn with_if_none_match(mut self, validator: Validator) -> Self {
-        self.if_none_match = Some(validator);
+    pub fn revalidate(mut self, previous: &EntityLookup) -> Self {
+        self.condition = match previous {
+            EntityLookup::Found { entity, etag } => Some(Condition::from_snapshot(entity, etag)),
+            EntityLookup::Unchanged { .. } | EntityLookup::NotFound => None,
+        };
         self
+    }
+
+    /// Forward the cache's already checked validator for exactly this key and selection.
+    pub(crate) fn for_cache_read(
+        key: EntityKey,
+        etag: Option<Validator>,
+        covers: &FieldSelection,
+    ) -> Self {
+        let condition = etag.map(|etag| Condition {
+            key: key.clone(),
+            registry_reference: None,
+            etag,
+            covers: covers.clone(),
+        });
+        Self { key, condition }
+    }
+
+    /// The held `ETag` if the key matches and the snapshot covers the projection.
+    #[must_use]
+    pub fn if_none_match_for(&self, projection: &Projection) -> Option<&Validator> {
+        let held = self.condition.as_ref()?;
+        let same_entity = self.key == held.key
+            || matches!(&self.key, EntityKey::GtsUuid(uuid) if held.registry_reference == Some(*uuid));
+        (same_entity && held.covers.is_superset(&projection.normalized())).then_some(&held.etag)
     }
 }
 
@@ -161,6 +231,7 @@ pub enum EntityField {
     GtsUuid,
     Kind,
     LifecycleStatus,
+    Ownership,
     Origin,
     Content,
     ResolvedSchema,
@@ -170,11 +241,12 @@ pub enum EntityField {
 }
 
 impl EntityField {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::GtsId,
         Self::GtsUuid,
         Self::Kind,
         Self::LifecycleStatus,
+        Self::Ownership,
         Self::Origin,
         Self::Content,
         Self::ResolvedSchema,
@@ -184,21 +256,41 @@ impl EntityField {
     ];
 
     /// Present on every snapshot, whatever the selection.
-    pub const MANDATORY: [Self; 4] = [
+    pub const MANDATORY: [Self; 5] = [
         Self::GtsId,
         Self::GtsUuid,
         Self::Kind,
         Self::LifecycleStatus,
+        Self::Ownership,
     ];
 
     /// What [`Projection::Default`] selects on single, batch and discovery reads: no documents.
-    pub const DEFAULT: [Self; 5] = [
+    pub const DEFAULT: [Self; 6] = [
         Self::GtsId,
         Self::GtsUuid,
         Self::Kind,
         Self::LifecycleStatus,
+        Self::Ownership,
         Self::Origin,
     ];
+
+    /// Whether the registry answers this field for an entity of `kind`: the derived
+    /// documents and provenance belong to a Type Schema only.
+    pub(crate) const fn applies_to(self, kind: EntityKind) -> bool {
+        match self {
+            Self::GtsId
+            | Self::GtsUuid
+            | Self::Kind
+            | Self::LifecycleStatus
+            | Self::Ownership
+            | Self::Origin
+            | Self::Content => true,
+            Self::ResolvedSchema
+            | Self::EffectiveTraits
+            | Self::EffectiveTraitsSchema
+            | Self::Provenance => matches!(kind, EntityKind::TypeSchema),
+        }
+    }
 
     /// The wire name, as `$select` spells it.
     #[must_use]
@@ -208,6 +300,7 @@ impl EntityField {
             Self::GtsUuid => "gts_uuid",
             Self::Kind => "kind",
             Self::LifecycleStatus => "lifecycle_status",
+            Self::Ownership => "ownership",
             Self::Origin => "origin",
             Self::Content => "content",
             Self::ResolvedSchema => "resolved_schema",
@@ -244,6 +337,12 @@ impl FieldSelection {
     #[must_use]
     pub fn contains(&self, field: EntityField) -> bool {
         self.0.contains(&field)
+    }
+
+    /// Whether every field of `other` is selected here.
+    #[must_use]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        self.0.is_superset(&other.0)
     }
 
     /// The selected fields in a stable order.
@@ -326,11 +425,19 @@ impl ReadOptions {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchGetEntitiesResponse(pub HashMap<EntityKey, EntityLookup>);
 
+/// A registered GTS identifier and its assigned Registry Reference. See
+/// [`PlatformTypesRegistryApi::batch_resolve_identities`](crate::PlatformTypesRegistryApi::batch_resolve_identities).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EntityIdentity {
+    pub gts_id: GtsId,
+    pub gts_uuid: Uuid,
+}
+
 /// Per-key read result; match future variants with a fallback arm.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum EntityLookup {
-    /// `etag` is scoped to the normalized projection, so it changes with it.
+    /// `etag` names the entity's state, the same under every projection.
     Found {
         entity: Box<Entity>,
         etag: Validator,
@@ -349,6 +456,8 @@ pub struct Entity {
     pub gts_uuid: Uuid,
     pub kind: EntityKind,
     pub lifecycle_status: LifecycleStatus,
+    /// How the entity is owned, as far as the caller may learn.
+    pub ownership: Ownership,
     pub origin: Option<Origin>,
     /// The authored document, whichever kind it is.
     pub content: Option<JsonDocument>,
@@ -368,6 +477,30 @@ impl Entity {
     pub fn segments(&self) -> &[GtsIdSegment] {
         self.gts_id.segments()
     }
+
+    /// Whether the snapshot carries `field`. A selected JSON `null` is carried.
+    pub(crate) const fn has(&self, field: EntityField) -> bool {
+        match field {
+            EntityField::GtsId
+            | EntityField::GtsUuid
+            | EntityField::Kind
+            | EntityField::LifecycleStatus
+            | EntityField::Ownership => true,
+            EntityField::Origin => self.origin.is_some(),
+            EntityField::Content => self.content.is_some(),
+            EntityField::ResolvedSchema => self.resolved_schema.is_some(),
+            EntityField::EffectiveTraits => self.effective_traits.is_some(),
+            EntityField::EffectiveTraitsSchema => self.effective_traits_schema.is_some(),
+            EntityField::Provenance => self.provenance.is_some(),
+        }
+    }
+
+    /// Whether the snapshot carries only fields that apply to its kind.
+    pub(crate) fn fits_its_kind(&self) -> bool {
+        EntityField::ALL
+            .into_iter()
+            .all(|field| field.applies_to(self.kind) || !self.has(field))
+    }
 }
 
 /// Projected Type Schema. Unselected fields are `None`; selected JSON null is `Some(Null)`.
@@ -376,6 +509,7 @@ pub struct TypeSchema {
     pub type_id: GtsTypeId,
     pub type_uuid: Uuid,
     pub lifecycle_status: LifecycleStatus,
+    pub ownership: Ownership,
     pub origin: Option<Origin>,
     /// The authored schema.
     pub content: Option<JsonDocument>,
@@ -393,6 +527,7 @@ pub struct Instance {
     pub uuid: Uuid,
     pub type_id: GtsTypeId,
     pub lifecycle_status: LifecycleStatus,
+    pub ownership: Ownership,
     pub origin: Option<Origin>,
     /// The authored document.
     pub content: Option<JsonDocument>,
@@ -413,6 +548,7 @@ impl TryFrom<Entity> for TypeSchema {
             type_id,
             type_uuid: snapshot.gts_uuid,
             lifecycle_status: snapshot.lifecycle_status,
+            ownership: snapshot.ownership,
             origin: snapshot.origin,
             content: snapshot.content,
             resolved_schema: snapshot.resolved_schema,
@@ -431,10 +567,7 @@ impl TryFrom<Entity> for Instance {
         // Reject Type Schema-only fields rather than silently dropping them.
         if snapshot.kind != EntityKind::Instance
             || snapshot.gts_id.is_type()
-            || snapshot.resolved_schema.is_some()
-            || snapshot.effective_traits.is_some()
-            || snapshot.effective_traits_schema.is_some()
-            || snapshot.provenance.is_some()
+            || !snapshot.fits_its_kind()
         {
             return Err(snapshot);
         }
@@ -452,6 +585,7 @@ impl TryFrom<Entity> for Instance {
             uuid: snapshot.gts_uuid,
             type_id,
             lifecycle_status: snapshot.lifecycle_status,
+            ownership: snapshot.ownership,
             origin: snapshot.origin,
             content: snapshot.content,
         })
@@ -501,6 +635,19 @@ pub enum Origin {
 pub enum LifecycleStatus {
     Active,
     Deleted,
+}
+
+/// How an entity is owned relative to the Context Tenant — the subject tenant unless
+/// another is named — disclosed without any owning tenant identifier. Platform reads
+/// see global entities only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ownership {
+    /// A global entity, visible platform-wide.
+    Global,
+    /// Owned by the Context Tenant.
+    ContextTenant,
+    /// Owned by an ancestor of the Context Tenant.
+    AncestorTenant,
 }
 
 // discovery.

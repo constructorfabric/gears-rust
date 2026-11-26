@@ -7,13 +7,19 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
+use std::collections::HashMap;
+
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
-    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, RegisterEntitiesRequest,
-    RegistrationOperation,
+    EntityIdentity, EntityKey, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
+    Operation, RegisterEntitiesRequest, RegistrationOperation,
 };
 
 /// The platform-plane Types Registry contract.
+///
+/// Reads, discovery and identity resolution see global entities only: a tenant-owned
+/// key answers `not_found` (or `None`) like an absent one. Work on a tenant's data
+/// runs under that tenant's service account through [`TypesRegistryApi`].
 ///
 /// Every method fails with `CanonicalError`. For typed dispatch, project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError); an operation item's failure
@@ -77,10 +83,32 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
         #[secctx] ctx: &PlatformSecurityContext,
         operation_id: Uuid,
     ) -> Result<Operation, CanonicalError>;
+
+    /// Resolve each distinct key to a registered GTS ID and Registry Reference,
+    /// including deleted entities, or `None`. Uses [`Self::batch_get_entities`]'s
+    /// bounds and key rules. The `resolve_*` helpers use this method.
+    ///
+    /// # Errors
+    /// Returns `Internal` for incomplete or inconsistent replies.
+    #[idempotency(SafeRead)]
+    async fn batch_resolve_identities(
+        &self,
+        #[secctx] ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 /// The tenant-plane Types Registry contract: the platform's reads, with the same models,
 /// projection and validators, under a tenant's [`SecurityContext`].
+///
+/// Pass the host-authenticated caller's context. Every authenticated reader can see
+/// global entities. Tenant-owned results require `read` or `list` authorization.
+/// Batch reads and identity resolutions must enforce the same read access.
+///
+/// [`CachedTypesRegistry`](crate::CachedTypesRegistry) keys tenant-owned visibility
+/// by subject, subject type, home tenant and raw token scopes. Reusing that context
+/// after a bearer refusal can still hit within the freshness window. Anonymous calls
+/// bypass the cache. REST calls forward the caller's bearer.
 ///
 /// Every method fails with `CanonicalError`; project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError) for typed dispatch.
@@ -108,6 +136,17 @@ pub trait TypesRegistryApi: Send + Sync {
         #[secctx] ctx: &SecurityContext,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError>;
+
+    /// Like [`PlatformTypesRegistryApi::batch_resolve_identities`] under tenant read access.
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApi::batch_resolve_identities`].
+    #[idempotency(SafeRead)]
+    async fn batch_resolve_identities(
+        &self,
+        #[secctx] ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 #[cfg(test)]

@@ -6,8 +6,7 @@ implements a DESIGN clause or records an explicit, named deviation from one.
 
 Status: **approved** for projection/filtering, OoP operation, publication ordering,
 one authenticated plane per route, early local SDK use and full local AM adoption.
-The **52 executable tasks** and their IDs are defined by [todo.md](./todo.md):
-37 are complete (through T35, including T34a, plus T35b); 15 remain (T35a and T36–T49).
+The **52 executable tasks** and their IDs are defined by [todo.md](./todo.md): 39 are complete (through T36, including T34a, T35a and T35b); 13 remain (T37–T49).
 The publication foundation is merged into `main`; this branch adds the managed core migration.
 T37/T39 and portions of T41/T42 are implemented without closing their remaining gates.
 T35a's compiled payload API is implemented using the existing released GTS API; its standing verification remains open. T46–T49 add the planned
@@ -86,7 +85,7 @@ Three deliverables:
 | PDP / `PolicyEnforcer`, read & write grants, declared permissions | Depends on the deferred identity-to-permission binding (§4 DESIGN) |
 | Federation: `source_claim`, the `routing` coordination state, Registry Source Plugins, Control-Plane Validator | Whole subsystem |
 | Availability Evaluator, `tenant-resolver` dependency | Needs tenancy |
-| Validator inputs that only a tenant or external read has: subject visibility-chain version, Context Tenant availability-chain version, routing generation, `external_revision` | Each is `tenant plane only`, availability-conditional or external, so **none participates in a platform-plane read** — the validator itself is in P0, see §8.5 |
+| Validator inputs that only a tenant or external read has: subject visibility-chain version, Context Tenant availability-chain version, routing generation, `external_revision` | Each is `tenant plane only`, Context-Tenant-conditional or external, so **none participates in a platform-plane read** — the validator itself is in P0, see §8.5 |
 | Availability, reason and Context Tenant ownership-view fields in `$select` | Those values need the tenant availability and visibility work deferred to P1. P0 still supports caller-chosen selection over its managed field allowlist (§10.2, historical decision P19) |
 | `expand_type_filter` | Its DESIGN definition *is* `$select=gts_uuid&availability=available` (plus explicit `lifecycle_status=active`), with the availability filter fixed by the method rather than supplied by the caller. Availability is out of P0 (needs tenancy), so a P0 method of that name would report retired contracts as usable — a same-named different meaning, which is worse than absence. Paging `list_entities` directly is available to any caller that wants the traversal |
 | Operator purge job, operation-retention sweep | ADR-0013, §3.2 — no P0 consumer |
@@ -116,7 +115,7 @@ correctness core, not scope.
 | D10 | **`POST /entities` breaks**: `200` + results becomes `202` + operation | No compatibility path on that route. The gear's REST stability is `unstable`; the break is called out in the changelog |
 | D11 | **Each owning gear publishes its declarations; registry pull ends in P0** | T31–T42 temporarily seed linked inventory and `cfg.entities` through the outbox; every inline seed must succeed or be unchanged before client publication. T42 retains only registry types, `toolkit-gts` bases and `cfg.entities`. In P0, all transitive admission dependencies of `cfg.entities` must lie within the registry-owned seed set: its control-plane types, the `toolkit-gts` base types and the other `cfg.entities`. Dependencies on another gear's declarations or on entities merely present in the database are unsupported, even if that gear is linked into an embedded host. All configured entities remain inline seeds; no deferred publication, remote dependency wait or readiness exception is introduced for them. T40 audits configurations against this restriction; historical T31/T32 linked-inventory coverage is not a remote-mode guarantee. Invalid configuration envelopes still fail boot synchronously. Reconciliation is T29; attribution remains C3. |
 | D12 | **`GET /entities` becomes a bounded page with a cursor, document-free by default** | The old shape returns every match with full `content` in one response. A `limit` without a cursor would make the endpoint incomplete, so both land together. P19 adds `$select` on this page and the two exact-key routes; selected documents are explicit and the discovery cursor binds the normalized selection (§10.2) |
-| D13 | **P0 field projection on all three reads** (historical decision P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity, T22d validators and T36 cache keys (§10.2) |
+| D13 | **P0 field projection on all three reads** (historical decision P19) | An absent `$select` means the same document-free managed metadata set on exact read, `batchGet` and discovery. P0 selects only fields it can answer; documents are flat and individually selectable. One normalized set drives SQL retrieval, cursor identity and T36 cache coverage (§10.2); T22d validators do not depend on it (§8.5) |
 | D14 | **Discovery filters by `pattern`, `depth`, `kind` and `lifecycle_status`, all exact SQL before `LIMIT`** (historical decision P20) | `depth` is an inclusive maximum GTS chain length; `kind` is `type_schema` or `instance`; `lifecycle_status` defaults to `active`. Admission materializes `entity.chain_depth` and one `entity_gts_segment` row per parsed segment; the repository compiles the `gts-rust`-parsed pattern into one join per constrained segment and fetches `limit + 1`, so only the last page is short. The cursor binds the filters so continuation cannot splice different result sets (§8.2, §10.2) |
 | D15 | **The SDK is an OoP toolkit contract** (P22) | `PlatformTypesRegistryApi` takes `PlatformSecurityContext` on every method; semantic models are serde-free with separate wire DTOs. A hand-written REST client preserves required headers/statuses and uses runtime helpers plus `DirectoryResolvingClient`; the server uses `OperationBuilder`. Every profile resolves the same ClientHub trait (§8.4, §10.1). |
 | D16 | **Per-crate declarations, published by the owning gear after wiring** (P22) | `declare_gts_inventory!()` / `gts_declarations()` replace global inventory. `gts_publication(crates = […])` on the gear records ownership; the macro generates the descriptor, the capability and the registry wiring, with the default adapter `types_registry_sdk::publication`. The runtime publishes each gear’s GTS Type Schemas and Instances concurrently after wiring, and activates the gear only after admission. Toolkit does not depend on the SDK; `PublisherContext`, `PublisherVersion` and the retry loop stay in `types-registry-sdk`, and `toolkit-gts` stays free of publication types. Contract: [GTS publication by gears](../DESIGN.md#inventory-and-startup-reconciliation). |
@@ -814,21 +813,45 @@ What P0 builds is DESIGN's cache minus what needs inputs P0 does not have:
 
 | DESIGN §3.3 | P0 |
 |---|---|
-| Bounded store, LRU eviction | ✅ — bound is **bytes**, not entries: §3.2 caps one resolved document at 1 MB, so today's `capacity: 1024` bounds memory to nothing useful. DESIGN's argument, adopted |
+| Bounded store, LRU eviction | ✅ — evict least-recently-used snapshots until both the byte and entry limits are met |
 | Freshness window, `0` meaningful and supported | ✅ — DESIGN's 30 s default replaces today's 1 min |
 | `fresh` per-call bypass | ✅ — T22d's validator makes the call revalidate unconditionally against the source, even within the freshness window |
 | Invalidation on an observed terminal mutation, across identifier and UUID keys | ✅ — a client observes a mutation when a poll or the reconciliation helper returns a terminal successful outcome, **not** when the `POST` is accepted |
 | Entries indexed by both identifier and UUID | ✅ — already true of the current cache |
 | `NotFound`, `Failed`, discovery pages and operation resources never cached | ✅ — all four are expressible in P0 |
-| Key includes visibility context, Context Tenant, normalized projection | ✅ for the selected-field set from T22b; visibility context and Context Tenant remain fixed P0 markers. A narrow entry never answers a wider selection |
+| Representation scope and projection coverage | ✅ A snapshot serves only fields it covers. Fields merge within one scope and validator if the result fits. Scope and invalidation rules follow below. |
 | Batched conditional revalidation against validators, fail-closed | ✅ — §8.5 puts validators in P0, so expiry sends expired keys and their validators in one conditional `batchGet` and keeps an `unchanged` entry. A failed revalidation propagates and never extends the window |
 | No invalidated result accepted as current after the mutation is observed | ✅ — per-key generation advances on observed terminal outcomes or `fresh` validator changes; reads started earlier cannot refill the cache (P23) |
 
 The cache is not carried over as-is: it is typed on `GtsTypeSchema` / `GtsInstance`, which D6 deletes, so it is ported onto `Entity` when the new trait lands. It also moves out of the registry's local client into the SDK, as a decorator over any `dyn PlatformTypesRegistryApi`: a gear in another process reads through the REST client, and DESIGN's cache is per client, not per registry (D15). Until then the existing cache keeps serving the old trait untouched.
 
-Ceiling C7 records what is still fixed rather than derived: visibility and Context Tenant key dimensions. Projection is real in P0.
+**Tenant reads.** Every authenticated reader may reuse a fresh global snapshot covering the projection (C6). Tenant-owned snapshots are per reader tenant. An owner sees `context_tenant` and a descendant sees `ancestor_tenant`, even under the same P0 validator (C7). P0 rejects tenant-owned rows in storage. SDK tests exercise this case with a test double. The reader tenant is `subject_tenant_id` until the SDK supports a named Context Tenant. Reads, pins, merges and confirmations stay within that scope.
 
-The byte bound measures canonical payload bytes of the cached documents, not the process's retained heap. The cache is in memory: a restart starts empty, and nothing survives an unreachable registry beyond the window (C13). The publisher stamp of D18 is not part of `Entity` in P0, so a metadata-only confirmation changes no cached representation.
+A cold read in one scope leaves other scopes' snapshots to expire. If a reply's validator differs from the condition sent or from the reader's resident snapshot, discard sibling snapshots even if the reply is oversized. Keep the reader's snapshot only if it already carries the new validator. An ownership class known at lookup from any snapshot or the identity LRU binds the reply even after eviction.
+
+For tenant-owned or unclassified entities, an LRU holds up to `max_entries` confirmations keyed by entity, `subject_id`, `subject_type`, `subject_tenant_id` and the raw `token_scopes` list. P1 ownership constraints apply per subject (C6).
+On a context's first read, `Unchanged` to its tenant's resident validator confirms both visibility and state for `freshness_window`. Use `fresh` to check earlier. Anonymous calls bypass the cache. REST misses require the caller's bearer.
+
+**Tenant identities.** Within the window, a confirmed read can resolve the resident snapshot's pair. A read or resolution can also confirm a pair in the identity LRU.
+Resolution carries no validator and proves only identity visibility. Proofs hold weak references. Replacing the snapshot or evicting the pair retires its proof, even if the same pair returns. Discovery always calls the registry and can learn pairs without confirming access for any context.
+
+A read or discovery can classify a pair as global. Bare resolution cannot. Every authenticated context may resolve a known-global pair from the identity LRU or a snapshot of any age. Global entities consume no confirmation slots. Stale content still revalidates on the next read.
+
+A read or resolution miss revokes that context's confirmation for the key and fences its in-flight confirmations. A read miss also drops a known-global snapshot. Other snapshots and contexts survive, including contexts with a different spelling of the scope list. The host authenticates each request. A bearer refusal leaves earlier confirmations usable within the window if the host reuses the context.
+
+**Platform identities.** Each client has a separate LRU for up to `max_identity_entries` confirmed pairs (default 16 384), with one LRU position and two indexes per pair.
+Identifiers are validated `GtsId` values up to 1024 bytes. Reads, resolutions and discovery supply registry-issued pairs. Discovery validates the whole page before learning pairs in order. It leaves snapshot content, validators and freshness unchanged. Omitted pairs age out by LRU.
+
+Resolution checks the identity LRU, then fresh snapshots, then `:batchResolve`.
+Setting the identity bound to zero skips the first step. An identity hit leaves snapshot recency unchanged. A first lookup sends the caller's exact key.
+Replies must cover exactly the requested keys and match their identities.
+Both spellings of an entity must agree on identity and presence. Pairs must also agree with resident, remembered and pinned pairs, including pairs pinned before eviction. A contradiction fails the batch as `Internal` before learning any pair.
+
+Identity entries carry neither lifecycle nor validators. Only positive pairs are cached, with no expiry or mutation invalidation because deleted entities still resolve. After purge (ADR-0013, deferred in §2) or a logical registry change, recreate the cached client or restart its consumer. Otherwise old pairs may still resolve offline. Snapshot indexes survive identity eviction so either key can still invalidate a snapshot. Ordinary `batchGet` always follows snapshot freshness.
+Empty batches or batches over 100 items go to the registry intact for refusal.
+
+The snapshot budget counts compact JSON (including selected `null`), GTS ID bytes, raw validator bytes and 256 bytes of metadata per snapshot. Byte-identical JSON in the same field of one entity is charged once until its last snapshot leaves.
+Merges reuse measured field sizes. Oversized snapshots bypass retention. Actual heap usage may exceed the budget. All caches start empty on restart. Expired reads and forwarded resolutions fail closed during an outage (C13). Platform identity hits still resolve offline. Publisher stamps (D18) do not affect cached representations.
 
 ---
 
@@ -1058,18 +1081,17 @@ need the inputs tenancy supplies; DESIGN §3.3's own input table
 | `entity.resource_version` | ✓ | **yes** — compare-and-swap already maintains it |
 | `type_schema.resolution_fingerprint` | ✓, Type Schemas only | **yes** — materialized at admission (D3) |
 | subject visibility-chain version | ✓ **tenant plane only** | **no** — DESIGN: *"a platform read has no subject visibility chain"*, and §8.4 establishes every P0 read is platform-plane |
-| Context Tenant availability-chain version | ✓, only when availability is selected | **no** — availability is out of scope, and the input is conditional even in P1 |
+| Context Tenant identifier and availability-chain version | ✓, whenever the read names a Context Tenant | **no** — availability is out of scope and a P0 read names no Context Tenant. In P1 both enter every projection of a read that names one, so one state keeps one validator per scope; the identifier because two tenants' chain versions can coincide |
 | routing generation | — external only | **no** — federation is out of scope |
 | `external_revision` | — external only | **no** — Externally Managed Entities are out of scope; managed revisions already move `resource_version` |
-| normalized projection | ✓ | **yes** — T22b normalizes the actual selected-field set for exact read and `batchGet`. Absent `$select` equals an explicit default set; order and case do not alter the digest. Discovery pages carry no validator |
+| normalized projection | — | **no** — every projection of one state carries one validator (wire version 3; version 1 digested the selected-field set, and version 2 predates the mandatory `ownership` field, so neither token matches). Discovery pages carry no validator |
 
-The tenant inputs are not missing from P0. They **do not participate** in a platform-plane
-managed read, by DESIGN's own rule. So the P0 validator is complete rather than approximate:
-a versioned digest over `resource_version`, `resolution_fingerprint` where the kind has one,
-and the normalized selected-field set. A validator for a narrow representation cannot
-match a wider one, even if the underlying entity version is unchanged.
+P0 computes one validator per managed state from `resource_version` and, for Type Schemas, `resolution_fingerprint`. Tombstones move `resource_version`. A change in any projection's bytes changes the validator, keeping the `ETag` strong under RFC 9110. A dependency refresh may also invalidate byte-identical `content`.
 
-**The SDK carries the token, not the entity-tag.** `Validator` holds the token's bytes — base64url of `version || digest`. The RFC 9110 framing — the quotes of `ETag` and `If-None-Match`, and of a batch item's `etag` and `if_none_match` — is REST's representation: the server adds it, and the REST SDK clients (T34, T35) strip it on receipt and restore it on send. The local client hands the token over as it is. Bytes that are not UTF-8 or not a current-version token make the condition unusable and the read proceeds in full (DESIGN §3.3); a value over the key bound is refused.
+Send a validator for the same entity and a projection the held snapshot covers.
+`BatchGetItem::revalidate(&previous_lookup)` binds both keys and coverage from a `Found` result. Transports use `item.if_none_match_for(&projection)`. A mismatch or a prior `Unchanged` or `NotFound` yields an unconditional read. Reuse a result only for the tenant it was read for: until P1 adds the Context Tenant, the validator does not tell tenants apart, while `ownership` does. Raw HTTP callers enforce key, projection coverage and that same-tenant reuse themselves.
+
+The SDK stores opaque validator bytes. REST strips entity-tag quotes on receipt and restores them on send. The local client accepts up to 1024 raw bytes, while REST batches count the quoted tag. Non-UTF-8 or obsolete tokens trigger a full read (DESIGN §3.3). The snapshot budget counts raw token bytes.
 
 `resolution_fingerprint` is not redundant beside `resource_version`, and this is the case a
 simpler digest gets wrong: a dependent's effective schema is refreshed when a base is revised
@@ -1080,11 +1102,7 @@ document genuinely changed.
 **Computed, never stored** (`principle-derive-not-store`). No column holds a validator, and no
 cache holds one as authority.
 
-**Wire form is DESIGN's**: base64url of a version byte followed by the 128-bit digest,
-byte-identical in the `ETag` header and in batch bodies. The 23-character payload is quoted as
-an HTTP entity-tag; both REST surfaces carry those 25 bytes. The version is also digested, and
-it is load-bearing — it is what lets P1 add the chain versions while retaining the projection
-digest and refusing to honour a P0 token (ceiling C7).
+The wire token is base64url of a version byte and a 128-bit digest. Both REST surfaces quote the 23-character payload for 25 bytes total. The digest includes the version. V3 rejects V1's projection-scoped tokens and V2's pre-`ownership` tokens, and a future version can add the chain inputs (C7).
 
 **Where they apply.** Exact reads carry an `ETag`; a matching `If-None-Match` returns a bodyless
 `304`. Batch reads carry validators **beside individual keys**, because one header cannot
@@ -1218,14 +1236,14 @@ C1 and C4 are **struck** — resolved in P0 rather than deferred. C3 is narrowed
 | C3 | **Cooperative attribution.** Until Phase 9 `owning_gear = "types-registry"` stays a compatibility placeholder for every admission. After it, a claimed row's `publisher_name` is the actual publisher, taken from the request's required `publisher` (D18) — but it is **declared, not authenticated**: any platform-plane workload or local caller can name any publisher, and nothing binds the internal token to a name. The first publication claims an unclaimed row, so a caller that names the wrong publisher can claim it first. It coordinates cooperating publishers; it is never authority | P1 #4628: registry-side **workload policy** (ADR-0006/0008) — the platform plane bypasses the tenant PDP, so no PDP decides this. A deployment-configured allow-list maps a validated identity to the publisher names it may use, and a request naming any other is refused with `403` before an operation exists. The allow-list keys on the **full** `PlatformIdentity`, not `peer_name()`, which drops the Kubernetes namespace; one process may host several gears under one identity, so the names need not equal the identity's. With a SPIFFE identity, which carries a version, `publisher_version` becomes attested; with a service account it stays declared. The local client gets its name bound when the runtime builds it, not from the caller. Claiming an unclaimed row then needs a permitted name too; correction of existing attribution even when authored content is unchanged; exposure on reads alongside the ownership view (§10.2). No owner is inferred from a GTS namespace |
 | C4 | **Struck by D2.** Was: startup reads the whole table on the platform boot path, so startup time is linear in entity count | Resolved in P0 — no warm-up read; startup cost is the seed set, not the table (§8.2) |
 | C5 | No operation-retention sweep: terminal operations accumulate | The §3.2 sweep, once volume justifies it |
-| C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. DESIGN lets an authenticated platform workload bypass the tenant PDP; P0 authenticates every caller, tenant or workload (D17), but binds no permission to either — a tenant bearer cannot mutate on any host, but any platform workload holding a valid internal token can, on the registry's own listener or through the gateway (D20). From T45 `publisher` is required too, and refused from a tenant bearer (D18). `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. Exact, batch and discovery reads are authenticated only too. What `exposed = false` does and does not bound is C8 | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12) |
-| C7 | **The validator and cache key have no tenant or visibility dimensions.** P0's validator digests `resource_version`, `resolution_fingerprint` and T22b's normalized selected-field set (§8.5); the SDK cache key carries the same projection and fixed visibility/Context Tenant markers. Correct for managed platform-plane reads, and incomplete once tenant visibility or availability arrives | The wire form leads with a **version** byte, so P1 adds the chain versions under a new version and refuses to honour a P0 token. The cache key gains real visibility/Context Tenant dimensions without changing its projection rule |
+| C6 | **No PDP.** Access is authenticated but not authorized, contrary to `06`. DESIGN lets an authenticated platform workload bypass the tenant PDP; P0 authenticates every caller, tenant or workload (D17), but binds no permission to either — a tenant bearer cannot mutate on any host, but any platform workload holding a valid internal token can, on the registry's own listener or through the gateway (D20). From T45 `publisher` is required too, and refused from a tenant bearer (D18). `#[secure(unrestricted)]` entities reject tenant-scoped queries. Registration policy covers creations only (§8.1 step 3); callers reaching mutations can revise or tombstone eligible entities, including `cf.core.*`, even in closed regions. Lifecycle, version and dependant checks provide no authority check. Exact, batch and discovery reads are authenticated only too. What `exposed = false` does and does not bound is C8 | P1 epic #4628: identity-to-permission binding first, then owner/principal checks before `unit::commit_revision` and `deletion::commit_deletion`, plus `tenant_col` + `PolicyEnforcer` (§12). Reads take one decision per request — `read` for `batchGet` and `batchResolve`, `list` for discovery — that denies or allows under constraints over `ownership_scope`/`owner_tenant_id`, compiled inside the tenant-owned branch of the visibility fence; global entries stay readable on a deny, and an excluded key answers `not_found` (DESIGN *Read authorization*). `batchGet` and `batchResolve` must apply the same decision and visibility, tombstones and `Unchanged` included, because one SDK confirmation serves both (§8.3); discovery grants none. Before the SDK reuses PDP-backed confirmations, its key must cover every decision input (Context Tenant joins the read context; scope equivalence is defined or kept raw) and lookups must honour a trusted credential deadline, or bypass where uncertain; the SDK's window adds to the server's cached decision, so P1 either bounds it by that decision's remaining validity or budgets the extra staleness explicitly. Global entities stay readable by every authenticated subject; read decisions constrain tenant-owned rows only, and the SDK serves global snapshots to every authenticated reader (§8.3). That holds while no global key passes an extra per-key visibility gate (a federated source pre-filtering one global key) and an entity's ownership is stable — purge or a mutable source must first invalidate snapshots and pair classifications |
+| C7 | **Validators are shared across tenants.** P0's validator digests `resource_version` and `resolution_fingerprint` (§8.5), so a registry serving tenant-owned rows would give an owner and its descendant one validator for representations that differ in `ownership`; the P0 registry refuses such rows. The SDK cache does not rely on the validator for that: it keys tenant-owned snapshots by reader tenant and shares only global ones (§8.3). The tenant client tracks time-limited visibility confirmations separately from snapshot content. Each client keeps its own identity store; a tenant client answers a pair only to a read context the registry showed that pair to, or a known-global pair to any authenticated context (§8.3). | A new validator version digests the Context Tenant identifier and chain versions (DESIGN §3.3), so raw HTTP callers and conditions carried across tenants also get the full result. When availability arrives, decide whether it can differ between tenants for a global entity (external sources' tenant enablement, P2 managed enablement); only then do global snapshots need a Context Tenant scope. The SDK carries an explicit Context Tenant in place of `subject_tenant_id`. |
 | C8 | **`exposed = false` is not an access boundary in Profile 1.** Every P0 operation is platform-plane (`plane = 1`), yet an embedded host registers every REST provider's routes on the gateway router regardless of `exposed` (`libs/toolkit/src/runtime/host_runtime.rs:753`). So in Profile 1 registration and deletion are reachable on the gateway's one listener by any caller holding a valid internal token — the gateway validates it per route (D20), but there is no separate platform listener and no workload policy, so every platform workload is equal (C6). A tenant bearer is refused there. Tenant reads are reachable by any authenticated tenant bearer, platform reads by any valid internal token (D17). `exposed = false` keeps mutations out of the gateway's external routing only when the registry runs out of process, where discovery publishes no platform route (§8.4) | A platform listener — the post-T38 `/types-registry/v1/platform/` routes move to it unchanged — and registry-side workload policy over the validated `PlatformIdentity` before mutation dispatch (C3) — not a PDP, which the platform plane bypasses (ADR-0006/0008). Only then may mutation routes be exposed through the gateway. This is toolkit/api-gateway work outside this gear, and ADR-0006/0008 already ask for the listener |
 | C9 | **Implementation sequencing.** T14 adds reverse-impact refresh; T17 adds compatibility checks and effective waiver provenance, replacing the temporary `skip_compatibility_check` refusal. ADR-0004 still permanently forbids content revisions of minor-bearing Type Schemas; creation is admissible (§8.1 step 4). C8 keeps mutations internal | Remove this row when Checkpoints 3 and 4 are complete, before T32 migrates existing consumers; T38 later rechecks the completed compatibility/refresh behavior. The ADR-0004 restriction remains |
 | C10 | **`batchGet` names at most 100 keys, not DESIGN §3.3's 500.** T22b's default and narrow projections reduce ordinary transfer cost, but `$select=content,resolved_schema,effective_traits,effective_traits_schema` can still request large documents for every key. The item limit is retained without claiming that it bounds aggregate response bytes; reconciliation inspecting more than 100 identifiers pages its reads | T29's reconciliation helper pages `batchGet`. A separately designed response-byte budget may justify lifting the key count later; discovery likewise limits items, and callers selecting documents should request smaller pages (§10.2) |
 | C11 | **Publication ordering is declared and per release, and arrives with Phase 9.** D18 stops a publisher with a lower `publisher_version` from rewriting a claimed entity, so a rolled-back or restarting older pod no longer restores older content. What remains: the version is the publisher's claim, not an attestation (C3); two pods of **one** version with different content — typically different configuration during a rollout — overwrite each other until the rollout ends; reverting content takes a newer release, since there is no override; a pre-Phase-9 registry binary on the same database bypasses the check, which is why none may write to a migrated database (§8.4); and between T41 and Phase 9 the old behaviour holds: compare-and-swap orders writes, not releases | Identity-bound publisher authority and SPIFFE-attested versions (C3's P1 path); a privileged, audited operator restore once authorization exists |
 | C12 | **No release atomicity and no owner-wide fence.** Stamps are per entity: a partially admitted release leaves some identifiers at the new version and some at the old, and an older pod can still **create** an identifier the newer release never published, or that it stopped declaring. Omitting a previously published schema or instance does not delete it | An owner-wide fence with per-entity applied stamps, if a use case needs it; deletion stays explicit |
-| C13 | **No stale read fallback.** Publishing gears require admission; current startup reconciles against the registry, and SDK reads fail closed after the freshness window (§8.3). The read cache is in memory, so a restart starts empty | A highly available registry remains required for business reads in Profile 3 (§8.4). Planned T46–T49 permit a matching stateful publication receipt to satisfy publication on restart without Registry contact; the receipt does not supply entity snapshots or offline business-read guarantees |
+| C13 | **No stale read fallback.** Publishing gears require admission; current startup reconciles against the registry, and SDK reads fail closed after the freshness window (§8.3). The one exception is an identity-store hit of a platform `resolve_*` helper, which carries no state of the entity and has no window. The read cache is in memory, so a restart starts empty | A highly available registry remains required for business reads in Profile 3 (§8.4). Planned T46–T49 permit a matching stateful publication receipt to satisfy publication on restart without Registry contact; the receipt does not supply entity snapshots or offline business-read guarantees |
 
 
 Each ceiling gets a `ponytail:`-style source comment naming the bound and the upgrade
@@ -1304,7 +1322,7 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
 
 Mutations return DESIGN's operation types **as read** through `get_operation` (D19). Receipts (`operation_id`, `status`, `replayed`) lack items even on terminal `200` replay, so adapters must not synthesize an empty successful operation. A failed read after acceptance names `operation_id`; retrying the same key replays. REST handles `Retry-After` with an SDK fallback; semantic models omit it and `replayed`. Reconciliation uses one monotonic submit/poll deadline, honours cancellation and names the operation on timeout; accepted writes continue. Only the caller's token ends the call as `Cancelled`; a `Cancelled` answered by the registry is a call refusal that leaves the affected identifiers pending, without a transport retry. `IdempotencyKey` is a trait parameter sent as the required `Idempotency-Key` header, enabling `toolkit-http` POST retries beyond always-retry cases such as `429`.
 
-`BatchGetEntitiesRequest` carries one `Projection` for all keys, and `ListEntitiesRequest` carries it for discovery. Single and batch typed read helpers take `ReadOptions { projection, fresh }` and forward both fields to `batch_get_entities`, including every chunk of a split batch. `ReadOptions::default()` uses `Projection::Default` and `fresh = false`; `fresh` controls client-cache bypass and is not sent on the wire. The SDK exposes typed field constants and `light()` / `with(&[…])` / `full()` selection builders rather than a type parameter, preserving object safety. `Default` and an explicit selection of the §10.2 default fields have one normalized identity: the wire selection, validators, cursors and cache keys use `normalized()`. `Projection` itself compares structurally, because the kind-narrowed list helpers give `Default` their own document selection while keeping an explicit selection as given; the two remain different requests. An empty or unsupported selection fails before transport; the REST adapter applies the same rules to wire input.
+`BatchGetEntitiesRequest` carries one `Projection` for all keys, and `ListEntitiesRequest` carries it for discovery. Single and batch typed read helpers take `ReadOptions { projection, fresh }` and forward both fields to `batch_get_entities`, including every chunk of a split batch. `ReadOptions::default()` uses `Projection::Default` and `fresh = false`; `fresh` controls client-cache bypass and is not sent on the wire. The SDK exposes typed field constants and `light()` / `with(&[…])` / `full()` selection builders rather than a type parameter, preserving object safety. `Default` and an explicit selection of the §10.2 default fields have one normalized identity: the wire selection, cursors and cache coverage use `normalized()`. `Projection` itself compares structurally, because the kind-narrowed list helpers give `Default` their own document selection while keeping an explicit selection as given; the two remain different requests. An empty or unsupported selection fails before transport; the REST adapter applies the same rules to wire input.
 
 `ListEntitiesRequest::filter` carries P0 `pattern`, `max_chain_depth`, `kind` and `lifecycle` alongside its projection and page request. `max_chain_depth` maps to REST `depth`; `kind` uses the existing `EntityKind` vocabulary. Omitted fields mean no restriction, except `lifecycle`, which defaults to `Active`; the server applies the same filter before either projected items or cursors are produced (§10.2).
 
@@ -1331,13 +1349,13 @@ P0 `origin` is managed, with `resource_version` and timestamps. `provenance` fol
 §10.2 and belongs to `Entity`/`TypeSchema`, never `Instance`. List helpers select
 documents explicitly, on the page or through `batchGet`.
 
-Both extension traits provide `resolve_type_uuid(s)`, `resolve_type_id(s)`,
-`resolve_instance_uuid(s)` and `resolve_instance_id(s)` for identifier/Registry
-Reference translation. They take no options, read mandatory fields through normal
-client caching, and return the snapshot's UUID or own identifier. Plural forms
-retain batch deduplication, chunking and failure rules. Active and deleted entities
-resolve; absence or the other kind returns `NotFound` singly and `None` in batches.
-Use `GtsId::to_uuid` for local derivation without registration or a read.
+Both extension traits provide `resolve_type_uuid(s)`, `resolve_type_id(s)`, `resolve_instance_uuid(s)` and `resolve_instance_id(s)`. They translate the registry's stored pairs for active and deleted entities. They take no read options. Plural helpers keep batch deduplication, chunking and failure rules.
+Absence or a kind mismatch yields `NotFound` singly and `None` in batches.
+
+Both contracts expose `batch_resolve_identities` as a `SafeRead` at `POST {base}/entities:batchResolve`. The registry reads only the identity rows for both key forms in one snapshot, using the batch read's bounds, key classification, deduplication and scope. The SDK validates replies and uses cached identities as described in §8.3. Test doubles with only a batch read can use `ext::resolve_through_batch_get` under the SDK's `test-util` feature.
+
+Deploy the registry with `:batchResolve` before its remote SDK consumers.
+The in-process SDK ships with the registry.
 
 **The old models' client-side `effective_*` methods are deleted, and duplication is the
 weakest of three reasons.**
@@ -1388,15 +1406,17 @@ Platform routes (`PlatformTypesRegistryApi`):
 | `POST` | `/types-registry/v1/platform/entities:batchDelete` | `202` + operation; `200` on terminal replay |
 | `DELETE` | `/types-registry/v1/platform/entities/{entity_key}` | `202` + operation; `200` on terminal replay — removed by T45 (no publisher) |
 | `POST` | `/types-registry/v1/platform/entities:batchGet` | `200`, one result per requested key |
+| `POST` | `/types-registry/v1/platform/entities:batchResolve` | `200`, one identity or `not_found` per requested key |
 | `GET` | `/types-registry/v1/platform/entities/{entity_key}` | `200`; `304` on a current `If-None-Match`; `404` when absent |
 | `GET` | `/types-registry/v1/platform/entities` | `200` + one bounded page and a cursor; document-free by default |
 | `GET` | `/types-registry/v1/platform/operations/{operation_id}` | `200` |
 
-Tenant routes (`TypesRegistryApi`) — the three entity reads, with the same bodies, statuses and validators as their platform twins:
+Tenant routes (`TypesRegistryApi`) — the four entity reads, with the same bodies, statuses and validators as their platform twins:
 
 | Method | Path | Success |
 |---|---|---|
 | `POST` | `/types-registry/v1/entities:batchGet` | as above |
+| `POST` | `/types-registry/v1/entities:batchResolve` | as above |
 | `GET` | `/types-registry/v1/entities/{entity_key}` | as above |
 | `GET` | `/types-registry/v1/entities` | as above |
 
@@ -1421,6 +1441,8 @@ Tenant routes (`TypesRegistryApi`) — the three entity reads, with the same bod
 P0 has no aggregate response-byte budget (ceiling C10). Absence is a per-key `not_found`
 inside a `200`, never a `404`:
 one missing key must not lose the answers for the others.
+
+`POST /entities:batchResolve` takes `{"items":[{"entity_key":"…"}]}` under the same raw item limit. Each result echoes the key (canonical UUID) and has `status` `found` or `not_found`. Only `found` includes `identity` with `gts_id` and `gts_uuid`. The route accepts no query parameters or condition and returns no lifecycle or validator.
 
 **Submission protocol (D10).** The database-backed `POST /entities` returns `202` with an operation receipt (`200` for terminal replay); callers poll for per-item outcomes. Requests carry the `items` array. The route is declared `unstable`. The legacy in-memory `/types-registry/v1` API remains until T38 and uses an `entities` array with synchronous `200` results; its list and exact reads include full content by default. The APIs use separate catalogues: no legacy handler takes `RegistryService`, no database-backed handler takes `TypesRegistryService`, and neither falls back to the other on a miss. An identifier registered only in one catalogue is absent from the other.
 
@@ -1450,10 +1472,8 @@ exact reads and discovery use DESIGN §3.3's field selection with document-free 
   combine `pattern`, `depth`, `kind` and `lifecycle_status`; all are intersected
   **before** the page limit and projection. `limit` and `cursor` control
   traversal, while `$select` controls returned fields; none changes the match predicate.
-- **One document-free default on all three reads.** Absent `$select` is identical to an explicit selection of `gts_id,gts_uuid,kind,origin,lifecycle_status`. `origin` has only the `managed` variant in P0 and carries `resource_version`, `created_at` and `updated_at`; its `external` variant waits for federation. The P0 default omits DESIGN's availability/reason and Context Tenant ownership view, which cannot be answered without tenancy. `publisher_name` is internal attribution, not ownership: P0 persists it on the entity (§9) but returns it on no read, nor as a stand-in for the missing ownership view, and defines no ownership group. Exposing it is P1 work, designed with that view. The same holds for `publisher_version` (D18). REST `origin` is an internally tagged object: `{"type":"managed","resource_version":1, "created_at":"...","updated_at":"..."}`; timestamps use RFC 3339. Federation's external variant adds `{"type":"external","source":"..."}` without changing the managed shape.
-- **P0 selectable fields.** The complete allowlist is the five default fields plus
-  `content`, `resolved_schema`, `effective_traits`, `effective_traits_schema` and
-  `provenance`. `content` is the whole authored JSON document for either kind. The three
+- **One document-free default on all three reads.** Absent `$select` is identical to an explicit selection of `gts_id,gts_uuid,kind,origin,lifecycle_status,ownership`. `origin` has only the `managed` variant in P0 and carries `resource_version`, `created_at` and `updated_at`; its `external` variant waits for federation. The P0 default omits DESIGN's availability/reason, which cannot be answered without tenancy. `ownership` is always `global`: every P0 row is global, and a read refuses a tenant-owned row as corrupt state rather than guess its relation to the caller. P1 replaces that refusal with the plane-aware filter: platform reads see global entities only, tenant reads the visibility fence. `publisher_name` is internal attribution, not ownership: P0 persists it on the entity (§9) but returns it on no read, nor as a stand-in for ownership, and defines no ownership group. Exposing it is P1 work, designed with that view. The same holds for `publisher_version` (D18). REST `origin` is an internally tagged object: `{"type":"managed","resource_version":1, "created_at":"...","updated_at":"..."}`; timestamps use RFC 3339. Federation's external variant adds `{"type":"external","source":"..."}` without changing the managed shape.
+- **P0 selectable fields.** The complete allowlist is the six default fields plus `content`, `resolved_schema`, `effective_traits`, `effective_traits_schema` and `provenance`. `content` is the whole authored JSON document for either kind. The three
   effective documents apply only to Type Schemas and are absent on Instances. Each document
   is selected independently and appears at the top level; there is no `effective` or
   `authored` wrapper. `provenance` is the one group and is selected only whole: its
@@ -1479,23 +1499,14 @@ exact reads and discovery use DESIGN §3.3's field selection with document-free 
   set; order does not affect identity, while duplicates are rejected by the parser.
   An empty, unknown, unavailable, nested, malformed or excessive selection is `400`
   RFC-9457 with a field violation naming `$select` and reason `INVALID_SELECT`, the
-  reason ToolKit's own parser reports. *Unavailable* means a DESIGN §3.3 field P0 cannot
-  answer — `availability` and `owned_by_context_tenant` — and *nested* any name
-  containing `.` or `/`. The canonical identity is the selected names sorted and
-  comma-joined, e.g. `content,gts_id,gts_uuid,kind,lifecycle_status`. In particular, reject empty comma
+  reason ToolKit's own parser reports. *Unavailable* means a DESIGN §3.3 field P0 cannot answer — `availability` — and *nested* any name containing `.` or `/`. The canonical identity is the selected names sorted and comma-joined, e.g. `content,gts_id,gts_uuid,kind,lifecycle_status,ownership`. In particular, reject empty comma
   segments such as `$select=content,,kind`: ToolKit's parser currently drops those,
   so the gear checks the raw spelling as well. Honor ToolKit's 2048-character and
-  100-field parser limits. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are
-  mandatory on every entity of all three reads, whatever `$select` names, including a
-  deleted result, so a narrow projection still says which documents apply;
-  they are always in the normalized effective set, so naming them does not change cursor,
-  validator or cache identity. Unselected fields
+  100-field parser limits. `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are mandatory on every entity of all three reads, whatever `$select` names, including a deleted result, so a narrow projection still says which documents apply; they are always in the normalized effective set, so naming them does not change cursor, validator or cache identity. Adding `ownership` to that set changed the canonical identity, so a cursor issued before it is rejected and its traversal restarts. Unselected fields
   are omitted, while a selected JSON `null` remains present. `entity_key`, per-key status and
   `etag` are batch result
   envelope metadata outside selection. An exact `ETag` is likewise outside the body.
-  REST DTOs and OpenAPI mark the four mandatory fields required and non-nullable and
-  every other field optional, omitting an unselected one; selected nullable values
-  remain present as JSON `null`.
+  REST DTOs and OpenAPI mark the mandatory fields required and non-nullable and every other field optional, omitting an unselected one; selected nullable values remain present as JSON `null`.
 - **Transport placement.** Exact `GET /entities/{entity_key}` and discovery `GET /entities`
   take `$select` in the query. `POST /entities:batchGet` takes one top-level body
   `"$select"` string applying to every `items[]` key, never a per-item selection or query
@@ -1562,16 +1573,16 @@ gears:
       local_client:
         cache:
           freshness_window: 30s        # DESIGN §3.3; `0s` disables the window
-          store_bound: 64MB            # bytes, not entries — see §8.3
+          max_size_bytes: 64MB         # documents, GTS IDs, raw validators, 256 B per snapshot
+          max_entries: 16384           # resident snapshots; zero disables snapshot retention
+          max_identity_entries: 16384  # identities retained for resolve_* (§8.3)
 ```
 
-The cache keys change shape: `local_client.cache.type_schemas.{capacity,ttl}` and
-`.instances.{capacity,ttl}` are replaced by one `freshness_window` and one byte `store_bound`
-covering both kinds. The four old keys are accepted-and-ignored for one release with a
-warning naming their replacements, so an existing deployment neither fails to start nor
-silently keeps a setting that no longer applies.
+The four old `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys configure the legacy cache until T38. After removal, one release accepts and ignores them with a warning naming the new snapshot settings.
 
-The cache is an SDK decorator (§8.3), so these two settings configure it wherever a client is built. In the registry's process they come from this config. A remote consumer's resolving client is built by `#[consumes]` wiring, and T36 decides where its cache settings are read from without adding a per-consumer key to this gear. Transport wiring itself — local versus REST, and static endpoint overrides — is toolkit configuration (`gears.<gear>.clients.provides` / `clients.consumes`), not a types-registry key.
+Each published local client has its own snapshot budget. Remote resolving clients use SDK defaults above endpoint resolution (30 s, 64 MiB, 16 384 snapshots and 16 384 platform identities). Use `with_cache_settings` to override these limits or set both entry limits to zero to disable retention. For other clients use `CachedPlatformTypesRegistry::new` or `CachedTypesRegistry::new`.
+Per-consumer tuning under `clients.consumes.<dep>` is a ToolKit follow-up.
+Use `gears.<gear>.clients.provides` and `clients.consumes` for transport and static endpoints.
 
 `ctx.config_or_default()` makes absent config and `config: {}` equivalent to these
 defaults. Existing keys (`entity_id_fields`, `schema_id_fields`, `entities`) are retained.
@@ -1939,7 +1950,7 @@ identifier profile refusals, topological order, baseline selection.
 | Same read with `fresh` | bypasses the window and returns the new value |
 | Read after a terminal successful registration outcome | the cached entry is gone under **both** its identifier and its UUID key, without waiting for the window |
 | `NotFound`, a failed read, a discovery page, an operation resource | never cached, each asserted separately (§8.3) |
-| Cache store bound | exceeded by cached bytes, not entry count: one 1 MB document evicts where a thousand small ones do not |
+| Cache store bound | both the byte budget and the snapshot count limit trigger LRU eviction |
 | Expired entry whose content did not change | revalidated to `unchanged` and **kept**, with no full snapshot fetched |
 | Two expired keys | one conditional `batchGet`, not two |
 | Failed revalidation | error propagates, window is not extended (`principle-fail-closed`) |
@@ -1949,12 +1960,12 @@ identifier profile refusals, topological order, baseline selection.
 | `batchGet` with a mix of current and stale validators | `200`, `unchanged` for current keys, snapshots for the rest |
 | Instance validator | omits `resolution_fingerprint` and still changes on revision |
 | Validator with an unknown version field | rejected, never treated as a match |
-| Same key under two selected-field sets | validators differ; a narrow token never answers `unchanged` for a wider selection. Reordered and explicit-default selections yield the same token |
+| Same key under two selected-field sets | one validator; a current one answers `unchanged` under any selection. The SDK sends it only for a projection the held fields cover, so a narrow holding never gets `unchanged` for a wider read, and never for another entity |
 | Type Schema whose `$ref` targets a type **outside** its derivation chain | `resolved_schema` closes over that reference too — the case the deleted client-side `effective_schema` left unresolved (§10.1) |
 | `effective_traits` of a chain with a trait default at two levels | matches `gts-rust`, not the deleted client-side merge order |
 | `$select` on exact read, `batchGet` and discovery | each applies the same field allowlist and document-free default; exact and batch return the same projected entity for one key; each document can be selected alone |
 | Invalid `$select` | empty, empty comma segment, duplicate, unknown, unavailable, nested and over-limit fields return RFC-9457 `400` naming `$select`; unsupported OData options and unknown unprefixed query keys are refused |
-| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns exactly the mandatory `gts_id`, `gts_uuid`, `kind: instance`, `lifecycle_status`; a deleted exact read with `$select=content` still includes `kind` and `lifecycle_status: deleted` |
+| Projected Instance and deleted entity | Type Schema-only fields are absent for an Instance; `$select=resolved_schema` on an Instance still returns exactly the mandatory `gts_id`, `gts_uuid`, `kind: instance`, `lifecycle_status`, `ownership: global`; a deleted exact read with `$select=content` still includes `kind` and `lifecycle_status: deleted` |
 | Metadata-only exact/batch/discovery reads | instrumented storage proves no authored/effective JSON column is fetched or parsed; selected documents are fetched in bounded, snapshot-consistent batches on SQLite, PostgreSQL and MySQL |
 | Content equality and reconciliation | no digest field is selectable; `unchanged` and `UpToDate` follow exact canonical authored-byte equality |
 | Registration policy, four DESIGN §3.2 entries | each admits and refuses exactly what §10.3's table says, including the exact-key-versus-`~*` split |
@@ -2136,10 +2147,7 @@ references.
 12. The workspace is on `gts-rust` 0.12.0, every declared identifier re-validates, and
     an undecidable compatibility comparison (`CompatibilityVerdict::Unknown`) is rejected
     with its own reason rather than collapsed into `Incompatible`.
-13. The SDK client cache is in place on the new models with a byte-bounded store, a
-    freshness window, `fresh` bypass, invalidation on an observed terminal outcome and
-    batched conditional revalidation — P0 does not ship an uncached read path (§8.3,
-    `cpt-cf-types-registry-fr-client-cache`).
+13. The SDK client cache is in place on the new models with a store bounded by bytes and snapshot count, a freshness window, `fresh` bypass, invalidation on an observed terminal outcome and batched conditional revalidation — P0 does not ship an uncached read path (§8.3, `cpt-cf-types-registry-fr-client-cache`).
 14. An exact read carries a validator and honours `If-None-Match` with a bodyless `304`;
     a batch read reports `unchanged` per key while returning `200`; a dependent refreshed
     by a base revision gets a new validator even though its own `resource_version` did not

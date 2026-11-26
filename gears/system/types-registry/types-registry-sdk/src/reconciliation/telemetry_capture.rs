@@ -3,9 +3,8 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use parking_lot::Mutex;
 use serde_json::Value;
 use tracing::Level;
 use tracing::subscriber::DefaultGuard;
@@ -98,7 +97,7 @@ struct Log(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for Log {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().extend_from_slice(buf);
+        self.0.lock().expect("captured log").extend_from_slice(buf);
         Ok(buf.len())
     }
 
@@ -138,7 +137,7 @@ impl Capture {
     }
 
     pub fn events(&self) -> Vec<Captured> {
-        String::from_utf8_lossy(&self.log.0.lock())
+        String::from_utf8_lossy(&self.log.0.lock().expect("captured log"))
             .lines()
             .map(Captured::parse)
             .collect()

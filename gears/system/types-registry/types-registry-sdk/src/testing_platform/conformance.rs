@@ -16,11 +16,11 @@ use crate::field;
 use crate::item_failure::AdmissionFailure;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, CandidateStatus, DeleteEntitiesRequest, DeleteItem,
-    DeletionItemResult, DeletionOutcome, Entity, EntityField, EntityFilter, EntityKey, EntityKind,
-    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
-    ListEntitiesRequest, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
-    PublisherContext, RegisterEntitiesRequest, RegisterItem, RegistrationOperation,
-    RegistrationOutcome, Validator,
+    DeletionItemResult, DeletionOutcome, Entity, EntityField, EntityFilter, EntityIdentity,
+    EntityKey, EntityKind, EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter,
+    LifecycleStatus, ListEntitiesRequest, Operation, OperationStatus, Origin, PageRequest,
+    Projection, Provenance, PublisherContext, RegisterEntitiesRequest, RegisterItem,
+    RegistrationOperation, RegistrationOutcome, Validator,
 };
 
 mod admission;
@@ -54,10 +54,13 @@ pub async fn run(client: &dyn PlatformTypesRegistryApi) {
     c.documents_resolve_through_the_chain().await;
     c.a_reference_an_instance_and_a_light_read_answer_their_fields()
         .await;
-    c.validators_are_scoped_to_the_projection().await;
+    c.a_validator_names_the_state_and_a_condition_what_it_covers()
+        .await;
     c.a_repeated_key_is_answered_under_its_first_mention().await;
     let (tombstone, etag) = c
         .tombstones_keep_their_documents_and_are_never_rewritten()
+        .await;
+    c.a_resolution_answers_each_key_s_stored_pair(&tombstone)
         .await;
     c.a_parent_change_moves_its_children_but_not_tombstones(tombstone, etag)
         .await;
@@ -374,13 +377,10 @@ impl Checker<'_> {
     async fn get_if(
         &self,
         key: EntityKey,
-        etag: &Validator,
+        previous: &EntityLookup,
         projection: Projection,
     ) -> EntityLookup {
-        let item = BatchGetItem {
-            key,
-            if_none_match: Some(etag.clone()),
-        };
+        let item = BatchGetItem::new(key).revalidate(previous);
         self.read(vec![item], projection).await
     }
 
@@ -466,7 +466,7 @@ impl Checker<'_> {
     async fn a_reference_an_instance_and_a_light_read_answer_their_fields(&self) {
         let (child, _) = found(self.get(gts_key(CHILD), every_field()).await);
         let (by_uuid, _) = found(
-            self.get(EntityKey::GtsUuid(gid(CHILD).to_uuid()), every_field())
+            self.get(EntityKey::GtsUuid(child.gts_uuid), every_field())
                 .await,
         );
         assert_eq!(by_uuid, child, "a Registry Reference reads the same entity");
@@ -496,31 +496,46 @@ impl Checker<'_> {
         );
     }
 
-    async fn validators_are_scoped_to_the_projection(&self) {
-        let (_, etag) = found(self.get(gts_key(CHILD), Projection::Default).await);
+    /// One state has one validator under every projection; what a condition may answer
+    /// is decided by the fields it covers, read off the answer it came from.
+    async fn a_validator_names_the_state_and_a_condition_what_it_covers(&self) {
+        let narrow = self.get(gts_key(CHILD), Projection::Default).await;
+        let EntityLookup::Found { etag, .. } = &narrow else {
+            panic!("expected Found")
+        };
+        let (_, wide_etag) = found(self.get(gts_key(CHILD), content_only()).await);
+        assert_eq!(&wide_etag, etag, "one state, one validator");
+
         assert!(
             matches!(
-                self.get_if(gts_key(CHILD), &etag, Projection::Default)
+                self.get_if(gts_key(CHILD), &narrow, Projection::Default)
                     .await,
                 EntityLookup::Unchanged { .. }
             ),
-            "a matching validator transfers nothing"
+            "a covering condition transfers nothing"
         );
         assert!(
             matches!(
-                self.get_if(gts_key(CHILD), &etag, content_only()).await,
+                self.get_if(gts_key(CHILD), &narrow, content_only()).await,
                 EntityLookup::Found { .. }
             ),
-            "a validator read under one projection does not condition another"
+            "a condition that does not cover the read is not sent"
+        );
+
+        let wide = self.get(gts_key(CHILD), every_field()).await;
+        assert!(
+            matches!(
+                self.get_if(gts_key(CHILD), &wide, Projection::Default)
+                    .await,
+                EntityLookup::Unchanged { .. }
+            ),
+            "a wider holding covers a narrower read"
         );
     }
 
     async fn a_repeated_key_is_answered_under_its_first_mention(&self) {
-        let (_, etag) = found(self.get(gts_key(CHILD), Projection::Default).await);
-        let conditional = BatchGetItem {
-            key: gts_key(CHILD),
-            if_none_match: Some(etag),
-        };
+        let previous = self.get(gts_key(CHILD), Projection::Default).await;
+        let conditional = BatchGetItem::new(gts_key(CHILD)).revalidate(&previous);
         let lookup = self
             .read(
                 vec![gts_key(CHILD).into(), conditional.clone()],
@@ -589,7 +604,11 @@ impl Checker<'_> {
         tombstone: Entity,
         tombstone_etag: Validator,
     ) {
-        let (_, child_etag) = found(self.get(gts_key(CHILD), light()).await);
+        let child_held = self.get(gts_key(CHILD), every_field()).await;
+        let tombstone_held = EntityLookup::Found {
+            entity: Box::new(tombstone),
+            etag: tombstone_etag,
+        };
         self.register(vec![revise(
             BASE,
             root(BASE, Some(revised_base_traits())),
@@ -598,7 +617,7 @@ impl Checker<'_> {
         .await;
 
         let (child, _) = found(
-            self.get_if(gts_key(CHILD), &child_etag, every_field())
+            self.get_if(gts_key(CHILD), &child_held, every_field())
                 .await,
         );
         assert_eq!(
@@ -616,7 +635,7 @@ impl Checker<'_> {
         );
         assert!(
             matches!(
-                self.get_if(gts_key(CHILD), &child_etag, light()).await,
+                self.get_if(gts_key(CHILD), &child_held, light()).await,
                 EntityLookup::Found { .. }
             ),
             "and moves their validators, even under a projection without documents"
@@ -624,14 +643,17 @@ impl Checker<'_> {
 
         assert!(
             matches!(
-                self.get_if(gts_key(DOOMED), &tombstone_etag, every_field())
+                self.get_if(gts_key(DOOMED), &tombstone_held, every_field())
                     .await,
                 EntityLookup::Unchanged { .. }
             ),
             "a parent's revision leaves a tombstone's validator alone"
         );
-        let (unchanged, _) = found(self.get(gts_key(DOOMED), every_field()).await);
-        assert_eq!(unchanged, tombstone, "and its documents");
+        let current = self.get(gts_key(DOOMED), every_field()).await;
+        assert_eq!(
+            current, tombstone_held,
+            "the tombstone keeps its documents and validator"
+        );
     }
 
     async fn discovery_applies_its_filters(&self) {
@@ -773,6 +795,57 @@ impl Checker<'_> {
             .expect("the page size is not part of the binding");
     }
 
+    /// A batch resolution answers each distinct key with the pair the registry stored for
+    /// it, a tombstone's included, or `None`; its bound is the batch read's, counted on the
+    /// raw keys.
+    async fn a_resolution_answers_each_key_s_stored_pair(&self, tombstone: &Entity) {
+        let (base, _) = found(self.get(gts_key(BASE), light()).await);
+        let by_reference = EntityKey::GtsUuid(tombstone.gts_uuid);
+        let keys = vec![
+            gts_key(BASE),
+            by_reference.clone(),
+            gts_key(ABSENT),
+            gts_key(BASE),
+        ];
+        let resolved = bounded(
+            "a batch resolution",
+            self.client.batch_resolve_identities(&Self::ctx(), keys),
+        )
+        .await
+        .expect("resolved");
+        assert_eq!(
+            resolved.len(),
+            3,
+            "one answer per distinct key: {resolved:?}"
+        );
+        assert_eq!(
+            resolved[&gts_key(BASE)],
+            Some(EntityIdentity {
+                gts_id: base.gts_id.clone(),
+                gts_uuid: base.gts_uuid,
+            })
+        );
+        assert_eq!(
+            resolved[&by_reference],
+            Some(EntityIdentity {
+                gts_id: tombstone.gts_id.clone(),
+                gts_uuid: tombstone.gts_uuid,
+            }),
+            "a tombstone resolves"
+        );
+        assert_eq!(resolved[&gts_key(ABSENT)], None);
+
+        for keys in [Vec::new(), vec![gts_key(BASE); 101]] {
+            let error = bounded(
+                "a refused resolution",
+                self.client.batch_resolve_identities(&Self::ctx(), keys),
+            )
+            .await
+            .expect_err("a resolution out of range is refused");
+            assert_field_violation(&error, field::ITEMS_FIELD);
+        }
+    }
+
     async fn requests_out_of_range_are_refused(&self) {
         for limit in [0, 101] {
             let error = self
@@ -908,6 +981,7 @@ impl Checker<'_> {
             publisher: publisher(),
         };
         let delete_key = self.next_key();
+        let (registered, _) = found(self.get(gts_key(KEYED), light()).await);
         let by_id = self
             .client
             .delete_entities(&Self::ctx(), delete_key.clone(), deletion(gts_key(KEYED)))
@@ -919,7 +993,7 @@ impl Checker<'_> {
             .delete_entities(
                 &Self::ctx(),
                 delete_key,
-                deletion(EntityKey::GtsUuid(gid(KEYED).to_uuid())),
+                deletion(EntityKey::GtsUuid(registered.gts_uuid)),
             )
             .await
             .expect("a Registry Reference replays the identifier's deletion");

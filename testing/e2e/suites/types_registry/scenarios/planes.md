@@ -50,6 +50,6 @@ Every scenario has an e2e test in [test_planes.py](../test_planes.py). The same 
 
 **Given:** `person_schema` is registered.
 
-**When:** every route of both sets — the seven platform routes (dry-run submit and deletions, the operation read, the three reads) and the three tenant reads — is called with no credential, the valid credential of each plane, a forged credential of each plane, and both credentials together in all four combinations of validity.
+**When:** every route of both sets — the eight platform routes (dry-run submit and deletions, the operation read, the four reads including `:batchResolve`) and the four tenant reads — is called with no credential, the valid credential of each plane, a forged credential of each plane, and both credentials together in all four combinations of validity.
 
 **Then:** a platform route serves only the valid internal token; with none, or a bearer alone, it is `401` `MISSING_INTERNAL_TOKEN`, and with a forged token `INTERNAL_AUTH_FAILED`. A tenant read serves only the valid bearer; with none, or a token alone, it is `401` `MISSING_BEARER`, and with a forged bearer `AUTHN_FAILED`. Both credentials together are `401` `MIXED_CREDENTIALS` on every route, whatever their validity.

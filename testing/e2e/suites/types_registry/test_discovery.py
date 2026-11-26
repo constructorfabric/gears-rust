@@ -134,6 +134,7 @@ async def test_a_limit_one_cursor_visits_every_row_once(
                         "gts_uuid": gts_uuid(device_schema["gts_id"]),
                         "kind": "type_schema",
                         "lifecycle_status": "active",
+                        "ownership": "global",
                         "origin": {
                             "type": "managed",
                             "resource_version": 1,
@@ -151,6 +152,7 @@ async def test_a_limit_one_cursor_visits_every_row_once(
                         "gts_uuid": gts_uuid(person_schema["gts_id"]),
                         "kind": "type_schema",
                         "lifecycle_status": "active",
+                        "ownership": "global",
                         "origin": {
                             "type": "managed",
                             "resource_version": 1,

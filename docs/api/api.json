@@ -1210,7 +1210,7 @@
             "type": "string"
           },
           "if_none_match": {
-            "description": "A prior `etag` for this key and `$select`; a match returns `unchanged`.\nBatch validators are per item. Exactly one entity-tag, weak or strong:\n`*`, an unquoted value or a list is refused rather than read as no condition.",
+            "description": "A prior `etag` for this key; a match returns `unchanged`. One state has one `etag`\nunder every `$select`, so send it only while holding every field `$select` names.\nBatch validators are per item. Exactly one entity-tag, weak or strong:\n`*`, an unquoted value or a list is refused rather than read as no condition.",
             "maxLength": 1024,
             "type": [
               "string",
@@ -1305,6 +1305,39 @@
         },
         "required": [
           "changes"
+        ],
+        "type": "object"
+      },
+      "BatchResolveItemDto": {
+        "additionalProperties": false,
+        "description": "One key in a batch resolution.",
+        "properties": {
+          "entity_key": {
+            "description": "A canonical GTS identifier or a Registry Reference UUID, classified exactly\nas `GET /entities/{entity_key}` classifies its path segment.",
+            "maxLength": 1024,
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity_key"
+        ],
+        "type": "object"
+      },
+      "BatchResolveRequest": {
+        "additionalProperties": false,
+        "description": "A batch resolution. Unknown fields are refused.",
+        "properties": {
+          "items": {
+            "description": "No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body\nis parsed. Items past it are counted, not kept.",
+            "items": {
+              "$ref": "#/components/schemas/BatchResolveItemDto"
+            },
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -5280,7 +5313,7 @@
         "type": "object"
       },
       "EntityDto": {
-        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a\nprojected item is identifiable, its kind needs no second read, and a tombstone is\nnever mistaken for an absence. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts and `provenance` are absent on an\nInstance, selected or not. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
+        "description": "One entity, projected by `$select` (SPEC §10.2).\n\n`gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always\npresent, so a projected item is identifiable, its kind needs no second read, a\ntombstone is never mistaken for an absence, and a client knows whether it is global. An\nunselected field is omitted; a selected document that is JSON `null` stays\npresent as `null`. The three artifacts and `provenance` are absent on an\nInstance, selected or not. Documents\nare written as stored, canonical text: keys sorted, no insignificant whitespace.",
         "properties": {
           "content": {
             "description": "The whole authored document, either kind."
@@ -5311,6 +5344,10 @@
           "origin": {
             "$ref": "#/components/schemas/OriginDto"
           },
+          "ownership": {
+            "$ref": "#/components/schemas/OwnershipDto",
+            "description": "Always present. Never an owning tenant identifier."
+          },
           "provenance": {
             "$ref": "#/components/schemas/ProvenanceDto",
             "description": "Managed Type Schemas only: how the current revision was admitted."
@@ -5323,9 +5360,36 @@
           "gts_id",
           "gts_uuid",
           "kind",
-          "lifecycle_status"
+          "lifecycle_status",
+          "ownership"
         ],
         "type": "object"
+      },
+      "EntityIdentityDto": {
+        "description": "A registered entity's canonical identity.",
+        "properties": {
+          "gts_id": {
+            "type": "string"
+          },
+          "gts_uuid": {
+            "description": "The Registry Reference, canonical lowercase hyphenated.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gts_id",
+          "gts_uuid"
+        ],
+        "type": "object"
+      },
+      "EntityIdentityStatusDto": {
+        "description": "`found` or `not_found`.",
+        "enum": [
+          "found",
+          "not_found"
+        ],
+        "type": "string"
       },
       "EntityKindDto": {
         "description": "`type_schema` or `instance`.",
@@ -5353,7 +5417,7 @@
             "type": "string"
           },
           "etag": {
-            "description": "The validator for this key under this `$select`, byte-identical to the exact\nread's `ETag`. Present unless `not_found`.",
+            "description": "The validator of this key's current state, the same under every `$select` and\nbyte-identical to the exact read's `ETag`. Present unless `not_found`.",
             "type": [
               "string",
               "null"
@@ -5410,6 +5474,48 @@
         "required": [
           "items",
           "page_info"
+        ],
+        "type": "object"
+      },
+      "EntityResolutionDto": {
+        "description": "One key's resolution, echoing the key it was asked by, as a batch read echoes it.",
+        "properties": {
+          "entity_key": {
+            "type": "string"
+          },
+          "identity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EntityIdentityDto",
+                "description": "Present only on `found`, Active or deleted alike."
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/EntityIdentityStatusDto"
+          }
+        },
+        "required": [
+          "entity_key",
+          "status"
+        ],
+        "type": "object"
+      },
+      "EntityResolutionsDto": {
+        "description": "One answer per distinct key in a batch resolution. Result order is not contractual.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EntityResolutionDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
         ],
         "type": "object"
       },
@@ -10041,6 +10147,15 @@
           "expires_at"
         ],
         "type": "object"
+      },
+      "OwnershipDto": {
+        "description": "`global`, `context_tenant` (owned by the Context Tenant) or `ancestor_tenant`\n(owned by an ancestor of it).",
+        "enum": [
+          "global",
+          "context_tenant",
+          "ancestor_tenant"
+        ],
+        "type": "string"
       },
       "PageInfo": {
         "properties": {
@@ -71341,7 +71456,7 @@
     },
     "/types-registry/v2/entities": {
       "get": {
-        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
+        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
         "operationId": "types_registry.list_entities",
         "parameters": [
           {
@@ -71515,7 +71630,7 @@
     },
     "/types-registry/v2/entities/{entity_key}": {
       "get": {
-        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status,ownership`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` names the entity's state and is the same under every `$select`; `If-None-Match` with a current one returns a bodyless 304 whatever the `$select`, so a client sends only the `ETag` of a representation that holds every field it now selects.",
         "operationId": "types_registry.get_entity",
         "parameters": [
           {
@@ -71528,7 +71643,7 @@
             }
           },
           {
-            "description": "An earlier `ETag` of this key under the same `$select`, or `*`",
+            "description": "An earlier `ETag` of this key, sent only while the client holds every field this `$select` names, or `*`",
             "in": "header",
             "name": "If-None-Match",
             "required": false,
@@ -71558,7 +71673,7 @@
             "description": "The requested entity",
             "headers": {
               "ETag": {
-                "description": "The validator of this key under this `$select`",
+                "description": "The validator of this key's current state, the same under every `$select`",
                 "schema": {
                   "type": "string"
                 }
@@ -71569,7 +71684,7 @@
             "description": "The If-None-Match validator is current",
             "headers": {
               "ETag": {
-                "description": "The validator of this key under this `$select`",
+                "description": "The validator of this key's current state, the same under every `$select`",
                 "schema": {
                   "type": "string"
                 }
@@ -71670,7 +71785,7 @@
     },
     "/types-registry/v2/entities:batchGet": {
       "post": {
-        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
+        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
         "operationId": "types_registry.batch_get_entities",
         "requestBody": {
           "content": {
@@ -71816,9 +71931,157 @@
         ]
       }
     },
+    "/types-registry/v2/entities:batchResolve": {
+      "post": {
+        "description": "Resolve up to 100 keys in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or a Registry Reference UUID), classified exactly as GET /types-registry/v2/entities/{entity_key} classifies it. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the registered entity's stored `identity` (`gts_id` and `gts_uuid`), Active or deleted alike, or `not_found`. A result carries no lifecycle, `etag` or document, and resolution looks up no validator, schema fingerprint or document. A key named twice, in any UUID spelling, collapses onto its first mention; the identifier and the Registry Reference of one entity are two keys and get two results. The limit counts every item, duplicates included. Query parameters are refused.",
+        "operationId": "types_registry.batch_resolve_identities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchResolveRequest"
+              }
+            }
+          },
+          "description": "Keys to resolve",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityResolutionsDto"
+                }
+              }
+            },
+            "description": "One result per requested key"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Resolve a set of GTS entity keys to canonical identities",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
     "/types-registry/v2/platform/entities": {
       "get": {
-        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/platform/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
+        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/platform/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
         "operationId": "types_registry.platform.list_entities",
         "parameters": [
           {
@@ -72382,7 +72645,7 @@
         ]
       },
       "get": {
-        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status,ownership`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` names the entity's state and is the same under every `$select`; `If-None-Match` with a current one returns a bodyless 304 whatever the `$select`, so a client sends only the `ETag` of a representation that holds every field it now selects.",
         "operationId": "types_registry.platform.get_entity",
         "parameters": [
           {
@@ -72395,7 +72658,7 @@
             }
           },
           {
-            "description": "An earlier `ETag` of this key under the same `$select`, or `*`",
+            "description": "An earlier `ETag` of this key, sent only while the client holds every field this `$select` names, or `*`",
             "in": "header",
             "name": "If-None-Match",
             "required": false,
@@ -72425,7 +72688,7 @@
             "description": "The requested entity",
             "headers": {
               "ETag": {
-                "description": "The validator of this key under this `$select`",
+                "description": "The validator of this key's current state, the same under every `$select`",
                 "schema": {
                   "type": "string"
                 }
@@ -72436,7 +72699,7 @@
             "description": "The If-None-Match validator is current",
             "headers": {
               "ETag": {
-                "description": "The validator of this key under this `$select`",
+                "description": "The validator of this key's current state, the same under every `$select`",
                 "schema": {
                   "type": "string"
                 }
@@ -72740,7 +73003,7 @@
     },
     "/types-registry/v2/platform/entities:batchGet": {
       "post": {
-        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/platform/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
+        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/platform/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
         "operationId": "types_registry.platform.batch_get_entities",
         "requestBody": {
           "content": {
@@ -72881,6 +73144,154 @@
           }
         ],
         "summary": "Read a set of GTS entities by key",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/platform/entities:batchResolve": {
+      "post": {
+        "description": "Resolve up to 100 keys in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or a Registry Reference UUID), classified exactly as GET /types-registry/v2/platform/entities/{entity_key} classifies it. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the registered entity's stored `identity` (`gts_id` and `gts_uuid`), Active or deleted alike, or `not_found`. A result carries no lifecycle, `etag` or document, and resolution looks up no validator, schema fingerprint or document. A key named twice, in any UUID spelling, collapses onto its first mention; the identifier and the Registry Reference of one entity are two keys and get two results. The limit counts every item, duplicates included. Query parameters are refused.",
+        "operationId": "types_registry.platform.batch_resolve_identities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchResolveRequest"
+              }
+            }
+          },
+          "description": "Keys to resolve",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityResolutionsDto"
+                }
+              }
+            },
+            "description": "One result per requested key"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ],
+        "summary": "Resolve a set of GTS entity keys to canonical identities",
         "tags": [
           "Types Registry"
         ]

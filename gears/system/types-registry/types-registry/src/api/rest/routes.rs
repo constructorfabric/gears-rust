@@ -15,9 +15,9 @@ use toolkit::api::operation_builder::{
 };
 
 use super::dto::{
-    BatchGetRequest, DeleteEntitiesRequest, EntityDto, EntityLookupsDto, EntityPageDto,
-    GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto, OperationDto,
-    RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
+    BatchGetRequest, BatchResolveRequest, DeleteEntitiesRequest, EntityDto, EntityLookupsDto,
+    EntityPageDto, EntityResolutionsDto, GtsEntityDto, ListEntitiesResponse, OperationAcceptedDto,
+    OperationDto, RegisterEntitiesRequest, RegisterEntitiesResponse, SubmitEntitiesRequest,
 };
 use super::handlers;
 pub use super::paths::{PLATFORM, V1, V2};
@@ -77,6 +77,7 @@ pub fn register_routes(
     for plane in [Plane::Platform, Plane::Tenant] {
         router = register_exact_read(router, openapi, plane);
         router = register_batch_get(router, openapi, plane);
+        router = register_batch_resolve(router, openapi, plane);
         router = register_discovery(router, openapi, &limits, plane);
     }
 
@@ -125,7 +126,7 @@ fn idempotency_key_param() -> ParamSpec {
 fn etag_header() -> ResponseHeaderSpec {
     ResponseHeaderSpec::new(
         "ETag",
-        "The validator of this key under this `$select`",
+        "The validator of this key's current state, the same under every `$select`",
         ResponseHeaderType::String,
     )
 }
@@ -351,16 +352,18 @@ fn register_exact_read(router: Router, openapi: &dyn OpenApiRegistry, plane: Pla
             "Return one entity, projected by `$select`. The key is either a canonical GTS \
              identifier or the Registry Reference UUID derived from it; a key over 1024 \
              bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is \
-             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; \
+             the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status,ownership`; \
              documents are selected individually from `content`, \
              `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last \
              three Type Schemas only), plus the `provenance` group of a Type Schema \
              (omitted on an Instance). Names are \
              case-insensitive; an empty, duplicate, unknown or nested name is a 400. \
-             `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, \
+             `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always returned, \
              whether or not `$select` names them, so a deleted entity is still readable and \
-             reports it. No other query parameter is accepted. The `ETag` is scoped to the \
-             `$select`; `If-None-Match` with a current one returns a bodyless 304.",
+             reports it. No other query parameter is accepted. The `ETag` names the entity's \
+             state and is the same under every `$select`; `If-None-Match` with a current one \
+             returns a bodyless 304 whatever the `$select`, so a client sends only the `ETag` \
+             of a representation that holds every field it now selects.",
         )
         .tag(API_TAG);
     let builder = plane
@@ -374,7 +377,10 @@ fn register_exact_read(router: Router, openapi: &dyn OpenApiRegistry, plane: Pla
         .param(
             ParamSpec::header("If-None-Match")
                 .required(false)
-                .description("An earlier `ETag` of this key under the same `$select`, or `*`"),
+                .description(
+                    "An earlier `ETag` of this key, sent only while the client holds every \
+                     field this `$select` names, or `*`",
+                ),
         )
         .with_odata_select();
     let builder = match plane {
@@ -414,7 +420,8 @@ fn register_batch_get(router: Router, openapi: &dyn OpenApiRegistry, plane: Plan
              per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry \
              Reference in canonical lowercase hyphenated form: `found` \
              with the selected fields, exactly as the exact read returns them and always \
-             including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. \
+             including `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership`, or \
+             `not_found`. \
              Every result but `not_found` carries the key's `etag`; an item whose \
              `if_none_match` is still current answers `unchanged` without the entity. \
              Query parameters are refused, `$select` included. A key \
@@ -448,6 +455,51 @@ fn register_batch_get(router: Router, openapi: &dyn OpenApiRegistry, plane: Plan
         .register(router, openapi)
 }
 
+/// `POST {base}/entities:batchResolve`, on either plane: a key's canonical identity
+/// without its state.
+fn register_batch_resolve(router: Router, openapi: &dyn OpenApiRegistry, plane: Plane) -> Router {
+    let base = plane.base();
+    // A read-only custom action and a `POST` for the reasons `:batchGet` is.
+    let builder = OperationBuilder::post(format!("{base}/entities:batchResolve"))
+        .operation_id(plane.operation_id("batch_resolve_identities"))
+        .summary("Resolve a set of GTS entity keys to canonical identities")
+        .description(format!(
+            "Resolve up to 100 keys in one round trip. Each item names one entity in \
+             `entity_key` (a canonical GTS identifier or a Registry Reference UUID), \
+             classified exactly as GET {base}/entities/{{entity_key}} classifies it. \
+             Returns 200 with one result per distinct requested key, in no contractual \
+             order, echoing the key it was asked by, a Registry Reference in canonical \
+             lowercase hyphenated form: `found` with the registered entity's stored \
+             `identity` (`gts_id` and `gts_uuid`), Active or deleted alike, or `not_found`. \
+             A result carries no lifecycle, `etag` or document, and resolution looks up no \
+             validator, schema fingerprint or document. A key named twice, in any UUID \
+             spelling, collapses onto its first mention; the identifier and the Registry \
+             Reference of one entity are two keys and get two results. The limit counts \
+             every item, duplicates included. Query parameters are refused.",
+        ))
+        .tag(API_TAG);
+    let builder = plane
+        .authenticate(builder)
+        .require_license_features::<License>([])
+        .json_request::<BatchResolveRequest>(openapi, "Keys to resolve");
+    let builder = match plane {
+        Plane::Platform => builder.handler(handlers::platform_batch_resolve_entities),
+        Plane::Tenant => builder.handler(handlers::batch_resolve_entities),
+    };
+    builder
+        .json_response_with_schema::<EntityResolutionsDto>(
+            openapi,
+            StatusCode::OK,
+            "One result per requested key",
+        )
+        .standard_errors(openapi)
+        .error_413(openapi)
+        .error_415(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .register(router, openapi)
+}
+
 /// `GET {base}/entities` — the bounded, projected discovery page (D12, T22a, T22b), on
 /// either plane.
 fn register_discovery(
@@ -467,8 +519,8 @@ fn register_discovery(
              `lifecycle_status` is `active` (default), `deleted` \
              (tombstones only) or `all`. Each item is projected by `$select` \
              exactly as GET {base}/entities/{{entity_key}} projects it; absent, the \
-             document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are \
-             always returned. A page never carries a validator. `depth` bounds the number of \
+             document-free default; `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and \
+             `ownership` are always returned. A page never carries a validator. `depth` bounds the number of \
              identifier segments and `kind` narrows to Type Schemas or Instances; \
              `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page \
              limit. `limit` (alias `$top`) \

@@ -34,6 +34,18 @@ pub enum OwnershipScope {
     Tenant,
 }
 
+/// How a read discloses ownership relative to the Context Tenant: never an owning
+/// tenant identifier.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Ownership {
+    Global,
+    /// Owned by the Context Tenant.
+    ContextTenant,
+    /// Owned by an ancestor of the Context Tenant.
+    AncestorTenant,
+}
+
 /// What kind of entity an identifier names.
 ///
 /// Follows from the identifier's trailing `~`; it is carried explicitly because

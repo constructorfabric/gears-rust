@@ -2,24 +2,25 @@
 //! directions.
 //!
 //! A recording decorator makes every read observable: its request, and which context
-//! object it was made under. It can also answer a Registry Reference other than the
+//! object it was made under. It resolves through [`resolve_through_batch_get`], as a test
+//! double with only a batch read does. It can also answer a Registry Reference other than the
 //! identifier's own, to show the helpers return what the registry read, not a local hash.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use gts::{GtsId, GtsInstanceId, GtsTypeId};
-use parking_lot::Mutex;
 use serde_json::json;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use uuid::Uuid;
 
-use super::MAX_BATCH_GET_KEYS;
+use super::{MAX_BATCH_GET_KEYS, resolve_through_batch_get};
 use crate::testing_platform::{Call, Fault, MockTypesRegistry, ProtocolFault, Seed};
 use crate::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, DeleteEntitiesRequest,
-    DeletionOperation, EntityKey, EntityLookup, FieldSelection, IdempotencyKey,
+    DeletionOperation, EntityIdentity, EntityKey, EntityLookup, FieldSelection, IdempotencyKey,
     ListEntitiesRequest, ListEntitiesResponse, Operation, PlatformTypesRegistryApi,
     PlatformTypesRegistryApiExt, Projection, RegisterEntitiesRequest, RegistrationOperation,
     TypesRegistryApi, TypesRegistryApiExt,
@@ -57,16 +58,16 @@ impl Recording {
     }
 
     fn reads(&self) -> Vec<BatchGetEntitiesRequest> {
-        self.reads.lock().clone()
+        self.reads.lock().expect("lock").clone()
     }
 
     fn record<C>(&self, ctx: &C, request: &BatchGetEntitiesRequest) {
-        self.reads.lock().push(request.clone());
-        self.contexts.lock().push(address(ctx));
+        self.reads.lock().expect("lock").push(request.clone());
+        self.contexts.lock().expect("lock").push(address(ctx));
     }
 
     fn answer(&self, mut response: BatchGetEntitiesResponse) -> BatchGetEntitiesResponse {
-        if let Some(uuid) = *self.answered_uuid.lock() {
+        if let Some(uuid) = *self.answered_uuid.lock().expect("lock") {
             for lookup in response.0.values_mut() {
                 if let EntityLookup::Found { entity, .. } = lookup {
                     entity.gts_uuid = uuid;
@@ -90,6 +91,7 @@ impl Recording {
         assert!(
             self.contexts
                 .lock()
+                .expect("lock")
                 .iter()
                 .all(|&seen| seen == address(ctx)),
             "every read is made under the caller's own context"
@@ -143,6 +145,16 @@ impl PlatformTypesRegistryApi for Recording {
     ) -> Result<Operation, CanonicalError> {
         self.inner.get_operation(ctx, operation_id).await
     }
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        resolve_through_batch_get(keys, |request| {
+            PlatformTypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -162,6 +174,16 @@ impl TypesRegistryApi for Recording {
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         TypesRegistryApi::list_entities(&self.inner, ctx, request).await
+    }
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        resolve_through_batch_get(keys, |request| {
+            TypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
     }
 }
 
@@ -350,7 +372,7 @@ macro_rules! plane_tests {
             async fn forward_helpers_answer_the_reference_the_registry_read() {
                 let client = Recording::seeded();
                 let answered = Uuid::from_u128(0xA5);
-                *client.answered_uuid.lock() = Some(answered);
+                *client.answered_uuid.lock().expect("lock") = Some(answered);
                 let api: &dyn $contract = &client;
                 let ctx = $context;
 
@@ -506,6 +528,39 @@ macro_rules! plane_tests {
             }
 
             #[tokio::test]
+            async fn a_reverse_read_answered_with_another_reference_fails() {
+                let client = Recording::seeded();
+                *client.answered_uuid.lock().expect("lock") = Some(Uuid::from_u128(0xA5));
+                let api: &dyn $contract = &client;
+                let ctx = $context;
+                assert_kind($ext::resolve_type_id(api, &ctx, uuid(TYPE)).await, internal);
+                assert_kind(
+                    $ext::resolve_instance_ids(api, &ctx, &[uuid(INSTANCE)]).await,
+                    internal,
+                );
+            }
+
+            /// A get answered with a consistent snapshot of another entity fails
+            /// rather than return it under the asked key.
+            #[tokio::test]
+            async fn a_get_answered_with_another_entitys_snapshot_fails() {
+                let client = Recording::seeded();
+                *client.answered_uuid.lock().expect("lock") = Some(Uuid::from_u128(0xA5));
+                let api: &dyn $contract = &client;
+                let ctx = $context;
+                assert_kind(
+                    $ext::get_type_schema_by_uuid(
+                        api,
+                        &ctx,
+                        uuid(TYPE),
+                        crate::ReadOptions::default(),
+                    )
+                    .await,
+                    internal,
+                );
+            }
+
+            #[tokio::test]
             async fn an_empty_resolution_needs_no_transport() {
                 let client = Recording::default();
                 let api: &dyn $contract = &client;
@@ -558,3 +613,298 @@ plane_tests!(
         .build()
         .expect("a caller context")
 );
+
+/// [`resolve_through_batch_get`] reads every key under the mandatory fields and answers
+/// each distinct key once: the registered entity it names, Active or deleted, or `None`.
+#[tokio::test]
+async fn resolving_through_a_batch_read_answers_every_distinct_key_from_one_light_read() {
+    let client = Recording::seeded();
+    let api: &dyn PlatformTypesRegistryApi = &client;
+    let ctx = PlatformSecurityContext::outbound_marker();
+    let keys = [
+        EntityKey::GtsId(GtsId::try_new(TYPE).expect("identifier")),
+        EntityKey::GtsUuid(uuid(DELETED_INSTANCE)),
+        EntityKey::GtsId(GtsId::try_new(UNREGISTERED_TYPE).expect("identifier")),
+    ];
+    let mut asked = keys.to_vec();
+    asked.push(keys[0].clone());
+
+    let identities = api
+        .batch_resolve_identities(&ctx, asked)
+        .await
+        .expect("read");
+
+    assert_eq!(client.reads().len(), 1);
+    client.assert_id_only_reads_under(&ctx);
+    assert_eq!(identities.len(), 3);
+    for (key, id) in [(&keys[0], TYPE), (&keys[1], DELETED_INSTANCE)] {
+        let gts_id = GtsId::try_new(id).expect("identifier");
+        let gts_uuid = gts_id.to_uuid();
+        assert_eq!(
+            identities[key],
+            Some(crate::EntityIdentity { gts_id, gts_uuid })
+        );
+    }
+    assert_eq!(identities[&keys[2]], None);
+}
+
+/// [`resolve_through_batch_get`] reads unconditionally, so a key its read leaves out, or
+/// answers `Unchanged`, is a broken read: it fails as `Internal` rather than posing as an
+/// absent entity.
+#[tokio::test]
+async fn resolving_through_a_batch_read_refuses_a_key_left_unanswered_or_unchanged() {
+    let key = EntityKey::GtsId(GtsId::try_new(TYPE).expect("identifier"));
+    let unchanged = EntityLookup::Unchanged {
+        etag: crate::Validator::from_bytes(b"etag".to_vec()),
+    };
+    for answer in [None, Some(unchanged)] {
+        let result = resolve_through_batch_get(vec![key.clone()], |_| {
+            let answered = answer.clone().map(|lookup| (key.clone(), lookup));
+            async move { Ok(BatchGetEntitiesResponse(answered.into_iter().collect())) }
+        })
+        .await;
+        assert!(
+            matches!(result, Err(CanonicalError::Internal { .. })),
+            "{answer:?}: {result:?}"
+        );
+    }
+}
+
+// the shared check of a batch resolution's answers.
+
+fn identity_of(id: &str) -> EntityIdentity {
+    let gts_id = GtsId::try_new(id).expect("identifier");
+    let gts_uuid = gts_id.to_uuid();
+    EntityIdentity { gts_id, gts_uuid }
+}
+
+/// A batch resolution's answers, by the key asked.
+type Answers = HashMap<EntityKey, Option<EntityIdentity>>;
+
+fn by_id(id: &str) -> EntityKey {
+    EntityKey::GtsId(GtsId::try_new(id).expect("identifier"))
+}
+
+/// What every client accepts from the registry's batch resolution: each distinct key
+/// answered once, found or absent, the identity of the entity its key names.
+#[test]
+fn a_consistent_resolution_is_accepted_per_distinct_key() {
+    let asked = vec![
+        by_id(TYPE),
+        EntityKey::GtsUuid(uuid(TYPE)),
+        by_id(UNREGISTERED_TYPE),
+        by_id(TYPE),
+    ];
+    let answered = HashMap::from([
+        (by_id(TYPE), Some(identity_of(TYPE))),
+        (EntityKey::GtsUuid(uuid(TYPE)), Some(identity_of(TYPE))),
+        (by_id(UNREGISTERED_TYPE), None),
+    ]);
+    assert_eq!(
+        super::checked_resolutions(&asked, answered.clone()).expect("consistent"),
+        answered
+    );
+}
+
+/// Anything else is a protocol fault of the whole batch, never an identity or an absence.
+#[test]
+fn an_inconsistent_resolution_is_refused_whole() {
+    let other_uuid = EntityKey::GtsUuid(uuid(INSTANCE));
+    let cases: Vec<(&str, Vec<EntityKey>, Answers)> = vec![
+        ("no answer at all", vec![by_id(TYPE)], HashMap::new()),
+        (
+            "an unasked key",
+            vec![by_id(TYPE)],
+            HashMap::from([(by_id(TYPE), None), (by_id(INSTANCE), None)]),
+        ),
+        (
+            "another entity's identity",
+            vec![by_id(TYPE)],
+            HashMap::from([(by_id(TYPE), Some(identity_of(INSTANCE)))]),
+        ),
+        (
+            "another Registry Reference's identity",
+            vec![other_uuid.clone()],
+            HashMap::from([(other_uuid, Some(identity_of(TYPE)))]),
+        ),
+        (
+            "two identifiers for one Registry Reference",
+            vec![by_id(TYPE), by_id(INSTANCE)],
+            HashMap::from([
+                (by_id(TYPE), Some(identity_of(TYPE))),
+                (
+                    by_id(INSTANCE),
+                    Some(EntityIdentity {
+                        gts_id: GtsId::try_new(INSTANCE).expect("identifier"),
+                        gts_uuid: uuid(TYPE),
+                    }),
+                ),
+            ]),
+        ),
+        (
+            "two Registry References for one identifier",
+            vec![
+                EntityKey::GtsUuid(uuid(TYPE)),
+                EntityKey::GtsUuid(uuid(INSTANCE)),
+            ],
+            HashMap::from([
+                (EntityKey::GtsUuid(uuid(TYPE)), Some(identity_of(TYPE))),
+                (
+                    EntityKey::GtsUuid(uuid(INSTANCE)),
+                    Some(EntityIdentity {
+                        gts_id: GtsId::try_new(TYPE).expect("identifier"),
+                        gts_uuid: uuid(INSTANCE),
+                    }),
+                ),
+            ]),
+        ),
+        (
+            "found by identifier, absent by Registry Reference",
+            vec![by_id(TYPE), EntityKey::GtsUuid(uuid(TYPE))],
+            HashMap::from([
+                (by_id(TYPE), Some(identity_of(TYPE))),
+                (EntityKey::GtsUuid(uuid(TYPE)), None),
+            ]),
+        ),
+        (
+            "found by Registry Reference, absent by identifier",
+            vec![EntityKey::GtsUuid(uuid(TYPE)), by_id(TYPE)],
+            HashMap::from([
+                (EntityKey::GtsUuid(uuid(TYPE)), Some(identity_of(TYPE))),
+                (by_id(TYPE), None),
+            ]),
+        ),
+    ];
+    for (what, asked, answered) in cases {
+        let error = super::checked_resolutions(&asked, answered).expect_err(what);
+        assert!(internal(&error), "{what}: {error:?}");
+    }
+}
+
+/// A tenant registry whose batch resolution answers `answers` whatever it is asked.
+struct Rigged {
+    answers: Answers,
+}
+
+#[async_trait]
+impl TypesRegistryApi for Rigged {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &SecurityContext,
+        _request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        unreachable!("the helpers resolve through batch resolution")
+    }
+    async fn list_entities(
+        &self,
+        _ctx: &SecurityContext,
+        _request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        unreachable!("the helpers resolve through batch resolution")
+    }
+    async fn batch_resolve_identities(
+        &self,
+        _ctx: &SecurityContext,
+        _keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        Ok(self.answers.clone())
+    }
+}
+
+/// The `resolve_*` helpers hold any implementation to the checks every SDK client
+/// applies: a reply that pairs two identifiers with one Registry Reference, names
+/// another entity, or answers a key not asked fails as `Internal`.
+#[tokio::test]
+async fn the_resolve_helpers_refuse_a_contradictory_batch_resolution() {
+    let ctx = SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x00C0_FFEE))
+        .subject_tenant_id(Uuid::from_u128(0x7E4A))
+        .build()
+        .expect("a caller context");
+    let shared = EntityIdentity {
+        gts_id: GtsId::try_new(DELETED_TYPE).expect("identifier"),
+        gts_uuid: uuid(TYPE),
+    };
+    let one_reference_for_two = Rigged {
+        answers: HashMap::from([
+            (by_id(TYPE), Some(identity_of(TYPE))),
+            (by_id(DELETED_TYPE), Some(shared)),
+        ]),
+    };
+    assert_kind(
+        one_reference_for_two
+            .resolve_type_uuids(&ctx, &[type_id(TYPE), type_id(DELETED_TYPE)])
+            .await,
+        internal,
+    );
+
+    let another_entity = Rigged {
+        answers: HashMap::from([(by_id(TYPE), Some(identity_of(DELETED_TYPE)))]),
+    };
+    assert_kind(
+        another_entity.resolve_type_uuid(&ctx, &type_id(TYPE)).await,
+        internal,
+    );
+    assert_kind(
+        another_entity
+            .resolve_type_uuids(&ctx, &[type_id(TYPE)])
+            .await,
+        internal,
+    );
+
+    let unasked = Rigged {
+        answers: HashMap::from([
+            (by_id(TYPE), Some(identity_of(TYPE))),
+            (by_id(DELETED_TYPE), Some(identity_of(DELETED_TYPE))),
+        ]),
+    };
+    assert_kind(
+        unasked.resolve_type_uuid(&ctx, &type_id(TYPE)).await,
+        internal,
+    );
+    assert_kind(
+        unasked.resolve_type_uuids(&ctx, &[type_id(TYPE)]).await,
+        internal,
+    );
+}
+
+/// [`resolve_through_batch_get`] holds a test double's read to the resolver contract:
+/// an answer for a key it was not asked fails the batch as `Internal`.
+#[tokio::test]
+async fn resolving_through_a_batch_read_refuses_an_answer_not_asked() {
+    let asked = by_id(TYPE);
+    let result = resolve_through_batch_get(vec![asked.clone()], |_| async {
+        let found = |id: &str| EntityLookup::Found {
+            entity: Box::new(light_entity(id)),
+            etag: crate::Validator::from_bytes(b"etag".to_vec()),
+        };
+        Ok(BatchGetEntitiesResponse(HashMap::from([
+            (by_id(TYPE), found(TYPE)),
+            (by_id(DELETED_TYPE), found(DELETED_TYPE)),
+        ])))
+    })
+    .await;
+    assert!(
+        matches!(result, Err(CanonicalError::Internal { .. })),
+        "{result:?}"
+    );
+}
+
+/// The mandatory fields of an Active global entity named `id`.
+fn light_entity(id: &str) -> crate::Entity {
+    let gts_id = GtsId::try_new(id).expect("identifier");
+    let (gts_uuid, kind) = (gts_id.to_uuid(), crate::EntityKind::of(&gts_id));
+    crate::Entity {
+        gts_id,
+        gts_uuid,
+        kind,
+        lifecycle_status: crate::LifecycleStatus::Active,
+        ownership: crate::Ownership::Global,
+        origin: None,
+        content: None,
+        resolved_schema: None,
+        effective_traits: None,
+        effective_traits_schema: None,
+        provenance: None,
+    }
+}

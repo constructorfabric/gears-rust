@@ -41,6 +41,7 @@ use types_registry::domain::registry_service::{
 };
 use types_registry::domain::selection::FieldSelection;
 use types_registry::domain::validator::IfNoneMatch;
+use types_registry::domain::validator::MAX_VALIDATOR_LEN;
 use types_registry::infra::storage::repo::{EntityRepo, InstanceRepo, TypeSchemaRepo};
 
 const NOW: OffsetDateTime = datetime!(2026-09-23 09:00:00 UTC);
@@ -471,19 +472,19 @@ async fn an_over_long_validator_is_refused_by_the_service(h: &Harness, backend: 
         .service
         .batch_get(
             common::caller(),
-            &[item(MAX_KEY_LEN + 1)],
+            &[item(MAX_VALIDATOR_LEN + 1)],
             FieldSelection::default(),
         )
         .await;
     assert!(
-        matches!(result, Err(ServiceError::ValidatorTooLong { len }) if len == MAX_KEY_LEN + 1),
+        matches!(result, Err(ServiceError::ValidatorTooLong { len }) if len == MAX_VALIDATOR_LEN + 1),
         "{backend}: {result:?}",
     );
     let at_bound = h
         .service
         .batch_get(
             common::caller(),
-            &[item(MAX_KEY_LEN)],
+            &[item(MAX_VALIDATOR_LEN)],
             FieldSelection::default(),
         )
         .await
@@ -491,6 +492,125 @@ async fn an_over_long_validator_is_refused_by_the_service(h: &Harness, backend: 
     assert!(
         matches!(at_bound.as_slice(), [(_, EntityLookup::Found { .. })]),
         "{backend}: {at_bound:?}",
+    );
+}
+
+/// Batch resolution reads only the `entity` table, with both key forms in one
+/// snapshot and a bounded number of statements.
+async fn a_resolution_reads_only_identity_rows(h: &Harness, backend: &str) {
+    let instance_uuid = gts::GtsId::try_new(INSTANCE).expect("identifier").to_uuid();
+    let absent = gts_id!("cf.core.projread.absent.v1~");
+    let keys = [
+        EntityKey::GtsId(TYPE.to_owned()),
+        EntityKey::Uuid(instance_uuid),
+        EntityKey::GtsId(absent.to_owned()),
+        EntityKey::GtsId(TYPE.to_owned()),
+    ];
+    h.recorder.clear();
+    let resolved = h
+        .service
+        .batch_resolve(common::caller(), &keys)
+        .await
+        .expect("resolution");
+    let found: Vec<_> = resolved
+        .iter()
+        .map(|(key, identity)| {
+            (
+                key.clone(),
+                identity
+                    .as_ref()
+                    .map(|identity| (identity.gts_id.clone(), identity.gts_uuid)),
+            )
+        })
+        .collect();
+    let type_uuid = gts::GtsId::try_new(TYPE).expect("identifier").to_uuid();
+    assert_eq!(
+        found,
+        [
+            (keys[0].clone(), Some((TYPE.to_owned(), type_uuid))),
+            (keys[1].clone(), Some((INSTANCE.to_owned(), instance_uuid))),
+            (keys[2].clone(), None),
+        ],
+        "{backend}: one answer per distinct key, in first-asked order"
+    );
+
+    let statements = assert_read_shape(&h.recorder, backend, "batch resolution");
+    assert!(
+        statements.len() <= 2,
+        "{backend}: one keyed read per spelling: {statements:#?}"
+    );
+    for sql in &statements {
+        assert!(
+            sql.contains("types_registry__entity"),
+            "{backend}: an identity row read: {sql}"
+        );
+        for other in [
+            "types_registry__type_schema",
+            "types_registry__instance",
+            "resolution_fingerprint",
+        ] {
+            assert!(
+                !sql.contains(other),
+                "{backend} must not read {other}: {sql}"
+            );
+        }
+    }
+    for column in DOCUMENT_COLUMNS {
+        assert!(!named(&statements, column), "{backend}: {statements:#?}");
+    }
+
+    // A regular batch read exercises the fingerprint lookup that resolution skips.
+    h.recorder.clear();
+    h.service
+        .batch_get(
+            common::caller(),
+            &[keys[0].clone().into()],
+            FieldSelection::default(),
+        )
+        .await
+        .expect("batch read");
+    let statements = assert_read_shape(&h.recorder, backend, "batch read");
+    assert!(
+        statements
+            .iter()
+            .any(|sql| sql.contains("types_registry__type_schema")),
+        "{backend}: {statements:#?}"
+    );
+}
+
+/// Invalid batch sizes and keys that cannot exist require no SQL. Duplicates count
+/// toward the raw batch limit.
+async fn a_refused_or_non_canonical_resolution_runs_no_sql(h: &Harness, backend: &str) {
+    h.recorder.clear();
+    let over = EntityKey::GtsId("a".repeat(MAX_KEY_LEN + 1));
+    let refused = h.service.batch_resolve(common::caller(), &[over]).await;
+    assert!(
+        matches!(refused, Err(ServiceError::KeyTooLong { len }) if len == MAX_KEY_LEN + 1),
+        "{backend}: {refused:?}"
+    );
+    let duplicates = vec![EntityKey::GtsId(TYPE.to_owned()); 101];
+    let refused = h.service.batch_resolve(common::caller(), &duplicates).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ServiceError::BatchReadOutOfRange { count: 101 })
+        ),
+        "{backend}: the raw count bounds the batch, duplicates included: {refused:?}"
+    );
+    let non_canonical = non_canonical_keys()
+        .into_iter()
+        .map(EntityKey::GtsId)
+        .collect::<Vec<_>>();
+    let absent = h
+        .service
+        .batch_resolve(common::caller(), &non_canonical)
+        .await
+        .expect("resolution");
+    assert!(absent.iter().all(|(_, identity)| identity.is_none()));
+    let events = h.recorder.events();
+    assert!(
+        events.is_empty(),
+        "{backend}: no SQL for refused or non-canonical keys: {events:#?}"
     );
 }
 
@@ -503,6 +623,8 @@ async fn assert_projected_reads(h: &Harness, backend: &str) {
     discovery_fetches_only_selected_documents(h, backend).await;
     selected_documents_are_fetched_and_only_they(h, backend).await;
     absent_columns_read_as_none_and_selected_ones_as_some(h, backend).await;
+    a_resolution_reads_only_identity_rows(h, backend).await;
+    a_refused_or_non_canonical_resolution_runs_no_sql(h, backend).await;
 }
 
 #[tokio::test]

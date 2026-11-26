@@ -8,18 +8,18 @@ use std::num::NonZeroU8;
 
 use gts::{GtsId, GtsIdPattern};
 use serde_json::{Value, json};
-use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
+use toolkit_canonical_errors::CanonicalError;
 use uuid::Uuid;
 
 use super::{
-    AcceptedWire, BatchGetBody, DeleteBody, LookupsWire, OperationWire, PageWire, SubmitBody,
-    discovery_query, parse, validator,
+    AcceptedWire, BatchGetBody, BatchResolveBody, DeleteBody, LookupsWire, OperationWire, PageWire,
+    ResolutionsWire, SubmitBody, discovery_query, parse, validator,
 };
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetItem, Cursor, DeleteEntitiesRequest, DeleteItem,
-    DeletionOutcome, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup,
-    FieldSelection, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, Operation,
+    DeletionOutcome, EntityField, EntityFilter, EntityIdentity, EntityKey, EntityKind,
+    EntityLookup, FieldSelection, LifecycleFilter, LifecycleStatus, ListEntitiesRequest, Operation,
     OperationStatus, Origin, PageRequest, Projection, PublisherContext, RegisterEntitiesRequest,
     RegisterItem, RegistrationOutcome, Validator,
 };
@@ -70,20 +70,45 @@ fn operation_in(status: &str, kind: &str, dry_run: bool, items: &Value) -> Value
 
 // ---- validators -----------------------------------------------------------------
 
+/// `token` held for `TYPE` under the default projection.
+fn held(token: Validator) -> BatchGetItem {
+    BatchGetItem::for_cache_read(
+        id(TYPE).into(),
+        Some(token),
+        &Projection::Default.normalized(),
+    )
+}
+
+#[test]
+fn a_condition_that_does_not_apply_is_not_sent() {
+    let token = Validator::from_bytes("v1:abc");
+    let mut other = BatchGetItem::for_cache_read(
+        id(INSTANCE).into(),
+        Some(token.clone()),
+        &FieldSelection::full(),
+    );
+    other.key = id(TYPE).into();
+    for request_item in [other, held(token)] {
+        let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
+            items: vec![request_item],
+            projection: Projection::Select(FieldSelection::with(&[EntityField::Content])),
+            fresh: false,
+        });
+        let item = &serde_json::to_value(body).unwrap()["items"][0];
+        assert!(item.get("if_none_match").is_none(), "{item}");
+    }
+}
+
 #[test]
 fn a_validator_is_the_same_token_from_either_transport() {
     let received = validator("\"v1:abc\"").expect("a strong entity-tag");
     assert_eq!(received, Validator::from_bytes("v1:abc"));
 
     let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
-        items: vec![BatchGetItem {
-            key: EntityKey::from(id(TYPE)),
-            if_none_match: Some(received),
-        }],
+        items: vec![held(received)],
         projection: Projection::Default,
         fresh: false,
-    })
-    .expect("encodable");
+    });
     assert_eq!(
         serde_json::to_value(body).unwrap()["items"][0]["if_none_match"],
         json!("\"v1:abc\""),
@@ -102,49 +127,27 @@ fn an_entity_tag_the_registry_never_issues_is_refused() {
 fn a_validator_no_entity_tag_can_carry_is_sent_as_no_condition() {
     for token in [&b""[..], b"a b", b"caf\xc3\xa9", b"q\""] {
         let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
-            items: vec![BatchGetItem {
-                key: EntityKey::from(id(TYPE)),
-                if_none_match: Some(Validator::from_bytes(token)),
-            }],
+            items: vec![held(Validator::from_bytes(token))],
             projection: Projection::Default,
             fresh: false,
-        })
-        .expect("encodable");
+        });
         let item = &serde_json::to_value(body).unwrap()["items"][0];
         assert!(item.get("if_none_match").is_none(), "{token:?}: {item}");
     }
 }
 
 #[test]
-fn an_oversized_validator_is_refused_as_the_local_client_refuses_it() {
-    for token in [vec![b'a'; 1025], vec![0xff; 1025]] {
-        let encoded = BatchGetBody::encode(&BatchGetEntitiesRequest {
-            items: vec![BatchGetItem {
-                key: EntityKey::from(id(TYPE)),
-                if_none_match: Some(Validator::from_bytes(token)),
-            }],
-            projection: Projection::Default,
-            fresh: false,
-        });
-        let Err(CanonicalError::InvalidArgument {
-            ctx: InvalidArgument::FieldViolations { field_violations },
-            ..
-        }) = encoded
-        else {
-            panic!("refused, not sent: {encoded:?}");
-        };
-        assert_eq!(field_violations[0].field, "if_none_match");
-    }
-
-    let at_bound = BatchGetBody::encode(&BatchGetEntitiesRequest {
-        items: vec![BatchGetItem {
-            key: EntityKey::from(id(TYPE)),
-            if_none_match: Some(Validator::from_bytes(vec![b'a'; 1024])),
-        }],
+fn a_long_validator_is_sent_verbatim_for_the_registry_to_check() {
+    let token = "a".repeat(1025);
+    let body = BatchGetBody::encode(&BatchGetEntitiesRequest {
+        items: vec![held(Validator::from_bytes(token.as_bytes()))],
         projection: Projection::Default,
         fresh: false,
     });
-    assert!(at_bound.is_ok());
+    assert_eq!(
+        serde_json::to_value(body).unwrap()["items"][0]["if_none_match"],
+        format!("\"{token}\"")
+    );
 }
 
 // ---- requests ----------------------------------------------------------------------
@@ -254,13 +257,12 @@ fn a_batch_read_sends_the_selection_and_not_the_cache_flag() {
         items: vec![BatchGetItem::from(EntityKey::from(id(TYPE)))],
         projection: Projection::Select(FieldSelection::with(&[EntityField::Content])),
         fresh: true,
-    })
-    .expect("encodable");
+    });
     let body = serde_json::to_value(body).unwrap();
     assert_eq!(body["items"], json!([{"entity_key": TYPE}]));
     assert_eq!(
         body["$select"],
-        json!("gts_id,gts_uuid,kind,lifecycle_status,content")
+        json!("gts_id,gts_uuid,kind,lifecycle_status,ownership,content")
     );
     assert!(body.get("fresh").is_none());
 
@@ -268,8 +270,7 @@ fn a_batch_read_sends_the_selection_and_not_the_cache_flag() {
         items: vec![],
         projection: Projection::Default,
         fresh: false,
-    })
-    .expect("encodable");
+    });
     assert!(
         serde_json::to_value(default)
             .unwrap()
@@ -316,7 +317,7 @@ fn discovery_sends_every_filter_and_always_the_lifecycle() {
     assert_eq!(full[5].1, "c1");
     assert_eq!(
         full[6].1,
-        "gts_id,gts_uuid,kind,lifecycle_status,effective_traits_schema"
+        "gts_id,gts_uuid,kind,lifecycle_status,ownership,effective_traits_schema"
     );
 }
 
@@ -581,6 +582,7 @@ fn entity(extra: &Value) -> Value {
         "gts_uuid": UUID,
         "kind": "type_schema",
         "lifecycle_status": "active",
+        "ownership": "global",
     });
     entity
         .as_object_mut()
@@ -591,6 +593,26 @@ fn entity(extra: &Value) -> Value {
 
 fn decode_page(body: &Value) -> Result<crate::models::ListEntitiesResponse, CanonicalError> {
     parse::<PageWire>("page", body.to_string().as_bytes())?.decode()
+}
+
+/// `ownership` is required; nothing defaults to global.
+#[test]
+fn ownership_decodes_each_value_and_is_required() {
+    for (wire, ownership) in [
+        ("global", crate::models::Ownership::Global),
+        ("context_tenant", crate::models::Ownership::ContextTenant),
+        ("ancestor_tenant", crate::models::Ownership::AncestorTenant),
+    ] {
+        let page = decode_page(&json!({
+            "items": [entity(&json!({ "ownership": wire }))],
+            "page_info": {"limit": 50},
+        }))
+        .expect("decodes");
+        assert_eq!(page.items[0].ownership, ownership, "{wire}");
+    }
+    let mut missing = entity(&json!({}));
+    missing.as_object_mut().unwrap().remove("ownership");
+    assert!(decode_page(&json!({ "items": [missing], "page_info": {"limit": 50} })).is_err());
 }
 
 #[test]
@@ -688,6 +710,7 @@ fn each_lookup_decodes_with_its_validator() {
         panic!("found");
     };
     assert_eq!(entity.gts_id, id(TYPE));
+    assert_eq!(entity.gts_uuid, Uuid::parse_str(UUID).unwrap());
     assert_eq!(etag, &Validator::from_bytes("t1"));
     assert_eq!(
         lookups.get(&EntityKey::GtsUuid(Uuid::parse_str(UUID).unwrap())),
@@ -702,8 +725,33 @@ fn each_lookup_decodes_with_its_validator() {
 }
 
 #[test]
+fn a_condition_from_the_wire_revalidates_either_returned_key() {
+    let lookups = decode_lookups(&json!([{
+        "entity_key": TYPE, "status": "found", "etag": "\"t1\"", "entity": entity(&json!({})),
+    }]))
+    .expect("decoded");
+    let by_id = EntityKey::from(id(TYPE));
+    let by_uuid = EntityKey::from(Uuid::parse_str(UUID).unwrap());
+    let held = &lookups.0[&by_id];
+    let request = BatchGetEntitiesRequest::new(
+        [by_id, by_uuid].map(|key| BatchGetItem::new(key).revalidate(held)),
+    )
+    .with_projection(FieldSelection::light());
+    let body = serde_json::to_value(BatchGetBody::encode(&request)).unwrap();
+    assert_eq!(
+        body["items"],
+        json!([
+            {"entity_key": TYPE, "if_none_match": "\"t1\""},
+            {"entity_key": UUID, "if_none_match": "\"t1\""},
+        ])
+    );
+}
+
+#[test]
 fn an_inconsistent_or_repeated_lookup_is_refused() {
     let refused = [
+        json!([{"entity_key": INSTANCE, "status": "found", "etag": "\"t\"", "entity": entity(&json!({}))}]),
+        json!([{"entity_key": OPERATION, "status": "found", "etag": "\"t\"", "entity": entity(&json!({}))}]),
         json!([{"entity_key": TYPE, "status": "found", "etag": "\"t\""}]),
         json!([{"entity_key": TYPE, "status": "found", "entity": entity(&json!({}))}]),
         json!([{"entity_key": TYPE, "status": "unchanged"}]),
@@ -717,6 +765,81 @@ fn an_inconsistent_or_repeated_lookup_is_refused() {
     for items in refused {
         assert!(
             is_internal(&decode_lookups(&items)),
+            "{items} must be refused"
+        );
+    }
+}
+
+// batch resolution.
+
+fn decode_resolutions(
+    items: &Value,
+) -> Result<std::collections::HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+    parse::<ResolutionsWire>(
+        "resolutions",
+        json!({"items": items}).to_string().as_bytes(),
+    )?
+    .decode()
+}
+
+#[test]
+fn a_batch_resolution_sends_only_its_keys_canonically() {
+    let keys = [
+        EntityKey::from(id(TYPE)),
+        EntityKey::GtsUuid(Uuid::parse_str(&UUID.to_uppercase()).unwrap()),
+    ];
+    assert_eq!(
+        serde_json::to_value(BatchResolveBody::encode(&keys)).unwrap(),
+        json!({"items": [{"entity_key": TYPE}, {"entity_key": UUID}]})
+    );
+}
+
+/// The stored pair is taken as the registry states it: a Registry Reference that is no
+/// derivation of the identifier is still the entity's.
+#[test]
+fn each_resolution_decodes_to_the_stored_pair_or_absence() {
+    let resolved = decode_resolutions(&json!([
+        {"entity_key": TYPE, "status": "found", "identity": {"gts_id": TYPE, "gts_uuid": UUID}},
+        {"entity_key": UUID.to_uppercase(), "status": "found", "identity": {"gts_id": TYPE, "gts_uuid": UUID}},
+        {"entity_key": INSTANCE, "status": "not_found"},
+    ]))
+    .expect("decodes");
+    let identity = Some(EntityIdentity {
+        gts_id: id(TYPE),
+        gts_uuid: Uuid::parse_str(UUID).unwrap(),
+    });
+    assert_ne!(id(TYPE).to_uuid(), Uuid::parse_str(UUID).unwrap());
+    assert_eq!(resolved.len(), 3);
+    assert_eq!(resolved[&EntityKey::from(id(TYPE))], identity);
+    assert_eq!(
+        resolved[&EntityKey::GtsUuid(Uuid::parse_str(UUID).unwrap())],
+        identity
+    );
+    assert_eq!(resolved[&EntityKey::from(id(INSTANCE))], None);
+}
+
+#[test]
+fn a_malformed_or_repeated_resolution_is_refused() {
+    let identity = json!({"gts_id": TYPE, "gts_uuid": UUID});
+    let refused = [
+        json!([{"entity_key": TYPE, "status": "found"}]),
+        json!([{"entity_key": TYPE, "status": "not_found", "identity": identity}]),
+        json!([{"entity_key": TYPE, "status": "unchanged"}]),
+        json!([{"entity_key": INSTANCE, "status": "found", "identity": identity}]),
+        json!([{"entity_key": OPERATION, "status": "found", "identity": identity}]),
+        json!([{"entity_key": TYPE, "status": "found", "identity": {"gts_id": "not an id", "gts_uuid": UUID}}]),
+        json!([
+            {"entity_key": TYPE, "status": "not_found"},
+            {"entity_key": TYPE, "status": "not_found"},
+        ]),
+        json!([
+            {"entity_key": UUID, "status": "not_found"},
+            {"entity_key": UUID.to_uppercase(), "status": "not_found"},
+        ]),
+    ];
+    for items in refused {
+        assert!(
+            is_internal(&decode_resolutions(&items)),
             "{items} must be refused"
         );
     }

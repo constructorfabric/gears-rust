@@ -104,6 +104,14 @@ fn read() -> BatchGetEntitiesRequest {
     }
 }
 
+/// Force a registry read when testing a change of resolved endpoint.
+fn routed() -> BatchGetEntitiesRequest {
+    BatchGetEntitiesRequest {
+        fresh: true,
+        ..read()
+    }
+}
+
 /// Registers [`CF_TYPE`] on `server` only, through its own local client, and waits.
 async fn seed(server: &PlatformServer) {
     let local = LocalClient::new(Arc::clone(&server.service));
@@ -168,18 +176,18 @@ async fn the_platform_resolving_client_follows_the_registry() {
         tuning(&resolutions),
     );
 
-    assert_unavailable(client.batch_get_entities(&platform(), read()).await);
+    assert_unavailable(client.batch_get_entities(&platform(), routed()).await);
 
     directory.point(Directory::At(first.base_url.clone()));
     let at_first = client
-        .batch_get_entities(&platform(), read())
+        .batch_get_entities(&platform(), routed())
         .await
         .expect("served with the process's token");
     assert!(found(&at_first), "{at_first:?}");
 
     directory.point(Directory::At(second.base_url.clone()));
     let at_second = client
-        .batch_get_entities(&platform(), read())
+        .batch_get_entities(&platform(), routed())
         .await
         .expect("served by the registry it moved to");
     assert_eq!(
@@ -189,13 +197,13 @@ async fn the_platform_resolving_client_follows_the_registry() {
     );
 
     directory.point(Directory::Down);
-    assert_unavailable(client.batch_get_entities(&platform(), read()).await);
+    assert_unavailable(client.batch_get_entities(&platform(), routed()).await);
     assert_unavailable(client.get_operation(&platform(), Uuid::nil()).await);
 
     directory.point(Directory::At(first.base_url.clone()));
     assert!(found(
         &client
-            .batch_get_entities(&platform(), read())
+            .batch_get_entities(&platform(), routed())
             .await
             .expect("recovered")
     ));
@@ -235,18 +243,73 @@ async fn the_tenant_resolving_client_follows_the_registry_with_the_callers_beare
         "{refused:?}"
     );
 
+    // A global snapshot serves any trusted context, even without a forwarding token,
+    // while a miss reaches the registry with the caller's own credential.
+    let same_claims = |bearer: Option<&str>| {
+        let builder = SecurityContext::builder()
+            .subject_id(tenant().subject_id())
+            .subject_tenant_id(tenant().subject_tenant_id());
+        match bearer {
+            Some(bearer) => builder.bearer_token(bearer.to_owned()),
+            None => builder,
+        }
+        .build()
+        .expect("tenant context")
+    };
+    assert!(found(
+        &client
+            .batch_get_entities(&same_claims(None), read())
+            .await
+            .expect("the shared global snapshot")
+    ));
+    let no_bearer = SecurityContext::builder()
+        .subject_id(Uuid::from_u128(4))
+        .subject_tenant_id(tenant().subject_tenant_id())
+        .build()
+        .expect("tenant context");
+    assert!(
+        matches!(
+            client.batch_get_entities(&no_bearer, routed()).await,
+            Err(CanonicalError::Unauthenticated { .. })
+        ),
+        "a miss reaches the registry with no credential"
+    );
+
+    // The empty second registry distinguishes a cache hit from a forwarded read.
     directory.point(Directory::At(second.base_url.clone()));
-    assert_eq!(
-        client
+    assert!(found(
+        &client
             .batch_get_entities(&tenant(), read())
             .await
-            .expect("served by the registry it moved to")
-            .0
-            .values()
-            .next(),
-        Some(&EntityLookup::NotFound),
-        "the second registry holds nothing"
-    );
+            .expect("cache hit")
+    ));
+    assert!(matches!(
+        client
+            .batch_get_entities(&same_claims(Some("wrong-bearer")), routed())
+            .await,
+        Err(CanonicalError::Unauthenticated { .. })
+    ));
+    for (request, why) in [
+        (
+            routed(),
+            "a forced read reaches the second registry, which holds nothing",
+        ),
+        (read(), "its not_found dropped the global snapshot"),
+    ] {
+        assert_eq!(
+            client
+                .batch_get_entities(&tenant(), request)
+                .await
+                .expect("served by the registry it moved to")
+                .0
+                .values()
+                .next(),
+            Some(&EntityLookup::NotFound),
+            "{why}"
+        );
+    }
+    let mut fresh = read();
+    fresh.fresh = true;
 
     directory.point(Directory::Empty);
     assert_unavailable(
@@ -255,7 +318,7 @@ async fn the_tenant_resolving_client_follows_the_registry_with_the_callers_beare
             .await,
     );
     directory.point(Directory::Down);
-    assert_unavailable(client.batch_get_entities(&tenant(), read()).await);
+    assert_unavailable(client.batch_get_entities(&tenant(), fresh).await);
 
     directory.point(Directory::At(first.base_url.clone()));
     assert!(found(
@@ -395,4 +458,128 @@ async fn await_completed(
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+}
+
+/// A directory outage distinguishes hits from forwarded calls. Polling a successful
+/// registration drops the snapshot while the known pair still resolves offline.
+#[tokio::test]
+async fn the_platform_resolving_client_caches_above_resolution() {
+    use types_registry_sdk::{GtsTypeId, PlatformTypesRegistryApiExt};
+
+    let server = serve().await;
+    seed(&server).await;
+    let directory = Scripted::new(Directory::At(server.base_url.clone()));
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let client = PlatformTypesRegistryApiRestResolvingClient::new(
+        Arc::clone(&directory) as Arc<dyn EndpointResolver>,
+        "types-registry",
+        tuning(&resolutions),
+    );
+    let cached = read;
+    let version = |response: types_registry_sdk::BatchGetEntitiesResponse| match response
+        .0
+        .into_values()
+        .next()
+    {
+        Some(EntityLookup::Found { entity, .. }) => match entity.origin {
+            Some(types_registry_sdk::Origin::Managed {
+                resource_version, ..
+            }) => resource_version,
+            _ => panic!("a managed origin is selected"),
+        },
+        other => panic!("found, got {other:?}"),
+    };
+
+    // Cold: the SDK resolves through the real `:batchResolve` route.
+    let type_id = GtsTypeId::try_new(CF_TYPE).unwrap();
+    let uuid = client
+        .resolve_type_uuid(&platform(), &type_id)
+        .await
+        .expect("registered");
+    let warm = client
+        .batch_get_entities(&platform(), cached())
+        .await
+        .expect("warm");
+    assert_eq!(version(warm), 1);
+
+    directory.point(Directory::Down);
+    let hit = client
+        .batch_get_entities(&platform(), cached())
+        .await
+        .expect("answered by the cache, resolving nothing");
+    assert_eq!(version(hit), 1);
+    assert_unavailable(client.batch_get_entities(&platform(), routed()).await);
+
+    directory.point(Directory::At(server.base_url.clone()));
+    let submitted = client
+        .register_entities(
+            &platform(),
+            key("resolving-cache-update"),
+            RegisterEntitiesRequest {
+                items: vec![RegisterItem {
+                    gts_id: gts::GtsId::try_new(CF_TYPE).unwrap(),
+                    content: json!({
+                        "$id": format!("gts://{CF_TYPE}"),
+                        "$schema": "http://json-schema.org/draft-07/schema#",
+                        "type": "object",
+                        "description": "revised",
+                    }),
+                    expected_resource_version: Some(1),
+                    skip_compatibility_check: false,
+                }],
+                dry_run: false,
+                publisher: PublisherContext {
+                    name: "resolving-client-test".to_owned(),
+                    version: "1.0.0".parse().unwrap(),
+                },
+            },
+        )
+        .await
+        .expect("accepted");
+    let Operation::Registration(done) = await_completed(&client, submitted.operation_id).await
+    else {
+        panic!("a registration");
+    };
+    assert!(
+        matches!(
+            done.items[0].outcome,
+            RegistrationOutcome::Succeeded {
+                resource_version: 2
+            }
+        ),
+        "{:?}",
+        done.items
+    );
+
+    // The terminal outcome dropped the snapshot but kept the identity, which
+    // resolves with the directory down before any read could relearn it.
+    directory.point(Directory::Down);
+    assert_unavailable(client.batch_get_entities(&platform(), cached()).await);
+    assert_eq!(
+        client
+            .resolve_type_uuid(&platform(), &type_id)
+            .await
+            .expect("known"),
+        uuid
+    );
+    assert_eq!(
+        client
+            .resolve_type_id(&platform(), uuid)
+            .await
+            .expect("known"),
+        type_id
+    );
+    let unknown = GtsTypeId::try_new(gts_id!("cf.core.example.unknown.v1~")).unwrap();
+    assert_unavailable(client.resolve_type_uuid(&platform(), &unknown).await);
+
+    directory.point(Directory::At(server.base_url.clone()));
+    let after = client
+        .batch_get_entities(&platform(), cached())
+        .await
+        .expect("read");
+    assert_eq!(
+        version(after),
+        2,
+        "no stale entry after the terminal outcome"
+    );
 }

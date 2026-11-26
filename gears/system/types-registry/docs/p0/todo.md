@@ -48,7 +48,7 @@ OAGW E2E remains a transitional legacy composition: its profiles retain the regi
 
 Global inventory and the legacy API remain required. Existing embedded configurations still rely on that transitional inventory: `config/e2e-local.yaml`'s customer type depends on AM's tenant base, and `config/event-broker-standalone.yaml`'s configured event/topic documents depend on event-broker SDK bases. These configurations are not proof of a self-contained registry seed set or remote bootstrap. T40 must move such external-dependent setup to the owning application or explicit platform API setup before T42 removes global seeding; preserve their application scenarios.
 
-The dedicated remote AM executable/configuration pair/two-process suite is absent; T41/T43 retain the final process/isolation proof. T35a's compiled API and task-level verification are complete. T35b's mock schema admission is complete. T36's new SDK cache, T44/T45's server-side publisher guard and T46–T49's journal are not implemented. No full-fleet or full-P0 completion is claimed.
+The dedicated remote AM executable/configuration pair/two-process suite is absent; T41/T43 retain the final process/isolation proof. T35a's compiled API and task-level verification are complete. T35b's mock schema admission is complete. T36's SDK cache is implemented. T44/T45's server-side publisher guard and T46–T49's journal are not implemented. No full-fleet or full-P0 completion is claimed.
 
 **Recorded verification (2026-11-06).** Regression tests cover Firebase managed publication, rejection of deleted policy resource types and preservation of caller 401/403 refusals in mandatory AM tenant-type reads. AM/policy-engine library suites pass (964/216 tests), Firebase passes 38, the SDK with `rest-client` passes 346, and the toolkit publication/deployment and runtime-preparation suites pass 34 tests each. Inverting the policy lifecycle guard makes its regression fail again. The embedded example-server composition with static AuthN/AuthZ/TR/IdP, AM, resource-group and admission-control passed cold SQLite startup, platform REST schema readback, readiness, restart with unchanged schema metadata and graceful shutdown; its isolated copy of `e2e-local.yaml` adds a policy-engine database for the selected feature set. This is embedded smoke coverage, not the deferred two-process AM, full E2E or three-backend checkpoint proof.
 
@@ -60,7 +60,7 @@ The dedicated remote AM executable/configuration pair/two-process suite is absen
 
 ### Remaining execution order
 
-1. T35a is complete; implement T36 cache. Verify existing T37 runtime and T39 collectors/macros; close Checkpoint 7A. Their implementation does not depend on T36.
+1. T35a and T36 are complete. Verify existing T37 runtime and T39 collectors/macros; close Checkpoint 7A.
 2. T38a records the core migration delivered in this branch. T40 closes configuration ownership/selection gaps; T38b migrates remaining system/service gears in small per-gear slices, with RG and OAGW host prerequisites first.
 3. T41 proves the real AM host remotely after the relevant T38b slices; Checkpoint 8A gates the final publication cleanup, not the already implemented core migration. T38c migrates BSS after its system prerequisites. T38b/T38c keep the transitional legacy API available to unmigrated consumers.
 4. T38 deletes legacy and promotes both REST planes with all remaining callers (Checkpoint 7). T42 completes declaration coverage and removes global inventory after T38b/T38c, T40 and Checkpoint 8A. T43 proves final OoP/HA deployment (Checkpoint 8).
@@ -321,7 +321,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 
 ### - [x] T6: Typed configuration
 
-**Description:** Extend `TypesRegistryConfig` with `allow_compatibility_force`, `limits.*` (including P0's `activation_write_set`), `registration_policy` and `worker.*`, keeping the existing keys. The `local_client.cache.*` keys stay live — the cache is kept (SPEC §8.3) — and their reshaping into `freshness_window` / `store_bound` belongs to T36, not here.
+**Description:** Extend `TypesRegistryConfig` with `allow_compatibility_force`, `limits.*` (including P0's `activation_write_set`), `registration_policy` and `worker.*`, keeping the existing keys. The `local_client.cache.*` keys stay live — the cache is kept (SPEC §8.3) — and their reshaping into `freshness_window` / `max_size_bytes` belongs to T36, not here.
 
 Outcome and evidence: the criteria below. The per-task report was folded into these and deleted.
 
@@ -2306,7 +2306,7 @@ and quickstart, for the seven-route completeness check)
 
 ## Phase 7 — Both clients, real local AM, and every gear on the persistent registry
 
-Plans P26–P31 and P33. T28–T35, T34a and T35b are complete. T35a is also complete; the next SDK implementation task is **T36**. Verify the existing T37 runtime alongside the remaining migration work before T38; T32’s incomplete final verification and the remaining Checkpoint 7A gates stay open before the T38 cutover. T35a supplies the implemented compiled-payload wrapper; T35b has completed mock Type Schema admission before consumer cutover; existing task numbers stay unchanged.
+Plans P26–P31 and P33. T28–T36, including T34a–T35b, are complete. T35a supplies the compiled-payload wrapper and T35b mock Type Schema admission. Before T38, verify T37, finish T32's verification and close the remaining Checkpoint 7A gates. Task numbers stay unchanged.
 
 - **Traits and local clients (T29, T30).** Both contracts, the platform and tenant extension helpers and both local clients land together, in one pull request.
 - **Embedded local handoff (T31).** All linked inventory and `cfg.entities` are admitted into the database before the new APIs are published in ClientHub. A new gear can reconcile in `init()` without waiting for REST, T37 or the fleet migration.
@@ -2745,7 +2745,7 @@ A normative reference, not a task: its items carry no checkboxes. Each names its
 **Description:** Expose the seven platform operations behind `.platform_authenticated()` and the three tenant entity reads behind `.authenticated()`, sharing their domain calls.
 
 **Acceptance criteria:**
-- [x] Codecs round-trip projected snapshots, validators and operations without serde or HTTP on the semantic models; a received entity-tag becomes `Validator` without its RFC 9110 quotes and gets them back when sent, so a validator is the same token from either transport (SPEC §8.5); unknown failure reasons and context are preserved; omission and `null` stay distinct; a malformed operation payload is refused, not defaulted. Beyond the plan: a validator over the registry's 1024-byte bound is refused as the local client refuses it, and an operation item missing a member the registry always sends is refused (`TR-SDK/src/rest_client/dto_tests.rs`, mutation-checked)
+- [x] Codecs round-trip projected snapshots, validators and operations without serde or HTTP on the semantic models; a received entity-tag becomes `Validator` without its RFC 9110 quotes and gets them back when sent, so a validator is the same token from either transport (SPEC §8.5); unknown failure reasons and context are preserved; omission and `null` stay distinct; a malformed operation payload is refused, not defaulted. Beyond the plan: validator length is checked by the registry, and an operation item missing a member the registry always sends is refused (`TR-SDK/src/rest_client/dto_tests.rs`, mutation-checked)
 - [x] Every `PlatformTypesRegistryApi` method works over real TCP and meets the platform rows of the REST contract — `Idempotency-Key`, `Location`, `Retry-After`, `200`/`202`, read-back through `get_operation`, per-key `unchanged`, projection, bounded pagination and cursor/filter binding — with a freshly resolved internal token on every attempt and never a bearer. The exact read's `ETag`/`304` is served on the platform route but has no client method: the contract has no exact read, and the extension's single reads go through `batchGet`. A receipt is checked against its status and `Location`; a still-running operation is read back after the receipt's `Retry-After`, bounded by `retry.max_delay`; an operation read must answer the operation asked for
 - [x] Submit → poll → read returns real item outcomes, never a synthesized receipt; a lost read-back is `Aborted` `OPERATION_READ_FAILED` naming the accepted operation, and replaying the same key recovers it (D19); every platform method is a safe read or keyed, so every one retries under `ClientConfig::retry`
 - [x] The platform route set serves only `/types-registry/v2/platform/` with `.platform_authenticated()` (operation ids `types_registry.platform.*`); no tenant mutation or `get_operation` route exists; the three tenant entity reads keep their bearer and share their domain calls with the platform twins. C2, C6 and C8 source comments match the REST contract
@@ -2986,42 +2986,49 @@ Rust API; REST contracts and dependency versions are unchanged.
 
 ---
 
-### - [ ] T36: SDK client cache — freshness window, byte bound, `fresh` bypass
+### - [x] T36: SDK client cache — freshness window, byte bound, `fresh` bypass
 
 **Description:** Port the cache to the new `Entity` models as an SDK decorator over any `dyn PlatformTypesRegistryApi`, covering local and REST clients before T38's cutover (SPEC §8.3, DESIGN §3.3, P7/P22). T22d validators enable revalidation; T22b supplies projection isolation. Visibility and Context-Tenant dimensions stay fixed until P1 tenancy.
 
+**Delivered** in `TR-SDK/src/cache/` as `CachedPlatformTypesRegistry`, `CachedTypesRegistry` and `CacheSettings`. Registry-issued ID/UUID pairs index snapshots under both keys. The identity LRU has its own limit.
+
+- Validators cannot order revisions. All tickets in a batch are checked against the same pre-commit event state and released on completion, error or drop.
+  A fenced reply cannot fill the cache and drops a conflicting resident snapshot.
+- Missing or unexpected keys, wrong identities or fields, and `Unchanged` with the wrong or missing validator fail the whole read as `Internal`. Only a match on the caller's own condition returns `Unchanged` to the caller.
+- Forward invalid batch sizes intact. The registry checks forwarded validator lengths.
+
 **Acceptance criteria:**
-- [ ] Cache is typed on `Entity`; the `GtsTypeSchema` / `GtsInstance` implementation keeps serving the old trait until T38 deletes both
-- [ ] The cache lives in the SDK as a `PlatformTypesRegistryApi` decorator. Wrap the embedded host's new platform local API delivered in T31 here; the legacy cache remains until T38. T41's real AM local/resolving clients use this decorator. Where a remote consumer's cache settings come from is decided and documented without adding a per-consumer key to the registry's config (SPEC §10.3)
-- [ ] Bound is **bytes** (`store_bound`, default 64MB), LRU-evicted — not an entry count. §3.2 caps one resolved document at 1MB, so the old `capacity: 1024` permitted ~1GB
-- [ ] Freshness window (`freshness_window`, default 30s per DESIGN); `0s` is meaningful and disables the window rather than being rejected
-- [ ] `fresh` on a read bypasses the window for that call and revalidates unconditionally against the entry's validator
-- [ ] **Expiry revalidates, it does not drop:** expired keys and their validators go out in **one** batched conditional `batchGet` — DESIGN's batch poll scheduling — and an `unchanged` result refreshes the confirmation instant while keeping the snapshot. Demand-driven, no timer
-- [ ] A failed revalidation **propagates the error and never extends the window** (`principle-fail-closed`); an entry is never served while its revalidation is in flight past the window
-- [ ] A terminal successful registration or deletion outcome invalidates every local entry for each returned identifier/UUID pair, under **both** key forms. A `202` acceptance invalidates nothing — the client has not observed the mutation yet
-- [ ] **Late-fill guard (historical decision P23):** each key carries a generation advanced by an observed terminal outcome or by a `fresh` read returning a new validator; a read started before the advance never fills the entry when it completes, for any projection or key form
-- [ ] The byte bound counts canonical payload bytes, once per snapshot whichever key form indexes it; no synchronous lock is held across a network await
-- [ ] A metadata-only publisher confirmation (SPEC D18) changes no cached representation; the publisher stamp is not cached
-- [ ] Entries are indexed by identifier and by UUID, so either resolution direction hits one snapshot
-- [ ] Never cached, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource
-- [ ] The key carries T22b's normalized selected-field set, with visibility context and Context Tenant as fixed P0 markers. A narrow cached representation is never returned for a wider selection; P1 adds real tenant dimensions without reshaping the key
-- [ ] `freshness_window` / `store_bound` configure the new cache; the four old keys become accepted-and-ignored in T38, when the old cache goes. A `ponytail:`-style comment records what is left of ceiling C7 (the key dimensions, not revalidation)
-- [ ] The tenant API gets no cache in P0: this task specifies none and introduces no tenant-cache semantics
+- [x] Cache is typed on `Entity`; the `GtsTypeSchema` / `GtsInstance` implementation keeps serving the old trait until T38 deletes both
+- [x] SDK decorators cover the T31 local APIs and resolving clients, including T41's AM clients. Each remote logical client uses SDK defaults above endpoint resolution (SPEC §10.3). The legacy cache remains until T38.
+- [x] Snapshot LRU enforces `max_size_bytes` (64 MiB) and `max_entries` (16 384). The 1 MB document cap alone let the old 1024-entry limit retain about 1 GB.
+- [x] `freshness_window` defaults to 30 s. Zero forces a registry check on every snapshot read.
+- [x] `fresh` forces a registry check, using the resident validator when its snapshot covers the projection.
+- [x] Expired keys revalidate in one demand-driven `batchGet`. `Unchanged` updates the confirmation time and keeps the snapshot.
+- [x] A failed revalidation **propagates the error and never extends the window** (`principle-fail-closed`); an entry is never served while its revalidation is in flight past the window
+- [x] Observing a terminal `Succeeded` registration or deletion invalidates both keys. A `202` receipt and dry-run `WouldSucceed` do not.
+- [x] The per-entity event count fences older reads across both keys and all projections (P23). Observed mutations and recorded replies, including `NotFound` or a changed validator, advance it.
+- [x] Enforce the per-snapshot byte charge from SPEC §8.3. Merges reuse measured fields. Size and clone outside the store lock and release it before network I/O.
+- [x] A metadata-only publisher confirmation (SPEC D18) changes no cached representation; the publisher stamp is not cached
+- [x] Entries are indexed by identifier and by UUID, so either resolution direction hits one snapshot
+- [x] Never cached as snapshots, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource. Discovery items may still teach and classify ID/UUID pairs in the separate identity LRU.
+- [x] An entry tracks the normalized set of fields it can serve. The tenant cache checks visibility separately from field coverage
+- [x] `freshness_window`, `max_size_bytes` and `max_entries` configure the snapshot cache; the four old keys become accepted-and-ignored in T38, when the old cache goes
+- [x] Authenticated readers share fresh global snapshots. Tenant-owned snapshots are per reader tenant, share byte-identical documents in the same field, and require confirmation for the same read context (SPEC §8.3).
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (runs SDK cache tests), plus `cargo test -p cf-gears-types-registry` for adapter parity
-- [ ] Test: read inside the window after a direct database change returns the cached value; the same read with `fresh` returns the new one
-- [ ] Test: `0s` window never serves a cached entry
-- [ ] Test: terminal outcome invalidates under identifier **and** UUID; a bare `202` invalidates nothing
-- [ ] Test: byte bound evicts on one 1MB document where a thousand small entries do not
-- [ ] Test: each of the four never-cached cases
-- [ ] Test: the same entity under two projections occupies distinct entries, while a reordered, case-varied or explicit-default selection reuses its normalized entry
-- [ ] Test: a failed read leaves no entry and does not extend an existing window
-- [ ] Test: an expired entry whose content did not change is revalidated to `unchanged` and **kept**, not refetched — assert on the absence of a full-snapshot response, not only on the returned value
-- [ ] Test: two expired keys produce **one** conditional `batchGet`, not two
-- [ ] Test: a failed revalidation surfaces the error and leaves the window unextended
-- [ ] Test: `read(old)` starts, a terminal outcome invalidates, `read(old)` completes — the entry stays empty and the next read fetches the new snapshot
-- [ ] Gear test through the real local client and the REST client: register → poll → read shows no stale entry after the terminal outcome
+- [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (runs SDK cache tests), plus `cargo test -p cf-gears-types-registry` for adapter parity
+- [x] SDK mock and booted host (`local_client_boot_test`): an unobserved row change remains cached inside the window, and `fresh` reads the new value.
+- [x] Test: `0s` window never serves a cached entry
+- [x] Test: terminal outcome invalidates under identifier **and** UUID; a bare `202` invalidates nothing
+- [x] Test: byte bound evicts on one 1MB document where a thousand small entries do not
+- [x] Test: each of the four never-cached cases leaves no snapshot; a discovery page teaches only identity pairs
+- [x] Test: projections of one entity share one entry when compatible. Default and reordered selections normalize, and the REST parser folds field case.
+- [x] Test: a failed read leaves no entry and does not extend an existing window
+- [x] Test: expired, unchanged entries keep the snapshot. Assert that revalidation transfers no full snapshot.
+- [x] Test: two expired keys produce **one** conditional `batchGet`, not two
+- [x] Test: a failed revalidation surfaces the error and leaves the window unextended
+- [x] Test: `read(old)` starts, a terminal outcome invalidates, `read(old)` completes — the entry stays empty and the next read fetches the new snapshot
+- [x] Gear test through the real local client and the REST client: register → poll → read shows no stale entry after the terminal outcome
 
 **Dependencies:** T35, T29, T31 (embedded local API), T22d **Files likely touched:** `TR-SDK/src/cache/` (moved from `TR/src/infra/cache/`), `TR/src/domain/local_client.rs`, `TR/src/gear.rs`, `TR/src/config.rs`, `TR-SDK/tests/client_cache_test.rs` **Scope:** M
 

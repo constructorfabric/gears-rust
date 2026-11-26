@@ -4,8 +4,7 @@ use axum::http::{HeaderMap, HeaderValue, header};
 use toolkit_canonical_errors::Problem;
 
 use super::{header_condition, item_condition};
-use crate::domain::registry_service::MAX_KEY_LEN;
-use crate::domain::validator::IfNoneMatch;
+use crate::domain::validator::{IfNoneMatch, MAX_VALIDATOR_LEN};
 
 fn headers(lines: &[&[u8]]) -> HeaderMap {
     let mut map = HeaderMap::new();
@@ -87,7 +86,7 @@ fn a_lone_wildcard_is_any() {
 /// one, and answered unconditionally.
 #[test]
 fn an_unreadable_header_is_refused_rather_than_ignored() {
-    let over = format!("\"{}\"", "v".repeat(MAX_KEY_LEN + 1));
+    let over = format!("\"{}\"", "v".repeat(MAX_VALIDATOR_LEN + 1));
     for lines in [
         vec![b"*, \"a\"".as_slice()],
         vec![b"*".as_slice(), b"\"a\"".as_slice()],
@@ -111,7 +110,7 @@ fn an_unreadable_header_is_refused_rather_than_ignored() {
 
 #[test]
 fn a_header_tag_at_the_bound_is_read() {
-    let at = "v".repeat(MAX_KEY_LEN);
+    let at = "v".repeat(MAX_VALIDATOR_LEN);
     let map = headers(&[format!("\"{at}\"").as_bytes()]);
     assert_eq!(header_condition(&map).expect("read"), Some(tags(&[&at])));
 }

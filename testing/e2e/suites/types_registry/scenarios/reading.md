@@ -1,10 +1,12 @@
 # Exact and batch read scenarios
 
-End-to-end read scenarios cover exact `GET /entities/{entity_key}`, `:batchGet` and conditional reads over live entities and tombstones. The local launcher uses **SQLite**; these tests do not prove PostgreSQL/MySQL or tenant/PDP behavior.
+End-to-end read scenarios cover exact `GET /entities/{entity_key}`, `:batchGet`, `:batchResolve` and conditional reads over live entities and tombstones. The local launcher uses **SQLite**; these tests do not prove PostgreSQL/MySQL or tenant/PDP behavior.
 
-Every scenario has an e2e test in [test_reading.py](../test_reading.py); the [suite README](../README.md) lists each group. Each scenario lists its source fixtures before Given and refers to them by name in Given/When/Then; all fixture links point to `fixtures/reading/`. Every scenario uses a fresh namespace, and registration and deletion in a Given are completed before the read. Independent `other_*` and `device_*` entities are controls: they show that each response answers its own key and that unrequested entities stay out of it.
+[Read tests](../test_reading.py) and [resolution tests](../test_resolution.py) cover every scenario in the [suite index](../README.md). Each scenario uses named fixtures from `fixtures/reading/`, a fresh namespace and completed setup operations.
+Independent `other_*` and `device_*` entities check keys and omissions.
 
-Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` accompany every selection, and an absent `$select` returns the document-free default metadata. A field that does not apply to an entity's kind is absent, not `null`. Batch results are matched by echoed `entity_key` after checking completeness and uniqueness, because batch order is not contractual. ETags are compared byte for byte; a `304` carries its ETag and has no body. Reads follow a terminal operation immediately, without sleeps or retries.
+Tests compare whole JSON responses. Exact and batch reads include `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`. The default selection is document-free and inapplicable fields are omitted. Batch results must echo each distinct key.
+Exact and batch validators match byte for byte. A `304` carries its ETag and no body. Reads follow terminal operations without sleeps or retries.
 
 ## Contents
 
@@ -30,8 +32,12 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 - [Conditional reads](#conditional-reads)
   - [TR-READ-301 — An exact ETag survives no-op admission and changes after revision](#tr-read-301--an-exact-etag-survives-no-op-admission-and-changes-after-revision)
   - [TR-READ-302 — Batch revalidation answers each key independently](#tr-read-302--batch-revalidation-answers-each-key-independently)
-  - [TR-READ-303 — A validator belongs to one projection](#tr-read-303--a-validator-belongs-to-one-projection)
+  - [TR-READ-303 — A validator names the state under every projection](#tr-read-303--a-validator-names-the-state-under-every-projection)
   - [TR-READ-304 — A base refresh invalidates its derived schema's ETag](#tr-read-304--a-base-refresh-invalidates-its-derived-schemas-etag)
+- [Batch resolution](#batch-resolution)
+  - [TR-READ-401 — Both planes resolve every distinct key to its stored identity](#tr-read-401--both-planes-resolve-every-distinct-key-to-its-stored-identity)
+  - [TR-READ-402 — A deleted entity keeps its identity](#tr-read-402--a-deleted-entity-keeps-its-identity)
+  - [TR-READ-404 — A resolution takes no selection or condition](#tr-read-404--a-resolution-takes-no-selection-or-condition)
 
 ## Exact read
 
@@ -221,15 +227,16 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 
 **Then:** the first conditional batch returns HTTP `200`: other is `unchanged` with the same `etag` and no `entity`; person is `found` with its revised document and new `etag`; the unconditioned Instance is `found` with its own content and `etag`; the absent key is `not_found` without either field. The second batch returns HTTP `200` with three `unchanged` results. Match every result by echoed key after checking completeness and uniqueness, since batch order is not contractual; a UUID key is echoed lowercase and hyphenated.
 
-### TR-READ-303 — A validator belongs to one projection
+### TR-READ-303 — A validator names the state under every projection
 
 **Fixtures:** [person_schema](../fixtures/reading/person_schema.json), [person_instance](../fixtures/reading/person_instance.json), [other_schema](../fixtures/reading/other_schema.json), [other_instance](../fixtures/reading/other_instance.json).
 
 **Given:** Register `person_schema`, `person_instance`, `other_schema`, and `other_instance` in one fresh namespace. Person and other schema documents differ.
 
-**When:** GET `person_schema` and `person_instance` without `$select` and retain their ETags. GET each key with `$select=content` and `If-None-Match` set to its metadata ETag; repeat each with its content response's ETag. GET `other_schema` with `$select=content` as a contrasting key.
+**When:** GET `person_schema` and `person_instance` without `$select` and retain their ETags. GET each key with `$select=content` unconditionally, then again with `If-None-Match` set to its retained ETag. GET `other_schema` with `$select=content` as a contrasting key.
 
-**Then:** both wider reads return `200`, their own full authored content and ETags different from their metadata ETags; their repeats return bodyless `304` carrying the corresponding content ETags. The other schema returns its own document. A metadata validator never declares a wider schema or Instance representation unchanged.
+**Then:** both content reads return `200` with the full authored content and the metadata ETag. After the client holds that content, conditional reads return bodyless `304` with the same ETag. The SDK binds conditions to held fields.
+`other_schema` returns its own document.
 
 ### TR-READ-304 — A base refresh invalidates its derived schema's ETag
 
@@ -240,3 +247,39 @@ Responses are compared whole as JSON values. The mandatory `gts_id`, `gts_uuid`,
 **When:** submit `trait_base_schema_revised`, changing only the base title under `expected_resource_version=1`, and await a successful item. GET the derived schema and both controls with the same selection and their old ETags; repeat the derived read with its new ETag.
 
 **Then:** the derived old ETag returns `200`: its resolved schema contains the revised base title and still requires `payload.employee_id`, its own `resource_version` remains 1, and its ETag changes. Both independent control reads return bodyless `304` with unchanged ETags. The derived new ETag also returns a bodyless `304`. No read retry is needed after the base operation completes.
+
+## Batch resolution
+
+Both `:batchResolve` routes return the stored `gts_id` and `gts_uuid` for each distinct key, including tombstones, or `not_found` for absent keys. Setup uses the platform API. Expected Registry References come from the fixture identifiers.
+
+### TR-READ-401 — Both planes resolve every distinct key to its stored identity
+
+**Fixtures:** [person_schema](../fixtures/reading/person_schema.json), [person_instance](../fixtures/reading/person_instance.json), [other_schema](../fixtures/reading/other_schema.json), [other_instance](../fixtures/reading/other_instance.json).
+
+**Given:** register `person_schema`, `person_instance`, `other_schema` and `other_instance` in one fresh namespace through the platform API. Prepare an absent valid GTS ID in that namespace and an unregistered UUID.
+
+**When:** send the same batch to the platform route (internal token) and tenant route (bearer): schema ID, uppercase schema Registry Reference, instance ID, repeated schema ID, lowercase schema Registry Reference, absent ID and absent UUID.
+
+**Then:** both planes return the same five results by echoed key in `200` responses.
+The schema resolves under its ID and canonical lowercase, hyphenated UUID.
+Repeated keys collapse. The instance returns its own identity. The two absent keys have `not_found` without identity. Lifecycle, validators, documents and unrequested `other_*` entities are omitted.
+
+### TR-READ-402 — A deleted entity keeps its identity
+
+**Fixtures:** [person_schema](../fixtures/reading/person_schema.json).
+
+**Given:** register `person_schema` in a fresh namespace. Resolve `person_schema` by its GTS ID and by its Registry Reference beside an absent GTS ID.
+
+**When:** delete `person_schema` with a completed, succeeded operation and resolve the same three keys again.
+
+**Then:** both `200` responses match by echoed key. Both schema keys keep the same identity and the absent key stays `not_found`.
+
+### TR-READ-404 — A resolution takes no selection or condition
+
+**Fixtures:** [person_schema](../fixtures/reading/person_schema.json).
+
+**Given:** `person_schema`'s GTS ID is a valid, unregistered key in a fresh namespace.
+
+**When:** POST `:batchResolve` for `person_schema` with `$select=gts_id` as a query parameter, then with an item `if_none_match`.
+
+**Then:** the query returns `400` with an `UNSUPPORTED_QUERY_PARAM` violation of `$select`. The item condition returns `422` with an `invalid_json_body` violation whose description names `if_none_match`.

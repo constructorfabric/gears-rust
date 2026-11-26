@@ -163,6 +163,23 @@ impl types_registry_sdk::PlatformTypesRegistryApi for Tampered {
     ) -> Result<types_registry_sdk::Operation, CanonicalError> {
         self.inner.get_operation(ctx, operation_id).await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::PlatformTypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
+    }
 }
 
 /// Fixture for opaque tenant-type UUIDs: every UUID read returns the same typed
@@ -194,6 +211,7 @@ impl types_registry_sdk::PlatformTypesRegistryApi for ConstantTypeRegistry {
                                 gts_uuid: uuid,
                                 kind: types_registry_sdk::EntityKind::TypeSchema,
                                 lifecycle_status: types_registry_sdk::LifecycleStatus::Active,
+                                ownership: types_registry_sdk::Ownership::Global,
                                 origin: None,
                                 content: None,
                                 resolved_schema: None,
@@ -246,6 +264,23 @@ impl types_registry_sdk::PlatformTypesRegistryApi for ConstantTypeRegistry {
         _operation_id: Uuid,
     ) -> Result<types_registry_sdk::Operation, CanonicalError> {
         Err(not_implemented())
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::PlatformTypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
     }
 }
 
@@ -370,6 +405,21 @@ impl<R: types_registry_sdk::TypesRegistryApi + 'static> types_registry_sdk::Type
         self.tenant(ctx);
         self.inner.list_entities(ctx, request).await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        CanonicalError,
+    > {
+        self.tenant(ctx);
+        self.inner.batch_resolve_identities(ctx, keys).await
+    }
 }
 
 #[async_trait]
@@ -421,6 +471,21 @@ impl<R: types_registry_sdk::PlatformTypesRegistryApi + 'static>
     ) -> Result<types_registry_sdk::Operation, CanonicalError> {
         self.platform();
         self.inner.get_operation(ctx, operation_id).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        CanonicalError,
+    > {
+        self.platform();
+        self.inner.batch_resolve_identities(ctx, keys).await
     }
 }
 
@@ -492,6 +557,23 @@ impl types_registry_sdk::TypesRegistryApi for Tampered {
         )
         .await
     }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::TypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -515,6 +597,23 @@ impl types_registry_sdk::TypesRegistryApi for ConstantTypeRegistry {
         _request: types_registry_sdk::ListEntitiesRequest,
     ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
         Err(not_implemented())
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::SecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+            types_registry_sdk::TypesRegistryApi::batch_get_entities(self, ctx, request)
+        })
+        .await
     }
 }
 

@@ -162,6 +162,7 @@ mod narrowed {
             gts_uuid: Uuid::from_u128(7),
             kind,
             lifecycle_status: LifecycleStatus::Active,
+            ownership: crate::models::Ownership::Global,
             origin: None,
             content: Some(json!({ "n": 1 })),
             resolved_schema: None,
@@ -216,6 +217,27 @@ mod narrowed {
         );
         assert_eq!(instance.type_id, GtsTypeId::try_new(TYPE).expect("valid"));
         assert_eq!(instance.content, Some(json!({ "n": 1 })));
+    }
+
+    /// Both typed views keep the mandatory `ownership` rather than defaulting it.
+    #[test]
+    fn typed_views_keep_the_ownership() {
+        use crate::models::Ownership;
+        let ownership = Ownership::AncestorTenant;
+        let mut schema = snapshot(TYPE, EntityKind::TypeSchema);
+        schema.ownership = ownership;
+        let mut instance = snapshot(INSTANCE, EntityKind::Instance);
+        instance.ownership = ownership;
+        assert_eq!(
+            TypeSchema::try_from(schema)
+                .expect("a Type Schema")
+                .ownership,
+            ownership
+        );
+        assert_eq!(
+            Instance::try_from(instance).expect("an Instance").ownership,
+            ownership
+        );
     }
 
     #[test]
@@ -483,26 +505,21 @@ fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
     let first = EntityKey::from(id("gts.cf.example.batch.thing.v1~"));
     let second = EntityKey::from(Uuid::nil());
     let validator = Validator::from_bytes(b"etag".to_vec());
-    let request = BatchGetEntitiesRequest::new([
-        BatchGetItem::new(first.clone()),
-        BatchGetItem::new(second.clone()).with_if_none_match(validator.clone()),
-    ]);
+    let item = BatchGetItem::for_cache_read(
+        second.clone(),
+        Some(validator.clone()),
+        &Projection::Default.normalized(),
+    );
+    let request = BatchGetEntitiesRequest::new([BatchGetItem::new(first.clone()), item]);
+    assert_eq!(request.items[0].key, first);
+    assert_eq!(request.items[1].key, second);
     assert_eq!(
-        request,
-        BatchGetEntitiesRequest {
-            items: vec![
-                BatchGetItem {
-                    key: first.clone(),
-                    if_none_match: None,
-                },
-                BatchGetItem {
-                    key: second,
-                    if_none_match: Some(validator),
-                },
-            ],
-            projection: Projection::Default,
-            fresh: false,
-        }
+        request.items[0].if_none_match_for(&request.projection),
+        None
+    );
+    assert_eq!(
+        request.items[1].if_none_match_for(&request.projection),
+        Some(&validator)
     );
     let keyed = BatchGetEntitiesRequest::new([first.clone()].map(BatchGetItem::new))
         .with_fresh(true)
@@ -513,4 +530,119 @@ fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
         keyed.projection,
         Projection::Select(FieldSelection::light())
     );
+}
+
+mod conditions {
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::id;
+    use crate::models::{
+        BatchGetItem, Entity, EntityField, EntityKey, EntityKind, EntityLookup, FieldSelection,
+        LifecycleStatus, Projection, Validator,
+    };
+
+    const TYPE: &str = "gts.cf.test.pkg.thing.v1~";
+    const INSTANCE: &str = "gts.cf.test.pkg.thing.v1~cf.test.pkg.one.v1";
+
+    fn etag() -> Validator {
+        Validator::from_bytes(b"etag".to_vec())
+    }
+
+    /// A snapshot of `gts_id` read with only its content selected.
+    fn content_read(gts_id: &str, kind: EntityKind) -> Entity {
+        let gts_id = id(gts_id);
+        let gts_uuid = Uuid::from_u128(137);
+        Entity {
+            gts_id,
+            gts_uuid,
+            kind,
+            lifecycle_status: LifecycleStatus::Active,
+            ownership: crate::models::Ownership::Global,
+            origin: None,
+            content: Some(json!({ "n": 1 })),
+            resolved_schema: None,
+            effective_traits: None,
+            effective_traits_schema: None,
+            provenance: None,
+        }
+    }
+
+    fn select(fields: &[EntityField]) -> Projection {
+        Projection::Select(FieldSelection::with(fields))
+    }
+
+    fn found(entity: Entity) -> EntityLookup {
+        EntityLookup::Found {
+            entity: Box::new(entity),
+            etag: etag(),
+        }
+    }
+
+    #[test]
+    fn revalidation_uses_both_returned_keys_and_only_the_held_fields() {
+        let snapshot = content_read(TYPE, EntityKind::TypeSchema);
+        let keys = [
+            EntityKey::from(snapshot.gts_id.clone()),
+            EntityKey::from(snapshot.gts_uuid),
+        ];
+        let previous = found(snapshot);
+        for key in keys {
+            let item = BatchGetItem::new(key).revalidate(&previous);
+            assert_eq!(
+                item.if_none_match_for(&select(&[EntityField::Content])),
+                Some(&etag())
+            );
+            assert_eq!(
+                item.if_none_match_for(&FieldSelection::light().into()),
+                Some(&etag())
+            );
+            for wider in [
+                Projection::Default,
+                select(&[EntityField::Content, EntityField::ResolvedSchema]),
+                FieldSelection::full().into(),
+            ] {
+                assert_eq!(item.if_none_match_for(&wider), None, "{wider:?}");
+            }
+        }
+        for key in [EntityKey::from(id(INSTANCE)), EntityKey::from(Uuid::nil())] {
+            let item = BatchGetItem::new(key).revalidate(&previous);
+            assert_eq!(
+                item.if_none_match_for(&select(&[EntityField::Content])),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn an_instance_covers_fields_that_do_not_apply_to_its_kind() {
+        let item = BatchGetItem::new(id(INSTANCE))
+            .revalidate(&found(content_read(INSTANCE, EntityKind::Instance)));
+        let documents = select(&[
+            EntityField::Content,
+            EntityField::ResolvedSchema,
+            EntityField::EffectiveTraits,
+            EntityField::EffectiveTraitsSchema,
+            EntityField::Provenance,
+        ]);
+        assert_eq!(item.if_none_match_for(&documents), Some(&etag()));
+        assert_eq!(item.if_none_match_for(&Projection::Default), None);
+    }
+
+    #[test]
+    fn results_without_a_snapshot_clear_revalidation() {
+        let lookup = found(content_read(TYPE, EntityKind::TypeSchema));
+        let item = BatchGetItem::new(id(TYPE)).revalidate(&lookup);
+        let light = FieldSelection::light().into();
+        assert_eq!(item.if_none_match_for(&light), Some(&etag()));
+        for previous in [
+            EntityLookup::Unchanged { etag: etag() },
+            EntityLookup::NotFound,
+        ] {
+            assert_eq!(
+                item.clone().revalidate(&previous).if_none_match_for(&light),
+                None
+            );
+        }
+    }
 }

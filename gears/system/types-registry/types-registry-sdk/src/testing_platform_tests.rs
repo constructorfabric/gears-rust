@@ -552,6 +552,32 @@ async fn strict_mode_panics_on_a_read_of_an_unexpected_key() {
 }
 
 #[tokio::test]
+async fn a_caught_strict_violation_leaves_the_fake_inspectable() {
+    let fake = std::sync::Arc::new(MockTypesRegistry::strict());
+    fake.allow(Call::BatchGet);
+    let refused = {
+        let fake = std::sync::Arc::clone(&fake);
+        tokio::spawn(async move { get(&fake, &[key(TOY)], light()).await.map(|_| ()) })
+    };
+    let panic = refused
+        .await
+        .expect_err("a strict violation panics")
+        .into_panic();
+    assert!(
+        panic
+            .downcast_ref::<String>()
+            .is_some_and(|message| message.contains("unexpected read of")),
+        "{panic:?}"
+    );
+
+    assert_eq!(fake.calls(Call::BatchGet), 1);
+    assert_eq!(fake.reads(), [key(TOY)]);
+    fake.seed(TOY, json!({}));
+    let answers = get(&fake, &[key(TOY)], light()).await.expect("reads");
+    assert!(matches!(answers[0], EntityLookup::Found { .. }));
+}
+
+#[tokio::test]
 async fn strict_mode_answers_stored_and_expected_absent_keys() {
     let fake = MockTypesRegistry::strict();
     fake.allow(Call::BatchGet);

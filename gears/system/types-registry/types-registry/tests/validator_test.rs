@@ -205,8 +205,7 @@ async fn a_current_validator_answers_unchanged_and_a_stale_one_the_representatio
         EntityLookup::Unchanged { etag } => assert_eq!(etag.encode(), current.encode()),
         other => panic!("unchanged: {other:?}"),
     }
-    // The same selection as the validator was issued under, so only the revision
-    // can make it stale.
+    // A validator names the entity's state, so only the revision can make it stale.
     match h
         .lookup(BASE, FieldSelection::default(), Some(holding(stale)))
         .await
@@ -401,18 +400,22 @@ async fn deletion_moves_the_validator_and_the_tombstone_keeps_one() {
     ));
 }
 
+/// One state, one validator: every selection of it carries the same token, and a held
+/// token answers any selection. Holding the selected fields is the caller's to track.
 #[tokio::test]
-async fn a_narrow_validator_never_answers_for_a_wider_selection() {
+async fn every_selection_of_one_state_shares_its_validator() {
     let h = harness().await;
     h.register("base", BASE, base("one"), None).await;
     let (_, narrow) = h.found(BASE, FieldSelection::default()).await;
+    let (_, wide) = h.found(BASE, select(&["content", "resolved_schema"])).await;
+    assert_eq!(wide.encode(), narrow.encode());
 
     match h
         .lookup(BASE, select(&["content"]), Some(holding(narrow)))
         .await
     {
-        EntityLookup::Found { etag, .. } => assert_ne!(etag, narrow),
-        other => panic!("found: {other:?}"),
+        EntityLookup::Unchanged { etag } => assert_eq!(etag, narrow),
+        other => panic!("unchanged: {other:?}"),
     }
 }
 

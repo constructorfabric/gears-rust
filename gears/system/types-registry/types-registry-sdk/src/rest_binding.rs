@@ -35,6 +35,12 @@ fn reads() -> Vec<HttpMethodBindingIr> {
             "/entities:batchGet",
             vec![HttpFieldBinding::Body],
         ),
+        method(
+            "batch_resolve_identities",
+            HttpMethod::Post,
+            "/entities:batchResolve",
+            vec![HttpFieldBinding::Body],
+        ),
         // The request becomes the discovery query string, parameter by parameter.
         method("list_entities", HttpMethod::Get, "/entities", Vec::new()),
     ]

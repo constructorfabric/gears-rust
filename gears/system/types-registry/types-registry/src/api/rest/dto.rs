@@ -9,12 +9,13 @@ use types_registry_sdk::item_failure::context;
 
 use crate::domain::admission::{AdmissionFailureReason, StoredFailure, UnreadableFailure};
 use crate::domain::enums::{
-    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus,
+    EntityKind, LifecycleStatus, OperationItemStatus, OperationKind, OperationStatus, Ownership,
 };
 use crate::domain::key::EntityKey;
 use crate::domain::model::{GtsEntity, ListQuery, SegmentMatchScope};
 use crate::domain::registry_service::{
-    EntityLookup, EntityRecord, MAX_BATCH_GET_KEYS, OperationItemRecord, OperationRecord,
+    EntityIdentity, EntityLookup, EntityRecord, MAX_BATCH_GET_KEYS, OperationItemRecord,
+    OperationRecord,
 };
 
 /// DTO for a GTS ID segment.
@@ -278,7 +279,13 @@ mod tests {
         let schema = schema_json::<EntityDto>();
         assert_eq!(
             schema["required"],
-            serde_json::json!(["gts_id", "gts_uuid", "kind", "lifecycle_status"])
+            serde_json::json!([
+                "gts_id",
+                "gts_uuid",
+                "kind",
+                "lifecycle_status",
+                "ownership"
+            ])
         );
         let properties = &schema["properties"];
         for field in ["gts_id", "gts_uuid"] {
@@ -362,6 +369,7 @@ mod tests {
             kind: EntityKindDto::TypeSchema,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Deleted,
+            ownership: OwnershipDto::Global,
             content: Some(RawValue::from_string("null".to_owned()).expect("JSON")),
             resolved_schema: None,
             effective_traits: None,
@@ -375,6 +383,7 @@ mod tests {
                 "gts_uuid": Uuid::nil(),
                 "kind": "type_schema",
                 "lifecycle_status": "deleted",
+                "ownership": "global",
                 "content": null,
             }),
         );
@@ -388,6 +397,7 @@ mod tests {
             kind: EntityKindDto::TypeSchema,
             origin: None,
             lifecycle_status: LifecycleStatusDto::Active,
+            ownership: OwnershipDto::Global,
             content: None,
             resolved_schema: None,
             effective_traits: None,
@@ -403,6 +413,7 @@ mod tests {
                 "gts_uuid": Uuid::nil(),
                 "kind": "type_schema",
                 "lifecycle_status": "active",
+                "ownership": "global",
                 "provenance": { "compatibility_check_skipped": false },
             }),
         );
@@ -1099,9 +1110,9 @@ pub enum DeletionKindDto {
 
 /// One entity, projected by `$select` (SPEC §10.2).
 ///
-/// `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always present, so a
-/// projected item is identifiable, its kind needs no second read, and a tombstone is
-/// never mistaken for an absence. An
+/// `gts_id`, `gts_uuid`, `kind`, `lifecycle_status` and `ownership` are always
+/// present, so a projected item is identifiable, its kind needs no second read, a
+/// tombstone is never mistaken for an absence, and a client knows whether it is global. An
 /// unselected field is omitted; a selected document that is JSON `null` stays
 /// present as `null`. The three artifacts and `provenance` are absent on an
 /// Instance, selected or not. Documents
@@ -1121,6 +1132,8 @@ pub struct EntityDto {
     pub origin: Option<OriginDto>,
     /// Always present. A tombstone stays exact-readable and is listed only on request.
     pub lifecycle_status: LifecycleStatusDto,
+    /// Always present. Never an owning tenant identifier.
+    pub ownership: OwnershipDto,
     /// The whole authored document, either kind.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<serde_json::Value>)]
@@ -1252,6 +1265,26 @@ impl From<EntityKind> for EntityKindDto {
 pub enum LifecycleStatusDto {
     Active,
     Deleted,
+}
+
+/// `global`, `context_tenant` (owned by the Context Tenant) or `ancestor_tenant`
+/// (owned by an ancestor of it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum OwnershipDto {
+    Global,
+    ContextTenant,
+    AncestorTenant,
+}
+
+impl From<Ownership> for OwnershipDto {
+    fn from(ownership: Ownership) -> Self {
+        match ownership {
+            Ownership::Global => Self::Global,
+            Ownership::ContextTenant => Self::ContextTenant,
+            Ownership::AncestorTenant => Self::AncestorTenant,
+        }
+    }
 }
 
 impl From<LifecycleStatus> for LifecycleStatusDto {
@@ -1390,6 +1423,7 @@ impl From<EntityRecord> for EntityDto {
                 updated_at: origin.updated_at,
             }),
             lifecycle_status: record.lifecycle_status.into(),
+            ownership: record.ownership.into(),
             content: record.content,
             resolved_schema: record.resolved_schema,
             effective_traits: record.effective_traits,
@@ -1417,7 +1451,8 @@ pub struct BatchGetItemDto {
     /// as `GET /entities/{entity_key}` classifies its path segment.
     #[schema(max_length = 1024)]
     pub entity_key: String,
-    /// A prior `etag` for this key and `$select`; a match returns `unchanged`.
+    /// A prior `etag` for this key; a match returns `unchanged`. One state has one `etag`
+    /// under every `$select`, so send it only while holding every field `$select` names.
     /// Batch validators are per item. Exactly one entity-tag, weak or strong:
     /// `*`, an unquoted value or a list is refused rather than read as no condition.
     #[serde(default)]
@@ -1447,32 +1482,35 @@ pub struct BatchGetRequest {
 /// The first [`MAX_BATCH_GET_KEYS`] items and the count of all of them: an
 /// over-long batch is refused by count without one DTO per element.
 #[derive(Debug, Clone)]
-pub struct BatchGetItems {
-    items: Vec<BatchGetItemDto>,
+pub struct BoundedItems<T> {
+    items: Vec<T>,
     count: usize,
 }
 
-impl BatchGetItems {
+/// A batch read's items, bounded while the body is parsed.
+pub type BatchGetItems = BoundedItems<BatchGetItemDto>;
+
+impl<T> BoundedItems<T> {
     #[must_use]
     pub fn count(&self) -> usize {
         self.count
     }
 
     #[must_use]
-    pub fn into_items(self) -> Vec<BatchGetItemDto> {
+    pub fn into_items(self) -> Vec<T> {
         self.items
     }
 }
 
-impl<'de> serde::Deserialize<'de> for BatchGetItems {
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for BoundedItems<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Items;
+        struct Items<T>(std::marker::PhantomData<T>);
 
-        impl<'de> serde::de::Visitor<'de> for Items {
-            type Value = BatchGetItems;
+        impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for Items<T> {
+            type Value = BoundedItems<T>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("an array of batch read items")
+                f.write_str("an array of batch items")
             }
 
             fn visit_seq<A: serde::de::SeqAccess<'de>>(
@@ -1481,9 +1519,9 @@ impl<'de> serde::Deserialize<'de> for BatchGetItems {
             ) -> Result<Self::Value, A::Error> {
                 let mut items = Vec::new();
                 while items.len() < MAX_BATCH_GET_KEYS {
-                    let Some(item) = seq.next_element::<BatchGetItemDto>()? else {
+                    let Some(item) = seq.next_element::<T>()? else {
                         let count = items.len();
-                        return Ok(BatchGetItems { items, count });
+                        return Ok(BoundedItems { items, count });
                     };
                     items.push(item);
                 }
@@ -1492,11 +1530,11 @@ impl<'de> serde::Deserialize<'de> for BatchGetItems {
                 while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
                     count += 1;
                 }
-                Ok(BatchGetItems { items, count })
+                Ok(BoundedItems { items, count })
             }
         }
 
-        deserializer.deserialize_seq(Items)
+        deserializer.deserialize_seq(Items(std::marker::PhantomData))
     }
 }
 
@@ -1524,8 +1562,8 @@ pub enum EntityLookupStatusDto {
 pub struct EntityLookupDto {
     pub entity_key: String,
     pub status: EntityLookupStatusDto,
-    /// The validator for this key under this `$select`, byte-identical to the exact
-    /// read's `ETag`. Present unless `not_found`.
+    /// The validator of this key's current state, the same under every `$select` and
+    /// byte-identical to the exact read's `ETag`. Present unless `not_found`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
     /// The selected fields, exactly as the exact read returns them for the same
@@ -1562,6 +1600,85 @@ impl EntityLookupDto {
 #[toolkit_macros::api_dto(response)]
 pub struct EntityLookupsDto {
     pub items: Vec<EntityLookupDto>,
+}
+
+// ---------------------------------------------------------------------------
+// Batch resolution: `:batchResolve`
+// ---------------------------------------------------------------------------
+
+/// One key in a batch resolution.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct BatchResolveItemDto {
+    /// A canonical GTS identifier or a Registry Reference UUID, classified exactly
+    /// as `GET /entities/{entity_key}` classifies its path segment.
+    #[schema(max_length = 1024)]
+    pub entity_key: String,
+}
+
+/// A batch resolution. Unknown fields are refused.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct BatchResolveRequest {
+    /// No `max_items`: the ceiling is `MAX_BATCH_GET_KEYS`, applied while the body
+    /// is parsed. Items past it are counted, not kept.
+    #[schema(value_type = Vec<BatchResolveItemDto>, min_items = 1)]
+    pub items: BoundedItems<BatchResolveItemDto>,
+}
+
+/// `found` or `not_found`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum EntityIdentityStatusDto {
+    Found,
+    NotFound,
+}
+
+/// A registered entity's canonical identity.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityIdentityDto {
+    pub gts_id: String,
+    /// The Registry Reference, canonical lowercase hyphenated.
+    pub gts_uuid: Uuid,
+}
+
+/// One key's resolution, echoing the key it was asked by, as a batch read echoes it.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityResolutionDto {
+    pub entity_key: String,
+    pub status: EntityIdentityStatusDto,
+    /// Present only on `found`, Active or deleted alike.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<EntityIdentityDto>,
+}
+
+impl EntityResolutionDto {
+    #[must_use]
+    pub fn new(entity_key: String, identity: Option<EntityIdentity>) -> Self {
+        Self {
+            entity_key,
+            status: if identity.is_some() {
+                EntityIdentityStatusDto::Found
+            } else {
+                EntityIdentityStatusDto::NotFound
+            },
+            identity: identity.map(|identity| EntityIdentityDto {
+                gts_id: identity.gts_id,
+                gts_uuid: identity.gts_uuid,
+            }),
+        }
+    }
+}
+
+/// One answer per distinct key in a batch resolution. Result order is not contractual.
+#[derive(Debug, Clone)]
+#[toolkit_macros::api_dto(response)]
+pub struct EntityResolutionsDto {
+    pub items: Vec<EntityResolutionDto>,
 }
 
 /// Where the next page starts.

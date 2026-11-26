@@ -90,6 +90,18 @@ enum Behavior {
     Observe,
     /// Read every expected seed the moment the platform API is resolvable.
     Verify(Vec<(GtsId, Value)>),
+    /// Read the configured base through both APIs around a direct database change;
+    /// `cached`: whether the platform read is expected to keep its snapshot.
+    ProbeCache {
+        database: std::path::PathBuf,
+        cached: bool,
+    },
+    /// Resolve the configured base, then remove it behind both APIs; `known`: whether the
+    /// platform resolution is expected to keep its identity.
+    ProbeIdentity {
+        database: std::path::PathBuf,
+        known: bool,
+    },
     /// Publish owned documents through the platform API.
     Publish {
         declarations: Vec<(GtsId, Value)>,
@@ -109,6 +121,12 @@ impl Consumer {
         match &self.behavior {
             Behavior::Observe => Ok(None),
             Behavior::Verify(expected) => verify(ctx, expected).await.map(|()| None),
+            Behavior::ProbeCache { database, cached } => {
+                probe_cache(ctx, database, *cached).await.map(|()| None)
+            }
+            Behavior::ProbeIdentity { database, known } => {
+                probe_identity(ctx, database, *known).await.map(|()| None)
+            }
             Behavior::Publish {
                 declarations,
                 version,
@@ -254,6 +272,182 @@ async fn verify(ctx: &GearCtx, expected: &[(GtsId, Value)]) -> Result<(), String
     } else {
         Err(format!("not seeded: {}", problems.join("; ")))
     }
+}
+
+/// Change a global row after warming both caches to distinguish a hit from revalidation.
+async fn probe_cache(
+    ctx: &GearCtx,
+    database: &std::path::Path,
+    cached: bool,
+) -> Result<(), String> {
+    let hub = ctx.client_hub();
+    let platform = hub
+        .get::<dyn PlatformTypesRegistryApi>()
+        .map_err(|e| format!("resolve the platform API: {e}"))?;
+    let tenant = hub
+        .get::<dyn TypesRegistryApi>()
+        .map_err(|e| format!("resolve the tenant API: {e}"))?;
+    let key = EntityKey::GtsId(GtsId::try_new(BASE).unwrap());
+    let request = |fresh: bool| BatchGetEntitiesRequest {
+        items: vec![key.clone().into()],
+        projection: Projection::Default,
+        fresh,
+    };
+    let version = |mut response: types_registry_sdk::BatchGetEntitiesResponse| match response
+        .0
+        .remove(&key)
+    {
+        Some(EntityLookup::Found { entity, .. }) => match entity.origin {
+            Some(Origin::Managed {
+                resource_version, ..
+            }) => Ok(resource_version),
+            _ => Err("no managed origin".to_owned()),
+        },
+        other => Err(format!("{other:?}")),
+    };
+    let platform = &platform;
+    let request = &request;
+    let version = &version;
+    let platform_read = |fresh: bool| async move {
+        platform
+            .batch_get_entities(&PlatformSecurityContext::outbound_marker(), request(fresh))
+            .await
+            .map_err(|e| format!("platform read: {e}"))
+            .and_then(version)
+    };
+
+    let tenant_ctx = |id| {
+        SecurityContext::builder()
+            .subject_id(uuid::Uuid::from_u128(id))
+            .subject_tenant_id(uuid::Uuid::from_u128(id))
+            .build()
+            .unwrap()
+    };
+    let tenant_read = |id, fresh| {
+        let ctx = tenant_ctx(id);
+        let tenant = &tenant;
+        async move {
+            tenant
+                .batch_get_entities(&ctx, request(fresh))
+                .await
+                .map_err(|e| format!("tenant read: {e}"))
+                .and_then(version)
+        }
+    };
+
+    let before = platform_read(false).await?;
+    if tenant_read(1, false).await? != before {
+        return Err("the two APIs disagree before the change".to_owned());
+    }
+    let db = Database::connect(format!("sqlite://{}?mode=rw", database.display()))
+        .await
+        .map_err(|e| format!("open the database: {e}"))?;
+    db.execute_raw(Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "UPDATE types_registry__entity SET resource_version = resource_version + 1 \
+             WHERE gts_id = '{BASE}'"
+        ),
+    ))
+    .await
+    .map_err(|e| format!("change the row: {e}"))?;
+
+    let windowed = platform_read(false).await?;
+    let tenant_after = tenant_read(1, false).await?;
+    let tenant_first = tenant_read(2, false).await?;
+    let tenant_fresh = tenant_read(1, true).await?;
+    let fresh = platform_read(true).await?;
+    let seen = (windowed, tenant_after, tenant_first, tenant_fresh, fresh);
+    // `BASE` is global: every authenticated tenant shares its fresh snapshot.
+    let expected = (
+        if cached { before } else { before + 1 },
+        if cached { before } else { before + 1 },
+        if cached { before } else { before + 1 },
+        before + 1,
+        before + 1,
+    );
+    if seen == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected (platform, tenant, new tenant, fresh tenant, fresh platform) = {expected:?}, saw {seen:?}"
+        ))
+    }
+}
+
+/// Simulate purge after identity-only lookups. With a zero window, only
+/// a retained platform pair resolves offline. The tenant pair has no global classification.
+async fn probe_identity(
+    ctx: &GearCtx,
+    database: &std::path::Path,
+    known: bool,
+) -> Result<(), String> {
+    let hub = ctx.client_hub();
+    let platform = hub
+        .get::<dyn PlatformTypesRegistryApi>()
+        .map_err(|e| format!("resolve the platform API: {e}"))?;
+    let tenant = hub
+        .get::<dyn TypesRegistryApi>()
+        .map_err(|e| format!("resolve the tenant API: {e}"))?;
+    let marker = PlatformSecurityContext::outbound_marker();
+    // Authenticated, so that the tenant API reads through its cache rather than past it.
+    let tenant_ctx = SecurityContext::builder()
+        .subject_id(uuid::Uuid::from_u128(1))
+        .subject_tenant_id(uuid::Uuid::from_u128(1))
+        .build()
+        .unwrap();
+    let base = GtsTypeId::try_new(BASE).unwrap();
+    let uuid = platform
+        .resolve_type_uuid(&marker, &base)
+        .await
+        .map_err(|e| format!("resolve before: {e}"))?;
+    let tenant_before = TypesRegistryApiExt::resolve_type_uuid(&*tenant, &tenant_ctx, &base)
+        .await
+        .map_err(|e| format!("tenant resolve before: {e}"))?;
+    if tenant_before != uuid {
+        return Err(format!("the two APIs disagree: {tenant_before} / {uuid}"));
+    }
+
+    let db = Database::connect(format!("sqlite://{}?mode=rw", database.display()))
+        .await
+        .map_err(|e| format!("open the database: {e}"))?;
+    db.execute_raw(Statement::from_string(
+        db.get_database_backend(),
+        format!("DELETE FROM types_registry__entity WHERE gts_id = '{BASE}'"),
+    ))
+    .await
+    .map_err(|e| format!("remove the row: {e}"))?;
+
+    let light = ReadOptions::new().with_projection(FieldSelection::light());
+    let read = platform
+        .batch_get_type_schemas(&marker, std::slice::from_ref(&base), light)
+        .await
+        .map_err(|e| format!("light read: {e}"))?;
+    if read[&base].is_some() {
+        return Err("the ordinary light read kept the removed entity".to_owned());
+    }
+    let tenant_resolved =
+        TypesRegistryApiExt::resolve_type_uuid(&*tenant, &tenant_ctx, &base).await;
+    if !matches!(
+        tenant_resolved,
+        Err(toolkit_canonical_errors::CanonicalError::NotFound { .. })
+    ) {
+        return Err(format!(
+            "the tenant resolution kept it: {tenant_resolved:?}"
+        ));
+    }
+    let forward = platform.resolve_type_uuid(&marker, &base).await;
+    let reverse = platform.resolve_type_id(&marker, uuid).await;
+    let seen = (forward.is_ok(), reverse.is_ok());
+    if seen != (known, known) {
+        return Err(format!(
+            "expected the identity known={known}, saw {forward:?} / {reverse:?}"
+        ));
+    }
+    if known && (forward.ok() != Some(uuid) || reverse.ok() != Some(base)) {
+        return Err("the known identity changed".to_owned());
+    }
+    Ok(())
 }
 
 /// Name every identifier that did not settle as admitted, and why.
@@ -765,4 +959,74 @@ async fn the_documented_example_publishes_and_restarts() {
     let report = published(restart.run().await);
     assert!(report.up_to_date, "an equal restart submits nothing");
     assert_eq!(report.resource_version, 1);
+}
+
+async fn probe(registry_config: Value, cached: bool) {
+    let dir = common::TestDir::new("tr-boot-cache");
+    let mut host = Host::new(&dir);
+    host.registry_config = registry_config;
+    host.behavior = Behavior::ProbeCache {
+        database: dir.path().join("boot.db"),
+        cached,
+    };
+    let outcome = host.run().await;
+    outcome.boot.expect("a healthy boot");
+    outcome
+        .report
+        .expect("the consumer ran")
+        .expect("the probe held");
+}
+
+#[tokio::test]
+async fn the_published_apis_are_cached_and_tenants_share_a_global_snapshot() {
+    probe(json!({ "entities": [base()] }), true).await;
+}
+
+/// A zero window in the gear configuration forces published clients to revalidate.
+#[tokio::test]
+async fn the_client_cache_keys_configure_the_published_platform_api() {
+    probe(
+        json!({
+            "entities": [base()],
+            "local_client": { "cache": { "freshness_window": "0s" } },
+        }),
+        false,
+    )
+    .await;
+}
+
+async fn probe_identity_with(registry_config: Value, known: bool) {
+    let dir = common::TestDir::new("tr-boot-identity");
+    let mut host = Host::new(&dir);
+    host.registry_config = registry_config;
+    host.behavior = Behavior::ProbeIdentity {
+        database: dir.path().join("boot.db"),
+        known,
+    };
+    let outcome = host.run().await;
+    outcome.boot.expect("a healthy boot");
+    outcome
+        .report
+        .expect("the consumer ran")
+        .expect("the probe held");
+}
+
+#[tokio::test]
+async fn the_published_platform_api_resolves_known_identities_and_its_bound_configures_it() {
+    probe_identity_with(
+        json!({
+            "entities": [base()],
+            "local_client": { "cache": { "freshness_window": "0s" } },
+        }),
+        true,
+    )
+    .await;
+    probe_identity_with(
+        json!({
+            "entities": [base()],
+            "local_client": { "cache": { "freshness_window": "0s", "max_identity_entries": 0 } },
+        }),
+        false,
+    )
+    .await;
 }

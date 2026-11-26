@@ -117,7 +117,10 @@ startup seed:
   stay unpublished.
 - **Database required:** without `gears.types-registry.database`, or after seed
   failure, neither contract is registered; resolution fails.
-- **Uncached:** every read hits the database until T36.
+- **Client cache.** Each local API defaults to a 30 s `freshness_window`, 64 MiB `max_size_bytes` and 16 384 `max_entries` under `local_client.cache`. Setting either retention limit to zero disables snapshots. The budget covers compact JSON, GTS IDs, raw validators and 256 bytes per snapshot. Identical document bytes in the same field of one entity are charged once across tenants.
+  Use `fresh` to check content and visibility immediately. Authenticated callers share fresh global snapshots. Tenant-owned snapshots are per tenant and require confirmation for the same subject, subject type, tenant and token scopes.
+  Observed terminal registration or deletion successes invalidate platform snapshots.
+  Platform reads, resolutions and discovery also seed a separate LRU for `resolve_*` in both directions (`max_identity_entries`, default 16 384, no expiry). Zero leaves platform resolution to fresh snapshots or the registry.
 - **Independent catalogues:** legacy `/v1` shares initial declarations but no later
   writes with the database until T38.
 - **Multiple instances:** outbox polling can delay admission by one minute. Keep
@@ -265,8 +268,7 @@ key count does not bound response bytes once documents are selected.
 
 ### Skip an unchanged body
 
-An exact read's `ETag` and a batch result's `etag` are the same value, quotes included, for
-that key and `$select`. Send it back unchanged and an unchanged entity costs no body:
+An exact read and a batch result return the same quoted validator for an entity's state across all `$select` values. Send it back unchanged to skip an unchanged body.
 
 ```bash
 URL="$TENANT/entities/gts.cf.core.example.event.v1~"
@@ -284,8 +286,8 @@ curl -s -X POST "$TENANT/entities:batchGet" \
 # {"items": [{"entity_key": "...", "status": "unchanged", "etag": "<$ETAG>"}]}
 ```
 
-A revision, a refreshed dependency or another `$select` yields a new validator; discovery
-pages carry none. On `:batchGet` the `If-None-Match` header is refused: validators are per key.
+Revisions and dependency refreshes change the validator. Send it only for the same key and a selection the held snapshot covers. The SDK checks both with `BatchGetItem::new(key).revalidate(&previous_lookup)`. Discovery returns no validators.
+For `:batchGet`, send per-item validators in the body. The `If-None-Match` header is refused.
 
 ### Discover what exists
 

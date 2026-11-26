@@ -427,13 +427,17 @@ impl EntityRepo {
             .map(row)
             .collect();
 
-        let next_after = if items.len() > limit {
-            items.truncate(limit);
-            items.last().map(|row| row.gts_id.clone())
-        } else {
-            None
-        };
-        Ok(EntityPage { items, next_after })
+        let lookahead = (items.len() > limit)
+            .then(|| items.split_off(limit))
+            .and_then(|mut rest| rest.pop());
+        let next_after = lookahead
+            .as_ref()
+            .and_then(|_| items.last().map(|row| row.gts_id.clone()));
+        Ok(EntityPage {
+            items,
+            next_after,
+            lookahead,
+        })
     }
 }
 

@@ -17,7 +17,7 @@ fn the_contract_descriptor_names_the_types_registry_v1_api() {
 }
 
 #[test]
-fn the_contract_has_exactly_the_five_spec_methods_with_their_idempotency() {
+fn the_contract_has_exactly_the_six_spec_methods_with_their_idempotency() {
     let ir = platform_types_registry_api_ir();
     let actual: Vec<(&str, Idempotency)> = ir
         .methods
@@ -32,6 +32,7 @@ fn the_contract_has_exactly_the_five_spec_methods_with_their_idempotency() {
             ("register_entities", Idempotency::IdempotentWrite),
             ("delete_entities", Idempotency::IdempotentWrite),
             ("get_operation", Idempotency::SafeRead),
+            ("batch_resolve_identities", Idempotency::SafeRead),
         ]
     );
 }
@@ -105,7 +106,7 @@ fn the_tenant_contract_descriptor_names_the_types_registry_v1_api() {
 }
 
 #[test]
-fn the_tenant_contract_has_only_the_two_safe_reads() {
+fn the_tenant_contract_has_only_the_three_safe_reads() {
     let ir = types_registry_api_ir();
     let actual: Vec<(&str, Idempotency)> = ir
         .methods
@@ -117,6 +118,7 @@ fn the_tenant_contract_has_only_the_two_safe_reads() {
         [
             ("batch_get_entities", Idempotency::SafeRead),
             ("list_entities", Idempotency::SafeRead),
+            ("batch_resolve_identities", Idempotency::SafeRead),
         ]
     );
 }

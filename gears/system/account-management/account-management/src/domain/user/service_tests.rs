@@ -55,7 +55,7 @@ async fn mandatory_tenant_type_read_preserves_caller_refusals_before_user_creati
         seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
         let registry = Arc::new(registry_with_test_tenant_type());
         seed_user_schema(&registry);
-        registry.inject(Fault::on(Call::BatchGet).fail(refusal));
+        registry.inject(Fault::on(Call::BatchResolve).fail(refusal));
         let idp = Arc::new(FakeIdpUserProvisioner::new());
         let service = UserService::new(tenants, idp.clone(), registry.clone(), mock_enforcer());
 
@@ -66,7 +66,7 @@ async fn mandatory_tenant_type_read_preserves_caller_refusals_before_user_creati
 
         assert_eq!(at_the_boundary(error).1, Some(status));
         assert_eq!(idp.create_call_count(), 0);
-        assert_eq!(registry.platform_calls(Call::BatchGet), 0);
+        assert_eq!(registry.platform_calls(Call::BatchResolve), 0);
     }
 }
 

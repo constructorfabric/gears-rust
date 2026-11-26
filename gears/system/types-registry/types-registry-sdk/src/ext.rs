@@ -28,11 +28,13 @@
 //!
 //! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
 //!
-//! The `resolve_*` helpers map a registered entity's identifier to its Registry Reference
-//! and back. They always read the registry, selecting the mandatory fields only, and answer
-//! from the snapshot read: an unregistered identifier does not resolve, a deleted entity
-//! does. They use the normal client cache. For an identifier's deterministic UUID before
-//! registration, use [`GtsId::to_uuid`].
+//! The `resolve_*` helpers translate registered IDs and Registry References, including
+//! tombstones. Cache misses fetch the stored pair through
+//! [`PlatformTypesRegistryApi::batch_resolve_identities`] or
+//! [`TypesRegistryApi::batch_resolve_identities`]. For deterministic UUIDs before
+//! registration, use [`GtsId::to_uuid`]. Whatever the implementation, a resolution
+//! reply that is incomplete, contradicts itself or answers a key not asked fails as
+//! `Internal`.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -50,7 +52,7 @@ use crate::field;
 use crate::gts::TypeResource;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, Entity, EntityField,
-    EntityKey, EntityKind, EntityLookup, FieldSelection, Instance, JsonDocument,
+    EntityIdentity, EntityKey, EntityKind, EntityLookup, FieldSelection, Instance, JsonDocument,
     ListEntitiesRequest, ListEntitiesResponse, Projection, PublisherContext, ReadOptions,
     TypeSchema,
 };
@@ -244,26 +246,31 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         ctx: &PlatformSecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<Uuid, CanonicalError> {
-        Ok(self
-            .get_type_schema(ctx, type_id, id_only())
-            .await?
-            .type_uuid)
+        let key = EntityKey::GtsId(parse_kind(type_id.as_ref(), EntityKind::TypeSchema)?);
+        Ok(
+            resolve_one::<_, TypeSchema>(&PlatformReads { api: self, ctx }, key)
+                .await?
+                .1,
+        )
     }
 
-    /// Registry References of Type Schemas, read as [`Self::batch_get_type_schemas`];
-    /// `None` when not registered.
+    /// Registry References of Type Schemas, Active or deleted, resolved through
+    /// [`PlatformTypesRegistryApi::batch_resolve_identities`] in batches of up to
+    /// [`MAX_BATCH_GET_KEYS`] distinct identifiers; `None` when not registered.
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// The error of a resolution that failed; the call then sends no further batch.
+    /// `InvalidArgument`, before any request, for an identifier that is not a Type
+    /// Schema's.
     async fn resolve_type_uuids(
         &self,
         ctx: &PlatformSecurityContext,
         type_ids: &[GtsTypeId],
     ) -> Result<HashMap<GtsTypeId, Option<Uuid>>, CanonicalError> {
-        let schemas = self
-            .batch_get_type_schemas(ctx, type_ids, id_only())
-            .await?;
-        Ok(project(schemas, |schema| schema.type_uuid))
+        let keys = keys_by_id::<_, TypeSchema>(type_ids)?;
+        let resolved =
+            resolve_many::<_, _, TypeSchema>(&PlatformReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(_, uuid)| uuid))
     }
 
     /// The identifier of the Type Schema a Registry Reference names, Active or deleted.
@@ -275,26 +282,28 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         ctx: &PlatformSecurityContext,
         type_uuid: Uuid,
     ) -> Result<GtsTypeId, CanonicalError> {
-        Ok(self
-            .get_type_schema_by_uuid(ctx, type_uuid, id_only())
-            .await?
-            .type_id)
+        let key = EntityKey::GtsUuid(type_uuid);
+        Ok(
+            resolve_one::<_, TypeSchema>(&PlatformReads { api: self, ctx }, key)
+                .await?
+                .0,
+        )
     }
 
-    /// Type Schema identifiers by Registry Reference, read as
-    /// [`Self::batch_get_type_schemas_by_uuid`]; `None` when absent or an Instance.
+    /// Type Schema identifiers by Registry Reference, Active or deleted, resolved as
+    /// [`Self::resolve_type_uuids`]; `None` when absent or an Instance.
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// The error of a resolution that failed; the call then sends no further batch.
     async fn resolve_type_ids(
         &self,
         ctx: &PlatformSecurityContext,
         type_uuids: &[Uuid],
     ) -> Result<HashMap<Uuid, Option<GtsTypeId>>, CanonicalError> {
-        let schemas = self
-            .batch_get_type_schemas_by_uuid(ctx, type_uuids, id_only())
-            .await?;
-        Ok(project(schemas, |schema| schema.type_id))
+        let keys = keys_by_uuid(type_uuids);
+        let resolved =
+            resolve_many::<_, _, TypeSchema>(&PlatformReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(type_id, _)| type_id))
     }
 
     /// The Registry Reference of a registered Instance, as [`Self::resolve_type_uuid`].
@@ -306,20 +315,27 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         ctx: &PlatformSecurityContext,
         id: &GtsInstanceId,
     ) -> Result<Uuid, CanonicalError> {
-        Ok(self.get_instance(ctx, id, id_only()).await?.uuid)
+        let key = EntityKey::GtsId(parse_kind(id.as_ref(), EntityKind::Instance)?);
+        Ok(
+            resolve_one::<_, Instance>(&PlatformReads { api: self, ctx }, key)
+                .await?
+                .1,
+        )
     }
 
     /// Registry References of Instances, as [`Self::resolve_type_uuids`].
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// As [`Self::resolve_type_uuids`], for an Instance.
     async fn resolve_instance_uuids(
         &self,
         ctx: &PlatformSecurityContext,
         ids: &[GtsInstanceId],
     ) -> Result<HashMap<GtsInstanceId, Option<Uuid>>, CanonicalError> {
-        let instances = self.batch_get_instances(ctx, ids, id_only()).await?;
-        Ok(project(instances, |instance| instance.uuid))
+        let keys = keys_by_id::<_, Instance>(ids)?;
+        let resolved =
+            resolve_many::<_, _, Instance>(&PlatformReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(_, uuid)| uuid))
     }
 
     /// The identifier of the Instance a Registry Reference names — the Instance's own,
@@ -332,23 +348,28 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         ctx: &PlatformSecurityContext,
         uuid: Uuid,
     ) -> Result<GtsInstanceId, CanonicalError> {
-        Ok(self.get_instance_by_uuid(ctx, uuid, id_only()).await?.id)
+        let key = EntityKey::GtsUuid(uuid);
+        Ok(
+            resolve_one::<_, Instance>(&PlatformReads { api: self, ctx }, key)
+                .await?
+                .0,
+        )
     }
 
     /// Instance identifiers by Registry Reference, as [`Self::resolve_type_ids`];
     /// `None` when absent or a Type Schema.
     ///
     /// # Errors
-    /// As [`Self::batch_get_type_schemas`].
+    /// As [`Self::resolve_type_ids`].
     async fn resolve_instance_ids(
         &self,
         ctx: &PlatformSecurityContext,
         uuids: &[Uuid],
     ) -> Result<HashMap<Uuid, Option<GtsInstanceId>>, CanonicalError> {
-        let instances = self
-            .batch_get_instances_by_uuid(ctx, uuids, id_only())
-            .await?;
-        Ok(project(instances, |instance| instance.id))
+        let keys = keys_by_uuid(uuids);
+        let resolved =
+            resolve_many::<_, _, Instance>(&PlatformReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(id, _)| id))
     }
 
     /// Traverse Type Schemas, preserving filters and page size. [`Projection::Default`]
@@ -510,10 +531,12 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<Uuid, CanonicalError> {
-        Ok(self
-            .get_type_schema(ctx, type_id, id_only())
-            .await?
-            .type_uuid)
+        let key = EntityKey::GtsId(parse_kind(type_id.as_ref(), EntityKind::TypeSchema)?);
+        Ok(
+            resolve_one::<_, TypeSchema>(&TenantReads { api: self, ctx }, key)
+                .await?
+                .1,
+        )
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_type_uuids`].
@@ -525,10 +548,10 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         type_ids: &[GtsTypeId],
     ) -> Result<HashMap<GtsTypeId, Option<Uuid>>, CanonicalError> {
-        let schemas = self
-            .batch_get_type_schemas(ctx, type_ids, id_only())
-            .await?;
-        Ok(project(schemas, |schema| schema.type_uuid))
+        let keys = keys_by_id::<_, TypeSchema>(type_ids)?;
+        let resolved =
+            resolve_many::<_, _, TypeSchema>(&TenantReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(_, uuid)| uuid))
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_type_id`].
@@ -540,10 +563,12 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         type_uuid: Uuid,
     ) -> Result<GtsTypeId, CanonicalError> {
-        Ok(self
-            .get_type_schema_by_uuid(ctx, type_uuid, id_only())
-            .await?
-            .type_id)
+        let key = EntityKey::GtsUuid(type_uuid);
+        Ok(
+            resolve_one::<_, TypeSchema>(&TenantReads { api: self, ctx }, key)
+                .await?
+                .0,
+        )
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_type_ids`].
@@ -555,10 +580,10 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         type_uuids: &[Uuid],
     ) -> Result<HashMap<Uuid, Option<GtsTypeId>>, CanonicalError> {
-        let schemas = self
-            .batch_get_type_schemas_by_uuid(ctx, type_uuids, id_only())
-            .await?;
-        Ok(project(schemas, |schema| schema.type_id))
+        let keys = keys_by_uuid(type_uuids);
+        let resolved =
+            resolve_many::<_, _, TypeSchema>(&TenantReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(type_id, _)| type_id))
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_instance_uuid`].
@@ -570,7 +595,12 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         id: &GtsInstanceId,
     ) -> Result<Uuid, CanonicalError> {
-        Ok(self.get_instance(ctx, id, id_only()).await?.uuid)
+        let key = EntityKey::GtsId(parse_kind(id.as_ref(), EntityKind::Instance)?);
+        Ok(
+            resolve_one::<_, Instance>(&TenantReads { api: self, ctx }, key)
+                .await?
+                .1,
+        )
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_instance_uuids`].
@@ -582,8 +612,10 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         ids: &[GtsInstanceId],
     ) -> Result<HashMap<GtsInstanceId, Option<Uuid>>, CanonicalError> {
-        let instances = self.batch_get_instances(ctx, ids, id_only()).await?;
-        Ok(project(instances, |instance| instance.uuid))
+        let keys = keys_by_id::<_, Instance>(ids)?;
+        let resolved =
+            resolve_many::<_, _, Instance>(&TenantReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(_, uuid)| uuid))
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_instance_id`].
@@ -595,7 +627,12 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         uuid: Uuid,
     ) -> Result<GtsInstanceId, CanonicalError> {
-        Ok(self.get_instance_by_uuid(ctx, uuid, id_only()).await?.id)
+        let key = EntityKey::GtsUuid(uuid);
+        Ok(
+            resolve_one::<_, Instance>(&TenantReads { api: self, ctx }, key)
+                .await?
+                .0,
+        )
     }
 
     /// As [`PlatformTypesRegistryApiExt::resolve_instance_ids`].
@@ -607,10 +644,10 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
         ctx: &SecurityContext,
         uuids: &[Uuid],
     ) -> Result<HashMap<Uuid, Option<GtsInstanceId>>, CanonicalError> {
-        let instances = self
-            .batch_get_instances_by_uuid(ctx, uuids, id_only())
-            .await?;
-        Ok(project(instances, |instance| instance.id))
+        let keys = keys_by_uuid(uuids);
+        let resolved =
+            resolve_many::<_, _, Instance>(&TenantReads { api: self, ctx }, keys).await?;
+        Ok(project(resolved, |(id, _)| id))
     }
 
     /// As [`PlatformTypesRegistryApiExt::list_type_schemas`].
@@ -654,6 +691,11 @@ trait EntityReads: Sync {
         &self,
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError>;
+
+    async fn batch_resolve(
+        &self,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>;
 }
 
 /// [`EntityReads`] over the platform contract.
@@ -676,6 +718,13 @@ impl<A: PlatformTypesRegistryApi + ?Sized> EntityReads for PlatformReads<'_, A> 
         request: ListEntitiesRequest,
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         self.api.list_entities(self.ctx, request).await
+    }
+
+    async fn batch_resolve(
+        &self,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.api.batch_resolve_identities(self.ctx, keys).await
     }
 }
 
@@ -700,6 +749,13 @@ impl<A: TypesRegistryApi + ?Sized> EntityReads for TenantReads<'_, A> {
     ) -> Result<ListEntitiesResponse, CanonicalError> {
         self.api.list_entities(self.ctx, request).await
     }
+
+    async fn batch_resolve(
+        &self,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.api.batch_resolve_identities(self.ctx, keys).await
+    }
 }
 
 async fn get_one<R: EntityReads + ?Sized, T: Kinded>(
@@ -722,16 +778,7 @@ async fn get_many_by_id<R: EntityReads + ?Sized, K: AsRef<str> + Clone + Eq + Ha
     ids: &[K],
     options: ReadOptions,
 ) -> Result<HashMap<K, Option<T>>, CanonicalError> {
-    // Validate all identifiers before issuing any read.
-    let keys = ids
-        .iter()
-        .map(|id| {
-            Ok((
-                id.clone(),
-                EntityKey::GtsId(parse_kind(id.as_ref(), T::KIND)?),
-            ))
-        })
-        .collect::<Result<Vec<_>, CanonicalError>>()?;
+    let keys = keys_by_id::<K, T>(ids)?;
     Ok(get_many(reads, keys, options).await?.into_iter().collect())
 }
 
@@ -740,23 +787,35 @@ async fn get_many_by_uuid<R: EntityReads + ?Sized, T: Kinded>(
     uuids: &[Uuid],
     options: ReadOptions,
 ) -> Result<HashMap<Uuid, Option<T>>, CanonicalError> {
-    let keys = uuids
-        .iter()
-        .map(|&uuid| (uuid, EntityKey::GtsUuid(uuid)))
-        .collect();
-    Ok(get_many(reads, keys, options).await?.into_iter().collect())
+    Ok(get_many(reads, keys_by_uuid(uuids), options)
+        .await?
+        .into_iter()
+        .collect())
 }
 
-/// Reads `keys` in bounded batches of distinct entity keys. Every asked key is answered,
-/// including different spellings that name one entity. A failed batch fails the call: no
-/// later batch is read, and no partial answer is returned beside the error.
-async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
-    reads: &R,
-    keys: Vec<(K, EntityKey)>,
-    options: ReadOptions,
-) -> Result<Vec<(K, Option<T>)>, CanonicalError> {
-    let mut out = Vec::with_capacity(keys.len());
-    // Who asked for each distinct key, in first-asked order.
+/// Every identifier as a key of `T`'s kind, all validated before any read.
+fn keys_by_id<K: AsRef<str> + Clone, T: Kinded>(
+    ids: &[K],
+) -> Result<Vec<(K, EntityKey)>, CanonicalError> {
+    ids.iter()
+        .map(|id| {
+            Ok((
+                id.clone(),
+                EntityKey::GtsId(parse_kind(id.as_ref(), T::KIND)?),
+            ))
+        })
+        .collect()
+}
+
+fn keys_by_uuid(uuids: &[Uuid]) -> Vec<(Uuid, EntityKey)> {
+    uuids
+        .iter()
+        .map(|&uuid| (uuid, EntityKey::GtsUuid(uuid)))
+        .collect()
+}
+
+/// The distinct entity keys of `keys` in first-asked order, and who asked for each.
+fn distinct<K>(keys: Vec<(K, EntityKey)>) -> (Vec<EntityKey>, HashMap<EntityKey, Vec<K>>) {
     let mut askers: HashMap<EntityKey, Vec<K>> = HashMap::with_capacity(keys.len());
     let mut distinct = Vec::with_capacity(keys.len());
     for (asked, key) in keys {
@@ -768,6 +827,31 @@ async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
             })
             .push(asked);
     }
+    (distinct, askers)
+}
+
+/// Gives `answer` to everyone who asked for `key`.
+fn fan_out<K, V: Clone>(
+    out: &mut Vec<(K, V)>,
+    askers: &mut HashMap<EntityKey, Vec<K>>,
+    key: &EntityKey,
+    answer: V,
+) {
+    let mut asked = askers.remove(key).unwrap_or_default();
+    let last = asked.pop();
+    out.extend(asked.into_iter().map(|k| (k, answer.clone())));
+    out.extend(last.map(|k| (k, answer)));
+}
+
+/// Read bounded batches of distinct keys, keeping both spellings when asked.
+/// A failed batch stops the call without partial results.
+async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
+    reads: &R,
+    keys: Vec<(K, EntityKey)>,
+    options: ReadOptions,
+) -> Result<Vec<(K, Option<T>)>, CanonicalError> {
+    let mut out = Vec::with_capacity(keys.len());
+    let (distinct, mut askers) = distinct(keys);
     for chunk in distinct.chunks(MAX_BATCH_GET_KEYS) {
         let request = BatchGetEntitiesRequest {
             items: chunk.iter().cloned().map(BatchGetItem::from).collect(),
@@ -779,32 +863,242 @@ async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
             let answer = found(key, T::KIND, lookups.0.remove(key))?
                 .map(narrow::<T>)
                 .transpose()?;
-            let mut asked = askers.remove(key).unwrap_or_default();
-            let last = asked.pop();
-            out.extend(asked.into_iter().map(|k| (k, answer.clone())));
-            out.extend(last.map(|k| (k, answer)));
+            fan_out(&mut out, &mut askers, key, answer);
         }
     }
     Ok(out)
 }
 
-/// Each answered snapshot reduced to the field a `resolve_*` helper returns.
+/// What a `resolve_*` helper answers of one registered entity of `T`'s kind: its own
+/// identifier and its Registry Reference.
+type Resolved<T> = (<T as Kinded>::Id, Uuid);
+
+/// Resolve distinct keys in bounded batches like [`get_many`].
+/// Return `None` for absent or wrong-kind entities. Any batch failure, including a
+/// reply [`checked_resolutions`] refuses, stops the call.
+async fn resolve_many<R: EntityReads + ?Sized, K: Send, T: Kinded>(
+    reads: &R,
+    keys: Vec<(K, EntityKey)>,
+) -> Result<Vec<(K, Option<Resolved<T>>)>, CanonicalError> {
+    let mut out = Vec::with_capacity(keys.len());
+    let (distinct, mut askers) = distinct(keys);
+    for chunk in distinct.chunks(MAX_BATCH_GET_KEYS) {
+        let mut identities =
+            checked_resolutions(chunk, reads.batch_resolve(chunk.to_vec()).await?)?;
+        for key in chunk {
+            let identity = identities.remove(key).ok_or_else(|| unresolved(key))?;
+            let answer = match identity {
+                Some(identity) => resolved::<T>(&identity)?,
+                None => None,
+            };
+            fan_out(&mut out, &mut askers, key, answer);
+        }
+    }
+    Ok(out)
+}
+
+/// One key resolved as [`resolve_many`] does; nothing of the kind is the caller's `NotFound`.
+async fn resolve_one<R: EntityReads + ?Sized, T: Kinded>(
+    reads: &R,
+    key: EntityKey,
+) -> Result<Resolved<T>, CanonicalError> {
+    let asked = [key.clone()];
+    let identity = checked_resolutions(&asked, reads.batch_resolve(asked.to_vec()).await?)?
+        .remove(&key)
+        .ok_or_else(|| unresolved(&key))?;
+    match identity {
+        Some(identity) => resolved::<T>(&identity)?,
+        None => None,
+    }
+    .ok_or_else(|| not_found(&key, T::KIND))
+}
+
+/// `identity` as an entity of `T`'s kind; `None` when it is of the other kind.
+fn resolved<T: Kinded>(identity: &EntityIdentity) -> Result<Option<Resolved<T>>, CanonicalError> {
+    if EntityKind::of(&identity.gts_id) != T::KIND {
+        return Ok(None);
+    }
+    let id = T::kind_id(&identity.gts_id).ok_or_else(|| {
+        CanonicalError::internal(format!(
+            "the registry identified a {:?} as {}, not an identifier of its kind",
+            T::KIND,
+            identity.gts_id
+        ))
+        .create()
+    })?;
+    Ok(Some((id, identity.gts_uuid)))
+}
+
+/// Adapt a batch reader, such as a test double, to `batch_resolve_identities`.
+/// Requires the `test-util` feature.
+/// Read the mandatory fields in one bounded batch and validate each distinct result.
+///
+/// ```ignore
+/// async fn batch_resolve_identities(&self, ctx: &PlatformSecurityContext, keys: Vec<EntityKey>)
+///     -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+///     types_registry_sdk::ext::resolve_through_batch_get(keys, |request| {
+///         self.batch_get_entities(ctx, request)
+///     })
+///     .await
+/// }
+/// ```
+///
+/// # Errors
+/// The read's error; `Internal` when it leaves a key unanswered, answers it with a
+/// snapshot its own data contradicts, or answers a key not asked.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn resolve_through_batch_get<F, Fut>(
+    keys: Vec<EntityKey>,
+    read: F,
+) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError>
+where
+    F: FnOnce(BatchGetEntitiesRequest) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<BatchGetEntitiesResponse, CanonicalError>> + Send,
+{
+    let request = BatchGetEntitiesRequest::new(keys.iter().cloned().map(BatchGetItem::new))
+        .with_projection(FieldSelection::light());
+    let answered = identities(&keys, read(request).await?)?;
+    checked_resolutions(&keys, answered)
+}
+
+/// Read active or deleted identities in one unconditional mandatory-field batch.
+/// Refuse missing, `Unchanged` or inconsistent replies.
+#[cfg(any(test, feature = "test-util"))]
+fn identities(
+    keys: &[EntityKey],
+    mut read: BatchGetEntitiesResponse,
+) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+    let mut out = HashMap::with_capacity(keys.len());
+    for key in keys {
+        if out.contains_key(key) {
+            continue;
+        }
+        let identity = match read.0.remove(key) {
+            Some(EntityLookup::Found { entity, .. }) => Some(identity_of(key, *entity)?),
+            Some(EntityLookup::NotFound) => None,
+            Some(EntityLookup::Unchanged { .. }) | None => return Err(unanswered(key)),
+        };
+        out.insert(key.clone(), identity);
+    }
+    if let Some(extra) = read.0.keys().next() {
+        return Err(resolution_fault(
+            extra,
+            "an answer although it was not asked",
+        ));
+    }
+    Ok(out)
+}
+
+/// Require one result per distinct requested key and agreement across key
+/// spellings. A mismatch, conflicting pair or one-sided absence for a found
+/// entity fails the whole batch.
+pub(crate) fn checked_resolutions(
+    asked: &[EntityKey],
+    mut answered: HashMap<EntityKey, Option<EntityIdentity>>,
+) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+    let mut out = HashMap::with_capacity(answered.len());
+    let mut by_id: HashMap<GtsId, Uuid> = HashMap::new();
+    let mut by_uuid: HashMap<Uuid, GtsId> = HashMap::new();
+    for key in asked {
+        if out.contains_key(key) {
+            continue;
+        }
+        let identity = answered.remove(key).ok_or_else(|| unresolved(key))?;
+        if let Some(identity) = &identity {
+            if !key.identifies(identity) {
+                return Err(resolution_fault(key, "another entity's identity"));
+            }
+            let id = by_id
+                .entry(identity.gts_id.clone())
+                .or_insert(identity.gts_uuid);
+            let uuid = by_uuid
+                .entry(identity.gts_uuid)
+                .or_insert_with(|| identity.gts_id.clone());
+            if *id != identity.gts_uuid || *uuid != identity.gts_id {
+                return Err(resolution_fault(
+                    key,
+                    "an identity conflicting within the batch",
+                ));
+            }
+        }
+        out.insert(key.clone(), identity);
+    }
+    if let Some(extra) = answered.keys().next() {
+        return Err(resolution_fault(
+            extra,
+            "an answer although it was not asked",
+        ));
+    }
+    // One snapshot answers the batch: an entity found by one spelling is not absent by
+    // the other.
+    for (key, identity) in &out {
+        let Some(identity) = identity else { continue };
+        let other = match key {
+            EntityKey::GtsId(_) => EntityKey::GtsUuid(identity.gts_uuid),
+            EntityKey::GtsUuid(_) => EntityKey::GtsId(identity.gts_id.clone()),
+        };
+        if matches!(out.get(&other), Some(None)) {
+            return Err(resolution_fault(
+                &other,
+                "absence although the batch found its entity",
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn resolution_fault(key: &EntityKey, what: &str) -> CanonicalError {
+    CanonicalError::internal(format!(
+        "the registry answered the batch resolution of {key} with {what}"
+    ))
+    .create()
+}
+
+fn unresolved(key: &EntityKey) -> CanonicalError {
+    CanonicalError::internal(format!(
+        "the registry did not answer the batch resolution of {key}"
+    ))
+    .create()
+}
+
+/// Extract the identity after checking the exact key and kind-specific fields.
+#[cfg(any(test, feature = "test-util"))]
+fn identity_of(key: &EntityKey, entity: Entity) -> Result<EntityIdentity, CanonicalError> {
+    check_snapshot(key, &entity)?;
+    let identity = EntityIdentity {
+        gts_id: entity.gts_id.clone(),
+        gts_uuid: entity.gts_uuid,
+    };
+    let narrows = match entity.kind {
+        EntityKind::TypeSchema => TypeSchema::try_from(entity).is_ok(),
+        EntityKind::Instance => Instance::try_from(entity).is_ok(),
+    };
+    if !narrows {
+        return Err(CanonicalError::internal(format!(
+            "the registry answered {key} with {} of inconsistent data",
+            identity.gts_id
+        ))
+        .create());
+    }
+    Ok(identity)
+}
+
+fn unanswered(key: &EntityKey) -> CanonicalError {
+    CanonicalError::internal(format!(
+        "the registry did not answer an unconditional read of {key}"
+    ))
+    .create()
+}
+
+/// Each answer reduced to the part a `resolve_*` helper returns.
 fn project<K: Eq + Hash, T, V>(
-    answers: HashMap<K, Option<T>>,
+    answers: impl IntoIterator<Item = (K, Option<T>)>,
     field: impl Fn(T) -> V,
 ) -> HashMap<K, Option<V>> {
     answers
         .into_iter()
         .map(|(key, answer)| (key, answer.map(&field)))
         .collect()
-}
-
-/// The read behind every `resolve_*` helper: the mandatory fields, through any cache.
-fn id_only() -> ReadOptions {
-    ReadOptions {
-        projection: Projection::Select(FieldSelection::light()),
-        fresh: false,
-    }
 }
 
 async fn list_kind<R: EntityReads + ?Sized, T: Kinded>(
@@ -895,32 +1189,55 @@ fn found(
     lookup: Option<EntityLookup>,
 ) -> Result<Option<Entity>, CanonicalError> {
     match lookup {
-        Some(EntityLookup::Found { entity, .. }) if !consistent(&entity) => {
-            Err(CanonicalError::internal(format!(
-                "the registry answered {key} with a snapshot whose kind its data contradicts"
-            ))
-            .create())
+        Some(EntityLookup::Found { entity, .. }) => {
+            check_snapshot(key, &entity)?;
+            Ok((entity.kind == kind).then_some(*entity))
         }
-        Some(EntityLookup::Found { entity, .. }) if entity.kind == kind => Ok(Some(*entity)),
-        Some(EntityLookup::Found { .. } | EntityLookup::NotFound) => Ok(None),
-        Some(EntityLookup::Unchanged { .. }) | None => Err(CanonicalError::internal(format!(
-            "the registry did not answer an unconditional read of {key}"
-        ))
-        .create()),
+        Some(EntityLookup::NotFound) => Ok(None),
+        Some(EntityLookup::Unchanged { .. }) | None => Err(unanswered(key)),
     }
 }
 
-/// A kind-narrowed read's result type and the kind it carries.
+fn check_snapshot(key: &EntityKey, entity: &Entity) -> Result<(), CanonicalError> {
+    if !key.names(entity) || !consistent(entity) {
+        return Err(CanonicalError::internal(format!(
+            "the registry answered {key} with another or an inconsistent entity ({})",
+            entity.gts_id
+        ))
+        .create());
+    }
+    Ok(())
+}
+
+/// A kind-narrowed read's result type, the kind it carries and that kind's identifier.
 trait Kinded: TryFrom<Entity, Error = Entity> + Clone + Send {
     const KIND: EntityKind;
+    type Id: Clone + Send;
+
+    /// `id` as this kind's own identifier; `None` when it is not one.
+    fn kind_id(id: &GtsId) -> Option<Self::Id>;
 }
 
 impl Kinded for TypeSchema {
     const KIND: EntityKind = EntityKind::TypeSchema;
+    type Id = GtsTypeId;
+
+    fn kind_id(id: &GtsId) -> Option<GtsTypeId> {
+        id.is_type()
+            .then(|| GtsTypeId::try_new(id.as_ref()).ok())
+            .flatten()
+    }
 }
 
 impl Kinded for Instance {
     const KIND: EntityKind = EntityKind::Instance;
+    type Id = GtsInstanceId;
+
+    fn kind_id(id: &GtsId) -> Option<GtsInstanceId> {
+        (!id.is_type())
+            .then(|| GtsInstanceId::try_new(id.as_ref()).ok())
+            .flatten()
+    }
 }
 
 /// Narrow a snapshot to the requested kind; inconsistent data fails the call.
@@ -935,13 +1252,10 @@ fn narrow<T: Kinded>(snapshot: Entity) -> Result<T, CanonicalError> {
     })
 }
 
-/// The kind field agrees with the identifier, and an Instance carries no derived form.
-fn consistent(snapshot: &Entity) -> bool {
-    snapshot.kind == EntityKind::of(&snapshot.gts_id)
-        && (snapshot.kind == EntityKind::TypeSchema
-            || (snapshot.resolved_schema.is_none()
-                && snapshot.effective_traits.is_none()
-                && snapshot.effective_traits_schema.is_none()))
+/// The kind field agrees with the identifier, and the snapshot carries only fields that
+/// apply to its kind.
+pub(crate) fn consistent(snapshot: &Entity) -> bool {
+    snapshot.kind == EntityKind::of(&snapshot.gts_id) && snapshot.fits_its_kind()
 }
 
 /// A single read's answer: absence is the caller's `NotFound`.

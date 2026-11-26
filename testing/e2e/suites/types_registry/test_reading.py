@@ -90,6 +90,7 @@ async def test_default_read_is_document_free_metadata(
                     "gts_uuid": gts_uuid(schema["gts_id"]),
                     "kind": "type_schema",
                     "lifecycle_status": "active",
+                    "ownership": "global",
                     "origin": {
                         "type": "managed",
                         "resource_version": 1,
@@ -518,7 +519,7 @@ async def test_an_unknown_selection_is_refused_on_both_transports(
         "INVALID_SELECT",
         "'contents' is not a selectable field; select from content, effective_traits, "
         "effective_traits_schema, gts_id, gts_uuid, kind, lifecycle_status, origin, "
-        "provenance, resolved_schema",
+        "ownership, provenance, resolved_schema",
     )
 
     assert_bad_request(
@@ -917,10 +918,10 @@ async def test_batch_revalidation_answers_each_key(
 
 
 @pytest.mark.scenario("TR-READ-303")
-async def test_a_validator_belongs_to_one_projection(
+async def test_a_validator_names_the_state_under_every_projection(
     registry_http, registry_api_path, reading_fixture, given_registered
 ):
-    """A metadata ETag never declares a wider representation unchanged."""
+    """One state has one ETag under every `$select`; holding the fields is the client's."""
     person_schema, person_instance, other_schema, other_instance = map(reading_fixture, PAIRS)
     await given_registered(person_schema, person_instance, other_schema, other_instance)
 
@@ -933,7 +934,18 @@ async def test_a_validator_belongs_to_one_projection(
                 "body": {**mandatory(document), "origin": managed(1)},
             },
         )
-        content_etag = assert_exact(
+        assert_exact(
+            await get_entity(
+                registry_http, registry_api_path, document["gts_id"], select="content"
+            ),
+            {
+                "status": 200,
+                "etag": metadata_etag,
+                "body": {**mandatory(document), "content": document["content"]},
+            },
+        )
+        # The client now holds the content too, so the one validator conditions it.
+        assert_exact(
             await get_entity(
                 registry_http,
                 registry_api_path,
@@ -941,22 +953,7 @@ async def test_a_validator_belongs_to_one_projection(
                 select="content",
                 if_none_match=metadata_etag,
             ),
-            {
-                "status": 200,
-                "etag": "<etag>",
-                "body": {**mandatory(document), "content": document["content"]},
-            },
-            known_etags=[metadata_etag],
-        )
-        assert_exact(
-            await get_entity(
-                registry_http,
-                registry_api_path,
-                document["gts_id"],
-                select="content",
-                if_none_match=content_etag,
-            ),
-            {"status": 304, "etag": content_etag},
+            {"status": 304, "etag": metadata_etag},
         )
     assert_exact(
         await get_entity(

@@ -11,7 +11,7 @@ fn absent_selection_equals_the_explicit_default_set() {
     assert_eq!(explicit, FieldSelection::default());
     assert_eq!(
         FieldSelection::default().canonical(),
-        "gts_id,gts_uuid,kind,lifecycle_status,origin"
+        "gts_id,gts_uuid,kind,lifecycle_status,origin,ownership"
     );
 }
 
@@ -34,7 +34,7 @@ fn mandatory_fields_are_always_in_the_normalized_set() {
     assert_eq!(without, with, "naming a mandatory field changes nothing");
     assert_eq!(
         without.canonical(),
-        "content,gts_id,gts_uuid,kind,lifecycle_status"
+        "content,gts_id,gts_uuid,kind,lifecycle_status,ownership"
     );
 }
 
@@ -89,13 +89,18 @@ fn unknown_unavailable_and_nested_names_are_told_apart() {
         parse(&["contents"]),
         Err(SelectionError::Unknown("contents".to_owned()))
     );
-    for name in ["availability", "owned_by_context_tenant"] {
-        assert_eq!(
-            parse(&[name]),
-            Err(SelectionError::Unavailable(name.to_owned())),
-            "{name} is a DESIGN field P0 cannot answer",
-        );
-    }
+    assert_eq!(
+        parse(&["availability"]),
+        Err(SelectionError::Unavailable("availability".to_owned())),
+        "a DESIGN field P0 cannot answer",
+    );
+    assert_eq!(
+        parse(&["owned_by_context_tenant"]),
+        Err(SelectionError::Unknown(
+            "owned_by_context_tenant".to_owned()
+        )),
+        "replaced by the mandatory ownership field",
+    );
     for name in [
         "content.title",
         "effective/resolved_schema",
@@ -169,6 +174,7 @@ fn every_field_is_listed_once_in_canonical_order() {
         | F::Kind
         | F::LifecycleStatus
         | F::Origin
+        | F::Ownership
         | F::Provenance
         | F::ResolvedSchema => (),
     };
@@ -181,6 +187,7 @@ fn every_field_is_listed_once_in_canonical_order() {
         F::Kind,
         F::LifecycleStatus,
         F::Origin,
+        F::Ownership,
         F::Provenance,
         F::ResolvedSchema,
     ];

@@ -5,6 +5,8 @@
 //! listener validates again, and never the process's internal token. One client serves
 //! every caller; it holds no request's context.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_contract::runtime::config::ClientConfig;
@@ -13,10 +15,13 @@ use toolkit_http::{HttpClient, HttpError};
 use toolkit_security::SecurityContext;
 
 use super::transport::{Credential, Transport, client_span, traced};
-use super::wire::{BatchGetBody, LookupsWire, PageWire, discovery_query, parse};
+use super::wire::{
+    BatchGetBody, BatchResolveBody, LookupsWire, PageWire, ResolutionsWire, discovery_query, parse,
+};
 use crate::contract::TypesRegistryApi;
 use crate::models::{
-    BatchGetEntitiesRequest, BatchGetEntitiesResponse, ListEntitiesRequest, ListEntitiesResponse,
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, EntityIdentity, EntityKey,
+    ListEntitiesRequest, ListEntitiesResponse,
 };
 
 /// The tenant reads' base path; T38 promotes them to `/types-registry/v1`.
@@ -27,7 +32,7 @@ const SERVICE: &str = "TypesRegistryApi";
 
 /// The tenant contract over REST.
 ///
-/// Both methods are safe reads, so every attempt may be retried under
+/// Every method is a safe read, so every attempt may be retried under
 /// [`ClientConfig::retry`], each within [`ClientConfig::timeout`].
 /// [`ClientConfig::internal_token_provider`] is never consulted.
 pub struct TypesRegistryApiRestClient {
@@ -74,7 +79,7 @@ impl TypesRegistryApi for TypesRegistryApiRestClient {
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         let span = span!("batch_get_entities", "POST", "/entities:batchGet");
         traced(span, async {
-            let body = BatchGetBody::encode(&request)?;
+            let body = BatchGetBody::encode(&request);
             let url = self.transport.url("/entities:batchGet");
             let answer = self
                 .transport
@@ -89,6 +94,33 @@ impl TypesRegistryApi for TypesRegistryApiRestClient {
                 )
                 .await?;
             parse::<LookupsWire>("batch read", &answer.body)?.decode()
+        })
+        .await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        let span = span!("batch_resolve_identities", "POST", "/entities:batchResolve");
+        traced(span, async {
+            let body = BatchResolveBody::encode(&keys);
+            let url = self.transport.url("/entities:batchResolve");
+            let answer = self
+                .transport
+                .exchange(
+                    "batch_resolve_identities",
+                    Credential::Bearer(ctx.bearer_token()),
+                    |http| {
+                        http.post(&url)
+                            .json(&body)
+                            .map_err(TransportError::serialization)
+                    },
+                )
+                .await?;
+            let answered = parse::<ResolutionsWire>("batch resolution", &answer.body)?.decode()?;
+            crate::ext::checked_resolutions(&keys, answered)
         })
         .await
     }

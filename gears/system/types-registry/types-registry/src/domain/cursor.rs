@@ -395,8 +395,31 @@ mod tests {
         Ok(())
     }
 
-    /// A T22b default-selection token (its canonical spelling is unchanged)
-    /// resumes while no `depth`, `kind` or non-default `lifecycle_status` is named.
+    /// A cursor issued before `ownership` joined the mandatory fields bound the old
+    /// canonical default selection, so its traversal restarts.
+    #[test]
+    fn a_cursor_from_before_ownership_is_rejected() -> Result<(), serde_json::Error> {
+        let select = ast::Expr::Compare(
+            Box::new(ast::Expr::Identifier("$select".to_owned())),
+            ast::CompareOperator::Eq,
+            Box::new(ast::Expr::Value(ast::Value::String(
+                "gts_id,gts_uuid,kind,lifecycle_status,origin".to_owned(),
+            ))),
+        );
+        let token = CursorV1 {
+            k: vec![AFTER.to_owned()],
+            o: SortDir::Asc,
+            s: page_order().to_signed_tokens(),
+            f: short_filter_hash(Some(&select)),
+            d: FORWARD.to_owned(),
+        }
+        .encode()?;
+        assert!(decode(&token, &bound(None, &[])).is_err());
+        Ok(())
+    }
+
+    /// A token of the T22b filter shape, under today's default selection, resumes
+    /// while no `depth`, `kind` or non-default `lifecycle_status` is named.
     #[test]
     fn a_t22b_cursor_resumes_under_the_same_absent_filters() -> Result<(), serde_json::Error> {
         let equals = |field: &str, value: &str| {

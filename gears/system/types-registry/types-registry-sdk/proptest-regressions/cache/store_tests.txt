@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e41ee53de0e27fb62d4364134d524cc959494dbe07792b440c19e72f98c4b1b7 # shrinks to resident = [None, None, None, None], answer = [None, None, Some(Null), None], covers = FieldSelection({GtsId, GtsUuid, Kind, LifecycleStatus, Ownership}), selected = FieldSelection({GtsId, GtsUuid, Kind, LifecycleStatus, Ownership, EffectiveTraits})

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+mod cache;
 pub mod contract;
 pub mod error;
 pub mod ext;
@@ -28,6 +29,7 @@ mod rest_client;
 )]
 pub mod testing_platform;
 
+pub use cache::{CacheSettings, CachedPlatformTypesRegistry, CachedTypesRegistry};
 pub use contract::{
     PlatformTypesRegistryApi, TypesRegistryApi, platform_types_registry_api_ir,
     types_registry_api_ir,
@@ -39,12 +41,12 @@ pub use item_failure::{AdmissionFailure, AdmissionFailureReason, DependencyKind}
 pub use models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Cursor,
     DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, DeletionOutcome,
-    Entity, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection,
-    IdempotencyKey, Instance, JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
-    ListEntitiesResponse, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
-    PublisherContext, PublisherVersion, PublisherVersionError, ReadOptions,
-    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
-    RegistrationOutcome, TypeSchema, Validator,
+    Entity, EntityField, EntityFilter, EntityIdentity, EntityKey, EntityKind, EntityLookup,
+    FieldSelection, IdempotencyKey, Instance, JsonDocument, LifecycleFilter, LifecycleStatus,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Ownership,
+    PageRequest, Projection, Provenance, PublisherContext, PublisherVersion, PublisherVersionError,
+    ReadOptions, RegisterEntitiesRequest, RegisterItem, RegistrationItemResult,
+    RegistrationOperation, RegistrationOutcome, TypeSchema, Validator,
 };
 
 pub use payload::CompilePayloadValidatorError;

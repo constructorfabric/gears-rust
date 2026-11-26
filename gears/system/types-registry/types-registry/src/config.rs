@@ -262,14 +262,56 @@ pub struct LocalClientSettings {
     pub cache: CacheSettings,
 }
 
-/// Per-kind cache settings.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// Independent SDK caches for the published platform and tenant APIs.
+/// The per-kind legacy caches remain until T38.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheSettings {
-    /// Cache settings for the type-schema cache.
+    /// Freshness of snapshots and tenant visibility confirmations (SPEC §8.3).
+    /// `0s` forces a registry check on every snapshot read.
+    #[serde(with = "toolkit_utils::humantime_serde")]
+    pub freshness_window: Duration,
+    /// Per-cache budget: compact JSON documents, GTS ID and raw validator bytes,
+    /// plus 256 bytes per snapshot for its other metadata.
+    /// Both APIs combined can retain twice this budget.
+    pub max_size_bytes: ByteSize,
+    /// Maximum number of snapshots per cache. Zero disables snapshot retention.
+    pub max_entries: usize,
+    /// Maximum ID/UUID pairs per cache, retained without expiry. Zero resolves
+    /// via eligible snapshots or the registry. See [`types_registry_sdk::CacheSettings`].
+    pub max_identity_entries: usize,
+    /// The legacy client's type-schema cache.
     pub type_schemas: SingleCacheSettings,
-    /// Cache settings for the instance cache.
+    /// The legacy client's instance cache.
     pub instances: SingleCacheSettings,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            freshness_window: types_registry_sdk::CacheSettings::DEFAULT_FRESHNESS_WINDOW,
+            max_size_bytes: ByteSize::from_bytes(
+                types_registry_sdk::CacheSettings::DEFAULT_MAX_SIZE_BYTES,
+            ),
+            max_entries: types_registry_sdk::CacheSettings::DEFAULT_MAX_ENTRIES,
+            max_identity_entries: types_registry_sdk::CacheSettings::DEFAULT_MAX_IDENTITY_ENTRIES,
+            type_schemas: SingleCacheSettings::default(),
+            instances: SingleCacheSettings::default(),
+        }
+    }
+}
+
+impl CacheSettings {
+    /// The SDK client cache's settings.
+    #[must_use]
+    pub fn client_cache(&self) -> types_registry_sdk::CacheSettings {
+        types_registry_sdk::CacheSettings {
+            freshness_window: self.freshness_window,
+            max_size_bytes: self.max_size_bytes.bytes(),
+            max_entries: self.max_entries,
+            max_identity_entries: self.max_identity_entries,
+        }
+    }
 }
 
 /// Settings for a single LRU cache.

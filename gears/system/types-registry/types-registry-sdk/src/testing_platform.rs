@@ -22,11 +22,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
@@ -39,10 +38,11 @@ use crate::gts::{OperationResource, TypeResource};
 use crate::item_failure::{AdmissionFailure, AdmissionFailureReason as Reason, context};
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionItemResult,
-    DeletionOperation, DeletionOutcome, Entity, EntityField, EntityKey, EntityKind, EntityLookup,
-    FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
-    ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance, RegisterEntitiesRequest,
-    RegisterItem, RegistrationItemResult, RegistrationOperation, RegistrationOutcome, Validator,
+    DeletionOperation, DeletionOutcome, Entity, EntityField, EntityIdentity, EntityKey, EntityKind,
+    EntityLookup, FieldSelection, IdempotencyKey, LifecycleFilter, LifecycleStatus,
+    ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus, Origin, Provenance,
+    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
+    RegistrationOutcome, Validator,
 };
 use crate::reason::aborted;
 
@@ -55,6 +55,7 @@ pub mod conformance;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Call {
     BatchGet,
+    BatchResolve,
     List,
     Register,
     Delete,
@@ -331,6 +332,24 @@ struct State {
     resolver: Resolver,
 }
 
+impl State {
+    fn strict_violation(&self, call: Call, keys: &[EntityKey]) -> Option<String> {
+        let strict = self.strict.as_ref()?;
+        if !strict.allowed.contains(&call) {
+            return Some(format!("unexpected {call:?} call"));
+        }
+        if !matches!(call, Call::BatchGet | Call::BatchResolve) {
+            return None;
+        }
+        keys.iter()
+            .find(|key| {
+                find(&self.entities, key).is_none()
+                    && !strict.absent.iter().any(|a| same_entity(a, key))
+            })
+            .map(|key| format!("unexpected read of {key}"))
+    }
+}
+
 /// In-memory [`PlatformTypesRegistryApi`] and [`TypesRegistryApi`]; see the module docs.
 pub struct MockTypesRegistry {
     state: Mutex<State>,
@@ -356,13 +375,20 @@ impl MockTypesRegistry {
         }
     }
 
+    /// Poisoning can leave the fake's indexes inconsistent.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .expect("MockTypesRegistry: an earlier panic left its state inconsistent")
+    }
+
     /// Strict: a call of a method not [allowed](Self::allow), or a batch read of a key that is
     /// neither stored nor [expected absent](Self::expect_absent), panics, so a caller that
     /// swallows errors cannot hide it.
     #[must_use]
     pub fn strict() -> Self {
         let fake = Self::new();
-        fake.state.lock().strict = Some(Strict {
+        fake.state().strict = Some(Strict {
             allowed: HashSet::new(),
             absent: Vec::new(),
         });
@@ -371,14 +397,14 @@ impl MockTypesRegistry {
 
     /// Allows `call` in strict mode; no effect on a lenient fake.
     pub fn allow(&self, call: Call) {
-        if let Some(strict) = &mut self.state.lock().strict {
+        if let Some(strict) = &mut self.state().strict {
             strict.allowed.insert(call);
         }
     }
 
     /// Lets a strict batch read ask for `key` while it is not stored; no effect on a lenient fake.
     pub fn expect_absent(&self, key: impl Into<EntityKey>) {
-        if let Some(strict) = &mut self.state.lock().strict {
+        if let Some(strict) = &mut self.state().strict {
             strict.absent.push(key.into());
         }
     }
@@ -415,7 +441,7 @@ impl MockTypesRegistry {
 
     /// Stores an entity directly, replacing any stored one.
     pub fn seed_entity(&self, seed: Seed) {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         state.resolver.invalidate();
         state.entities.insert(
             seed.gts_id.id().to_owned(),
@@ -445,8 +471,7 @@ impl MockTypesRegistry {
 
     /// Admission refuses every registration of `gts_id` with `reason`.
     pub fn reject(&self, gts_id: &str, reason: Reason) {
-        self.state
-            .lock()
+        self.state()
             .admission
             .rejections
             .insert(gts_id.to_owned(), reason);
@@ -454,8 +479,7 @@ impl MockTypesRegistry {
 
     /// Admission refuses `gts_id` as `dependency_not_found` while `dependency` is not active.
     pub fn depends_on(&self, gts_id: &str, dependency: &str) {
-        self.state
-            .lock()
+        self.state()
             .admission
             .dependencies
             .push((gts_id.to_owned(), dependency.to_owned()));
@@ -471,12 +495,12 @@ impl MockTypesRegistry {
             "a key selector never matches {:?}",
             fault.call
         );
-        self.state.lock().rules.push((fault, 0));
+        self.state().rules.push((fault, 0));
     }
 
     /// Breaks later responses; see [`ProtocolFault`].
     pub fn protocol_fault(&self, fault: ProtocolFault) {
-        let protocol = &mut self.state.lock().protocol;
+        let protocol = &mut self.state().protocol;
         if let ProtocolFault::LoseReadBacks(n) = fault {
             protocol.lose_read_backs = n;
         } else {
@@ -486,13 +510,13 @@ impl MockTypesRegistry {
 
     /// Race the next registration with another publisher's create/update.
     pub fn race_next_submit(&self, gts_id: &str, content: serde_json::Value) {
-        self.state.lock().races.push((gts_id.to_owned(), content));
+        self.state().races.push((gts_id.to_owned(), content));
     }
 
     /// How many calls of `call` were made, counted on entry: failed and cancelled ones included.
     #[must_use]
     pub fn calls(&self, call: Call) -> u32 {
-        self.state.lock().calls.get(&call).copied().unwrap_or(0)
+        self.state().calls.get(&call).copied().unwrap_or(0)
     }
 
     /// Request-plane contexts passed to `call`, cloned on entry in call order, including failed
@@ -500,8 +524,7 @@ impl MockTypesRegistry {
     /// vector.
     #[must_use]
     pub fn caller_contexts(&self, call: Call) -> Vec<SecurityContext> {
-        self.state
-            .lock()
+        self.state()
             .caller_contexts
             .get(&call)
             .cloned()
@@ -512,25 +535,19 @@ impl MockTypesRegistry {
     /// [`Self::calls`] counts both planes together.
     #[must_use]
     pub fn platform_calls(&self, call: Call) -> u32 {
-        self.state
-            .lock()
-            .platform_calls
-            .get(&call)
-            .copied()
-            .unwrap_or(0)
+        self.state().platform_calls.get(&call).copied().unwrap_or(0)
     }
 
     /// Every key batch reads asked for, in order.
     #[must_use]
     pub fn reads(&self) -> Vec<EntityKey> {
-        self.state.lock().reads.clone()
+        self.state().reads.clone()
     }
 
     /// Every item of every registration submitted, in order: [`Self::submissions`] flattened.
     #[must_use]
     pub fn registered(&self) -> Vec<RegisterItem> {
-        self.state
-            .lock()
+        self.state()
             .submissions
             .iter()
             .flat_map(|(_, request)| request.items.iter().cloned())
@@ -540,14 +557,13 @@ impl MockTypesRegistry {
     /// Every registration that got past its delay, accepted, refused or replayed, in order.
     #[must_use]
     pub fn submissions(&self) -> Vec<(IdempotencyKey, RegisterEntitiesRequest)> {
-        self.state.lock().submissions.clone()
+        self.state().submissions.clone()
     }
 
     /// The stored content of `gts_id`, if active.
     #[must_use]
     pub fn content(&self, gts_id: &str) -> Option<serde_json::Value> {
-        self.state
-            .lock()
+        self.state()
             .entities
             .get(gts_id)
             .filter(|s| s.lifecycle == LifecycleStatus::Active)
@@ -568,7 +584,7 @@ impl MockTypesRegistry {
         caller: Option<&SecurityContext>,
     ) -> Option<CanonicalError> {
         let (delay, failure) = {
-            let mut guard = self.state.lock();
+            let mut guard = self.state();
             let state = &mut *guard;
             *state.calls.entry(call).or_default() += 1;
             if let Some(caller) = caller {
@@ -583,20 +599,10 @@ impl MockTypesRegistry {
             if call == Call::BatchGet {
                 state.reads.extend(keys.iter().cloned());
             }
-            if let Some(strict) = &state.strict {
-                assert!(
-                    strict.allowed.contains(&call),
-                    "MockTypesRegistry (strict): unexpected {call:?} call"
-                );
-                if call == Call::BatchGet {
-                    for key in keys {
-                        assert!(
-                            find(&state.entities, key).is_some()
-                                || strict.absent.iter().any(|a| same_entity(a, key)),
-                            "MockTypesRegistry (strict): unexpected read of {key}"
-                        );
-                    }
-                }
+            if let Some(violation) = state.strict_violation(call, keys) {
+                // Keep the recorded call inspectable after the expected panic.
+                drop(guard);
+                panic!("MockTypesRegistry (strict): {violation}");
             }
             let mut chosen = None;
             for (fault, seen) in &mut state.rules {
@@ -623,7 +629,7 @@ impl MockTypesRegistry {
         candidates: Vec<Candidate>,
         dry_run: bool,
     ) -> Result<Uuid, CanonicalError> {
-        let mut state = self.state.lock();
+        let mut state = self.state();
         if let Some((known, operation_id)) = state.keys.get(key.as_str()) {
             return if *known == fingerprint {
                 Ok(*operation_id)
@@ -654,7 +660,7 @@ impl MockTypesRegistry {
 
     fn read_back(&self, operation_id: Uuid) -> Result<Operation, CanonicalError> {
         {
-            let protocol = &mut self.state.lock().protocol;
+            let protocol = &mut self.state().protocol;
             if protocol.lose_read_backs > 0 {
                 protocol.lose_read_backs -= 1;
                 return Err(OperationResource::aborted("lost read back")
@@ -668,7 +674,7 @@ impl MockTypesRegistry {
 
     /// The operation as a read sees it; a poll counts toward completion.
     fn operation(&self, operation_id: Uuid, poll: bool) -> Result<Operation, CanonicalError> {
-        let mut guard = self.state.lock();
+        let mut guard = self.state();
         let State {
             entities,
             operations,
@@ -1007,6 +1013,7 @@ fn snapshot(
         gts_uuid,
         kind,
         lifecycle_status: stored.lifecycle,
+        ownership: crate::models::Ownership::Global,
         origin: has(EntityField::Origin).then_some(Origin::Managed {
             resource_version: stored.resource_version,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -1027,20 +1034,16 @@ fn snapshot(
     })
 }
 
-/// Bind the token to the projection and resolved documents, including parent changes.
-fn validator(
-    stored: &Stored,
-    fields: &FieldSelection,
-    resolution: Option<&Resolution>,
-) -> Validator {
+/// Bind the token to the entity's state: its revision and resolved documents, including
+/// parent changes. Like the registry's, it is the same under every projection and
+/// carries no identity.
+fn validator(stored: &Stored, resolution: Option<&Resolution>) -> Validator {
     let resolution = resolution.map(|r| {
         let mut hasher = DefaultHasher::new();
         hasher.write(format!("{r:?}").as_bytes());
         hasher.finish()
     });
-    Validator::from_bytes(
-        format!("v{}:{fields:?}:{resolution:?}", stored.resource_version).into_bytes(),
-    )
+    Validator::from_bytes(format!("v{}:{resolution:?}", stored.resource_version).into_bytes())
 }
 
 /// Bind cursors to filters and projection, allowing page-size changes.
@@ -1090,7 +1093,7 @@ impl MockTypesRegistry {
             return Err(items_violation("batch read out of range"));
         }
         let fields = request.projection.normalized();
-        let mut guard = self.state.lock();
+        let mut guard = self.state();
         let state = &mut *guard;
         if state.protocol.has(ProtocolFault::DropAnswers) {
             return Ok(BatchGetEntitiesResponse(HashMap::new()));
@@ -1108,8 +1111,8 @@ impl MockTypesRegistry {
             let resolution = is_type(&id)
                 .then(|| resolve_and_freeze(&mut state.resolver, &mut state.entities, &id));
             let stored = state.entities.get(&id).expect("found above");
-            let etag = validator(stored, &fields, resolution.as_ref());
-            let lookup = if item.if_none_match.as_ref() == Some(&etag) {
+            let etag = validator(stored, resolution.as_ref());
+            let lookup = if item.if_none_match_for(&request.projection) == Some(&etag) {
                 EntityLookup::Unchanged { etag }
             } else {
                 let mut snapshot = snapshot(&id, stored, &fields, resolution.as_ref())?;
@@ -1130,6 +1133,35 @@ impl MockTypesRegistry {
             out.insert(item.key, lookup);
         }
         Ok(BatchGetEntitiesResponse(out))
+    }
+
+    /// The batch resolution both contracts serve: the stored pair of every distinct key,
+    /// Active or deleted, with no resolution, document or validator.
+    async fn resolve_batch(
+        &self,
+        caller: Option<&SecurityContext>,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        if let Some(error) = self.enter(Call::BatchResolve, &keys, caller).await {
+            return Err(error);
+        }
+        if keys.is_empty() || keys.len() > crate::models::MAX_BATCH_GET_KEYS {
+            return Err(items_violation("batch resolution out of range"));
+        }
+        let state = self.state();
+        if state.protocol.has(ProtocolFault::DropAnswers) {
+            return Ok(HashMap::new());
+        }
+        let mut out = HashMap::with_capacity(keys.len());
+        for key in keys {
+            let identity = find(&state.entities, &key).map(|(id, _)| {
+                let gts_id = gts::GtsId::try_new(id).expect("a stored identifier is valid");
+                let gts_uuid = gts_id.to_uuid();
+                EntityIdentity { gts_id, gts_uuid }
+            });
+            out.entry(key).or_insert(identity);
+        }
+        Ok(out)
     }
 
     /// The discovery page both contracts serve.
@@ -1166,7 +1198,7 @@ impl MockTypesRegistry {
                 _ => return Err(cursor_not_usable()),
             },
         };
-        let mut guard = self.state.lock();
+        let mut guard = self.state();
         let state = &mut *guard;
         let matching: Vec<String> = state
             .entities
@@ -1224,6 +1256,14 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
         self.read_batch(None, request).await
     }
 
+    async fn batch_resolve_identities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.resolve_batch(None, keys).await
+    }
+
     async fn list_entities(
         &self,
         _ctx: &PlatformSecurityContext,
@@ -1245,7 +1285,7 @@ impl PlatformTypesRegistryApi for MockTypesRegistry {
             .collect();
         let failure = self.enter(Call::Register, &keys, None).await;
         {
-            let mut state = self.state.lock();
+            let mut state = self.state();
             state.submissions.push((key.clone(), request.clone()));
             if let Some(error) = failure {
                 return Err(error);
@@ -1375,6 +1415,14 @@ impl TypesRegistryApi for MockTypesRegistry {
         request: BatchGetEntitiesRequest,
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         self.read_batch(Some(ctx), request).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        self.resolve_batch(Some(ctx), keys).await
     }
 
     async fn list_entities(

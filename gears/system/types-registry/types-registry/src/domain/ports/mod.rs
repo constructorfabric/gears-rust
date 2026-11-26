@@ -651,6 +651,9 @@ pub struct EntityPage {
     /// The last returned `gts_id` when another row matches, else `None`. A page
     /// with a continuation is always full.
     pub next_after: Option<String>,
+    /// The row fetched past the page to decide `next_after`, so a caller can check
+    /// it as well as the page.
+    pub lookahead: Option<EntityRow>,
 }
 
 impl EntityPage {
@@ -659,6 +662,7 @@ impl EntityPage {
         Self {
             items: Vec::new(),
             next_after: None,
+            lookahead: None,
         }
     }
 }

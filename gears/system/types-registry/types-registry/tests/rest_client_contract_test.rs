@@ -225,25 +225,19 @@ async fn submit_read_and_replay_over_tcp() {
     );
 
     let selection = Projection::Select(FieldSelection::full());
-    let read = |if_none_match| BatchGetEntitiesRequest {
-        items: vec![BatchGetItem {
-            key: EntityKey::GtsId(gts::GtsId::try_new(CF_TYPE).unwrap()),
-            if_none_match,
-        }],
-        projection: selection.clone(),
-        fresh: false,
-    };
+    let read = |item| BatchGetEntitiesRequest::new([item]).with_projection(selection.clone());
+    let item = BatchGetItem::new(type_key(CF_TYPE));
     let found = client
-        .batch_get_entities(&ctx(), read(None))
+        .batch_get_entities(&ctx(), read(item.clone()))
         .await
         .expect("read")
         .0;
-    let Some(EntityLookup::Found { entity, etag }) = found.values().next() else {
+    let Some(lookup @ EntityLookup::Found { entity, etag }) = found.values().next() else {
         panic!("found: {found:?}");
     };
     assert_eq!(entity.content, Some(schema(CF_TYPE)));
     let unchanged = client
-        .batch_get_entities(&ctx(), read(Some(etag.clone())))
+        .batch_get_entities(&ctx(), read(item.revalidate(lookup)))
         .await
         .expect("read")
         .0;
@@ -553,10 +547,7 @@ async fn tenant_reads_over_tcp_answer_as_the_local_tenant_client() {
     assert_eq!(found.0[&absent], EntityLookup::NotFound);
 
     let conditional = BatchGetEntitiesRequest {
-        items: vec![BatchGetItem {
-            key: type_key(CF_TYPE),
-            if_none_match: Some(etag.clone()),
-        }],
+        items: vec![BatchGetItem::new(type_key(CF_TYPE)).revalidate(&found.0[&type_key(CF_TYPE)])],
         projection,
         fresh: false,
     };
@@ -590,25 +581,33 @@ async fn tenant_reads_over_tcp_answer_as_the_local_tenant_client() {
     );
 
     let oversized = BatchGetEntitiesRequest {
-        items: vec![BatchGetItem {
-            key: type_key(CF_TYPE),
-            if_none_match: Some(Validator::from_bytes(vec![b'v'; 2048])),
-        }],
+        items: vec![
+            BatchGetItem::new(type_key(CF_TYPE)).revalidate(&EntityLookup::Found {
+                entity: entity.clone(),
+                etag: Validator::from_bytes(vec![b'v'; 2048]),
+            }),
+        ],
         projection: Projection::Default,
         fresh: false,
     };
-    assert_eq!(
-        wire(
-            TypesRegistryApi::batch_get_entities(&remote, &tenant, oversized.clone())
-                .await
-                .expect_err("over the validator bound")
-        ),
-        wire(
-            TypesRegistryApi::batch_get_entities(&local, &tenant, oversized)
-                .await
-                .expect_err("over the validator bound")
-        )
-    );
+    let remote_error = TypesRegistryApi::batch_get_entities(&remote, &tenant, oversized.clone())
+        .await
+        .expect_err("over the quoted entity-tag limit");
+    let local_error = TypesRegistryApi::batch_get_entities(&local, &tenant, oversized)
+        .await
+        .expect_err("over the raw validator limit");
+    for (error, len) in [(remote_error, 2050), (local_error, 2048)] {
+        let problem = wire(error);
+        assert_eq!(problem["status"], 400);
+        assert_eq!(
+            problem["context"]["field_violations"],
+            json!([{
+                "field": "if_none_match",
+                "reason": "VALIDATION_FAILED",
+                "description": format!("each if_none_match entity-tag must be at most 1024 bytes; this one is {len}"),
+            }])
+        );
+    }
 
     let filter = EntityFilter {
         pattern: Some(gts::GtsIdPattern::try_new("gts.cf.core.example.*").expect("pattern")),
@@ -768,6 +767,53 @@ async fn transient_tenant_failures_are_retried_with_the_same_bearer() {
     };
     assert_eq!(attempts("POST", "/types-registry/v2/entities:batchGet"), 3);
     assert_eq!(attempts("GET", "/types-registry/v2/entities"), 2);
+    let bearer = format!("Bearer {TENANT_BEARER}");
+    assert!(
+        seen.iter().all(
+            |request| request.authorization.as_deref() == Some(bearer.as_str()) && !request.token
+        ),
+        "{seen:?}"
+    );
+}
+
+/// The tenant batch resolution reaches its own route under the caller's bearer, is
+/// retried as a safe read, and answers the stored pair or absence per distinct key.
+#[tokio::test]
+async fn the_tenant_resolution_round_trips_under_the_callers_bearer() {
+    let faults = Arc::new(Faults::default());
+    faults.fail("POST", "/v2/entities:batchResolve", 1);
+    let server = serve_with(faults.wrap()).await;
+    let local = LocalClient::new(Arc::clone(&server.service));
+    seed(&local, &[CF_TYPE]).await;
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let remote = tenant_client(&server, &resolutions);
+    let registered = gts::GtsId::try_new(CF_TYPE).expect("identifier");
+    let by_uuid = EntityKey::GtsUuid(registered.to_uuid());
+    let absent = type_key(CF_OTHER);
+
+    let resolved = TypesRegistryApi::batch_resolve_identities(
+        &remote,
+        &caller(TENANT_BEARER),
+        vec![type_key(CF_TYPE), by_uuid.clone(), absent.clone()],
+    )
+    .await
+    .expect("resolved on the second attempt");
+
+    let gts_uuid = registered.to_uuid();
+    let identity = Some(types_registry_sdk::EntityIdentity {
+        gts_id: registered,
+        gts_uuid,
+    });
+    assert_eq!(resolved.len(), 3);
+    assert_eq!(resolved[&type_key(CF_TYPE)], identity);
+    assert_eq!(resolved[&by_uuid], identity);
+    assert_eq!(resolved[&absent], None);
+    let seen: Vec<_> = faults
+        .seen()
+        .into_iter()
+        .filter(|request| request.path == "/types-registry/v2/entities:batchResolve")
+        .collect();
+    assert_eq!(seen.len(), 2, "{seen:?}");
     let bearer = format!("Bearer {TENANT_BEARER}");
     assert!(
         seen.iter().all(

@@ -1,6 +1,6 @@
 # Types Registry e2e suite
 
-The suite covers asynchronous admission (`202` + `GET /operations/{id}`), exact and batch reads, discovery and plane separation through numbered scenarios. Ordinary scenarios use one selected API and HTTP client for submissions, deletions, operation polling and entity reads. By default this is `/types-registry/v2/platform/` with the internal token. The plane-separation scenarios additionally exercise tenant reads under `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit HTTP client and API path so the same workflows can exercise tenant mutations once supported. The [legacy suite](legacy/README.md) covers the original synchronous v1 API (`200` + a `results` array) and has no reserved scenario IDs.
+Numbered e2e scenarios cover asynchronous admission (`202` + `GET /operations/{id}`), exact and batch reads, resolution, discovery and both API planes. Workflows default to `/types-registry/v2/platform/` with the internal token. Tenant read scenarios use `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit client and API path for either plane, including future tenant mutations. The [legacy suite](legacy/README.md) covers synchronous v1 (`200` + `results`) and has no reserved scenario IDs.
 
 ## Scenario index
 
@@ -31,15 +31,16 @@ Every scenario has a test. Scenarios proved by one workflow share a test functio
 | 19 | [Batch read](scenarios/reading.md#batch-read) | `TR-READ-101`–`TR-READ-199` | [test_reading.py](test_reading.py) | Implemented |
 | 20 | [Consistency across read routes](scenarios/reading.md#consistency-across-read-routes) | `TR-READ-201`–`TR-READ-299` | [test_reading.py](test_reading.py) | Implemented |
 | 21 | [Conditional reads](scenarios/reading.md#conditional-reads) | `TR-READ-301`–`TR-READ-399` | [test_reading.py](test_reading.py) | Implemented |
-| 22 | [Paged discovery and returned fields](scenarios/discovery.md#paged-discovery-and-returned-fields) | `TR-DISC-001`–`TR-DISC-099` | [test_discovery.py](test_discovery.py) | Implemented |
-| 23 | [Filters](scenarios/discovery.md#filters) | `TR-DISC-101`–`TR-DISC-199` | [test_discovery.py](test_discovery.py), [test_discovery_patterns.py](test_discovery_patterns.py) | Implemented; identifier matching TR-DISC-104–109 follows GTS §10 (33 separate selector cases) |
-| 24 | [Cursor continuation](scenarios/discovery.md#cursor-continuation) | `TR-DISC-201`–`TR-DISC-299` | [test_discovery.py](test_discovery.py) | Implemented |
-| 25 | [Read discovered entities with batchGet](scenarios/discovery.md#read-discovered-entities-with-batchget) | `TR-DISC-301`–`TR-DISC-399` | [test_discovery.py](test_discovery.py) | Implemented |
-| 26 | [Plane separation](scenarios/planes.md#plane-separation) | `TR-PLANE-001`–`TR-PLANE-099` | [test_planes.py](test_planes.py) | Implemented |
+| 22 | [Batch resolution](scenarios/reading.md#batch-resolution) | `TR-READ-401`–`TR-READ-499` | [test_resolution.py](test_resolution.py) | Implemented |
+| 23 | [Paged discovery and returned fields](scenarios/discovery.md#paged-discovery-and-returned-fields) | `TR-DISC-001`–`TR-DISC-099` | [test_discovery.py](test_discovery.py) | Implemented |
+| 24 | [Filters](scenarios/discovery.md#filters) | `TR-DISC-101`–`TR-DISC-199` | [test_discovery.py](test_discovery.py), [test_discovery_patterns.py](test_discovery_patterns.py) | Implemented; identifier matching TR-DISC-104–109 follows GTS §10 (33 separate selector cases) |
+| 25 | [Cursor continuation](scenarios/discovery.md#cursor-continuation) | `TR-DISC-201`–`TR-DISC-299` | [test_discovery.py](test_discovery.py) | Implemented |
+| 26 | [Read discovered entities with batchGet](scenarios/discovery.md#read-discovered-entities-with-batchget) | `TR-DISC-301`–`TR-DISC-399` | [test_discovery.py](test_discovery.py) | Implemented |
+| 27 | [Plane separation](scenarios/planes.md#plane-separation) | `TR-PLANE-001`–`TR-PLANE-099` | [test_planes.py](test_planes.py) | Implemented |
 
 The shared base config (`config/e2e-local.yaml`) allows `skip_compatibility_check` requests and allows vendor `acme` only under `gts.acme.e2e.*`, so the unscoped `make e2e-local` server runs TR-REG-903 and TR-REG-904 too. TR-REG-902 uses the force-disabled profile; every other run skips it.
 
-`conftest.py` provides HTTP/fixture setup, `given_registered` and scenario-ID binding; `helpers.py` provides submit-and-poll and read helpers, expected-body builders and comparators. Pytest collects both sets.
+`conftest.py` provides HTTP/fixture setup, the tenant client, `given_registered` and scenario-ID binding; `helpers.py` provides submit-and-poll and read helpers, expected-body builders and comparators. Pytest collects both sets.
 
 ## Test scope
 
@@ -60,11 +61,11 @@ T38 promotes it to `/types-registry/v1/platform` alongside the tenant `/v2` → 
 cutover; the platform fixture value then becomes `v1/platform`.
 
 - The focused launcher starts each run with fresh databases under `target/e2e-home-types_registry`, isolating seed revisions and migrations from other branches and local development data.
-- Every ordinary workflow uses `registry_http` / `registry_api_path`, with `TYPES_REGISTRY_API_VERSION=v2/platform` by default. Platform paths select the internal-token client; tenant paths select bearer credentials. Set the version to `v2` once tenant mutations are supported to run the same scenarios there. There is no automatic fallback and credentials are never merged. `test_planes.py` fixes the platform/tenant routes explicitly and adds a tenant client only for plane-separation checks.
+- Every ordinary workflow uses `registry_http` / `registry_api_path`, with `TYPES_REGISTRY_API_VERSION=v2/platform` by default. Platform paths select the internal-token client; tenant paths select bearer credentials. Set the version to `v2` once tenant mutations are supported to run the same scenarios there. There is no automatic fallback and credentials are never merged. `test_planes.py` and `test_resolution.py` fix the platform/tenant routes explicitly, prepare data through the platform API and read the tenant routes with the bearer-only `registry_tenant_http` client.
 - Each test gets a fresh `cf.e2e.r<uuid>.` namespace. Fixture loaders rewrite IDs and `$ref` targets, not schema constraints or values. TR-REG-901 and TR-REG-904 change the vendor and package after loading to exercise the configured policy region.
 - Submissions use a fresh `Idempotency-Key` by default. Replay and conflict scenarios intentionally reuse the key they are testing.
 - Registration outcomes match by GTS ID. Deletion outcomes preserve request order and use `assert_operation(..., ordered=True)`.
-- Read responses are compared whole. `assert_exact` compares `{"status", "etag", "body"}` as one JSON value; a `304` has no `body`. An expected `"<etag>"` stands for a validated ETag that is none of the known ones, so a changed ETag is part of the expectation. `assert_batch` matches results by echoed key, because batch order is not contractual. `walk` follows every cursor and `assert_pages` compares the whole walk.
+- Read responses are compared whole. `assert_exact` compares `{"status", "etag", "body"}` as one JSON value; a `304` has no `body`. An expected `"<etag>"` stands for a validated ETag that is none of the known ones, so a changed ETag is part of the expectation. `assert_batch` and `assert_resolutions` match results by echoed key, because batch order is not contractual. `walk` follows every cursor and `assert_pages` compares the whole walk.
 - Only unpredictable values are masked, after validation: operation IDs, receipt status, timestamps, new ETags, cursors, implementation versions, trace IDs and non-contractual messages.
 - Tests contain complete expected bodies; scenario docs state intent.
 

@@ -26,7 +26,7 @@ pub use crate::domain::admission::{DeleteRequest, DeleteTarget};
 use crate::domain::caller::CallerContext;
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
-    OperationStatus,
+    OperationStatus, Ownership, OwnershipScope,
 };
 pub use crate::domain::key::{EntityKey, MAX_KEY_LEN};
 use crate::domain::policy::RegistrationPolicy;
@@ -35,7 +35,7 @@ use crate::domain::ports::{
     CurrentReadRow, EntityRow, ListFilter, PageRequest, Stores, snapshot_read,
 };
 use crate::domain::selection::{EntityField, FieldSelection};
-use crate::domain::validator::{IfNoneMatch, Validator};
+use crate::domain::validator::{IfNoneMatch, MAX_VALIDATOR_LEN, Validator};
 
 /// One operation and its per-candidate outcomes, as a caller polls it.
 #[domain_model]
@@ -72,6 +72,7 @@ pub struct EntityRecord {
     pub kind: EntityKind,
     pub origin: Option<ManagedOrigin>,
     pub lifecycle_status: LifecycleStatus,
+    pub ownership: Ownership,
     pub content: Option<Box<RawValue>>,
     pub resolved_schema: Option<Box<RawValue>>,
     pub effective_traits: Option<Box<RawValue>>,
@@ -113,6 +114,14 @@ pub enum EntityLookup {
         etag: Validator,
     },
     NotFound,
+}
+
+/// The registered pair returned for an active or deleted entity.
+#[domain_model]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntityIdentity {
+    pub gts_id: String,
+    pub gts_uuid: Uuid,
 }
 
 /// One key of a batch read; a condition makes just this key conditional.
@@ -206,7 +215,7 @@ pub enum ServiceError {
     Storage(#[from] ScopeError),
     #[error("database failure: {0}")]
     Db(#[from] DbError),
-    #[error("a stored document could not be read as JSON: {0}")]
+    #[error("a stored entity is invalid: {0}")]
     CorruptDocument(String),
     /// A blocking task panicked or was cancelled; the source says which.
     #[error("a blocking task did not complete: {0}")]
@@ -218,7 +227,7 @@ pub enum ServiceError {
     BatchReadOutOfRange { count: usize },
     #[error("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}")]
     KeyTooLong { len: usize },
-    #[error("a validator must be at most {MAX_KEY_LEN} bytes; this one is {len}")]
+    #[error("a validator must be at most {MAX_VALIDATOR_LEN} bytes; this one is {len}")]
     ValidatorTooLong { len: usize },
     /// `limit` outside `1..=limits.page_size_max` (D12).
     #[error("a page size must be between 1 and {max}; this request asked for {limit}")]
@@ -510,7 +519,8 @@ impl RegistryService {
     ///
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure, or
-    /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
+    /// [`ServiceError::CorruptDocument`] for a stored entity that is not valid: a
+    /// document that is not JSON, missing current state, or a tenant-owned row.
     pub async fn entity(
         &self,
         caller: CallerContext<'_>,
@@ -561,9 +571,10 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::BatchReadOutOfRange`] for an empty or over-long batch,
     /// [`ServiceError::KeyTooLong`] for a key over [`MAX_KEY_LEN`] bytes,
-    /// [`ServiceError::ValidatorTooLong`] for a validator over [`MAX_KEY_LEN`] bytes,
+    /// [`ServiceError::ValidatorTooLong`] for a validator over [`MAX_VALIDATOR_LEN`] bytes,
     /// [`ServiceError::Storage`] for a read failure, or
-    /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
+    /// [`ServiceError::CorruptDocument`] for a stored entity that is not valid: a
+    /// document that is not JSON, missing current state, or a tenant-owned row.
     pub async fn batch_get(
         &self,
         _caller: CallerContext<'_>,
@@ -588,7 +599,7 @@ impl RegistryService {
                 .if_none_match
                 .as_ref()
                 .map(IfNoneMatch::longest)
-                .filter(|len| *len > MAX_KEY_LEN)
+                .filter(|len| *len > MAX_VALIDATOR_LEN)
             {
                 return Err(ServiceError::ValidatorTooLong { len });
             }
@@ -597,22 +608,8 @@ impl RegistryService {
             }
         }
 
-        // A non-canonical identifier cannot be stored, so it never reaches SQL.
-        let gts_ids: Vec<String> = requested
-            .iter()
-            .filter_map(|item| match &item.key {
-                EntityKey::GtsId(gts_id) if is_canonical(gts_id) => Some(gts_id.clone()),
-                EntityKey::GtsId(_) | EntityKey::Uuid(_) => None,
-            })
-            .collect();
-        let gts_uuids: Vec<Uuid> = requested
-            .iter()
-            .filter_map(|item| match item.key {
-                EntityKey::Uuid(gts_uuid) => Some(gts_uuid),
-                EntityKey::GtsId(_) => None,
-            })
-            .collect();
-        if gts_ids.is_empty() && gts_uuids.is_empty() {
+        let lookup = KeyedLookup::of(requested.iter().map(|item| &item.key));
+        if lookup.is_empty() {
             return Ok(requested
                 .into_iter()
                 .map(|item| (item.key, EntityLookup::NotFound))
@@ -628,15 +625,11 @@ impl RegistryService {
         let (answers, rows, current) = provider
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
-                    let mut rows = stores.find_by_gts_ids(tx, &scope, &gts_ids).await?;
-                    rows.extend(stores.find_by_gts_uuids(tx, &scope, &gts_uuids).await?);
-                    // The two identity reads are independent, so a row named by both
-                    // spellings arrives twice; the current-state reads below must
-                    // name it once.
-                    rows.sort_by_key(|row| row.id);
-                    rows.dedup_by_key(|row| row.id);
+                    let mut rows = lookup.rows(&*stores, tx, &scope).await?;
+                    // Before any validator is matched: an unchanged answer discloses too.
+                    p0_global_only(&rows)?;
 
-                    let etags = validators(&*stores, tx, &scope, &rows, selection).await?;
+                    let etags = validators(&*stores, tx, &scope, &rows).await?;
                     let answers = answer(requested, &rows, &etags);
                     let found: std::collections::BTreeSet<i64> = answers
                         .iter()
@@ -688,6 +681,69 @@ impl RegistryService {
             .collect())
     }
 
+    /// Resolve each distinct key to an active or deleted entity's pair, or `None`
+    /// (DESIGN §3.3). Use [`Self::batch_get`]'s bounds and key rules. Both keyed
+    /// identity reads share one snapshot so the two spellings agree.
+    ///
+    /// # Errors
+    /// [`ServiceError::BatchReadOutOfRange`] for an empty or oversized batch,
+    /// [`ServiceError::KeyTooLong`] above [`MAX_KEY_LEN`],
+    /// [`ServiceError::Storage`] for a read failure, or
+    /// [`ServiceError::CorruptDocument`] if a key reaches a tenant-owned row.
+    pub async fn batch_resolve(
+        &self,
+        _caller: CallerContext<'_>,
+        keys: &[EntityKey],
+    ) -> Result<Vec<(EntityKey, Option<EntityIdentity>)>, ServiceError> {
+        // Bounded on the raw count, duplicates included, before any read.
+        if keys.is_empty() || keys.len() > MAX_BATCH_GET_KEYS {
+            return Err(ServiceError::BatchReadOutOfRange { count: keys.len() });
+        }
+        let mut requested: Vec<EntityKey> = Vec::with_capacity(keys.len());
+        let mut seen: std::collections::HashSet<&EntityKey> =
+            std::collections::HashSet::with_capacity(keys.len());
+        for key in keys {
+            if let EntityKey::GtsId(gts_id) = key
+                && gts_id.len() > MAX_KEY_LEN
+            {
+                return Err(ServiceError::KeyTooLong { len: gts_id.len() });
+            }
+            if seen.insert(key) {
+                requested.push(key.clone());
+            }
+        }
+
+        let lookup = KeyedLookup::of(requested.iter());
+        let rows = if lookup.is_empty() {
+            Vec::new()
+        } else {
+            let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
+            let scope = Self::scope();
+            let stores = Arc::clone(&self.stores);
+            provider
+                .transaction_with_config(snapshot_read(&self.db), move |tx| {
+                    Box::pin(async move {
+                        let rows = lookup.rows(&*stores, tx, &scope).await?;
+                        p0_global_only(&rows)?;
+                        Ok(rows)
+                    })
+                })
+                .await?
+        };
+
+        let rows = RowsByKey::new(&rows);
+        Ok(requested
+            .into_iter()
+            .map(|key| {
+                let identity = rows.get(&key).map(|row| EntityIdentity {
+                    gts_id: row.gts_id.clone(),
+                    gts_uuid: row.gts_uuid,
+                });
+                (key, identity)
+            })
+            .collect())
+    }
+
     /// One bounded page of entities in `query.lifecycle`, ordered by canonical identifier and
     /// projected by `query.selection` (D12).
     ///
@@ -698,7 +754,8 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::PageSizeOutOfRange`] for a refused `limit`,
     /// [`ServiceError::InvalidPattern`] for a pattern `gts-rust` will not compile,
-    /// or [`ServiceError::Storage`] for a read failure.
+    /// [`ServiceError::Storage`] for a read failure, or
+    /// [`ServiceError::CorruptDocument`] for a stored entity that is not valid.
     pub async fn discover(
         &self,
         _caller: CallerContext<'_>,
@@ -744,6 +801,9 @@ impl RegistryService {
             .transaction_with_config(snapshot_read(&self.db), move |tx| {
                 Box::pin(async move {
                     let page = stores.list_page(tx, &scope, &filter, request).await?;
+                    // The lookahead row decides the cursor, so it is checked too.
+                    p0_global_only(&page.items)?;
+                    p0_global_only(page.lookahead.as_slice())?;
                     let current =
                         read_current(&*stores, tx, &scope, &page.items, selection).await?;
                     Ok((page, current))
@@ -765,6 +825,74 @@ pub(crate) fn is_canonical(gts_id: &str) -> bool {
     GtsId::try_new(gts_id).is_ok_and(|id| id.id() == gts_id)
 }
 
+/// Group distinct keys by form for identity lookup. Skip non-canonical
+/// identifiers that cannot be stored.
+struct KeyedLookup {
+    gts_ids: Vec<String>,
+    gts_uuids: Vec<Uuid>,
+}
+
+impl KeyedLookup {
+    fn of<'a>(keys: impl Iterator<Item = &'a EntityKey>) -> Self {
+        let mut lookup = Self {
+            gts_ids: Vec::new(),
+            gts_uuids: Vec::new(),
+        };
+        for key in keys {
+            match key {
+                EntityKey::GtsId(gts_id) if is_canonical(gts_id) => {
+                    lookup.gts_ids.push(gts_id.clone());
+                }
+                EntityKey::GtsId(_) => {}
+                EntityKey::Uuid(gts_uuid) => lookup.gts_uuids.push(*gts_uuid),
+            }
+        }
+        lookup
+    }
+
+    /// Nothing that could be stored is asked: every key is absent without a read.
+    fn is_empty(&self) -> bool {
+        self.gts_ids.is_empty() && self.gts_uuids.is_empty()
+    }
+
+    /// The rows the keys name, each once, by entity id.
+    async fn rows(
+        &self,
+        stores: &dyn Stores,
+        tx: &toolkit_db::DbTx<'_>,
+        scope: &AccessScope,
+    ) -> Result<Vec<EntityRow>, ServiceError> {
+        let mut rows = stores.find_by_gts_ids(tx, scope, &self.gts_ids).await?;
+        rows.extend(stores.find_by_gts_uuids(tx, scope, &self.gts_uuids).await?);
+        // Deduplicate rows named by both key forms before further reads.
+        rows.sort_by_key(|row| row.id);
+        rows.dedup_by_key(|row| row.id);
+        Ok(rows)
+    }
+}
+
+/// Rows found by the key that names them, by either spelling.
+struct RowsByKey<'a> {
+    by_gts_id: BTreeMap<&'a str, &'a EntityRow>,
+    by_gts_uuid: BTreeMap<Uuid, &'a EntityRow>,
+}
+
+impl<'a> RowsByKey<'a> {
+    fn new(rows: &'a [EntityRow]) -> Self {
+        Self {
+            by_gts_id: rows.iter().map(|row| (row.gts_id.as_str(), row)).collect(),
+            by_gts_uuid: rows.iter().map(|row| (row.gts_uuid, row)).collect(),
+        }
+    }
+
+    fn get(&self, key: &EntityKey) -> Option<&'a EntityRow> {
+        match key {
+            EntityKey::GtsId(gts_id) => self.by_gts_id.get(gts_id.as_str()).copied(),
+            EntityKey::Uuid(gts_uuid) => self.by_gts_uuid.get(gts_uuid).copied(),
+        }
+    }
+}
+
 /// The entity ids of one kind, for the kind-specific current-state reads.
 fn ids_of(rows: &[EntityRow], kind: EntityKind) -> Vec<i64> {
     rows.iter()
@@ -779,7 +907,6 @@ async fn validators(
     tx: &toolkit_db::DbTx<'_>,
     scope: &AccessScope,
     rows: &[EntityRow],
-    selection: FieldSelection,
 ) -> Result<BTreeMap<i64, Validator>, ServiceError> {
     let type_ids = ids_of(rows, EntityKind::TypeSchema);
     let fingerprints: BTreeMap<i64, Vec<u8>> = stores
@@ -799,7 +926,7 @@ async fn validators(
                         .as_slice(),
                 ),
             };
-            let etag = Validator::compute(row.resource_version, fingerprint, selection);
+            let etag = Validator::compute(row.resource_version, fingerprint);
             Ok((row.id, etag))
         })
         .collect()
@@ -811,15 +938,11 @@ fn answer(
     rows: &[EntityRow],
     etags: &BTreeMap<i64, Validator>,
 ) -> Vec<(EntityKey, Answer)> {
-    let by_gts_id: BTreeMap<&str, i64> = rows.iter().map(|r| (r.gts_id.as_str(), r.id)).collect();
-    let by_gts_uuid: BTreeMap<Uuid, i64> = rows.iter().map(|r| (r.gts_uuid, r.id)).collect();
+    let rows = RowsByKey::new(rows);
     requested
         .into_iter()
         .map(|item| {
-            let id = match &item.key {
-                EntityKey::GtsId(gts_id) => by_gts_id.get(gts_id.as_str()).copied(),
-                EntityKey::Uuid(gts_uuid) => by_gts_uuid.get(gts_uuid).copied(),
-            };
+            let id = rows.get(&item.key).map(|row| row.id);
             let answer = match id.and_then(|id| Some((id, *etags.get(&id)?))) {
                 None => Answer::NotFound,
                 Some((_, etag)) if item.if_none_match.as_ref().is_some_and(|c| c.matches(etag)) => {
@@ -888,6 +1011,7 @@ fn into_records(
             missing_state(&row.gts_id, what)
         })?;
         let is_schema = row.entity_kind == EntityKind::TypeSchema;
+        let ownership = ownership(&row)?;
         let document = |field: EntityField, text: Option<String>| {
             select_document(selection, field, is_schema, text, &row.gts_id)
         };
@@ -922,6 +1046,7 @@ fn into_records(
                         updated_at: row.updated_at,
                     }),
                 lifecycle_status: row.lifecycle_status,
+                ownership,
                 content,
                 resolved_schema,
                 effective_traits,
@@ -931,6 +1056,25 @@ fn into_records(
         );
     }
     Ok(out)
+}
+
+/// Refuse every read that reaches a tenant-owned row, on either plane, before it
+/// answers anything about it.
+fn p0_global_only(rows: &[EntityRow]) -> Result<(), ServiceError> {
+    rows.iter().try_for_each(|row| ownership(row).map(drop))
+}
+
+/// P0 stores no tenant-owned entity, so a read refuses one rather than guess how it
+/// relates to the caller. P1's plane-aware filter replaces this: platform reads see
+/// global entities only, tenant reads the visibility fence.
+fn ownership(row: &EntityRow) -> Result<Ownership, ServiceError> {
+    match row.ownership_scope {
+        OwnershipScope::Global => Ok(Ownership::Global),
+        OwnershipScope::Tenant => Err(ServiceError::CorruptDocument(format!(
+            "entity '{}' is tenant-owned, which P0 never stores",
+            row.gts_id
+        ))),
+    }
 }
 
 fn select_document(
@@ -956,13 +1100,46 @@ fn missing_state(gts_id: &str, what: &str) -> ServiceError {
 /// text that is not JSON must fail here rather than corrupt the body.
 fn raw_stored(text: String, gts_id: &str) -> Result<Box<RawValue>, ServiceError> {
     RawValue::from_string(text)
-        .map_err(|e| ServiceError::CorruptDocument(format!("'{gts_id}': {e}")))
+        .map_err(|e| ServiceError::CorruptDocument(format!("'{gts_id}' stored non-JSON text: {e}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::enums::OwnershipScope;
+
+    /// P0 stores no tenant-owned entity: a read refuses one rather than disclose it
+    /// with a guessed relation to the caller.
+    #[test]
+    fn a_read_refuses_a_tenant_owned_row() {
+        let row = |ownership_scope, owner_tenant_id| EntityRow {
+            id: 1,
+            gts_uuid: Uuid::nil(),
+            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            entity_kind: EntityKind::TypeSchema,
+            family_id: 1,
+            ownership_scope,
+            owner_tenant_id,
+            owning_gear: None,
+            lifecycle_status: LifecycleStatus::Active,
+            resource_version: 1,
+            deleted_at: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            ownership(&row(OwnershipScope::Global, None)).ok(),
+            Some(Ownership::Global)
+        );
+        let refused = ownership(&row(OwnershipScope::Tenant, Some(Uuid::from_u128(7))))
+            .expect_err("P0 refuses a tenant-owned row");
+        assert!(matches!(refused, ServiceError::CorruptDocument(_)));
+        assert_eq!(
+            refused.to_string(),
+            "a stored entity is invalid: entity 'gts.cf.core.example.type.v1~' is tenant-owned, \
+             which P0 never stores"
+        );
+    }
 
     const AT: OffsetDateTime = time::macros::datetime!(2026-09-23 10:00:00 UTC);
 

@@ -6,6 +6,7 @@
 //! internal token, resolved afresh, and never a bearer: the `PlatformSecurityContext`
 //! argument is a plane marker and is never serialized.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,15 +19,15 @@ use uuid::Uuid;
 
 use super::transport::{Answer, Credential, Transport, client_span, traced};
 use super::wire::{
-    AcceptedWire, BatchGetBody, DeleteBody, LookupsWire, OperationWire, PageWire, SubmitBody,
-    discovery_query, parse,
+    AcceptedWire, BatchGetBody, BatchResolveBody, DeleteBody, LookupsWire, OperationWire, PageWire,
+    ResolutionsWire, SubmitBody, discovery_query, parse,
 };
 use crate::contract::PlatformTypesRegistryApi;
 use crate::gts::OperationResource;
 use crate::models::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
-    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, OperationStatus,
-    RegisterEntitiesRequest, RegistrationOperation,
+    EntityIdentity, EntityKey, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
+    Operation, OperationStatus, RegisterEntitiesRequest, RegistrationOperation,
 };
 use crate::reason;
 
@@ -254,7 +255,7 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryApiRestClient {
     ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
         let span = span!("batch_get_entities", "POST", "/entities:batchGet");
         traced(span, async {
-            let body = BatchGetBody::encode(&request)?;
+            let body = BatchGetBody::encode(&request);
             let url = self.url("/entities:batchGet");
             let answer = self
                 .exchange("batch_get_entities", |http| {
@@ -264,6 +265,28 @@ impl PlatformTypesRegistryApi for PlatformTypesRegistryApiRestClient {
                 })
                 .await?;
             parse::<LookupsWire>("batch read", &answer.body)?.decode()
+        })
+        .await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        let span = span!("batch_resolve_identities", "POST", "/entities:batchResolve");
+        traced(span, async {
+            let body = BatchResolveBody::encode(&keys);
+            let url = self.url("/entities:batchResolve");
+            let answer = self
+                .exchange("batch_resolve_identities", |http| {
+                    http.post(&url)
+                        .json(&body)
+                        .map_err(TransportError::serialization)
+                })
+                .await?;
+            let answered = parse::<ResolutionsWire>("batch resolution", &answer.body)?.decode()?;
+            crate::ext::checked_resolutions(&keys, answered)
         })
         .await
     }

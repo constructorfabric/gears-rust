@@ -6,8 +6,7 @@ use gts::GtsId;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
-/// A key's ceiling in bytes, on reads and writes alike: a GTS identifier runs to 1024.
-pub const MAX_KEY_LEN: usize = 1024;
+pub use gts::GTS_ID_MAX_LENGTH as MAX_KEY_LEN;
 
 /// GTS identifier or deterministic Registry Reference for the same row.
 #[domain_model]

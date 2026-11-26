@@ -17,6 +17,7 @@ fn snapshot(content: Value, resolved_schema: Value) -> TypeSchema {
         type_id: GtsTypeId::try_new(TYPE_ID).expect("type identifier"),
         type_uuid: GtsId::try_new(TYPE_ID).expect("identifier").to_uuid(),
         lifecycle_status: LifecycleStatus::Active,
+        ownership: crate::models::Ownership::Global,
         origin: None,
         content: Some(content),
         resolved_schema: Some(resolved_schema),

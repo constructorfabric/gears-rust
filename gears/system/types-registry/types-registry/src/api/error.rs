@@ -10,6 +10,7 @@ use crate::domain::error::DomainError;
 use crate::domain::error::LocalClientError;
 use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
 use crate::domain::selection::{EntityField, SelectionError};
+use crate::domain::validator::MAX_VALIDATOR_LEN;
 
 #[resource_error(gts_id!("cf.core.types_registry.entity.v1~"))]
 pub struct TypeRegistryError;
@@ -158,11 +159,10 @@ impl From<ServiceError> for CanonicalError {
             ServiceError::Storage(inner) => opaque_internal(&inner, "storage read"),
             ServiceError::Blocking(inner) => opaque_internal(&inner, "blocking task"),
             ServiceError::Db(inner) => opaque_internal(&inner, "database read"),
-            // A stored document that will not parse is corruption, not input, so
-            // the offending value goes to the operator log and not to the caller.
-            ServiceError::CorruptDocument(detail) => {
-                opaque_internal(&detail, "stored document parse")
-            }
+            // A stored entity that is not valid (a document that will not parse,
+            // missing state, a row P0 never stores) is corruption, not input, so the
+            // offending value goes to the operator log and not to the caller.
+            ServiceError::CorruptDocument(detail) => opaque_internal(&detail, "stored entity"),
             // Report the request field and its bound without exposing configuration keys.
             ServiceError::BatchReadOutOfRange { count } => invalid_field(
                 field::ITEMS_FIELD,
@@ -504,7 +504,7 @@ pub fn validator_too_long(field_name: &'static str, len: usize) -> CanonicalErro
     invalid_field(
         field_name,
         format!(
-            "each {field_name} entity-tag must be at most {MAX_KEY_LEN} bytes; this one is {len}"
+            "each {field_name} entity-tag must be at most {MAX_VALIDATOR_LEN} bytes; this one is {len}"
         ),
         field::VALIDATION_FAILED,
     )
