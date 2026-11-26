@@ -62,6 +62,21 @@ pub struct UserDto {
 | `I64` | `i64` | `count ge 100` |
 | `Bool` | `bool` | `is_active eq true` |
 
+### Filter-only fields
+
+A field that can be filtered on but not sorted on takes `orderable = false`:
+
+```rust
+#[odata(filter(kind = "String", orderable = false))]
+pub region: Option<String>,
+```
+
+`with_odata_orderby` leaves such a field out of the `$orderby` description and
+`x-odata-orderby.allowedFields`, and the default `FieldToColumn::is_orderable`
+refuses it in `$orderby` with `InvalidOrderByField`. Both read
+`FilterField::orderable`, so do not re-declare the list in the mapper. A
+hand-written `FilterField` impl overrides `orderable()` instead.
+
 ## OperationBuilder with OData
 
 ### OData-enabled list endpoint

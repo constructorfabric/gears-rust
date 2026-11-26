@@ -613,7 +613,8 @@ pub trait OperationBuilderODataExt<S, H, R> {
     #[must_use]
     fn with_odata_select(self) -> Self;
 
-    /// Adds optional `$orderby` query parameter to `OpenAPI`.
+    /// Adds optional `$orderby` query parameter to `OpenAPI`, with `asc` and
+    /// `desc` for each field whose `FilterField::orderable` is true.
     #[must_use]
     fn with_odata_orderby<T>(self) -> Self
     where
@@ -704,7 +705,9 @@ where
             .x_odata_orderby
             .unwrap_or_default();
         let mut description = "OData v4 orderby expression".to_owned();
-        for field in T::FIELDS {
+        // A filter-only field is refused in `$orderby` at request time, so the
+        // contract does not offer it.
+        for field in T::FIELDS.iter().filter(|field| field.orderable()) {
             let name = field.name().to_owned();
 
             // Add sort options (asc/desc)

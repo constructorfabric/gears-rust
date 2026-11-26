@@ -72,10 +72,6 @@ impl FieldToColumn<ModelFilterField> for ModelODataMapper {
             F::UpdatedAt => C::UpdatedAt,
         }
     }
-
-    fn is_orderable(field: ModelFilterField) -> bool {
-        field.orderable()
-    }
 }
 
 impl ODataFieldMapping<ModelFilterField> for ModelODataMapper {

@@ -74,6 +74,16 @@ pub trait FilterField: Copy + Eq + std::hash::Hash + fmt::Debug + 'static {
         false
     }
 
+    /// Whether `$orderby` (and so a pagination cursor) may sort on this field. `true` by default.
+    ///
+    /// A filter-only field returns `false`: `with_odata_orderby` leaves it out of the `$orderby`
+    /// description and `x-odata-orderby.allowedFields`, and the default
+    /// `FieldToColumn::is_orderable` in `toolkit-db` refuses it in `$orderby`, so the contract
+    /// and the runtime check read one flag.
+    fn orderable(&self) -> bool {
+        true
+    }
+
     fn from_name(name: &str) -> Option<Self> {
         // Try exact match first (handles both simple names and slash-delimited property paths
         // like "hierarchy/depth" if the enum defines them).
