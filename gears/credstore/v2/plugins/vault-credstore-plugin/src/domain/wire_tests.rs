@@ -360,6 +360,7 @@ fn error_messages_never_contain_the_redacted_secret() {
 #[test]
 fn classify_get_response_absent_version_or_key_is_none() {
     assert_eq!(classify_get_response(404, ABSENT_404).expect("ok"), None);
+    assert_eq!(classify_get_response(404, "{}").expect("ok"), None);
     for body in ["", HTML_PAGE] {
         assert!(matches!(
             classify_get_response(404, body).unwrap_err(),
@@ -498,7 +499,7 @@ fn classify_metadata_response_404_is_empty() {
             .expect("ok")
             .is_empty()
     );
-    for body in ["", HTML_PAGE] {
+    for body in ["", HTML_PAGE, "{}", r#"{"message":"no Route matched"}"#] {
         assert!(matches!(
             classify_metadata_response(404, body).unwrap_err(),
             CredStorePluginError::Internal { .. }
@@ -526,8 +527,10 @@ fn classify_delete_and_destroy_responses() {
     for classify in [classify_delete_response, classify_destroy_response] {
         classify(204, "").expect("204 is ok");
         classify(404, ABSENT_404).expect("a missing key is ok, idempotent");
-        classify(404, SOFT_DELETED_404).expect("a 404 without errors is ok, idempotent");
         for (status, body) in [
+            (404, SOFT_DELETED_404),
+            (404, "{}"),
+            (404, r#"{"message":"no Route matched"}"#),
             (404, ""),
             (404, HTML_PAGE),
             (200, ""),

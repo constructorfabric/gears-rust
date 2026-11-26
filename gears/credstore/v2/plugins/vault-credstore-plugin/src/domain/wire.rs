@@ -347,9 +347,11 @@ pub fn error_text(body: &str, redact: &[&str]) -> String {
     flat.chars().take(MAX_ERROR_TEXT_CHARS).collect()
 }
 
-/// `404` that means "nothing at this path": Vault answers `{"errors":[]}`
-/// for an absent key or version, and a body without `errors` (carrying the
-/// version metadata) for a soft-deleted or destroyed one. A `404` that
+/// `404` that means "no readable version at this path", the soft rule used
+/// only by the version read (`GET data`): Vault answers `{"errors":[]}` for an
+/// absent key or version, and a body without `errors` (carrying the version
+/// metadata) for a soft-deleted or destroyed one. Delete, destroy and the
+/// metadata read must not use it, see [`is_absent_key`]. A `404` that
 /// explains itself (`no handler for route ...`: the mount does not exist) is
 /// a misconfiguration. A `404` whose body is not a Vault JSON object (empty,
 /// HTML from an ingress or proxy, plain text) is not plain either: it did not
@@ -357,6 +359,23 @@ pub fn error_text(body: &str, redact: &[&str]) -> String {
 fn is_plain_not_found(status: u16, body: &str) -> bool {
     status == NOT_FOUND
         && serde_json::from_str::<ErrorBody>(body).is_ok_and(|b| b.errors.is_empty())
+}
+
+/// Strict `404` for "no such key": the body must be Vault's own
+/// `{"errors":[]}`, with the `errors` field present and an empty array. Used
+/// by `DELETE metadata`, `POST destroy` and `GET metadata`, which answer `204`
+/// or exactly this body for an absent key. A body that merely parses (`{}`,
+/// `{"errors":null}`, `{"message":"no Route matched"}` from an ingress or
+/// gateway, the body of a soft-deleted version) is not Vault's answer, so the
+/// cleanup debt must stay.
+fn is_absent_key(status: u16, body: &str) -> bool {
+    #[derive(Deserialize)]
+    struct StrictErrorBody {
+        errors: Option<Vec<String>>,
+    }
+    status == NOT_FOUND
+        && serde_json::from_str::<StrictErrorBody>(body)
+            .is_ok_and(|b| b.errors.is_some_and(|e| e.is_empty()))
 }
 
 /// Maps a response that is not a success into the plugin error taxonomy.
@@ -462,22 +481,25 @@ pub fn classify_metadata_write_response(
 }
 
 /// Classifies a `DELETE` metadata or `POST` destroy response: `204` (what
-/// Vault answers) or a plain `404` (already gone) both succeed (idempotent).
+/// Vault answers) or a `404` with Vault's `{"errors":[]}` body (already gone)
+/// both succeed (idempotent). Any other `404` body (`{}`, a message from a
+/// gateway, a soft-deleted version's body) is an error.
 /// Any other `2xx` (for example a proxy's `200` page) is not a confirmed
 /// delete and is an error.
 ///
 /// # Errors
 /// See [`map_error_status`].
 pub fn classify_delete_response(status: u16, body: &str) -> Result<(), CredStorePluginError> {
-    if status == NO_CONTENT || is_plain_not_found(status, body) {
+    if status == NO_CONTENT || is_absent_key(status, body) {
         Ok(())
     } else {
         Err(map_error_status(status, body, None, &[]))
     }
 }
 
-/// Classifies a metadata `GET` response used to list versions: a plain `404`
-/// (no such key) is an empty list, 2xx parses the live versions.
+/// Classifies a metadata `GET` response used to list versions: a `404` with
+/// Vault's `{"errors":[]}` body (no such key) is an empty list, 2xx parses the
+/// live versions. Any other `404` body is an error.
 ///
 /// # Errors
 /// See [`map_error_status`] and [`parse_live_versions`].
@@ -485,7 +507,7 @@ pub fn classify_metadata_response(
     status: u16,
     body: &str,
 ) -> Result<Vec<u64>, CredStorePluginError> {
-    if is_plain_not_found(status, body) {
+    if is_absent_key(status, body) {
         return Ok(Vec::new());
     }
     if is_success(status) {
@@ -494,8 +516,8 @@ pub fn classify_metadata_response(
     Err(map_error_status(status, body, None, &[]))
 }
 
-/// Classifies a `POST destroy` response: `204` or a plain `404` succeed
-/// (idempotent).
+/// Classifies a `POST destroy` response: `204` or a `404` with Vault's
+/// `{"errors":[]}` body succeed (idempotent).
 ///
 /// # Errors
 /// See [`map_error_status`].

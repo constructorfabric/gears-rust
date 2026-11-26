@@ -65,7 +65,7 @@ The plugin adds three things the contract leaves to the backend: **token authent
 |---|---|
 | Exact bytes, durable versions (ADR-0006) | One KV v2 write per `put` (preceded by the key's `max_versions` call), never overwritten, never `cas`; the value is stored base64-encoded in one field; the version is Vault's own number |
 | Ordered versions with `destroy` | KV v2 numbers versions per key from 1, increasing; a destroyed number is never reissued (verified by the conformance suite) |
-| Idempotent `delete_key` / `destroy` | A plain `404` and Vault's `204` for a missing key or version are success; `destroy(Below)` makes no call when nothing is left to destroy |
+| Idempotent `delete_key` / `destroy` | A `404` with Vault's `{"errors":[]}` body and Vault's `204` for a missing key or version are success (any other `404` body is an error); `destroy(Below)` makes no call when nothing is left to destroy |
 | Token rotation without restart | `TokenStore` caches the token; a `403` makes the transport re-read the source once and resend the request once if the token changed |
 | No startup dependency on Vault | Config validation is static; the transport performs no I/O when built; a `token_file` is read on first use |
 | Honest failure classes | Fixed mapping table (§3.3); a `403` is "credentials rejected", a plain `404` on read is "no value", an explained `404` is an internal error |
@@ -227,9 +227,9 @@ All calls carry `X-Vault-Token` (and `X-Vault-Namespace` when configured). "Tran
 |---|---|---|---|---|
 | `put(key, value)` | First `POST metadata/...` with `{"max_versions":100}`, then `POST data/...` with `{"data":{"value":"<base64>"}}` (no `cas`). The data call is sent only after the metadata call succeeded | `204` / `2xx` on the metadata call, then `200` with `data.version` -> that version | Explained `404` (missing mount) -> `Internal`; a plain `404` on a write does not occur | Neither call is retried. On either call: transient -> `Unavailable`; `403` -> `CredentialsRejected` (the token source is re-read once, as for any call); `400` -> `Internal` with Vault's text; anything else -> `Internal`. A failure of the metadata call fails the `put` and no data call is made; a plain `404` on the metadata call is not success (the call creates the metadata, so a `404` means a wrong mount) |
 | `get(key, version)` | `GET data/...?version=N` (never sent for `N = 0`) | `200` with a value -> bytes | Plain `404` (absent, soft-deleted, destroyed, evicted, key missing) -> `None`; explained `404` -> `Internal` | Retried on transient. `403` -> `CredentialsRejected`; an entry with no string `value` or invalid base64 -> `Internal` (permanent); unexpected shape -> `Internal` |
-| `delete_key(key)` | `DELETE metadata/...` | `204` -> `Ok` (any other `2xx` is `Internal`) | Plain `404` (Vault JSON body without error text) -> `Ok`; explained `404`, or a `404` with an empty or non-JSON body (proxy page) -> `Internal` | Retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
-| `destroy(key, Exactly(v))` | `POST destroy/...` with `{"versions":[v]}` (no call for `v = 0`) | `204` -> `Ok` | Plain `404` -> `Ok`; explained `404` -> `Internal` | As `delete_key` |
-| `destroy(key, Below(v))` | `GET metadata/...`, then `POST destroy/...` with every version `< v` that has `destroyed = false` | `Ok` | Plain `404` on the metadata read (no such key) -> `Ok`, no destroy call; empty selection -> `Ok`, no destroy call; `v <= 1` -> `Ok` without any call | Each of the two calls retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
+| `delete_key(key)` | `DELETE metadata/...` | `204` -> `Ok` (any other `2xx` is `Internal`) | `404` with Vault's `{"errors":[]}` body -> `Ok`; any other `404` (explained, `{}`, a gateway message, a soft-deleted version's body, an empty or non-JSON body such as a proxy page) -> `Internal` | Retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
+| `destroy(key, Exactly(v))` | `POST destroy/...` with `{"versions":[v]}` (no call for `v = 0`) | `204` -> `Ok` | `404` with Vault's `{"errors":[]}` body -> `Ok`; any other `404` -> `Internal` | As `delete_key` |
+| `destroy(key, Below(v))` | `GET metadata/...`, then `POST destroy/...` with every version `< v` that has `destroyed = false` | `Ok` | `404` with Vault's `{"errors":[]}` body on the metadata read (no such key) -> `Ok`, no destroy call; any other `404` -> `Internal`; empty selection -> `Ok`, no destroy call; `v <= 1` -> `Ok` without any call | Each of the two calls retried on transient; `403` -> `CredentialsRejected`; others -> `Internal` |
 | `destroyer()` | none | `Some(self)` | | |
 
 A soft-deleted version has `destroyed = false` and a `deletion_time`: it is included in a `Below` selection, so that a cleanup turns it into a destroyed one.
@@ -396,7 +396,7 @@ sequenceDiagram
         S-->>G: Ok (nothing can be older)
     else
         S->>V: GET metadata/prefix/tenant/record
-        V-->>S: 200 versions map  (or plain 404: key missing)
+        V-->>S: 200 versions map  (or 404 with errors:[]: key missing)
         S->>S: select versions < v with destroyed = false
         alt selection empty or key missing
             S-->>G: Ok (no destroy call)

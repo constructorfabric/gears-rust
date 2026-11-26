@@ -741,6 +741,42 @@ async fn secret_selected_item_with_its_version_gone_and_pointer_unmoved_fails_th
 }
 
 #[tokio::test]
+async fn secret_selected_item_replaced_between_row_query_and_read_is_skipped() {
+    let tenant = Uuid::new_v4();
+    let repo = Arc::new(FakeSecretRepo::new());
+    let plugin = FakePlugin::new();
+    let dir = Arc::new(FakeDir::single(tenant));
+    let svc = service_with(repo.clone(), plugin.clone(), dir, mock_enforcer(), 200);
+    let ctx = make_ctx(Uuid::new_v4(), tenant);
+
+    for name in ["r1", "r2"] {
+        svc.put(
+            &ctx,
+            &key(name),
+            write_generic(SharingMode::Tenant, "v"),
+            create_only(),
+        )
+        .await
+        .expect("create");
+    }
+    let other = repo
+        .rows()
+        .into_iter()
+        .find(|r| r.reference == "r2")
+        .expect("r2 row");
+
+    // The first read of r1 finds its version gone; the row re-read then
+    // resolves to another record, as after a delete and re-create.
+    plugin.fail_next_gets_with_not_found(1);
+    repo.redirect_next_resolve_for_get(other.id);
+    let page = svc
+        .list(&ctx, &secret_query("reference in ('r1')"))
+        .await
+        .expect("a record replaced mid-read is skipped, not a failed request");
+    assert!(page.items.is_empty(), "{:?}", page.items.len());
+}
+
+#[tokio::test]
 async fn secret_selected_clamps_to_the_read_secret_permitted_types_and_paginates() {
     let tenant = Uuid::new_v4();
     let repo = Arc::new(FakeSecretRepo::new());

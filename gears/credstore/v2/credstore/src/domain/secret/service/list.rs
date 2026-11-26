@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::domain::authz::{self, RowClamp, actions};
 use crate::domain::error::DomainError;
 use crate::domain::ports::audit::{AuditOperation, AuditOutcome};
+use crate::domain::ports::metrics::ReadOutcome;
 use crate::domain::secret::list_filter::{self, ListDirection, ParsedFilter};
 use crate::domain::secret::model::SecretRow;
 use crate::domain::secret::reduce::{self, Reduced};
@@ -511,9 +512,20 @@ impl Service {
         // `Service::list` is driven through a generic handler.
         let job_count = jobs.len();
         let mut reads = stream::iter(jobs.into_iter().enumerate().map(|(index, job)| async move {
-            let outcome = self
+            let outcome = match self
                 .read_value_for_row(plugin, ctx, req, subject, &job.key, chain, &job.winner)
-                .await;
+                .await
+            {
+                // The record was deleted or replaced by another one between
+                // the row query and the value read. Like every other missing
+                // value, the item is skipped rather than failing the page;
+                // nothing was resolved, so nothing is audited.
+                Err(DomainError::NotFound) => {
+                    self.metrics.read_outcome(ReadOutcome::Miss);
+                    Ok(None)
+                }
+                other => other,
+            };
             (index, job.credential, job.key, job.gts_id, outcome)
         }))
         .buffer_unordered(SECRET_READ_CONCURRENCY);

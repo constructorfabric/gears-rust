@@ -3,13 +3,15 @@
 //! Every call stays pending forever without a timer, so a test that gives the
 //! code under test a zero budget waits for nothing.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     BatchGetEntitiesRequest, BatchGetEntitiesResponse, DeleteEntitiesRequest, DeletionOperation,
-    IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse, Operation, PlatformTypesRegistryApi,
-    RegisterEntitiesRequest, RegistrationOperation,
+    EntityIdentity, EntityKey, IdempotencyKey, ListEntitiesRequest, ListEntitiesResponse,
+    Operation, PlatformTypesRegistryApi, RegisterEntitiesRequest, RegistrationOperation,
 };
 use uuid::Uuid;
 
@@ -57,6 +59,14 @@ impl PlatformTypesRegistryApi for StalledRegistry {
         _ctx: &PlatformSecurityContext,
         _operation_id: Uuid,
     ) -> Result<Operation, CanonicalError> {
+        std::future::pending().await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        _ctx: &PlatformSecurityContext,
+        _keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
         std::future::pending().await
     }
 }
