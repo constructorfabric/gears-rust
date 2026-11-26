@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{
@@ -15,10 +15,10 @@ use crate::engine::TransactionEvaluator;
 use crate::engine::{EvaluationContext, EvaluationLimits, PolicySchemaSnapshot};
 use crate::models::{
     ApplicableQuotas, AttributionDigest, BatchDebitItem, BatchRecord, BootstrapBundle, CapPatch,
-    ConfigDefaults, DecisionResult, EventId, IdempotencyScope, IdempotencySubjectKey,
-    IdempotencyWrite, LeaseState, LeaseToken, NotificationEvent, NotificationEventKind,
-    OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersionState, QuotaFilter, QuotaId, QuotaPatch, QuotaStatus,
+    ConfigDefaults, DecisionResult, EventId, IdempotencyScope, IdempotencyWrite, LeaseState,
+    LeaseToken, NotificationEvent, NotificationEventKind, OperationType, PageRequest, PayloadHash,
+    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState, QuotaFilter, QuotaId,
+    QuotaPatch, QuotaStatus,
 };
 use crate::models::{
     EvaluatedDebit, EvaluatedLease, PartialIdempotencyWrite, PeriodType, Retention, RollbackTarget,
@@ -38,12 +38,10 @@ fn scripted(evaluator: &Arc<ScriptedEvaluator>) -> Arc<crate::engine::Transactio
     Arc::new(move |context: &EvaluationContext<'_>| evaluator.evaluate(context))
 }
 
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(test_tenant().as_uuid())
-        .build()
-        .expect("test security context")
+fn actor() -> crate::models::Actor {
+    crate::models::Actor::Caller {
+        subject_id: Uuid::from_u128(0x5eed),
+    }
 }
 
 fn scope() -> AccessScope {
@@ -54,7 +52,6 @@ fn idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: test_tenant(),
-            subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -62,9 +59,7 @@ fn idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
     }
 }
 
-/// The caller's half of a settlement's key. Commit and release cannot name a
-/// subject key: storage completes the scope from the one the acquisition
-/// persisted.
+/// The caller's half of a settlement's key; storage fixes its operation kind.
 fn partial_idem(key: &str, payload: u8) -> PartialIdempotencyWrite {
     PartialIdempotencyWrite {
         tenant_id: test_tenant(),
@@ -120,14 +115,13 @@ impl EvaluatedMutations for InMemoryStorage {
         let applicable = applicable();
         storage
             .apply_debit_plan(
-                &ctx(),
+                &actor(),
                 &scope(),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount,
                     request: &serde_json::Value::Null,
-                    resource: &serde_json::Value::Null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: limits(),
                     idempotency: write,
                     authorized: authorized(),
@@ -150,14 +144,13 @@ impl EvaluatedMutations for InMemoryStorage {
         let applicable = applicable();
         storage
             .acquire_lease(
-                &ctx(),
+                &actor(),
                 &scope(),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount,
                     request: &serde_json::Value::Null,
-                    resource: &serde_json::Value::Null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: limits(),
                     idempotency: write,
                     authorized: authorized(),
@@ -177,11 +170,7 @@ fn token_of(outcome: &TransitionOutcome<EvaluatedLease>) -> LeaseToken {
 /// The attribution digest a debit is authorized under. One value throughout,
 /// so a rollback in these tests presents the same one the debit recorded.
 fn authorized() -> AttributionDigest {
-    AttributionDigest::of_canonical(&serde_json::json!({
-        "metric": "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.tokens.v1",
-        "subjects": [{"kind": "user", "id": "u1"}],
-    }))
-    .expect("a constant document serializes")
+    AttributionDigest::of(test_tenant(), &[test_subject("u1")], &test_metric(), None)
 }
 
 fn applicable() -> ApplicableQuotas {
@@ -194,7 +183,12 @@ fn applicable() -> ApplicableQuotas {
 
 async fn seeded_quota(storage: &InMemoryStorage, cap: Option<u64>) -> QuotaId {
     storage
-        .create_quota(&ctx(), &scope(), quota_draft(test_subject("u1"), cap), &[])
+        .create_quota(
+            &actor(),
+            &scope(),
+            quota_draft(test_subject("u1"), cap),
+            &[],
+        )
         .await
         .expect("create quota")
 }
@@ -343,7 +337,7 @@ async fn storage_update_enforces_cap_versus_consumed_and_bumps_the_version() {
         .expect("debit");
     let err = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
@@ -363,7 +357,7 @@ async fn storage_update_enforces_cap_versus_consumed_and_bumps_the_version() {
     );
     let updated = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
@@ -378,7 +372,7 @@ async fn storage_update_enforces_cap_versus_consumed_and_bumps_the_version() {
     assert_eq!(updated.record_version, 2);
     let missing = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             QuotaId::generate(),
             QuotaPatch::default(),
@@ -405,10 +399,11 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
 
     let over = storage
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             token,
             Some(31),
+            None,
             &partial_idem("c0", 1),
             &[],
         )
@@ -424,10 +419,11 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
 
     storage
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             token,
             Some(20),
+            None,
             &partial_idem("c1", 1),
             &[],
         )
@@ -436,7 +432,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     assert_eq!(storage.consumed(id), 20, "unused reservation is returned");
     assert_eq!(storage.lease_state(token), Some(LeaseState::Committed));
     let again = storage
-        .release_lease(&ctx(), &scope(), token, &partial_idem("x", 1), &[])
+        .release_lease(&actor(), &scope(), token, &partial_idem("x", 1), &[])
         .await
         .expect_err("terminal lease");
     assert_eq!(again, StorageError::LeaseNotActive { token });
@@ -448,7 +444,15 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     let token2 = token_of(&expiring_lease);
     storage.expire_leases();
     let expired = storage
-        .commit_lease(&ctx(), &scope(), token2, None, &partial_idem("c2", 1), &[])
+        .commit_lease(
+            &actor(),
+            &scope(),
+            token2,
+            None,
+            None,
+            &partial_idem("c2", 1),
+            &[],
+        )
         .await
         .expect_err("expired leases are released lazily (I4)");
     assert_eq!(expired, StorageError::LeaseNotActive { token: token2 });
@@ -467,7 +471,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
         .expect("third lease");
     let token3 = token_of(&held_lease);
     let outcome = storage
-        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .deactivate_quota(&actor(), &scope(), id, &[])
         .await
         .expect("deactivate");
     assert_eq!(outcome.resolved_leases, vec![token3]);
@@ -523,7 +527,7 @@ async fn storage_snapshot_reads_reflect_scope_and_remaining_capacity() {
         .await
         .expect("debit");
     let snaps = storage
-        .read_quota_snapshot(&ctx(), &scope(), &applicable())
+        .read_quota_snapshot(&scope(), &applicable())
         .await
         .expect("snapshot");
     assert_eq!(snaps.len(), 1);
@@ -536,7 +540,7 @@ async fn storage_snapshot_reads_reflect_scope_and_remaining_capacity() {
     };
     assert!(
         storage
-            .read_quota_snapshot(&ctx(), &scope(), &other)
+            .read_quota_snapshot(&scope(), &other)
             .await
             .expect("snapshot")
             .is_empty(),
@@ -560,12 +564,12 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         created_by: "op".to_owned(),
     };
     let v1 = storage
-        .create_policy(&ctx(), draft.clone(), &[])
+        .create_policy(&actor(), draft.clone(), &[])
         .await
         .expect("v1");
     assert_eq!(v1.version, 1);
     let dup = storage
-        .create_policy(&ctx(), draft, &[])
+        .create_policy(&actor(), draft, &[])
         .await
         .expect_err("scope taken");
     assert!(matches!(dup, StorageError::PolicyScopeOccupied { .. }));
@@ -580,7 +584,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         created_by: "op".to_owned(),
     };
     let err = storage
-        .update_policy(&ctx(), PolicyId::global(), stale, &[])
+        .update_policy(&actor(), PolicyId::global(), stale, &[])
         .await
         .expect_err("lost update");
     assert_eq!(
@@ -593,7 +597,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
 
     let v2 = storage
         .update_policy(
-            &ctx(),
+            &actor(),
             PolicyId::global(),
             PolicyUpdate {
                 schema_snapshot: None,
@@ -620,7 +624,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
     );
 
     let back = storage
-        .rollback_policy(&ctx(), PolicyId::global(), 1, None, &[])
+        .rollback_policy(&actor(), PolicyId::global(), 1, None, &[])
         .await
         .expect("rollback");
     assert!(back.is_applied(), "the pointer moved off version 2");
@@ -636,7 +640,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         Some(PolicyVersionState::RolledBack)
     );
     let terminal = storage
-        .rollback_policy(&ctx(), PolicyId::global(), 2, None, &[])
+        .rollback_policy(&actor(), PolicyId::global(), 2, None, &[])
         .await
         .expect_err("rolled-back versions never re-activate");
     assert!(matches!(
@@ -644,7 +648,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
         StorageError::VersionRolledBack { version: 2, .. }
     ));
     let unknown = storage
-        .rollback_policy(&ctx(), PolicyId::global(), 9, None, &[])
+        .rollback_policy(&actor(), PolicyId::global(), 9, None, &[])
         .await
         .expect_err("unknown version");
     assert!(matches!(
@@ -654,7 +658,7 @@ async fn storage_policy_versions_update_rollback_and_delete() {
 
     assert_eq!(
         storage
-            .delete_policy(&ctx(), PolicyId::global(), None, &[])
+            .delete_policy(&actor(), PolicyId::global(), None, &[])
             .await,
         Err(StorageError::CannotDeleteSeededGlobalPolicy)
     );
@@ -668,13 +672,18 @@ async fn storage_policy_versions_update_rollback_and_delete() {
 }
 
 #[tokio::test]
-async fn storage_reclaims_expired_idempotency_records_and_log_entries() {
+async fn storage_reclaims_expired_idempotency_records_and_log_entries_but_no_charge() {
     let storage = storage_with_policy().await;
-    let _quota = seeded_quota(&storage, None).await;
+    let quota = seeded_quota(&storage, None).await;
+    let debit = idem(OperationType::Debit, "d", 1);
     storage
-        .apply_debit_plan_for(1, &idem(OperationType::Debit, "d", 1))
+        .apply_debit_plan_for(1, &debit)
         .await
         .expect("debit");
+    storage
+        .apply_credit(&actor(), &scope(), quota, 1, &partial("c", 2), &[])
+        .await
+        .expect("credit");
     let far_future = OffsetDateTime::now_utc() + time::Duration::days(10);
     assert_eq!(
         storage
@@ -690,6 +699,14 @@ async fn storage_reclaims_expired_idempotency_records_and_log_entries() {
             .expect("reclaim"),
         1
     );
+    assert!(
+        storage
+            .lookup_idempotency(&debit.scope)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the charge of the debit is not an idempotency record"
+    );
     assert_eq!(
         storage
             .reclaim_operation_log(1, far_future)
@@ -702,7 +719,8 @@ async fn storage_reclaims_expired_idempotency_records_and_log_entries() {
             .reclaim_operation_log(10, far_future)
             .await
             .expect("log again"),
-        1
+        2,
+        "the debit's and the credit's"
     );
     assert_eq!(
         storage
@@ -713,75 +731,13 @@ async fn storage_reclaims_expired_idempotency_records_and_log_entries() {
     );
 }
 
-#[tokio::test]
-async fn active_projection_bindings_are_the_distinct_pairs_of_active_quotas() {
-    let storage = InMemoryStorage::new();
-    assert!(
-        storage
-            .read_active_projection_bindings()
-            .await
-            .expect("empty store")
-            .is_empty()
-    );
-
-    let first = storage
-        .create_quota(
-            &ctx(),
-            &scope(),
-            quota_draft(test_subject("u1"), Some(10)),
-            &[],
-        )
-        .await
-        .expect("first");
-    storage
-        .create_quota(
-            &ctx(),
-            &scope(),
-            quota_draft(test_subject("u2"), Some(10)),
-            &[],
-        )
-        .await
-        .expect("same pair, other subject id");
-    let bindings = storage
-        .read_active_projection_bindings()
-        .await
-        .expect("bindings");
-    assert_eq!(
-        bindings.len(),
-        1,
-        "distinct by (metric, projection_type): {bindings:?}"
-    );
-    let binding = bindings.iter().next().expect("one");
-    assert_eq!(binding.metric, test_metric());
-    assert_eq!(binding.projection_type, test_subject("u1").projection_type);
-
-    storage
-        .deactivate_quota(&ctx(), &scope(), first, &[])
-        .await
-        .expect("deactivate one");
-    assert_eq!(
-        storage
-            .read_active_projection_bindings()
-            .await
-            .expect("bindings")
-            .len(),
-        1,
-        "the other active Quota keeps the pair"
-    );
-
-    storage.fail_with(StorageError::Unavailable("db down".into()));
-    assert!(matches!(
-        storage.read_active_projection_bindings().await,
-        Err(StorageError::Unavailable(_))
-    ));
-}
-
 // --- quota lifecycle reference semantics -----------------------------------
 
 fn quota_changed(quota_id: Option<QuotaId>) -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
+        actor: actor(),
         scope: crate::NotificationScope::Tenant {
             tenant_id: test_tenant(),
         },
@@ -798,7 +754,7 @@ async fn storage_create_fills_the_quota_id_on_events_that_lack_it() {
     let storage = InMemoryStorage::new();
     let id = storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             quota_draft(test_subject("u1"), Some(10)),
             &[quota_changed(None)],
@@ -816,13 +772,13 @@ async fn storage_update_rejects_thresholds_on_an_unbounded_merged_row() {
     let mut draft = quota_draft(test_subject("u1"), Some(100));
     draft.notification_thresholds = vec![50];
     let id = storage
-        .create_quota(&ctx(), &scope(), draft, &[])
+        .create_quota(&actor(), &scope(), draft, &[])
         .await
         .expect("create");
 
     let unbound_only = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
@@ -842,7 +798,7 @@ async fn storage_update_rejects_thresholds_on_an_unbounded_merged_row() {
 
     let unbound_and_clear = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
@@ -859,7 +815,7 @@ async fn storage_update_rejects_thresholds_on_an_unbounded_merged_row() {
 
     let thresholds_on_unbounded = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
@@ -898,7 +854,7 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
     assert_eq!(storage.consumed(id), 5);
 
     let outcome = storage
-        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .deactivate_quota(&actor(), &scope(), id, &[])
         .await
         .expect("deactivate");
     assert_eq!(
@@ -913,7 +869,7 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
     assert_eq!(row.record_version, 2);
 
     let again = storage
-        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .deactivate_quota(&actor(), &scope(), id, &[])
         .await
         .expect_err("no second cascade");
     assert_eq!(again, StorageError::QuotaDeactivated { id });
@@ -921,7 +877,7 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
 
     let patched = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
@@ -944,14 +900,26 @@ async fn storage_active_quota_counts_cover_active_quotas_only() {
     let counts = storage.read_active_quota_counts().await.expect("counts");
     assert_eq!((counts.cap_zero, counts.cap_unbounded), (1, 1));
     assert_eq!(counts.by_metric.get(&test_metric()), Some(&3));
+    assert!(counts.conditions.is_empty(), "no Quota has conditions");
+    for _ in 0..2 {
+        let mut conditioned = quota_draft(test_subject("u2"), Some(1));
+        conditioned.metadata.insert("region".into(), "eu".into());
+        storage
+            .create_quota(&actor(), &scope(), conditioned, &[])
+            .await
+            .expect("create quota");
+    }
+    let counts = storage.read_active_quota_counts().await.expect("counts");
+    assert_eq!(counts.conditions.len(), 1, "one distinct set");
+    assert_eq!(counts.conditions[0].quotas, 2);
 
     storage
-        .deactivate_quota(&ctx(), &scope(), zero, &[])
+        .deactivate_quota(&actor(), &scope(), zero, &[])
         .await
         .expect("deactivate");
     let counts = storage.read_active_quota_counts().await.expect("counts");
     assert_eq!((counts.cap_zero, counts.cap_unbounded), (0, 1));
-    assert_eq!(counts.by_metric.get(&test_metric()), Some(&2));
+    assert_eq!(counts.by_metric.get(&test_metric()), Some(&4));
 
     storage.fail_with(StorageError::Unavailable("db down".into()));
     assert!(matches!(
@@ -968,7 +936,7 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
         ids.push(
             storage
                 .create_quota(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     quota_draft(test_subject(&format!("u{n}")), Some(n)),
                     &[],
@@ -978,17 +946,12 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
         );
     }
     storage
-        .deactivate_quota(&ctx(), &scope(), ids[4], &[])
+        .deactivate_quota(&actor(), &scope(), ids[4], &[])
         .await
         .expect("deactivate the last one");
 
     let first = storage
-        .read_quotas(
-            &ctx(),
-            &scope(),
-            QuotaFilter::default(),
-            PageRequest::first(2),
-        )
+        .read_quotas(&scope(), QuotaFilter::default(), PageRequest::first(2))
         .await
         .expect("page 1");
     assert_eq!(
@@ -997,7 +960,6 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
     );
     let second = storage
         .read_quotas(
-            &ctx(),
             &scope(),
             QuotaFilter::default(),
             PageRequest {
@@ -1013,7 +975,6 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
     );
     let third = storage
         .read_quotas(
-            &ctx(),
             &scope(),
             QuotaFilter::default(),
             PageRequest {
@@ -1031,7 +992,6 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
 
     let active = storage
         .read_quotas(
-            &ctx(),
             &scope(),
             QuotaFilter {
                 status: Some(QuotaStatus::Active),
@@ -1044,7 +1004,6 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
     assert_eq!(active.items.len(), 4);
     let by_subject = storage
         .read_quotas(
-            &ctx(),
             &scope(),
             QuotaFilter {
                 subject: Some(test_subject("u3")),
@@ -1060,7 +1019,6 @@ async fn storage_read_quotas_filters_and_pages_in_creation_order() {
     );
     let by_ids = storage
         .read_quotas(
-            &ctx(),
             &scope(),
             QuotaFilter {
                 ids: vec![ids[0], ids[4]],
@@ -1078,7 +1036,7 @@ async fn storage_read_quotas_refuses_a_cursor_it_did_not_issue() {
     let storage = InMemoryStorage::new();
     storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             quota_draft(test_subject("u"), Some(1)),
             &[],
@@ -1088,7 +1046,6 @@ async fn storage_read_quotas_refuses_a_cursor_it_did_not_issue() {
     for cursor in ["not-a-cursor", "", "-1", "1.5"] {
         let err = storage
             .read_quotas(
-                &ctx(),
                 &scope(),
                 QuotaFilter::default(),
                 PageRequest {
@@ -1103,77 +1060,34 @@ async fn storage_read_quotas_refuses_a_cursor_it_did_not_issue() {
 }
 
 #[tokio::test]
-async fn storage_update_quota_moves_the_contract_reference_with_the_metadata() {
+async fn storage_update_quota_replaces_the_metadata() {
     let storage = InMemoryStorage::new();
     let id = storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             quota_draft(test_subject("u"), Some(10)),
             &[],
         )
         .await
         .expect("created");
-    let before = storage.quota(id).expect("stored").constraint_contract;
-    let v2 = crate::models::ContractRef {
-        type_id: gts::GtsTypeId::new(
-            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v2~",
-        ),
-        version: 2,
-    };
     let mut metadata = serde_json::Map::new();
     metadata.insert("weight".to_owned(), serde_json::json!(3));
-
-    let err = storage
-        .update_quota(
-            &ctx(),
-            &scope(),
-            id,
-            QuotaPatch {
-                metadata: Some(metadata.clone()),
-                ..QuotaPatch::default()
-            },
-            &[],
-        )
-        .await
-        .expect_err("metadata without its contract");
-    assert!(matches!(err, StorageError::Internal(_)), "{err:?}");
-    assert_eq!(storage.quota(id).expect("stored").record_version, 1);
-
     let updated = storage
         .update_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             id,
             QuotaPatch {
                 metadata: Some(metadata),
-                constraint_contract: Some(v2.clone()),
                 ..QuotaPatch::default()
             },
             &[],
         )
         .await
-        .expect("metadata with its contract");
-    assert_ne!(before, v2);
-    assert_eq!(updated.constraint_contract, v2);
+        .expect("metadata patch");
     assert_eq!(updated.metadata["weight"], serde_json::json!(3));
-    let unrelated = storage
-        .update_quota(
-            &ctx(),
-            &scope(),
-            id,
-            QuotaPatch {
-                fail_open_hint: Some(true),
-                ..QuotaPatch::default()
-            },
-            &[],
-        )
-        .await
-        .expect("non-metadata patch");
-    assert_eq!(
-        unrelated.constraint_contract, v2,
-        "other patches leave it alone"
-    );
+    assert_eq!(updated.record_version, 2);
 }
 
 #[tokio::test]
@@ -1192,12 +1106,17 @@ async fn deleted_policy_history_survives_scope_recreation_and_replays_are_noops(
         created_by: "operator".into(),
     };
     let first = storage
-        .create_policy(&ctx(), draft.clone(), &[])
+        .create_policy(&actor(), draft.clone(), &[])
         .await
         .expect("create");
     assert!(
         storage
-            .delete_policy(&ctx(), first.policy_id.clone(), Some("retire".into()), &[])
+            .delete_policy(
+                &actor(),
+                first.policy_id.clone(),
+                Some("retire".into()),
+                &[]
+            )
             .await
             .expect("delete")
             .is_applied()
@@ -1205,7 +1124,7 @@ async fn deleted_policy_history_survives_scope_recreation_and_replays_are_noops(
     let count = storage.policy_audit().len();
     assert!(
         !storage
-            .delete_policy(&ctx(), first.policy_id.clone(), None, &[])
+            .delete_policy(&actor(), first.policy_id.clone(), None, &[])
             .await
             .expect("replay")
             .is_applied(),
@@ -1220,7 +1139,7 @@ async fn deleted_policy_history_survives_scope_recreation_and_replays_are_noops(
         Some("retire")
     );
     let second = storage
-        .create_policy(&ctx(), draft, &[])
+        .create_policy(&actor(), draft, &[])
         .await
         .expect("recreate");
     assert_ne!(first.policy_id, second.policy_id);
@@ -1234,13 +1153,13 @@ async fn deleted_policy_history_survives_scope_recreation_and_replays_are_noops(
     assert_eq!(old.comment.as_deref(), Some("original"));
     assert!(matches!(
         storage
-            .rollback_policy(&ctx(), first.policy_id, 1, None, &[])
+            .rollback_policy(&actor(), first.policy_id, 1, None, &[])
             .await,
         Err(StorageError::PolicyDeleted { .. })
     ));
     assert!(matches!(
         storage
-            .delete_policy(&ctx(), PolicyId::new("never-created"), None, &[])
+            .delete_policy(&actor(), PolicyId::new("never-created"), None, &[])
             .await,
         Err(StorageError::PolicyNotFound { .. })
     ));
@@ -1251,7 +1170,7 @@ async fn rollback_preserves_comments_and_update_allocates_above_high_water() {
     let storage = InMemoryStorage::new();
     let first = storage
         .create_policy(
-            &ctx(),
+            &actor(),
             PolicyDraft {
                 schema_snapshot: PolicySchemaSnapshot::default(),
                 scope: PolicyScope::Global,
@@ -1276,16 +1195,16 @@ async fn rollback_preserves_comments_and_update_allocates_above_high_water() {
         created_by: "operator".into(),
     };
     storage
-        .update_policy(&ctx(), first.policy_id.clone(), patch(1), &[])
+        .update_policy(&actor(), first.policy_id.clone(), patch(1), &[])
         .await
         .expect("v2");
     storage
-        .update_policy(&ctx(), first.policy_id.clone(), patch(2), &[])
+        .update_policy(&actor(), first.policy_id.clone(), patch(2), &[])
         .await
         .expect("v3");
     let back = storage
         .rollback_policy(
-            &ctx(),
+            &actor(),
             first.policy_id.clone(),
             1,
             Some("rollback note".into()),
@@ -1303,7 +1222,7 @@ async fn rollback_preserves_comments_and_update_allocates_above_high_water() {
     assert!(
         !storage
             .rollback_policy(
-                &ctx(),
+                &actor(),
                 first.policy_id.clone(),
                 1,
                 Some("retry".into()),
@@ -1317,7 +1236,7 @@ async fn rollback_preserves_comments_and_update_allocates_above_high_water() {
     assert_eq!(storage.policy_audit(), audit);
     assert_eq!(
         storage
-            .update_policy(&ctx(), first.policy_id, patch(1), &[])
+            .update_policy(&actor(), first.policy_id, patch(1), &[])
             .await
             .expect("v4")
             .version,
@@ -1377,14 +1296,13 @@ async fn a_transaction_that_needs_a_prepared_artifact_rolls_back_and_writes_noth
     let applicable = applicable();
     let err = storage
         .apply_debit_plan(
-            &ctx(),
+            &actor(),
             &scope(),
             &EvaluatedMutation {
                 applicable: &applicable,
                 amount: 5,
                 request: &serde_json::Value::Null,
-                resource: &serde_json::Value::Null,
-                user_projection: None,
+                metric_id: None,
                 limits: limits(),
                 idempotency: &write,
                 authorized: authorized(),
@@ -1425,17 +1343,17 @@ async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
             applicable: applicable(),
             amount: 7,
             request: serde_json::Value::Null,
-            resource: serde_json::Value::Null,
+            metric_id: None,
             authorized: authorized(),
-            item_scope: None,
+            idempotency: idem(OperationType::Debit, "item-7", 7),
         },
         BatchDebitItem {
             applicable: applicable(),
             amount: 3,
             request: serde_json::Value::Null,
-            resource: serde_json::Value::Null,
+            metric_id: None,
             authorized: authorized(),
-            item_scope: None,
+            idempotency: idem(OperationType::Debit, "item-3", 3),
         },
     ];
     let applied = run_batch(&storage, &envelope, &items, &call)
@@ -1464,7 +1382,7 @@ async fn selection_prefers_the_metric_policy_and_falls_through_to_global_once_it
     let _quota = seeded_quota(&storage, Some(100)).await;
     let metric_policy = storage
         .create_policy(
-            &ctx(),
+            &actor(),
             PolicyDraft {
                 schema_snapshot: PolicySchemaSnapshot::default(),
                 scope: PolicyScope::Metric {
@@ -1495,7 +1413,7 @@ async fn selection_prefers_the_metric_policy_and_falls_through_to_global_once_it
     // Deleting it falls the metric through to the global policy, inside the
     // same transaction that mutates the counters.
     storage
-        .delete_policy(&ctx(), metric_policy.policy_id, None, &[])
+        .delete_policy(&actor(), metric_policy.policy_id, None, &[])
         .await
         .expect("delete");
     let after = storage
@@ -1539,12 +1457,11 @@ async fn run_batch_within(
         .map(|item| BatchEntry {
             item,
             scope: &item_scope,
-            user_projection: None,
         })
         .collect();
     storage
         .apply_batch_debit(
-            &ctx(),
+            &actor(),
             &scope(),
             &EvaluatedBatch {
                 envelope,
@@ -1559,13 +1476,18 @@ async fn run_batch_within(
 }
 
 fn batch_item(amount: u64) -> BatchDebitItem {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = format!(
+        "item-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     BatchDebitItem {
         applicable: applicable(),
         amount,
         request: serde_json::Value::Null,
-        resource: serde_json::Value::Null,
+        metric_id: None,
         authorized: authorized(),
-        item_scope: None,
+        idempotency: idem(OperationType::Debit, &key, 1),
     }
 }
 
@@ -1690,14 +1612,13 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
     let applicable = applicable();
     storage
         .apply_debit_plan(
-            &ctx(),
+            &actor(),
             &scope(),
             &EvaluatedMutation {
                 applicable: &applicable,
                 amount: 1,
                 request: &serde_json::Value::Null,
-                resource: &serde_json::Value::Null,
-                user_projection: None,
+                metric_id: None,
                 limits: limits(),
                 idempotency: &write,
                 authorized: authorized(),
@@ -1723,7 +1644,7 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
         .expect("seeded");
     storage
         .update_policy(
-            &ctx(),
+            &actor(),
             active.policy_id,
             PolicyUpdate {
                 schema_snapshot: None,
@@ -1741,14 +1662,13 @@ async fn the_budget_is_resolved_against_the_policy_the_transaction_selected() {
     let clamped = idem(OperationType::Debit, "clamped", 9);
     storage
         .apply_debit_plan(
-            &ctx(),
+            &actor(),
             &scope(),
             &EvaluatedMutation {
                 applicable: &applicable,
                 amount: 1,
                 request: &serde_json::Value::Null,
-                resource: &serde_json::Value::Null,
-                user_projection: None,
+                metric_id: None,
                 limits: limits(),
                 idempotency: &clamped,
                 authorized: authorized(),
@@ -1789,7 +1709,7 @@ async fn consumption_storage(cap: Option<u64>, thresholds: Vec<u8>) -> (InMemory
     storage.set_now(Some(day_one()));
     let id = storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             super::consumption_quota_draft(test_subject("u1"), cap, PeriodType::Day, thresholds),
             &[],
@@ -1892,7 +1812,7 @@ async fn thresholds_fire_upward_once_and_reset_when_the_period_rolls_over() {
 
     // A credit below 80 does not re-arm it.
     storage
-        .apply_credit(&ctx(), &scope(), id, 40, &partial("c1", 9), &[])
+        .apply_credit(&actor(), &scope(), id, 40, &partial("c1", 9), &[])
         .await
         .expect("credit");
     storage
@@ -1957,7 +1877,7 @@ async fn a_no_applicable_quota_denial_records_nothing_and_is_reevaluated_later()
 }
 
 #[tokio::test]
-async fn a_credit_derives_its_scope_from_the_locked_row_and_floors_at_zero() {
+async fn a_credit_records_under_its_scope_and_floors_at_zero() {
     let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
     storage
         .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
@@ -1965,26 +1885,25 @@ async fn a_credit_derives_its_scope_from_the_locked_row_and_floors_at_zero() {
         .expect("debit");
 
     let applied = storage
-        .apply_credit(&ctx(), &scope(), id, 40, &partial("c1", 9), &[])
+        .apply_credit(&actor(), &scope(), id, 40, &partial("c1", 9), &[])
         .await
         .expect("credit");
     assert!(matches!(applied, TransitionOutcome::Applied(_)));
     assert_eq!(storage.consumed(id), 0, "a credit floors at zero");
     assert!(kinds(&storage).contains(&NotificationEventKind::QuotaCounterAdjusted));
 
-    // The scope the plugin derived is the Quota's own subject pair.
-    let derived = IdempotencySubjectKey::of(&[test_subject("u1")]);
-    let record = storage
-        .lookup_idempotency(&IdempotencyScope {
-            tenant_id: test_tenant(),
-            subject_key: derived,
-            operation_type: OperationType::Credit,
-            key: "c1".to_owned(),
-        })
-        .await
-        .expect("lookup")
-        .expect("the credit recorded under the derived scope");
-    assert_eq!(record.attribution_hash, None, "a credit reverses nothing");
+    assert!(
+        storage
+            .lookup_idempotency(&IdempotencyScope {
+                tenant_id: test_tenant(),
+                operation_type: OperationType::Credit,
+                key: "c1".to_owned(),
+            })
+            .await
+            .expect("lookup")
+            .is_some(),
+        "the credit is recorded under its own scope"
+    );
 }
 
 #[tokio::test]
@@ -1995,23 +1914,23 @@ async fn a_credit_replays_even_after_its_quota_was_deactivated() {
         .await
         .expect("debit");
     storage
-        .apply_credit(&ctx(), &scope(), id, 4, &partial("c1", 9), &[])
+        .apply_credit(&actor(), &scope(), id, 4, &partial("c1", 9), &[])
         .await
         .expect("credit");
     storage
-        .deactivate_quota(&ctx(), &scope(), id, &[])
+        .deactivate_quota(&actor(), &scope(), id, &[])
         .await
         .expect("deactivate");
 
     let replay = storage
-        .apply_credit(&ctx(), &scope(), id, 4, &partial("c1", 9), &[])
+        .apply_credit(&actor(), &scope(), id, 4, &partial("c1", 9), &[])
         .await
         .expect("a replay answers from the record, not from the guards");
     assert!(matches!(replay, TransitionOutcome::NoOp(_)));
     assert_eq!(storage.consumed(id), 6, "the replay moved nothing");
 
     let fresh = storage
-        .apply_credit(&ctx(), &scope(), id, 1, &partial("c2", 8), &[])
+        .apply_credit(&actor(), &scope(), id, 1, &partial("c2", 8), &[])
         .await
         .expect_err("a fresh credit is refused");
     assert_eq!(fresh, StorageError::QuotaDeactivated { id });
@@ -2023,14 +1942,14 @@ async fn a_credit_refuses_a_closed_period_but_materializes_one_that_was_never_op
 
     // Never evaluated: the current window is open, so the row is materialized.
     storage
-        .apply_credit(&ctx(), &scope(), id, 5, &partial("c1", 9), &[])
+        .apply_credit(&actor(), &scope(), id, 5, &partial("c1", 9), &[])
         .await
         .expect("a Quota with no row has an open current window");
     assert_eq!(storage.period_rows(id).len(), 1);
 
     storage.set_now(Some(at("2026-03-19T00:00:00Z")));
     let err = storage
-        .apply_credit(&ctx(), &scope(), id, 5, &partial("c2", 8), &[])
+        .apply_credit(&actor(), &scope(), id, 5, &partial("c2", 8), &[])
         .await
         .expect_err("the latest period has ended");
     assert_eq!(err, StorageError::PeriodClosed);
@@ -2049,13 +1968,7 @@ async fn a_rollback_reverses_against_the_acquisition_period_after_the_boundary()
     // that must lose the amount (I5), not the row now current.
     storage.set_now(Some(at("2026-03-18T00:00:00Z")));
     storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &target(&original),
-            &idem(OperationType::Rollback, "r1", 2),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &target(&original), &[])
         .await
         .expect("rollback into the settlement window");
 
@@ -2065,7 +1978,48 @@ async fn a_rollback_reverses_against_the_acquisition_period_after_the_boundary()
 }
 
 #[tokio::test]
-async fn a_rollback_is_refused_once_the_attribution_period_has_settled() {
+async fn a_scope_of_another_tenant_reaches_no_charge_and_no_quota() {
+    let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
+    let original = idem(OperationType::Debit, "k1", 1);
+    storage
+        .apply_debit_plan_for(30, &original)
+        .await
+        .expect("debit");
+    let foreign = AccessScope::for_tenant(Uuid::from_u128(0xbad));
+
+    let err = storage
+        .apply_rollback(&actor(), &foreign, &target(&original), &[])
+        .await
+        .expect_err("rollback");
+    assert!(
+        matches!(err, StorageError::OperationNotFound { .. }),
+        "{err:?}"
+    );
+    let ret = crate::models::ChargeReturn {
+        charge: original.scope.clone(),
+        metric: super::test_metric(),
+        amount: 5,
+        key: "r1".to_owned(),
+    };
+    let err = storage
+        .apply_return(&actor(), &foreign, &ret, &[])
+        .await
+        .expect_err("return");
+    assert!(
+        matches!(err, StorageError::OperationNotFound { .. }),
+        "{err:?}"
+    );
+    let err = storage
+        .apply_credit(&actor(), &foreign, id, 5, &partial("c1", 9), &[])
+        .await
+        .expect_err("credit");
+    assert_eq!(err, StorageError::QuotaNotFound { id });
+
+    assert_eq!(storage.period_rows(id)[0].consumed, 30, "nothing moved");
+}
+
+#[tokio::test]
+async fn a_rollback_of_a_settled_period_alone_is_not_applicable() {
     let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
     let original = idem(OperationType::Debit, "k1", 1);
     storage
@@ -2081,16 +2035,10 @@ async fn a_rollback_is_refused_once_the_attribution_period_has_settled() {
         .expect("debit in the new period");
 
     let err = storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &target(&original),
-            &idem(OperationType::Rollback, "r1", 3),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &target(&original), &[])
         .await
         .expect_err("a settled period is final");
-    assert_eq!(err, StorageError::PeriodClosed);
+    assert_eq!(err, StorageError::ReturnNotApplicable);
     assert_eq!(storage.period_rows(id)[0].consumed, 30, "nothing moved");
 }
 
@@ -2110,13 +2058,7 @@ async fn a_rollback_authorized_under_another_attribution_finds_nothing() {
         authorized: AttributionDigest::from_bytes([9; 32]),
     };
     let err = storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &foreign,
-            &idem(OperationType::Rollback, "r1", 2),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &foreign, &[])
         .await
         .expect_err("the caller was admitted for something else");
 
@@ -2135,7 +2077,7 @@ async fn a_rollback_of_a_credit_a_denial_or_an_unknown_key_finds_nothing() {
     let (storage, id) = consumption_storage(Some(10), Vec::new()).await;
     let credit_key = partial("c1", 9);
     storage
-        .apply_credit(&ctx(), &scope(), id, 1, &credit_key, &[])
+        .apply_credit(&actor(), &scope(), id, 1, &credit_key, &[])
         .await
         .expect("credit");
     let denied = idem(OperationType::Debit, "denied", 4);
@@ -2154,7 +2096,6 @@ async fn a_rollback_of_a_credit_a_denial_or_an_unknown_key_finds_nothing() {
             "a credit",
             IdempotencyScope {
                 tenant_id: test_tenant(),
-                subject_key: IdempotencySubjectKey::of(&[test_subject("u1")]),
                 operation_type: OperationType::Credit,
                 key: "c1".to_owned(),
             },
@@ -2162,13 +2103,12 @@ async fn a_rollback_of_a_credit_a_denial_or_an_unknown_key_finds_nothing() {
     ] {
         let err = storage
             .apply_rollback(
-                &ctx(),
+                &actor(),
                 &scope(),
                 &RollbackTarget {
                     original: scope_of,
                     authorized: authorized(),
                 },
-                &idem(OperationType::Rollback, label, 2),
                 &[],
             )
             .await
@@ -2181,39 +2121,7 @@ async fn a_rollback_of_a_credit_a_denial_or_an_unknown_key_finds_nothing() {
 }
 
 #[tokio::test]
-async fn the_same_original_key_under_another_subject_set_is_a_different_operation() {
-    let storage = storage_with_policy().await;
-    storage.set_now(Some(day_one()));
-    seeded_quota(&storage, Some(100)).await;
-    let original = idem(OperationType::Debit, "k1", 1);
-    storage
-        .apply_debit_plan_for(30, &original)
-        .await
-        .expect("debit");
-
-    let other_subject = IdempotencyScope {
-        subject_key: IdempotencySubjectKey::from_bytes([2; 32]),
-        ..original.scope.clone()
-    };
-    let err = storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &RollbackTarget {
-                original: other_subject,
-                authorized: authorized(),
-            },
-            &idem(OperationType::Rollback, "r1", 2),
-            &[],
-        )
-        .await
-        .expect_err("the scope includes the subject set");
-
-    assert!(matches!(err, StorageError::OperationNotFound { .. }));
-}
-
-#[tokio::test]
-async fn a_second_rollback_under_another_key_is_an_idempotent_no_op() {
+async fn a_second_rollback_succeeds_and_changes_nothing() {
     let storage = storage_with_policy().await;
     storage.set_now(Some(day_one()));
     let id = seeded_quota(&storage, Some(100)).await;
@@ -2223,67 +2131,19 @@ async fn a_second_rollback_under_another_key_is_an_idempotent_no_op() {
         .await
         .expect("debit");
     storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &target(&original),
-            &idem(OperationType::Rollback, "r1", 2),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &target(&original), &[])
         .await
         .expect("first rollback");
     assert_eq!(storage.consumed(id), 0);
 
     let again = storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &target(&original),
-            &idem(OperationType::Rollback, "r2", 3),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &target(&original), &[])
         .await
         .expect("a second rollback is accepted");
 
-    assert!(
-        again.get().decision.debit_plan.is_empty(),
-        "reversal happens once, so the second plan is empty"
-    );
+    assert!(matches!(again, TransitionOutcome::NoOp(_)));
+    assert!(again.get().decision.debit_plan.is_empty());
     assert_eq!(storage.consumed(id), 0, "the counter did not go negative");
-}
-
-#[tokio::test]
-async fn a_rollback_replay_returns_the_stored_outcome() {
-    let storage = storage_with_policy().await;
-    storage.set_now(Some(day_one()));
-    let id = seeded_quota(&storage, Some(100)).await;
-    let original = idem(OperationType::Debit, "k1", 1);
-    storage
-        .apply_debit_plan_for(30, &original)
-        .await
-        .expect("debit");
-    let rollback = idem(OperationType::Rollback, "r1", 2);
-    storage
-        .apply_rollback(&ctx(), &scope(), &target(&original), &rollback, &[])
-        .await
-        .expect("first rollback");
-
-    let replay = storage
-        .apply_rollback(&ctx(), &scope(), &target(&original), &rollback, &[])
-        .await
-        .expect("replay");
-    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
-    assert_eq!(storage.consumed(id), 0);
-
-    let mismatch = IdempotencyWrite {
-        payload_hash: PayloadHash::from_bytes([7; 32]),
-        ..rollback.clone()
-    };
-    let err = storage
-        .apply_rollback(&ctx(), &scope(), &target(&original), &mismatch, &[])
-        .await
-        .expect_err("a different payload under the same key");
-    assert_eq!(err, StorageError::IdempotencyPayloadMismatch);
 }
 
 #[tokio::test]
@@ -2297,7 +2157,7 @@ async fn a_snapshot_read_writes_nothing_and_the_next_mutation_opens_the_period()
 
     storage.set_now(Some(at("2026-03-19T00:00:00Z")));
     let snapshots = storage
-        .read_quota_snapshot(&ctx(), &scope(), &applicable())
+        .read_quota_snapshot(&scope(), &applicable())
         .await
         .expect("read");
 
@@ -2323,7 +2183,7 @@ async fn a_snapshot_read_writes_nothing_and_the_next_mutation_opens_the_period()
 }
 
 #[tokio::test]
-async fn a_replay_after_the_retention_window_is_a_new_operation() {
+async fn a_charge_answers_its_debit_after_the_retention_window() {
     let storage = storage_with_policy().await;
     storage.set_now(Some(day_one()));
     let id = seeded_quota(&storage, Some(100)).await;
@@ -2337,13 +2197,46 @@ async fn a_replay_after_the_retention_window_is_a_new_operation() {
         .reclaim_expired_idempotency(10, at("2999-01-01T00:00:00Z"))
         .await
         .expect("reclaim");
-    assert_eq!(reclaimed, 1);
+    assert_eq!(reclaimed, 0, "the debit's record is its charge");
 
+    let replay = storage
+        .apply_debit_plan_for(10, &write)
+        .await
+        .expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(storage.consumed(id), 10, "the counter moved once");
+    assert_eq!(
+        storage
+            .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 2))
+            .await
+            .expect_err("another fingerprint under the charge's key"),
+        StorageError::IdempotencyPayloadMismatch
+    );
+}
+
+#[tokio::test]
+async fn a_denied_debit_replays_only_for_the_retention_window() {
+    let storage = storage_with_policy().await;
+    storage.set_now(Some(day_one()));
+    let id = seeded_quota(&storage, Some(5)).await;
+    let write = idem(OperationType::Debit, "k1", 1);
     storage
         .apply_debit_plan_for(10, &write)
         .await
+        .expect("a denial is a successful call");
+
+    let reclaimed = storage
+        .reclaim_expired_idempotency(10, at("2999-01-01T00:00:00Z"))
+        .await
+        .expect("reclaim");
+    assert_eq!(reclaimed, 1);
+
+    let again = storage
+        .apply_debit_plan_for(10, &write)
+        .await
         .expect("re-evaluated as a new operation");
-    assert_eq!(storage.consumed(id), 20, "the counter moved a second time");
+    assert!(matches!(again, TransitionOutcome::Applied(_)));
+    assert_eq!(storage.consumed(id), 0);
 }
 
 #[tokio::test]
@@ -2352,7 +2245,7 @@ async fn a_failed_batch_item_discards_every_effect_of_the_items_before_it() {
     storage.set_now(Some(day_one()));
     let id = storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             super::consumption_quota_draft(
                 test_subject("u1"),
@@ -2434,7 +2327,7 @@ async fn an_expired_hold_is_returned_once_by_whoever_touches_the_counter_first()
     );
 
     storage
-        .apply_credit(&ctx(), &scope(), id, 50, &partial("c1", 2), &[])
+        .apply_credit(&actor(), &scope(), id, 50, &partial("c1", 2), &[])
         .await
         .expect("credit");
     assert_eq!(storage.consumed(id), 0, "a credit floors at zero");
@@ -2535,10 +2428,11 @@ async fn a_commit_of_zero_returns_every_hold_and_still_reverses_as_a_no_op() {
 
     let committed = storage
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             token,
             Some(0),
+            None,
             &partial_idem("c1", 5),
             &[],
         )
@@ -2550,10 +2444,11 @@ async fn a_commit_of_zero_returns_every_hold_and_still_reverses_as_a_no_op() {
 
     let replay = storage
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             token,
             Some(0),
+            None,
             &partial_idem("c1", 5),
             &[],
         )
@@ -2562,27 +2457,24 @@ async fn a_commit_of_zero_returns_every_hold_and_still_reverses_as_a_no_op() {
     assert!(matches!(replay, TransitionOutcome::NoOp(_)));
 
     // The commit is a real operation, so its rollback succeeds; it simply has
-    // nothing to move. A denied debit, which also records no movement, stays
-    // irreversible.
+    // nothing to move.
     let reversed = storage
         .apply_rollback(
-            &ctx(),
+            &actor(),
             &scope(),
             &RollbackTarget {
                 original: IdempotencyScope {
                     tenant_id: test_tenant(),
-                    subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
                     operation_type: OperationType::Commit,
                     key: "c1".to_owned(),
                 },
                 authorized: authorized(),
             },
-            &idem(OperationType::Rollback, "rb", 6),
             &[],
         )
         .await
         .expect("a zero commit reverses as a no-op");
-    assert!(matches!(reversed, TransitionOutcome::Applied(_)));
+    assert!(matches!(reversed, TransitionOutcome::NoOp(_)));
     assert_eq!(storage.consumed(id), 0);
 }
 
@@ -2594,8 +2486,6 @@ async fn a_rollback_reverses_the_namespace_it_names_not_the_other() {
     let id = seeded_quota(&storage, Some(100)).await;
     // The key the acquisition persisted: the commit reuses it, and the debit
     // under the same client key resolves to the same one.
-    let subject_key = IdempotencySubjectKey::from_bytes([1; 32]);
-
     let acquired = storage
         .acquire_lease_for(
             30,
@@ -2607,10 +2497,11 @@ async fn a_rollback_reverses_the_namespace_it_names_not_the_other() {
     let token = token_of(&acquired);
     storage
         .commit_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             token,
             Some(30),
+            None,
             &partial_idem("shared", 5),
             &[],
         )
@@ -2625,32 +2516,19 @@ async fn a_rollback_reverses_the_namespace_it_names_not_the_other() {
     let scope_for = |operation| RollbackTarget {
         original: IdempotencyScope {
             tenant_id: test_tenant(),
-            subject_key,
             operation_type: operation,
             key: "shared".to_owned(),
         },
         authorized: authorized(),
     };
     storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &scope_for(OperationType::Commit),
-            &idem(OperationType::Rollback, "rb-commit", 8),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &scope_for(OperationType::Commit), &[])
         .await
         .expect("reverse the commit");
     assert_eq!(storage.consumed(id), 20, "only the commit was reversed");
 
     storage
-        .apply_rollback(
-            &ctx(),
-            &scope(),
-            &scope_for(OperationType::Debit),
-            &idem(OperationType::Rollback, "rb-debit", 9),
-            &[],
-        )
+        .apply_rollback(&actor(), &scope(), &scope_for(OperationType::Debit), &[])
         .await
         .expect("reverse the debit");
     assert_eq!(storage.consumed(id), 0);
@@ -2676,7 +2554,7 @@ async fn a_settlement_refuses_a_token_outside_the_callers_tenant() {
         payload_hash: PayloadHash::from_bytes([5; 32]),
     };
     let refused = storage
-        .commit_lease(&ctx(), &scope(), token, None, &foreign, &[])
+        .commit_lease(&actor(), &scope(), token, None, None, &foreign, &[])
         .await
         .expect_err("another tenant's token is simply absent");
     assert_eq!(refused, StorageError::LeaseNotFound { token });
@@ -2807,7 +2685,7 @@ async fn quotas_for(storage: &InMemoryStorage, subjects: &[&str]) -> Vec<QuotaId
         ids.push(
             storage
                 .create_quota(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     quota_draft(test_subject(subject), Some(10)),
                     &[],
@@ -2828,19 +2706,19 @@ async fn a_bulk_read_returns_the_union_once_each_in_id_order_across_pages() {
     let pairs = [pair(&["u1", "u2"]), pair(&["u2", "u3"])];
 
     let first = storage
-        .bulk_read_quota_snapshot(&ctx(), &scope(), &pairs, PageRequest::first(2))
+        .bulk_read_quota_snapshot(&scope(), &pairs, PageRequest::first(2), false)
         .await
         .expect("first page");
     let cursor = first.next_cursor.clone().expect("a second page");
     let second = storage
         .bulk_read_quota_snapshot(
-            &ctx(),
             &scope(),
             &pairs,
             PageRequest {
                 limit: 2,
                 cursor: Some(cursor.clone()),
             },
+            false,
         )
         .await
         .expect("second page");
@@ -2865,13 +2743,13 @@ async fn a_bulk_read_refuses_a_cursor_it_did_not_issue() {
     let storage = storage_with_policy().await;
     let err = storage
         .bulk_read_quota_snapshot(
-            &ctx(),
             &scope(),
             &[applicable()],
             PageRequest {
                 limit: 10,
                 cursor: Some("7".to_owned()),
             },
+            false,
         )
         .await
         .expect_err("an offset is not a cursor");
@@ -2900,7 +2778,7 @@ async fn snapshot_reads_apply_the_scope_subset_and_refuse_what_they_cannot_evalu
         let pairs = &pairs;
         async move {
             storage
-                .bulk_read_quota_snapshot(&ctx(), &scope, pairs, PageRequest::first(10))
+                .bulk_read_quota_snapshot(&scope, pairs, PageRequest::first(10), false)
                 .await
         }
     };
@@ -2931,9 +2809,7 @@ async fn snapshot_reads_apply_the_scope_subset_and_refuse_what_they_cannot_evalu
         "a hierarchical scope is refused, never ignored"
     );
     assert!(matches!(
-        storage
-            .read_quota_snapshot(&ctx(), &subtree, &applicable())
-            .await,
+        storage.read_quota_snapshot(&subtree, &applicable()).await,
         Err(StorageError::Internal(_))
     ));
 }
@@ -2951,13 +2827,13 @@ async fn an_unsupported_scope_is_refused_even_when_no_row_would_be_read() {
     for scope in [subtree_scope(), unknown_property] {
         assert!(unsupported(
             storage
-                .read_quota_snapshot(&ctx(), &scope, &applicable())
+                .read_quota_snapshot(&scope, &applicable())
                 .await
                 .map(|_| ())
         ));
         assert!(unsupported(
             storage
-                .bulk_read_quota_snapshot(&ctx(), &scope, &[applicable()], PageRequest::first(10))
+                .bulk_read_quota_snapshot(&scope, &[applicable()], PageRequest::first(10), false)
                 .await
                 .map(|_| ())
         ));
@@ -2971,7 +2847,7 @@ async fn an_unsupported_scope_is_refused_even_when_no_row_would_be_read() {
     };
     assert!(unsupported(
         storage
-            .bulk_read_quota_snapshot(&ctx(), &subtree_scope(), &[applicable()], past)
+            .bulk_read_quota_snapshot(&subtree_scope(), &[applicable()], past, false)
             .await
             .map(|_| ())
     ));
@@ -2982,7 +2858,7 @@ async fn a_read_creates_no_row_and_still_returns_a_quota_outside_its_window() {
     let (storage, valid) = consumption_storage(Some(100), Vec::new()).await;
     let lapsed = storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             crate::models::QuotaDraft {
                 validity_window: Some(crate::models::ValidityWindow {
@@ -3009,10 +2885,10 @@ async fn a_read_creates_no_row_and_still_returns_a_quota_outside_its_window() {
     storage.set_now(Some(at("2026-03-19T00:00:00Z")));
     let page = storage
         .bulk_read_quota_snapshot(
-            &ctx(),
             &scope(),
             &[pair(&["u1", "u2"])],
             PageRequest::first(10),
+            false,
         )
         .await
         .expect("bulk read");
@@ -3050,7 +2926,6 @@ async fn a_read_creates_no_row_and_still_returns_a_quota_outside_its_window() {
 
     storage
         .read_quota_snapshot(
-            &ctx(),
             &scope(),
             &ApplicableQuotas {
                 subjects: vec![test_subject("u2")],
@@ -3101,6 +2976,7 @@ fn changed() -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
+        actor: actor(),
         scope: crate::models::NotificationScope::Tenant {
             tenant_id: test_tenant(),
         },
@@ -3119,7 +2995,7 @@ async fn with_events(storage: &InMemoryStorage, count: usize) -> Vec<EventId> {
         ids.push(event.event_id);
         storage
             .create_quota(
-                &ctx(),
+                &actor(),
                 &scope(),
                 quota_draft(test_subject(&format!("u{index}")), Some(10)),
                 &[event],
@@ -3336,7 +3212,6 @@ fn bulk_idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: test_tenant(),
-            subject_key: IdempotencySubjectKey::of(&[]),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -3378,7 +3253,7 @@ fn deactivate_entry(quota_id: QuotaId) -> crate::bulk::BulkDeactivateEntry {
 async fn created(storage: &InMemoryStorage, subject: &str, cap: Option<u64>) -> QuotaId {
     storage
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope(),
             quota_draft(test_subject(subject), cap),
             &[],
@@ -3396,7 +3271,7 @@ async fn a_bulk_create_commits_every_draft_and_its_record_or_nothing() {
         items: vec![create_entry("u1", Some(10)), create_entry("u2", None)],
     };
     let outcome = storage
-        .bulk_create_quotas(&ctx(), &envelope)
+        .bulk_create_quotas(&actor(), &envelope)
         .await
         .expect("bulk create");
     assert!(outcome.is_applied());
@@ -3414,7 +3289,7 @@ async fn a_bulk_create_commits_every_draft_and_its_record_or_nothing() {
     );
 
     let replay = storage
-        .bulk_create_quotas(&ctx(), &envelope)
+        .bulk_create_quotas(&actor(), &envelope)
         .await
         .expect("replay");
     assert!(!replay.is_applied(), "a replay writes nothing");
@@ -3426,7 +3301,7 @@ async fn a_bulk_create_commits_every_draft_and_its_record_or_nothing() {
         ..envelope.clone()
     };
     assert_eq!(
-        storage.bulk_create_quotas(&ctx(), &changed_items).await,
+        storage.bulk_create_quotas(&actor(), &changed_items).await,
         Err(StorageError::IdempotencyPayloadMismatch)
     );
 
@@ -3438,7 +3313,7 @@ async fn a_bulk_create_commits_every_draft_and_its_record_or_nothing() {
         items: vec![create_entry("u4", None), foreign],
     };
     assert_eq!(
-        storage.bulk_create_quotas(&ctx(), &failing).await,
+        storage.bulk_create_quotas(&actor(), &failing).await,
         Err(StorageError::SubjectOutOfScope.at_item(1))
     );
     assert_eq!(
@@ -3469,7 +3344,7 @@ async fn a_bulk_update_rolls_back_every_patch_when_one_item_fails() {
             update_entry(QuotaId::generate(), 20),
         ],
     };
-    let err = storage.bulk_update_quotas(&ctx(), &envelope).await;
+    let err = storage.bulk_update_quotas(&actor(), &envelope).await;
     assert!(
         matches!(
             &err,
@@ -3489,7 +3364,7 @@ async fn a_bulk_update_rolls_back_every_patch_when_one_item_fails() {
         ..envelope
     };
     let outcome = storage
-        .bulk_update_quotas(&ctx(), &good)
+        .bulk_update_quotas(&actor(), &good)
         .await
         .expect("bulk update")
         .into_inner();
@@ -3510,7 +3385,7 @@ async fn a_bulk_deactivate_reports_the_first_failing_item_in_submission_order() 
     let active = created(&storage, "u1", Some(10)).await;
     let gone = created(&storage, "u2", Some(10)).await;
     storage
-        .deactivate_quota(&ctx(), &scope(), gone, &[])
+        .deactivate_quota(&actor(), &scope(), gone, &[])
         .await
         .expect("deactivate");
     let envelope = crate::bulk::BulkDeactivateEnvelope {
@@ -3518,7 +3393,7 @@ async fn a_bulk_deactivate_reports_the_first_failing_item_in_submission_order() 
         idempotency: bulk_idem(OperationType::BulkDeactivateQuotas, "offboard", 1),
         items: vec![deactivate_entry(active), deactivate_entry(gone)],
     };
-    let err = storage.bulk_deactivate_quotas(&ctx(), &envelope).await;
+    let err = storage.bulk_deactivate_quotas(&actor(), &envelope).await;
     assert!(
         matches!(
             &err,
@@ -3544,7 +3419,7 @@ async fn a_one_item_replay_whose_target_is_hidden_names_item_zero() {
         items: vec![update_entry(quota, 20)],
     };
     storage
-        .bulk_update_quotas(&ctx(), &envelope)
+        .bulk_update_quotas(&actor(), &envelope)
         .await
         .expect("bulk update");
 
@@ -3556,7 +3431,102 @@ async fn a_one_item_replay_whose_target_is_hidden_names_item_zero() {
         ..envelope
     };
     assert_eq!(
-        storage.bulk_update_quotas(&ctx(), &hidden).await,
+        storage.bulk_update_quotas(&actor(), &hidden).await,
         Err(StorageError::QuotaNotFound { id: unknown }.at_item(0))
     );
+}
+
+#[tokio::test]
+async fn an_in_window_bulk_read_leaves_out_quotas_outside_their_window_before_the_page_is_cut() {
+    let storage = storage_with_policy().await;
+    let now = time::macros::datetime!(2026-03-17 10:00 UTC);
+    storage.set_now(Some(now));
+    let window = |start, end| crate::models::ValidityWindow { start, end };
+    for (subject, validity) in [
+        ("u1", window(None, Some(now - time::Duration::SECOND))),
+        ("u2", window(Some(now + time::Duration::SECOND), None)),
+    ] {
+        storage
+            .create_quota(
+                &actor(),
+                &scope(),
+                crate::models::QuotaDraft {
+                    validity_window: Some(validity),
+                    ..quota_draft(test_subject(subject), Some(10))
+                },
+                &[],
+            )
+            .await
+            .expect("create quota");
+    }
+    let current = quotas_for(&storage, &["u3"]).await;
+    let pairs = [pair(&["u1", "u2", "u3"])];
+
+    let page = storage
+        .bulk_read_quota_snapshot(&scope(), &pairs, PageRequest::first(1), true)
+        .await
+        .expect("page");
+    let all = storage
+        .bulk_read_quota_snapshot(&scope(), &pairs, PageRequest::first(10), false)
+        .await
+        .expect("every quota");
+
+    assert_eq!(
+        page.items.iter().map(|s| s.quota_id).collect::<Vec<_>>(),
+        current
+    );
+    assert_eq!(page.next_cursor, None);
+    assert_eq!(all.items.len(), 3);
+}
+
+#[tokio::test]
+async fn a_commit_naming_another_metric_type_is_a_mismatch_and_changes_nothing() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let acquired = storage
+        .acquire_lease_for(
+            40,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+    let other = crate::models::MetricId::parse(
+        "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_requests.v1~",
+    )
+    .expect("metric");
+
+    let err = storage
+        .commit_lease(
+            &actor(),
+            &scope(),
+            token,
+            Some(10),
+            Some(&other),
+            &partial_idem("c1", 5),
+            &[],
+        )
+        .await
+        .expect_err("another metric type");
+    assert!(
+        matches!(err, StorageError::MetricTypeMismatch { .. }),
+        "{err:?}"
+    );
+    assert_eq!(storage.consumed(id), 40);
+    assert_eq!(storage.lease_state(token), Some(LeaseState::Active));
+
+    storage
+        .commit_lease(
+            &actor(),
+            &scope(),
+            token,
+            Some(10),
+            Some(&test_metric()),
+            &partial_idem("c2", 5),
+            &[],
+        )
+        .await
+        .expect("the lease's own metric type");
+    assert_eq!(storage.consumed(id), 10);
 }

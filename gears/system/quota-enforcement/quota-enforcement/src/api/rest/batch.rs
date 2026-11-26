@@ -92,6 +92,7 @@ impl From<BatchDebitRequestDto> for BatchDebitRequest {
 /// The batch-level verdict.
 #[derive(Debug, Clone, Copy)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = QuotaBatchResultDto)]
 pub enum BatchResultDto {
     /// Every item was allowed and applied.
     Allowed,
@@ -148,7 +149,7 @@ async fn batch_debit(
     Extension(service): Extension<Arc<Service>>,
     JsonBody(body): JsonBody<BatchDebitRequestDto>,
 ) -> ApiResult<impl IntoResponse> {
-    let decision = service.operations()?.batch_debit(&ctx, body.into()).await?;
+    let decision = service.operations(&ctx)?.batch_debit(body.into()).await?;
     Ok(Json(BatchDecisionDto::from(decision)))
 }
 

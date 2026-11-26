@@ -7,6 +7,9 @@
 //! its two siblings map `tenant_id` and `quota_id`, so `SecureORM` applies the
 //! PDP scope to every row of every table.
 
+pub mod charge;
+pub mod charge_entry;
+pub mod charge_return;
 pub mod contention_timeout_config;
 pub mod idempotency_record;
 pub mod idempotency_retention_config;

@@ -155,6 +155,16 @@ gears:
           key:
             type: ip                # one bucket per client IP
           max_keys: 10000           # max distinct IPs tracked
+        # The quota-resolver tenant route POST /quota-resolver/v1/quota-state
+        # (--features quota-resolver) binds this zone after authentication.
+        # `ip` because auth_disabled is true here; with auth on, use
+        # `key: { type: identity }` to key it on the caller.
+        rl_quota_resolver_quota_state:
+          rate_limit: 20/s
+          burst_limit: 40
+          key:
+            type: ip
+          max_keys: 10000
 
       in_flight_limit_zones:
         ifl_mini_chat_chat:
@@ -200,10 +210,9 @@ gears:
       vendor: "constructorfabric"
       priority: 100
 
-  # Requires --features quota-enforcement. Quotas also need a catalog: the
-  # metric base, metrics, subject projections and request/constraint
-  # contracts in types-registry `entities`, and the projections listed under
-  # `catalog`. testing/e2e/suites/quota_enforcement/e2e.yaml is a worked example.
+  # Requires --features quota-enforcement. Quotas also need their metric types,
+  # derived from gts.cf.core.quota.metric.v1~, registered in types-registry by
+  # the modules that own the metrics.
   quota-enforcement:
     config:
       storage_vendor: "constructorfabric"
@@ -211,6 +220,18 @@ gears:
         ttl_secs: 30
         max_missed_renewals: 2
       sweeper_stop_timeout_secs: 10
+
+  # Requires --features quota-resolver (implied by quota-enforcement). The
+  # gateway picks the backend plugin of this vendor with the lowest priority.
+  # principal_subject_types maps a principal type to the quota subject type its
+  # quotas are held under; the quota subject type must be registered in
+  # types-registry, so the example stays commented out. A principal type without a mapping is denied
+  # with `principal_not_mapped`.
+  quota-resolver:
+    config:
+      vendor: "constructorfabric"
+      # principal_subject_types:
+      #   "gts.cf.core.security.subject_user.v1~": "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~"
 
   # The platform cluster gear elects the quota-enforcement sweepers. Linked by
   # --features quota-enforcement together with grpc-hub, which cluster requires.

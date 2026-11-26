@@ -18,7 +18,7 @@ use tower::ServiceExt as _;
 use super::super::routes::{PATH_PREFIX, register_routes};
 use crate::domain::Service;
 use crate::test_support::{
-    LLM_USER_PROJECTION, METRIC_TOKENS, PermitTenantsPdp, bound_service, ctx, tenant,
+    METRIC_TOKENS, PermitTenantsPdp, USER_SUBJECT_TYPE, bound_service, ctx, tenant,
 };
 
 async fn service() -> Arc<Service> {
@@ -50,14 +50,14 @@ async fn post(app: &Router, path: &str, body: &Value) -> (StatusCode, Value) {
 fn quota(subject: &str) -> Value {
     json!({
         "tenant_id": tenant().as_uuid(),
-        "subject": { "projection_type": LLM_USER_PROJECTION, "subject_id": subject },
+        "subject": { "type": USER_SUBJECT_TYPE, "id": subject },
         "metric": METRIC_TOKENS,
         "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
         "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
         "enforcement_mode": "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
         "cap": 100,
         "notification_thresholds": [50],
-        "metadata": { "regions": ["eu"], "weight": 5 },
+        "metadata": {},
         "source": "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1"
     })
 }
@@ -163,9 +163,10 @@ async fn bulk_update_and_deactivate_answer_their_summaries() {
 #[tokio::test]
 async fn the_in_process_client_takes_the_same_path() {
     let service = service().await;
-    let quotas = service.quotas().expect("bound");
+    let ctx = ctx();
+    let quotas = service.quotas(&ctx).expect("bound");
     let id = quotas
-        .create(&ctx(), {
+        .create({
             let body: super::super::dto::CreateQuotaDto =
                 serde_json::from_value(quota("u1")).expect("dto");
             crate::domain::quotas::CreateQuotaRequest::try_from(body).expect("request")
@@ -177,7 +178,7 @@ async fn the_in_process_client_takes_the_same_path() {
     let client = crate::api::in_process::InProcessQuotaManager::new(Arc::clone(&service));
     let outcome = client
         .bulk_deactivate_quotas(
-            &ctx(),
+            &ctx,
             BulkDeactivateQuotasRequest {
                 tenant_id: tenant(),
                 idempotency_key: "off".to_owned(),
@@ -191,9 +192,9 @@ async fn the_in_process_client_takes_the_same_path() {
         .expect("bulk deactivate");
     assert_eq!(outcome.items[0].idempotency_key.as_deref(), Some("only"));
     let view = service
-        .quotas()
+        .quotas(&ctx)
         .expect("bound")
-        .get(&ctx(), id)
+        .get(id)
         .await
         .expect("read");
     assert_eq!(view.quota.status, QuotaStatus::Deactivated);
@@ -203,7 +204,7 @@ async fn the_in_process_client_takes_the_same_path() {
 async fn an_oversized_envelope_is_bulk_too_large_even_when_an_item_is_malformed() {
     let app = app(service().await);
     let mut quotas: Vec<Value> = (0..501).map(|index| quota(&format!("u{index}"))).collect();
-    quotas[0]["subject"]["projection_type"] = json!("not a type id");
+    quotas[0]["subject"]["type"] = json!("not a type id");
     let (status, problem) = post(&app, "/quotas/bulk-create", &create_body("pack", quotas)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
     assert!(problem.to_string().contains("BULK_TOO_LARGE"), "{problem}");

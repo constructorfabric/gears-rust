@@ -6,17 +6,18 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{
-    ActiveQuotaCounts, AttributionDigest, CapPatch, ContractRef, DECISION_BLOB_VERSION,
+    ActiveQuotaCounts, Actor, AttributionDigest, BackgroundTask, CapPatch, DECISION_BLOB_VERSION,
     DebitRequest, Decision, DecisionPreview, DecisionResult, EnforcementMode,
-    EvaluationAttribution, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey, LeaseState,
-    MetricId, MetricKind, NO_APPLICABLE_QUOTA, NotificationEventKind, OperationType, PageRequest,
-    PageResult, PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyId, PolicyScope,
-    ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch, QuotaSource,
-    QuotaSpec, QuotaStatus, QuotaType, QuotaView, ResourceProjection, Retention,
-    RollbackableOperation, ScopeError, SubjectRef, SubjectScope, TenantId, UnknownValue,
-    ValidityWindow, apportion, positive_amount,
+    EvaluationAttribution, HeldEntry, IdempotencyRecord, IdempotencyScope, LeaseState, MetricId,
+    MetricKind, MetricRef, NO_APPLICABLE_QUOTA, NotificationEventKind, OperationType, PageRequest,
+    PageResult, PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyId, PolicyScope, Quota,
+    QuotaDebitPlan, QuotaDraft, QuotaId, QuotaPatch, QuotaSource, QuotaSpec, QuotaStatus,
+    QuotaType, QuotaView, Retention, RollbackableOperation, SubjectClaim, SubjectRef, TenantId,
+    UnknownValue, UnwindError, ValidityWindow, plan_entries, plan_of, positive_amount, unwind,
 };
-use crate::gts::{SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER};
+
+const METRIC: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
+const USER_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
 
 fn ts(secs: i64) -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(secs).expect("valid unix timestamp")
@@ -168,7 +169,7 @@ fn operation_type_names_match_the_storage_discriminator() {
     for op in [
         OperationType::Debit,
         OperationType::Credit,
-        OperationType::Rollback,
+        OperationType::Return,
         OperationType::Reserve,
         OperationType::Commit,
         OperationType::Release,
@@ -219,12 +220,13 @@ fn policy_id_recognizes_the_seeded_global_policy() {
 }
 
 #[test]
-fn metric_id_accepts_instance_ids_and_rejects_type_ids() {
-    let ok = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1");
+fn metric_id_accepts_type_ids_and_rejects_instance_ids() {
+    let ok = MetricId::parse(METRIC);
     assert!(ok.is_ok(), "{ok:?}");
     assert!(
-        MetricId::parse("gts.cf.core.qe.metric_type.v1~").is_err(),
-        "type id rejected"
+        MetricId::parse("gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
+            .is_err(),
+        "instance id rejected"
     );
     assert!(MetricId::parse("not-a-gts-id").is_err());
     let metric = ok.expect("parsed");
@@ -237,13 +239,13 @@ fn digest_hex_round_trip_and_rejection() {
     let mut bytes = [0_u8; 32];
     bytes[0] = 0xab;
     bytes[31] = 0x01;
-    let key = IdempotencySubjectKey::from_bytes(bytes);
+    let key = PayloadHash::from_bytes(bytes);
     let hex = key.to_hex();
     assert_eq!(hex.len(), 64);
     assert!(hex.starts_with("ab") && hex.ends_with("01"));
-    assert_eq!(IdempotencySubjectKey::parse_hex(&hex).expect("parse"), key);
+    assert_eq!(PayloadHash::parse_hex(&hex).expect("parse"), key);
     assert_eq!(
-        IdempotencySubjectKey::parse_hex(&hex.to_uppercase()).expect("uppercase"),
+        PayloadHash::parse_hex(&hex.to_uppercase()).expect("uppercase"),
         key
     );
     let json = serde_json::to_string(&key).expect("serialize");
@@ -255,10 +257,7 @@ fn digest_hex_round_trip_and_rejection() {
         &"ab".repeat(31),
         &"+f".repeat(32),
     ] {
-        assert!(
-            IdempotencySubjectKey::parse_hex(bad).is_err(),
-            "must reject {bad:?}"
-        );
+        assert!(PayloadHash::parse_hex(bad).is_err(), "must reject {bad:?}");
     }
     assert!(
         format!("{key:?}").contains(&hex),
@@ -319,25 +318,6 @@ fn quota_patch_default_is_empty_and_any_field_makes_it_non_empty() {
 }
 
 #[test]
-fn a_client_update_cannot_carry_a_constraint_contract() {
-    let contract = json!({ "type_id": "gts.cf.core.qe.constraint.v1~", "version": 1 });
-    let single = json!({
-        "quota_id": QuotaId::generate(),
-        "patch": { "metadata": {}, "constraint_contract": contract },
-    });
-    let err = serde_json::from_value::<crate::UpdateQuotaRequest>(single)
-        .expect_err("the gear alone names the contract");
-    assert!(err.to_string().contains("constraint_contract"), "{err}");
-    let item = json!({
-        "quota_id": QuotaId::generate(),
-        "patch": { "metadata": {}, "constraint_contract": contract },
-    });
-    let err = serde_json::from_value::<crate::BulkUpdateItem>(item)
-        .expect_err("the gear alone names the contract");
-    assert!(err.to_string().contains("constraint_contract"), "{err}");
-}
-
-#[test]
 fn decision_result_is_tagged_and_denied_carries_its_reason() {
     let quota = QuotaId::new(Uuid::from_u128(1));
     let denied = Decision {
@@ -345,7 +325,7 @@ fn decision_result_is_tagged_and_denied_carries_its_reason() {
             violated_quota_ids: vec![quota],
             reason: "NO_APPLICABLE_QUOTA".to_owned(),
         },
-        debit_plan: BTreeMap::new(),
+        debit_plan: Vec::new(),
         diagnostics: BTreeMap::new(),
     };
     let value = serde_json::to_value(&denied).expect("serialize");
@@ -356,18 +336,23 @@ fn decision_result_is_tagged_and_denied_carries_its_reason() {
 
     let allowed = Decision {
         result: DecisionResult::Allowed,
-        debit_plan: BTreeMap::from([(quota, QuotaDebitPlan { amount: 5 })]),
+        debit_plan: vec![vec![QuotaDebitPlan {
+            quota_id: quota,
+            amount: 5,
+        }]],
         diagnostics: BTreeMap::new(),
     };
     let value = serde_json::to_value(&allowed).expect("serialize");
     assert_eq!(value["result"], json!({ "outcome": "allowed" }));
-    assert_eq!(value["debit_plan"][quota.to_string()]["amount"], json!(5));
+    assert_eq!(
+        value["debit_plan"],
+        json!([[{ "quota_id": quota.to_string(), "amount": 5 }]])
+    );
 }
 
 #[test]
 fn policy_scope_is_tagged_by_kind() {
-    let metric = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")
-        .expect("metric id");
+    let metric = MetricId::parse(METRIC).expect("metric id");
     let scope = PolicyScope::Metric {
         metric: metric.clone(),
     };
@@ -398,184 +383,107 @@ fn page_types_default_to_the_platform_page_size_and_map_items() {
 
 #[test]
 fn subject_ref_equality_covers_both_halves_of_the_identity() {
-    let projection = GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~");
     let a = SubjectRef {
-        projection_type: projection.clone(),
+        subject_type: GtsTypeId::new(USER_TYPE),
         subject_id: "u1".to_owned(),
     };
     let b = SubjectRef {
-        projection_type: projection,
+        subject_type: GtsTypeId::new(USER_TYPE),
         subject_id: "u2".to_owned(),
     };
     assert_ne!(a, b);
     assert_eq!(a.clone(), a);
 }
 
-// --- Scopes and attribution (projection-contracts feature) -----------------
-
 #[test]
-fn subject_scope_parse_and_deserialization_accept_only_scope_instances() {
-    let user = SubjectScope::parse(SCOPE_USER).expect("user scope");
-    assert_eq!(user, SubjectScope::user());
-    assert!(!user.is_tenant());
-    let tenant = SubjectScope::parse(SCOPE_TENANT).expect("tenant scope");
-    assert_eq!(tenant, SubjectScope::tenant());
-    assert!(tenant.is_tenant());
-
-    let rejected = [
-        SCOPE_TYPE,                                             // a type, not an instance
-        "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~", // another type
-        "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1", // an instance of another type
-        "not-a-gts-id",
-        "",
-    ];
-    for raw in rejected {
-        let direct = SubjectScope::parse(raw).expect_err(raw);
-        assert!(
-            matches!(
-                direct,
-                ScopeError::Invalid { .. } | ScopeError::NotAScope { .. }
-            ),
-            "{raw}: {direct:?}"
-        );
-        let json = serde_json::to_string(raw).expect("json string");
-        assert!(
-            serde_json::from_str::<SubjectScope>(&json).is_err(),
-            "deserialization must run the same check: {raw}"
-        );
-    }
-    assert!(matches!(
-        SubjectScope::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1"),
-        Err(ScopeError::NotAScope { .. })
-    ));
+fn subject_ref_serializes_as_type_and_id() {
+    let subject = SubjectRef {
+        subject_type: GtsTypeId::new(USER_TYPE),
+        subject_id: "u1".to_owned(),
+    };
+    let value = serde_json::to_value(&subject).expect("serialize");
+    assert_eq!(value, json!({ "type": USER_TYPE, "id": "u1" }));
+    let back: SubjectRef = serde_json::from_value(value).expect("deserialize");
+    assert_eq!(back, subject);
+    assert!(!subject.is_tenant());
 }
 
 #[test]
-fn subject_scope_serializes_as_its_instance_id_and_round_trips() {
-    let json = serde_json::to_string(&SubjectScope::user()).expect("serialize");
-    assert_eq!(json, format!("\"{SCOPE_USER}\""));
-    let back: SubjectScope = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back, SubjectScope::user());
-    assert_eq!(back.as_gts().as_ref(), SCOPE_USER);
-    assert_eq!(back.to_string(), SCOPE_USER);
+fn the_tenant_subject_names_the_tenant_under_the_tenant_subject_type() {
+    let tenant = TenantId::new(Uuid::from_u128(7));
+    let subject = SubjectRef::tenant(tenant);
+    assert_eq!(
+        subject.subject_type.as_ref(),
+        quota_resolver_sdk::QUOTA_TENANT_SUBJECT_TYPE_ID
+    );
+    assert_eq!(subject.subject_id, tenant.to_string());
+    assert!(subject.is_tenant());
 }
 
 #[test]
-fn evaluation_attribution_distinguishes_omitted_metadata_from_null() {
-    let tenant = Uuid::from_u128(7);
-    let metric = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1";
+fn a_subject_claim_keeps_its_type_as_text_and_rejects_unknown_fields() {
+    let claim: SubjectClaim =
+        serde_json::from_value(json!({ "type": "not a gts id", "id": "" })).expect("text");
+    assert_eq!(claim.subject_type, "not a gts id");
+    assert!(
+        serde_json::from_value::<SubjectClaim>(json!({ "kind": USER_TYPE, "id": "u1" })).is_err()
+    );
+}
 
-    let omitted: EvaluationAttribution =
-        serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric }))
-            .expect("metadata may be omitted at the type level");
+#[test]
+fn a_metric_ref_distinguishes_omitted_id_and_metadata_from_null() {
+    let omitted: MetricRef =
+        serde_json::from_value(json!({ "type": METRIC })).expect("both may be omitted");
+    assert_eq!(omitted.id, None);
     assert_eq!(
         omitted.metadata, None,
         "the gear rejects the omission later"
     );
-    assert!(omitted.subjects.is_empty());
-    assert_eq!(omitted.resource, None);
+    let written = serde_json::to_value(&omitted).expect("serialize");
+    assert_eq!(
+        written,
+        json!({ "type": METRIC }),
+        "absent fields are not written"
+    );
 
-    let empty: EvaluationAttribution =
-        serde_json::from_value(json!({ "tenant_id": tenant, "metric": metric, "metadata": {} }))
-            .expect("an empty object is a present object");
-    assert_eq!(empty.metadata.as_ref().map(serde_json::Map::len), Some(0));
+    let present: MetricRef =
+        serde_json::from_value(json!({ "type": METRIC, "id": "gpt-4o", "metadata": {} }))
+            .expect("present");
+    assert_eq!(present.id.as_deref(), Some("gpt-4o"));
+    assert_eq!(present.metadata.as_ref().map(serde_json::Map::len), Some(0));
 
-    for field in ["metadata", "resource"] {
-        let explicit_null = json!({ "tenant_id": tenant, "metric": metric, field: null });
+    for field in ["id", "metadata"] {
+        let explicit_null = json!({ "type": METRIC, "metadata": {}, field: null });
         assert!(
-            serde_json::from_value::<EvaluationAttribution>(explicit_null).is_err(),
+            serde_json::from_value::<MetricRef>(explicit_null).is_err(),
             "{field}: null is not absence"
         );
     }
-    let unknown =
-        json!({ "tenant_id": tenant, "metric": metric, "metadata": {}, "caller_type": "x" });
+    let unknown = json!({ "type": METRIC, "metadata": {}, "resource": {} });
+    assert!(serde_json::from_value::<MetricRef>(unknown).is_err());
+}
+
+#[test]
+fn evaluation_attribution_requires_subjects_and_a_metric_object() {
+    let tenant = Uuid::from_u128(7);
+    let parsed: EvaluationAttribution = serde_json::from_value(json!({
+        "tenant_id": tenant,
+        "subjects": [{ "type": USER_TYPE, "id": "u1" }],
+        "metric": { "type": METRIC, "metadata": {} },
+    }))
+    .expect("attribution");
+    assert_eq!(parsed.subjects.len(), 1);
+    assert_eq!(parsed.metric.metric_type, METRIC);
+
+    let no_subjects = json!({ "tenant_id": tenant, "metric": { "type": METRIC, "metadata": {} } });
+    assert!(serde_json::from_value::<EvaluationAttribution>(no_subjects).is_err());
+    let unknown = json!({
+        "tenant_id": tenant,
+        "subjects": [],
+        "metric": { "type": METRIC, "metadata": {} },
+        "caller_type": "x",
+    });
     assert!(serde_json::from_value::<EvaluationAttribution>(unknown).is_err());
-}
-
-#[test]
-fn resource_projection_keeps_an_absent_id_absent() {
-    let without_id: ResourceProjection = serde_json::from_value(json!({
-        "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
-        "metadata": { "model_family": "gpt" }
-    }))
-    .expect("id may be omitted");
-    assert_eq!(without_id.id, None);
-    let written = serde_json::to_value(&without_id).expect("serialize");
-    let mut keys: Vec<String> = written
-        .as_object()
-        .map(|m| m.keys().cloned().collect())
-        .unwrap_or_default();
-    keys.sort_unstable();
-    assert_eq!(
-        keys,
-        ["metadata", "type"],
-        "no id key is written for an absent id"
-    );
-
-    let with_id: ResourceProjection = serde_json::from_value(json!({
-        "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
-        "id": "model-7",
-        "metadata": {}
-    }))
-    .expect("id may be present");
-    assert_eq!(with_id.id.as_deref(), Some("model-7"));
-
-    for field in ["id", "metadata"] {
-        let explicit_null = json!({
-            "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~",
-            "metadata": {},
-            field: null
-        });
-        assert!(
-            serde_json::from_value::<ResourceProjection>(explicit_null).is_err(),
-            "{field}: null is rejected, the resource base requires a value when present"
-        );
-    }
-    let no_metadata = json!({ "type": "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~" });
-    let parsed: ResourceProjection = serde_json::from_value(no_metadata).expect("type only");
-    assert_eq!(
-        parsed.metadata, None,
-        "the gear rejects the omission at ingress"
-    );
-}
-
-#[test]
-fn contract_ref_for_type_takes_the_major_version_of_the_last_segment() {
-    let id = GtsTypeId::try_new(
-        "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v3~",
-    )
-    .expect("type id");
-    let reference = ContractRef::for_type(&id).expect("versioned");
-    assert_eq!(reference.type_id, id);
-    assert_eq!(reference.version, 3);
-}
-
-#[test]
-fn projection_bindings_are_distinct_by_pair() {
-    let metric =
-        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_requests.v1")
-            .expect("metric");
-    let user =
-        GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~").expect("type");
-    let tenant =
-        GtsTypeId::try_new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~").expect("type");
-    let set: std::collections::HashSet<ProjectionBinding> = [
-        ProjectionBinding {
-            metric: metric.clone(),
-            projection_type: user.clone(),
-        },
-        ProjectionBinding {
-            metric: metric.clone(),
-            projection_type: user,
-        },
-        ProjectionBinding {
-            metric,
-            projection_type: tenant,
-        },
-    ]
-    .into_iter()
-    .collect();
-    assert_eq!(set.len(), 2);
 }
 
 // --- quota-lifecycle read and create shapes ---------------------------------
@@ -584,13 +492,10 @@ fn spec() -> QuotaSpec {
     QuotaSpec {
         tenant_id: TenantId::new(Uuid::from_u128(7)),
         subject: SubjectRef {
-            projection_type: GtsTypeId::new("gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"),
+            subject_type: GtsTypeId::new(USER_TYPE),
             subject_id: "u1".to_owned(),
         },
-        metric: MetricId::parse(
-            "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1",
-        )
-        .expect("metric"),
+        metric: MetricId::parse(METRIC).expect("metric"),
         quota_type: QuotaType::Consumption,
         period: Some(PeriodType::Month),
         enforcement_mode: EnforcementMode::Hard,
@@ -603,17 +508,8 @@ fn spec() -> QuotaSpec {
     }
 }
 
-fn contract() -> ContractRef {
-    ContractRef {
-        type_id: GtsTypeId::new(
-            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~",
-        ),
-        version: 1,
-    }
-}
-
 fn stored(spec: QuotaSpec, window: Option<ValidityWindow>) -> Quota {
-    let draft = QuotaDraft::from_spec(spec, contract());
+    let draft = QuotaDraft::from_spec(spec);
     Quota {
         id: QuotaId::new(Uuid::from_u128(1)),
         tenant_id: draft.tenant_id,
@@ -629,7 +525,6 @@ fn stored(spec: QuotaSpec, window: Option<ValidityWindow>) -> Quota {
         metadata: draft.metadata,
         source: draft.source,
         status: QuotaStatus::Active,
-        constraint_contract: draft.constraint_contract,
         record_version: 1,
         created_at: ts(0),
         updated_at: ts(0),
@@ -681,18 +576,12 @@ fn metric_kind_is_closed_and_snake_case() {
 }
 
 #[test]
-fn quota_spec_has_no_contract_field_and_becomes_a_draft_with_one() {
+fn quota_spec_rejects_unknown_fields_and_becomes_a_draft() {
     let spec = spec();
-    let value = serde_json::to_value(&spec).expect("serialize");
-    assert!(value.get("constraint_contract").is_none());
-    let mut with_contract = value;
-    with_contract["constraint_contract"] = json!({ "type_id": "x", "version": 1 });
-    assert!(
-        serde_json::from_value::<QuotaSpec>(with_contract).is_err(),
-        "a caller cannot smuggle the contract in"
-    );
-    let draft = QuotaDraft::from_spec(spec.clone(), contract());
-    assert_eq!(draft.constraint_contract, contract());
+    let mut with_unknown = serde_json::to_value(&spec).expect("serialize");
+    with_unknown["resource"] = json!({});
+    assert!(serde_json::from_value::<QuotaSpec>(with_unknown).is_err());
+    let draft = QuotaDraft::from_spec(spec.clone());
     assert_eq!(draft.metric, spec.metric);
     assert_eq!(draft.notification_thresholds, vec![50, 90]);
 }
@@ -708,11 +597,9 @@ fn active_quota_counts_default_to_zero_and_round_trip() {
     let mut counts = ActiveQuotaCounts::default();
     assert_eq!((counts.cap_zero, counts.cap_unbounded), (0, 0));
     counts.cap_zero = 2;
-    counts.by_metric.insert(
-        MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1")
-            .expect("metric"),
-        3,
-    );
+    counts
+        .by_metric
+        .insert(MetricId::parse(METRIC).expect("metric"), 3);
     let value = serde_json::to_value(&counts).expect("serialize");
     let back: ActiveQuotaCounts = serde_json::from_value(value).expect("round trip");
     assert_eq!(back, counts);
@@ -761,76 +648,114 @@ fn public_policy_inputs_reject_server_owned_fields() {
 
 // --- digests ---------------------------------------------------------------
 
-fn subject(projection: &str, id: &str) -> SubjectRef {
+fn subject(subject_type: &str, id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::new(projection),
+        subject_type: GtsTypeId::new(subject_type),
         subject_id: id.to_owned(),
     }
 }
 
-#[test]
-fn a_subject_key_ignores_the_order_and_multiplicity_of_its_pairs() {
-    let tenant = subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1");
-    let user = subject("gts.cf.core.qe.subj.v1~acme.user.v1", "u-9");
-
-    let one = IdempotencySubjectKey::of(&[tenant.clone(), user.clone()]);
-    let other = IdempotencySubjectKey::of(&[user, tenant.clone(), tenant]);
-
-    assert_eq!(one, other);
+fn digest_of(subjects: &[SubjectRef], metric_id: Option<&str>) -> AttributionDigest {
+    AttributionDigest::of(
+        TenantId::new(Uuid::from_u128(1)),
+        subjects,
+        &MetricId::parse(METRIC).expect("metric id"),
+        metric_id,
+    )
 }
 
 #[test]
-fn a_subject_key_separates_fields_that_would_otherwise_concatenate_alike() {
-    let split_one = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~a.xy.v1", "z")]);
-    let split_other = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~a.x.v1", "yz")]);
+fn an_attribution_digest_ignores_the_order_of_the_subjects() {
+    let user = subject("gts.cf.core.quota.subj.v1~acme.user.v1", "u-9");
+    let project = subject("gts.cf.core.quota.subj.v1~acme.project.v1", "p-2");
+
+    assert_eq!(
+        digest_of(&[user.clone(), project.clone()], None),
+        digest_of(&[project, user], None)
+    );
+}
+
+#[test]
+fn an_attribution_digest_leaves_the_tenant_subject_to_the_tenant_id() {
+    let user = subject("gts.cf.core.quota.subj.v1~acme.user.v1", "u-9");
+    let tenant = SubjectRef::tenant(TenantId::new(Uuid::from_u128(1)));
+
+    assert_eq!(
+        digest_of(&[tenant.clone(), user.clone()], None),
+        digest_of(std::slice::from_ref(&user), None)
+    );
+    assert_ne!(
+        digest_of(std::slice::from_ref(&user), None),
+        AttributionDigest::of(
+            TenantId::new(Uuid::from_u128(2)),
+            &[tenant, user],
+            &MetricId::parse(METRIC).expect("metric id"),
+            None,
+        ),
+        "the tenant id is part of the digest"
+    );
+}
+
+#[test]
+fn an_attribution_digest_tells_a_metric_id_from_its_absence() {
+    let user = subject("gts.cf.core.quota.subj.v1~acme.user.v1", "u-9");
 
     assert_ne!(
-        split_one, split_other,
-        "length prefixes keep the encoding injective"
+        digest_of(std::slice::from_ref(&user), None),
+        digest_of(std::slice::from_ref(&user), Some(""))
     );
-}
-
-#[test]
-fn different_subject_sets_fingerprint_differently() {
-    let one = IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]);
-    let other =
-        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-2")]);
-
-    assert_ne!(one, other);
-}
-
-#[test]
-fn the_empty_subject_set_still_fingerprints_deterministically() {
+    assert_ne!(
+        digest_of(std::slice::from_ref(&user), Some("m-1")),
+        digest_of(std::slice::from_ref(&user), Some("m-2"))
+    );
     assert_eq!(
-        IdempotencySubjectKey::of(&[]),
-        IdempotencySubjectKey::of(&[])
+        digest_of(std::slice::from_ref(&user), Some("m-1")),
+        digest_of(&[user], Some("m-1"))
     );
 }
 
 #[test]
-fn a_subject_key_is_pinned_to_its_byte_form() {
-    // Golden vector: one pair, each field length-prefixed big-endian.
+fn an_attribution_digest_separates_fields_that_would_otherwise_concatenate_alike() {
+    assert_ne!(
+        digest_of(&[subject("gts.cf.core.quota.subj.v1~a.xy.v1", "z")], None),
+        digest_of(&[subject("gts.cf.core.quota.subj.v1~a.x.v1", "yz")], None)
+    );
+}
+
+#[test]
+fn an_attribution_digest_is_pinned_to_its_byte_form() {
     let expected = {
         use toolkit_security::crypto::hash::Sha256;
-        let mut hasher = Sha256::new();
-        for field in ["gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1"] {
+        let field = |hasher: &mut Sha256, value: &str| {
             hasher.update(
-                u32::try_from(field.len())
+                u32::try_from(value.len())
                     .expect("short field")
                     .to_be_bytes(),
             );
-            hasher.update(field.as_bytes());
-        }
-        {
-            let digest = hasher.finalize();
-            let mut bytes = [0; 32];
-            bytes.copy_from_slice(digest.as_ref());
-            IdempotencySubjectKey::from_bytes(bytes)
-        }
+            hasher.update(value.as_bytes());
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(Uuid::from_u128(1).as_bytes());
+        hasher.update(1_u32.to_be_bytes());
+        field(&mut hasher, "gts.cf.core.quota.subj.v1~acme.user.v1");
+        field(&mut hasher, "u-9");
+        field(&mut hasher, METRIC);
+        hasher.update([1]);
+        field(&mut hasher, "m-1");
+        let digest = hasher.finalize();
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(digest.as_ref());
+        AttributionDigest::from_bytes(bytes)
     };
 
     assert_eq!(
-        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]),
+        digest_of(
+            &[
+                SubjectRef::tenant(TenantId::new(Uuid::from_u128(1))),
+                subject("gts.cf.core.quota.subj.v1~acme.user.v1", "u-9"),
+            ],
+            Some("m-1"),
+        ),
         expected
     );
 }
@@ -868,25 +793,6 @@ fn a_payload_hash_distinguishes_the_amount_it_covers() {
     );
 }
 
-#[test]
-fn an_attribution_digest_is_canonical_in_the_same_way() {
-    let one = json!({"metric": "m", "subjects": [{"kind": "tenant", "id": "t-1"}]});
-    let other = json!({"subjects": [{"id": "t-1", "kind": "tenant"}], "metric": "m"});
-
-    assert_eq!(
-        AttributionDigest::of_canonical(&one).expect("serializable"),
-        AttributionDigest::of_canonical(&other).expect("serializable")
-    );
-    assert_ne!(
-        AttributionDigest::of_canonical(&one)
-            .expect("serializable")
-            .to_hex(),
-        AttributionDigest::of_canonical(&json!({"metric": "other"}))
-            .expect("serializable")
-            .to_hex()
-    );
-}
-
 // --- consumer requests -----------------------------------------------------
 
 #[test]
@@ -894,14 +800,13 @@ fn a_debit_request_ignores_decision_shaped_fields_a_caller_echoed_back() {
     let request: DebitRequest = serde_json::from_value(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
-            "subjects": [{"kind": "gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1", "id": "t-1"}],
-            "metadata": {}
+            "metric": {"type": "gts.cf.core.quota.metric.v1~acme.tokens.v1~", "metadata": {}},
+            "subjects": [{"type": "gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~", "id": "t-1"}]
         },
         "amount": 5,
         "idempotency_key": "k-1",
         "result": {"outcome": "allowed"},
-        "debit_plan": {},
+        "debit_plan": [],
         "diagnostics": {"engine": "noise"}
     }))
     .expect("server-derived fields are ignored, never rejected");
@@ -915,9 +820,8 @@ fn an_attribution_inside_a_request_keeps_rejecting_its_own_unknown_fields() {
     let error = serde_json::from_value::<DebitRequest>(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
+            "metric": {"type": "gts.cf.core.quota.metric.v1~acme.tokens.v1~", "metadata": {}},
             "subjects": [],
-            "metadata": {},
             "tenant": "typo"
         },
         "amount": 5,
@@ -933,9 +837,8 @@ fn a_signed_amount_reaches_the_domain_instead_of_failing_deserialization() {
     let request: DebitRequest = serde_json::from_value(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
-            "subjects": [],
-            "metadata": {}
+            "metric": {"type": "gts.cf.core.quota.metric.v1~acme.tokens.v1~", "metadata": {}},
+            "subjects": []
         },
         "amount": -3,
         "idempotency_key": "k-1"
@@ -951,7 +854,7 @@ fn a_signed_amount_reaches_the_domain_instead_of_failing_deserialization() {
 
 #[test]
 fn a_preview_flattens_the_decision_next_to_its_marker() {
-    let preview = DecisionPreview::of(Decision::allowed_with_plan(BTreeMap::new()));
+    let preview = DecisionPreview::of(Decision::allowed_with_plan(Vec::new()));
 
     let value = serde_json::to_value(&preview).expect("serializable");
     let mut keys: Vec<&str> = value
@@ -973,19 +876,15 @@ fn a_preview_flattens_the_decision_next_to_its_marker() {
 // --- idempotency records ---------------------------------------------------
 
 #[test]
-fn a_partial_write_completes_into_the_scope_the_transaction_derived() {
+fn a_partial_write_completes_into_the_scope_of_its_operation() {
     let partial = PartialIdempotencyWrite {
         tenant_id: TenantId::new(Uuid::from_u128(1)),
         key: "k-1".to_owned(),
         payload_hash: PayloadHash::of_canonical(&json!({"amount": 5})).expect("serializable"),
     };
-    let subject_key =
-        IdempotencySubjectKey::of(&[subject("gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1")]);
-
-    let write = partial.clone().complete(subject_key, OperationType::Credit);
+    let write = partial.clone().complete(OperationType::Credit);
 
     assert_eq!(write.scope.tenant_id, TenantId::new(Uuid::from_u128(1)));
-    assert_eq!(write.scope.subject_key, subject_key);
     assert_eq!(write.scope.operation_type, OperationType::Credit);
     assert_eq!(write.scope.key, "k-1");
     assert_eq!(write.payload_hash, partial.payload_hash);
@@ -996,7 +895,6 @@ fn a_versioned_blob_decodes_into_the_decision_it_recorded() {
     let record = IdempotencyRecord {
         scope: IdempotencyScope {
             tenant_id: TenantId::new(Uuid::from_u128(1)),
-            subject_key: IdempotencySubjectKey::of(&[]),
             operation_type: OperationType::Debit,
             key: "k-1".to_owned(),
         },
@@ -1004,13 +902,12 @@ fn a_versioned_blob_decodes_into_the_decision_it_recorded() {
         decision_blob: json!({
             "__version": DECISION_BLOB_VERSION,
             "result": {"outcome": "allowed"},
-            "debit_plan": {},
+            "debit_plan": [],
             "diagnostics": {}
         }),
         engine_id: None,
         policy_id: None,
         policy_version: None,
-        attribution_hash: None,
         created_at: ts(0),
         expires_at: ts(86_400),
     };
@@ -1028,13 +925,13 @@ fn a_denial_reports_its_reason_and_whether_it_records_anything() {
             violated_quota_ids: Vec::new(),
             reason: NO_APPLICABLE_QUOTA.to_owned(),
         },
-        debit_plan: BTreeMap::new(),
+        debit_plan: Vec::new(),
         diagnostics: BTreeMap::new(),
     };
 
     assert_eq!(denied.denied_reason(), Some(NO_APPLICABLE_QUOTA));
     assert!(denied.is_no_applicable_quota());
-    assert!(!Decision::allowed_with_plan(BTreeMap::new()).is_no_applicable_quota());
+    assert!(!Decision::allowed_with_plan(Vec::new()).is_no_applicable_quota());
 }
 
 #[test]
@@ -1049,89 +946,85 @@ fn retention_reports_the_deadline_only_when_something_was_recorded() {
     assert_eq!(Retention::Unrecorded.expires_at(), None);
 }
 
-// --- commit apportionment --------------------------------------------------
+// --- unwinding --------------------------------------------------------------
 
-/// The reserved amount a plan was acquired under. Never zero: an acquisition
-/// rejects a non-positive amount long before it reaches storage.
-fn reserved(amount: u64) -> std::num::NonZeroU64 {
-    std::num::NonZeroU64::new(amount).expect("a lease reserves a positive amount")
-}
-
-#[test]
-fn a_commit_charges_the_ceiling_of_its_share_and_never_more_than_a_hold_holds() {
-    // A plan need not hold the reserved amount on every Quota, and may hold
-    // less than it in total; using one unit still charges one.
-    assert_eq!(apportion(&[1], 1, reserved(10)), Ok(vec![1]));
-    // Rounding up rather than to nearest: half a unit used is a unit charged.
-    assert_eq!(apportion(&[3], 1, reserved(2)), Ok(vec![2]));
-    // Whole units split exactly, so no remainder is handed out.
-    assert_eq!(apportion(&[10, 10], 6, reserved(10)), Ok(vec![6, 6]));
-    assert_eq!(apportion(&[10, 5, 5], 6, reserved(10)), Ok(vec![6, 3, 3]));
-    // The unit that rounding creates goes to one hold, not to every hold: the
-    // charged total is the ceiling of the whole, not the sum of ceilings.
-    assert_eq!(apportion(&[1, 1], 1, reserved(2)), Ok(vec![1, 0]));
-    assert_eq!(apportion(&[1, 1, 1], 1, reserved(3)), Ok(vec![1, 0, 0]));
-    // Committing everything keeps every hold whole, and committing nothing
-    // returns every hold.
-    assert_eq!(apportion(&[7, 2], 9, reserved(9)), Ok(vec![7, 2]));
-    assert_eq!(apportion(&[7, 2], 0, reserved(9)), Ok(vec![0, 0]));
-    assert_eq!(apportion(&[], 5, reserved(5)), Ok(Vec::new()));
-}
-
-#[test]
-fn the_apportioned_shares_conserve_the_charged_total_for_every_plan() {
-    // Exhaustive over small plans: the three invariants the commit path relies
-    // on hold for every shape the engine contract permits, not only the ones
-    // spelled out above.
-    for reserved_amount in 1_u64..8 {
-        for actual in 0..=reserved_amount {
-            for first in 0_u64..6 {
-                for second in 0_u64..6 {
-                    for third in 0_u64..6 {
-                        let holds = [first, second, third];
-                        let kept =
-                            apportion(&holds, actual, reserved(reserved_amount)).expect("in range");
-                        let total_held: u64 = holds.iter().sum();
-                        let expected = u64::try_from(
-                            (u128::from(total_held) * u128::from(actual))
-                                .div_ceil(u128::from(reserved_amount)),
-                        )
-                        .expect("a share of the held total fits");
-                        assert_eq!(
-                            kept.iter().sum::<u64>(),
-                            expected,
-                            "holds {holds:?} of {reserved_amount}, committing {actual}"
-                        );
-                        for (kept, held) in kept.iter().zip(&holds) {
-                            assert!(
-                                kept <= held,
-                                "a hold is never charged more than it holds: {holds:?}"
-                            );
-                        }
-                        assert_eq!(
-                            actual > 0 && total_held > 0,
-                            kept.iter().sum::<u64>() > 0,
-                            "any use charges a unit, and no use charges none: {holds:?}"
-                        );
-                    }
-                }
-            }
-        }
+fn held(chain: u32, position: u32, held: u64) -> HeldEntry {
+    HeldEntry {
+        chain,
+        position,
+        held,
     }
 }
 
 #[test]
-fn apportionment_refuses_an_over_commit_and_reports_overflow_instead_of_panicking() {
-    assert_eq!(
-        apportion(&[10], 11, reserved(10)),
-        Err(crate::models::ApportionError::OverCommit)
-    );
-    // The product of two `u64::MAX`-sized values leaves `u128`; the caller
-    // learns that rather than losing the transaction to a panic.
-    assert_eq!(
-        apportion(&[u64::MAX, u64::MAX], u64::MAX, reserved(u64::MAX)),
-        Err(crate::models::ApportionError::Overflow)
-    );
+fn unwinding_a_cascade_takes_from_the_last_entry_first() {
+    let cascade = [held(0, 0, 20), held(0, 1, 30)];
+
+    assert_eq!(unwind(&cascade, 10), Ok(vec![0, 10]));
+    assert_eq!(unwind(&cascade, 30), Ok(vec![0, 30]));
+    assert_eq!(unwind(&cascade, 45), Ok(vec![15, 30]));
+    assert_eq!(unwind(&cascade, 50), Ok(vec![20, 30]));
+    assert_eq!(unwind(&cascade, 0), Ok(vec![0, 0]));
+}
+
+#[test]
+fn unwinding_follows_positions_not_the_order_entries_are_listed_in() {
+    let listed_by_quota = [held(0, 2, 5), held(0, 0, 20), held(0, 1, 25)];
+
+    assert_eq!(unwind(&listed_by_quota, 15), Ok(vec![5, 0, 10]));
+}
+
+#[test]
+fn unwinding_an_and_gives_back_the_amount_from_every_chain() {
+    let and = [held(0, 0, 50), held(1, 0, 50)];
+
+    assert_eq!(unwind(&and, 20), Ok(vec![20, 20]));
+}
+
+#[test]
+fn unwinding_a_mix_gives_back_the_amount_from_each_chain_in_its_own_order() {
+    let mix = [held(0, 0, 20), held(0, 1, 30), held(1, 0, 50)];
+
+    assert_eq!(unwind(&mix, 35), Ok(vec![5, 30, 35]));
+}
+
+#[test]
+fn an_entry_gives_back_at_most_what_it_still_holds_after_earlier_unwinds() {
+    let charged = [held(0, 0, 20), held(0, 1, 30)];
+    let first = unwind(&charged, 40).expect("the chain holds 50");
+    assert_eq!(first, vec![10, 30]);
+    let left: Vec<HeldEntry> = charged
+        .iter()
+        .zip(&first)
+        .map(|(entry, taken)| held(entry.chain, entry.position, entry.held - taken))
+        .collect();
+
+    assert_eq!(unwind(&left, 5), Ok(vec![5, 0]));
+    assert_eq!(unwind(&left, 11), Err(UnwindError { chain: 0 }));
+}
+
+#[test]
+fn unwinding_more_than_a_chain_holds_names_that_chain() {
+    let mix = [held(0, 0, 50), held(1, 0, 10), held(1, 1, 5)];
+
+    assert_eq!(unwind(&mix, 20), Err(UnwindError { chain: 1 }));
+}
+
+#[test]
+fn a_plan_survives_tagging_its_entries_and_rebuilding() {
+    let entry = |id: u128, amount| QuotaDebitPlan {
+        quota_id: QuotaId::new(Uuid::from_u128(id)),
+        amount,
+    };
+    let plan = vec![vec![entry(2, 20), entry(1, 30)], vec![entry(3, 50)]];
+    let mut tagged: Vec<_> = plan_entries(&plan)
+        .map(|(slot, entry)| (slot, *entry))
+        .collect();
+    assert_eq!(tagged[1].0, (0, 1));
+    assert_eq!(tagged[2].0, (1, 0));
+    tagged.reverse();
+
+    assert_eq!(plan_of(tagged), plan);
 }
 
 #[test]
@@ -1150,30 +1043,27 @@ fn a_rollback_names_the_namespace_of_the_operation_it_reverses() {
         RollbackableOperation::default(),
         RollbackableOperation::Debit
     );
-    // A request written before leases existed still means a debit.
-    let legacy: crate::models::RollbackRequest = serde_json::from_value(json!({
+    let unnamed: crate::models::RollbackRequest = serde_json::from_value(json!({
         "attribution": {
             "tenant_id": "00000000-0000-0000-0000-000000000001",
-            "metric": "gts.cf.core.qe.metric_type.v1~acme.tokens.v1",
-            "subjects": [],
-            "metadata": {}
+            "metric": {"type": "gts.cf.core.quota.metric.v1~acme.tokens.v1~", "metadata": {}},
+            "subjects": []
         },
-        "original_idempotency_key": "k-0",
-        "idempotency_key": "k-1"
+        "original_idempotency_key": "k-0"
     }))
     .expect("the selector defaults");
-    assert_eq!(legacy.original_operation, RollbackableOperation::Debit);
+    assert_eq!(unnamed.original_operation, RollbackableOperation::Debit);
 }
 
 #[test]
 fn a_batch_is_denied_when_any_item_is_and_keeps_every_item_in_order() {
-    let allowed = crate::Decision::allowed_with_plan(std::collections::BTreeMap::new());
+    let allowed = crate::Decision::allowed_with_plan(Vec::new());
     let denied = crate::Decision {
         result: crate::DecisionResult::Denied {
             violated_quota_ids: Vec::new(),
             reason: "QUOTA_EXCEEDED".to_owned(),
         },
-        debit_plan: std::collections::BTreeMap::new(),
+        debit_plan: Vec::new(),
         diagnostics: std::collections::BTreeMap::new(),
     };
     let keys = || ["a".to_owned(), "b".to_owned(), "c".to_owned()];
@@ -1225,4 +1115,72 @@ fn a_batch_timer_is_armed_once_and_shared_by_every_attempt() {
     assert!(spent.arm().is_zero());
     assert!(spent.expired());
     assert_eq!(spent.armed_remaining(), Some(std::time::Duration::ZERO));
+}
+
+#[test]
+fn an_actor_records_as_the_caller_the_platform_identity_or_the_task() {
+    let caller = Actor::Caller {
+        subject_id: Uuid::from_u128(0x5eed),
+    };
+    let platform = Actor::Platform {
+        identity: Some(toolkit_security::PlatformIdentity::Shared {
+            name: "billing".to_owned(),
+        }),
+    };
+    let anonymous = Actor::Platform { identity: None };
+    let sweeper = Actor::Task {
+        task: BackgroundTask::LeaseSweeper,
+    };
+    assert_eq!(caller.to_string(), "00000000-0000-0000-0000-000000005eed");
+    assert_eq!(platform.to_string(), "platform:billing");
+    assert_eq!(anonymous.to_string(), "platform");
+    assert_eq!(sweeper.to_string(), "lease-sweeper");
+    for actor in [caller, platform, anonymous, sweeper] {
+        let json = serde_json::to_value(&actor).expect("serialize");
+        assert_eq!(
+            serde_json::from_value::<Actor>(json).expect("round trip"),
+            actor
+        );
+    }
+}
+
+#[test]
+fn a_quota_applies_only_when_every_condition_holds_on_the_request() {
+    use crate::conditions_hold;
+    let conditions = |value: serde_json::Value| value.as_object().cloned().expect("object");
+    let request = serde_json::json!({ "region": "eu", "gpus": 8, "spot": false });
+
+    assert!(conditions_hold(
+        &conditions(serde_json::json!({})),
+        &request
+    ));
+    assert!(conditions_hold(
+        &conditions(serde_json::json!({})),
+        &serde_json::Value::Null
+    ));
+    assert!(conditions_hold(
+        &conditions(serde_json::json!({ "region": ["us", "eu"], "gpus": 8, "spot": false })),
+        &request
+    ));
+    for failing in [
+        serde_json::json!({ "region": "us" }),
+        serde_json::json!({ "region": ["us"] }),
+        serde_json::json!({ "gpus": "8" }),
+        serde_json::json!({ "model": "m-1" }),
+        serde_json::json!({ "region": "eu", "spot": true }),
+    ] {
+        assert!(
+            !conditions_hold(&conditions(failing.clone()), &request),
+            "{failing}"
+        );
+    }
+}
+
+#[test]
+fn a_decision_registers_no_schema_named_after_a_container() {
+    let mut schemas = Vec::new();
+    <crate::Decision as utoipa::ToSchema>::schemas(&mut schemas);
+    let names: Vec<&str> = schemas.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(names.contains(&"QuotaDebitPlan"), "{names:?}");
+    assert!(!names.contains(&"Vec"), "{names:?}");
 }

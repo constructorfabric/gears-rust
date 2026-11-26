@@ -143,7 +143,7 @@ fn contract_validation_counters_render_with_their_closed_labels() {
     );
     meter.record_contract_validation_failure(
         ValidationSurface::Bootstrap,
-        ValidationReason::DuplicatePair,
+        ValidationReason::TraitInvalid,
     );
     meter.record_admitted_metric_violation(ValidationSurface::Bootstrap);
     provider.force_flush().expect("flush");
@@ -160,7 +160,7 @@ fn contract_validation_counters_render_with_their_closed_labels() {
         counter_sum(
             &exporter,
             CONTRACT_VALIDATION_FAILURES_TOTAL,
-            Some((REASON_LABEL, "duplicate_pair"))
+            Some((REASON_LABEL, "trait_invalid"))
         ),
         Some(1)
     );
@@ -208,16 +208,33 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
         surfaces,
         [
             "request_subject",
-            "request_resource",
+            "request_metric",
             "caller_attribution",
-            "arbitration",
-            "policy_pair",
+            "quota_write",
+            "policy",
             "bootstrap"
         ],
-        "the DESIGN 5.16 surface set"
+        "the DESIGN 4.1 surface set"
     );
     let reasons: Vec<&str> = ValidationReason::ALL.iter().map(|r| r.as_label()).collect();
     assert_distinct_snake_case(&reasons);
+    assert_eq!(
+        reasons,
+        [
+            "shape_invalid",
+            "metadata_missing",
+            "schema_violation",
+            "schema_invalid",
+            "unregistered",
+            "abstract",
+            "not_derived",
+            "metric_unregistered",
+            "major_version_zero",
+            "trait_invalid",
+            "projection_not_resolvable"
+        ],
+        "the DESIGN 4.1 reason set"
+    );
     // The hot path's two label sets are closed for the same reason: a denial
     // reason authored in a CEL policy, or an operation kind, must never widen
     // the cardinality of an instrument.
@@ -226,12 +243,12 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
     assert_eq!(
         operations,
         [
-            "debit", "credit", "rollback", "preview", "reserve", "commit", "release"
+            "debit", "credit", "rollback", "return", "preview", "reserve", "commit", "release"
         ]
     );
     let tables: Vec<&str> = RetentionTable::ALL.iter().map(|t| t.as_str()).collect();
     assert_distinct_snake_case(&tables);
-    assert_eq!(tables, ["idempotency", "operation_log"]);
+    assert_eq!(tables, ["idempotency", "operation_log", "charges"]);
     assert_eq!(
         DenialReason::from_decision_reason("SOMETHING_A_POLICY_AUTHORED").as_label(),
         "engine_denied",
@@ -241,7 +258,12 @@ fn every_reason_label_is_a_distinct_snake_case_token() {
 
 #[test]
 fn the_default_adapter_builds_on_the_global_provider_without_panicking() {
-    let adapter = build_default_adapter(&MetricsConfig::default(), cell(), Arc::default());
+    let adapter = build_default_adapter(
+        &MetricsConfig::default(),
+        cell(),
+        Arc::default(),
+        Arc::default(),
+    );
     adapter.record_denial(DenialReason::NotReady);
 }
 
@@ -288,6 +310,7 @@ fn lifecycle_gauges_observe_the_published_sample_and_nothing_when_withdrawn() {
         cap_zero: 2,
         cap_unbounded: 5,
         for_direct_metric: 1,
+        conditions_unfit: 0,
     }));
     provider.force_flush().expect("flush");
     assert_eq!(gauge_last_u64(&exporter, QUOTA_CAP_ZERO_TOTAL), Some(2));
@@ -322,6 +345,7 @@ fn lifecycle_gauges_honour_the_configured_prefix() {
         cap_zero: 1,
         cap_unbounded: 0,
         for_direct_metric: 0,
+        conditions_unfit: 0,
     }));
     provider.force_flush().expect("flush");
     assert_eq!(
@@ -348,7 +372,7 @@ fn policy_engine_instruments_use_only_documented_labels() {
     );
     adapter.record_plan_violation(
         EngineLabel::from_linked_id("cel"),
-        DebitPlanInvariant::AmountExceedsRequestAmount,
+        DebitPlanInvariant::ChainSumMismatch,
     );
     adapter.record_policy_transition(PolicyTransition::Rollback);
     adapter.record_policy_conflict();
@@ -420,11 +444,12 @@ fn lease_instruments_carry_only_the_admitted_metric_label() {
     use crate::infra::lease_backlog::{LEASE_UNRECLAIMED_EXPIRED, LeaseBacklogCell};
     let (provider, exporter) = local_provider();
     let backlog = Arc::new(LeaseBacklogCell::default());
-    let adapter = QeMetricsMeter::with_lease_backlog(
+    let adapter = QeMetricsMeter::with_backlogs(
         &provider.meter("quota-enforcement"),
         &MetricsConfig::default(),
         cell(),
         backlog.clone(),
+        Arc::default(),
     );
     let tokens = MetricLabel::admitted(
         &quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
@@ -460,4 +485,114 @@ fn lease_instruments_carry_only_the_admitted_metric_label() {
         None,
         "a withdrawn backlog is absent, never zero"
     );
+}
+
+#[test]
+fn held_charge_gauges_carry_only_the_admitted_metric_label() {
+    use crate::domain::ports::metrics::{ChargeBacklogSink, HeldCharges, MetricLabel};
+    use crate::infra::charge_backlog::{
+        ALLOCATION_CHARGE_MAX_AGE_SECONDS, ALLOCATION_CHARGES_PAST_REPLAY_WINDOW, ChargeBacklogCell,
+    };
+    let (provider, exporter) = local_provider();
+    let charges = Arc::new(ChargeBacklogCell::default());
+    let _adapter = QeMetricsMeter::with_backlogs(
+        &provider.meter("quota-enforcement"),
+        &MetricsConfig::default(),
+        cell(),
+        Arc::default(),
+        charges.clone(),
+    );
+    let tokens = MetricLabel::admitted(
+        &quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric"),
+    );
+
+    charges.publish(Some(vec![(
+        tokens,
+        HeldCharges {
+            count: 3,
+            oldest_age_secs: 7_200,
+        },
+    )]));
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(&exporter, ALLOCATION_CHARGES_PAST_REPLAY_WINDOW),
+        Some(3)
+    );
+    assert_eq!(
+        gauge_last_u64(&exporter, ALLOCATION_CHARGE_MAX_AGE_SECONDS),
+        Some(7_200)
+    );
+
+    charges.publish(None);
+    exporter.reset();
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(&exporter, ALLOCATION_CHARGES_PAST_REPLAY_WINDOW),
+        None,
+        "a withdrawn sample is absent, never zero"
+    );
+}
+
+#[test]
+fn catalogue_instruments_carry_only_their_documented_labels() {
+    use crate::domain::ports::metrics::{CatalogReadPhase, EngineLabel, METRIC_LABEL, MetricLabel};
+    let (provider, exporter) = local_provider();
+    let adapter = QeMetricsMeter::new(
+        &provider.meter("quota-enforcement"),
+        &MetricsConfig::default(),
+        cell(),
+    );
+    let tokens = MetricLabel::admitted(
+        &quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
+            .expect("metric"),
+    );
+    provider.force_flush().expect("flush");
+    assert_eq!(
+        gauge_last_u64(
+            &exporter,
+            super::CATALOG_LAST_SCHEDULED_READ_TIMESTAMP_SECONDS
+        ),
+        None,
+        "no scheduled read yet, no data point"
+    );
+
+    adapter.record_policy_evaluation_failure(EngineLabel::from_linked_id("cel"), &tokens);
+    adapter.record_catalog_read_failure(CatalogReadPhase::Start);
+    adapter.record_catalog_read_failure(CatalogReadPhase::Scheduled);
+    adapter.record_catalog_read_failure(CatalogReadPhase::Scheduled);
+    adapter.record_catalog_scheduled_read();
+    adapter.set_catalog_unavailable_metrics(3);
+    exporter.reset();
+    provider.force_flush().expect("flush");
+
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            super::POLICY_EVALUATION_FAILURES_TOTAL,
+            Some((METRIC_LABEL, tokens.as_str()))
+        ),
+        Some(1)
+    );
+    assert_eq!(
+        counter_sum(
+            &exporter,
+            super::CATALOG_READ_FAILURES_TOTAL,
+            Some((super::PHASE_LABEL, "scheduled"))
+        ),
+        Some(2)
+    );
+    assert!(
+        gauge_last_u64(
+            &exporter,
+            super::CATALOG_LAST_SCHEDULED_READ_TIMESTAMP_SECONDS
+        )
+        .is_some_and(|at| at > 0)
+    );
+    assert_eq!(
+        gauge_last_u64(&exporter, super::CATALOG_UNAVAILABLE_METRICS),
+        Some(3)
+    );
+    let phases: Vec<&str> = CatalogReadPhase::ALL.iter().map(|p| p.as_label()).collect();
+    assert_eq!(phases, ["start", "first_use", "scheduled"]);
 }

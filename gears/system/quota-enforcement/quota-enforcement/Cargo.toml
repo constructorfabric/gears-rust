@@ -31,6 +31,7 @@ quota-enforcement-engine-cel = { workspace = true }
 quota-enforcement-engine-most-restrictive = { workspace = true }
 parking_lot = { workspace = true }
 quota-enforcement-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
+quota-resolver-sdk = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 types-registry-sdk = { workspace = true }
@@ -60,6 +61,7 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 # The notification dispatcher calls every sink at once.
 futures = { workspace = true }
+lru = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -67,6 +69,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+chrono = { workspace = true }
 
 # Instruments are declared on a scoped `Meter` from ToolKit's global
 # `SdkMeterProvider` (OTLP push; no gear-local exporter).
@@ -77,6 +80,8 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
+toolkit = { workspace = true, features = ["test-support"] }
+quota-resolver = { package = "cf-gears-quota-resolver", path = "../../quota-resolver/quota-resolver" }
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # A real cluster over the standalone backend for the adapter and gear tests.

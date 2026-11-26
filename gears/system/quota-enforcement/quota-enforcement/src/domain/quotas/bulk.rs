@@ -19,10 +19,9 @@
 //!    validation chain;
 //! 7. storage, one transaction for the envelope.
 //!
-//! The envelope's idempotency scope is `(tenant, no subjects, operation, key)`:
-//! management envelopes name their targets explicitly, so there is no
-//! resolved subject set to fingerprint, and a key is unique per tenant and
-//! bulk operation. The payload digest covers the tenant and every item.
+//! The envelope's idempotency scope is `(tenant, operation, key)`, so a key is
+//! unique per tenant and bulk operation. The payload digest covers the tenant
+//! and every item.
 
 use crate::domain::admission::admission_span;
 use std::collections::HashSet;
@@ -31,21 +30,21 @@ use tracing::Instrument as _;
 use quota_enforcement_sdk::{
     BulkCreateEntry, BulkCreateEnvelope, BulkCreated, BulkDeactivateEntry, BulkDeactivateEnvelope,
     BulkDeactivated, BulkRecord, BulkUpdateEntry, BulkUpdateEnvelope, BulkUpdated, EnforcementMode,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, OperationType, PageRequest,
-    PayloadHash, PeriodType, QuotaFilter, QuotaId, QuotaSource, QuotaType, SubjectRef, TenantId,
-    ValidityWindow,
+    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, OperationType, PageRequest, PayloadHash,
+    PeriodType, QuotaFilter, QuotaId, QuotaSource, QuotaType, SubjectRef, TenantId, ValidityWindow,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use super::request::{CreateQuotaRequest, Presence, UpdateQuotaRequest};
 use super::service::{PreparedCreate, PreparedUpdate, QuotaManagement};
 use super::validation::{validate_create_shape, validate_update_shape};
 use crate::domain::admission::AdmissionTarget;
 use crate::domain::error::{DomainError, ResourceKind};
+use crate::domain::operations::service::key_fault;
 use crate::domain::pep::{actions, resources};
 use crate::domain::ports::metrics::DenialReason;
 use crate::domain::tokens;
@@ -284,12 +283,23 @@ fn envelope_write(
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id,
-            subject_key: IdempotencySubjectKey::of(&[]),
             operation_type,
             key: key.to_owned(),
         },
         payload_hash,
     }
+}
+
+fn outcome_of<T: DeserializeOwned>(
+    record: IdempotencyRecord,
+    write: &IdempotencyWrite,
+) -> Result<T, DomainError> {
+    if record.payload_hash != write.payload_hash {
+        return Err(DomainError::IdempotencyPayloadMismatch);
+    }
+    serde_json::from_value::<BulkRecord<T>>(record.decision_blob)
+        .map(|record| record.outcome)
+        .map_err(|error| DomainError::Internal(error.to_string()))
 }
 
 fn not_found(quota_id: QuotaId) -> DomainError {
@@ -315,8 +325,8 @@ impl SeenItems {
             Err(DomainError::InvalidArgument { field, reason })
         };
         if let Some(key) = key {
-            if key.trim().is_empty() {
-                return refuse("idempotency_key", tokens::IDEMPOTENCY_KEY_REQUIRED);
+            if let Some(reason) = key_fault(key) {
+                return refuse("idempotency_key", reason);
             }
             if !self.keys.insert(key.to_owned()) {
                 return refuse("idempotency_key", tokens::BATCH_ITEM_KEY_DUPLICATE);
@@ -365,10 +375,10 @@ impl QuotaManagement<'_> {
                 reason: tokens::BATCH_EMPTY,
             }));
         }
-        if key.trim().is_empty() {
+        if let Some(reason) = key_fault(key) {
             return Err(refuse(DomainError::InvalidArgument {
                 field: "idempotency_key",
-                reason: tokens::IDEMPOTENCY_KEY_REQUIRED,
+                reason,
             }));
         }
         Ok(())
@@ -391,28 +401,38 @@ impl QuotaManagement<'_> {
         &self,
         write: &IdempotencyWrite,
     ) -> Result<Option<T>, DomainError> {
+        match self.storage.lookup_idempotency(&write.scope).await? {
+            Some(record) => outcome_of(record, write).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::stored`] for update and deactivate. Their envelope tenant is
+    /// named by the caller and no admission covers it, so the targets are
+    /// checked before the record answers anything, the mismatch included.
+    async fn stored_for_targets<T: DeserializeOwned>(
+        &self,
+        write: &IdempotencyWrite,
+        targets: &[(QuotaId, AccessScope)],
+    ) -> Result<Option<T>, DomainError> {
         let Some(record) = self.storage.lookup_idempotency(&write.scope).await? else {
             return Ok(None);
         };
-        if record.payload_hash != write.payload_hash {
-            return Err(DomainError::IdempotencyPayloadMismatch);
-        }
-        serde_json::from_value::<BulkRecord<T>>(record.decision_blob)
-            .map(|record| Some(record.outcome))
-            .map_err(|error| DomainError::Internal(error.to_string()))
+        self.check_targets_visible(write.scope.tenant_id, targets)
+            .await?;
+        outcome_of(record, write).map(Some)
     }
 
     /// Step 4 for update and deactivate: every target still visible under its
     /// item's current scope, in the envelope tenant.
     async fn check_targets_visible(
         &self,
-        ctx: &SecurityContext,
         tenant: TenantId,
         targets: &[(QuotaId, AccessScope)],
     ) -> Result<(), DomainError> {
         for (index, (quota_id, scope)) in targets.iter().enumerate() {
             let visible = self
-                .read_one(ctx, scope, *quota_id)
+                .read_one(scope, *quota_id)
                 .await
                 .map_err(|error| error.at_item(index))?
                 .is_some_and(|quota| quota.tenant_id == tenant);
@@ -427,14 +447,13 @@ impl QuotaManagement<'_> {
     /// does, returning each item's scope.
     async fn admit_items(
         &self,
-        ctx: &SecurityContext,
         action: &'static str,
         ids: &[QuotaId],
     ) -> Result<Vec<(QuotaId, AccessScope)>, DomainError> {
         let mut targets = Vec::with_capacity(ids.len());
         for (index, quota_id) in ids.iter().copied().enumerate() {
             let admitted = self
-                .admit_resource(ctx, action, quota_id)
+                .admit_resource(action, quota_id)
                 .await
                 .map_err(|error| error.at_item(index))?;
             targets.push((quota_id, admitted.access_scope));
@@ -454,7 +473,6 @@ impl QuotaManagement<'_> {
     #[tracing::instrument(name = "quota_enforcement.quotas.bulk_create", skip_all, fields(tenant_id = %request.tenant_id, item_count = request.items.len()))]
     pub async fn bulk_create(
         &self,
-        ctx: &SecurityContext,
         request: BulkCreateRequest,
     ) -> Result<BulkCreated, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-create:p2:inst-qbc-request
@@ -473,7 +491,6 @@ impl QuotaManagement<'_> {
         let admitted = self
             .admission
             .admit(
-                ctx,
                 &resources::QUOTA,
                 actions::CREATE,
                 AdmissionTarget::tenant(tenant),
@@ -503,7 +520,7 @@ impl QuotaManagement<'_> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-create:p2:inst-qbc-envelope
         // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-idem
         if let Some(stored) = self.stored::<BulkCreated>(&write).await? {
-            self.check_created_visible(ctx, &admitted.access_scope, &stored)
+            self.check_created_visible(&admitted.access_scope, &stored)
                 .await?;
             return Ok(stored);
         }
@@ -555,7 +572,7 @@ impl QuotaManagement<'_> {
         let outcome = self
             .storage
             .bulk_create_quotas(
-                ctx,
+                &self.admission.actor(),
                 &BulkCreateEnvelope {
                     tenant_id: tenant,
                     idempotency: write,
@@ -573,7 +590,6 @@ impl QuotaManagement<'_> {
     /// tenant's, so their visibility is the tenant's membership in the scope.
     async fn check_created_visible(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         stored: &BulkCreated,
     ) -> Result<(), DomainError> {
@@ -586,7 +602,6 @@ impl QuotaManagement<'_> {
             let page = self
                 .storage
                 .read_quotas(
-                    ctx,
                     scope,
                     QuotaFilter {
                         ids: ids.clone(),
@@ -624,7 +639,6 @@ impl QuotaManagement<'_> {
     #[tracing::instrument(name = "quota_enforcement.quotas.bulk_update", skip_all, fields(tenant_id = %request.tenant_id, item_count = request.items.len()))]
     pub async fn bulk_update(
         &self,
-        ctx: &SecurityContext,
         request: BulkUpdateRequest,
     ) -> Result<BulkUpdated, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-request
@@ -633,7 +647,7 @@ impl QuotaManagement<'_> {
         self.check_configured_limit(request.items.len())?;
         let ids: Vec<QuotaId> = request.items.iter().map(|item| item.quota_id).collect();
         let targets = self
-            .admit_items(ctx, actions::UPDATE, &ids)
+            .admit_items(actions::UPDATE, &ids)
             .instrument(admission_span(ids.len()))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-request
@@ -656,8 +670,10 @@ impl QuotaManagement<'_> {
             digest(&payload)?,
         );
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-envelope
-        if let Some(stored) = self.stored::<BulkUpdated>(&write).await? {
-            self.check_targets_visible(ctx, tenant, &targets).await?;
+        if let Some(stored) = self
+            .stored_for_targets::<BulkUpdated>(&write, &targets)
+            .await?
+        {
             return Ok(stored);
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-envelope
@@ -680,7 +696,7 @@ impl QuotaManagement<'_> {
                 tenant_id,
                 ..
             } = self
-                .prepare_update(ctx, &scope, item.quota_id, patch)
+                .prepare_update(&scope, item.quota_id, patch)
                 .await
                 .map_err(|error| error.at_item(index))?;
             if tenant_id != tenant {
@@ -702,7 +718,7 @@ impl QuotaManagement<'_> {
         let outcome = self
             .storage
             .bulk_update_quotas(
-                ctx,
+                &self.admission.actor(),
                 &BulkUpdateEnvelope {
                     tenant_id: tenant,
                     idempotency: write,
@@ -728,7 +744,6 @@ impl QuotaManagement<'_> {
     #[tracing::instrument(name = "quota_enforcement.quotas.bulk_deactivate", skip_all, fields(tenant_id = %request.tenant_id, item_count = request.items.len()))]
     pub async fn bulk_deactivate(
         &self,
-        ctx: &SecurityContext,
         request: BulkDeactivateRequest,
     ) -> Result<BulkDeactivated, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-request
@@ -737,7 +752,7 @@ impl QuotaManagement<'_> {
         self.check_configured_limit(request.items.len())?;
         let ids: Vec<QuotaId> = request.items.iter().map(|item| item.quota_id).collect();
         let targets = self
-            .admit_items(ctx, actions::DEACTIVATE, &ids)
+            .admit_items(actions::DEACTIVATE, &ids)
             .instrument(admission_span(ids.len()))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-request
@@ -760,8 +775,10 @@ impl QuotaManagement<'_> {
             digest(&payload)?,
         );
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-envelope
-        if let Some(stored) = self.stored::<BulkDeactivated>(&write).await? {
-            self.check_targets_visible(ctx, tenant, &targets).await?;
+        if let Some(stored) = self
+            .stored_for_targets::<BulkDeactivated>(&write, &targets)
+            .await?
+        {
             return Ok(stored);
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-envelope
@@ -776,7 +793,7 @@ impl QuotaManagement<'_> {
                 Ok(()),
             )?;
             let (tenant_id, events) = self
-                .prepare_deactivate(ctx, &scope, item.quota_id)
+                .prepare_deactivate(&scope, item.quota_id)
                 .await
                 .map_err(|error| error.at_item(index))?;
             if tenant_id != tenant {
@@ -796,7 +813,7 @@ impl QuotaManagement<'_> {
         let outcome = self
             .storage
             .bulk_deactivate_quotas(
-                ctx,
+                &self.admission.actor(),
                 &BulkDeactivateEnvelope {
                     tenant_id: tenant,
                     idempotency: write,

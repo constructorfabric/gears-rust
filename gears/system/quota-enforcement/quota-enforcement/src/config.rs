@@ -3,10 +3,9 @@
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
-use gts::GtsTypeId;
 use serde::Deserialize;
 
-use crate::domain::catalog::CatalogConfig;
+use crate::domain::catalog::UnknownMemory;
 use crate::domain::notifications::DispatchLimits;
 use crate::domain::policies::schemas::SnapshotLimits;
 use crate::domain::policies::{EvaluationLimits, PolicyLimits, PolicyRuntimeLimits};
@@ -29,7 +28,7 @@ pub struct QuotaEnforcementConfig {
     pub pdp_deadline_ms: u64,
     /// Operational metrics.
     pub metrics: MetricsConfig,
-    /// The owner projections configured for evaluation.
+    /// The metric catalogue's registry reads.
     pub catalog: CatalogSection,
     /// Bounds of the Quota lifecycle surface.
     pub quotas: QuotasSection,
@@ -47,6 +46,8 @@ pub struct QuotaEnforcementConfig {
     pub snapshot: SnapshotSection,
     /// Retry and timeout bounds of notification dispatch.
     pub notifications: NotificationsSection,
+    /// The quota resolver plugin instance QE registers.
+    pub resolver_plugin: ResolverPluginSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -66,6 +67,7 @@ impl Default for QuotaEnforcementConfig {
             leases: LeasesSection::default(),
             snapshot: SnapshotSection::default(),
             notifications: NotificationsSection::default(),
+            resolver_plugin: ResolverPluginSection::default(),
         }
     }
 }
@@ -99,7 +101,8 @@ impl QuotaEnforcementConfig {
         self.retention.validate()?;
         self.leases.validate()?;
         self.snapshot.validate()?;
-        self.notifications.validate()
+        self.notifications.validate()?;
+        self.resolver_plugin.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -212,65 +215,92 @@ impl MetricsConfig {
     }
 }
 
-/// The evaluation catalogue (`[quota-enforcement.catalog]`): the concrete owner
-/// projections this deployment resolves at bootstrap (ADR-0007). Request and
-/// constraint contracts are discovered from the registry, not configured.
-/// Empty lists boot an empty catalogue.
-// @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-config
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+/// The metric catalogue (`[quota-enforcement.catalog]`, ADR-0012).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CatalogSection {
-    /// GTS type ids of concrete subject projections derived from
-    /// `gts.cf.core.qe.subj.v1~`.
-    pub subject_projections: Vec<String>,
-    /// GTS type ids of concrete resource projections derived from
-    /// `gts.cf.core.qe.res.v1~`.
-    pub resource_projections: Vec<String>,
+    /// Time limit of one types-registry read of a metric or subject type, in
+    /// milliseconds. A read that reaches it is `ServiceUnavailable`.
+    pub read_timeout_ms: u64,
+    /// Interval of the scheduled read, in seconds: a revision of a metric
+    /// type reaches every replica within it.
+    pub read_interval_secs: u64,
+    /// How long the answer "the registry does not know this type" is
+    /// remembered, in seconds.
+    pub unknown_ttl_secs: u64,
+    /// How many such answers are remembered.
+    pub unknown_capacity: usize,
 }
-// @cpt-end:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-config
+
+impl Default for CatalogSection {
+    fn default() -> Self {
+        Self {
+            read_timeout_ms: 2_000,
+            read_interval_secs: 60,
+            unknown_ttl_secs: 10,
+            unknown_capacity: 10_000,
+        }
+    }
+}
 
 impl CatalogSection {
-    /// Reject ids that are not GTS type ids and duplicate entries.
+    /// The largest `read_timeout_ms`: one minute.
+    pub const READ_TIMEOUT_CEILING_MS: u64 = 60_000;
+    /// The largest `read_interval_secs` and `unknown_ttl_secs`: one day.
+    pub const SECS_CEILING: u64 = 86_400;
+
+    /// Reject a value outside its range.
     ///
     /// # Errors
     ///
-    /// Returns an error naming the field and the offending entry.
+    /// Returns an error naming the field.
     pub fn validate(&self) -> anyhow::Result<()> {
-        Self::validate_list("subject_projections", &self.subject_projections)?;
-        Self::validate_list("resource_projections", &self.resource_projections)
-    }
-
-    /// Reject an entry that is not a GTS type id or is listed twice.
-    fn validate_list(field: &str, ids: &[String]) -> anyhow::Result<()> {
-        for (index, id) in ids.iter().enumerate() {
-            GtsTypeId::try_new(id).map_err(|e| {
-                anyhow::anyhow!(
-                    "[quota-enforcement.catalog].{field}[{index}] is not a GTS type id: {e}"
-                )
-            })?;
-            if ids[..index].contains(id) {
-                anyhow::bail!("[quota-enforcement.catalog].{field} lists {id} twice");
+        for (field, value, ceiling) in [
+            (
+                "read_timeout_ms",
+                self.read_timeout_ms,
+                Self::READ_TIMEOUT_CEILING_MS,
+            ),
+            (
+                "read_interval_secs",
+                self.read_interval_secs,
+                Self::SECS_CEILING,
+            ),
+            (
+                "unknown_ttl_secs",
+                self.unknown_ttl_secs,
+                Self::SECS_CEILING,
+            ),
+        ] {
+            if !(1..=ceiling).contains(&value) {
+                anyhow::bail!("[quota-enforcement.catalog].{field} must be from 1 to {ceiling}");
             }
+        }
+        if self.unknown_capacity == 0 {
+            anyhow::bail!("[quota-enforcement.catalog].unknown_capacity must be at least 1");
         }
         Ok(())
     }
 
-    /// The domain view of the section.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when an id does not parse; `validate` reports the same
-    /// condition with the field name.
-    pub fn to_domain(&self) -> anyhow::Result<CatalogConfig> {
-        let parse = |ids: &[String]| -> anyhow::Result<Vec<GtsTypeId>> {
-            ids.iter()
-                .map(|id| GtsTypeId::try_new(id).map_err(|e| anyhow::anyhow!("{id}: {e}")))
-                .collect()
-        };
-        Ok(CatalogConfig {
-            subject_projections: parse(&self.subject_projections)?,
-            resource_projections: parse(&self.resource_projections)?,
-        })
+    /// Time limit of one registry read.
+    #[must_use]
+    pub const fn read_timeout(&self) -> Duration {
+        Duration::from_millis(self.read_timeout_ms)
+    }
+
+    /// Interval of the scheduled read.
+    #[must_use]
+    pub const fn read_interval(&self) -> Duration {
+        Duration::from_secs(self.read_interval_secs)
+    }
+
+    /// The memory of unknown type ids.
+    #[must_use]
+    pub fn unknown_memory(&self) -> UnknownMemory {
+        UnknownMemory {
+            ttl: Duration::from_secs(self.unknown_ttl_secs),
+            capacity: NonZeroUsize::new(self.unknown_capacity).unwrap_or(NonZeroUsize::MIN),
+        }
     }
 }
 
@@ -286,16 +316,6 @@ pub struct QuotasSection {
     /// Largest canonical-JSON size of a Quota's `metadata` object, in bytes
     /// (PRD section 5.2, default 4 KiB).
     pub metadata_max_bytes: usize,
-    /// Entries the metric classification cache holds before evicting the
-    /// least recently used one.
-    pub metric_cache_entries: usize,
-    /// Age after which a cached classification is refreshed from the
-    /// registry, in seconds.
-    pub metric_cache_ttl_secs: u64,
-    /// Additional age during which a cached classification may still be
-    /// served to a write when the registry does not answer, in seconds.
-    /// Beyond `ttl + grace` nothing is served; the write fails closed.
-    pub metric_cache_stale_grace_secs: u64,
     /// Largest page a list request may ask for.
     pub list_max_limit: u32,
     /// Largest number of explicit ids one list request may name.
@@ -309,9 +329,6 @@ impl Default for QuotasSection {
     fn default() -> Self {
         Self {
             metadata_max_bytes: 4096,
-            metric_cache_entries: 256,
-            metric_cache_ttl_secs: 60,
-            metric_cache_stale_grace_secs: 300,
             list_max_limit: 500,
             list_max_ids: 100,
             bulk_max_items: 50,
@@ -339,12 +356,6 @@ impl QuotasSection {
                 Self::MAX_METADATA_BYTES
             );
         }
-        if self.metric_cache_entries == 0 {
-            anyhow::bail!("[quota-enforcement.quotas].metric_cache_entries must be at least 1");
-        }
-        if self.metric_cache_ttl_secs == 0 {
-            anyhow::bail!("[quota-enforcement.quotas].metric_cache_ttl_secs must be at least 1");
-        }
         if self.list_max_limit == 0 {
             anyhow::bail!("[quota-enforcement.quotas].list_max_limit must be at least 1");
         }
@@ -368,18 +379,6 @@ impl QuotasSection {
             list_max_ids: self.list_max_ids,
             bulk_max_items: self.bulk_max_items,
         }
-    }
-
-    /// Age after which a cached classification is refreshed.
-    #[must_use]
-    pub const fn metric_cache_ttl(&self) -> Duration {
-        Duration::from_secs(self.metric_cache_ttl_secs)
-    }
-
-    /// Additional age during which a stale classification may serve a write.
-    #[must_use]
-    pub const fn metric_cache_stale_grace(&self) -> Duration {
-        Duration::from_secs(self.metric_cache_stale_grace_secs)
     }
 }
 
@@ -614,6 +613,43 @@ impl GaugesSection {
 #[path = "config_tests.rs"]
 mod config_tests;
 
+/// The quota resolver plugin instance (`[quota-enforcement.resolver_plugin]`):
+/// the quota resolver selects among the instances of its configured vendor
+/// the one with the lowest priority.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ResolverPluginSection {
+    /// Vendor of the instance.
+    pub vendor: String,
+    /// Priority of the instance; lower wins.
+    pub priority: i16,
+}
+
+impl Default for ResolverPluginSection {
+    fn default() -> Self {
+        Self {
+            vendor: "constructorfabric".to_owned(),
+            priority: 100,
+        }
+    }
+}
+
+impl ResolverPluginSection {
+    /// Reject a blank vendor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the vendor is empty or whitespace-only.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.vendor.trim().is_empty() {
+            anyhow::bail!(
+                "[quota-enforcement.resolver_plugin].vendor must not be empty or whitespace-only"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Bounds of the snapshot read (`[quota-enforcement.snapshot]`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
@@ -791,8 +827,10 @@ impl OperationsSection {
                 "[quota-enforcement.operations].idempotency_cache_ttl_ms must be at least 1"
             );
         }
-        if self.max_batch_items == 0 {
-            anyhow::bail!("[quota-enforcement.operations].max_batch_items must be at least 1");
+        // A batch writes its charges in one statement; the bound keeps it under
+        // the bind-parameter limit of the database.
+        if !(1..=1_000).contains(&self.max_batch_items) {
+            anyhow::bail!("[quota-enforcement.operations].max_batch_items must be from 1 to 1000");
         }
         if self.batch_timeout_ms == 0 {
             anyhow::bail!("[quota-enforcement.operations].batch_timeout_ms must be at least 1");
@@ -849,8 +887,10 @@ impl RetentionSection {
         if self.interval_secs == 0 {
             anyhow::bail!("[quota-enforcement.retention].interval_secs must be at least 1");
         }
-        if self.batch_size == 0 {
-            anyhow::bail!("[quota-enforcement.retention].batch_size must be at least 1");
+        // A pass deletes the charges of its batch in one statement; the bound
+        // keeps it under the bind-parameter limit of the database.
+        if !(1..=10_000).contains(&self.batch_size) {
+            anyhow::bail!("[quota-enforcement.retention].batch_size must be from 1 to 10000");
         }
         if self.operation_log_retention_days == 0 {
             anyhow::bail!(

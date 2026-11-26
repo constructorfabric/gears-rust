@@ -49,10 +49,8 @@ pub struct NewLease<'a> {
     pub tenant_id: Uuid,
     /// The metric the hold is on.
     pub metric: &'a str,
-    /// The acquisition's idempotency subject key.
-    pub subject_key: &'a [u8],
-    /// The attribution the acquisition was authorized under.
-    pub attribution_hash: &'a [u8],
+    /// The attribution digest the acquisition was admitted under.
+    pub attribution_digest: &'a [u8],
     /// The acquisition's own idempotency key.
     pub idem_key: &'a str,
     /// What the caller reserved.
@@ -78,8 +76,7 @@ pub async fn insert_lease(
             token: ActiveValue::Set(lease.token),
             tenant_id: ActiveValue::Set(lease.tenant_id),
             metric: ActiveValue::Set(lease.metric.to_owned()),
-            subject_key: ActiveValue::Set(lease.subject_key.to_vec()),
-            attribution_hash: ActiveValue::Set(lease.attribution_hash.to_vec()),
+            attribution_digest: ActiveValue::Set(lease.attribution_digest.to_vec()),
             idem_key: ActiveValue::Set(lease.idem_key.to_owned()),
             state: ActiveValue::Set(STATE_ACTIVE.to_owned()),
             reserved_amount: ActiveValue::Set(lease.reserved_amount),
@@ -104,20 +101,18 @@ pub async fn insert_lease(
 pub async fn insert_hold(
     runner: &impl DBRunner,
     scope: &AccessScope,
-    token: Uuid,
-    tenant_id: Uuid,
-    quota_id: Uuid,
-    held_amount: i64,
-    period_id: Option<Uuid>,
+    hold: lease_hold::Model,
 ) -> Result<(), ScopeError> {
     secure_insert::<lease_hold::Entity>(
         lease_hold::ActiveModel {
-            lease_token: ActiveValue::Set(token),
-            quota_id: ActiveValue::Set(quota_id),
-            tenant_id: ActiveValue::Set(tenant_id),
-            held_amount: ActiveValue::Set(held_amount),
-            period_id: ActiveValue::Set(period_id),
-            returned_at: ActiveValue::Set(None),
+            lease_token: ActiveValue::Set(hold.lease_token),
+            quota_id: ActiveValue::Set(hold.quota_id),
+            tenant_id: ActiveValue::Set(hold.tenant_id),
+            held_amount: ActiveValue::Set(hold.held_amount),
+            period_id: ActiveValue::Set(hold.period_id),
+            chain: ActiveValue::Set(hold.chain),
+            position: ActiveValue::Set(hold.position),
+            returned_at: ActiveValue::Set(hold.returned_at),
         },
         scope,
         runner,
@@ -347,6 +342,12 @@ fn active_on_quota_query(
     quota_id: Uuid,
     now: OffsetDateTime,
 ) -> sea_orm::Select<lease::Entity> {
+    unsettled_on_quota_query(scope, quota_id).filter(lease::Column::ExpiryAt.gt(now))
+}
+
+/// The leases in state `active` with a hold on `quota_id` not yet returned,
+/// expired or not, in token order.
+fn unsettled_on_quota_query(scope: &AccessScope, quota_id: Uuid) -> sea_orm::Select<lease::Entity> {
     // A subquery, not a bound token list: the unreturned holds have no upper bound.
     let holders = lease_hold::Entity::find()
         .filter(lease_hold::Column::QuotaId.eq(quota_id))
@@ -360,23 +361,21 @@ fn active_on_quota_query(
     lease::Entity::find()
         .filter(lease::Column::Token.in_subquery(holders))
         .filter(lease::Column::State.eq(STATE_ACTIVE))
-        .filter(lease::Column::ExpiryAt.gt(now))
         .order_by(lease::Column::Token, Order::Asc)
 }
 
-/// [`active_on_quota_for_update`], read without a lock: what a caller must
-/// know before it takes rank 3.
+/// [`unsettled_on_quota_query`], read without a lock: what a caller must know
+/// before it takes rank 3.
 ///
 /// # Errors
 ///
 /// The scope or database error of the read.
-pub async fn active_on_quota(
+pub async fn unsettled_on_quota(
     runner: &impl DBRunner,
     scope: &AccessScope,
     quota_id: Uuid,
-    now: OffsetDateTime,
 ) -> Result<Vec<lease::Model>, ScopeError> {
-    active_on_quota_query(scope, quota_id, now)
+    unsettled_on_quota_query(scope, quota_id)
         .secure()
         .scope_with(scope)
         .all(runner)

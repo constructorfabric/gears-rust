@@ -1,7 +1,9 @@
 //! Gear declaration of quota-enforcement.
 //!
 //! `init` wires the PEP boundary, the domain service, the in-process manager
-//! client, and the cluster coordination binding. The lifecycle entry runs the
+//! client, the quota resolver plugin, and the cluster coordination binding.
+//! The plugin instance is published from the configuration before `init`,
+//! which binds its scoped client. The lifecycle entry runs the
 //! fail-closed bootstrap before the ready signal, which ends by starting
 //! notification delivery, then hosts the leader-only sweepers under child
 //! tokens, and stops delivery on shutdown. The REST surface mounts into
@@ -20,36 +22,46 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use quota_enforcement_sdk::{QuotaEnforcementApi, QuotaManagerApi, QuotaOperatorApi};
+use quota_resolver_sdk::{QuotaResolverPluginClient, QuotaResolverPluginSpecV1};
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::client_hub::ClientHub;
 use toolkit::context::GearCtx;
+use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
 use toolkit::lifecycle::ReadySignal;
+use toolkit::plugins::bind_plugin_instances;
 use toolkit::{Gear, Healthcheck, RestApiCapability};
 use toolkit_contract::policy::PolicyStack;
-use tracing::info;
-use types_registry_sdk::TypesRegistryClient;
+use tracing::{info, warn};
+use types_registry_sdk::{GtsId, PlatformTypesRegistryApi};
 
 use crate::api::healthcheck::ReadinessCheck;
 use crate::api::in_process::{
     InProcessQuotaEnforcement, InProcessQuotaManager, InProcessQuotaOperator,
 };
+use crate::api::resolver_plugin::ResolverPlugin;
 use crate::api::rest::routes;
 use crate::config::QuotaEnforcementConfig;
-use crate::domain::ports::{LifecycleGaugeSink, MetricRegistry, QeMetrics};
+use crate::domain::ports::{LifecycleGaugeSink, QeMetrics};
 use crate::domain::{
-    Admission, Bootstrap, BootstrapReporting, Bound, CatalogBinding, GaugeTiming,
-    LifecycleGaugeRefresher, PluginBinding, Readiness, Service, SingletonScope,
+    Admission, Bootstrap, BootstrapReporting, Bound, GaugeTiming, LifecycleGaugeRefresher,
+    MetricCatalog, PluginBinding, Readiness, Service, SingletonScope,
 };
+use crate::infra::charge_backlog::ChargeBacklogCell;
 use crate::infra::cluster_coordination::{ClusterCoordinationBinding, ElectionTiming};
 use crate::infra::lease_backlog::LeaseBacklogCell;
 use crate::infra::lifecycle_gauges::LifecycleGaugeCell;
-use crate::infra::metric_registry::CachedMetricRegistry;
 use crate::infra::metrics;
 use crate::infra::pdp_probe::PdpReachability;
-use crate::infra::types_registry::TypesRegistryContracts;
+use crate::infra::types_registry::PlatformTypeRegistry;
 
 const LOG_TARGET: &str = "qe.lifecycle";
+const BOOTSTRAP_RETRY_MIN: Duration = Duration::from_secs(1);
+const BOOTSTRAP_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// GTS segment of QE's quota resolver plugin instance.
+pub const RESOLVER_PLUGIN_SEGMENT: &str = "cf.core.quota_enforcement.plugin.v1";
 
 /// Quota Enforcement gear.
 ///
@@ -61,7 +73,8 @@ const LOG_TARGET: &str = "qe.lifecycle";
     name = "quota-enforcement",
     deps = [authz_resolver, types_registry],
     capabilities = [rest, stateful],
-    lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+    lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
+    gts_publication(entities = Self::resolver_plugin_instance),
 )]
 #[toolkit::provides(
     contract = quota_enforcement_sdk::QuotaManagerApi,
@@ -96,8 +109,12 @@ struct GaugeWiring {
     retention: crate::domain::operations::RetentionTiming,
     /// The sample cell of `lease_unreclaimed_expired`.
     lease_backlog: Arc<LeaseBacklogCell>,
+    /// The sample cell of the held-allocation-charge gauges.
+    charge_backlog: Arc<ChargeBacklogCell>,
     /// Timing of the lease sweeper.
     lease_sweep: crate::domain::operations::LeaseSweepTiming,
+    /// Interval of the scheduled catalogue read.
+    catalog_read_interval: Duration,
 }
 
 impl Default for QuotaEnforcementGear {
@@ -155,22 +172,25 @@ impl QuotaEnforcementGear {
         let bound = bootstrap_or_stop(bootstrap, &cancel, gauges.stop_timeout).await?;
         let refresher = LifecycleGaugeRefresher::new(
             bound.storage.clone(),
-            bound.metric_registry.clone(),
+            Arc::clone(&bound.catalog),
             gauges.cell.clone() as Arc<dyn LifecycleGaugeSink>,
             gauges.timing,
         );
         let sweeper = Arc::new(crate::domain::operations::RetentionSweeper::new(
             bound.storage.clone(),
             Arc::clone(&gauges.metrics),
+            Arc::clone(&bound.catalog),
+            gauges.charge_backlog.clone() as Arc<dyn crate::domain::ports::ChargeBacklogSink>,
             gauges.retention,
         ));
         let lease_sweeper = Arc::new(crate::domain::operations::LeaseSweeper::new(
             bound.storage.clone(),
-            Arc::clone(&bound.classifications),
+            Arc::clone(&bound.catalog),
             gauges.lease_backlog.clone() as Arc<dyn crate::domain::ports::LeaseBacklogSink>,
             gauges.lease_sweep,
         ));
         let coordinator = bound.coordinator.clone();
+        let catalog = Arc::clone(&bound.catalog);
         service
             .bind(bound)
             .context("quota-enforcement: publish bootstrapped dependencies")?;
@@ -200,6 +220,14 @@ impl QuotaEnforcementGear {
             cancel.child_token(),
         );
         // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-elect
+        let interval = gauges.catalog_read_interval;
+        let catalog_shutdown = cancel.child_token();
+        let catalog_task = tokio::spawn(async move {
+            catalog
+                .run_scheduled_reads(interval, catalog_shutdown)
+                .await;
+            Ok(())
+        });
         cancel.cancelled().await;
         info!(target: LOG_TARGET, "quota-enforcement is stopping");
         stop_background(
@@ -207,6 +235,7 @@ impl QuotaEnforcementGear {
                 ("lifecycle gauge", gauge_task),
                 ("retention sweeper", retention_task),
                 ("lease sweeper", lease_task),
+                ("catalogue read", catalog_task),
             ],
             &delivery,
             gauges.stop_timeout,
@@ -217,6 +246,21 @@ impl QuotaEnforcementGear {
 }
 
 impl QuotaEnforcementGear {
+    /// The publication's config-only document: the quota resolver plugin
+    /// instance, admitted before `init` binds its client.
+    fn resolver_plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: QuotaEnforcementConfig = inputs.config_or_default()?;
+        cfg.resolver_plugin.validate()?;
+        let (id, document) = PluginV1::<QuotaResolverPluginSpecV1>::build_registration(
+            RESOLVER_PLUGIN_SEGMENT,
+            cfg.resolver_plugin.vendor,
+            cfg.resolver_plugin.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
+    }
+
     /// The init-time cells, all filled or none.
     fn initialised(&self) -> anyhow::Result<(Arc<Service>, &Bootstrap, &GaugeWiring)> {
         const BEFORE_INIT: &str = "quota-enforcement: serve invoked before init";
@@ -228,17 +272,38 @@ impl QuotaEnforcementGear {
 }
 
 /// Bootstrap raced against shutdown: a shutdown during bootstrap is an error
-/// of the lifecycle entry, so the ready signal is never sent.
+/// of the lifecycle entry, so the ready signal is never sent. A dependency
+/// that does not answer is waited for: nothing restarts a gear whose entry
+/// returned an error, so giving up would leave the replica not ready for good.
 async fn bootstrap_or_shutdown(
     bootstrap: &Bootstrap,
     cancel: &CancellationToken,
 ) -> anyhow::Result<Bound> {
-    tokio::select! {
-        biased;
-        () = cancel.cancelled() => {
-            anyhow::bail!("quota-enforcement: shutdown requested during bootstrap");
+    const SHUTDOWN: &str = "quota-enforcement: shutdown requested during bootstrap";
+    // ponytail: no jitter; add it when the replica count makes retries in step a load on a dependency.
+    let mut pause = BOOTSTRAP_RETRY_MIN;
+    loop {
+        let outage = tokio::select! {
+            biased;
+            () = cancel.cancelled() => anyhow::bail!(SHUTDOWN),
+            outcome = bootstrap.run() => match outcome {
+                Ok(bound) => return Ok(bound),
+                Err(error) if error.is_dependency_outage() => error,
+                Err(error) => return Err(error).context("quota-enforcement bootstrap failed"),
+            },
+        };
+        warn!(
+            target: LOG_TARGET,
+            error = %outage,
+            retry_in_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            "quota-enforcement bootstrap waits for a dependency"
+        );
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => anyhow::bail!(SHUTDOWN),
+            () = tokio::time::sleep(pause) => {}
         }
-        outcome = bootstrap.run() => outcome.context("quota-enforcement bootstrap failed"),
+        pause = (pause * 2).min(BOOTSTRAP_RETRY_MAX);
     }
 }
 
@@ -256,7 +321,8 @@ async fn bootstrap_or_stop(
     outcome
 }
 
-/// A leader-only task: its election's outcome once it stops.
+/// A background task: for a leader-only one, its election's outcome once it
+/// stops.
 type LeaderTask = tokio::task::JoinHandle<Result<(), crate::domain::DomainError>>;
 
 /// Leader-only: the elected replica refreshes and publishes the gauge sample;
@@ -286,9 +352,10 @@ async fn join_leader_task(name: &str, mut task: LeaderTask, budget: Duration) {
     tracing::warn!(target: LOG_TARGET, "{failure}");
 }
 
-/// Stop the leader tasks and notification delivery together, within `budget`.
+/// Stop the background tasks and notification delivery together, within
+/// `budget`.
 async fn stop_background(
-    tasks: [(&str, LeaderTask); 3],
+    tasks: [(&str, LeaderTask); 4],
     delivery: &crate::domain::notifications::DeliveryLifecycle,
     budget: Duration,
 ) {
@@ -335,29 +402,32 @@ impl Gear for QuotaEnforcementGear {
         // The SDK default is a hang guard, far above the admission latency budget.
         let enforcer = PolicyEnforcer::new(authz).with_deadline(cfg.pdp_deadline());
 
-        // Bootstrap builds the projection catalogue from this registry client.
-        let registry: Arc<dyn TypesRegistryClient> = hub
-            .get::<dyn TypesRegistryClient>()
-            .with_context(|| format!("{} requires a types-registry client", Self::MODULE_NAME))?;
-        let catalog = CatalogBinding {
-            registry: Arc::new(TypesRegistryContracts::new(registry.clone())),
-            config: cfg
-                .catalog
-                .to_domain()
-                .context("[quota-enforcement.catalog] is not a valid catalogue")?,
-        };
-        let metric_registry: Arc<dyn MetricRegistry> = Arc::new(CachedMetricRegistry::new(
-            registry,
-            cfg.quotas.metric_cache_entries,
-            cfg.quotas.metric_cache_ttl(),
-            cfg.quotas.metric_cache_stale_grace(),
-        ));
+        let registry: Arc<dyn PlatformTypesRegistryApi> =
+            hub.get::<dyn PlatformTypesRegistryApi>().with_context(|| {
+                format!(
+                    "{} requires the types-registry platform client",
+                    Self::MODULE_NAME
+                )
+            })?;
 
         let gauge_cell = Arc::new(LifecycleGaugeCell::default());
         let lease_backlog = Arc::new(LeaseBacklogCell::default());
-        let metrics: Arc<dyn QeMetrics> =
-            metrics::build_default_adapter(&cfg.metrics, gauge_cell.clone(), lease_backlog.clone());
+        let charge_backlog = Arc::new(ChargeBacklogCell::default());
+        let metrics: Arc<dyn QeMetrics> = metrics::build_default_adapter(
+            &cfg.metrics,
+            gauge_cell.clone(),
+            lease_backlog.clone(),
+            charge_backlog.clone(),
+        );
         let readiness = Arc::new(Readiness::new());
+        let catalog = Arc::new(MetricCatalog::new(
+            Arc::new(PlatformTypeRegistry::new(
+                registry,
+                cfg.catalog.read_timeout(),
+            )),
+            Arc::clone(&metrics),
+            cfg.catalog.unknown_memory(),
+        ));
         let admission = Admission::new(enforcer, metrics.clone());
         let policy_limits = cfg
             .policies
@@ -379,6 +449,15 @@ impl Gear for QuotaEnforcementGear {
         ));
         // The local builders find the service here; the key is crate-private.
         hub.register::<LocalService>(Arc::new(LocalService(service.clone())));
+        let resolver_plugin: Arc<dyn QuotaResolverPluginClient> = Arc::new(ResolverPlugin::new(
+            service.clone(),
+            cfg.snapshot.to_limits().page_size,
+        ));
+        bind_plugin_instances::<QuotaResolverPluginSpecV1, _>(
+            &hub,
+            ctx.gts_publication_manifest()?.documents(),
+            &resolver_plugin,
+        )?;
         self.wire_quota_manager_api(ctx).await?;
         self.wire_quota_enforcement_api(ctx).await?;
         self.wire_quota_operator_api(ctx).await?;
@@ -396,7 +475,6 @@ impl Gear for QuotaEnforcementGear {
             coordinator,
             pdp_probe,
             catalog,
-            metric_registry,
             BootstrapReporting {
                 metrics: Arc::clone(&metrics),
                 readiness,
@@ -415,10 +493,12 @@ impl Gear for QuotaEnforcementGear {
                 .to_timing()
                 .context("[quota-enforcement.retention] is not a valid sweeper timing")?,
             lease_backlog,
+            charge_backlog,
             lease_sweep: cfg
                 .leases
                 .to_sweep_timing()
                 .context("[quota-enforcement.leases] is not a valid sweeper timing")?,
+            catalog_read_interval: cfg.catalog.read_interval(),
         };
         set_once(&self.gauges, gauges)?;
         set_once(&self.hub, hub)?;

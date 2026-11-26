@@ -20,6 +20,10 @@ pub const QUOTA_CAP_UNBOUNDED_TOTAL: &str = "quota_cap_unbounded_total";
 /// Catalogue name of the active Quotas-on-`Direct`-metrics gauge.
 pub const QUOTA_FOR_DIRECT_METRIC_TOTAL: &str = "quota_for_direct_metric_total";
 
+/// Catalogue name of the gauge of active Quotas whose conditions no longer fit
+/// their metric type.
+pub const QUOTA_CONDITIONS_UNFIT_TOTAL: &str = "quota_conditions_unfit_total";
+
 /// The published sample, or nothing.
 #[derive(Debug, Default)]
 pub struct LifecycleGaugeCell(ArcSwapOption<LifecycleCounts>);

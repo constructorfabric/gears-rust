@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded
 date: 2026-08-12
 ---
 
@@ -28,6 +28,22 @@ date: 2026-08-12
 <!-- /toc -->
 
 **ID**: `cpt-cf-quota-enforcement-adr-projection-contracts`
+
+> **Superseded, except two rules.** Three later records replace this one:
+>
+> - ADR-0008 (`cpt-cf-quota-enforcement-adr-quota-resolver-subjects`) replaces subject projections, the scope type
+>   and its instances, the resource base, and the metric base: subjects are quota resolver subject types that the
+>   metric admits.
+> - ADR-0013 (`cpt-cf-quota-enforcement-adr-metric-types`) removes the request contract, the constraint contract, and
+>   the resource projection: a metric is a type with traits and a metadata schema, and Quota metadata are
+>   conditions over that metadata.
+> - ADR-0012 (`cpt-cf-quota-enforcement-adr-contract-catalogue`) replaces the catalogue that is built once at
+>   bootstrap and the bootstrap failure on an inconsistency. It also replaces two statements below: that evaluation
+>   never calls the registry (the first request for a metric reads its type), and that the metric mode on the hot path
+>   comes from storage errors (it comes from the metric's catalogue entry).
+>
+> Two rules of this record stay: QE validates a whole document against the resolved schema of its type, and
+> evaluation reads the process-local catalogue.
 
 ## Context and Problem Statement
 
@@ -388,16 +404,10 @@ owner's projection resolve the same shared applicable-Quota set.
 
 ## More Information
 
-The contract model ships as validated JSON Schema files in [`docs/schemas/`](../schemas/), not
-only as prose: the four abstract bases, the concrete scope-discriminator type with its two P1
-well-known instances, and worked `cf.genai.llm_gateway` owner examples for all four contract
-families under [`docs/schemas/examples/`](../schemas/examples/). The examples exercise the
-decisions above: one owner publishing user- and tenant-scope projections that admit the same
-metrics (scope cascade), one metric request contract per metric and each shared by both
-projections, a constraint contract whose `regions: string[]` pairs with the request's scalar
-`region` (the cel operator/cardinality check), a request contract that declares no properties
-and therefore takes `{}` on the wire, and a constraint contract that carries only an
-arbitration field with no request-side counterpart.
+The contract model shipped as JSON Schema files under `docs/schemas/`: the request and constraint bases
+`gts.cf.core.qe.request.v1~` and `gts.cf.core.qe.constraint.v1~`, and `cf.genai.llm_gateway` owner examples of both.
+ADR-0013 removes these types and their files. The schemas of the metric base and of example metric types are in the
+quota resolver's [`docs/schemas/`](../../../quota-resolver/docs/schemas/).
 
 The naming, one-level derivation, traits, abstract types, and typed-id rules come from
 [`guidelines/GTS.md`](../../../../../guidelines/GTS.md). The reference decisions are

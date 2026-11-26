@@ -682,6 +682,18 @@ Introduces an abstraction layer over the upstream License Manager service. The g
 - [API](../gears/system/license-resolver/license-resolver/README.md)
 - [SDK](../gears/system/license-resolver/license-resolver-sdk/README.md)
 
+### Quota Resolver
+#### Responsibility
+Introduces a gateway in front of a quota backend. The goal is to provide a single entry point to debit, lease, return, and read quotas for principals and other subjects, without coupling consuming modules to a specific backend. Stateless: it maps principal types to quota subject types, fixes the tenant, and delegates to one backend plugin. Writes exist on the platform plane only; the tenant plane reads the caller's own quota state.
+#### High Level Scenarios
+- [ ] p1 - debit and lease for a principal or another subject on the platform plane
+- [ ] p1 - read the caller's own quota state on the tenant plane
+#### More details
+- [PRD](../gears/system/quota-resolver/docs/PRD.md)
+- [Design](../gears/system/quota-resolver/docs/DESIGN.md)
+- [API](../gears/system/quota-resolver/quota-resolver/README.md)
+- [SDK](../gears/system/quota-resolver/quota-resolver-sdk/README.md)
+
 ### Credentials Store
 #### Responsibility
 Introduces an abstraction layer for credentials storage, either as a local service or a connector to upstream Credentials Store service. The goal is to provide a single entry point for storing, resolving, and injecting secrets without coupling feature code to a specific vault or secret-management backend.

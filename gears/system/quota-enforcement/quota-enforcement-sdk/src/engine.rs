@@ -189,20 +189,16 @@ mod tests {
     }
 }
 
-/// Persistable, engine-dependent schema closure. MRW uses an empty closure.
+/// The metric type schemas a Policy version was checked against when it was
+/// written. Empty for an engine that reads no request metadata.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
 #[serde(deny_unknown_fields)]
 pub struct PolicySchemaSnapshot {
-    /// Fully resolved documents keyed by canonical schema identifier.
+    /// The resolved schema of each metric type, keyed by the metric type id.
     pub schemas: std::collections::BTreeMap<String, serde_json::Value>,
-    /// Environment schema for each metric admitted by this policy.
-    pub environments: Vec<MetricEnvironmentSchema>,
-    /// Which environment inputs the policy reads. Only their contracts are
-    /// retained above, and a later activation is checked only against them,
-    /// so a catalogue change to an input the policy never touches cannot
-    /// invalidate it.
+    /// Which environment inputs the policy reads.
     #[serde(default)]
     pub inputs: EnvironmentInputs,
 }
@@ -227,40 +223,22 @@ pub struct EngineConfigError {
     pub column: Option<usize>,
 }
 
-/// Which typed environment inputs a compiled policy reads. Decides which
-/// schemas its version persists and which catalogue changes can invalidate a
-/// later activation: a policy that never reads `resource` is not touched by a
-/// resource projection being added.
+/// Which environment inputs a compiled policy reads. A policy that reads no
+/// `request` keeps no metric type schema in its version.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
 #[serde(deny_unknown_fields)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "three independent, individually named flags; a bitset would hide them on the wire"
-)]
 pub struct EnvironmentInputs {
-    /// The request projection metadata.
+    /// The metadata of the request's metric object.
     pub request: bool,
-    /// The resource projection.
-    pub resource: bool,
-    /// Each applicable Quota's arbitration metadata.
-    pub arbitration: bool,
 }
 
 impl EnvironmentInputs {
     /// Everything: the conservative answer for an engine that does not report.
-    pub const ALL: Self = Self {
-        request: true,
-        resource: true,
-        arbitration: true,
-    };
+    pub const ALL: Self = Self { request: true };
     /// Nothing: an engine that reads no metadata at all.
-    pub const NONE: Self = Self {
-        request: false,
-        resource: false,
-        arbitration: false,
-    };
+    pub const NONE: Self = Self { request: false };
 }
 
 impl Default for EnvironmentInputs {
@@ -282,13 +260,26 @@ pub trait ValidatedConfig: std::any::Any + Send + Sync {
     }
 }
 
-/// Resolved subject specificity; custom owner projection IDs do not affect order.
+/// The tier of a Quota's subject (ADR-0008): the tenant subject type is
+/// `Tenant`, every other subject type is `Subject`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum QuotaScopeTier {
     /// Tenant-wide fallback tier.
     Tenant,
-    /// User-specific tier, preferred over tenant quotas.
-    User,
+    /// A subject other than the tenant, preferred over tenant quotas.
+    Subject,
+}
+
+impl QuotaScopeTier {
+    /// The tier of `subject`.
+    #[must_use]
+    pub fn of(subject: &crate::SubjectRef) -> Self {
+        if subject.is_tenant() {
+            Self::Tenant
+        } else {
+            Self::Subject
+        }
+    }
 }
 
 /// One applicable quota with the tier resolved before engine invocation.
@@ -296,28 +287,27 @@ pub enum QuotaScopeTier {
 pub struct EvaluationQuota<'a> {
     /// Current transaction-visible accounting snapshot.
     pub snapshot: &'a crate::QuotaSnapshot,
-    /// Resolved owner scope tier.
+    /// The tier of the Quota's subject.
     pub tier: QuotaScopeTier,
-    /// Owner-defined, validated arbitration value; inaccessible to MRW.
-    pub arbitration: &'a serde_json::Value,
 }
 
 /// Invocation-scoped, server-materialized input. No identity or I/O capability.
 pub struct EvaluationContext<'a> {
     /// Authoritatively selected policy version.
     pub policy: &'a crate::PolicyVersion,
-    /// Requested metric.
+    /// The type of the request's metric object.
     pub metric: &'a crate::MetricId,
     /// Requested debit amount.
     pub amount: u64,
     /// Server evaluation time.
     pub time: time::OffsetDateTime,
-    /// Every applicable quota, including those excluded by engine metadata rules.
+    /// Every Quota that applies: its conditions hold on the request.
     pub quotas: &'a [EvaluationQuota<'a>],
-    /// Validated request projection value.
+    /// The validated `metadata` of the request's metric object.
     pub request: &'a serde_json::Value,
-    /// Validated resource projection value.
-    pub resource: &'a serde_json::Value,
+    /// The `id` of the request's metric object: the one thing the amount is
+    /// counted for. It is not part of a counter key.
+    pub metric_id: Option<&'a str>,
     /// Newly resolved limits for this invocation.
     pub budget: EvaluationBudget,
 }
@@ -394,16 +384,6 @@ macro_rules! register_engine {
     };
 }
 
-/// One metric's persisted CEL environment schema.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct MetricEnvironmentSchema {
-    /// Admitted metric identifier.
-    pub metric: crate::MetricId,
-    /// Resolved environment schema.
-    pub schema: serde_json::Value,
-}
-
 /// Closed debit-plan invariant labels used by telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum DebitPlanInvariant {
@@ -413,9 +393,12 @@ pub enum DebitPlanInvariant {
     /// A signed engine output was negative before conversion to the SDK plan.
     #[error("negative_amount")]
     NegativeAmount,
-    /// One debit exceeds the requested amount.
-    #[error("amount_exceeds_request_amount")]
-    AmountExceedsRequestAmount,
+    /// The amounts of a chain do not add up to the requested amount.
+    #[error("chain_sum_mismatch")]
+    ChainSumMismatch,
+    /// A quota appears more than once in the plan.
+    #[error("duplicate_quota")]
+    DuplicateQuota,
     /// Verdict and plan disagree, including an invalid MRW shape.
     #[error("result_plan_inconsistency")]
     ResultPlanInconsistency,
@@ -438,12 +421,20 @@ impl EvaluationOutcome {
     ) -> Result<Self, DebitPlanInvariant> {
         let applicable: std::collections::BTreeSet<_> =
             context.quotas.iter().map(|q| q.snapshot.quota_id).collect();
-        for (id, debit) in &decision.debit_plan {
-            if !applicable.contains(id) {
-                return Err(DebitPlanInvariant::QuotaIdOutsideApplicableSet);
+        let mut seen = std::collections::BTreeSet::new();
+        for chain in &decision.debit_plan {
+            let mut sum: u128 = 0;
+            for entry in chain {
+                if !applicable.contains(&entry.quota_id) {
+                    return Err(DebitPlanInvariant::QuotaIdOutsideApplicableSet);
+                }
+                if !seen.insert(entry.quota_id) {
+                    return Err(DebitPlanInvariant::DuplicateQuota);
+                }
+                sum += u128::from(entry.amount);
             }
-            if debit.amount > context.amount {
-                return Err(DebitPlanInvariant::AmountExceedsRequestAmount);
+            if sum != u128::from(context.amount) {
+                return Err(DebitPlanInvariant::ChainSumMismatch);
             }
         }
         match decision.result {
@@ -455,11 +446,7 @@ impl EvaluationOutcome {
                     return Err(DebitPlanInvariant::ResultPlanInconsistency);
                 }
                 if context.policy.engine_id == "most-restrictive-wins"
-                    && (decision.debit_plan.len() != 1
-                        || decision
-                            .debit_plan
-                            .values()
-                            .any(|debit| debit.amount != context.amount))
+                    && !matches!(decision.debit_plan.as_slice(), [chain] if chain.len() == 1)
                 {
                     return Err(DebitPlanInvariant::ResultPlanInconsistency);
                 }
@@ -493,6 +480,10 @@ impl EvaluationOutcome {
         self.decision
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod engine_tests;
 
 /// Transaction callback failure. Preparation requires rollback before compilation.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

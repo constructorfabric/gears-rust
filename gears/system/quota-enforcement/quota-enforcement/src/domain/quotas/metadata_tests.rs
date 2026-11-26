@@ -1,99 +1,90 @@
 #![allow(clippy::expect_used)]
 
-use gts::GtsTypeId;
+use std::sync::Arc;
+
 use quota_enforcement_sdk::MetricId;
 use serde_json::{Map, Value, json};
 
-use super::validate_metadata;
-use crate::domain::catalog::{
-    CatalogBuilder, CatalogConfig, ConstraintContract, ProjectionContractCatalog,
-};
+use super::{check, violations};
+use crate::domain::catalog::ServedMetric;
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::{ValidationReason, ValidationSurface};
 use crate::domain::tokens;
-use crate::test_support::{
-    FakeContractRegistry, LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_USER_PROJECTION,
-    METRIC_TOKENS, RecordingMetrics,
-};
-
-async fn catalog() -> ProjectionContractCatalog {
-    let registry = FakeContractRegistry::llm_gateway();
-    let metrics = RecordingMetrics::default();
-    CatalogBuilder::new(&registry, &metrics)
-        .build(&CatalogConfig {
-            subject_projections: vec![
-                GtsTypeId::try_new(LLM_USER_PROJECTION).expect("type"),
-                GtsTypeId::try_new(LLM_TENANT_PROJECTION).expect("type"),
-            ],
-            resource_projections: Vec::new(),
-        })
-        .await
-        .expect("catalogue")
-}
-
-fn token_constraint(catalog: &ProjectionContractCatalog) -> &ConstraintContract {
-    &catalog
-        .request_contract(&MetricId::parse(METRIC_TOKENS).expect("metric"))
-        .expect("token request contract")
-        .constraint
-}
+use crate::test_support::{METRIC_TOKENS, RecordingMetrics, test_catalog};
 
 fn object(value: &Value) -> Map<String, Value> {
     value.as_object().cloned().expect("object")
 }
 
+/// The fixture metric: `metadata` declares `region` and `model`, both strings.
+async fn tokens() -> Arc<ServedMetric> {
+    test_catalog()
+        .0
+        .served(
+            &MetricId::parse(METRIC_TOKENS).expect("metric"),
+            ValidationSurface::QuotaWrite,
+        )
+        .await
+        .expect("served")
+}
+
+fn paths(schema: &Value, metadata: &Value) -> Vec<String> {
+    violations(schema, &object(metadata))
+        .into_iter()
+        .map(|v| v.path)
+        .collect()
+}
+
 #[tokio::test]
-async fn conforming_metadata_returns_the_contract_reference_and_records_nothing() {
-    let catalog = catalog().await;
+async fn conditions_on_declared_properties_of_the_registered_type_pass() {
     let metrics = RecordingMetrics::default();
-    let reference = validate_metadata(
-        &object(&json!({ "regions": ["eu"], "weight": 5 })),
-        token_constraint(&catalog),
-        4096,
-        &metrics,
-    )
-    .expect("conforming");
-    assert_eq!(reference.type_id.as_ref(), LLM_TOKEN_CONSTRAINT);
-    assert_eq!(reference.version, 1);
+    let served = tokens().await;
+    for metadata in [
+        json!({}),
+        json!({ "region": "eu" }),
+        json!({ "region": ["eu", "us"], "model": "m-1" }),
+    ] {
+        check(&metrics, &served, &object(&metadata), 4096).expect("fits");
+    }
     assert!(metrics.contract_failures().is_empty());
 }
 
 #[tokio::test]
-async fn a_contract_violation_is_a_failed_precondition_recorded_on_the_arbitration_surface() {
-    let catalog = catalog().await;
+async fn each_condition_that_does_not_fit_is_one_violation_and_nothing_else_is_checked() {
     let metrics = RecordingMetrics::default();
-    let err = validate_metadata(
-        &object(&json!({ "regions": ["eu"], "weight": "heavy" })),
-        token_constraint(&catalog),
-        4096,
+    let served = tokens().await;
+    let err = check(
         &metrics,
+        &served,
+        &object(&json!({ "regions": ["eu"], "region": 7, "model": "m-1" })),
+        4096,
     )
-    .expect_err("the contract types weight");
-    assert_eq!(
-        err,
-        DomainError::ConstraintContractMismatch {
-            contract: LLM_TOKEN_CONSTRAINT.to_owned()
-        }
-    );
+    .expect_err("does not fit");
+    let DomainError::QuotaMetadataRejected { violations } = err else {
+        panic!("rejection expected: {err:?}");
+    };
+    let paths: Vec<&str> = violations.iter().map(|v| v.path.as_str()).collect();
+    assert_eq!(paths, ["/region", "/regions"]);
     assert_eq!(
         metrics.contract_failures(),
         vec![(
-            ValidationSurface::Arbitration,
+            ValidationSurface::QuotaWrite,
             ValidationReason::SchemaViolation
         )]
     );
 }
 
 #[tokio::test]
-async fn the_size_limit_applies_to_the_canonical_json_and_is_checked_first() {
-    let catalog = catalog().await;
+async fn the_size_limit_is_checked_first() {
     let metrics = RecordingMetrics::default();
-    let metadata = object(&json!({ "regions": ["eu"], "weight": 5 }));
-    let exact = serde_json::to_vec(&metadata).expect("json").len();
-    validate_metadata(&metadata, token_constraint(&catalog), exact, &metrics)
-        .expect("exactly at the limit");
-    let err = validate_metadata(&metadata, token_constraint(&catalog), exact - 1, &metrics)
-        .expect_err("one byte over");
+    let served = tokens().await;
+    let err = check(
+        &metrics,
+        &served,
+        &object(&json!({ "blob": "x".repeat(64) })),
+        16,
+    )
+    .expect_err("oversize");
     assert_eq!(
         err,
         DomainError::InvalidArgument {
@@ -101,18 +92,46 @@ async fn the_size_limit_applies_to_the_canonical_json_and_is_checked_first() {
             reason: tokens::METADATA_TOO_LARGE
         }
     );
+    assert!(metrics.contract_failures().is_empty());
+}
+
+#[test]
+fn a_condition_takes_a_scalar_property_and_values_of_its_type_and_enum() {
+    let schema = json!({
+        "allOf": [
+            { "$ref": "gts://base" },
+            { "properties": { "metadata": { "allOf": [
+                { "properties": {
+                    "tier": { "type": "string", "enum": ["gold", "silver"] },
+                    "gpus": { "type": "integer" },
+                } },
+                { "properties": {
+                    "spot": { "type": "boolean" },
+                    "rate": { "type": "number" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                } },
+            ] } } },
+        ]
+    });
     assert!(
-        metrics.contract_failures().is_empty(),
-        "a size rejection is not a contract violation"
+        paths(
+            &schema,
+            &json!({ "tier": ["gold"], "gpus": 8, "spot": false })
+        )
+        .is_empty()
     );
-    // Key order does not change the measured size. The size is the invariant,
-    // not the bytes: whether `serde_json::Map` sorts keys or keeps insertion
-    // order depends on whose `preserve_order` feature is unified into the
-    // build, and reordering keys cannot change the byte count either way.
-    let reordered = object(&json!({ "b": 1, "a": 2 }));
-    let ordered = object(&json!({ "a": 2, "b": 1 }));
     assert_eq!(
-        serde_json::to_vec(&reordered).expect("json").len(),
-        serde_json::to_vec(&ordered).expect("json").len()
+        paths(
+            &schema,
+            &json!({
+                "tier": "bronze",
+                "gpus": [1, "2"],
+                "spot": [],
+                "rate": 1,
+                "tags": "a",
+                "a/b": 1,
+            })
+        ),
+        ["/a~1b", "/gpus", "/rate", "/spot", "/tags", "/tier"]
     );
 }

@@ -63,9 +63,14 @@ model-registry = ["dep:model_registry"]
 usage-collector = ["dep:usage_collector"]
 timescaledb-usage-collector = ["dep:timescaledb_usage_collector_plugin"]
 clickhouse-usage-collector = ["dep:clickhouse_usage_collector_plugin"]
-# Quota Enforcement gear, its storage plugin, and the platform cluster gear it
-# elects its sweepers on (with grpc-hub, which cluster requires). Opt-in.
+# Quota Resolver gateway; runs without a backend, quota operations then fail
+# until a plugin is registered.
+quota-resolver = ["dep:quota_resolver"]
+# Quota Enforcement gear, its storage plugin, the Quota Resolver whose backend it
+# is, and the platform cluster gear it elects its sweepers on (with grpc-hub,
+# which cluster requires). Opt-in.
 quota-enforcement = [
+    "quota-resolver",
     "dep:quota_enforcement",
     "dep:quota_enforcement_storage_plugin",
     "dep:cluster",
@@ -168,6 +173,8 @@ bss_rate_provider_http_json_plugin = { package = "cf-gears-bss-rate-provider-htt
 usage_collector = { package = "cf-gears-usage-collector", path = "../../gears/system/usage-collector/usage-collector", optional = true }
 timescaledb_usage_collector_plugin = { package = "cf-gears-timescaledb-usage-collector-plugin", path = "../../gears/system/usage-collector/plugins/timescaledb-usage-collector-plugin", optional = true }
 clickhouse_usage_collector_plugin = { package = "cf-gears-clickhouse-usage-collector-plugin", path = "../../gears/system/usage-collector/plugins/clickhouse-usage-collector-plugin", optional = true }
+# Optional Quota Resolver gateway
+quota_resolver = { package = "cf-gears-quota-resolver", path = "../../gears/system/quota-resolver/quota-resolver", optional = true }
 # Optional Quota Enforcement gear + its plugins
 quota_enforcement = { package = "cf-gears-quota-enforcement", path = "../../gears/system/quota-enforcement/quota-enforcement", optional = true }
 quota_enforcement_storage_plugin = { package = "cf-gears-quota-enforcement-storage-plugin", path = "../../gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin", optional = true }

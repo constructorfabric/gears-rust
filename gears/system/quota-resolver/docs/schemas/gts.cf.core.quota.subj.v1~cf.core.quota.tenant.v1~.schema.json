@@ -1,0 +1,23 @@
+{
+  "$id": "gts://gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "The tenant quota subject type. Its id is the tenant id; in a request it must name the request's tenant. Final: no type derives from it.",
+  "x-gts-final": true,
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.quota.subj.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "format": "uuid",
+          "description": "The tenant id."
+        }
+      }
+    }
+  ]
+}

@@ -101,9 +101,10 @@ Two needs shape this entry point:
 | Principal      | Whoever authenticated: a person, a service account, a system actor. `SecurityContext` carries its type (the **principal type**, a GTS type id), its id, and its tenant. |
 | Quota subject  | Whom a quota applies to: a quota subject type (a GTS type id derived from the resolver's quota subject base, for example a user or a tenant type) and an opaque id.     |
 | Principal form | A subject given as a principal type and a principal id. The resolver maps it to a quota subject.                                                                        |
+| Metric         | What is counted, for example model tokens: a GTS type derived from the resolver's metric base `gts.cf.core.quota.metric.v1~`. The module that owns the metric registers the type; its type id names the metric. |
+| Metric object  | How a debit or a lease acquisition names its metric: the metric type, an optional id of the one thing the amount is counted for (for example a model or a virtual machine), and metadata, the attributes of the operation that the backend's policies read. |
 | Amount         | A positive integer in the smallest unit that the metric defines, for example MiB rather than a fraction of a GB.                                                        |
-| Metric         | A registered GTS instance id that names what is counted, for example model tokens.                                                                                      |
-| Charge         | An allowed debit or a lease commit, named by the idempotency key of that call.                                                                                          |
+| Charge         | An allowed debit or a lease commit, named by its operation (debit or lease commit) and the idempotency key of that call.                                                 |
 | Lease          | A hold on capacity for a bounded time, settled by commit (charge what was used) or release (charge nothing), or released when it expires.                               |
 | Decision       | The verdict of a debit or a lease acquisition: allowed or denied. A denial is a successful call, not an error.                                                          |
 | Platform plane | Calls authenticated as a platform service (`PlatformSecurityContext`). The service is trusted to name the tenant and the subjects.                                      |
@@ -143,14 +144,14 @@ request's `SecurityContext` and passes them as request data.
 This module introduces no environment constraints beyond project defaults: see
 [docs/ARCHITECTURE_MANIFEST.md](../../../../docs/ARCHITECTURE_MANIFEST.md) and [guidelines/](../../../../guidelines/).
 
-**Quota kinds.** The backend applies quotas of three kinds. The kind belongs to the quota: a module charges a metric,
-and the backend applies every quota on that metric by its kind. The resolver does not read the kind; the module knows
-which kind its metric uses and calls the matching operations.
+**Quota types.** The backend applies quotas of three types. The type belongs to the quota: a module charges a metric,
+and the backend applies every quota on that metric by its type. The resolver does not read the type; the module knows
+which type its metric uses and calls the matching operations.
 
-| Kind          | What it bounds                                                            | How a module charges                                                                                                                  | How capacity comes back                                                                                                                                        |
+| Type          | What it bounds                                                            | How a module charges                                                                                                                  | How capacity comes back                                                                                                                                        |
 |---------------|---------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Rate limiting | The amount in a moving time window, for example 100 requests a minute     | A debit when it admits the work                                                                                                       | By itself, as the window moves; a return fails with an error                                                                                                   |
-| Consumption   | The amount used in a period, for example 1 M tokens a month               | A debit before work whose cost is known, or a lease before work whose cost is known only afterwards, held for the most the work can use and committed for the actual amount | At the period reset. A return gives back a charge for work that failed, in the current period; a released lease and the unused part of a commit charge nothing |
+| Rate limiting | The amount in a moving time window, for example 100 requests a minute     | A debit when it admits the work                                                                                                       | By itself, as the window moves; a return gives nothing back                                                                                                    |
+| Consumption   | The amount used in a period, for example 1 M tokens a month               | A debit before work whose cost is known, or a lease before work whose cost is known only afterwards, held for the most the work can use and committed for the actual amount | At the period reset. A return gives back a charge for work that failed, in the current period and inside the return window, a time after the charge that the backend states; a released lease and the unused part of a commit charge nothing |
 | Allocation    | The amount held at one time, with no period, for example 20 parallel jobs | A lease while the resource is created, committed when it exists, or a debit. Growing a resource charges the added amount the same way | By a return: the whole amount when the resource is deleted, the removed part when it is reduced. A released lease charges nothing                              |
 
 ## 4. Scope
@@ -174,7 +175,9 @@ which kind its metric uses and calls the matching operations.
 * Authorization of platform-plane callers by the policy decision point.
 * Quota notifications.
 * Reconciliation of held allocation with the resources that exist: a resource deleted without a return keeps its
-  capacity held until the module returns it or the operator corrects the quota through the backend's own API.
+  capacity held until the module returns it. Comparing held amounts with the resources that exist is the task of a
+  component above the resolver and its backend that reads the records of the Usage Collector, the gear that stores
+  measured usage, and the quota state.
 
 ## 5. Functional Requirements
 
@@ -185,7 +188,9 @@ which kind its metric uses and calls the matching operations.
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-debit`
 
 The system **MUST** charge a positive amount of one metric for a set of subjects in one tenant and return a decision.
-An allowed decision means the amount is charged; a denied decision means nothing is charged.
+The request names the metric as a metric object; the backend's policies evaluate its metadata. The resolver passes
+the metric object to the backend unchecked. An allowed decision means the amount is charged; a denied decision means
+nothing is charged.
 
 - **Rationale**: Modules charge consumption after or while doing work.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`
@@ -210,23 +215,31 @@ above a cap, is metered outside quotas.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-return`
 
-The system **MUST** return a positive amount of a charge, named by the charge's idempotency key, in one tenant. The
-return reaches the quotas, subjects, and metric that the charge reached, never others. Each quota takes the return by
-its kind:
+The system **MUST** return a positive amount of a charge, named by the charge's operation and idempotency key, in one
+tenant. The return reaches the quotas, subjects, and metric that the charge reached, never others. Each quota takes
+the return by its type:
 
 * allocation: the held amount decreases, so the capacity becomes available again;
 * consumption: the consumed amount of the period of the charge decreases;
-* rate limiting: the return fails.
+* rate limiting: nothing comes back; the window moves by itself.
 
 A module returns allocation when it deletes or reduces a resource, and consumption when work it charged for fails. A
-charge **MUST** stay returnable on allocation quotas until all of it is returned, and on consumption quotas until its
-period ends, whatever the backend's window for repeated calls. A return that exceeds what remains of the charge, names
-an unknown charge, or meets a rate-limiting quota **MUST** fail with an error and change nothing. Each growth of a
-resource is a separate charge with its own key, so a module returns every charge of a resource when it deletes the
-resource. Release only cancels a lease that is not committed; it does not return an amount after a commit.
+charge **MUST** stay returnable on allocation quotas until all of it is returned, or until the backend no longer
+applies any of those quotas, for example because the operator has deactivated them. On consumption quotas it **MUST**
+stay returnable for the return window, and not after the backend has closed the period of the charge. A return that
+exceeds what remains of the charge, names an unknown charge, or gives nothing back on any quota of the charge **MUST**
+fail with an error and change nothing. A repeated return with the same key inside the backend's replay window
+(`cpt-cf-quota-resolver-fr-idempotency`) **MUST** get the first result and give nothing back again. Each growth of a
+resource is a separate charge with its own key, so a module returns every
+charge of a resource when it deletes the resource. The module that made a charge is the only one that can return it,
+so it is responsible for delivering the return: it records the intent to return in the same transaction that deletes
+or reduces the resource, and repeats the call until it succeeds. The module builds the key of a charge from its own
+data, for example the resource id and the number of the growth, so that it can send the return again at any later
+time without reading anything from the resolver. Release only cancels a lease that is not committed; it does not
+return an amount after a commit.
 
 - **Rationale**: Allocation capacity stays held after a commit until the module gives it back, and a charge for work
-that failed must not count against the period. One return for both kinds keeps the module from knowing which kinds of
+that failed must not count against the period. One return for both types keeps the module from knowing which types of
 quotas the backend applies. Naming the charge keeps a module from returning capacity that another resource holds, and
 keeps a return correct when the principal mapping changes after the charge.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`
@@ -247,9 +260,11 @@ expired lease frees capacity that the work still uses.
 
 - [ ] `p2` - **ID**: `cpt-cf-quota-resolver-fr-multi-metric`
 
-Debit and lease acquisition **MUST** accept several metrics, each with its own amount, for the same subjects, and apply
-all of them or none: if one metric is denied or fails, nothing is charged. A commit **MUST** take the actual amount of
-each metric of the lease, and a return the amount of each metric of the charge, also all or none.
+Debit and lease acquisition **MUST** accept several metric items, each a metric object and its amount, for the same
+subjects, and apply all of them or none: if one metric is denied or fails, nothing is charged. Each item carries its
+own metadata; an attribute common to several items is repeated in each. A commit **MUST** take the actual amount of
+each metric of the lease, and a return the amount of each metric of the charge, each named by its metric type id, also
+all or none.
 
 - **Rationale**: One resource often needs several metrics together. A partly charged set holds capacity that no work
 can use.
@@ -264,6 +279,11 @@ backend applies to them: cap, consumed amount, remaining amount, and, for a quot
 with its reset time. The
 backend decides which quotas apply, including quotas of the tenant; the resolver returns the backend's page unchanged.
 
+A request names each metric by its metric type and **MAY** add the `metadata` of the metric object of a request that
+the caller is about to make. A backend can limit a quota to requests with certain attributes; with the metadata the
+read returns only the quotas that apply to such a request, and without it the quotas whatever attributes they are
+limited to.
+
 - **Rationale**: Modules and users must see remaining capacity before they start work.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`, `cpt-cf-quota-resolver-actor-end-user`
 
@@ -272,16 +292,22 @@ backend decides which quotas apply, including quotas of the tenant; the resolver
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-idempotency`
 
 Debit, lease acquisition, lease extension, commit, release, and return **MUST** require an idempotency key and pass it
-to the backend unchanged. A repeated call with the same key and the same request **MUST** return the first result and
-charge nothing again. A call that reuses a key with a different request is a caller error; the backend decides its
+to the backend unchanged. A repeated call with the same key and the same request inside the backend's **replay
+window** **MUST** return the first result and charge nothing again. The replay window is the time for which the
+backend keeps the result of a call under its key; the backend states its length (the quota-enforcement backend: 24
+hours by default). The backend may treat a repeat after the replay window as a new call, so a calling module **MUST
+NOT** retry a call later than that. A call that reuses a key with a different request is a caller error; the backend
+decides its
 outcome. The outcome for a principal that is not mapped is decided again on every call and charges nothing.
+A backend may also decide again a denial that it made because no quota applied: it charged nothing, and a quota may
+exist by the time of the repeat.
 
 A calling module **MUST** reuse a key only to retry the same call. No other call in the same tenant and operation, of
 this module or another one, may use it. A module **MUST NOT** pass as a key, as is, a value that other modules also see,
 such as a request id (it may build the key from that value, for example by adding its own name).
 
-- **Rationale**: Callers retry after timeouts; a retry must not charge twice. The resolver passes no caller identity to
-the backend, so the keys of all modules share one space in a tenant and operation.
+- **Rationale**: Callers retry after timeouts; a retry must not charge twice. The caller's identity is not part
+of a key's scope, so the keys of all modules share one space in a tenant and operation.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`
 
 ### 5.2 Subjects and Planes
@@ -290,7 +316,10 @@ the backend, so the keys of all modules share one space in a tenant and operatio
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-subject-forms`
 
-A platform-plane request **MUST** accept each subject either as a quota subject or in the principal form.
+A platform-plane request **MUST** accept each subject either as a quota subject or in the principal form. A request
+for a debit or a lease acquisition **MUST** name at least one subject, and a request for quota state exactly one. A
+subject of the tenant quota subject type **MUST** name the request's tenant; a request that charges only the tenant
+names that subject.
 
 - **Rationale**: A module charges both principals and subjects that are not principals, such as a device or an agent.
 - **Actors**: `cpt-cf-quota-resolver-actor-consuming-module`
@@ -312,7 +341,7 @@ quota subject types.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-platform-plane`
 
-The platform plane **MUST** offer debit, lease acquisition, lease extension, commit, release, return, and quota state.
+The platform plane **MUST** offer debit, lease acquisition, commit, release, return, and quota state.
 It **MUST** be callable only with a platform service credential and **MUST NOT** be reachable from the edge. The tenant
 and the subjects come from the request. A module that charges the principal of a user request passes that principal and
 its tenant as request data, taken from the request's `SecurityContext`; the user's `SecurityContext` is neither
@@ -341,7 +370,11 @@ authorized to charge, because it decides the metric and the amount; the user is 
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-fr-plugin-delegation`
 
 The system **MUST** execute every operation through a backend plugin discovered through types-registry and selected by
-vendor and priority, and **MUST NOT** store quota data itself.
+vendor and priority, and **MUST NOT** store quota data itself. The resolver keeps no record of operations. It **MUST** pass
+the platform identity that it receives from the caller to the plugin, and the backend **MUST** record that identity
+with every operation that changes a counter. The backend **MUST NOT** authorize by that identity. The record is not an
+audit log: the identity names the calling service only when the caller runs in another process; the platform gives a
+caller in the same process no identity of its own, and the record then names no module.
 
 - **Rationale**: Quota state belongs to the backend; consuming modules must not depend on a particular backend.
 - **Actors**: `cpt-cf-quota-resolver-actor-backend-plugin`
@@ -399,18 +432,32 @@ p95 latency **MUST** be at most the backend's p95 latency threshold plus 5 ms.
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-nfr-availability`
 
 Once the principal type and the plugin of a call are resolved, the call **MUST** depend on the plugin only, so calls
-through the resolver meet the backend's availability target. At start the resolver needs no other gear: it checks only
-the form of its configuration. types-registry is needed only to resolve the plugin on the first call after start and,
-once, for a principal type without its own configuration entry; a failed or timed-out lookup fails the call with
+through the resolver meet the backend's availability target. At start the resolver checks the form of
+its configuration and publishes its GTS types to types-registry: the process does not start while types-registry
+does not admit them. After start, types-registry is
+needed only to resolve the plugin on the first call and for a principal type without its own configuration
+entry (once for a registered type, on every call for an unregistered one); a lookup that types-registry does not answer,
+or does not answer in time, fails the call with
 `ServiceUnavailable`.
 
 A calling module **MUST** limit each call by its own deadline. It **MAY** retry a call that failed with
-`ServiceUnavailable` or ran past its deadline; a retried write **MUST** reuse its idempotency key. If charging stays
+`ServiceUnavailable` or `Aborted`, or ran past its deadline; a retried write **MUST** reuse its idempotency key.
+`Aborted` means that the backend could not take a lock in time, for example because an earlier attempt of the same
+call is still running. A backend **MUST** answer `Aborted` only when a repeat of the same call with the same key can
+succeed. A key that is already in use for another request is a different error, `AlreadyExists`: the module **MUST
+NOT** retry it and **MUST NOT** treat it as unavailable charging, because every repeat fails the same way: the module
+reused a key, or the operator changed the mapping of the principal between the attempts (ADR-0002), and a new charge
+needs a new key. When it answers a retry, the outcome of the first attempt is unknown, and that attempt may have
+charged: before it charges under a new key, the module returns the whole amount of the first attempt's charge, named
+by that attempt's key (`cpt-cf-quota-resolver-fr-return`). A return that names an unknown charge means that the
+first attempt charged nothing. A lease acquisition makes no charge; a lease that its first attempt may hold ends when
+its time runs out. If charging stays
 unavailable, the module decides whether to do the work without a charge.
 
 - **Threshold**: availability of calls through the resolver is at least the backend's target, over the backend's
-  measurement period (for the quota-enforcement backend: 99.95% per calendar month); 0 failed calls for resolved
-  principal types during a types-registry outage.
+  measurement period (for the quota-enforcement backend: 99.95% per calendar month); 0 failed calls caused by the
+  resolver for resolved principal types during a types-registry outage. A backend can need types-registry itself:
+  the quota-enforcement backend reads a metric type and a subject type on their first use on each replica.
 - **Rationale**: The resolver fails closed, so a dependency it adds to a call would stop charged work on its outage.
 
 ### 6.2 NFR Exclusions
@@ -428,7 +475,7 @@ unavailable, the module decides whether to do the work without a charge.
 - **Type**: Two Rust traits in the SDK crate, one per plane, each with a REST projection: the platform plane under
 `/quota-resolver/v1/platform`, the tenant plane under `/quota-resolver/v1`, as in types-registry.
 - **Stability**: unstable.
-- **Description**: Platform plane: debit, lease acquire, lease extension, commit, release, return, and quota state.
+- **Description**: Platform plane: debit, lease acquire, commit, release, return, and quota state.
 Tenant plane: quota state,
 with the same operation name.
 - **Breaking Change Policy**: Major version bump of the contract.
@@ -440,7 +487,9 @@ with the same operation name.
 - [ ] `p1` - **ID**: `cpt-cf-quota-resolver-contract-backend-plugin`
 
 - **Direction**: required from the plugin.
-- **Protocol/Format**: in-process Rust trait. Requests carry the tenant and quota subjects only, never a principal.
+- **Protocol/Format**: in-process Rust trait. Requests carry the tenant and quota subjects only, never a principal. A
+debit or lease acquisition request carries its metric objects as the caller sent them; the backend checks them against
+their metric types.
 - **Compatibility**: Major version bump of the plugin contract for any breaking change.
 
 ## 8. Use Cases
@@ -539,8 +588,8 @@ with the same operation name.
 
 **Main Flow**:
 1. To create a resource, the module acquires a lease on the platform plane for the amount the resource needs.
-2. It creates the resource and commits the lease. The commit's idempotency key names the charge, for example the
-   resource id.
+2. It creates the resource and commits the lease. The commit's idempotency key names the charge; the module builds
+   it from its own name, the resource id, and the step, for example `compute:vm-123:create`.
 3. To grow the resource, it charges the added amount the same way, under a new key.
 4. To reduce the resource, it returns the removed amount from one or more charges of the resource.
 5. To delete the resource, it returns what remains of every charge of the resource.
@@ -560,22 +609,23 @@ naming a quota subject type.
 - [ ] A principal that is not mapped is denied a debit or a lease acquisition and gets an empty quota state page,
 without a backend call.
 - [ ] With no plugin or an unavailable backend, no operation returns an allowed decision or a lease.
-- [ ] A return of a charge makes the returned amount available again on the allocation and consumption quotas that the
-charge reached, also after the backend's window for repeated calls; a return above what remains of the charge, or on a
-rate-limiting quota, fails and changes nothing.
+- [ ] A return of a charge makes the returned amount available again on the allocation quotas that the charge reached,
+for as long as the charge holds an amount there, and on its consumption quotas inside the return window and before the
+backend closes the period of the charge; a return above what remains of the charge, or one that gives nothing back on
+any quota of the charge, fails and changes nothing.
 
 ## 10. Dependencies
 
 | Dependency            | Description                                                                     | Criticality |
 |-----------------------|---------------------------------------------------------------------------------|-------------|
-| types-registry        | Plugin discovery; ancestors of principal types for the mapping                  | p1          |
-| Quota backend plugin  | Quotas of each kind, counters, leases, idempotency, and evaluation              | p1          |
+| types-registry        | SDK type registration; plugin discovery; whether a principal type is registered | p1          |
+| Quota backend plugin  | Quotas of each type, counters, leases, idempotency, and evaluation              | p1          |
 | AuthN and api-gateway | `SecurityContext` and `PlatformSecurityContext` of the caller; edge publication | p1          |
 
 ## 11. Assumptions
 
-* Principal types are GTS types that derive from a platform principal base, so their ancestors resolve in
-  types-registry (issue #5446).
+* Principal types are GTS types that derive from a platform principal base, so the ancestors of a type are part of its
+  type id (issue #5446).
 * A platform-plane caller is trusted to name the tenant and the subjects, as for other platform-plane resolvers.
 
 ## 12. Risks
@@ -584,8 +634,8 @@ rate-limiting quota, fails and changes nothing.
 |-----------------------------------------------------------|--------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------|
 | A platform service charges the wrong subject              | Wrong quota charged                              | Platform plane only for platform services; the principal of a user request comes from its `SecurityContext`                        |
 | The mapping points to a type the metric does not admit    | Every debit for that principal type fails        | The backend rejects it as an invalid request; the resolver logs the misconfiguration                                               |
-| A resource is deleted without a return                    | Its allocation capacity stays held               | The module reconciles its resources; the operator corrects the quota through the backend's own API                                 |
-| A platform service charges or returns quota in any tenant | Another tenant's quota is used up or freed       | Platform routes are internal and need a platform credential; authorization of platform-plane callers when the platform supports it |
+| A resource is deleted without a return                    | Its allocation capacity stays held               | The module delivers every return: it records the intent with the deletion and repeats the call (`cpt-cf-quota-resolver-fr-return`). The operator can raise the cap in the backend until then |
+| A platform service charges or returns quota in any tenant | Another tenant's quota is used up or freed       | Platform routes are internal and need a platform credential. Authorization of the calling service is tracked in #6037. |
 | A module returns another module's charge                  | Capacity is freed that this module never charged | Keys are unique across modules (`cpt-cf-quota-resolver-fr-idempotency`)                                                            |
 
 ## 13. Open Questions

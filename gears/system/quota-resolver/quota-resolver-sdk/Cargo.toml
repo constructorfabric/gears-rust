@@ -1,0 +1,48 @@
+[package]
+name = "cf-gears-quota-resolver-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for quota_resolver gear: platform and tenant quota contracts, plugin contract, quota GTS base types"
+repository.workspace = true
+keywords = ["constructorfabric", "cf-gears", "quota"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "quota_resolver_sdk"
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+utoipa = { workspace = true }
+
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-contract = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+
+toolkit-http = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+[features]
+rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http", "dep:secrecy"]
+rest-server = ["toolkit-contract/rest-server", "dep:axum"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"] }
+types-registry = { package = "cf-gears-types-registry", path = "../../types-registry/types-registry" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../../types-registry/types-registry-sdk" }

@@ -1,0 +1,49 @@
+[package]
+name = "cf-gears-quota-resolver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Quota resolver gear - maps principals to quota subjects and delegates quota operations to a backend plugin"
+repository.workspace = true
+keywords = ["constructorfabric", "cf-gears", "quota"]
+categories = ["development-tools"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "quota_resolver"
+
+[lints]
+workspace = true
+
+[dependencies]
+quota-resolver-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-gts = { workspace = true }
+
+axum = { workspace = true }
+gts = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+opentelemetry = { workspace = true }
+tracing = { workspace = true }
+inventory = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+
+[dev-dependencies]
+chrono = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tokio-util = { workspace = true }
+tracing-test = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["test-util"] }

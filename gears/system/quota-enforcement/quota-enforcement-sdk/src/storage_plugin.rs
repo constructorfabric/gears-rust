@@ -5,11 +5,13 @@
 //!
 //! # Invariants every implementation upholds
 //!
-//! - **I1 Atomicity.** Counter changes, idempotency, outbox events, and the
-//!   operation log commit in one transaction.
-//! - **I2 Idempotency.** Replay returns the original outcome; a different
-//!   payload under the same scope returns
-//!   [`StorageError::IdempotencyPayloadMismatch`].
+//! - **I1 Atomicity.** Counter changes, charges, idempotency, outbox events,
+//!   and the operation log commit in one transaction.
+//! - **I2 Idempotency.** A key is scoped by `(tenant, operation, key)`.
+//!   Replay returns the original outcome; a different payload under the same
+//!   scope, other subjects included, returns
+//!   [`StorageError::IdempotencyPayloadMismatch`]. The charge of an allowed
+//!   debit or lease commit answers for it for as long as the charge lives.
 //! - **I3 Read-only.** Reads do not mutate state, and snapshot reads take no
 //!   row lock. A consumption Quota with no row for its current window reads
 //!   as zero there; the next mutating operation creates the row and closes
@@ -29,25 +31,27 @@
 //! missing artifact rolls back with [`StorageError::PreparationRequired`] so
 //! the caller can compile outside the transaction and retry.
 //!
-//! Every tenant-scoped call receives the caller's [`AccessScope`] unmodified
-//! and binds it through `SecureConn`. No scoped operation runs without it.
+//! Every tenant-scoped call receives the [`AccessScope`] that admission
+//! returned, unmodified, and binds it through `SecureConn`. No scoped
+//! operation runs without it. Every mutation that serves a request also
+//! receives the [`Actor`] the operation log and its events name.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use crate::engine::{EvaluationFailure, EvaluationLimits, TransactionEvaluator};
 use crate::models::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchDebitItem,
-    BootstrapBundle, ConfigDefaults, DeactivateOutcome, EvaluatedDebit, EvaluatedLease,
-    ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId,
-    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
-    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota,
-    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, TransitionOutcome,
+    ActiveQuotaCounts, Actor, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchDebitItem,
+    BootstrapBundle, ChargeReturn, ConfigDefaults, DeactivateOutcome, EvaluatedDebit,
+    EvaluatedLease, ExpiredLease, HeldAllocationCharges, IdempotencyRecord, IdempotencyScope,
+    IdempotencyWrite, LeaseToken, MetricId, NotificationEvent, PageRequest, PageResult,
+    PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion,
+    PolicyVersionMeta, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot,
+    RollbackTarget, TransitionOutcome,
 };
 
 /// Major version of this contract. Coupled to the gear's major version. A
@@ -77,12 +81,33 @@ impl BootstrapBundle {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StorageError {
     // --- operations ---
-    /// No committed debit answers the rollback target: absent record, a record
-    /// that moved no counter, or one authorized under another attribution.
-    #[error("no committed debit is registered under the requested key")]
+    /// No charge answers a rollback or a return: none under its scope, a
+    /// deleted one, or, for a rollback, one with another attribution digest.
+    #[error("no charge is registered under the requested key")]
     OperationNotFound {
         /// The original idempotency key the caller named.
         key: String,
+    },
+    /// A return asks for more than remains of its charge.
+    #[error("return of {requested} exceeds the {remaining} that remains of the charge")]
+    ReturnExceedsCharge {
+        /// The amount the return asked for.
+        requested: u64,
+        /// What remains of the charge.
+        remaining: u64,
+    },
+    /// No entry the amount reaches can take a part of it: each is on a rate
+    /// Quota, or on a consumption Quota outside the return window or in a
+    /// settled period.
+    #[error("no quota of the charge can take the returned amount")]
+    ReturnNotApplicable,
+    /// A return names a metric type other than its charge's.
+    #[error("metric type {requested} is not the charge's {charged}")]
+    MetricTypeMismatch {
+        /// The metric type the request named.
+        requested: String,
+        /// The metric type of the charge.
+        charged: String,
     },
     /// No lease with this token exists inside the caller's authorized scope.
     /// A token belonging to another tenant is reported the same way, so the
@@ -197,7 +222,7 @@ pub enum StorageError {
     #[error("the target period is closed")]
     PeriodClosed,
 
-    // --- metric and contract registry ---
+    // --- metric and subject types ---
     /// The metric is not registered.
     #[error("metric {metric} is not registered")]
     MetricNotRegistered {
@@ -210,10 +235,10 @@ pub enum StorageError {
         /// The metric identifier.
         metric: String,
     },
-    /// The projection type is not registered.
-    #[error("projection {projection} is not registered")]
+    /// The subject type is not registered.
+    #[error("subject type {projection} is not registered")]
     ProjectionNotRegistered {
-        /// The projection type identifier.
+        /// The subject type identifier.
         projection: String,
     },
 
@@ -268,8 +293,9 @@ pub enum StorageError {
 
     // --- bulk envelopes ---
     /// One item of a bulk envelope failed; the whole envelope rolled back.
-    /// Only item-specific failures are wrapped: a failure of the envelope as a
-    /// whole (the backend, a payload mismatch, contention) is raised as is.
+    /// Only item-specific failures are wrapped, an item key that is already
+    /// taken among them: a failure of the envelope as a whole (the backend, a
+    /// mismatch of the envelope's own key, contention) is raised as is.
     #[error("bulk item {index}: {cause}")]
     BulkItem {
         /// Position of the failing item in the request.
@@ -298,29 +324,25 @@ impl StorageError {
 /// transaction under its own locks, so no decision can be computed against a
 /// state the mutation does not then apply to.
 pub struct EvaluatedMutation<'a> {
-    /// PDP-authorized, catalogue-mapped subject set of the operation.
+    /// Admitted subject set of the operation.
     pub applicable: &'a ApplicableQuotas,
     /// Requested amount.
     pub amount: u64,
-    /// Validated request projection value.
+    /// The validated `metadata` of the request's metric object.
     pub request: &'a serde_json::Value,
-    /// Validated resource projection value, `null` when the operation has none.
-    pub resource: &'a serde_json::Value,
-    /// The owner projection the catalogue resolved as this metric's user tier.
-    /// Every other projection is the tenant fallback tier.
-    pub user_projection: Option<&'a gts::GtsTypeId>,
+    /// The `id` of the request's metric object, for the Engine.
+    pub metric_id: Option<&'a str>,
     /// The operator clamp this deployment loaded. The budget is resolved from
     /// it against the policy the transaction selects, never before: the caller
     /// does not know which version that will be, and an activation between the
     /// two would otherwise apply the previous version's requested timeout.
     pub limits: EvaluationLimits,
-    /// Idempotency key and payload digest. The record written under it carries
-    /// the decision this transaction produced.
+    /// Idempotency key and payload digest. The charge or record written under
+    /// it carries the decision this transaction produced.
     pub idempotency: &'a IdempotencyWrite,
-    /// Digest of the authorized, catalogue-mapped attribution. Recorded with
-    /// the outcome so that a rollback can prove it reverses an operation it was
-    /// itself authorized for: the idempotency scope covers tenant and subjects,
-    /// but not the metric or the resource.
+    /// Digest of the authorized attribution ([`AttributionDigest::of`]). The
+    /// charge of an allowed debit keeps it, and so does a lease, for the
+    /// charge of its commit.
     pub authorized: AttributionDigest,
     /// Synchronous, side-effect-free evaluation callback. It performs no I/O,
     /// holds no database handle, and may be retried after preparation.
@@ -383,16 +405,14 @@ impl BatchTimer {
     }
 }
 
-/// One item of an atomic batch together with what only the gear knows about
-/// it: the scope its own authorization produced, and its metric's user tier.
+/// One item of an atomic batch together with the scope its own authorization
+/// produced.
 pub struct BatchEntry<'a> {
     /// The item.
     pub item: &'a BatchDebitItem,
     /// The item's admitted scope. Its Quotas are discovered, read and written
     /// under this scope, never another item's.
     pub scope: &'a AccessScope,
-    /// The owner projection this item's metric treats as its user tier.
-    pub user_projection: Option<&'a gts::GtsTypeId>,
 }
 
 /// An atomic batch under one envelope key. Every item is evaluated, in order,
@@ -402,7 +422,7 @@ pub struct BatchEntry<'a> {
 pub struct EvaluatedBatch<'a> {
     /// Envelope idempotency key and payload digest.
     pub envelope: &'a IdempotencyWrite,
-    /// The items, each with its own scope and user tier.
+    /// The items, each with its own scope.
     pub items: &'a [BatchEntry<'a>],
     /// The cost limit each item's engine runs under. The time limit is the
     /// batch timer's remainder, which supersedes the per-policy timeout.
@@ -431,16 +451,6 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn bootstrap(&self, bundle: &BootstrapBundle) -> Result<(), StorageError>;
 
-    /// Returns distinct `(metric, projection_type)` pairs bound by active
-    /// Quotas for the bootstrap compatibility check.
-    ///
-    /// # Errors
-    ///
-    /// - [`StorageError::Unavailable`] when the backend cannot answer.
-    async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StorageError>;
-
     /// Returns active-Quota counts for lifecycle gauges: zero cap, unbounded
     /// cap, and per metric. Validity windows do not affect the counts.
     ///
@@ -464,7 +474,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn create_quota(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         draft: QuotaDraft,
         events: &[NotificationEvent],
@@ -472,13 +482,10 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     /// Apply `patch` under a row lock and return the committed row (I1, I6,
     /// I11, I14). Every accepted patch increments `record_version` once and
-    /// sets `updated_at`. A `metadata` patch carries the contract it was
-    /// validated against in `constraint_contract`; both are written together.
+    /// sets `updated_at`.
     ///
     /// # Errors
     ///
-    /// - [`StorageError::Internal`] for a `metadata` patch without its
-    ///   `constraint_contract`.
     /// - [`StorageError::QuotaNotFound`] when no row with this id lies inside
     ///   `scope`.
     /// - [`StorageError::QuotaDeactivated`] when the row is deactivated;
@@ -489,7 +496,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn update_quota(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         patch: QuotaPatch,
@@ -511,7 +518,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn deactivate_quota(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         events: &[NotificationEvent],
@@ -530,7 +537,6 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Internal`] for an over-long `filter.ids`.
     async fn read_quotas(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         filter: QuotaFilter,
         page: PageRequest,
@@ -558,7 +564,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn bulk_create_quotas(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &crate::bulk::BulkCreateEnvelope,
     ) -> Result<TransitionOutcome<crate::bulk::BulkCreated>, StorageError>;
 
@@ -577,7 +583,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// item errors are those of `update_quota`.
     async fn bulk_update_quotas(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &crate::bulk::BulkUpdateEnvelope,
     ) -> Result<TransitionOutcome<crate::bulk::BulkUpdated>, StorageError>;
 
@@ -593,7 +599,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// item errors are those of `deactivate_quota`.
     async fn bulk_deactivate_quotas(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &crate::bulk::BulkDeactivateEnvelope,
     ) -> Result<TransitionOutcome<crate::bulk::BulkDeactivated>, StorageError>;
 
@@ -612,8 +618,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ///   different payload (I2).
     /// - [`StorageError::QuotaDeactivated`] when a planned Quota is inactive.
     /// - [`StorageError::LeaseContentionTimeout`] when the wait on a contended
-    ///   row exceeds the metric's budget (I8). The default is 0 ms, so a
-    ///   concurrent writer on the same row is refused at once; nothing was
+    ///   row exceeds the metric's budget (I8). The seeded default is 50 ms; with
+    ///   0 ms a concurrent writer on the same row is refused at once; nothing was
     ///   written and the call is safe to retry.
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     ///
@@ -622,11 +628,16 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// A replay returns `NoOp` with the stored [`crate::Decision`], retention
     /// deadline, and an empty [`crate::MutationResult`].
     ///
-    /// Fresh outcomes are recorded except [`crate::NO_APPLICABLE_QUOTA`], which
-    /// must be re-evaluated after provisioning changes.
+    /// An allowed debit writes a charge, which is its record: the request
+    /// fingerprint, the attribution digest, the decision, the metric, the
+    /// amount, and per plan entry its chain, position, Quota, period, and
+    /// charged amount. Its retention deadline is the end of its return window.
+    /// A denial writes an idempotency record, except
+    /// [`crate::NO_APPLICABLE_QUOTA`], which must be re-evaluated after
+    /// provisioning changes.
     async fn apply_debit_plan(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
@@ -636,16 +647,22 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// A failure on any item leaves the whole batch unwritten; a denied batch
     /// records its decisions and moves no counter. The record expires after
     /// the longest idempotency retention configured for any item's metric.
+    /// An applied batch writes one `debit` charge per item under the item's
+    /// key. A batch is replayed only as a whole, by its envelope key.
     ///
     /// # Errors
     ///
     /// The variants of [`QuotaEnforcementStoragePluginV1::apply_debit_plan`],
-    /// raised for the first item that fails, and
+    /// raised for the first item that fails;
+    /// [`StorageError::IdempotencyPayloadMismatch`] at the first item whose
+    /// key already names a `debit` charge or the record of a denied debit,
+    /// wrapped in [`StorageError::BulkItem`] and checked under the item keys'
+    /// locks, which changes nothing; and
     /// [`StorageError::BatchTimeout`] when the batch timer runs out before the
     /// write phase.
     async fn apply_batch_debit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         batch: &EvaluatedBatch<'_>,
         events: &[NotificationEvent],
@@ -653,9 +670,9 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     /// Credit one named Quota, returning consumption to it.
     ///
-    /// Storage completes the idempotency scope from the locked Quota row and
-    /// checks replay before fresh-credit guards. Thus a credit that succeeded
-    /// before deactivation still replays.
+    /// Storage checks replay under the locked Quota row before the
+    /// fresh-credit guards. Thus a credit that succeeded before deactivation
+    /// still replays.
     ///
     /// # Errors
     ///
@@ -669,13 +686,13 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay with a
     ///   different payload (I2).
     /// - [`StorageError::LeaseContentionTimeout`] when the wait on a contended
-    ///   row exceeds the metric's budget (I8). The default is 0 ms, so a
-    ///   concurrent writer on the same row is refused at once; nothing was
+    ///   row exceeds the metric's budget (I8). The seeded default is 50 ms; with
+    ///   0 ms a concurrent writer on the same row is refused at once; nothing was
     ///   written and the call is safe to retry.
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
     async fn apply_credit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         amount: u64,
@@ -683,29 +700,61 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Reverses the committed debit named by `target` against its original
-    /// period, at most once (I5).
+    /// Give back part of the charge `ret` names (ADR-0011): unwind the amount
+    /// over its entries (ADR-0010) and apply each by its Quota's type, all or
+    /// nothing. An allocation Quota's held amount decreases; a consumption
+    /// Quota's counter of the charge's period decreases inside the return
+    /// window while that period is not settled; a rate Quota's counter does
+    /// not change. A deactivated Quota takes its part as an active one does,
+    /// and no counter goes below zero. Each entry's returned amount grows by
+    /// its whole part either way.
+    ///
+    /// An applied return writes one return record (key, charge, amount),
+    /// unique per tenant and key, which is deleted with its charge. A repeat
+    /// with the same charge and amount changes nothing and returns `NoOp`
+    /// with an empty plan. The charge is kept for one replay window from now.
     ///
     /// # Errors
     ///
-    /// - [`StorageError::OperationNotFound`] when no matching committed debit
-    ///   exists, including an attribution mismatch. These cases are deliberately
-    ///   indistinguishable to the caller.
-    /// - [`StorageError::PeriodClosed`] when the attribution period was
-    ///   already settled, checked before any write.
-    /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay of this
-    ///   rollback with a different payload (I2).
+    /// - [`StorageError::OperationNotFound`] when no live charge is under
+    ///   the scope.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] when the key names a
+    ///   return of another charge or amount.
+    /// - [`StorageError::MetricTypeMismatch`] when the metric is not the
+    ///   charge's.
+    /// - [`StorageError::ReturnExceedsCharge`] when the amount exceeds what
+    ///   remains of the charge.
+    /// - [`StorageError::ReturnNotApplicable`] when no entry the amount
+    ///   reaches can take a part of it.
     /// - [`StorageError::LeaseContentionTimeout`] when the wait on a contended
-    ///   row exceeds the metric's budget (I8). The default is 0 ms, so a
-    ///   concurrent writer on the same row is refused at once; nothing was
-    ///   written and the call is safe to retry.
+    ///   row exceeds the metric's budget (I8).
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn apply_return(
+        &self,
+        actor: &Actor,
+        scope: &AccessScope,
+        ret: &ChargeReturn,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Give back everything that remains of the charge `target` names, by the
+    /// rules of [`Self::apply_return`], with no key and no return record. On
+    /// a charge with nothing left it changes nothing and returns `NoOp`.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::OperationNotFound`] when no live charge answers the
+    ///   target, including an attribution mismatch. These cases are
+    ///   deliberately indistinguishable to the caller.
+    /// - [`StorageError::ReturnNotApplicable`] when something remains but no
+    ///   entry can take a part of it.
+    /// - [`StorageError::LeaseContentionTimeout`] and
+    ///   [`StorageError::Unavailable`] as for [`Self::apply_return`].
     async fn apply_rollback(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         target: &RollbackTarget,
-        idempotency: &IdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
@@ -724,7 +773,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// plus [`StorageError::LeaseInflightLimitExceeded`] (I7).
     async fn acquire_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         ttl: Duration,
@@ -733,19 +782,20 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// Convert an active lease into a debit. `actual_amount` defaults to the
     /// reserved amount; `Some(0)` returns every hold and commits nothing.
     ///
-    /// The caller cannot know the lease's subject key, so it passes the partial
-    /// write and storage completes the scope from the key the acquisition
-    /// persisted (never from caller input), under the lease row lock. Replay is
-    /// checked before the lease-state guards, so a commit that succeeded before
-    /// its lease was resolved still replays.
+    /// Replay is checked under the commit's key lock before the lease-state
+    /// guards, so a commit that succeeded before its lease was resolved still
+    /// replays. A commit writes the charge of `actual_amount`, which is its
+    /// record and takes its attribution digest from the lease.
     ///
-    /// What is kept per hold is [`crate::models::apportion`]: proportional to
-    /// each hold, with the charged total rounded up.
+    /// The unused part `reserved - actual` is taken back from the holds by
+    /// [`crate::models::unwind`], so every chain keeps exactly `actual`.
     ///
     /// # Errors
     ///
     /// - [`StorageError::LeaseNotFound`] when no such lease lies inside `scope`.
     /// - [`StorageError::LeaseNotActive`] when it is expired (I4) or terminal.
+    /// - [`StorageError::MetricTypeMismatch`] when `metric` is given and is
+    ///   not the lease's; nothing changes.
     /// - [`StorageError::OverCommitNotAuthorized`] when `actual_amount` exceeds
     ///   the reserved amount.
     /// - [`StorageError::IdempotencyPayloadMismatch`] for a replay with a
@@ -753,12 +803,17 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// - [`StorageError::LeaseContentionTimeout`] when the wait on a contended
     ///   row exceeds the configured budget (I8).
     /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the settlement names its lease, amount, metric, key and events"
+    )]
     async fn commit_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
+        metric: Option<&MetricId>,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
@@ -772,7 +827,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// minus the over-commit.
     async fn release_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         idempotency: &PartialIdempotencyWrite,
@@ -788,7 +843,6 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// current window has no row yet reads as zero over that window.
     async fn read_quota_snapshot(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
@@ -798,8 +852,9 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// Selects every active Quota under `scope` whose tenant and metric match
     /// a pair and whose subject is in that pair's subjects. The union is
     /// ordered by `quota_id` ascending and returns each Quota once, however
-    /// many pairs select it; Quotas outside their validity window are
-    /// included. At most `page.limit` rows are returned (a zero limit means
+    /// many pairs select it. Quotas outside their validity window at the
+    /// plugin's clock are included unless `in_window_only` is set, in which
+    /// case they are left out before the page is cut. At most `page.limit` rows are returned (a zero limit means
     /// the default). `next_cursor` is opaque and holds only the last
     /// `quota_id` returned, so the next page resumes after it and a walk to
     /// exhaustion yields each row once; it is `None` on the last page. The
@@ -812,10 +867,10 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// [`StorageError::Unavailable`] when the backend cannot serve the page.
     async fn bulk_read_quota_snapshot(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
+        in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError>;
 
     // --- policies (platform-wide, operator-scoped) ---
@@ -827,7 +882,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// errors leave no version, transition audit or event committed.
     async fn create_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         draft: PolicyDraft,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError>;
@@ -839,7 +894,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// and backend failures are `Internal`. Failures commit no writes or events.
     async fn update_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         update: PolicyUpdate,
         events: &[NotificationEvent],
@@ -854,7 +909,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// `VersionRolledBack`, or a backend failure; no partial transition commits.
     async fn rollback_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         target_version: u32,
         comment: Option<String>,
@@ -868,7 +923,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// `CannotDeleteSeededGlobalPolicy`, `PolicyNotFound`, or a backend failure.
     async fn delete_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
@@ -890,7 +945,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         policy_id: &PolicyId,
     ) -> Result<Option<PolicyVersion>, StorageError>;
 
-    /// Caller-less active-policy snapshot for bootstrap catalogue validation.
+    /// Caller-less snapshot of every active policy version, read at bootstrap.
     ///
     /// # Errors
     /// Backend failure. This is an internal platform read, not a public list API.
@@ -918,7 +973,9 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
 
     // --- idempotency ---
 
-    /// Read-only lookup of a stored record (I3).
+    /// Read-only lookup of a stored record (I3). For a debit or a lease commit
+    /// it also answers from the charge under `scope`, for as long as the
+    /// charge lives.
     async fn lookup_idempotency(
         &self,
         scope: &IdempotencyScope,
@@ -964,7 +1021,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     ) -> Result<Vec<ExpiredLease>, StorageError>;
 
     /// Delete up to `batch_size` idempotency records expired before `before`.
-    /// Returns the number of deleted records.
+    /// Returns the number of deleted records. Charges are not idempotency
+    /// records and are not deleted here.
     async fn reclaim_expired_idempotency(
         &self,
         batch_size: u32,
@@ -978,6 +1036,35 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         batch_size: u32,
         before: OffsetDateTime,
     ) -> Result<u64, StorageError>;
+
+    /// Remove up to `batch_size` charges deleted at `now` (ADR-0011): the
+    /// replay window has passed since their creation and since the last
+    /// return or rollback, and no allocation entry holds an amount on an
+    /// active Quota. The delete checks the rule itself, so a charge that
+    /// became live again or replaced a deleted one under its key stays.
+    /// Their return records go with them. Returns the number removed.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn reclaim_expired_charges(
+        &self,
+        batch_size: u32,
+        now: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
+
+    /// Per metric, the allocation charges whose return window ended before
+    /// `before` and that still hold an amount on an active Quota, with the
+    /// creation time of the oldest. Metrics with none are left out. A backend
+    /// may also count a hold on a deactivated Quota until it releases it.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn read_held_allocation_charge_stats(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<HeldAllocationCharges>, StorageError>;
 }
 
 #[cfg(test)]

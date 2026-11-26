@@ -1,7 +1,6 @@
 //! The sink contract's closed error set and its object safety.
 
 use async_trait::async_trait;
-use toolkit_security::SecurityContext;
 
 use crate::notifications::{DispatchError, QuotaEvent, QuotaNotificationSinkV1};
 
@@ -14,11 +13,7 @@ impl QuotaNotificationSinkV1 for Accepting {
         "accepting"
     }
 
-    async fn dispatch(
-        &self,
-        _ctx: &SecurityContext,
-        _event: QuotaEvent,
-    ) -> Result<(), DispatchError> {
+    async fn dispatch(&self, _event: QuotaEvent) -> Result<(), DispatchError> {
         Ok(())
     }
 }

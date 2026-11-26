@@ -22,8 +22,6 @@ impl ValidatedConfig for EmptyConfig {
         self
     }
 
-    /// Reads no request, resource or arbitration metadata, so no catalogue
-    /// change to any of them can strand a `most-restrictive-wins` policy.
     fn inputs(&self) -> EnvironmentInputs {
         EnvironmentInputs::NONE
     }
@@ -77,8 +75,8 @@ impl QuotaResolutionEngineV1 for MostRestrictiveWins {
             }
             // @cpt-end:cpt-cf-quota-enforcement-algo-most-restrictive-wins:p1:inst-mrw-window
             // @cpt-begin:cpt-cf-quota-enforcement-algo-most-restrictive-wins:p1:inst-mrw-metadata
-            // `request`, `resource` and every `arbitration` value are ignored:
-            // metadata-driven selection is what a `cel` policy is for.
+            // `request` is ignored: selection by the request's metadata beyond
+            // the Quotas' own conditions is what a `cel` policy is for.
             // @cpt-end:cpt-cf-quota-enforcement-algo-most-restrictive-wins:p1:inst-mrw-metadata
             applicable += 1;
             // @cpt-begin:cpt-cf-quota-enforcement-algo-most-restrictive-wins:p1:inst-mrw-satisfiable
@@ -111,15 +109,13 @@ impl QuotaResolutionEngineV1 for MostRestrictiveWins {
                 "contribution": 0,
             }));
         }
-        let mut plan = BTreeMap::new();
+        let mut plan = Vec::new();
         // @cpt-begin:cpt-cf-quota-enforcement-algo-most-restrictive-wins:p1:inst-mrw-return
         let result = if let Some((_, _, _, id)) = binding {
-            plan.insert(
-                id,
-                QuotaDebitPlan {
-                    amount: context.amount,
-                },
-            );
+            plan.push(vec![QuotaDebitPlan {
+                quota_id: id,
+                amount: context.amount,
+            }]);
             if let Some(detail) = details.get_mut(&id.to_string()) {
                 detail["contribution"] = json!(context.amount);
             }

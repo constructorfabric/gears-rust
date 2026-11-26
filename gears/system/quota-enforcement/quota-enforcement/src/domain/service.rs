@@ -1,14 +1,18 @@
 //! The gear's domain service: admission plus the dependencies bootstrap binds.
+//!
+//! It builds every component per call over admission in one of its two
+//! modes: PDP mode for QE's API, bound to the caller's `SecurityContext`, and
+//! trusted mode for the quota resolver plugin (ADR-0009).
 
 use std::sync::{Arc, OnceLock};
 
 use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
 use toolkit_macros::domain_model;
+use toolkit_security::{PlatformIdentity, SecurityContext};
 
-use super::admission::Admission;
-use super::attribution::Attribution;
+use super::admission::{Admission, Gate};
 use super::bootstrap::Bound;
-use super::catalog::ProjectionContractCatalog;
+use super::catalog::MetricCatalog;
 use super::error::{Dependency, DomainError};
 use super::policies::PolicyRuntimeLimits;
 use super::ports::coordination::SingletonCoordinator;
@@ -138,12 +142,12 @@ impl Service {
             })
     }
 
-    /// The published projection contract catalogue.
+    /// The metric catalogue.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::NotReady`] before bootstrap completed.
-    pub fn catalog(&self) -> Result<Arc<ProjectionContractCatalog>, DomainError> {
+    pub fn catalog(&self) -> Result<Arc<MetricCatalog>, DomainError> {
         self.bound
             .get()
             .map(|b| b.catalog.clone())
@@ -152,29 +156,22 @@ impl Service {
             })
     }
 
-    /// The ingress step of every subject-based evaluation operation: shape
-    /// check, PDP admission of the attribution tuple, catalogue mapping.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomainError::NotReady`] before bootstrap completed.
-    pub fn attribution(&self) -> Result<Attribution<'_>, DomainError> {
-        let bound = self.bound.get().ok_or(DomainError::NotReady {
-            dependency: Dependency::Catalog,
-        })?;
-        Ok(Attribution::new(
-            &self.admission,
-            &bound.catalog,
-            self.admission.metrics(),
-        ))
-    }
-
-    /// The shared operator policy lifecycle.
+    /// The shared operator policy lifecycle for one call of QE's API.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::NotReady`] before bootstrap publishes the dependencies.
-    pub fn policies(&self) -> Result<super::policies::PolicyManagement<'_>, DomainError> {
+    pub fn policies<'a>(
+        &'a self,
+        ctx: &'a SecurityContext,
+    ) -> Result<super::policies::PolicyManagement<'a>, DomainError> {
+        self.policies_over(self.admission.pdp(ctx))
+    }
+
+    fn policies_over<'a>(
+        &'a self,
+        admission: Gate<'a>,
+    ) -> Result<super::policies::PolicyManagement<'a>, DomainError> {
         let bound = self.bound.get().ok_or(DomainError::NotReady {
             dependency: Dependency::Storage,
         })?;
@@ -182,7 +179,7 @@ impl Service {
             dependency: Dependency::Catalog,
         })?;
         Ok(super::policies::PolicyManagement {
-            admission: &self.admission,
+            admission,
             storage: bound.storage.as_ref(),
             engines: &bound.engines,
             cache: &bound.artifacts,
@@ -192,24 +189,42 @@ impl Service {
         })
     }
 
-    /// The consumption hot path: debit, credit, rollback, preview, and leases.
+    /// The consumption hot path for one call of QE's API, over PDP admission:
+    /// debit, credit, rollback, preview, batch, snapshot, and leases.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::NotReady`] before bootstrap completed.
-    pub fn operations(&self) -> Result<super::operations::Operations<'_>, DomainError> {
+    pub fn operations<'a>(
+        &'a self,
+        ctx: &'a SecurityContext,
+    ) -> Result<super::operations::Operations<'a>, DomainError> {
+        self.operations_over(self.admission.pdp(ctx))
+    }
+
+    /// The same operations over trusted admission, for one call through the
+    /// quota resolver plugin (ADR-0009).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::NotReady`] before bootstrap completed.
+    pub(crate) fn trusted_operations(
+        &self,
+        caller: Option<PlatformIdentity>,
+    ) -> Result<super::operations::Operations<'_>, DomainError> {
+        self.operations_over(self.admission.trusted(caller))
+    }
+
+    fn operations_over<'a>(
+        &'a self,
+        admission: Gate<'a>,
+    ) -> Result<super::operations::Operations<'a>, DomainError> {
         let bound = self.bound.get().ok_or(DomainError::NotReady {
             dependency: Dependency::Storage,
         })?;
         Ok(super::operations::Operations {
-            admission: &self.admission,
-            attribution: Attribution::new(
-                &self.admission,
-                &bound.catalog,
-                self.admission.metrics(),
-            ),
+            admission,
             catalog: &bound.catalog,
-            classifications: &bound.classifications,
             storage: bound.storage.as_ref(),
             engines: Arc::clone(&bound.engines),
             artifacts: Arc::clone(&bound.artifacts),
@@ -223,21 +238,23 @@ impl Service {
         })
     }
 
-    /// The Quota lifecycle: create, update, deactivate, read.
+    /// The Quota lifecycle for one call of QE's API: create, update,
+    /// deactivate, read.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::NotReady`] before bootstrap completed.
-    pub fn quotas(&self) -> Result<QuotaManagement<'_>, DomainError> {
+    pub fn quotas<'a>(
+        &'a self,
+        ctx: &'a SecurityContext,
+    ) -> Result<QuotaManagement<'a>, DomainError> {
         let bound = self.bound.get().ok_or(DomainError::NotReady {
             dependency: Dependency::Storage,
         })?;
         Ok(QuotaManagement::new(
-            &self.admission,
+            self.admission.pdp(ctx),
             &bound.catalog,
             bound.storage.as_ref(),
-            bound.registry.as_ref(),
-            bound.metric_registry.as_ref(),
             self.admission.metrics(),
             self.limits,
         ))

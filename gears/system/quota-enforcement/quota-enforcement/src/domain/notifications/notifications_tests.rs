@@ -10,12 +10,8 @@ use quota_enforcement_sdk::{
     DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1,
     NotificationEvent, NotificationEventKind, QuotaEvent, QuotaNotificationSinkV1,
 };
-use toolkit_security::SecurityContext;
 
-use super::{
-    DISPATCHER_SUBJECT_ID, DISPATCHER_SUBJECT_TYPE, DeliveryLifecycle, DispatchLimits,
-    NotificationDispatcher, dispatcher_context,
-};
+use super::{DeliveryLifecycle, DispatchLimits, NotificationDispatcher};
 use crate::domain::quotas::events::{ChangeKind, quota_changed};
 use crate::test_support::{RecordingMetrics, tenant};
 
@@ -23,6 +19,7 @@ const BUDGET: Duration = Duration::from_secs(28);
 
 fn event() -> NotificationEvent {
     quota_changed(
+        crate::test_support::actor(),
         tenant(),
         None,
         None,
@@ -35,12 +32,7 @@ fn dispatcher(
     sinks: Vec<Arc<dyn QuotaNotificationSinkV1>>,
     metrics: &Arc<RecordingMetrics>,
 ) -> NotificationDispatcher {
-    NotificationDispatcher::new(
-        sinks,
-        dispatcher_context().expect("context"),
-        DispatchLimits::default(),
-        Arc::clone(metrics) as _,
-    )
+    NotificationDispatcher::new(sinks, DispatchLimits::default(), Arc::clone(metrics) as _)
 }
 
 fn transient(reason: &str) -> Result<(), DispatchError> {
@@ -66,30 +58,14 @@ impl QuotaNotificationSinkV1 for HangingSink {
         "hanging"
     }
 
-    async fn dispatch(
-        &self,
-        _ctx: &SecurityContext,
-        _event: QuotaEvent,
-    ) -> Result<(), DispatchError> {
+    async fn dispatch(&self, _event: QuotaEvent) -> Result<(), DispatchError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         std::future::pending().await
     }
 }
 
-#[test]
-fn the_dispatcher_context_is_a_named_system_subject_not_an_anonymous_one() {
-    let ctx = dispatcher_context().expect("context");
-    assert!(!ctx.is_anonymous());
-    assert_eq!(ctx.subject_id(), DISPATCHER_SUBJECT_ID);
-    assert_eq!(ctx.subject_type(), Some(DISPATCHER_SUBJECT_TYPE));
-    assert_eq!(
-        ctx.subject_tenant_id(),
-        toolkit_security::constants::DEFAULT_TENANT_ID
-    );
-}
-
 #[tokio::test]
-async fn every_sink_receives_the_event_under_the_system_context() {
+async fn every_sink_receives_the_event_naming_its_actor() {
     let metrics = Arc::new(RecordingMetrics::default());
     let a = Arc::new(RecordingSink::new("a"));
     let b = Arc::new(RecordingSink::new("b"));
@@ -101,8 +77,8 @@ async fn every_sink_receives_the_event_under_the_system_context() {
     for sink in [&a, &b] {
         let received = sink.received();
         assert_eq!(received.len(), 1);
-        assert_eq!(received[0].0.subject_id(), DISPATCHER_SUBJECT_ID);
-        assert_eq!(received[0].1.event_id, event.event_id);
+        assert_eq!(received[0].event_id, event.event_id);
+        assert_eq!(received[0].actor, crate::test_support::actor());
     }
     assert_eq!(metrics.dispatch_failures(), Vec::new());
     assert_eq!(metrics.outbox_rejections(), 0);
@@ -205,12 +181,7 @@ async fn a_still_failing_event_is_retried_below_the_limit_and_dead_lettered_at_i
         "busy",
         vec![transient("busy"), transient("busy")],
     ));
-    let dispatcher = NotificationDispatcher::new(
-        vec![sink],
-        dispatcher_context().expect("context"),
-        limits,
-        Arc::clone(&metrics) as _,
-    );
+    let dispatcher = NotificationDispatcher::new(vec![sink], limits, Arc::clone(&metrics) as _);
     assert_eq!(
         dispatcher
             .deliver(event(), limits.max_attempts - 1, BUDGET)

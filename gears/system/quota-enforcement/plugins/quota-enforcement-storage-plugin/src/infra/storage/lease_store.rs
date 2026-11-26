@@ -6,9 +6,9 @@
 //! An acquisition *is* a debit that can be taken back: it evaluates the policy
 //! under the Quota locks and applies the plan exactly as
 //! [`super::consumption_store`] does, then records a lease and one hold per
-//! Quota so a later commit or release can settle it. Everything about the
+//! plan entry so a later commit or release can settle it. Everything about the
 //! evaluation, the idempotency record and the threshold routine is shared, not
-//! restated.
+//! restated. A commit writes the charge of what it keeps, which is its record.
 //!
 //! Two things are the lease's own:
 //!
@@ -27,11 +27,12 @@
 //! # Lock rank
 //!
 //! One order for every primitive in this plugin (ADR-0002, extended past
-//! Quota rows): Quota rows ascending by id, then idempotency records, then
-//! lease rows ascending by token, then capacity rows (acquisitions only), then
-//! counter rows (the waiting paths ascending by `(quota_id, period_id)`), then
-//! the hold rows under their counter, then inserts. A primitive may skip a rank
-//! and never goes back; anything it must know before locking — a lease's
+//! Quota rows): Quota rows ascending by id, then key locks (the stripes of
+//! idempotency scopes), then lease rows ascending by token, then capacity rows
+//! (acquisitions only), then counter rows (the waiting paths ascending by
+//! `(quota_id, period_id)`), then the hold rows under their counter, then
+//! inserts. A primitive may skip a rank and never goes back; anything it must
+//! know before locking — a lease's
 //! metric and holds, both immutable once written — is read unscoped of rank
 //! first and re-read under the lock.
 //!
@@ -45,21 +46,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use quota_enforcement_sdk::{
-    AppliedMutation, AttributionDigest, Decision, DecisionResult, EvaluatedLease,
-    EvaluatedMutation, ExpiredLease, IdempotencySubjectKey, LeaseHold, LeaseToken, MetricId,
-    MutationResult, NO_APPLICABLE_QUOTA, NotificationEvent, NotificationEventKind,
-    NotificationScope, OperationType, PartialIdempotencyWrite, Quota, QuotaId, StorageError,
-    TenantId, TransitionOutcome, apportion,
+    Actor, AppliedMutation, AttributionDigest, Decision, DecisionResult, EvaluatedLease,
+    EvaluatedMutation, ExpiredLease, HeldEntry, LeaseHold, LeaseToken, MetricId, MutationResult,
+    NO_APPLICABLE_QUOTA, NotificationEvent, NotificationEventKind, NotificationScope,
+    OperationType, PartialIdempotencyWrite, Quota, QuotaId, StorageError, TenantId,
+    TransitionOutcome, plan_entries, plan_of, unwind,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::DBRunner;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::consumption_store::{
-    AppliedEntry, OwnedMutation, RACE_ATTEMPTS, RecordBlob, RecordWrite, Replay,
-    SqlConsumptionStore, TxError, actor_of, counters_of, credit_counter, debit_counter,
-    decision_of, lift, replay_of, settle_elapsed_rows, write_record,
+    AppliedEntry, ChargeWrite, OwnedMutation, RACE_ATTEMPTS, RecordBlob, RecordWrite, Replay,
+    SqlConsumptionStore, TxError, counters_of, credit_counter, debit_counter, decision_of, lift,
+    replay_of, settle_elapsed_rows, write_charge, write_record,
 };
 use super::entity::lease_hold;
 use super::locking::{ContentionBudget, lock_scopes, with_budget};
@@ -90,13 +91,13 @@ impl SqlConsumptionStore {
     /// As the contract documents for `acquire_lease`.
     pub async fn acquire_lease_impl(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         ttl: Duration,
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
         const OPERATION: &str = "acquire lease";
-        let actor = actor_of(ctx);
+        let actor = actor.clone();
         let tenant = mutation.applicable.tenant_id;
         let metric = mutation.applicable.metric.clone();
         let config = self.config().await?;
@@ -123,7 +124,7 @@ impl SqlConsumptionStore {
                             let quotas = SqlConsumptionStore::lock_applicable(
                                 tx,
                                 scope,
-                                &owned.applicable,
+                                owned,
                                 RowWait::Nowait,
                             )
                             .await?;
@@ -139,8 +140,8 @@ impl SqlConsumptionStore {
                                 replay_of(tx, scope, &owned.idempotency, now, Some(RowWait::Nowait))
                                     .await?
                             {
-                                let acquired: EvaluatedLease =
-                                    serde_json::from_str(&row.decision_blob).map_err(|error| {
+                                let acquired: EvaluatedLease = serde_json::from_str(&row.blob)
+                                    .map_err(|error| {
                                         TxError::Storage(StorageError::Internal(error.to_string()))
                                     })?;
                                 return Ok(TransitionOutcome::NoOp(acquired));
@@ -197,7 +198,7 @@ impl SqlConsumptionStore {
                                 // @cpt-end:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-cap-if
                                 // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-acquire:p1:inst-lac-insert
                                 let applied = SqlConsumptionStore::hold_plan(
-                                    tx, scope, &quotas, &decision, now, &enqueuer,
+                                    tx, scope, &actor, &quotas, &decision, now, &enqueuer,
                                 )
                                 .await?;
                                 let token = LeaseToken::from(Uuid::now_v7());
@@ -209,8 +210,7 @@ impl SqlConsumptionStore {
                                         token: token.as_uuid(),
                                         tenant_id: tenant.as_uuid(),
                                         metric: metric.as_str(),
-                                        subject_key: owned.idempotency.scope.subject_key.as_bytes(),
-                                        attribution_hash: owned.authorized.as_bytes(),
+                                        attribution_digest: owned.authorized.as_bytes(),
                                         idem_key: &owned.idempotency.scope.key,
                                         reserved_amount: i64::try_from(owned.amount).map_err(
                                             |_| {
@@ -229,15 +229,7 @@ impl SqlConsumptionStore {
                                     lease_repo::insert_hold(
                                         tx,
                                         scope,
-                                        token.as_uuid(),
-                                        tenant.as_uuid(),
-                                        entry.quota_id,
-                                        i64::try_from(entry.amount).map_err(|_| {
-                                            TxError::Storage(StorageError::Internal(
-                                                "held amount does not fit the column".to_owned(),
-                                            ))
-                                        })?,
-                                        entry.period_id,
+                                        hold_row(token, tenant, entry)?,
                                     )
                                     .await?;
                                     operation_log_repo::append(
@@ -280,8 +272,6 @@ impl SqlConsumptionStore {
                                 &RecordWrite {
                                     write: &owned.idempotency,
                                     blob: RecordBlob::Verbatim(&blob),
-                                    entries: None,
-                                    authorized: Some(owned.authorized),
                                     policy: Some(&policy),
                                     expires_at: deadline,
                                     now,
@@ -298,7 +288,7 @@ impl SqlConsumptionStore {
                 Ok(outcome) => return Ok(outcome),
                 Err(TxError::Raced(lost)) => {
                     if let Some(record) = self.winner_of(&lost).await? {
-                        let acquired: EvaluatedLease = serde_json::from_str(&record.decision_blob)
+                        let acquired: EvaluatedLease = serde_json::from_str(&record.blob)
                             .map_err(|error| StorageError::Internal(error.to_string()))?;
                         return Ok(TransitionOutcome::NoOp(acquired));
                     }
@@ -312,14 +302,15 @@ impl SqlConsumptionStore {
         Err(unavailable_arbiter(OPERATION))
     }
 
-    /// Settle a lease: commit keeps its apportioned share, release keeps none.
+    /// Settle a lease: commit unwinds the unused part from the holds, release
+    /// keeps none.
     ///
     /// # Errors
     ///
     /// As the contract documents for `commit_lease` and `release_lease`.
     pub async fn settle_lease_impl(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         settlement: Settlement,
@@ -328,10 +319,9 @@ impl SqlConsumptionStore {
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         let op_name = settlement.name();
         let operation = settlement.operation();
-        let actor = actor_of(ctx);
+        let actor = actor.clone();
         // Rank-free: the metric names the contention budget, which has to start
-        // before the first lock, and the subject key completes the idempotency
-        // scope. Both are immutable once written and re-read under the lock.
+        // before the first lock. It is immutable once written.
         let conn = self
             .db
             .conn()
@@ -343,8 +333,7 @@ impl SqlConsumptionStore {
         if preview.tenant_id != idempotency.tenant_id.as_uuid() {
             return Err(StorageError::LeaseNotFound { token });
         }
-        let subject_key = subject_key_of(&preview.subject_key)?;
-        let write = idempotency.clone().complete(subject_key, operation);
+        let write = idempotency.clone().complete(operation);
         let config = self.config().await?;
         let budget = ContentionBudget::of(&config, [preview.metric.as_str()]);
         let tenant = idempotency.tenant_id;
@@ -358,6 +347,8 @@ impl SqlConsumptionStore {
             let grant = scope.clone();
             let events = events.to_vec();
             let write_owned = write.clone();
+            let metric = preview.metric.clone();
+            let settlement = settlement.clone();
             let actor = actor.clone();
             settling(
                 wakes,
@@ -384,9 +375,8 @@ impl SqlConsumptionStore {
                             replay_of(tx, scope, &write_owned, now, Some(RowWait::Nowait)).await?
                         {
                             return Ok(TransitionOutcome::NoOp(AppliedMutation {
-                                decision: decision_of(&row.decision_blob)?,
+                                decision: decision_of(&row.blob)?,
                                 mutation: MutationResult::default(),
-                                expires_at: row.expires_at,
                             }));
                         }
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-idem
@@ -416,15 +406,13 @@ impl SqlConsumptionStore {
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-notactive-if
                         let holds = lease_repo::holds_of(tx, scope, token.as_uuid()).await?;
-                        let held: Vec<u64> = holds
-                            .iter()
-                            .map(|hold| u64::try_from(hold.held_amount).unwrap_or(0))
-                            .collect();
                         let reserved = u64::try_from(lease.reserved_amount).unwrap_or(0);
-                        let actual = settlement.kept(reserved);
+                        // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-metric
+                        let actual = settlement.kept(reserved, &lease.metric)?;
+                        // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-metric
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit
-                        let kept = kept_of(&held, reserved, actual)?;
+                        let returns = returns_of(&holds, reserved, actual)?;
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-overcommit-if
                         // @cpt-begin:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
@@ -432,9 +420,8 @@ impl SqlConsumptionStore {
                         // Rank 5 and 5b, ascending by `quota_id` as `holds_of`
                         // returns them.
                         let mut entries = Vec::new();
-                        for (hold, kept) in holds.iter().zip(&kept) {
-                            let held_amount = u64::try_from(hold.held_amount).unwrap_or(0);
-                            let returned = held_amount.saturating_sub(*kept);
+                        for (hold, returned) in holds.iter().zip(returns) {
+                            let kept = u64::try_from(hold.held_amount).unwrap_or(0) - returned;
                             // Rank 5 before 5b: the counter row is taken first, and
                             // only then is its hold stamped. Stamping under a row
                             // this transaction does not hold would let a sweeper
@@ -477,12 +464,14 @@ impl SqlConsumptionStore {
                                 value
                             };
                             // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-boundary
-                            if *kept > 0 {
+                            if kept > 0 {
                                 entries.push(AppliedEntry {
                                     quota_id: hold.quota_id,
                                     period_id: hold.period_id,
-                                    amount: *kept,
+                                    amount: kept,
                                     value,
+                                    chain: u32::try_from(hold.chain).unwrap_or(0),
+                                    position: u32::try_from(hold.position).unwrap_or(0),
                                 });
                                 operation_log_repo::append(
                                     tx,
@@ -510,41 +499,41 @@ impl SqlConsumptionStore {
                         // @cpt-end:cpt-cf-quota-enforcement-state-lease:p1:inst-lst-commit
                         // Settling evaluates nothing: the plan was fixed at
                         // acquisition, so the recorded decision is what it kept.
-                        let decision = Decision::allowed_with_plan(
-                            entries
-                                .iter()
-                                .map(|entry| {
-                                    (
-                                        QuotaId::from(entry.quota_id),
-                                        quota_enforcement_sdk::QuotaDebitPlan {
-                                            amount: entry.amount,
-                                        },
-                                    )
-                                })
-                                .collect(),
-                        );
+                        let decision = Decision::allowed_with_plan(plan_of(
+                            entries.iter().map(AppliedEntry::planned),
+                        ));
                         let deadline = now + retention;
-                        // A commit produces a debit its own key can reverse, so it
-                        // records what it kept and the attribution it was
-                        // authorized under. A release reverses nothing.
-                        let authorized = (operation == OperationType::Commit)
-                            .then(|| attribution_of(&lease.attribution_hash))
-                            .transpose()?;
-                        write_record(
-                            tx,
-                            scope,
-                            &RecordWrite {
-                                write: &write_owned,
-                                blob: RecordBlob::Decision(&decision),
-                                entries: (operation == OperationType::Commit)
-                                    .then_some(&entries[..]),
-                                authorized,
-                                policy: None,
-                                expires_at: deadline,
-                                now,
-                            },
-                        )
-                        .await?;
+                        if operation == OperationType::Commit {
+                            write_charge(
+                                tx,
+                                scope,
+                                &ChargeWrite {
+                                    write: &write_owned,
+                                    decision: &decision,
+                                    policy: None,
+                                    authorized: attribution_of(&lease.attribution_digest)?,
+                                    metric: &metric,
+                                    amount: actual,
+                                    entries: &entries,
+                                    return_window_end: deadline,
+                                    now,
+                                },
+                            )
+                            .await?;
+                        } else {
+                            write_record(
+                                tx,
+                                scope,
+                                &RecordWrite {
+                                    write: &write_owned,
+                                    blob: RecordBlob::Decision(&decision),
+                                    policy: None,
+                                    expires_at: deadline,
+                                    now,
+                                },
+                            )
+                            .await?;
+                        }
                         let mut result = MutationResult {
                             counters: counters_of(&entries),
                             threshold_crossings: Vec::new(),
@@ -557,7 +546,6 @@ impl SqlConsumptionStore {
                         Ok::<_, TxError>(TransitionOutcome::Applied(AppliedMutation {
                             decision,
                             mutation: result,
-                            expires_at: deadline,
                         }))
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
@@ -665,9 +653,8 @@ impl SqlConsumptionStore {
                                     .first()
                                     .map_or(lease.token, |hold| hold.quota_id.as_uuid()),
                                 operation: OP_LEASE_AUTO_RELEASE,
-                                actor: &crate::domain::ports::Actor {
-                                    subject_id: lease.tenant_id,
-                                    subject_type: None,
+                                actor: &Actor::Task {
+                                    task: quota_enforcement_sdk::BackgroundTask::LeaseSweeper,
                                 },
                                 record_version: 1,
                                 detail: String::new(),
@@ -680,6 +667,9 @@ impl SqlConsumptionStore {
                         // @cpt-begin:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-emit
                         let held: u64 = returned.iter().map(|hold| hold.held_amount).sum();
                         let event = NotificationEvent {
+                            actor: Actor::Task {
+                                task: quota_enforcement_sdk::BackgroundTask::LeaseSweeper,
+                            },
                             event_id: quota_enforcement_sdk::EventId::generate(),
                             kind: NotificationEventKind::LeaseAutoReleased,
                             scope: NotificationScope::Tenant {
@@ -706,8 +696,6 @@ impl SqlConsumptionStore {
                         reclaimed.push(ExpiredLease {
                             token,
                             tenant_id: TenantId::from(lease.tenant_id),
-                            subject_key: subject_key_of(&lease.subject_key)
-                                .map_err(TxError::Storage)?,
                             holds: returned,
                             expired_at: lease.expiry_at,
                         });
@@ -753,27 +741,31 @@ impl SqlConsumptionStore {
             .collect()
     }
 
-    /// Apply an acquisition's plan: the same counter movement a debit makes,
-    /// returning what each Quota now holds.
+    /// Apply an acquisition's plan: the same counter movement a debit makes, in
+    /// ascending `quota_id` order (ADR-0002), returning what each entry holds.
     async fn hold_plan(
         tx: &impl DBRunner,
         scope: &AccessScope,
+        actor: &Actor,
         quotas: &[Quota],
         decision: &Decision,
         now: OffsetDateTime,
         enqueuer: &Arc<dyn NotificationEnqueuer>,
     ) -> Result<Vec<AppliedEntry>, TxError> {
-        let mut entries = Vec::with_capacity(decision.debit_plan.len());
-        for (quota_id, planned) in &decision.debit_plan {
-            let Some(quota) = quotas.iter().find(|quota| quota.id == *quota_id) else {
+        let mut planned: Vec<_> = plan_entries(&decision.debit_plan).collect();
+        planned.sort_by_key(|(_, plan)| plan.quota_id);
+        let mut entries = Vec::with_capacity(planned.len());
+        for ((chain, position), planned) in planned {
+            let Some(quota) = quotas.iter().find(|quota| quota.id == planned.quota_id) else {
                 return Err(TxError::Storage(StorageError::QuotaNotFound {
-                    id: *quota_id,
+                    id: planned.quota_id,
                 }));
             };
-            settle_elapsed_rows(tx, scope, quota, now, enqueuer, RowWait::Nowait).await?;
+            settle_elapsed_rows(tx, scope, actor, quota, now, enqueuer, RowWait::Nowait).await?;
             let (entry, _) = debit_counter(
                 tx,
                 scope,
+                actor,
                 quota,
                 planned.amount,
                 now,
@@ -781,7 +773,11 @@ impl SqlConsumptionStore {
                 RowWait::Nowait,
             )
             .await?;
-            entries.push(entry);
+            entries.push(AppliedEntry {
+                chain,
+                position,
+                ..entry
+            });
         }
         Ok(entries)
     }
@@ -835,13 +831,6 @@ pub(super) async fn counter_value_of(
     Ok(u64::try_from(value).unwrap_or(0))
 }
 
-/// Read a stored digest back into its domain type.
-fn subject_key_of(bytes: &[u8]) -> Result<IdempotencySubjectKey, StorageError> {
-    <[u8; 32]>::try_from(bytes)
-        .map(IdempotencySubjectKey::from_bytes)
-        .map_err(|_| StorageError::Internal("a stored subject key is not 32 bytes".to_owned()))
-}
-
 fn attribution_of(bytes: &[u8]) -> Result<AttributionDigest, TxError> {
     <[u8; 32]>::try_from(bytes)
         .map(AttributionDigest::from_bytes)
@@ -854,82 +843,118 @@ fn attribution_of(bytes: &[u8]) -> Result<AttributionDigest, TxError> {
 
 /// How a lease is settled: a commit keeps `actual` of the reserved amount
 /// (all of it when absent), a release keeps nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Settlement {
     /// Convert the lease into a debit of `actual`.
     Commit {
         /// What was used; absent keeps the whole reservation.
         actual: Option<u64>,
+        /// The metric type the request names; it must be the lease's.
+        metric: Option<String>,
     },
     /// Return every hold.
     Release,
 }
 
 impl Settlement {
-    fn operation(self) -> OperationType {
+    fn operation(&self) -> OperationType {
         match self {
             Self::Commit { .. } => OperationType::Commit,
             Self::Release => OperationType::Release,
         }
     }
 
-    fn name(self) -> &'static str {
+    fn name(&self) -> &'static str {
         match self {
             Self::Commit { .. } => "commit lease",
             Self::Release => "release lease",
         }
     }
 
-    fn log_verb(self) -> &'static str {
+    fn log_verb(&self) -> &'static str {
         match self {
             Self::Commit { .. } => OP_LEASE_COMMIT,
             Self::Release => OP_LEASE_RELEASE,
         }
     }
 
-    fn state(self) -> &'static str {
+    fn state(&self) -> &'static str {
         match self {
             Self::Commit { .. } => lease_repo::STATE_COMMITTED,
             Self::Release => lease_repo::STATE_RELEASED,
         }
     }
 
-    /// What this settlement keeps of `reserved`. A release keeps nothing,
-    /// which the apportionment reads as a commit of zero.
-    fn kept(self, reserved: u64) -> u64 {
+    /// What this settlement keeps of `reserved` on a lease of the metric
+    /// type `leased`. A release keeps nothing, which the unwinding reads as a
+    /// commit of zero; a commit naming another metric type is
+    /// `MetricTypeMismatch`.
+    fn kept(&self, reserved: u64, leased: &str) -> Result<u64, TxError> {
         match self {
-            Self::Commit { actual } => actual.unwrap_or(reserved),
-            Self::Release => 0,
+            Self::Commit {
+                metric: Some(requested),
+                ..
+            } if requested != leased => Err(TxError::Storage(StorageError::MetricTypeMismatch {
+                requested: requested.clone(),
+                charged: leased.to_owned(),
+            })),
+            Self::Commit { actual, .. } => Ok(actual.unwrap_or(reserved)),
+            Self::Release => Ok(0),
         }
     }
 }
 
-/// Split `actual` across a lease's holds by the conserving apportionment of
-/// DESIGN I5.
+/// The hold row of one applied plan entry of the lease `token`.
+fn hold_row(
+    token: LeaseToken,
+    tenant: TenantId,
+    entry: &AppliedEntry,
+) -> Result<lease_hold::Model, TxError> {
+    let column = |what: &str| {
+        TxError::Storage(StorageError::Internal(format!(
+            "{what} does not fit the column"
+        )))
+    };
+    Ok(lease_hold::Model {
+        lease_token: token.as_uuid(),
+        quota_id: entry.quota_id,
+        tenant_id: tenant.as_uuid(),
+        held_amount: i64::try_from(entry.amount).map_err(|_| column("held amount"))?,
+        period_id: entry.period_id,
+        chain: i32::try_from(entry.chain).map_err(|_| column("chain"))?,
+        position: i32::try_from(entry.position).map_err(|_| column("position"))?,
+        returned_at: None,
+    })
+}
+
+/// What each hold gives back when the lease keeps `actual` of `reserved`: the
+/// unused part unwound from the holds (ADR-0010).
 ///
 /// # Errors
 ///
-/// `OverCommitNotAuthorized` above the reserved amount; `Internal` on an
-/// arithmetic overflow no bounded plan can reach.
-fn kept_of(held: &[u64], reserved: u64, actual: u64) -> Result<Vec<u64>, TxError> {
-    let Some(reserved) = std::num::NonZeroU64::new(reserved) else {
-        // An acquisition never reserves zero; returning everything is the
-        // safe reading of "kept nothing".
-        return Ok(vec![0; held.len()]);
+/// `OverCommitNotAuthorized` above the reserved amount; `Internal` when a
+/// chain of the holds does not add up to the reserved amount.
+fn returns_of(
+    holds: &[lease_hold::Model],
+    reserved: u64,
+    actual: u64,
+) -> Result<Vec<u64>, TxError> {
+    let Some(unused) = reserved.checked_sub(actual) else {
+        return Err(TxError::Storage(StorageError::OverCommitNotAuthorized {
+            reserved,
+            actual,
+        }));
     };
-    apportion(held, actual, reserved).map_err(|error| {
-        TxError::Storage(match error {
-            quota_enforcement_sdk::ApportionError::OverCommit => {
-                StorageError::OverCommitNotAuthorized {
-                    reserved: reserved.get(),
-                    actual,
-                }
-            }
-            other @ quota_enforcement_sdk::ApportionError::Overflow => {
-                StorageError::Internal(other.to_string())
-            }
+    let held: Vec<HeldEntry> = holds
+        .iter()
+        .map(|hold| HeldEntry {
+            chain: u32::try_from(hold.chain).unwrap_or(0),
+            position: u32::try_from(hold.position).unwrap_or(0),
+            held: u64::try_from(hold.held_amount).unwrap_or(0),
         })
-    })
+        .collect();
+    unwind(&held, unused)
+        .map_err(|error| TxError::Storage(StorageError::Internal(error.to_string())))
 }
 
 fn unavailable_arbiter(operation: &'static str) -> StorageError {
@@ -944,29 +969,31 @@ fn unavailable_arbiter(operation: &'static str) -> StorageError {
 impl crate::domain::ports::LeaseStore for SqlConsumptionStore {
     async fn acquire_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         ttl: Duration,
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
-        self.acquire_lease_impl(ctx, scope, mutation, ttl).await
+        self.acquire_lease_impl(actor, scope, mutation, ttl).await
     }
 
     async fn commit_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
+        metric: Option<&MetricId>,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         self.settle_lease_impl(
-            ctx,
+            actor,
             scope,
             token,
             Settlement::Commit {
                 actual: actual_amount,
+                metric: metric.map(|metric| metric.as_str().to_owned()),
             },
             idempotency,
             events,
@@ -976,14 +1003,21 @@ impl crate::domain::ports::LeaseStore for SqlConsumptionStore {
 
     async fn release_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
-        self.settle_lease_impl(ctx, scope, token, Settlement::Release, idempotency, events)
-            .await
+        self.settle_lease_impl(
+            actor,
+            scope,
+            token,
+            Settlement::Release,
+            idempotency,
+            events,
+        )
+        .await
     }
 
     async fn reclaim_expired_leases(

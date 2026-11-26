@@ -38,30 +38,29 @@ items, and nesting stops at depth 48.
 
 ## Environment and decision record
 
-The documents fix the typed input triple `{request, resource, arbitration}`
-(ADR-0007), the config shape `{ expr: <CEL string> }` (ADR-0005, PRD §5.9) and the
+The documents fix the input `request` (ADR-0013), the config shape `{ expr: <CEL string> }` (ADR-0005, PRD §5.9) and the
 `Decision { result, debit_plan, diagnostics }` output. How the applicable-Quotas set
 is bound is engine-internal (ADR-0005, "Concrete realisation"). This engine binds:
 
 | Variable   | Type                                    |
 |------------|-----------------------------------------|
-| `request`  | the metric's request metadata schema    |
-| `resource` | the resource projection schema, or null |
+| `request`  | the `metadata` schema of the metric type |
 | `amount`   | `int`                                   |
-| `quotas`   | `list<{ id, tier, cap, consumed, remaining, arbitration }>` |
+| `metric_id`| `string`: the `id` of the request's metric object, `""` when it has none |
+| `quotas`   | `list<{ id, subject_type, tier, cap, consumed, remaining }>` |
 
 `cap` and `remaining` are nullable integers: integer operators accept them and
 evaluation refuses an actual `null`. A field the profile cannot type — a `number`
 (there is no float), a `$ref`, a `not`, a nullable scalar other than an integer, or
 a member of a schema object without declared properties — stays reachable so `has()`
 can test it, and every operator, comparison, call or record field that uses it is
-refused at save time with a position. The ADR-0007 example's `weight: number` is
-therefore visible but unusable until the contract declares it as `integer`.
+refused at save time with a position. A `weight: number` is therefore visible but
+unusable until the metric type declares it as `integer`.
 
-`quotas[i].arbitration` carries the constraint-contract metadata schema, so the
-ADR-0007 pair checks apply to `request.region in q.arbitration.regions` inside a
-comprehension. `cap`/`remaining` are `null` for an unbounded Quota. No principal,
-attribution, clock or randomness is bound.
+A Quota carries no metadata: QE core has already left out the Quotas whose
+conditions do not hold on the request (ADR-0013). `tier` is `"tenant"` for the tenant subject type and `"subject"` for every
+other. `cap`/`remaining` are `null` for an unbounded Quota. No principal, attribution,
+clock or randomness is bound.
 
 ## Bounds before the parser
 
@@ -74,25 +73,29 @@ source is bounded at 8 KiB and the expanded AST at 1024 nodes / 48 levels.
 
 ## Decision record, on every path
 
-The record returned is exactly one of `{ "debit_plan": [ { "id", "amount" } ] }`
-(`Allowed`; an empty list is `Denied` with `NO_QUOTA_SELECTED`) or
-`{ "deny": { "reason", "violated_quota_ids"? } }`. Amounts are decoded with checked
-conversions; a negative amount, a non-UUID id or a duplicate id is a type error
-before any plan is formed.
+The record returned is exactly one of
+`{ "debit_plan": [ [ { "id", "amount" }, ... ], ... ] }` (`Allowed`, one inner list per
+chain, primary pool first; a plan with no entry is `Denied` with `NO_QUOTA_SELECTED`)
+or `{ "deny": { "reason", "violated_quota_ids"? } }`. A flat list of entries is not a
+plan. Amounts are decoded with checked conversions; a negative amount or a non-UUID id
+is a type error before any plan is formed. The chain rules (each chain adds up to the
+requested amount, no Quota twice) are checked by QE after evaluation.
 
 At save time the record is checked on every path — each branch of a conditional
 and the body of a `cel.bind` on its own — so one valid branch cannot vouch for
-another. A literal record must carry exactly one of the two keys; every
-`debit_plan` element needs exactly `id: string` and `amount: int` (a nullable
+another. A literal record must carry exactly one of the two keys; `debit_plan` must be
+a list of lists, and every entry needs exactly `id: string` and `amount: int` (a nullable
 integer counts, and evaluation refuses the `null`); `deny` needs `reason: string`
 and may carry `violated_quota_ids: list<string>`. A record built from computed
 keys can only be decoded at evaluation and is decoded strictly there.
 
-Each compiled policy reports which inputs it reads (`request`, `resource`,
-`arbitration`). Only those contracts are persisted with the version, and a later
-activation is judged against those alone, so adding a resource projection cannot
-strand a policy that never reads `resource`.
+Each compiled policy reports whether it reads `request`.
 
-A policy is type-checked against the environment of **every** metric in its
+A policy is type-checked against the metric type schema of **every** metric in its
 persisted snapshot. Evaluation for a metric outside that set fails with
-`InvalidConfig`; it never falls back to a looser environment or another engine.
+`InvalidConfig`; it never falls back to a looser environment or another engine. A
+snapshot with no schema (a global policy, or one that reads no `request`) leaves
+`request` untyped, and the policy evaluates for any metric. An untyped `request` is not
+checked at save: a read of a property that a request does not carry fails the
+evaluation, and the request is refused with `POLICY_EVALUATION_FAILED`. Such a policy
+guards the read with `has()`; a wrong property name is the operator's error.

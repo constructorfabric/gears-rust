@@ -5,13 +5,13 @@
 //! trait implementation delegates to them.
 
 use quota_enforcement_sdk::{
-    ApplicableQuotas, AppliedMutation, EvaluatedDebit, EvaluatedMutation, IdempotencyRecord,
-    IdempotencyScope, IdempotencyWrite, NotificationEvent, PageRequest, PageResult,
-    PartialIdempotencyWrite, QuotaId, QuotaSnapshot, RollbackTarget, StorageError,
+    Actor, ApplicableQuotas, AppliedMutation, ChargeReturn, EvaluatedDebit, EvaluatedMutation,
+    HeldAllocationCharges, IdempotencyRecord, IdempotencyScope, NotificationEvent, PageRequest,
+    PageResult, PartialIdempotencyWrite, QuotaId, QuotaSnapshot, RollbackTarget, StorageError,
     TransitionOutcome,
 };
 use time::OffsetDateTime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use super::bootstrap::StoragePlugin;
 use super::ports::ConsumptionStore;
@@ -30,13 +30,13 @@ impl StoragePlugin {
     /// As the contract documents for `apply_debit_plan`.
     pub async fn apply_debit_plan(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         self.consumption
-            .apply_debit_plan(ctx, scope, mutation, events)
+            .apply_debit_plan(actor, scope, mutation, events)
             .await
     }
 
@@ -47,13 +47,13 @@ impl StoragePlugin {
     /// As the contract documents for `apply_batch_debit`.
     pub async fn apply_batch_debit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
         self.consumption
-            .apply_batch_debit(ctx, scope, batch, events)
+            .apply_batch_debit(actor, scope, batch, events)
             .await
     }
 
@@ -64,7 +64,7 @@ impl StoragePlugin {
     /// As the contract documents for `apply_credit`.
     pub async fn apply_credit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         amount: u64,
@@ -72,25 +72,41 @@ impl StoragePlugin {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         self.consumption
-            .apply_credit(ctx, scope, quota_id, amount, idempotency, events)
+            .apply_credit(actor, scope, quota_id, amount, idempotency, events)
             .await
     }
 
-    /// Reverse a committed debit against its acquisition period.
+    /// Give back part of a charge.
+    ///
+    /// # Errors
+    ///
+    /// As the contract documents for `apply_return`.
+    pub async fn apply_return(
+        &self,
+        actor: &Actor,
+        scope: &AccessScope,
+        ret: &ChargeReturn,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.consumption
+            .apply_return(actor, scope, ret, events)
+            .await
+    }
+
+    /// Give back everything that remains of a charge.
     ///
     /// # Errors
     ///
     /// As the contract documents for `apply_rollback`.
     pub async fn apply_rollback(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         target: &RollbackTarget,
-        idempotency: &IdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         self.consumption
-            .apply_rollback(ctx, scope, target, idempotency, events)
+            .apply_rollback(actor, scope, target, events)
             .await
     }
 
@@ -101,12 +117,11 @@ impl StoragePlugin {
     /// `Unavailable` when the backend cannot answer.
     pub async fn read_quota_snapshot(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
         self.consumption
-            .read_quota_snapshot(ctx, scope, applicable)
+            .read_quota_snapshot(scope, applicable)
             .await
     }
 
@@ -118,13 +133,13 @@ impl StoragePlugin {
     /// when the backend cannot answer.
     pub async fn bulk_read_quota_snapshot(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
+        in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
         self.consumption
-            .bulk_read_quota_snapshot(ctx, scope, pairs, page)
+            .bulk_read_quota_snapshot(scope, pairs, page, in_window_only)
             .await
     }
 
@@ -167,6 +182,35 @@ impl StoragePlugin {
     ) -> Result<u64, StorageError> {
         self.consumption
             .reclaim_operation_log(batch_size, before)
+            .await
+    }
+
+    /// Remove charges deleted at `now`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    pub async fn reclaim_expired_charges(
+        &self,
+        batch_size: u32,
+        now: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        self.consumption
+            .reclaim_expired_charges(batch_size, now)
+            .await
+    }
+
+    /// The held allocation charges past their return window, per metric.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    pub async fn read_held_allocation_charge_stats(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<HeldAllocationCharges>, StorageError> {
+        self.consumption
+            .read_held_allocation_charge_stats(before)
             .await
     }
 }

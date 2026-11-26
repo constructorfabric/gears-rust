@@ -4,23 +4,23 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use gts::GtsTypeId;
-use quota_enforcement_sdk::testing::InMemoryStorage;
+use quota_enforcement_sdk::testing::{InMemoryStorage, bundle_with_global_policy};
 use quota_enforcement_sdk::{
-    CapPatch, EnforcementMode, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite,
-    LeaseState, MetricKind, NotificationEventKind, OperationType, PayloadHash, PeriodType,
-    QuotaEnforcementStoragePluginV1, QuotaId, QuotaSource, QuotaStatus, QuotaType, SubjectRef,
-    TenantId, ValidityWindow,
+    CapPatch, EnforcementMode, IdempotencyScope, IdempotencyWrite, LeaseState, MetricKind,
+    NotificationEventKind, OperationType, PayloadHash, PeriodType, QuotaEnforcementStoragePluginV1,
+    QuotaId, QuotaSource, QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow,
 };
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::AccessScope;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use super::QuotaManagement;
 use crate::domain::admission::Admission;
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig, ProjectionContractCatalog};
+use crate::domain::catalog::MetricCatalog;
 use crate::domain::error::{DomainError, ResourceKind};
-use crate::domain::ports::metric_registry::{MetricDescriptor, MetricMode};
 use crate::domain::ports::metrics::{DenialReason, ValidationReason, ValidationSurface};
 use crate::domain::quotas::request::{
     CreateQuotaRequest, ListQuotasRequest, Presence, UpdateQuotaRequest,
@@ -28,9 +28,10 @@ use crate::domain::quotas::request::{
 use crate::domain::quotas::validation::{QuotaLimits, RATE_QUOTAS};
 use crate::domain::tokens;
 use crate::test_support::{
-    DenyAllPdp, FakeContractRegistry, FakeMetricRegistry, LLM_TENANT_PROJECTION,
-    LLM_TOKEN_CONSTRAINT, LLM_TOKEN_CONSTRAINT_V2, LLM_USER_PROJECTION, METRIC_OTHER,
-    METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, ctx, gated_counter, tenant,
+    DEVICE_SUBJECT_TYPE, DenyAllPdp, METRIC_OTHER, METRIC_REQUESTS, METRIC_TOKENS,
+    PermitTenantsPdp, RecordingMetrics, TENANT_SUBJECT_TYPE, USER_SUBJECT_TYPE, actor, caller,
+    catalog_over, fail_registry_reads, metric_type_document, platform_registry, registry_reads,
+    subject_type_document, tenant,
 };
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -47,75 +48,33 @@ fn limits() -> QuotaLimits {
 }
 
 struct Harness {
-    catalog: ProjectionContractCatalog,
+    registry: Arc<MockTypesRegistry>,
+    catalog: Arc<MetricCatalog>,
     admission: Admission,
     storage: Arc<InMemoryStorage>,
-    registry: Arc<FakeContractRegistry>,
-    metric_registry: Arc<FakeMetricRegistry>,
     metrics: Arc<RecordingMetrics>,
     limits: QuotaLimits,
 }
 
 impl Harness {
-    /// Both `llm_gateway` projections, both metrics classified, a permitting PDP.
     async fn new() -> Self {
-        Self::build(
-            Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
-            vec![type_id(LLM_USER_PROJECTION), type_id(LLM_TENANT_PROJECTION)],
-        )
-        .await
+        Self::with_pdp(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await
     }
 
     async fn with_pdp(pdp: Arc<dyn AuthZResolverApi>) -> Self {
-        Self::build(
-            pdp,
-            vec![type_id(LLM_USER_PROJECTION), type_id(LLM_TENANT_PROJECTION)],
-        )
-        .await
-    }
-
-    async fn build(pdp: Arc<dyn AuthZResolverApi>, subject_projections: Vec<GtsTypeId>) -> Self {
-        Self::over(
-            pdp,
-            subject_projections,
-            Arc::new(FakeContractRegistry::llm_gateway()),
-            Arc::new(InMemoryStorage::new()),
-        )
-        .await
-    }
-
-    /// A later process over the same storage: `registry` is what its
-    /// catalogue is built from.
-    async fn restarted_with(&self, registry: FakeContractRegistry) -> Self {
-        Self::over(
-            Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
-            vec![type_id(LLM_USER_PROJECTION), type_id(LLM_TENANT_PROJECTION)],
-            Arc::new(registry),
-            self.storage.clone(),
-        )
-        .await
-    }
-
-    async fn over(
-        pdp: Arc<dyn AuthZResolverApi>,
-        subject_projections: Vec<GtsTypeId>,
-        registry: Arc<FakeContractRegistry>,
-        storage: Arc<InMemoryStorage>,
-    ) -> Self {
+        let registry = platform_registry();
         let metrics = Arc::new(RecordingMetrics::default());
-        let catalog = CatalogBuilder::new(registry.as_ref(), metrics.as_ref())
-            .build(&CatalogConfig {
-                subject_projections,
-                resource_projections: Vec::new(),
-            })
+        let storage = Arc::new(InMemoryStorage::new());
+        storage
+            .bootstrap(&bundle_with_global_policy())
             .await
-            .expect("catalogue");
+            .expect("bootstrap");
+        let catalog = catalog_over(&registry, metrics.clone());
         Self {
+            registry,
             catalog,
             admission: Admission::new(PolicyEnforcer::new(pdp), metrics.clone()),
             storage,
-            registry,
-            metric_registry: Arc::new(FakeMetricRegistry::classified()),
             metrics,
             limits: limits(),
         }
@@ -123,11 +82,9 @@ impl Harness {
 
     fn quotas(&self) -> QuotaManagement<'_> {
         QuotaManagement::new(
-            &self.admission,
+            self.admission.pdp(caller()),
             &self.catalog,
             self.storage.as_ref(),
-            self.registry.as_ref(),
-            self.metric_registry.as_ref(),
             self.metrics.as_ref(),
             self.limits,
         )
@@ -135,17 +92,23 @@ impl Harness {
 
     async fn create(&self, request: CreateQuotaRequest) -> QuotaId {
         self.quotas()
-            .create(&ctx(), request)
+            .create(request)
             .await
             .expect("create")
             .quota
             .id
     }
+
+    fn seed_unavailable(&self, metric: &str) {
+        let mut broken = metric_type_document(metric, json!({ "kind": "counter" }), json!({}));
+        broken["x-gts-abstract"] = json!(true);
+        self.registry.seed(metric, broken);
+    }
 }
 
 fn user_subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: type_id(LLM_USER_PROJECTION),
+        subject_type: type_id(USER_SUBJECT_TYPE),
         subject_id: id.to_owned(),
     }
 }
@@ -154,7 +117,6 @@ fn metadata(value: &Value) -> serde_json::Map<String, Value> {
     value.as_object().cloned().expect("object")
 }
 
-/// A consumption Quota on the user projection with conforming metadata.
 fn request() -> CreateQuotaRequest {
     CreateQuotaRequest {
         tenant_id: tenant(),
@@ -167,7 +129,7 @@ fn request() -> CreateQuotaRequest {
         notification_thresholds: vec![50],
         validity_window: None,
         fail_open_hint: false,
-        metadata: Some(metadata(&json!({ "regions": ["eu"], "weight": 5 }))),
+        metadata: None,
         source: QuotaSource::Operator,
     }
 }
@@ -176,7 +138,6 @@ fn idem(op: OperationType, key: &str) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
             operation_type: op,
             key: key.to_owned(),
         },
@@ -184,8 +145,8 @@ fn idem(op: OperationType, key: &str) -> IdempotencyWrite {
     }
 }
 
-/// A counter mutation through the shared convention: the transaction selects
-/// the policy and evaluates, so these tests state an amount, not a plan.
+// A counter mutation through the shared convention: the transaction selects
+// the policy and evaluates, so these tests state an amount, not a plan.
 async fn debit(storage: &InMemoryStorage, amount: u64, write: &IdempotencyWrite) {
     let evaluator = std::sync::Arc::new(quota_enforcement_sdk::testing::ScriptedEvaluator::new());
     let call: std::sync::Arc<quota_enforcement_sdk::engine::TransactionEvaluator> =
@@ -195,7 +156,7 @@ async fn debit(storage: &InMemoryStorage, amount: u64, write: &IdempotencyWrite)
             },
         );
     storage
-        .apply_debit_plan(&ctx(), &scope(), &evaluated(amount, write, call), &[])
+        .apply_debit_plan(&actor(), &scope(), &evaluated(amount, write, call), &[])
         .await
         .expect("debit");
 }
@@ -209,8 +170,7 @@ fn evaluated(
         applicable: applicable(),
         amount,
         request: &serde_json::Value::Null,
-        resource: &serde_json::Value::Null,
-        user_projection: None,
+        metric_id: None,
         limits: test_limits_clamp(),
         idempotency: write,
         authorized: quota_enforcement_sdk::AttributionDigest::from_bytes([7; 32]),
@@ -244,13 +204,9 @@ fn scope() -> AccessScope {
 #[tokio::test]
 async fn ac1_create_persists_an_active_row_and_enqueues_the_created_event() {
     let h = Harness::new().await;
-    let view = h.quotas().create(&ctx(), request()).await.expect("create");
+    let view = h.quotas().create(request()).await.expect("create");
     assert_eq!(view.quota.status, QuotaStatus::Active);
     assert_eq!(view.quota.record_version, 1);
-    assert_eq!(
-        view.quota.constraint_contract.type_id.as_ref(),
-        LLM_TOKEN_CONSTRAINT
-    );
     assert_eq!(view.metric_kind, Some(MetricKind::Counter));
     assert!(view.currently_within_window);
     let stored = h.storage.quota(view.quota.id).expect("stored");
@@ -260,10 +216,12 @@ async fn ac1_create_persists_an_active_row_and_enqueues_the_created_event() {
     assert_eq!(events[0].kind, NotificationEventKind::QuotaChanged);
     assert_eq!(events[0].quota_id, Some(view.quota.id));
     assert_eq!(events[0].payload, json!({ "change_kind": "created" }));
+    let reads = registry_reads(&h.registry);
+    h.create(request()).await;
     assert_eq!(
-        h.metric_registry.calls(),
-        1,
-        "the registry is consulted once, before storage, never after"
+        registry_reads(&h.registry),
+        reads,
+        "a held metric and a cached subject type need no registry read"
     );
 }
 
@@ -272,13 +230,10 @@ async fn ac2_an_unregistered_metric_and_an_unreachable_registry_fail_closed_befo
     let h = Harness::new().await;
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                metric: METRIC_OTHER.to_owned(),
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            metric: METRIC_OTHER.to_owned(),
+            ..request()
+        })
         .await
         .expect_err("unknown metric");
     assert_eq!(
@@ -287,89 +242,149 @@ async fn ac2_an_unregistered_metric_and_an_unreachable_registry_fail_closed_befo
             metric: METRIC_OTHER.to_owned()
         }
     );
-    h.metric_registry.fail_all();
+    assert!(matches!(
+        CanonicalError::from(err),
+        CanonicalError::InvalidArgument { .. }
+    ));
+    fail_registry_reads(&h.registry);
     let err = h
         .quotas()
-        .create(&ctx(), request())
+        .create(request())
         .await
-        .expect_err("registry down");
+        .expect_err("registry down on first use");
     assert!(
         matches!(err, DomainError::TypesRegistryUnavailable(_)),
         "{err:?}"
     );
+    assert!(matches!(
+        CanonicalError::from(err),
+        CanonicalError::ServiceUnavailable { .. }
+    ));
     assert!(h.storage.events().is_empty(), "nothing persisted");
 }
 
 #[tokio::test]
-async fn ac3_membership_and_subject_scope_are_enforced_before_persistence() {
-    let tenant_only = Harness::build(
-        Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
-        vec![type_id(LLM_TENANT_PROJECTION)],
-    )
-    .await;
-    let err = tenant_only
-        .quotas()
-        .create(&ctx(), request())
-        .await
-        .expect_err("user projection registered but not configured");
-    assert_eq!(
-        err,
-        DomainError::ProjectionNotResolvable {
-            projection: LLM_USER_PROJECTION.to_owned()
-        }
-    );
-
+async fn a_quota_write_for_a_metric_with_no_served_entry_is_not_resolvable() {
     let h = Harness::new().await;
-    h.metric_registry.add(METRIC_OTHER, gated_counter());
+    let id = h.create(request()).await;
+    let broken = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
+    h.seed_unavailable(broken);
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                metric: METRIC_OTHER.to_owned(),
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            metric: broken.to_owned(),
+            ..request()
+        })
         .await
-        .expect_err("registered metric the projection does not admit");
+        .expect_err("unavailable");
+    assert!(
+        matches!(err, DomainError::ProjectionNotResolvable { .. }),
+        "{err:?}"
+    );
+    let CanonicalError::FailedPrecondition { ctx: violation, .. } = CanonicalError::from(err)
+    else {
+        panic!("FailedPrecondition expected");
+    };
+    assert_eq!(
+        violation.violations[0].type_,
+        DomainError::PROJECTION_NOT_RESOLVABLE
+    );
+    assert!(
+        h.storage.events().len() == 1,
+        "only the first create persisted"
+    );
+    h.quotas().deactivate(id).await.expect("deactivate runs");
+}
+
+#[tokio::test]
+async fn ac3_subject_admission_and_scope_are_enforced_before_persistence() {
+    let h = Harness::new().await;
+    let derived = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~acme.core.quota.admin.v1~";
+    h.registry.seed(derived, subject_type_document(derived));
+    h.create(CreateQuotaRequest {
+        subject: SubjectRef {
+            subject_type: type_id(derived),
+            subject_id: "a1".to_owned(),
+        },
+        ..request()
+    })
+    .await;
+
+    let device = CreateQuotaRequest {
+        subject: SubjectRef {
+            subject_type: type_id(DEVICE_SUBJECT_TYPE),
+            subject_id: "d1".to_owned(),
+        },
+        ..request()
+    };
+    let err = h
+        .quotas()
+        .create(device.clone())
+        .await
+        .expect_err("the metric does not admit devices");
     assert_eq!(
         err,
         DomainError::InvalidArgument {
-            field: "metric",
+            field: "subject.type",
             reason: tokens::METRIC_NOT_ADMITTED
         }
     );
     assert_eq!(
         h.metrics.admitted_violations(),
-        vec![ValidationSurface::Arbitration]
+        vec![ValidationSurface::QuotaWrite]
+    );
+    h.quotas()
+        .create(CreateQuotaRequest {
+            metric: METRIC_REQUESTS.to_owned(),
+            ..device
+        })
+        .await
+        .expect("a metric admitting the subject base admits devices");
+
+    let err = h
+        .quotas()
+        .create(CreateQuotaRequest {
+            subject: SubjectRef {
+                subject_type: type_id("gts.cf.core.quota.subj.v1~acme.core.quota.robot.v1~"),
+                subject_id: "r1".to_owned(),
+            },
+            metric: METRIC_REQUESTS.to_owned(),
+            ..request()
+        })
+        .await
+        .expect_err("unregistered subject type");
+    assert!(
+        matches!(err, DomainError::ProjectionNotRegistered { .. }),
+        "{err:?}"
     );
 
     let tenant_subject = |id: String| CreateQuotaRequest {
         subject: SubjectRef {
-            projection_type: type_id(LLM_TENANT_PROJECTION),
+            subject_type: type_id(TENANT_SUBJECT_TYPE),
             subject_id: id,
         },
         ..request()
     };
     let err = h
         .quotas()
-        .create(&ctx(), tenant_subject("someone-else".to_owned()))
+        .create(tenant_subject("someone-else".to_owned()))
         .await
-        .expect_err("tenant scope demands the tenant id");
+        .expect_err("a tenant subject names the Quota's tenant");
     assert_eq!(
         err,
         DomainError::InvalidArgument {
-            field: "subject.subject_id",
-            reason: tokens::SUBJECT_SCOPE_VIOLATION
+            field: "subject.id",
+            reason: tokens::TENANT_SUBJECT_MISMATCH
         }
     );
     h.quotas()
-        .create(&ctx(), tenant_subject(tenant().to_string()))
+        .create(tenant_subject(tenant().to_string()))
         .await
-        .expect("the tenant itself");
-    assert!(
-        h.storage.events().len() == 1,
-        "only the accepted create persisted"
+        .expect("the tenant itself, always admitted");
+    assert_eq!(
+        h.storage.events().len(),
+        3,
+        "only the accepted creates persisted"
     );
 }
 
@@ -379,13 +394,10 @@ async fn ac4_negative_caps_fail_before_the_pdp_while_zero_and_unbounded_are_coun
     let h = Harness::with_pdp(pdp.clone()).await;
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                cap: Some(-1),
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            cap: Some(-1),
+            ..request()
+        })
         .await
         .expect_err("negative");
     assert_eq!(err, DomainError::CapMustBeNonNegative { cap: -1 });
@@ -412,13 +424,10 @@ async fn ac5_thresholds_require_a_bounded_cap_at_create_and_at_update() {
     let h = Harness::new().await;
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                cap: None,
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            cap: None,
+            ..request()
+        })
         .await
         .expect_err("thresholds on unbounded");
     assert_eq!(err, DomainError::ThresholdsRequireBoundedCap);
@@ -427,7 +436,6 @@ async fn ac5_thresholds_require_a_bounded_cap_at_create_and_at_update() {
     let err = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 cap: Presence::Null,
@@ -447,7 +455,6 @@ async fn ac5_thresholds_require_a_bounded_cap_at_create_and_at_update() {
     let err = h
         .quotas()
         .update(
-            &ctx(),
             unbounded,
             UpdateQuotaRequest {
                 notification_thresholds: Some(vec![50]),
@@ -473,14 +480,11 @@ async fn ac7_rate_is_unimplemented_on_create_and_update_before_any_other_gate() 
     let h = Harness::with_pdp(pdp.clone()).await;
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                quota_type: QuotaType::Rate,
-                period: Presence::Absent,
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            quota_type: QuotaType::Rate,
+            period: Presence::Absent,
+            ..request()
+        })
         .await
         .expect_err("rate create");
     assert_eq!(
@@ -493,7 +497,6 @@ async fn ac7_rate_is_unimplemented_on_create_and_update_before_any_other_gate() 
     let err = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 metric: Presence::Value(json!(METRIC_OTHER)),
@@ -519,16 +522,11 @@ async fn ac7_rate_is_unimplemented_on_create_and_update_before_any_other_gate() 
 #[tokio::test]
 async fn ac8_the_cap_guard_is_decided_by_storage_and_raises_bypass_it() {
     let h = Harness::new().await;
-    h.storage
-        .bootstrap(&quota_enforcement_sdk::testing::bundle_with_global_policy())
-        .await
-        .expect("bootstrap");
     let id = h.create(request()).await;
     debit(&h.storage, 60, &idem(OperationType::Debit, "d")).await;
     let err = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 cap: Presence::Value(50),
@@ -547,7 +545,6 @@ async fn ac8_the_cap_guard_is_decided_by_storage_and_raises_bypass_it() {
     let raised = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 cap: Presence::Value(200),
@@ -561,7 +558,6 @@ async fn ac8_the_cap_guard_is_decided_by_storage_and_raises_bypass_it() {
     let unbound = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 cap: Presence::Null,
@@ -596,12 +592,12 @@ async fn ac9_immutable_fields_are_rejected_and_identity_survives_updates() {
         (
             "subject",
             UpdateQuotaRequest {
-                subject: Presence::Value(json!({ "subject_id": "u2" })),
+                subject: Presence::Value(json!({ "id": "u2" })),
                 ..UpdateQuotaRequest::default()
             },
         ),
     ] {
-        let err = h.quotas().update(&ctx(), id, patch).await.expect_err(field);
+        let err = h.quotas().update(id, patch).await.expect_err(field);
         assert_eq!(
             err,
             DomainError::InvalidArgument {
@@ -613,7 +609,6 @@ async fn ac9_immutable_fields_are_rejected_and_identity_survives_updates() {
     let updated = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 fail_open_hint: Some(true),
@@ -633,7 +628,7 @@ async fn ac9_immutable_fields_are_rejected_and_identity_survives_updates() {
 }
 
 #[tokio::test]
-async fn ac10_metadata_is_validated_before_persistence_and_snapshotted() {
+async fn ac10_metadata_is_bounded_and_checked_against_the_metric_type_before_persistence() {
     let h = Harness::new().await;
     let small = Harness {
         limits: QuotaLimits {
@@ -644,7 +639,10 @@ async fn ac10_metadata_is_validated_before_persistence_and_snapshotted() {
     };
     let err = small
         .quotas()
-        .create(&ctx(), request())
+        .create(CreateQuotaRequest {
+            metadata: Some(metadata(&json!({ "region": "eu" }))),
+            ..request()
+        })
         .await
         .expect_err("oversize");
     assert_eq!(
@@ -654,86 +652,123 @@ async fn ac10_metadata_is_validated_before_persistence_and_snapshotted() {
             reason: tokens::METADATA_TOO_LARGE
         }
     );
-    assert!(small.metrics.contract_failures().is_empty());
+    let over_4kb = Map::from_iter([("blob".to_owned(), json!("x".repeat(4096)))]);
+    let err = h
+        .quotas()
+        .create(CreateQuotaRequest {
+            metadata: Some(over_4kb),
+            ..request()
+        })
+        .await
+        .expect_err("over 4 KB");
+    assert_eq!(
+        err,
+        DomainError::InvalidArgument {
+            field: "metadata",
+            reason: tokens::METADATA_TOO_LARGE
+        }
+    );
 
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                metadata: Some(metadata(&json!({ "regions": ["eu"], "weight": "heavy" }))),
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            metadata: Some(metadata(&json!({ "bad": true, "region": 7 }))),
+            ..request()
+        })
         .await
-        .expect_err("contract violation");
+        .expect_err("conditions that do not fit");
+    let DomainError::QuotaMetadataRejected { violations } = &err else {
+        panic!("rejection expected: {err:?}");
+    };
+    assert_eq!(violations.len(), 2);
+    let CanonicalError::InvalidArgument { ctx: invalid, .. } = CanonicalError::from(err.clone())
+    else {
+        panic!("InvalidArgument expected");
+    };
+    let toolkit_canonical_errors::InvalidArgument::FieldViolations { field_violations } = invalid
+    else {
+        panic!("field violations expected");
+    };
+    let fields: Vec<(&str, &str)> = field_violations
+        .iter()
+        .map(|v| (v.field.as_str(), v.reason.as_str()))
+        .collect();
     assert_eq!(
-        err,
-        DomainError::ConstraintContractMismatch {
-            contract: LLM_TOKEN_CONSTRAINT.to_owned()
-        }
+        fields,
+        vec![
+            ("metadata/bad", "QUOTA_METADATA_REJECTED"),
+            ("metadata/region", "QUOTA_METADATA_REJECTED"),
+        ]
     );
     assert_eq!(
         h.metrics.contract_failures(),
         vec![(
-            ValidationSurface::Arbitration,
+            ValidationSurface::QuotaWrite,
             ValidationReason::SchemaViolation
         )]
     );
     assert!(h.storage.events().is_empty(), "rejected before persistence");
 
     let id = h.create(request()).await;
-    let stored = h.storage.quota(id).expect("stored");
-    assert_eq!(
-        stored.constraint_contract.type_id.as_ref(),
-        LLM_TOKEN_CONSTRAINT
-    );
-    assert_eq!(stored.constraint_contract.version, 1);
     let updated = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
-                metadata: Some(metadata(&json!({ "regions": ["eu"], "weight": 9 }))),
+                metadata: Some(metadata(&json!({ "region": ["eu"], "model": "m-9" }))),
                 ..UpdateQuotaRequest::default()
             },
         )
         .await
-        .expect("metadata-only update");
+        .expect("metadata-only update whose conditions fit");
     assert_eq!(updated.quota.id, id);
-    assert_eq!(updated.quota.metadata["weight"], json!(9));
-    assert_eq!(
-        updated.quota.constraint_contract,
-        stored.constraint_contract
-    );
+    assert_eq!(updated.quota.metadata["model"], json!("m-9"));
+    let err = h
+        .quotas()
+        .update(
+            id,
+            UpdateQuotaRequest {
+                metadata: Some(metadata(&json!({ "bad": 1 }))),
+                ..UpdateQuotaRequest::default()
+            },
+        )
+        .await
+        .expect_err("a metadata change is checked again");
+    assert!(matches!(err, DomainError::QuotaMetadataRejected { .. }));
     assert_eq!(
         h.storage.events().len(),
         2,
-        "create and update each enqueued one event"
+        "create and the accepted update each enqueued one event"
     );
 }
 
-/// A catalogue that moved between two processes: the stored reference names
-/// the contract the current object was accepted against, never an older one.
 #[tokio::test]
-async fn a_metadata_update_after_a_catalogue_change_moves_the_stored_contract_reference() {
+async fn a_quota_update_for_a_metric_that_became_unavailable_is_refused() {
+    let h = Harness::new().await;
+    let broken = "gts.cf.core.quota.metric.v1~cf.qetest.metric.later.v1~";
     let first = Harness::new().await;
-    let id = first.create(request()).await;
-    let created = first.storage.quota(id).expect("stored");
-    assert_eq!(
-        created.constraint_contract.type_id.as_ref(),
-        LLM_TOKEN_CONSTRAINT
+    first.registry.seed(
+        broken,
+        metric_type_document(
+            broken,
+            json!({ "kind": "counter", "admitted_subjects": [USER_SUBJECT_TYPE] }),
+            json!({}),
+        ),
     );
-    assert_eq!(created.constraint_contract.version, 1);
-
-    let later = first
-        .restarted_with(FakeContractRegistry::llm_gateway_v2())
+    let id = first
+        .create(CreateQuotaRequest {
+            metric: broken.to_owned(),
+            ..request()
+        })
         .await;
-    let untouched = later
+    let later = Harness {
+        storage: first.storage.clone(),
+        ..h
+    };
+    later.seed_unavailable(broken);
+    let err = later
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 fail_open_hint: Some(true),
@@ -741,45 +776,21 @@ async fn a_metadata_update_after_a_catalogue_change_moves_the_stored_contract_re
             },
         )
         .await
-        .expect("a patch without metadata");
-    assert_eq!(
-        untouched.quota.constraint_contract, created.constraint_contract,
-        "only a metadata change is re-validated, so only it moves the reference"
+        .expect_err("no served entry");
+    assert!(
+        matches!(err, DomainError::ProjectionNotResolvable { .. }),
+        "{err:?}"
     );
-
-    let moved = later
+    later
         .quotas()
-        .update(
-            &ctx(),
-            id,
-            UpdateQuotaRequest {
-                metadata: Some(metadata(&json!({ "regions": ["us"], "weight": 2 }))),
-                ..UpdateQuotaRequest::default()
-            },
-        )
+        .deactivate(id)
         .await
-        .expect("metadata validated against the current catalogue");
-    assert_eq!(moved.quota.metadata["weight"], json!(2));
-    assert_eq!(
-        moved.quota.constraint_contract.type_id.as_ref(),
-        LLM_TOKEN_CONSTRAINT_V2
-    );
-    assert_eq!(moved.quota.constraint_contract.version, 2);
-    let stored = later.storage.quota(id).expect("stored");
-    assert_eq!(
-        stored.constraint_contract, moved.quota.constraint_contract,
-        "the row carries the reference its metadata was accepted against"
-    );
-    assert_eq!(stored.record_version, 3);
+        .expect("a deactivation makes no catalogue check");
 }
 
 #[tokio::test]
 async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
     let h = Harness::new().await;
-    h.storage
-        .bootstrap(&quota_enforcement_sdk::testing::bundle_with_global_policy())
-        .await
-        .expect("bootstrap");
     let id = h.create(request()).await;
     let write = idem(OperationType::Reserve, "r");
     let evaluator = std::sync::Arc::new(quota_enforcement_sdk::testing::ScriptedEvaluator::new());
@@ -792,7 +803,7 @@ async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
     let acquired = h
         .storage
         .acquire_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             &evaluated(60, &write, call),
             std::time::Duration::from_mins(1),
@@ -800,7 +811,7 @@ async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
         .await
         .expect("lease");
     let token = acquired.get().token.expect("an allowed acquisition holds");
-    let outcome = h.quotas().deactivate(&ctx(), id).await.expect("deactivate");
+    let outcome = h.quotas().deactivate(id).await.expect("deactivate");
     assert_eq!(outcome.resolved_leases, vec![token]);
     assert_eq!(
         h.storage.lease_state(token),
@@ -810,16 +821,11 @@ async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
         h.storage.events().last().map(|e| e.payload.clone()),
         Some(json!({ "change_kind": "deactivated" }))
     );
-    let again = h
-        .quotas()
-        .deactivate(&ctx(), id)
-        .await
-        .expect_err("terminal");
+    let again = h.quotas().deactivate(id).await.expect_err("terminal");
     assert_eq!(again, DomainError::QuotaDeactivated { id: id.to_string() });
     let patched = h
         .quotas()
         .update(
-            &ctx(),
             id,
             UpdateQuotaRequest {
                 fail_open_hint: Some(true),
@@ -837,22 +843,27 @@ async fn ac11_deactivation_resolves_active_leases_once_and_is_terminal() {
 #[tokio::test]
 async fn ac12_deactivated_quotas_stay_readable_and_reads_are_pdp_gated() {
     let h = Harness::new().await;
-    let id = h.create(request()).await;
-    h.quotas().deactivate(&ctx(), id).await.expect("deactivate");
-    let one = h.quotas().get(&ctx(), id).await.expect("get");
+    let id = h
+        .create(CreateQuotaRequest {
+            metadata: Some(metadata(&json!({ "region": ["eu"], "model": "m-5" }))),
+            ..request()
+        })
+        .await;
+    h.quotas().deactivate(id).await.expect("deactivate");
+    let one = h.quotas().get(id).await.expect("get");
     assert_eq!(one.quota.status, QuotaStatus::Deactivated);
-    assert_eq!(one.quota.metadata["weight"], json!(5));
+    assert_eq!(one.quota.metadata["model"], json!("m-5"));
     assert_eq!(one.metric_kind, Some(MetricKind::Counter));
     let page = h
         .quotas()
-        .list(&ctx(), ListQuotasRequest::default())
+        .list(ListQuotasRequest::default())
         .await
         .expect("list");
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].quota.id, id);
     let missing = h
         .quotas()
-        .get(&ctx(), QuotaId::new(Uuid::from_u128(404)))
+        .get(QuotaId::new(Uuid::from_u128(404)))
         .await
         .expect_err("unknown");
     assert_eq!(
@@ -866,18 +877,18 @@ async fn ac12_deactivated_quotas_stay_readable_and_reads_are_pdp_gated() {
     let denied = Harness::with_pdp(Arc::new(DenyAllPdp)).await;
     let err = denied
         .quotas()
-        .list(&ctx(), ListQuotasRequest::default())
+        .list(ListQuotasRequest::default())
         .await
         .expect_err("denied");
     assert!(matches!(err, DomainError::PdpDenied { .. }), "{err:?}");
     let err = denied
         .quotas()
-        .create(&ctx(), request())
+        .create(request())
         .await
         .expect_err("denied create");
     assert!(matches!(err, DomainError::PdpDenied { .. }), "{err:?}");
     assert_eq!(
-        denied.metric_registry.calls(),
+        registry_reads(&denied.registry),
         0,
         "the PDP answers before any registry call"
     );
@@ -900,7 +911,7 @@ async fn a_list_without_a_tenant_returns_only_the_callers_own_tenant() {
     .await;
     let page = h
         .quotas()
-        .list(&ctx(), ListQuotasRequest::default())
+        .list(ListQuotasRequest::default())
         .await
         .expect("list");
     let ids: Vec<QuotaId> = page.items.iter().map(|v| v.quota.id).collect();
@@ -914,16 +925,25 @@ async fn a_list_without_a_tenant_returns_only_the_callers_own_tenant() {
 #[tokio::test]
 async fn ac13_a_quota_on_a_direct_metric_is_accepted() {
     let h = Harness::new().await;
-    h.metric_registry.add(
-        METRIC_TOKENS,
-        MetricDescriptor {
-            kind: MetricKind::Counter,
-            mode: MetricMode::Direct,
-        },
+    let direct = "gts.cf.core.quota.metric.v1~cf.qetest.metric.direct.v1~";
+    h.registry.seed(
+        direct,
+        metric_type_document(
+            direct,
+            json!({
+                "kind": "counter",
+                "enforcement": "direct",
+                "admitted_subjects": [USER_SUBJECT_TYPE],
+            }),
+            json!({}),
+        ),
     );
     let view = h
         .quotas()
-        .create(&ctx(), request())
+        .create(CreateQuotaRequest {
+            metric: direct.to_owned(),
+            ..request()
+        })
         .await
         .expect("accepted");
     assert_eq!(view.quota.status, QuotaStatus::Active);
@@ -942,7 +962,7 @@ async fn ac14_a_past_validity_end_flips_the_flag_and_never_the_status() {
             ..request()
         })
         .await;
-    let view = h.quotas().get(&ctx(), id).await.expect("get");
+    let view = h.quotas().get(id).await.expect("get");
     assert_eq!(view.quota.status, QuotaStatus::Active);
     assert!(!view.currently_within_window);
 }
@@ -954,61 +974,89 @@ async fn a_shape_failure_wins_over_a_denying_pdp_and_a_denial_over_the_registry(
     let h = Harness::with_pdp(Arc::new(DenyAllPdp)).await;
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                subject: user_subject(""),
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            subject: user_subject(""),
+            ..request()
+        })
         .await
         .expect_err("shape");
     assert_eq!(
         err,
         DomainError::InvalidArgument {
-            field: "subject.subject_id",
+            field: "subject.id",
             reason: tokens::SUBJECT_ID_REQUIRED
         }
     );
     let err = h
         .quotas()
-        .create(
-            &ctx(),
-            CreateQuotaRequest {
-                metric: METRIC_OTHER.to_owned(),
-                ..request()
-            },
-        )
+        .create(CreateQuotaRequest {
+            metric: METRIC_OTHER.to_owned(),
+            ..request()
+        })
         .await
         .expect_err("denied");
     assert!(matches!(err, DomainError::PdpDenied { .. }));
-    assert_eq!(h.metric_registry.calls(), 0);
+    assert_eq!(registry_reads(&h.registry), 0);
 }
 
 #[tokio::test]
-async fn reads_fail_closed_on_a_cold_registry_and_tolerate_a_removed_metric() {
-    let h = Harness::new().await;
-    let id = h.create(request()).await;
-    h.metric_registry.fail_all();
-    let err = h
+async fn reads_tolerate_a_registry_outage_and_a_metric_without_a_served_entry() {
+    let first = Harness::new().await;
+    let id = first.create(request()).await;
+
+    let cold = Harness {
+        storage: first.storage.clone(),
+        ..Harness::new().await
+    };
+    fail_registry_reads(&cold.registry);
+    let view = cold
         .quotas()
-        .get(&ctx(), id)
+        .get(id)
         .await
-        .expect_err("cold cache, registry down");
-    assert!(
-        matches!(err, DomainError::TypesRegistryUnavailable(_)),
-        "{err:?}"
-    );
-    h.metric_registry.recover();
-    h.metric_registry.remove(METRIC_TOKENS);
-    let view = h.quotas().get(&ctx(), id).await.expect("still readable");
+        .expect("readable with the registry down");
     assert_eq!(view.metric_kind, None, "unknown, never defaulted");
-    let page = h
+
+    let broken = Harness {
+        storage: first.storage.clone(),
+        ..Harness::new().await
+    };
+    broken.seed_unavailable(METRIC_TOKENS);
+    let view = broken.quotas().get(id).await.expect("still readable");
+    assert_eq!(view.metric_kind, None, "unknown, never defaulted");
+    let page = broken
         .quotas()
-        .list(&ctx(), ListQuotasRequest::default())
+        .list(ListQuotasRequest::default())
         .await
         .expect("list");
     assert_eq!(page.items[0].metric_kind, None);
+
+    let warm = Harness {
+        storage: first.storage.clone(),
+        ..Harness::new().await
+    };
+    warm.quotas().get(id).await.expect("holds the tokens type");
+    first
+        .create(CreateQuotaRequest {
+            metric: METRIC_REQUESTS.to_owned(),
+            ..request()
+        })
+        .await;
+    fail_registry_reads(&warm.registry);
+    let page = warm
+        .quotas()
+        .list(ListQuotasRequest::default())
+        .await
+        .expect("list");
+    let kinds: Vec<_> = page
+        .items
+        .iter()
+        .map(|view| (view.quota.id == id, view.metric_kind))
+        .collect();
+    assert!(
+        kinds.contains(&(true, Some(MetricKind::Counter))),
+        "a held metric keeps its kind: {kinds:?}"
+    );
+    assert!(kinds.contains(&(false, None)), "{kinds:?}");
 }
 
 #[tokio::test]
@@ -1038,18 +1086,14 @@ async fn the_in_process_conversions_keep_caps_in_range() {
     );
     let max = CreateQuotaRequest::try_from(quota_enforcement_sdk::QuotaSpec {
         cap: Some(quota_enforcement_sdk::Quota::MAX_CAP),
-        metadata: json!({ "regions": ["eu"], "weight": 5 })
+        metadata: json!({ "region": ["eu"], "model": "m-5" })
             .as_object()
             .cloned()
             .expect("object"),
         ..spec
     })
     .expect("the largest supported cap");
-    let view = h
-        .quotas()
-        .create(&ctx(), max)
-        .await
-        .expect("accepted end to end");
+    let view = h.quotas().create(max).await.expect("accepted end to end");
     assert_eq!(view.quota.cap, Some(quota_enforcement_sdk::Quota::MAX_CAP));
     let patch = quota_enforcement_sdk::QuotaUpdate {
         cap: Some(CapPatch::Bounded(u64::MAX)),
@@ -1063,4 +1107,124 @@ async fn the_in_process_conversions_keep_caps_in_range() {
             reason: tokens::CAP_OUT_OF_RANGE
         }
     );
+}
+
+#[tokio::test]
+async fn a_quota_type_the_kind_of_its_metric_does_not_take_is_invalid() {
+    let h = Harness::new().await;
+    let gauge = "gts.cf.core.quota.metric.v1~cf.qetest.metric.seats.v1~";
+    h.registry.seed(
+        gauge,
+        metric_type_document(
+            gauge,
+            json!({ "kind": "gauge", "admitted_subjects": [USER_SUBJECT_TYPE] }),
+            json!({}),
+        ),
+    );
+    let allocation = |metric: &str| CreateQuotaRequest {
+        metric: metric.to_owned(),
+        quota_type: QuotaType::Allocation,
+        period: Presence::Absent,
+        metadata: None,
+        ..request()
+    };
+    let consumption_on_gauge = CreateQuotaRequest {
+        metric: gauge.to_owned(),
+        metadata: None,
+        ..request()
+    };
+
+    for refused in [allocation(METRIC_TOKENS), consumption_on_gauge] {
+        let err = h
+            .quotas()
+            .create(refused)
+            .await
+            .expect_err("the kind does not take the quota type");
+        assert!(
+            matches!(
+                err,
+                DomainError::InvalidArgument {
+                    field: "quota_type",
+                    reason
+                } if reason == tokens::QUOTA_TYPE_KIND_MISMATCH
+            ),
+            "{err:?}"
+        );
+        assert!(matches!(
+            CanonicalError::from(err),
+            CanonicalError::InvalidArgument { .. }
+        ));
+    }
+    assert!(h.storage.events().is_empty(), "nothing persisted");
+
+    h.create(allocation(gauge)).await;
+    h.create(CreateQuotaRequest {
+        metadata: None,
+        ..request()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn with_the_registry_down_a_create_checks_admission_and_the_metric_before_the_subject_type() {
+    let h = Harness::new().await;
+    let broken = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
+    h.seed_unavailable(broken);
+    for metric in [METRIC_TOKENS, broken] {
+        h.catalog
+            .served(
+                &quota_enforcement_sdk::MetricId::parse(metric).expect("metric"),
+                ValidationSurface::QuotaWrite,
+            )
+            .await
+            .ok();
+    }
+    fail_registry_reads(&h.registry);
+    let device = |metric: &str| CreateQuotaRequest {
+        subject: SubjectRef {
+            subject_type: type_id(DEVICE_SUBJECT_TYPE),
+            subject_id: "d1".to_owned(),
+        },
+        metric: metric.to_owned(),
+        ..request()
+    };
+
+    let err = h
+        .quotas()
+        .create(device(METRIC_TOKENS))
+        .await
+        .expect_err("the metric does not admit devices");
+    assert_eq!(
+        err,
+        DomainError::InvalidArgument {
+            field: "subject.type",
+            reason: tokens::METRIC_NOT_ADMITTED
+        }
+    );
+    let err = h
+        .quotas()
+        .create(device(broken))
+        .await
+        .expect_err("unavailable");
+    assert!(
+        matches!(err, DomainError::ProjectionNotResolvable { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_on_a_held_metric_reads_its_subject_type_with_one_read() {
+    let h = Harness::new().await;
+    h.catalog
+        .served(
+            &quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
+            ValidationSurface::QuotaWrite,
+        )
+        .await
+        .expect("held");
+    let reads = registry_reads(&h.registry);
+
+    h.create(request()).await;
+
+    assert_eq!(registry_reads(&h.registry), reads + 1);
 }

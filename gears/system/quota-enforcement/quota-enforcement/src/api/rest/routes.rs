@@ -18,14 +18,14 @@ use super::{dto, handlers};
 use crate::domain::Service;
 
 /// Path prefix of every operational route (DESIGN section 3.3).
-pub const PATH_PREFIX: &str = "/v1/quota-enforcement";
+pub const PATH_PREFIX: &str = "/quota-enforcement/v1";
 
 const API_TAG: &str = "Quotas";
 
 /// Mount the gear's routes and make the service reachable from handlers.
 ///
-/// Owner projections are published by their owning gears directly to the
-/// types registry; no QE route registers a contract.
+/// Metric types and subject types are registered by their owners in the
+/// types registry; no QE route registers a type.
 // @cpt-begin:cpt-cf-quota-enforcement-flow-owner-projection-publication:p1:inst-pub-registry
 pub fn register_routes(
     router: Router,
@@ -54,8 +54,9 @@ fn register_quota_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
         .operation_id("quota_enforcement.create_quota")
         .summary("Create a Quota")
         .description(
-            "Validate the draft, authorize its explicit target, resolve the metric owner's \
-             constraint contract, and persist the Quota. The reserved `rate` type answers 501.",
+            "Validate the draft, authorize its explicit target, check the subject against the \
+             metric type and the metadata, the Quota's conditions, against the metric type's \
+             schema, and persist the Quota. The reserved `rate` type answers 501.",
         )
         .tag(API_TAG)
         .authenticated()
@@ -98,7 +99,7 @@ fn register_quota_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> R
         .description(
             "A filtered, cursor-paginated page of Quotas within the caller's scope, ordered by \
              identifier (creation order). `$filter` takes `eq` on every field and `in` on `id`, \
-             joined by `and`; `projection_type` and `subject_id` come together.",
+             joined by `and`; `subject_type` and `subject_id` come together.",
         )
         .tag(API_TAG)
         .authenticated()

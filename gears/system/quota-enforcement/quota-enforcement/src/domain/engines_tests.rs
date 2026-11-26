@@ -21,7 +21,7 @@ use super::{
 };
 use crate::domain::error::DomainError;
 use crate::domain::ports::metrics::EngineLabel;
-use crate::test_support::{LLM_USER_PROJECTION, METRIC_OTHER, METRIC_TOKENS, RecordingMetrics};
+use crate::test_support::{METRIC_OTHER, METRIC_TOKENS, RecordingMetrics, USER_SUBJECT_TYPE};
 
 fn metric() -> MetricId {
     MetricId::parse(METRIC_TOKENS).expect("metric")
@@ -48,8 +48,8 @@ fn snapshot(cap: u64) -> QuotaSnapshot {
     QuotaSnapshot {
         quota_id: QuotaId::generate(),
         subject: serde_json::from_value(json!({
-            "projection_type": LLM_USER_PROJECTION,
-            "subject_id": "alice"
+            "type": USER_SUBJECT_TYPE,
+            "id": "alice"
         }))
         .expect("subject"),
         metric: metric(),
@@ -70,8 +70,8 @@ fn budget() -> EvaluationBudget {
     EvaluationBudget::new(Some(1000), thousand, thousand).expect("budget")
 }
 
-/// An engine that reports a registered id but debits a Quota nobody asked
-/// about: what the invariant boundary exists to catch.
+// An engine that reports a registered id but debits a Quota nobody asked
+// about: what the invariant boundary exists to catch.
 struct RogueEngine;
 
 struct NoConfig;
@@ -101,13 +101,10 @@ impl QuotaResolutionEngineV1 for RogueEngine {
     ) -> Result<Decision, EngineError> {
         Ok(Decision {
             result: DecisionResult::Allowed,
-            debit_plan: std::iter::once((
-                QuotaId::generate(),
-                QuotaDebitPlan {
-                    amount: context.amount,
-                },
-            ))
-            .collect(),
+            debit_plan: vec![vec![QuotaDebitPlan {
+                quota_id: QuotaId::generate(),
+                amount: context.amount,
+            }]],
             diagnostics: std::collections::BTreeMap::new(),
         })
     }
@@ -169,8 +166,7 @@ fn a_prepared_evaluation_records_latency_and_a_miss_asks_for_preparation() {
     let quota = snapshot(100);
     let quotas = [EvaluationQuota {
         snapshot: &quota,
-        tier: QuotaScopeTier::User,
-        arbitration: &Value::Null,
+        tier: QuotaScopeTier::Subject,
     }];
     let context = EvaluationContext {
         policy: &policy,
@@ -179,7 +175,7 @@ fn a_prepared_evaluation_records_latency_and_a_miss_asks_for_preparation() {
         time: OffsetDateTime::UNIX_EPOCH,
         quotas: &quotas,
         request: &Value::Null,
-        resource: &Value::Null,
+        metric_id: None,
         budget: budget(),
     };
 
@@ -205,8 +201,11 @@ fn a_prepared_evaluation_records_latency_and_a_miss_asks_for_preparation() {
     cache.publish(PolicyId::global(), 1, artifact);
     let outcome = evaluate_prepared(&registry, &cache, &context, &metrics).expect("prepared");
     assert_eq!(
-        outcome.decision().debit_plan.get(&quota.quota_id),
-        Some(&QuotaDebitPlan { amount: 7 })
+        outcome.decision().debit_plan,
+        vec![vec![QuotaDebitPlan {
+            quota_id: quota.quota_id,
+            amount: 7
+        }]]
     );
     assert_eq!(
         outcome.decision().diagnostics["engine_id"],
@@ -220,8 +219,8 @@ fn a_prepared_evaluation_records_latency_and_a_miss_asks_for_preparation() {
     );
 }
 
-/// An engine linked from outside the repository: it debits the request
-/// against the first applicable Quota.
+// An engine linked from outside the repository: it debits the request
+// against the first applicable Quota.
 struct AcmeEngine;
 
 impl QuotaResolutionEngineV1 for AcmeEngine {
@@ -244,13 +243,10 @@ impl QuotaResolutionEngineV1 for AcmeEngine {
         let quota = context.quotas.first().ok_or(EngineError::CostExceeded)?;
         Ok(Decision {
             result: DecisionResult::Allowed,
-            debit_plan: std::iter::once((
-                quota.snapshot.quota_id,
-                QuotaDebitPlan {
-                    amount: context.amount,
-                },
-            ))
-            .collect(),
+            debit_plan: vec![vec![QuotaDebitPlan {
+                quota_id: quota.snapshot.quota_id,
+                amount: context.amount,
+            }]],
             diagnostics: std::collections::BTreeMap::new(),
         })
     }
@@ -272,8 +268,7 @@ fn an_engine_outside_the_built_ins_evaluates_under_its_own_label() {
     let quota = snapshot(100);
     let quotas = [EvaluationQuota {
         snapshot: &quota,
-        tier: QuotaScopeTier::User,
-        arbitration: &Value::Null,
+        tier: QuotaScopeTier::Subject,
     }];
     let context = EvaluationContext {
         policy: &policy,
@@ -282,15 +277,18 @@ fn an_engine_outside_the_built_ins_evaluates_under_its_own_label() {
         time: OffsetDateTime::UNIX_EPOCH,
         quotas: &quotas,
         request: &Value::Null,
-        resource: &Value::Null,
+        metric_id: None,
         budget: budget(),
     };
 
     let outcome = evaluate_prepared(&registry, &cache, &context, &metrics)
         .expect("a linked engine evaluates like a built-in");
     assert_eq!(
-        outcome.decision().debit_plan.get(&quota.quota_id),
-        Some(&QuotaDebitPlan { amount: 7 })
+        outcome.decision().debit_plan,
+        vec![vec![QuotaDebitPlan {
+            quota_id: quota.quota_id,
+            amount: 7
+        }]]
     );
     let evaluations = metrics.engine_evaluations.lock();
     assert_eq!(evaluations.len(), 1);
@@ -311,8 +309,7 @@ fn a_decision_outside_the_applicable_set_is_refused_and_counted() {
     let quota = snapshot(100);
     let quotas = [EvaluationQuota {
         snapshot: &quota,
-        tier: QuotaScopeTier::User,
-        arbitration: &Value::Null,
+        tier: QuotaScopeTier::Subject,
     }];
     let context = EvaluationContext {
         policy: &policy,
@@ -321,7 +318,7 @@ fn a_decision_outside_the_applicable_set_is_refused_and_counted() {
         time: OffsetDateTime::UNIX_EPOCH,
         quotas: &quotas,
         request: &Value::Null,
-        resource: &Value::Null,
+        metric_id: None,
         budget: budget(),
     };
     let failure = evaluate_prepared(&registry, &cache, &context, &metrics).expect_err("rogue");
@@ -367,8 +364,15 @@ fn every_engine_failure_lifts_to_its_documented_domain_error() {
             engine_id: "cel".to_owned()
         }
     );
+    assert_eq!(
+        lift(EngineError::TypeError("missing regions".to_owned()).into()),
+        DomainError::PolicyEvaluationFailed {
+            engine_id: "cel".to_owned(),
+            detail: "missing regions".to_owned()
+        },
+        "a policy that cannot read the request or a Quota's metadata is not an internal failure"
+    );
     for error in [
-        EngineError::TypeError("x".to_owned()),
         EngineError::InvalidConfig("x".to_owned()),
         EngineError::Internal("x".to_owned()),
     ] {
@@ -377,7 +381,7 @@ fn every_engine_failure_lifts_to_its_documented_domain_error() {
                 lift(error.into()),
                 DomainError::EngineFailure { ref engine_id, .. } if engine_id == "cel"
             ),
-            "type, config and internal failures are all opaque internals"
+            "config and internal failures are opaque internals"
         );
     }
     assert!(matches!(
@@ -389,13 +393,13 @@ fn every_engine_failure_lifts_to_its_documented_domain_error() {
     ));
 }
 
-/// A persisted global policy naming an engine this deployment registers, so
-/// the driver has something it can actually compile.
+// A persisted global policy naming an engine this deployment registers, so
+// the driver has something it can actually compile.
 async fn seed_global(storage: &quota_enforcement_sdk::testing::InMemoryStorage) -> PolicyVersion {
     seed_policy(storage, PolicyScope::Global, "most-restrictive-wins").await
 }
 
-/// A persisted policy at one scope, naming whichever engine the test registers.
+// A persisted policy at one scope, naming whichever engine the test registers.
 async fn seed_policy(
     storage: &quota_enforcement_sdk::testing::InMemoryStorage,
     scope: PolicyScope,
@@ -404,7 +408,7 @@ async fn seed_policy(
     use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
     storage
         .create_policy(
-            &crate::test_support::ctx(),
+            &crate::test_support::actor(),
             quota_enforcement_sdk::PolicyDraft {
                 schema_snapshot: PolicySchemaSnapshot::default(),
                 scope,
@@ -505,7 +509,7 @@ async fn a_version_that_never_becomes_available_exhausts_the_bounded_retry_budge
     assert_eq!(attempts.get(), 3, "two preparations, then refusal");
 }
 
-/// Counts compilations and records the highest number that ever ran at once.
+// Counts compilations and records the highest number that ever ran at once.
 struct CountingEngine {
     compiles: Arc<AtomicUsize>,
     in_flight: Arc<AtomicUsize>,
@@ -677,8 +681,8 @@ async fn compiling_distinct_versions_stays_within_the_configured_bound() {
     );
 }
 
-/// An engine that reports when a compilation starts, so a test can abandon its
-/// caller while the work is genuinely running.
+// An engine that reports when a compilation starts, so a test can abandon its
+// caller while the work is genuinely running.
 struct DwellingEngine {
     in_flight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,

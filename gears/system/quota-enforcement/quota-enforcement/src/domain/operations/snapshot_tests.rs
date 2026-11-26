@@ -1,51 +1,51 @@
 #![allow(clippy::expect_used)]
-//! The snapshot read over the in-memory double: the request's bounds and
-//! shape before the PDP, one PDP call carrying every target, the target
-//! semantics (a user target reads the user's and the tenant's Quotas, a
-//! tenant target the tenant's only), and what the page holds.
 
 use std::sync::Arc;
 
 use quota_enforcement_sdk::{
     EnforcementMode, PageResult, PeriodType, QuotaDraft, QuotaEnforcementStoragePluginV1, QuotaId,
-    QuotaSnapshot, QuotaSource, QuotaType, SCOPE_TENANT, SCOPE_USER, SnapshotRequest,
-    SnapshotSubject, SubjectRef, TenantId, ValidityWindow,
+    QuotaSnapshot, QuotaSource, QuotaType, SnapshotRequest, SnapshotSubject, SubjectRef, TenantId,
+    ValidityWindow,
 };
+use serde_json::json;
 use time::macros::datetime;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::super::harness_tests::{Harness, type_id};
+use crate::domain::catalog::MetricMode;
 use crate::domain::error::DomainError;
-use crate::domain::ports::metric_registry::MetricMode;
 use crate::domain::ports::metrics::DenialReason;
 use crate::domain::tokens;
 use crate::test_support::{
-    LLM_TENANT_PROJECTION, LLM_TOKEN_CONSTRAINT, LLM_USER_PROJECTION, METRIC_TOKENS,
-    PermitFiltersPdp, PermitTenantsPdp, ctx, tenant,
+    DEVICE_SUBJECT_TYPE, METRIC_OTHER, METRIC_TOKENS, PermitFiltersPdp, PermitTenantsPdp,
+    TENANT_SUBJECT_TYPE, USER_SUBJECT_TYPE, UncallablePdp, actor, fail_registry_reads,
+    metric_type_document, tenant,
 };
 
-/// A scope kind the catalogue knows but admits for no metric.
-const GROUP_SCOPE: &str = "gts.cf.core.qe.scope.v1~cf.core.qe.group.v1";
-
 fn user(id: &str) -> SubjectSnapshot {
-    SubjectSnapshot::new(SCOPE_USER, id)
+    SubjectSnapshot::new(USER_SUBJECT_TYPE, id)
 }
 
 fn tenant_target(id: &str) -> SubjectSnapshot {
-    SubjectSnapshot::new(SCOPE_TENANT, id)
+    SubjectSnapshot::new(TENANT_SUBJECT_TYPE, id)
 }
 
-/// A request subject, built fluently in the tests.
 struct SubjectSnapshot(SnapshotSubject);
 
 impl SubjectSnapshot {
-    fn new(kind: &str, id: &str) -> Self {
+    fn new(subject_type: &str, id: &str) -> Self {
         Self(SnapshotSubject {
-            kind: kind.to_owned(),
+            subject_type: subject_type.to_owned(),
             id: id.to_owned(),
             metric: METRIC_TOKENS.to_owned(),
+            metadata: None,
         })
+    }
+
+    fn metadata(mut self, metadata: &serde_json::Value) -> Self {
+        self.0.metadata = metadata.as_object().cloned();
+        self
     }
 
     fn metric(mut self, metric: &str) -> Self {
@@ -77,30 +77,26 @@ fn draft(subject: SubjectRef) -> QuotaDraft {
         fail_open_hint: false,
         metadata: serde_json::Map::new(),
         source: QuotaSource::Operator,
-        constraint_contract: quota_enforcement_sdk::ContractRef {
-            type_id: type_id(LLM_TOKEN_CONSTRAINT),
-            version: 1,
-        },
     }
 }
 
 fn user_ref(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: type_id(LLM_USER_PROJECTION),
+        subject_type: type_id(USER_SUBJECT_TYPE),
         subject_id: id.to_owned(),
     }
 }
 
 fn tenant_ref() -> SubjectRef {
     SubjectRef {
-        projection_type: type_id(LLM_TENANT_PROJECTION),
+        subject_type: type_id(TENANT_SUBJECT_TYPE),
         subject_id: tenant().to_string(),
     }
 }
 
 async fn create(h: &Harness, draft: QuotaDraft) -> QuotaId {
     h.storage
-        .create_quota(&ctx(), &AccessScope::allow_all(), draft, &[])
+        .create_quota(&actor(), &AccessScope::allow_all(), draft, &[])
         .await
         .expect("quota")
 }
@@ -112,7 +108,6 @@ fn ids(page: &PageResult<QuotaSnapshot>) -> Vec<QuotaId> {
         .collect()
 }
 
-/// A request and the refusal it must meet: subject index, field, reason.
 type Refusal = (SnapshotRequest, Option<usize>, &'static str, &'static str);
 
 fn refused(error: &DomainError, index: Option<usize>, field: &str, reason: &str) -> bool {
@@ -134,16 +129,16 @@ async fn a_user_target_reads_the_users_and_the_tenants_quotas_once_each() {
 
     let alone = h
         .operations()
-        .snapshot(&ctx(), request(vec![user("u-1")]))
+        .snapshot(request(vec![user("u-1")]))
         .await
         .expect("snapshot");
     // The repeated tenant target overlaps the user target's tenant tier.
     let page = h
         .operations()
-        .snapshot(
-            &ctx(),
-            request(vec![user("u-1"), tenant_target(&tenant().to_string())]),
-        )
+        .snapshot(request(vec![
+            user("u-1"),
+            tenant_target(&tenant().to_string()),
+        ]))
         .await
         .expect("snapshot");
 
@@ -155,6 +150,51 @@ async fn a_user_target_reads_the_users_and_the_tenants_quotas_once_each() {
 }
 
 #[tokio::test]
+async fn a_target_with_metadata_reads_only_the_quotas_that_apply_to_it() {
+    let h = Harness::new().await;
+    let conditioned = |region: &str| {
+        let mut draft = draft(user_ref("u-1"));
+        draft.metadata.insert("region".into(), region.into());
+        draft
+    };
+    let any = create(&h, draft(user_ref("u-1"))).await;
+    let eu = create(&h, conditioned("eu")).await;
+    let us = create(&h, conditioned("us")).await;
+    let read = |target: SubjectSnapshot| {
+        let h = &h;
+        async move {
+            let page = h.operations().snapshot(request(vec![target])).await;
+            ids(&page.expect("snapshot"))
+        }
+    };
+
+    let mut all = vec![any, eu, us];
+    all.sort();
+    assert_eq!(read(user("u-1")).await, all, "no metadata: every Quota");
+    let mut in_eu = vec![any, eu];
+    in_eu.sort();
+    assert_eq!(
+        read(user("u-1").metadata(&json!({ "region": "eu" }))).await,
+        in_eu
+    );
+    assert_eq!(
+        read(user("u-1").metadata(&json!({}))).await,
+        [any],
+        "a request without the property meets no condition on it"
+    );
+
+    let error = h
+        .operations()
+        .snapshot(request(vec![user("u-1").metadata(&json!({ "region": 7 }))]))
+        .await
+        .expect_err("metadata that does not fit the metric type");
+    assert!(
+        refused(&error, Some(0), "metadata", tokens::CONTRACT_VIOLATION),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_tenant_target_reads_the_tenants_own_quotas_only() {
     let h = Harness::new().await;
     create(&h, draft(user_ref("u-1"))).await;
@@ -162,7 +202,7 @@ async fn a_tenant_target_reads_the_tenants_own_quotas_only() {
 
     let page = h
         .operations()
-        .snapshot(&ctx(), request(vec![tenant_target(&tenant().to_string())]))
+        .snapshot(request(vec![tenant_target(&tenant().to_string())]))
         .await
         .expect("snapshot");
 
@@ -176,13 +216,10 @@ async fn a_tenant_target_naming_another_tenant_is_refused_before_the_pdp() {
 
     let error = h
         .operations()
-        .snapshot(
-            &ctx(),
-            request(vec![
-                user("u-1"),
-                tenant_target(&Uuid::from_u128(0xbad).to_string()),
-            ]),
-        )
+        .snapshot(request(vec![
+            user("u-1"),
+            tenant_target(&Uuid::from_u128(0xbad).to_string()),
+        ]))
         .await
         .expect_err("mismatch");
 
@@ -209,13 +246,13 @@ async fn out_of_window_quotas_are_read_and_deactivated_ones_are_not() {
     .await;
     let gone = create(&h, draft(user_ref("u-1"))).await;
     h.storage
-        .deactivate_quota(&ctx(), &AccessScope::allow_all(), gone, &[])
+        .deactivate_quota(&actor(), &AccessScope::allow_all(), gone, &[])
         .await
         .expect("deactivate");
 
     let page = h
         .operations()
-        .snapshot(&ctx(), request(vec![user("u-1")]))
+        .snapshot(request(vec![user("u-1")]))
         .await
         .expect("snapshot");
 
@@ -231,7 +268,7 @@ async fn a_directly_recorded_metric_is_still_readable() {
 
     let page = h
         .operations()
-        .snapshot(&ctx(), request(vec![user("u-1")]))
+        .snapshot(request(vec![user("u-1")]))
         .await
         .expect("a snapshot is not a write");
 
@@ -243,7 +280,7 @@ async fn a_target_matching_nothing_is_an_empty_page() {
     let h = Harness::new().await;
     let page = h
         .operations()
-        .snapshot(&ctx(), request(vec![user("nobody")]))
+        .snapshot(request(vec![user("nobody")]))
         .await
         .expect("snapshot");
     assert!(page.items.is_empty());
@@ -303,15 +340,27 @@ async fn the_request_is_refused_in_order_before_any_pdp_call() {
             tokens::SUBJECT_ID_REQUIRED,
         ),
         (
-            request(vec![SubjectSnapshot::new("no such kind!", "a")]),
+            request(vec![user(&"a".repeat(257))]),
             Some(0),
-            "kind",
-            tokens::SUBJECT_KIND_INVALID,
+            "id",
+            tokens::SUBJECT_ID_TOO_LONG,
+        ),
+        (
+            request(vec![SubjectSnapshot::new("no such type!", "a")]),
+            Some(0),
+            "type",
+            tokens::SUBJECT_TYPE_INVALID,
+        ),
+        (
+            request(vec![user("a").metric(USER_SUBJECT_TYPE)]),
+            Some(0),
+            "metric",
+            tokens::METRIC_INVALID,
         ),
     ];
     let count = cases.len();
     for (request, index, field, reason) in cases {
-        let error = ops.snapshot(&ctx(), request).await.expect_err("refused");
+        let error = ops.snapshot(request).await.expect_err("refused");
         assert!(
             refused(&error, index, field, reason),
             "{field}/{reason}: {error:?}"
@@ -336,43 +385,34 @@ async fn the_limit_defaults_to_the_page_size_and_never_exceeds_it() {
     ops.snapshot.page_size = 2;
 
     let defaulted = ops
-        .snapshot(&ctx(), request(vec![user("u-1")]))
+        .snapshot(request(vec![user("u-1")]))
         .await
         .expect("default limit");
     assert_eq!(defaulted.items.len(), 2);
     let cursor = defaulted.next_cursor.clone().expect("a next page");
     let rest = ops
-        .snapshot(
-            &ctx(),
-            SnapshotRequest {
-                cursor: Some(cursor),
-                ..request(vec![user("u-1")])
-            },
-        )
+        .snapshot(SnapshotRequest {
+            cursor: Some(cursor),
+            ..request(vec![user("u-1")])
+        })
         .await
         .expect("next page");
     assert_eq!(rest.items.len(), 1);
     assert_eq!(rest.next_cursor, None);
 
     let at_most = ops
-        .snapshot(
-            &ctx(),
-            SnapshotRequest {
-                limit: Some(2),
-                ..request(vec![user("u-1")])
-            },
-        )
+        .snapshot(SnapshotRequest {
+            limit: Some(2),
+            ..request(vec![user("u-1")])
+        })
         .await
         .expect("limit = page_size");
     assert_eq!(at_most.items.len(), 2);
     let over = ops
-        .snapshot(
-            &ctx(),
-            SnapshotRequest {
-                limit: Some(3),
-                ..request(vec![user("u-1")])
-            },
-        )
+        .snapshot(SnapshotRequest {
+            limit: Some(3),
+            ..request(vec![user("u-1")])
+        })
         .await
         .expect_err("limit above page_size");
     assert!(refused(
@@ -384,24 +424,136 @@ async fn the_limit_defaults_to_the_page_size_and_never_exceeds_it() {
 }
 
 #[tokio::test]
-async fn an_unadmitted_kind_is_named_after_the_pdp() {
+async fn a_subject_type_the_metric_does_not_admit_is_named_after_the_pdp() {
     let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
     let h = Harness::with_pdp(pdp.clone()).await;
 
     let error = h
         .operations()
-        .snapshot(
-            &ctx(),
-            request(vec![user("u-1"), SubjectSnapshot::new(GROUP_SCOPE, "g-1")]),
-        )
+        .snapshot(request(vec![
+            user("u-1"),
+            SubjectSnapshot::new(DEVICE_SUBJECT_TYPE, "d-1"),
+        ]))
         .await
-        .expect_err("group is not admitted");
+        .expect_err("the device type is not admitted");
 
     assert!(
-        refused(&error, Some(1), "kind", tokens::SUBJECT_KIND_NOT_ADMITTED),
+        refused(&error, Some(1), "type", tokens::METRIC_NOT_ADMITTED),
         "{error:?}"
     );
+    assert!(matches!(
+        toolkit_canonical_errors::CanonicalError::from(error),
+        toolkit_canonical_errors::CanonicalError::InvalidArgument { .. }
+    ));
     assert_eq!(pdp.calls(), 1, "the PDP authorized the target first");
+}
+
+#[tokio::test]
+async fn in_trusted_mode_a_subject_type_the_metric_does_not_admit_reads_the_tenants_quotas() {
+    let h = Harness::with_pdp(Arc::new(UncallablePdp)).await;
+    let shared = create(&h, draft(tenant_ref())).await;
+    create(&h, draft(user_ref("u-1"))).await;
+
+    let page = h
+        .trusted(None)
+        .snapshot(request(vec![SubjectSnapshot::new(
+            DEVICE_SUBJECT_TYPE,
+            "d-1",
+        )]))
+        .await
+        .expect("narrowed, not refused");
+
+    assert_eq!(ids(&page), vec![shared]);
+}
+
+#[tokio::test]
+async fn one_unavailable_metric_fails_the_whole_read() {
+    let h = Harness::new().await;
+    let broken = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
+    h.registry.seed(broken, {
+        let mut document = metric_type_document(broken, json!({ "kind": "counter" }), json!({}));
+        document["x-gts-abstract"] = json!(true);
+        document
+    });
+    create(&h, draft(user_ref("u-1"))).await;
+
+    let error = h
+        .operations()
+        .snapshot(request(vec![user("u-1"), user("u-1").metric(broken)]))
+        .await
+        .expect_err("one target names an unavailable metric");
+
+    assert!(
+        matches!(error, DomainError::ProjectionNotResolvable { .. }),
+        "{error:?}"
+    );
+    assert!(matches!(
+        toolkit_canonical_errors::CanonicalError::from(error),
+        toolkit_canonical_errors::CanonicalError::FailedPrecondition { .. }
+    ));
+}
+
+#[tokio::test]
+async fn an_unavailable_metric_wins_over_a_subject_type_not_admitted_in_either_order() {
+    let h = Harness::new().await;
+    let broken = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
+    h.registry.seed(broken, {
+        let mut document = metric_type_document(broken, json!({ "kind": "counter" }), json!({}));
+        document["x-gts-abstract"] = json!(true);
+        document
+    });
+    let not_admitted = || SubjectSnapshot::new(DEVICE_SUBJECT_TYPE, "d-1");
+    let unavailable = || user("u-1").metric(broken);
+
+    for subjects in [
+        vec![not_admitted(), unavailable()],
+        vec![unavailable(), not_admitted()],
+    ] {
+        let error = h
+            .operations()
+            .snapshot(request(subjects))
+            .await
+            .expect_err("two faulty targets");
+        assert!(
+            matches!(error, DomainError::ProjectionNotResolvable { .. }),
+            "{error:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unregistered_metric_is_invalid_and_a_silent_registry_is_unavailable() {
+    let h = Harness::new().await;
+    let unregistered = h
+        .operations()
+        .snapshot(request(vec![user("u-1").metric(METRIC_OTHER)]))
+        .await
+        .expect_err("unregistered");
+    assert!(
+        matches!(unregistered, DomainError::MetricNotRegistered { .. }),
+        "{unregistered:?}"
+    );
+
+    h.operations()
+        .snapshot(request(vec![user("u-1")]))
+        .await
+        .expect("the metric is now held");
+    fail_registry_reads(&h.registry);
+    h.operations()
+        .snapshot(request(vec![tenant_target(&tenant().to_string())]))
+        .await
+        .expect("a held metric needs no registry read");
+    let down = h
+        .operations()
+        .snapshot(request(vec![
+            tenant_target(&tenant().to_string()).metric(crate::test_support::METRIC_REQUESTS),
+        ]))
+        .await
+        .expect_err("a metric not held while the registry is down");
+    assert!(
+        matches!(down, DomainError::TypesRegistryUnavailable(_)),
+        "{down:?}"
+    );
 }
 
 // --- authorization -------------------------------------------------------------------
@@ -412,10 +564,10 @@ async fn one_pdp_call_carries_every_target() {
     let h = Harness::with_pdp(pdp.clone()).await;
 
     h.operations()
-        .snapshot(
-            &ctx(),
-            request(vec![user("u-1"), tenant_target(&tenant().to_string())]),
-        )
+        .snapshot(request(vec![
+            user("u-1"),
+            tenant_target(&tenant().to_string()),
+        ]))
         .await
         .expect("snapshot");
 
@@ -429,9 +581,9 @@ async fn one_pdp_call_carries_every_target() {
     assert_eq!(
         filters,
         &vec![
-            serde_json::json!({ "kind": SCOPE_USER, "id": "u-1", "metric": METRIC_TOKENS }),
-            serde_json::json!({
-                "kind": SCOPE_TENANT,
+            json!({ "type": USER_SUBJECT_TYPE, "id": "u-1", "metric": METRIC_TOKENS }),
+            json!({
+                "type": TENANT_SUBJECT_TYPE,
                 "id": tenant().to_string(),
                 "metric": METRIC_TOKENS
             }),
@@ -442,7 +594,7 @@ async fn one_pdp_call_carries_every_target() {
 #[tokio::test]
 async fn one_target_outside_the_grant_denies_the_request_before_storage() {
     let pdp = Arc::new(PermitFiltersPdp::new(
-        &[(SCOPE_USER, "u-1", METRIC_TOKENS)],
+        &[(USER_SUBJECT_TYPE, "u-1", METRIC_TOKENS)],
         vec![tenant().as_uuid()],
     ));
     let h = Harness::with_pdp(pdp.clone()).await;
@@ -458,28 +610,109 @@ async fn one_target_outside_the_grant_denies_the_request_before_storage() {
 
     let error = h
         .operations()
-        .snapshot(&ctx(), request(vec![user("u-1"), user("u-2")]))
+        .snapshot(request(vec![user("u-1"), user("u-2")]))
         .await
         .expect_err("u-2 is another user");
     assert!(matches!(error, DomainError::PdpDenied { .. }), "{error:?}");
 
     let cross_tenant = h
         .operations()
-        .snapshot(
-            &ctx(),
-            SnapshotRequest {
-                tenant_id: TenantId::new(Uuid::from_u128(0xbad)),
-                ..request(vec![user("u-1")])
-            },
-        )
+        .snapshot(SnapshotRequest {
+            tenant_id: TenantId::new(Uuid::from_u128(0xbad)),
+            ..request(vec![user("u-1")])
+        })
         .await
         .expect_err("another tenant");
     assert!(matches!(cross_tenant, DomainError::PdpDenied { .. }));
 
     let allowed = h
         .operations()
-        .snapshot(&ctx(), request(vec![user("u-1")]))
+        .snapshot(request(vec![user("u-1")]))
         .await
         .expect("the granted target alone");
     assert_eq!(ids(&allowed), vec![id]);
+}
+
+#[tokio::test]
+async fn with_the_registry_down_a_subject_type_not_admitted_is_refused_or_narrowed() {
+    let h = Harness::with_pdp(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
+    let shared = create(&h, draft(tenant_ref())).await;
+    h.operations()
+        .snapshot(request(vec![tenant_target(&tenant().to_string())]))
+        .await
+        .expect("holds the metric");
+    fail_registry_reads(&h.registry);
+    let device = || request(vec![SubjectSnapshot::new(DEVICE_SUBJECT_TYPE, "d-1")]);
+
+    let error = h
+        .operations()
+        .snapshot(device())
+        .await
+        .expect_err("the device type is not admitted");
+    assert!(
+        refused(&error, Some(0), "type", tokens::METRIC_NOT_ADMITTED),
+        "{error:?}"
+    );
+    let page = h
+        .trusted(None)
+        .snapshot(device())
+        .await
+        .expect("narrowed without a subject read");
+    assert_eq!(ids(&page), vec![shared]);
+}
+
+#[tokio::test]
+async fn with_the_registry_down_an_unavailable_metric_is_a_failed_precondition() {
+    let h = Harness::new().await;
+    let broken = "gts.cf.core.quota.metric.v1~cf.qetest.metric.broken.v1~";
+    h.registry.seed(broken, {
+        let mut document = metric_type_document(broken, json!({ "kind": "counter" }), json!({}));
+        document["x-gts-abstract"] = json!(true);
+        document
+    });
+    h.catalog
+        .served(
+            &quota_enforcement_sdk::MetricId::parse(broken).expect("metric"),
+            crate::domain::ports::metrics::ValidationSurface::RequestMetric,
+        )
+        .await
+        .expect_err("holds the unavailable entry");
+    fail_registry_reads(&h.registry);
+
+    let error = h
+        .operations()
+        .snapshot(request(vec![
+            SubjectSnapshot::new(DEVICE_SUBJECT_TYPE, "d-1").metric(broken),
+        ]))
+        .await
+        .expect_err("unavailable");
+
+    assert!(
+        matches!(error, DomainError::ProjectionNotResolvable { .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn held_metrics_read_the_subject_types_not_cached_with_one_read() {
+    let h = Harness::new().await;
+    h.operations()
+        .snapshot(request(vec![
+            tenant_target(&tenant().to_string()),
+            tenant_target(&tenant().to_string()).metric(crate::test_support::METRIC_REQUESTS),
+        ]))
+        .await
+        .expect("holds both metrics");
+    let reads = crate::test_support::registry_reads(&h.registry);
+
+    h.operations()
+        .snapshot(request(vec![
+            user("u-1"),
+            SubjectSnapshot::new(DEVICE_SUBJECT_TYPE, "d-1")
+                .metric(crate::test_support::METRIC_REQUESTS),
+        ]))
+        .await
+        .expect("snapshot");
+
+    assert_eq!(crate::test_support::registry_reads(&h.registry), reads + 1);
 }

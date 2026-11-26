@@ -8,9 +8,9 @@
 //!   the I1 to I14 invariants (see the [`storage_plugin`] module docs).
 //! - The domain types the contract references ([`models`]), including the
 //!   wire attribution types of a subject-based evaluation request
-//!   ([`EvaluationAttribution`]) and the scope discriminator ([`SubjectScope`]).
-//! - GTS plugin spec, resource identifiers, and the QE-owned projection
-//!   contract bases ([`gts`], ADR-0007).
+//!   ([`EvaluationAttribution`]).
+//! - GTS plugin specs and resource identifiers ([`gts`]). The quota subject
+//!   and metric types belong to the quota resolver SDK.
 //!
 //! Singleton coordination for the sweepers is not a contract of this SDK: the
 //! gear consumes the platform `cluster` gear's leader election (ADR-0006).
@@ -53,34 +53,33 @@ pub use client::{
 pub use engine::{
     EngineConfigError, EngineError, EngineRegistration, EngineValidationInput, EnvironmentInputs,
     EvaluationBudget, EvaluationContext, EvaluationFailure, EvaluationMeter, EvaluationOutcome,
-    EvaluationQuota, MetricEnvironmentSchema, PolicySchemaSnapshot, QuotaResolutionEngineV1,
-    QuotaScopeTier, ValidatedConfig, linked_engines,
+    EvaluationQuota, PolicySchemaSnapshot, QuotaResolutionEngineV1, QuotaScopeTier,
+    ValidatedConfig, linked_engines,
 };
 pub use gts::{
-    CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
-    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER,
-    SUBJECT_BASE, owned_definitions,
+    LEASE_RESOURCE, OPERATION_RESOURCE, POLICY_RESOURCE, QUOTA_RESOURCE,
+    QuotaEnforcementStoragePluginSpecV1, QuotaNotificationSinkSpecV1,
 };
 pub use models::{
-    AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,
-    ApportionError, AttributionDigest, BatchDebitItem, BatchDebitRequest, BatchDecision,
-    BatchItemOutcome, BatchItemRequest, BatchMode, BatchRecord, BatchResult, BootstrapBundle,
-    CapPatch, CommitLeaseRequest, ConfigDefaults, ContractRef, CounterSnapshot, CreditRequest,
-    DECISION_BLOB_VERSION, DeactivateOutcome, DebitPlan, DebitRequest, Decision, DecisionPreview,
-    DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EvaluationAttribution,
-    EventId, ExpiredLease, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
-    IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId, MetricKind, MutationResult,
+    AcquireLeaseOutcome, AcquireLeaseRequest, ActiveConditions, ActiveQuotaCounts, Actor,
+    ApplicableQuotas, AppliedMutation, AttributionDigest, BackgroundTask, BatchDebitItem,
+    BatchDebitRequest, BatchDecision, BatchItemOutcome, BatchItemRequest, BatchMode, BatchRecord,
+    BatchResult, BootstrapBundle, CapPatch, ChargeReturn, CommitLeaseRequest, ConfigDefaults,
+    CounterSnapshot, CreditRequest, DECISION_BLOB_VERSION, DeactivateOutcome, DebitChain,
+    DebitPlan, DebitRequest, Decision, DecisionPreview, DecisionResult, EnforcementMode,
+    EvaluatedDebit, EvaluatedLease, EvaluationAttribution, EventId, ExpiredLease,
+    HeldAllocationCharges, HeldEntry, IdempotencyRecord, IdempotencyScope, IdempotencyWrite,
+    LeaseHold, LeaseState, LeaseToken, MetricId, MetricKind, MetricRef, MutationResult,
     NO_APPLICABLE_QUOTA, NotificationEvent, NotificationEventKind, NotificationScope,
     OperationType, PageRequest, PageResult, PartialIdempotencyWrite, PayloadHash, PeriodId,
     PeriodType, PeriodWindow, PolicyDraft, PolicyId, PolicyPatch, PolicyScope, PolicySpec,
-    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, PreviewRequest,
-    ProjectionBinding, Quota, QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, PreviewRequest, Quota,
+    QuotaDebitPlan, QuotaDraft, QuotaFilter, QuotaId, QuotaMetadataViolation, QuotaPatch,
     QuotaSnapshot, QuotaSource, QuotaSpec, QuotaStatus, QuotaType, QuotaUpdate, QuotaView,
-    ReleaseLeaseRequest, ResourceProjection, Retention, RollbackRequest, RollbackTarget,
-    RollbackableOperation, ScopeError, SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef,
-    SubjectScope, TenantId, ThresholdCrossing, TransitionOutcome, UnknownValue, ValidityWindow,
-    ValidityWindowPatch, apportion, positive_amount,
+    ReleaseLeaseRequest, Retention, RollbackRequest, RollbackTarget, RollbackableOperation,
+    SnapshotRequest, SnapshotSubject, SubjectClaim, SubjectRef, TenantId, ThresholdCrossing,
+    TransitionOutcome, UnknownValue, UnwindError, ValidityWindow, ValidityWindowPatch,
+    conditions_hold, plan_entries, plan_of, positive_amount, unwind,
 };
 pub use notifications::{
     DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,

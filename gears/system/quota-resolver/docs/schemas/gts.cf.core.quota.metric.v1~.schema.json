@@ -1,0 +1,63 @@
+{
+  "$id": "gts://gts.cf.core.quota.metric.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base of quota metric types: what a quota counts. A metric is a type derived from this base, registered by the module that owns it and named under that module. A request names a metric as its type, an optional id, and metadata; a quota names the metric type.",
+  "x-gts-abstract": true,
+  "x-gts-traits-schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": [
+          "counter",
+          "gauge"
+        ],
+        "description": "counter: usage adds up over time, for example tokens. gauge: usage is a level held at a moment, for example concurrent sessions."
+      },
+      "admitted_subjects": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "x-gts-type-ref": "gts.cf.core.quota.subj.v1~"
+        },
+        "default": [],
+        "description": "Quota subject types the metric's quotas may count; a type derived from an admitted type is admitted. The tenant subject type is always admitted, so the empty default admits tenant quotas only. The list guards against a wrong configuration when the owner knows the metric's kinds of subject; an owner that does not know them admits the base gts.cf.core.quota.subj.v1~, which admits every subject type."
+      },
+      "enforcement": {
+        "type": "string",
+        "enum": [
+          "quota_gated",
+          "direct"
+        ],
+        "default": "quota_gated",
+        "description": "quota_gated: operations on the metric are checked against quotas. direct: the metric is not checked against quotas, and the backend rejects the operations that take capacity on it (debit, lease acquisition), while commit, release, and return still run; a quota can still be created for it and has no effect."
+      }
+    },
+    "required": [
+      "kind"
+    ]
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "x-gts-type-ref": "/$id",
+      "description": "The concrete quota metric type."
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional id of the one thing the amount is counted for, for example a model or a virtual machine; without it the request names the metric as a whole."
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Attributes of the charged operation that the backend's policies read, refined by the derived type."
+    }
+  },
+  "required": [
+    "type",
+    "metadata"
+  ]
+}

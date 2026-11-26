@@ -1,17 +1,19 @@
-# Quota Enforcement profile.
+# Quota Enforcement and Quota Resolver profile.
 #
-# A focused suite: the shared `config/e2e-local.yaml` has no QE, so this
-# manifest adds the gear, its SQL storage plugin, the standalone cluster
-# profile, and the GTS catalog QE needs at bootstrap. The metric base is
-# deployment-owned (nothing registers it), so it is seeded here with one
-# metric, two subject projections, and the request/constraint contracts.
-# The QE bases and scope instances are registered by QE itself.
+# A focused suite: the shared `config/e2e-local.yaml` configures the gears but
+# seeds no quota types, so this manifest adds the GTS catalog QE needs: two
+# quota metric types and one quota subject type, which the resolver maps the
+# static-authn user principal to. The
+# metric and subject bases and the resolver plugin type are registered by the
+# gears themselves; the metrics and the subject type belong to their owners, so
+# they are seeded here.
 #
 # Gated by E2E_QUOTA_ENFORCEMENT (the suite's conftest skips without it).
 # Run via: make e2e-local SUITE=quota-enforcement
 suite: quota-enforcement
 features:
   - quota-enforcement
+  - quota-resolver
   - static-tenants
   - static-authn
   - static-authz
@@ -19,54 +21,38 @@ launcher: e2e-launcher
 config_gears:
   - quota-enforcement
   - quota-enforcement-storage-plugin
+  - quota-resolver
   - cluster
   - grpc-hub
 env:
   E2E_QUOTA_ENFORCEMENT: "1"
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# The tests leave their Quotas behind; start every run on an empty database.
+clean_home: true
 config_overrides:
   gears:
+    api-gateway:
+      config:
+        # Bound by the resolver's tenant quota-state route.
+        rate_limit_zones:
+          rl_quota_resolver_quota_state:
+            rate_limit: 20/s
+            burst_limit: 40
+            key:
+              type: identity
+            max_keys: 10000
     types-registry:
       config:
         entities:
-          - $id: "gts://gts.cf.core.qe.metric_type.v1~"
+          - $id: "gts://gts.cf.core.quota.metric.v1~cf.e2e.qe.tokens.v1~"
             $schema: "http://json-schema.org/draft-07/schema#"
-            description: "E2E stand-in for the platform metric base."
-            type: "object"
-            properties:
-              id: { type: "string" }
-              type: { type: "string" }
-            required: ["id", "type"]
-          - id: "gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"
-            type: "gts.cf.core.qe.metric_type.v1~"
-            kind: "counter"
-            enforcement: "quota_gated"
-          - $id: "gts://gts.cf.core.qe.subj.v1~cf.e2e.qe.tenant.v1~"
-            $schema: "http://json-schema.org/draft-07/schema#"
-            description: "E2E tenant-scope projection."
+            description: "E2E counter metric, charged by the debit and lease tests."
             x-gts-traits:
-              scope: "gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1"
-              admitted_metrics: ["gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"]
+              kind: "counter"
+              admitted_subjects: ["gts.cf.core.quota.subj.v1~"]
             type: "object"
             allOf:
-              - $ref: "gts://gts.cf.core.qe.subj.v1~"
-          - $id: "gts://gts.cf.core.qe.subj.v1~cf.e2e.qe.user.v1~"
-            $schema: "http://json-schema.org/draft-07/schema#"
-            description: "E2E user-scope projection."
-            x-gts-traits:
-              scope: "gts.cf.core.qe.scope.v1~cf.core.qe.user.v1"
-              admitted_metrics: ["gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"]
-            type: "object"
-            allOf:
-              - $ref: "gts://gts.cf.core.qe.subj.v1~"
-          - $id: "gts://gts.cf.core.qe.request.v1~cf.e2e.qe.tokens.v1~"
-            $schema: "http://json-schema.org/draft-07/schema#"
-            description: "E2E request contract for the tokens metric."
-            x-gts-traits:
-              metric: "gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"
-              constraint_contract: "gts.cf.core.qe.constraint.v1~cf.e2e.qe.tokens_constraint.v1~"
-            type: "object"
-            allOf:
-              - $ref: "gts://gts.cf.core.qe.request.v1~"
+              - $ref: "gts://gts.cf.core.quota.metric.v1~"
               - type: "object"
                 properties:
                   metadata:
@@ -74,23 +60,22 @@ config_overrides:
                     additionalProperties: false
                     properties:
                       region: { type: "string" }
-                      model: { type: "string" }
                     required: ["region"]
-          - $id: "gts://gts.cf.core.qe.constraint.v1~cf.e2e.qe.tokens_constraint.v1~"
+          - $id: "gts://gts.cf.core.quota.metric.v1~cf.e2e.qe.state.v1~"
             $schema: "http://json-schema.org/draft-07/schema#"
-            description: "E2E constraint contract for the tokens metric."
+            description: "E2E counter metric, held by the quota-state tests only: they create a tenant quota on it."
+            x-gts-traits:
+              kind: "counter"
+              admitted_subjects: ["gts.cf.core.quota.subj.v1~"]
             type: "object"
             allOf:
-              - $ref: "gts://gts.cf.core.qe.constraint.v1~"
-              - type: "object"
-                properties:
-                  metadata:
-                    type: "object"
-                    additionalProperties: false
-                    properties:
-                      regions: { type: "array", items: { type: "string" } }
-                      weight: { type: "number" }
-                    required: ["regions"]
+              - $ref: "gts://gts.cf.core.quota.metric.v1~"
+          - $id: "gts://gts.cf.core.quota.subj.v1~cf.e2e.qe.user.v1~"
+            $schema: "http://json-schema.org/draft-07/schema#"
+            description: "E2E user quota subject type; its id is the user id."
+            type: "object"
+            allOf:
+              - $ref: "gts://gts.cf.core.quota.subj.v1~"
     quota-enforcement:
       config:
         storage_vendor: "constructorfabric"
@@ -98,10 +83,11 @@ config_overrides:
           ttl_secs: 30
           max_missed_renewals: 2
         sweeper_stop_timeout_secs: 10
-        catalog:
-          subject_projections:
-            - "gts.cf.core.qe.subj.v1~cf.e2e.qe.tenant.v1~"
-            - "gts.cf.core.qe.subj.v1~cf.e2e.qe.user.v1~"
+    quota-resolver:
+      config:
+        vendor: "constructorfabric"
+        principal_subject_types:
+          "gts.cf.core.security.subject_user.v1~": "gts.cf.core.quota.subj.v1~cf.e2e.qe.user.v1~"
     cluster:
       config:
         profiles:

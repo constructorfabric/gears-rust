@@ -1,8 +1,7 @@
 //! Conversions between the contract types and the `qe_quotas` row.
 //!
 //! Writes narrow contract values into their columns and fail on a value that
-//! does not fit (a `u64` cap above `i64::MAX`, a contract version above
-//! `i32::MAX`); reads parse the columns back and fail on a row that does not
+//! does not fit (a `u64` cap above `i64::MAX`); reads parse the columns back and fail on a row that does not
 //! read as the contract type, which is corruption, never caller input. A
 //! validity window with neither bound reads back as no window; both forms
 //! contain every instant.
@@ -11,9 +10,8 @@ use std::str::FromStr;
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::{
-    CapPatch, ContractRef, EnforcementMode, MetricId, PeriodType, Quota, QuotaDraft, QuotaId,
-    QuotaPatch, QuotaSource, QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow,
-    ValidityWindowPatch,
+    CapPatch, EnforcementMode, MetricId, PeriodType, Quota, QuotaDraft, QuotaId, QuotaPatch,
+    QuotaSource, QuotaStatus, QuotaType, SubjectRef, TenantId, ValidityWindow, ValidityWindowPatch,
 };
 use sea_orm::ActiveValue;
 use serde_json::{Map, Value};
@@ -35,17 +33,6 @@ pub enum MappingError {
         /// The cap.
         cap: u64,
     },
-    /// A caller-supplied version above `i32::MAX`.
-    #[error("{field}={value} does not fit the column type")]
-    VersionOutOfRange {
-        /// The field.
-        field: &'static str,
-        /// The value.
-        value: u64,
-    },
-    /// A `metadata` patch without the contract it was validated against.
-    #[error("metadata patch carries no constraint contract")]
-    MetadataWithoutContract,
     /// A stored column does not parse as its contract type.
     #[error("column {column} does not read back as the contract type: {detail}")]
     Column {
@@ -97,25 +84,18 @@ pub fn thresholds_of(json: &str) -> Result<Vec<u8>, MappingError> {
 ///
 /// # Errors
 ///
-/// [`MappingError::CapOutOfRange`] or [`MappingError::VersionOutOfRange`]
-/// when a draft value does not fit its column.
+/// [`MappingError::CapOutOfRange`] when the cap does not fit its column.
 pub fn draft_to_row(
     id: QuotaId,
     draft: &QuotaDraft,
     now: OffsetDateTime,
 ) -> Result<quota::ActiveModel, MappingError> {
     let cap = draft.cap.map(cap_to_column).transpose()?;
-    let contract_version = i32::try_from(draft.constraint_contract.version).map_err(|_| {
-        MappingError::VersionOutOfRange {
-            field: "constraint_contract.version",
-            value: u64::from(draft.constraint_contract.version),
-        }
-    })?;
     let window = draft.validity_window.unwrap_or_default();
     Ok(quota::ActiveModel {
         id: ActiveValue::Set(id.as_uuid()),
         tenant_id: ActiveValue::Set(draft.tenant_id.as_uuid()),
-        projection_type: ActiveValue::Set(draft.subject.projection_type.as_ref().to_owned()),
+        subject_type: ActiveValue::Set(draft.subject.subject_type.as_ref().to_owned()),
         subject_id: ActiveValue::Set(draft.subject.subject_id.clone()),
         metric: ActiveValue::Set(draft.metric.as_str().to_owned()),
         quota_type: ActiveValue::Set(draft.quota_type.as_gts_id().to_owned()),
@@ -131,13 +111,10 @@ pub fn draft_to_row(
         metadata: ActiveValue::Set(metadata_to_json(&draft.metadata)?),
         source: ActiveValue::Set(draft.source.as_gts_id().to_owned()),
         status: ActiveValue::Set(STATUS_ACTIVE.to_owned()),
-        constraint_contract_type: ActiveValue::Set(
-            draft.constraint_contract.type_id.as_ref().to_owned(),
-        ),
-        constraint_contract_version: ActiveValue::Set(contract_version),
         record_version: ActiveValue::Set(1),
         created_at: ActiveValue::Set(now),
         updated_at: ActiveValue::Set(now),
+        holds_pending: ActiveValue::Set(false),
     })
 }
 
@@ -165,12 +142,6 @@ pub fn row_to_quota(row: quota::Model) -> Result<Quota, MappingError> {
         .transpose()?;
     let record_version = u32::try_from(row.record_version)
         .map_err(|_| column("record_version", row.record_version))?;
-    let contract_version = u32::try_from(row.constraint_contract_version).map_err(|_| {
-        column(
-            "constraint_contract_version",
-            row.constraint_contract_version,
-        )
-    })?;
     let metadata: Map<String, Value> =
         serde_json::from_str(&row.metadata).map_err(|e| column("metadata", e))?;
     let validity_window = match (row.validity_start, row.validity_end) {
@@ -181,8 +152,8 @@ pub fn row_to_quota(row: quota::Model) -> Result<Quota, MappingError> {
         id: QuotaId::new(row.id),
         tenant_id: TenantId::new(row.tenant_id),
         subject: SubjectRef {
-            projection_type: GtsTypeId::try_new(&row.projection_type)
-                .map_err(|e| column("projection_type", e))?,
+            subject_type: GtsTypeId::try_new(&row.subject_type)
+                .map_err(|e| column("subject_type", e))?,
             subject_id: row.subject_id,
         },
         metric: MetricId::parse(&row.metric).map_err(|e| column("metric", e))?,
@@ -200,11 +171,6 @@ pub fn row_to_quota(row: quota::Model) -> Result<Quota, MappingError> {
         metadata,
         source: parse_enum::<QuotaSource>("source", &row.source)?,
         status,
-        constraint_contract: ContractRef {
-            type_id: GtsTypeId::try_new(&row.constraint_contract_type)
-                .map_err(|e| column("constraint_contract_type", e))?,
-            version: contract_version,
-        },
         record_version,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -225,10 +191,8 @@ pub struct QuotaUpdate {
     pub notification_thresholds: Option<String>,
     /// New `(validity_start, validity_end)`.
     pub validity: Option<(Option<OffsetDateTime>, Option<OffsetDateTime>)>,
-    /// New metadata JSON, always together with `constraint_contract`.
+    /// New metadata JSON.
     pub metadata: Option<String>,
-    /// New `(constraint_contract_type, constraint_contract_version)`.
-    pub constraint_contract: Option<(String, i32)>,
     /// New enforcement mode id.
     pub enforcement_mode: Option<String>,
     /// New fail-open hint.
@@ -255,23 +219,8 @@ impl QuotaUpdate {
 ///
 /// # Errors
 ///
-/// [`MappingError::CapOutOfRange`] for a bounded cap above `i64::MAX`,
-/// [`MappingError::VersionOutOfRange`] for a contract version above
-/// `i32::MAX`, [`MappingError::MetadataWithoutContract`] for a `metadata`
-/// patch without its contract.
+/// [`MappingError::CapOutOfRange`] for a bounded cap above `i64::MAX`.
 pub fn patch_to_update(patch: &QuotaPatch) -> Result<QuotaUpdate, MappingError> {
-    let constraint_contract = match (&patch.metadata, &patch.constraint_contract) {
-        (None, _) => None,
-        (Some(_), None) => return Err(MappingError::MetadataWithoutContract),
-        (Some(_), Some(contract)) => {
-            let version =
-                i32::try_from(contract.version).map_err(|_| MappingError::VersionOutOfRange {
-                    field: "constraint_contract.version",
-                    value: u64::from(contract.version),
-                })?;
-            Some((contract.type_id.as_ref().to_owned(), version))
-        }
-    };
     let cap = match patch.cap {
         None => None,
         Some(CapPatch::Unbounded) => Some(None),
@@ -291,7 +240,6 @@ pub fn patch_to_update(patch: &QuotaPatch) -> Result<QuotaUpdate, MappingError> 
             .transpose()?,
         validity,
         metadata: patch.metadata.as_ref().map(metadata_to_json).transpose()?,
-        constraint_contract,
         enforcement_mode: patch.enforcement_mode.map(|m| m.as_gts_id().to_owned()),
         fail_open_hint: patch.fail_open_hint,
     })

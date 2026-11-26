@@ -3,7 +3,7 @@
 
 pub mod schemas;
 
-use super::admission::{Admission, OperatorAdmission};
+use super::admission::{Gate, OperatorAdmission};
 use super::engines::{EngineRegistry, PolicyArtifactCache};
 use super::error::DomainError;
 use super::pep::actions;
@@ -11,38 +11,34 @@ use super::ports::metrics::{PolicyTransition, QeMetrics};
 use crate::domain::admission::admission_span;
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
-    EngineValidationInput, EnvironmentInputs, EventId, NotificationEvent, NotificationEventKind,
-    NotificationScope, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyPatch,
-    PolicySchemaSnapshot, PolicyScope, PolicySpec, PolicyUpdate, PolicyVersion, PolicyVersionMeta,
-    PolicyVersionState, QuotaEnforcementStoragePluginV1, StorageError, TransitionOutcome,
-    ValidatedConfig,
+    Actor, EngineValidationInput, EnvironmentInputs, EventId, NotificationEvent,
+    NotificationEventKind, NotificationScope, PageRequest, PageResult, PolicyDraft, PolicyId,
+    PolicyPatch, PolicySchemaSnapshot, PolicyScope, PolicySpec, PolicyUpdate, PolicyVersion,
+    PolicyVersionMeta, PolicyVersionState, QuotaEnforcementStoragePluginV1, StorageError,
+    TransitionOutcome, ValidatedConfig,
 };
 use serde_json::json;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
-use toolkit_security::SecurityContext;
 use tracing::Instrument as _;
 
-/// Server-owned schema resolution and activation compatibility.
+/// Server-owned resolution of the schemas a Policy write is checked against.
 #[async_trait]
 pub trait PolicySchemas: Send + Sync {
-    /// Resolve the policy's admitted schema set, bounded, keeping only the
-    /// contracts behind `inputs`. Compile against `ALL`; persist what the
-    /// artifact reports it reads.
+    /// The bounded snapshot for a Policy of `scope` and `engine`, keeping only
+    /// what `inputs` reads. Compile against `ALL`; persist what the artifact
+    /// reports it reads.
     /// # Errors
-    /// Invalid scope/schema or registry unavailability.
+    /// The catalogue's errors for the scope's metric, or a snapshot outside
+    /// the configured bounds.
     async fn snapshot(
         &self,
         scope: &PolicyScope,
         engine: &str,
         inputs: EnvironmentInputs,
     ) -> Result<PolicySchemaSnapshot, DomainError>;
-    /// Check a retained version against the currently loaded catalogue without rewriting it.
-    /// # Errors
-    /// A snapshot no longer compatible with the active catalogue.
-    fn check_activation(&self, version: &PolicyVersion) -> Result<(), DomainError>;
 }
 
 /// Validated operational bounds of policy authoring.
@@ -83,7 +79,7 @@ pub struct PolicyRuntimeLimits {
 #[domain_model]
 pub struct PolicyManagement<'a> {
     /// Operator admission boundary.
-    pub admission: &'a Admission,
+    pub admission: Gate<'a>,
     /// Transactional storage.
     pub storage: &'a dyn QuotaEnforcementStoragePluginV1,
     /// Immutable registry.
@@ -104,11 +100,7 @@ impl PolicyManagement<'_> {
     /// Admission, bounded input, engine/schema validation, or atomic storage failure.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-write:p1
     #[tracing::instrument(name = "quota_enforcement.policies.create", skip_all, fields(engine_id = %spec.engine_id))]
-    pub async fn create(
-        &self,
-        ctx: &SecurityContext,
-        spec: PolicySpec,
-    ) -> Result<PolicyVersion, DomainError> {
+    pub async fn create(&self, spec: PolicySpec) -> Result<PolicyVersion, DomainError> {
         self.validate(
             &spec.engine_config,
             spec.timeout_ms,
@@ -117,7 +109,7 @@ impl PolicyManagement<'_> {
         self.comment(spec.description.as_deref())?;
         let admitted = self
             .admission
-            .admit_operator(ctx, actions::CREATE)
+            .admit_operator(actions::CREATE)
             .instrument(admission_span(1))
             .await?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-engine-lookup
@@ -133,8 +125,6 @@ impl PolicyManagement<'_> {
         let compiled = self
             .compile(&admitted, &spec.engine_id, &spec.engine_config, &full)
             .await?;
-        // Persist only the contracts the artifact reads: a change to an input
-        // it never touches must not invalidate a later activation.
         let snapshot = self
             .schemas
             .snapshot(&spec.scope, &spec.engine_id, compiled.inputs())
@@ -143,7 +133,7 @@ impl PolicyManagement<'_> {
             .rebuild(&admitted, &spec.engine_id, &spec.engine_config, &snapshot)
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-validate
-        let events = [event(None, "created")];
+        let events = [event(admitted.actor(), None, "created")];
         let draft = PolicyDraft {
             scope: spec.scope,
             engine_id: spec.engine_id,
@@ -151,13 +141,13 @@ impl PolicyManagement<'_> {
             timeout_ms: spec.timeout_ms,
             description: spec.description,
             comment: spec.comment,
-            created_by: ctx.subject_id().to_string(),
+            created_by: admitted.actor().to_string(),
             schema_snapshot: snapshot,
         };
         // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-write:p1:inst-pw-persist
         let version = self
             .storage
-            .create_policy(ctx, draft, &events)
+            .create_policy(admitted.actor(), draft, &events)
             .await
             .map_err(|e| self.storage_error(e))?;
         self.publish(&version, artifact);
@@ -175,7 +165,6 @@ impl PolicyManagement<'_> {
     #[tracing::instrument(name = "quota_enforcement.policies.update", skip_all, fields(policy_id = %id))]
     pub async fn update(
         &self,
-        ctx: &SecurityContext,
         id: PolicyId,
         patch: PolicyPatch,
     ) -> Result<PolicyVersion, DomainError> {
@@ -192,7 +181,7 @@ impl PolicyManagement<'_> {
         }
         let admitted = self
             .admission
-            .admit_operator(ctx, actions::UPDATE)
+            .admit_operator(actions::UPDATE)
             .instrument(admission_span(1))
             .await?;
         let current = self.active(&id).await?;
@@ -225,13 +214,13 @@ impl PolicyManagement<'_> {
             engine_config: Some(config),
             timeout_ms,
             comment: patch.comment,
-            created_by: ctx.subject_id().to_string(),
+            created_by: admitted.actor().to_string(),
             schema_snapshot: Some(snapshot),
         };
-        let events = [event(Some(id.clone()), "updated")];
+        let events = [event(admitted.actor(), Some(id.clone()), "updated")];
         let version = self
             .storage
-            .update_policy(ctx, id, update, &events)
+            .update_policy(admitted.actor(), id, update, &events)
             .await
             .map_err(|e| self.storage_error(e))?;
         self.publish(&version, artifact);
@@ -240,14 +229,15 @@ impl PolicyManagement<'_> {
         Ok(version)
     }
 
-    /// Reactivate a compatible retained version. Replays emit no transition metric.
+    /// Reactivate a retained version. Replays emit no transition metric. It
+    /// makes no catalogue check: the version keeps the schemas it was checked
+    /// against.
     /// # Errors
-    /// Admission, incompatible/terminal/unknown version, or transactional failure.
+    /// Admission, terminal/unknown version, or transactional failure.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-rollback:p1
     #[tracing::instrument(name = "quota_enforcement.policies.rollback", skip_all, fields(policy_id = %id, target_version = target))]
     pub async fn rollback(
         &self,
-        ctx: &SecurityContext,
         id: PolicyId,
         target: u32,
         comment: Option<String>,
@@ -255,10 +245,10 @@ impl PolicyManagement<'_> {
         self.comment(comment.as_deref())?;
         let admitted = self
             .admission
-            .admit_operator(ctx, actions::POLICY_ROLLBACK)
+            .admit_operator(actions::POLICY_ROLLBACK)
             .instrument(admission_span(1))
             .await?;
-        // Storage's order (deleted, unknown, rolled back), before catalogue drift can mask it.
+        // Storage's order: deleted, unknown, rolled back.
         if self.storage.read_active_policy_by_id(&id).await?.is_none() {
             // Every policy keeps version 1, so its absence means the id never existed.
             let error = if self.storage.read_policy_version(&id, 1).await?.is_some() {
@@ -285,7 +275,6 @@ impl PolicyManagement<'_> {
             }
             .into());
         }
-        self.schemas.check_activation(&version)?;
         let artifact = self
             .compile(
                 &admitted,
@@ -297,10 +286,10 @@ impl PolicyManagement<'_> {
         // Rollback is a latest-pointer move, so the notification says `updated`;
         // `rolled_back` is the state the displaced version lands in, not a
         // change kind (feature flow `inst-prd-rollback-apply`).
-        let events = [event(Some(id.clone()), "updated")];
+        let events = [event(admitted.actor(), Some(id.clone()), "updated")];
         let outcome = self
             .storage
-            .rollback_policy(ctx, id, target, comment, &events)
+            .rollback_policy(admitted.actor(), id, target, comment, &events)
             .await
             .map_err(|e| self.storage_error(e))?;
         let version = match outcome {
@@ -322,23 +311,18 @@ impl PolicyManagement<'_> {
     /// Admission, protected global/unknown ID, or storage failure.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-policy-delete:p1
     #[tracing::instrument(name = "quota_enforcement.policies.delete", skip_all, fields(policy_id = %id))]
-    pub async fn delete(
-        &self,
-        ctx: &SecurityContext,
-        id: PolicyId,
-        comment: Option<String>,
-    ) -> Result<(), DomainError> {
+    pub async fn delete(&self, id: PolicyId, comment: Option<String>) -> Result<(), DomainError> {
         self.comment(comment.as_deref())?;
-        let _admitted = self
+        let admitted = self
             .admission
-            .admit_operator(ctx, actions::DELETE)
+            .admit_operator(actions::DELETE)
             .instrument(admission_span(1))
             .await?;
-        let events = [event(Some(id.clone()), "deleted")];
+        let events = [event(admitted.actor(), Some(id.clone()), "deleted")];
         // @cpt-begin:cpt-cf-quota-enforcement-flow-policy-delete:p1:inst-prd-delete-return
         if matches!(
             self.storage
-                .delete_policy(ctx, id, comment, &events)
+                .delete_policy(admitted.actor(), id, comment, &events)
                 .await?,
             TransitionOutcome::Applied(())
         ) {
@@ -355,13 +339,12 @@ impl PolicyManagement<'_> {
     #[tracing::instrument(name = "quota_enforcement.policies.read", skip_all, fields(policy_id = %id))]
     pub async fn read(
         &self,
-        ctx: &SecurityContext,
         id: &PolicyId,
         version: Option<u32>,
     ) -> Result<PolicyVersion, DomainError> {
         let _admitted = self
             .admission
-            .admit_operator(ctx, actions::GET)
+            .admit_operator(actions::GET)
             .instrument(admission_span(1))
             .await?;
         match version {
@@ -393,7 +376,6 @@ impl PolicyManagement<'_> {
     #[tracing::instrument(name = "quota_enforcement.policies.list", skip_all, fields(policy_id = %id))]
     pub async fn list(
         &self,
-        ctx: &SecurityContext,
         id: &PolicyId,
         limit: Option<u32>,
         cursor: Option<String>,
@@ -414,7 +396,7 @@ impl PolicyManagement<'_> {
         }
         let _admitted = self
             .admission
-            .admit_operator(ctx, actions::LIST)
+            .admit_operator(actions::LIST)
             .instrument(admission_span(1))
             .await?;
         Ok(self.storage.list_policy_versions(id, page).await?)
@@ -585,10 +567,11 @@ fn invalid(field: &'static str, reason: &'static str, detail: &str) -> DomainErr
     }
 }
 
-fn event(policy_id: Option<PolicyId>, change: &str) -> NotificationEvent {
+fn event(actor: &Actor, policy_id: Option<PolicyId>, change: &str) -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::PolicyChanged,
+        actor: actor.clone(),
         scope: NotificationScope::Platform,
         quota_id: None,
         policy_id,

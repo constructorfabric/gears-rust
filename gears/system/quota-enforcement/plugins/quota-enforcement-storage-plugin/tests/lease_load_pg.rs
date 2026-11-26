@@ -39,10 +39,9 @@ use gts::GtsTypeId;
 use quota_enforcement_sdk::engine::PolicySchemaSnapshot;
 use quota_enforcement_sdk::testing::consumption_quota_draft;
 use quota_enforcement_sdk::{
-    ApplicableQuotas, AttributionDigest, EvaluatedMutation, IdempotencyScope,
-    IdempotencySubjectKey, IdempotencyWrite, LeaseToken, MetricId, OperationType,
-    PartialIdempotencyWrite, PayloadHash, PeriodType, PolicyDraft, PolicyScope, StorageError,
-    SubjectRef, TenantId,
+    ApplicableQuotas, AttributionDigest, EvaluatedMutation, IdempotencyScope, IdempotencyWrite,
+    LeaseToken, MetricId, OperationType, PartialIdempotencyWrite, PayloadHash, PeriodType,
+    PolicyDraft, PolicyScope, StorageError, SubjectRef, TenantId,
 };
 use sea_orm::ActiveValue::Set;
 use sea_orm_migration::MigratorTrait;
@@ -54,7 +53,7 @@ use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::domain::ports::LeaseStore;
@@ -70,8 +69,8 @@ use quota_enforcement_storage_plugin::{
     SqlPolicyStore, SqlQuotaStore, start_undelivered_outbox,
 };
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 const RESERVED: u64 = 10;
 const COMMITTED: u64 = 7;
 /// Past `PostgreSQL`'s idle stats flush interval (10 s), so counters are complete.
@@ -116,17 +115,15 @@ fn tenant(slot: usize) -> TenantId {
     TenantId::new(Uuid::from_u128(0x10ad_0000 + slot as u128))
 }
 
-fn ctx(tenant: TenantId) -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant.as_uuid())
-        .build()
-        .expect("security context")
+fn actor() -> Actor {
+    Actor::Caller {
+        subject_id: Uuid::from_u128(0x5eed),
+    }
 }
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -271,7 +268,7 @@ impl Harness {
     async fn seed_policy(&self, enqueuer: Arc<dyn NotificationOutbox>) {
         SqlPolicyStore::new(self.db.clone(), enqueuer)
             .create_policy(
-                &ctx(tenant(0)),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     engine_id: "cel".to_owned(),
@@ -309,10 +306,7 @@ impl Harness {
         let mut draft = consumption_quota_draft(subject(subject_id), None, PeriodType::Day, vec![]);
         draft.tenant_id = tenant;
         draft.metric = MetricId::parse(METRIC_TOKENS).expect("metric");
-        let actor = Actor {
-            subject_id: Uuid::from_u128(0x5eed),
-            subject_type: None,
-        };
+        let actor = actor();
         self.quotas
             .create_quota(
                 &actor,
@@ -346,7 +340,6 @@ impl Harness {
         let tenant = tenant(slot);
         self.store
             .read_quota_snapshot(
-                &ctx(tenant),
                 &AccessScope::for_tenant(tenant.as_uuid()),
                 &applicable(tenant, subject_id),
             )
@@ -547,7 +540,7 @@ struct Worker {
 impl Worker {
     async fn run(self) -> WorkerReport {
         let mut report = WorkerReport::default();
-        let ctx = ctx(self.tenant);
+        let actor = actor();
         let scope = AccessScope::for_tenant(self.tenant.as_uuid());
         let applicable = applicable(self.tenant, &self.subject);
         let null = serde_json::Value::Null;
@@ -555,7 +548,6 @@ impl Worker {
             let write = IdempotencyWrite {
                 scope: IdempotencyScope {
                     tenant_id: self.tenant,
-                    subject_key: IdempotencySubjectKey::of(&applicable.subjects),
                     operation_type: OperationType::Reserve,
                     key: format!("w{}-c{cycle}", self.id),
                 },
@@ -569,14 +561,13 @@ impl Worker {
             let acquired = self
                 .store
                 .acquire_lease(
-                    &ctx,
+                    &actor,
                     &scope,
                     &EvaluatedMutation {
                         applicable: &applicable,
                         amount: RESERVED,
                         request: &null,
-                        resource: &null,
-                        user_projection: None,
+                        metric_id: None,
                         limits: common::limits(),
                         idempotency: &write,
                         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -601,7 +592,7 @@ impl Worker {
                 tokio::time::sleep(self.hold).await;
             }
             self.gauge.down();
-            self.settle(&mut report, &ctx, &scope, token, cycle).await;
+            self.settle(&mut report, &actor, &scope, token, cycle).await;
         }
         report
     }
@@ -611,7 +602,7 @@ impl Worker {
     async fn settle(
         &self,
         report: &mut WorkerReport,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         cycle: usize,
@@ -626,11 +617,11 @@ impl Worker {
             let started = Instant::now();
             let settled = if commit {
                 self.store
-                    .commit_lease(ctx, scope, token, Some(COMMITTED), &write, &[])
+                    .commit_lease(actor, scope, token, Some(COMMITTED), None, &write, &[])
                     .await
             } else {
                 self.store
-                    .release_lease(ctx, scope, token, &write, &[])
+                    .release_lease(actor, scope, token, &write, &[])
                     .await
             };
             let stats = if commit {

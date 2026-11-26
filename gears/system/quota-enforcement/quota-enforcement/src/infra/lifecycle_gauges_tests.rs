@@ -9,6 +9,7 @@ fn the_cell_starts_empty_and_holds_the_latest_publication() {
         cap_zero: 1,
         cap_unbounded: 2,
         for_direct_metric: 3,
+        conditions_unfit: 0,
     };
     cell.publish(Some(first));
     assert_eq!(cell.load(), Some(first));

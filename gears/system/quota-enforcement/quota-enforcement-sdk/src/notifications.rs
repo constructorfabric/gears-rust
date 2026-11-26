@@ -15,10 +15,8 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
-use toolkit_security::SecurityContext;
-
 use crate::models::NotificationEvent;
+use async_trait::async_trait;
 
 /// The event a sink receives: the outbox row's [`NotificationEvent`], as the
 /// producing transaction enqueued it.
@@ -43,10 +41,10 @@ pub enum DispatchError {
 /// A deployment's notification sink.
 ///
 /// The dispatcher calls every registered sink with every event, concurrently,
-/// each call bounded by the operator's per-sink timeout, under the
-/// dispatcher's system context. That context identifies the caller only: a
-/// sink that serves one tenant filters on the event's own `scope`, never on
-/// the context's tenant, and `Platform` events reach every sink.
+/// each call bounded by the operator's per-sink timeout. A sink gets no
+/// security context: the event names its own actor, and a sink that serves
+/// one tenant filters on the event's `scope`; `Platform` events reach every
+/// sink.
 ///
 /// Delivery is at least once: the same `event_id` may arrive again after a
 /// retry or a lease handover, and a sink must tolerate it.
@@ -64,8 +62,7 @@ pub trait QuotaNotificationSinkV1: Send + Sync + 'static {
     /// [`DispatchError::Timeout`] or [`DispatchError::Transient`] to have the
     /// event re-delivered later; [`DispatchError::Permanent`] to have it
     /// dead-lettered.
-    async fn dispatch(&self, ctx: &SecurityContext, event: QuotaEvent)
-    -> Result<(), DispatchError>;
+    async fn dispatch(&self, event: QuotaEvent) -> Result<(), DispatchError>;
 }
 
 /// What the dispatcher decided for one claimed event.

@@ -23,14 +23,6 @@ use crate::test_support::{
     actor, bound_outbox, draft, enqueued_messages, quota_changed, scope_for, tenant, test_db,
 };
 
-fn ctx() -> toolkit_security::SecurityContext {
-    toolkit_security::SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("context")
-}
-
 #[test]
 fn a_tenant_always_lands_on_the_same_partition_within_the_bound() {
     for raw in [0_u128, 1, 7, 8, u128::MAX, 0x00ac_ce55] {
@@ -389,7 +381,7 @@ async fn a_cold_bootstrap_runs_unbound_and_delivery_starts_after_it() {
         .expect("a cold bootstrap needs no pipeline");
     let refused = plugin
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             draft(tenant(), "u1", Some(10)),
             &[quota_changed(tenant())],
@@ -415,7 +407,7 @@ async fn a_cold_bootstrap_runs_unbound_and_delivery_starts_after_it() {
     let event = quota_changed(tenant());
     plugin
         .create_quota(
-            &ctx(),
+            &actor(),
             &scope_for(tenant()),
             draft(tenant(), "u1", Some(10)),
             std::slice::from_ref(&event),

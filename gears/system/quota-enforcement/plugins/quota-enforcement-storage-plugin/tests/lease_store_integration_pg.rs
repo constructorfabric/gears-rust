@@ -38,7 +38,7 @@ use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ApplicableQuotas, AppliedMutation, AttributionDigest, BulkDeactivateEntry,
     BulkDeactivateEnvelope, Decision, DecisionResult, EvaluatedLease, EvaluatedMutation,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseToken, MetricId, OperationType,
+    IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, OperationType,
     PartialIdempotencyWrite, PayloadHash, PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft,
     QuotaId, StorageError, SubjectRef, TenantId, TransitionOutcome,
 };
@@ -51,7 +51,7 @@ use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::domain::ports::LeaseStore;
@@ -65,8 +65,8 @@ use quota_enforcement_storage_plugin::{
     SqlPolicyStore, SqlQuotaStore, start_undelivered_outbox,
 };
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 
 fn tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(0x00ac_ce55))
@@ -77,23 +77,14 @@ fn scope() -> AccessScope {
 }
 
 fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: None,
     }
-}
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
 }
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -145,12 +136,10 @@ fn evaluator() -> Arc<TransactionEvaluator> {
                     .quotas
                     .iter()
                     .map(|quota| {
-                        (
-                            quota.snapshot.quota_id,
-                            QuotaDebitPlan {
-                                amount: context.amount,
-                            },
-                        )
+                        vec![QuotaDebitPlan {
+                            quota_id: quota.snapshot.quota_id,
+                            amount: context.amount,
+                        }]
                     })
                     .collect(),
             )
@@ -160,11 +149,38 @@ fn evaluator() -> Arc<TransactionEvaluator> {
                     violated_quota_ids: exceeded,
                     reason: "QUOTA_EXCEEDED".to_owned(),
                 },
-                debit_plan: std::collections::BTreeMap::new(),
+                debit_plan: Vec::new(),
                 diagnostics: std::collections::BTreeMap::new(),
             }
         };
         Ok(EvaluationOutcome::validate(decision, context)?)
+    })
+}
+
+/// One chain over every applicable Quota, bounded Quotas first, each taking
+/// what it has left of the amount.
+fn cascade() -> Arc<TransactionEvaluator> {
+    Arc::new(move |context: &EvaluationContext<'_>| {
+        let mut quotas: Vec<_> = context.quotas.iter().map(|quota| quota.snapshot).collect();
+        quotas.sort_by_key(|quota| (quota.remaining.is_none(), quota.quota_id));
+        let mut left = context.amount;
+        let chain = quotas
+            .into_iter()
+            .map(|quota| {
+                let amount = quota
+                    .remaining
+                    .map_or(left, |remaining| remaining.min(left));
+                left -= amount;
+                QuotaDebitPlan {
+                    quota_id: quota.quota_id,
+                    amount,
+                }
+            })
+            .collect();
+        Ok(EvaluationOutcome::validate(
+            Decision::allowed_with_plan(vec![chain]),
+            context,
+        )?)
     })
 }
 
@@ -232,7 +248,7 @@ impl PgHarness {
         let policies = SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer));
         policies
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     // Not the built-in engine, whose plans name one Quota only:
@@ -390,7 +406,6 @@ impl PgHarness {
             let idempotency = IdempotencyWrite {
                 scope: IdempotencyScope {
                     tenant_id: tenant(),
-                    subject_key: IdempotencySubjectKey::of(&subjects),
                     operation_type: OperationType::Reserve,
                     key,
                 },
@@ -401,14 +416,13 @@ impl PgHarness {
             let null = serde_json::Value::Null;
             store
                 .acquire_lease(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     &EvaluatedMutation {
                         applicable: &applicable,
                         amount,
                         request: &null,
-                        resource: &null,
-                        user_projection: None,
+                        metric_id: None,
                         limits: limits(),
                         idempotency: &idempotency,
                         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -423,10 +437,10 @@ impl PgHarness {
     /// `count` active leases an hour past their expiry, as a stalled sweeper leaves them.
     async fn seed_expired_leases(&self, count: u32) {
         let sql = format!(
-            "INSERT INTO qe_leases (token, tenant_id, metric, subject_key, attribution_hash, \
-             idem_key, state, reserved_amount, acquired_at, expiry_at, record_version, \
+            "INSERT INTO qe_leases (token, tenant_id, metric, attribution_digest, idem_key, \
+             state, reserved_amount, acquired_at, expiry_at, record_version, \
              created_at, updated_at) \
-             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', '\\x00', '\\x00', \
+             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', '\\x00', \
              'backlog-' || n, 'active', 1, now() - interval '2 hours', \
              now() - interval '1 hour', 1, now(), now() \
              FROM generate_series(1, {count}) AS n",
@@ -451,15 +465,15 @@ impl PgHarness {
         let period_value = period.map_or_else(|| "NULL".to_owned(), |period| format!("'{period}'"));
         let sql = format!(
             "{period_sql}WITH leases AS (INSERT INTO qe_leases (token, tenant_id, metric, \
-             subject_key, attribution_hash, idem_key, state, reserved_amount, acquired_at, \
+             attribution_digest, idem_key, state, reserved_amount, acquired_at, \
              expiry_at, record_version, created_at, updated_at) \
-             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', \
-             decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'), \
+             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', '\\x00', \
              'backlog-' || n, 'active', 1, now() - interval '2 hours', \
              now() - interval '1 hour', 1, now(), now() \
              FROM generate_series(1, {count}) AS n RETURNING token) \
              INSERT INTO qe_lease_holds (lease_token, quota_id, tenant_id, held_amount, \
-             period_id) SELECT token, '{quota}', '{tenant}', 1, {period_value} FROM leases"
+             period_id, chain, position) SELECT token, '{quota}', '{tenant}', 1, {period_value}, \
+             0, 0 FROM leases"
         );
         self.psql_inserts(&sql, count).await;
     }
@@ -507,10 +521,11 @@ impl PgHarness {
         tokio::spawn(async move {
             store
                 .commit_lease(
-                    &ctx(),
+                    &actor(),
                     &scope(),
                     token,
                     Some(actual),
+                    None,
                     &PartialIdempotencyWrite {
                         tenant_id: tenant(),
                         key,
@@ -639,7 +654,7 @@ impl PgHarness {
 
     async fn consumed(&self, holder: &str, id: QuotaId) -> u64 {
         self.store
-            .read_quota_snapshot(&ctx(), &scope(), &applicable(subjects(&[holder])))
+            .read_quota_snapshot(&scope(), &applicable(subjects(&[holder])))
             .await
             .expect("snapshot")
             .into_iter()
@@ -668,7 +683,7 @@ impl PgHarness {
 async fn release_on(store: Arc<SqlConsumptionStore>, token: LeaseToken, key: String) -> Settled {
     store
         .release_lease(
-            &ctx(),
+            &actor(),
             &scope(),
             token,
             &PartialIdempotencyWrite {
@@ -778,6 +793,46 @@ async fn a_cascade_and_a_commit_resolve_one_lease_exactly_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_below_the_held_amount_unwinds_each_chain_from_its_last_entry() {
+    let h = PgHarness::up().await;
+    let primary = h.quota("p", Some(30)).await;
+    let fallback = h.quota("f", None).await;
+    let acquired = h
+        .acquire_with(&["p", "f"], 50, "a1", cascade())
+        .await
+        .expect("join");
+    let token = token_of(&acquired).expect("the cascade holds");
+    let committed = h.commit(token, 35, "c1").await.expect("join");
+    assert!(
+        matches!(committed, Ok(TransitionOutcome::Applied(_))),
+        "{committed:?}"
+    );
+    assert_eq!(
+        (
+            h.consumed("p", primary).await,
+            h.consumed("f", fallback).await
+        ),
+        (30, 5),
+        "the fallback gives back first"
+    );
+
+    let first = h.quota("x", Some(100)).await;
+    let second = h.quota("y", Some(100)).await;
+    let token = h.held(&["x", "y"], 40, "a2").await;
+    let committed = h.commit(token, 25, "c2").await.expect("join");
+    assert!(
+        matches!(committed, Ok(TransitionOutcome::Applied(_))),
+        "{committed:?}"
+    );
+    assert_eq!(
+        (h.consumed("x", first).await, h.consumed("y", second).await),
+        (25, 25),
+        "every chain of an AND keeps the committed amount"
+    );
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_acquisitions_admit_exactly_the_lease_cap() {
     let h = PgHarness::up().await;
     h.queue_writers().await;
@@ -865,7 +920,6 @@ async fn only_an_acquisition_waits_on_a_held_capacity_row() {
         idempotency: IdempotencyWrite {
             scope: IdempotencyScope {
                 tenant_id: tenant(),
-                subject_key: IdempotencySubjectKey::of(&[]),
                 operation_type: OperationType::BulkDeactivateQuotas,
                 key: "b1".to_owned(),
             },
@@ -1221,15 +1275,9 @@ fn held_evaluator(
     })
 }
 
-/// Commit a record under the scope `holders` acquire with, without the scope
-/// lock: the writer an acquisition can still lose the record's key to.
-async fn commit_record_out_of_band(
-    h: &PgHarness,
-    holders: &[&str],
-    key: &str,
-    payload: u8,
-    blob: String,
-) {
+/// Commit an acquisition record under `key` without the scope lock: the
+/// writer an acquisition can still lose the record's key to.
+async fn commit_record_out_of_band(h: &PgHarness, key: &str, payload: u8, blob: String) {
     use quota_enforcement_storage_plugin::infra::storage::entity::idempotency_record;
     use sea_orm::ActiveValue::Set;
     let now = OffsetDateTime::now_utc();
@@ -1240,16 +1288,10 @@ async fn commit_record_out_of_band(
     let insert = toolkit_db::secure::secure_insert::<idempotency_record::Entity>(
         idempotency_record::ActiveModel {
             tenant_id: Set(tenant().as_uuid()),
-            subject_key: Set(IdempotencySubjectKey::of(&subjects(holders))
-                .as_bytes()
-                .to_vec()),
             operation_type: Set(OperationType::Reserve.as_str().to_owned()),
             idem_key: Set(key.to_owned()),
             payload_hash: Set(vec![payload; 32]),
             decision_blob: Set(blob),
-            applied_entries: Set(None),
-            attribution_hash: Set(Some(vec![7; 32])),
-            reversed_by_key: Set(None),
             engine_id: Set(None),
             policy_id: Set(None),
             policy_version: Set(None),
@@ -1267,7 +1309,7 @@ async fn commit_record_out_of_band(
 
 fn winners_lease() -> EvaluatedLease {
     EvaluatedLease {
-        decision: Decision::allowed_with_plan(std::collections::BTreeMap::new()),
+        decision: Decision::allowed_with_plan(Vec::new()),
         token: Some(LeaseToken::new(Uuid::from_u128(0x0011_7e55))),
         expires_at: None,
     }
@@ -1297,7 +1339,7 @@ async fn an_acquisition_that_loses_the_record_key_replays_the_winner_and_holds_n
     let (holder, release) = hold_an_acquisition(&h, "raced");
     let blob = serde_json::to_string(&winners_lease()).expect("lease");
     // The acquisition payload is its amount, 5.
-    commit_record_out_of_band(&h, &["u1"], "raced", 5, blob).await;
+    commit_record_out_of_band(&h, "raced", 5, blob).await;
     release.send(()).expect("release");
 
     match holder.await.expect("join") {
@@ -1320,7 +1362,7 @@ async fn an_acquisition_that_loses_the_record_key_to_another_payload_is_a_mismat
     let id = h.quota("u1", Some(100)).await;
     let (holder, release) = hold_an_acquisition(&h, "raced");
     let blob = serde_json::to_string(&winners_lease()).expect("lease");
-    commit_record_out_of_band(&h, &["u1"], "raced", 6, blob).await;
+    commit_record_out_of_band(&h, "raced", 6, blob).await;
     release.send(()).expect("release");
 
     assert!(
@@ -1378,5 +1420,90 @@ async fn the_deactivation_lookup_survives_a_backlog_beyond_one_statement_of_para
     .await
     .expect("the lookup runs");
     assert!(holders.is_empty(), "every seeded lease has expired");
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_scoped_to_another_tenant_cannot_reach_the_lease() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", Some(100)).await;
+    let token = h.held(&["u1"], 10, "acquire").await;
+    let before = h.consumed("u1", id).await;
+
+    let refused = h
+        .store
+        .commit_lease(
+            &actor(),
+            &AccessScope::for_tenant(Uuid::from_u128(0xb)),
+            token,
+            Some(10),
+            None,
+            &PartialIdempotencyWrite {
+                tenant_id: tenant(),
+                key: "commit".to_owned(),
+                payload_hash: PayloadHash::from_bytes([9; 32]),
+            },
+            &[],
+        )
+        .await;
+
+    assert!(
+        matches!(refused, Err(StorageError::LeaseNotFound { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(h.state(token).await, "active");
+    assert_eq!(h.consumed("u1", id).await, before);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deactivation_waits_for_a_commit_on_a_lease_that_its_clock_sees_expired() {
+    let h = PgHarness::up().await;
+    let id = h.quota("x", Some(100)).await;
+    let token = h.held(&["x"], 20, "a").await;
+
+    // A commit on a clock still before the expiry holds the lease row.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let db = h.db.clone();
+    let holder = tokio::spawn(async move {
+        db.transaction_ref_mapped(move |tx| {
+            Box::pin(async move {
+                lease_repo::find_for_update(
+                    tx,
+                    &AccessScope::allow_all(),
+                    token.as_uuid(),
+                    lease_repo::RowWait::Wait,
+                )
+                .await?;
+                _ = locked_tx.send(());
+                _ = release_rx.await;
+                Ok::<_, toolkit_db::DbError>(())
+            })
+        })
+        .await
+    });
+    locked_rx.await.expect("the lease row is locked");
+
+    // The deactivation's clock is past the expiry.
+    h.advance(Duration::from_mins(2));
+    let quotas = h.quotas.clone();
+    let cascade =
+        tokio::spawn(async move { quotas.deactivate_quota(&actor(), &scope(), id, &[]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !cascade.is_finished(),
+        "the deactivation waits on the expired lease's row"
+    );
+
+    release_tx.send(()).expect("release");
+    holder.await.expect("join").expect("the holder commits");
+    let resolved = tokio::time::timeout(NO_DEADLOCK, cascade)
+        .await
+        .expect("no deadlock")
+        .expect("join")
+        .expect("the deactivation commits")
+        .resolved_leases;
+    assert!(resolved.is_empty(), "an expired lease is the sweeper's");
     h.down().await;
 }

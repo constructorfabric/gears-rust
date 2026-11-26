@@ -6,14 +6,14 @@
 //! DESIGN leaves the mechanism to the plugin. This one never lets a transaction
 //! queue behind another:
 //!
-//! - Every row lock the budgeted primitives take — debit, credit, rollback and
-//!   the three lease operations — is `FOR UPDATE ... NOWAIT`
+//! - Every row lock the budgeted primitives take — debit, credit, return,
+//!   rollback and the three lease operations — is `FOR UPDATE ... NOWAIT`
 //!   ([`RowWait::Nowait`](super::repo::RowWait)). A held row is refused at
 //!   once with `PostgreSQL`'s `lock_not_available` (SQLSTATE `55P03`).
 //! - [`with_budget`] then rolls the whole transaction back, sleeps for the
 //!   shorter of its backoff and what remains of the budget, and runs it again,
 //!   until it succeeds or the budget is spent. No attempt starts once the
-//!   deadline has passed, so at the 0 ms platform default there is no retry:
+//!   deadline has passed, so with a 0 ms budget there is no retry:
 //!   the first refusal is the answer.
 //!
 //! The budget is a deadline, so it bounds the operation's total wait across
@@ -44,17 +44,22 @@
 //! transaction or be lost apart from it. A second writer of the scope is
 //! refused and retries under its budget; once it gets in, the winner's record
 //! is committed, so its `replay_of` answers and its delete and insert meet no
-//! open transaction. A rollback locks two stripes, its own scope's and the
-//! original's, deduplicated and in ascending order. The retention sweeper
-//! takes a stripe the same way but `SKIP LOCKED`, and deletes only a record
-//! still expired, so it neither waits on a writer nor removes a replacement.
+//! open transaction, with one exception: a return whose key still names a
+//! charge the retention sweeper is deleting waits for that delete, which
+//! removes the key's return record by cascade. A return locks two stripes, its charge's and its return
+//! key's, deduplicated and in ascending order. The retention sweeper takes the
+//! stripes of a whole batch in one statement but `SKIP LOCKED`, and deletes
+//! only the records still expired, or the charges still
+//! deleted, whose stripes it took, so it neither waits on a writer nor removes
+//! a replacement.
 //!
 //! **Unrelated scopes can share a stripe.** They then serialize like two
-//! writers of one scope: at the 0 ms default the second is refused with
+//! writers of one scope: with a 0 ms budget the second is refused with
 //! `LEASE_CONTENTION_TIMEOUT` although nothing it touches is contended, and
 //! with a positive budget it waits for the first. With 65 536 stripes the
 //! chance is about one in 65 536 per pair of concurrent writers. A retention
-//! pass holding a stripe for its one delete has the same effect.
+//! pass holding the stripes of its batch for its delete has the same
+//! effect on the writers that share them.
 //!
 //! A period row's first insert needs no such lock: the Quota row lock already
 //! serializes its writers. The capacity row is created with its first Quota
@@ -255,8 +260,8 @@ pub(super) fn scope_lock_not_available(error: &ScopeError) -> bool {
     db_error.to_string().contains("could not obtain lock on")
 }
 
-/// Lock the stripes of `scopes` (rank 2): deduplicated, in ascending order,
-/// each `NOWAIT`, so a held one fails the transaction with
+/// Lock the stripes of `scopes` (rank 2): deduplicated, in ascending order, in
+/// one `NOWAIT` statement, so a held one fails the transaction with
 /// `lock_not_available` for [`with_budget`] to retry.
 ///
 /// # Errors
@@ -275,12 +280,11 @@ pub(super) async fn lock_scopes<E: ContentionError>(
         .collect();
     stripes.sort_unstable();
     stripes.dedup();
-    for stripe in stripes {
-        if !super::repo::idempotency_repo::lock_stripe(tx, stripe).await? {
-            return Err(E::missing_stripe(stripe));
-        }
+    let locked = super::repo::idempotency_repo::lock_stripes(tx, &stripes).await?;
+    match stripes.iter().find(|stripe| !locked.contains(stripe)) {
+        Some(missing) => Err(E::missing_stripe(*missing)),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]

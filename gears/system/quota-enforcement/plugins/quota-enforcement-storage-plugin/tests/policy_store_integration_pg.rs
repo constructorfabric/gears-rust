@@ -23,7 +23,6 @@ use testcontainers_modules::postgres::Postgres;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::{ConnectOpts, Db, connect_db};
-use toolkit_security::SecurityContext;
 
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
 use quota_enforcement_storage_plugin::{
@@ -36,8 +35,10 @@ struct PgHarness {
     _container: ContainerAsync<Postgres>,
 }
 
-fn context() -> SecurityContext {
-    SecurityContext::anonymous()
+fn actor() -> quota_enforcement_sdk::Actor {
+    quota_enforcement_sdk::Actor::Caller {
+        subject_id: uuid::Uuid::nil(),
+    }
 }
 
 fn draft() -> PolicyDraft {
@@ -131,10 +132,10 @@ impl PgHarness {
 #[tokio::test]
 async fn two_updates_from_the_same_version_leave_exactly_one_winner() {
     let harness = PgHarness::up().await;
-    let ctx = context();
+    let actor = actor();
     let created = harness
         .store
-        .create_policy(&ctx, draft(), &[])
+        .create_policy(&actor, draft(), &[])
         .await
         .expect("create");
     let id = created.policy_id.clone();
@@ -145,10 +146,10 @@ async fn two_updates_from_the_same_version_leave_exactly_one_winner() {
     let (left, right) = tokio::join!(
         harness
             .store
-            .update_policy(&ctx, id.clone(), patch(1, "left"), &[]),
+            .update_policy(&actor, id.clone(), patch(1, "left"), &[]),
         harness
             .store
-            .update_policy(&ctx, id.clone(), patch(1, "right"), &[]),
+            .update_policy(&actor, id.clone(), patch(1, "right"), &[]),
     );
     let (winner, loser) = match (left, right) {
         (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
@@ -193,10 +194,10 @@ async fn two_updates_from_the_same_version_leave_exactly_one_winner() {
 #[tokio::test]
 async fn a_concurrent_update_and_delete_commit_in_one_order_or_the_other() {
     let harness = PgHarness::up().await;
-    let ctx = context();
+    let actor = actor();
     let created = harness
         .store
-        .create_policy(&ctx, draft(), &[])
+        .create_policy(&actor, draft(), &[])
         .await
         .expect("create");
     let id = created.policy_id.clone();
@@ -204,8 +205,8 @@ async fn a_concurrent_update_and_delete_commit_in_one_order_or_the_other() {
     let (updated, deleted) = tokio::join!(
         harness
             .store
-            .update_policy(&ctx, id.clone(), patch(1, "update"), &[]),
-        harness.store.delete_policy(&ctx, id.clone(), None, &[]),
+            .update_policy(&actor, id.clone(), patch(1, "update"), &[]),
+        harness.store.delete_policy(&actor, id.clone(), None, &[]),
     );
 
     // Whichever order the lock grants, the reader never sees a mixed state: the
@@ -254,14 +255,14 @@ async fn a_concurrent_update_and_delete_commit_in_one_order_or_the_other() {
 #[tokio::test]
 async fn concurrent_creates_at_one_scope_leave_a_single_live_policy() {
     let harness = PgHarness::up().await;
-    let ctx = context();
+    let actor = actor();
 
     // Creation does not lock a header, because there is none yet. The partial
     // unique index on the live scope is what arbitrates, so this proves the
     // constraint and not the lock.
     let (left, right) = tokio::join!(
-        harness.store.create_policy(&ctx, draft(), &[]),
-        harness.store.create_policy(&ctx, draft(), &[]),
+        harness.store.create_policy(&actor, draft(), &[]),
+        harness.store.create_policy(&actor, draft(), &[]),
     );
     let winner = match (left, right) {
         (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => {
@@ -298,21 +299,21 @@ async fn concurrent_creates_at_one_scope_leave_a_single_live_policy() {
 #[tokio::test]
 async fn a_rollback_racing_an_update_never_reuses_a_version_number() {
     let harness = PgHarness::up().await;
-    let ctx = context();
+    let actor = actor();
     let created = harness
         .store
-        .create_policy(&ctx, draft(), &[])
+        .create_policy(&actor, draft(), &[])
         .await
         .expect("create");
     let id = created.policy_id.clone();
     harness
         .store
-        .update_policy(&ctx, id.clone(), patch(1, "v2"), &[])
+        .update_policy(&actor, id.clone(), patch(1, "v2"), &[])
         .await
         .expect("v2");
     harness
         .store
-        .update_policy(&ctx, id.clone(), patch(2, "v3"), &[])
+        .update_policy(&actor, id.clone(), patch(2, "v3"), &[])
         .await
         .expect("v3");
 
@@ -322,10 +323,10 @@ async fn a_rollback_racing_an_update_never_reuses_a_version_number() {
     let (rolled, updated) = tokio::join!(
         harness
             .store
-            .rollback_policy(&ctx, id.clone(), 1, Some("back".into()), &[]),
+            .rollback_policy(&actor, id.clone(), 1, Some("back".into()), &[]),
         harness
             .store
-            .update_policy(&ctx, id.clone(), patch(3, "v4"), &[]),
+            .update_policy(&actor, id.clone(), patch(3, "v4"), &[]),
     );
     assert!(rolled.expect("rollback").is_applied());
     if let Ok(version) = updated {
@@ -335,7 +336,7 @@ async fn a_rollback_racing_an_update_never_reuses_a_version_number() {
     let next = harness
         .store
         .update_policy(
-            &ctx,
+            &actor,
             id.clone(),
             patch(
                 harness
@@ -381,7 +382,7 @@ async fn a_rollback_racing_an_update_never_reuses_a_version_number() {
 #[tokio::test]
 async fn an_unknown_policy_is_absence_on_reads_and_an_error_on_transitions() {
     let harness = PgHarness::up().await;
-    let ctx = context();
+    let actor = actor();
     let missing = PolicyId::new("never-created");
     assert!(
         harness
@@ -401,14 +402,14 @@ async fn an_unknown_policy_is_absence_on_reads_and_an_error_on_transitions() {
     assert!(matches!(
         harness
             .store
-            .delete_policy(&ctx, missing.clone(), None, &[])
+            .delete_policy(&actor, missing.clone(), None, &[])
             .await,
         Err(StorageError::PolicyNotFound { .. })
     ));
     assert!(matches!(
         harness
             .store
-            .delete_policy(&ctx, PolicyId::global(), None, &[])
+            .delete_policy(&actor, PolicyId::global(), None, &[])
             .await,
         Err(StorageError::CannotDeleteSeededGlobalPolicy)
     ));

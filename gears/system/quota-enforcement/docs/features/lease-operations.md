@@ -39,9 +39,10 @@
 
 ### 1.1 Overview
 
-Implements the two-phase lease protocol: atomic multi-Quota hold acquisition with a caller-supplied TTL, commit with
-unused-capacity return, release, and TTL auto-release. Correctness rests on the lazy-expiry semantic that every read
-and write path enforces on its own; the `LeaseSweeper` background task is only the physical reclamation tier.
+Implements the two-phase lease protocol: atomic multi-Quota hold acquisition with a caller-supplied TTL, commit that
+unwinds the unused part from the holds, release, and TTL auto-release. Correctness rests on the lazy-expiry semantic
+that every read and write path enforces on its own; the `LeaseSweeper` background task is only the physical
+reclamation tier.
 
 ### 1.2 Purpose
 
@@ -95,12 +96,18 @@ state mutation, invariant I11), and the settlement machinery of period rollover 
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) (§2.6)
 - **ADR**: [ADR-0002 Acquisition ordering](../ADR/0002-cpt-cf-quota-enforcement-adr-acquisition-ordering.md),
   [ADR-0004 Settlement window emit](../ADR/0004-cpt-cf-quota-enforcement-adr-settlement-window-emit.md),
-  [ADR-0006 Coordination via the cluster gear](../ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md)
+  [ADR-0006 Coordination via the cluster gear](../ADR/0006-cpt-cf-quota-enforcement-adr-coordination-plugin.md),
+  [ADR-0010 Debit plan of chains](../ADR/0010-cpt-cf-quota-enforcement-adr-debit-plan-chains.md),
+  [ADR-0011 Charge ledger](../ADR/0011-cpt-cf-quota-enforcement-adr-charge-ledger.md),
+  [ADR-0012 Metric catalogue](../ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md) (commit and release on
+  an unavailable metric),
+  [ADR-0013 Metric types](../ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md) (the metric of a request)
 - **Dependencies**: `cpt-cf-quota-enforcement-feature-consumption-operations` (the `EvaluationOrchestrator` pipeline
   the acquire path runs through, the idempotency scope and replay machinery, and the period-rollover settlement that
   waits on lease resolution), plus transitively `cpt-cf-quota-enforcement-feature-resolution-policy-engine` (the
-  Decision and Debit Plan a lease holds against), `cpt-cf-quota-enforcement-feature-projection-contracts` (ingress
-  validation and subject resolution), and `cpt-cf-quota-enforcement-feature-foundation` (storage plugin, admission,
+  Decision and Debit Plan a lease holds against), `cpt-cf-quota-enforcement-feature-projection-contracts` (Metric
+  Types & Subject Admission: ingress validation and subject admission; this document calls it the
+  projection-contracts feature, after its file name), and `cpt-cf-quota-enforcement-feature-foundation` (storage plugin, admission,
   coordination adapter, telemetry conventions)
 
 ## 2. Actor Flows (CDSL)
@@ -132,25 +139,25 @@ Realises `cpt-cf-quota-enforcement-seq-lease-acquire`.
   Quota
 
 **Steps**:
-1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/leases` with an `AcquireLeaseRequest` carrying caller-supplied attribution, one operation-level metadata object, optional resource, metric, positive integer `amount`, required `ttl`, and idempotency key; foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) and projection-contracts ingress validation have already run - `inst-lac-request`
+1. [x] - `p1` - Caller sends `POST /quota-enforcement/v1/leases` with an `AcquireLeaseRequest` carrying `tenant_id`, `{type, id}` subjects, the metric object `metric: {type, id?, metadata}`, positive integer `amount`, required `ttl`, and idempotency key; in the metric object, `type` is the **metric type** (the GTS type that the metric's owner registers, ADR-0013), `id` is optional and names the one thing the amount is counted for, and `metadata` holds the attributes of the operation that policies read; foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) and projection-contracts ingress validation have already run - `inst-lac-request`
 2. [x] - `p1` - **IF** `amount <= 0` - `inst-lac-amount-if`
    1. [x] - `p1` - **RETURN** `INVALID_AMOUNT` (`DomainError::InvalidAmount`, canonical `InvalidArgument`) before idempotency lookup, multi-quota evaluation, or any hold acquisition; no idempotency record, lease row, or capacity hold is created (`cpt-cf-quota-enforcement-fr-lease-acquire`) - `inst-lac-amount`
 3. [x] - `p1` - **IF** `ttl` is missing or falls outside the operator-configurable `[min_lease_ttl, max_lease_ttl]` window (platform defaults 1 s and 1 h) - `inst-lac-ttl-if`
    1. [x] - `p1` - **RETURN** `TTL_OUT_OF_BOUNDS` (`DomainError::TtlOutOfBounds`, canonical `InvalidArgument`) at the gateway with the same nothing-persisted guarantee as the `INVALID_AMOUNT` fail-fast; clamping is not performed, because the lease contract entitles the holder to the exact TTL it reserved - `inst-lac-ttl`
-4. [x] - `p1` - Run the pipeline `cpt-cf-quota-enforcement-algo-evaluation-pipeline` with `acquire_lease` as the mutating primitive and `reserve` as the operation type in the idempotency scope; the complete authorized, catalogue-mapped applicable-subject set becomes the acquisition's `IdempotencySubjectKey`, and an exact replay short-circuits through `cpt-cf-quota-enforcement-algo-idempotency-replay` and **RETURN**s the stored `AcquireLeaseOutcome` - `inst-lac-pipeline`
+4. [x] - `p1` - Run the pipeline `cpt-cf-quota-enforcement-algo-evaluation-pipeline` with `acquire_lease` as the mutating primitive and `reserve` as the operation type in the idempotency scope `(tenant, reserve, key)`; an exact replay short-circuits through `cpt-cf-quota-enforcement-algo-idempotency-replay` and **RETURN**s the stored `AcquireLeaseOutcome` - `inst-lac-pipeline`
 5. [x] - `p1` - **IF** the Decision is `Denied` (the lease would exceed at least one applicable Quota under the active Policy; lease evaluation is identical to debit per `cpt-cf-quota-enforcement-fr-multi-quota-evaluation`) - `inst-lac-denied-if`
    1. [x] - `p1` - Persist `AcquireLeaseOutcome::Denied { decision }` under the acquisition idempotency scope and **RETURN** it as an HTTP 200 verdict with no capacity held in any Quota; increment `denial_total` by the closed `reason` kind - `inst-lac-denied`
 6. [x] - `p1` - DB: `LeaseManager` locks the `lease_capacity_counters` row for `(tenant, metric)`; **IF** the count of active leases would exceed the operator-configured cap (default 1000, sourced from the most specific `lease_capacity_config` row per I7, the `(*, *)` row being the platform default, cached in-process) - `inst-lac-cap-if`
    1. [x] - `p1` - **RETURN** `LEASE_INFLIGHT_LIMIT_EXCEEDED` (`StorageError::LeaseInflightLimitExceeded` lifted to canonical `ResourceExhausted`, 429) without holding any Quota; increment `lease_inflight_limit_exceeded_total` with the canonical registered `metric` label; expired leases never count toward the cap (I4) - `inst-lac-cap`
-7. [x] - `p1` - **IF** the wait on contended counter rows exceeds the operator-configured per-metric acquisition contention timeout (default 0 ms, fail-fast, from `contention_timeout_config`; mechanism plugin-internal per I8) - `inst-lac-contention-if`
+7. [x] - `p1` - **IF** the wait on contended rows exceeds the operator-configured per-metric acquisition contention timeout (default 50 ms; 0 ms means no wait; from `contention_timeout_config`; mechanism plugin-internal per I8) - `inst-lac-contention-if`
    1. [x] - `p1` - **RETURN** `LEASE_CONTENTION_TIMEOUT` (`StorageError::LeaseContentionTimeout` lifted to canonical `Aborted`, 409) with no hold on any Quota; increment `lease_contention_rejected_total` with the canonical registered `metric` label - `inst-lac-contention`
-8. [x] - `p1` - DB: `acquire_lease(applicable, plan, ttl, idem_scope)` in the single backend transaction: insert the `leases` row and one `lease_holds` row per Quota named in the Debit Plan, acquiring row locks in ascending lexicographic `quota_id` order (ADR-0002) so that either every named Quota's capacity is held or none is; capture `acquisition_period_id` for every consumption Quota in the plan (I5) and the acquisition's `IdempotencySubjectKey`; persist `AcquireLeaseOutcome::Acquired { token }` as the idempotency outcome (I1, I2); commit - `inst-lac-insert`
+8. [x] - `p1` - DB: `acquire_lease(applicable, plan, ttl, idem_scope)` in the single backend transaction: insert the `leases` row, with the attribution digest of the acquisition (a digest of its tenant, its subjects, and its metric with the type and optional id; ADR-0011), and one `lease_holds` row per Debit Plan entry, keeping the entry's chain and position, acquiring row locks in ascending lexicographic `quota_id` order (ADR-0002) so that either every named Quota's capacity is held or none is; capture `acquisition_period_id` for every consumption Quota in the plan (I5); admit the lease under the active-lease cap of its `(tenant, metric)` (I7); persist `AcquireLeaseOutcome::Acquired { token, expires_at }` as the idempotency outcome (I1, I2); commit - `inst-lac-insert`
 9. [x] - `p1` - Observe `lease_acquisition_wait_seconds` with the canonical registered `metric` label for the wait before successful acquisition or rejection on every path through steps 6 to 8 - `inst-lac-wait`
-10. [x] - `p1` - **RETURN** `{ lease_token, expiry_at }`; the token is opaque and server-issued, each applicable Quota's remaining capacity is decreased by the reserved amount for the TTL duration, and the SDK path is `QuotaEnforcementApi::acquire_lease(req)` returning `AcquireLeaseOutcome::Acquired { token }` (a `Denied` verdict from step 5 returns `AcquireLeaseOutcome::Denied { decision }`) - `inst-lac-return`
+10. [x] - `p1` - **RETURN** `{ lease_token, expiry_at }`; the token is opaque and server-issued, each applicable Quota's remaining capacity is decreased by the reserved amount for the TTL duration, and the SDK path is `QuotaEnforcementApi::acquire_lease(req)` returning `AcquireLeaseOutcome::Acquired { token, expires_at }` (a `Denied` verdict from step 5 returns `AcquireLeaseOutcome::Denied { decision }`) - `inst-lac-return`
 
 ### Commit Lease
 
-- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-lease-commit`
+- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-lease-commit`
 
 Realises `cpt-cf-quota-enforcement-seq-lease-commit`.
 
@@ -162,22 +169,28 @@ Realises `cpt-cf-quota-enforcement-seq-lease-commit`.
 - A commit after the acquisition period's calendar boundary, or after the Quota's `validity_end`, succeeds and lands
   on the acquisition period's counter
 - A replay of the same idempotency key returns the original Decision without a second counter effect
+- A commit of a lease whose metric has an unavailable catalogue entry runs as any other; a **catalogue entry** is
+  what QE keeps of a metric type it has read, and it is served or unavailable (ADR-0012)
 
 **Error Scenarios**:
 - The lease is expired or already resolved: `LEASE_NOT_ACTIVE` (canonical `FailedPrecondition`, 400)
 - `actual_amount > reserved_amount`: `OVER_COMMIT_NOT_AUTHORIZED` (canonical `FailedPrecondition`, 400)
+- The request names a metric type other than the lease's: `METRIC_TYPE_MISMATCH` (canonical `InvalidArgument`, 400)
 
 **Steps**:
-1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/leases/{token}/commit` with a `CommitLeaseRequest` carrying an optional `actual_amount` less than or equal to the reserved amount and the commit's own idempotency key (operation type `commit`, so the same key string never cross-matches the acquire) - `inst-lcm-request`
-2. [x] - `p1` - DB: read the lease's persisted acquisition `IdempotencySubjectKey`, construct the commit `IdempotencyScope`, and run `lookup_idempotency`; on an exact replay **RETURN** the stored Decision per `cpt-cf-quota-enforcement-algo-idempotency-replay` - `inst-lcm-idem`
-3. [x] - `p1` - DB: begin the transaction and lock the lease row with the lazy-expiry guard in the predicate, `state = 'active' AND expiry_at > now()` (I4), so an expired lease is rejected without depending on sweeper liveness - `inst-lcm-lock`
-4. [x] - `p1` - **IF** the lease is expired or in a terminal state - `inst-lcm-notactive-if`
-   1. [x] - `p1` - **RETURN** `LEASE_NOT_ACTIVE` (`StorageError::LeaseNotActive` lifted to canonical `FailedPrecondition`); this covers committed, released, auto-released, and resolved-by-deactivation leases alike - `inst-lcm-notactive`
-5. [x] - `p1` - **IF** `actual_amount > reserved_amount` - `inst-lcm-overcommit-if`
+1. [x] - `p1` - Caller sends `POST /quota-enforcement/v1/leases/{token}/commit` with a `CommitLeaseRequest` carrying an optional `actual_amount` less than or equal to the reserved amount, an optional `metric_type` (the id of the metric type that the amount is for; the resolver plugin passes the id that the resolver's commit names) and the commit's own idempotency key (operation type `commit`, so the same key string never cross-matches the acquire) - `inst-lcm-request`
+2. [x] - `p1` - Construct the commit `IdempotencyScope` `(tenant, commit, key)`; no lookup runs before the transaction and the in-process replay cache is not used: the transaction of step 3 finds a committed lease by its charge under the key lock and answers an exact replay with the stored Decision per `cpt-cf-quota-enforcement-algo-idempotency-replay` - `inst-lcm-idem`
+3. [x] - `p1` - DB: begin the transaction, take the commit's key lock, and lock the lease row with the lazy-expiry guard in the predicate, `state = 'active' AND expiry_at > now()` (I4), so an expired lease is rejected without depending on sweeper liveness - `inst-lcm-lock`
+4. [ ] - `p1` - **IF** the lease is already committed and a charge exists under this commit's key - `inst-lcm-replay-if`
+   1. [ ] - `p1` - **RETURN** the charge's stored result, or `IDEMPOTENCY_PAYLOAD_MISMATCH` for another fingerprint, so the loser of two concurrent commits with one key gets the winner's result - `inst-lcm-replay`
+5. [x] - `p1` - **IF** the lease is expired or in a terminal state - `inst-lcm-notactive-if`
+   1. [x] - `p1` - **RETURN** `LEASE_NOT_ACTIVE` (`StorageError::LeaseNotActive` lifted to canonical `FailedPrecondition`); this covers leases committed under another key, released, auto-released, and resolved-by-deactivation alike - `inst-lcm-notactive`
+6. [x] - `p1` - **IF** the request carries `metric_type` and it is not the metric type of the locked lease **RETURN** `METRIC_TYPE_MISMATCH`; nothing changes - `inst-lcm-metric`
+7. [x] - `p1` - **IF** `actual_amount > reserved_amount` - `inst-lcm-overcommit-if`
    1. [x] - `p1` - **RETURN** `OVER_COMMIT_NOT_AUTHORIZED` (`StorageError::OverCommitNotAuthorized`); callers that need more than their lease must reserve a higher worst-case estimate up front (`cpt-cf-quota-enforcement-fr-lease-commit`) - `inst-lcm-overcommit`
-6. [x] - `p1` - DB: `commit_lease(token, actual_amount, idem_scope, events)` in the same transaction: lock the `lease_holds` and counter rows for the `acquisition_period_id`, apply `actual_amount` against the acquisition period's counter and return `reserved - actual` to it (I5), transition the lease to `Committed`, invoke the shared threshold-emission routine (`cpt-cf-quota-enforcement-algo-threshold-emission`; it stays silent for settlement-window mutations per ADR-0004), and persist the commit's idempotency record (I1, I11); commit - `inst-lcm-apply`
-7. [x] - `p1` - Cross-boundary attribution holds by construction: a commit after a period rollover mutates the acquisition period's counter and never the new period's, and a commit after the Quota's `validity_end` succeeds because the lease guarantee was earned at acquisition time; operators that want strict cutoffs constrain the TTL bounds instead - `inst-lcm-boundary`
-8. [x] - `p1` - **RETURN** the `Decision` (Allowed); the commit produces a debit record addressable by the commit call's idempotency key, so it is reversible through the consumption-operations rollback flow (`cpt-cf-quota-enforcement-flow-rollback`); the SDK path is `QuotaEnforcementApi::commit_lease(req)` returning `Decision` - `inst-lcm-return`
+8. [x] - `p1` - DB: `commit_lease(token, actual_amount, idem_scope, events)` in the same transaction: lock, in the lock rank of DESIGN, the counter rows for the `acquisition_period_id` and the `lease_holds` under them, unwind the unused part `reserved - actual` from the holds (`cpt-cf-quota-enforcement-algo-unwind`) and return it to the acquisition period's counters, so the holds left sum to `actual_amount` in every chain (I5), write the commit's charge from those holds, with the request fingerprint and the lease's attribution digest (`cpt-cf-quota-enforcement-adr-charge-ledger`), transition the lease to `Committed`; a commit only lowers counters, so it emits no threshold event (the acquisition emitted them, `cpt-cf-quota-enforcement-algo-threshold-emission`); the charge is the commit's idempotency record for as long as it lives (I1, I11); commit - `inst-lcm-apply`
+9. [x] - `p1` - Cross-boundary attribution holds by construction: a commit after a period rollover mutates the acquisition period's counter and never the new period's, and a commit after the Quota's `validity_end` succeeds because the lease guarantee was earned at acquisition time; operators that want strict cutoffs constrain the TTL bounds instead - `inst-lcm-boundary`
+10. [x] - `p1` - **RETURN** the `Decision` (Allowed); the commit's charge is named by the commit call's idempotency key, so it is returnable through the consumption-operations return and rollback flows (`cpt-cf-quota-enforcement-flow-return`, `cpt-cf-quota-enforcement-flow-rollback`); the SDK path is `QuotaEnforcementApi::commit_lease(req)` returning `Decision` - `inst-lcm-return`
 
 ### Release Lease
 
@@ -192,14 +205,15 @@ Realises `cpt-cf-quota-enforcement-seq-lease-release` (the symmetric inverse of
 - The full held amount returns to every affected Quota's remaining capacity against the acquisition period, with no
   debit committed
 - A replay of the same idempotency key is a no-op after the first invocation
+- A release of a lease whose metric has an unavailable catalogue entry runs as any other (ADR-0012)
 
 **Error Scenarios**:
 - The lease is expired or already resolved: `LEASE_NOT_ACTIVE`
 
 **Steps**:
-1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/leases/{token}/release` with a `ReleaseLeaseRequest` carrying the release's own idempotency key (operation type `release`) - `inst-lrl-request`
-2. [x] - `p1` - DB: read the lease's persisted acquisition `IdempotencySubjectKey`, construct the release `IdempotencyScope`, and run `lookup_idempotency`; on an exact replay **RETURN** the stored outcome, a no-op per `cpt-cf-quota-enforcement-fr-lease-release` - `inst-lrl-idem`
-3. [x] - `p1` - DB: lock the lease row under the same `state = 'active' AND expiry_at > now()` predicate (I4); **IF** the lease is expired or terminal - `inst-lrl-notactive-if`
+1. [x] - `p1` - Caller sends `POST /quota-enforcement/v1/leases/{token}/release` with a `ReleaseLeaseRequest` carrying the release's own idempotency key (operation type `release`) - `inst-lrl-request`
+2. [x] - `p1` - Construct the release `IdempotencyScope` `(tenant, release, key)`; no lookup runs before the transaction and the in-process replay cache is not used: step 3 reads the idempotency record under the key lock and answers an exact replay with the stored outcome, a no-op per `cpt-cf-quota-enforcement-fr-lease-release` - `inst-lrl-idem`
+3. [x] - `p1` - DB: take the release's key lock, read the release's idempotency record again under it and **RETURN** its stored outcome when it exists (the loser of two concurrent releases with one key), then lock the lease row under the same `state = 'active' AND expiry_at > now()` predicate (I4); **IF** the lease is expired or terminal - `inst-lrl-notactive-if`
    1. [x] - `p1` - **RETURN** `LEASE_NOT_ACTIVE`; an expired lease has already been semantically released, so a caller-issued release has nothing left to return - `inst-lrl-notactive`
 4. [x] - `p1` - DB: `release_lease(token, idem_scope, events)` in one transaction: return the full `held_amount` of every hold to the acquisition period's counter (I5), transition the lease to `Released`, and persist the release's idempotency record (I1, I11); commit; the eight-kind event catalog defines no dedicated event for a caller-initiated release - `inst-lrl-apply`
 5. [x] - `p1` - **RETURN** the `Decision`; the SDK path is `QuotaEnforcementApi::release_lease(req)` returning `Decision` - `inst-lrl-return`
@@ -236,7 +250,7 @@ Realises `cpt-cf-quota-enforcement-seq-lease-auto-release`.
 **Steps**:
 1. [x] - `p1` - API: the `LeaseSweeper` hands its sweep body to the coordination adapter for `SingletonScope::LeaseSweeper`; while this replica is a follower no sweep body runs (the foundation `cpt-cf-quota-enforcement-dod-coordination-adapter` owns the election semantics) - `inst-swp-elect`
 2. [x] - `p1` - The elected replica runs the tick loop on the child `CancellationToken` it received; the resolved cluster backend renews the claim; on leadership loss the token is cancelled, the loop stops before its next batch, and the replica is a follower again until re-election, which is automatic - `inst-swp-lost`
-3. [x] - `p1` - DB: `reclaim_expired_leases(batch_size, before = now())`; **FOR EACH** batch, repeated until a batch comes back short, one transaction: transition every lease with `expiry_at <= now() AND state = 'active'` to `AutoReleased`, lock every counter the batch's holds name once in ascending order, return each hold's `held_amount` to its acquisition period's counter (I5), and enqueue exactly one `lease-auto-released` event per lease, carrying the lease ID, owning subject context, held amount, affected Quotas, and expiry timestamp, in the same transaction (I11); commit - `inst-swp-reclaim`
+3. [x] - `p1` - DB: `reclaim_expired_leases(batch_size, before = now())`; **FOR EACH** batch, repeated until a batch comes back short, one transaction: transition every lease with `expiry_at <= now() AND state = 'active'` to `AutoReleased`, lock every counter the batch's holds name once in ascending order, return each hold's `held_amount` to its acquisition period's counter (I5), and enqueue exactly one `lease-auto-released` event per lease, carrying the lease ID, the tenant, held amount, affected Quotas, and expiry timestamp, in the same transaction (I11); commit - `inst-swp-reclaim`
 4. [x] - `p1` - The sweeper is the canonical emission point for `lease-auto-released`: emission is deterministic with respect to the expiry timestamp, and under sweeper outage the events are deferred until reclamation while the semantic tier keeps accounting correct - `inst-swp-emit`
 5. [x] - `p1` - Physical reclamation completes within 1 hour of expiry: every tick drains the whole backlog, so reclamation normally lags expiry by one tick plus the drain time, and the knobs are the tick interval and the batch size; the sweeper **MAY** delete lease rows after a grace period per operator configuration - `inst-swp-interval`
 6. [x] - `p1` - Emit the `lease_unreclaimed_expired` gauge for the count of expired-but-unreclaimed leases by canonical registered `metric`, so operators can detect and localize sweeper outages - `inst-swp-gauge`
@@ -253,13 +267,14 @@ Realises `cpt-cf-quota-enforcement-seq-lease-auto-release`.
 **Initial State**: Active (created by `acquire_lease` together with its holds)
 
 **Transitions**:
-1. [x] - `p1` - **FROM** Active **TO** Committed **WHEN** a commit succeeds before `expiry_at`: `actual_amount` is debited against the acquisition period and `reserved - actual` returns to it - `inst-lst-commit`
+1. [x] - `p1` - **FROM** Active **TO** Committed **WHEN** a commit succeeds before `expiry_at`: `actual_amount` is debited against the acquisition period and `reserved - actual` is unwound from the holds back to it - `inst-lst-commit`
 2. [x] - `p1` - **FROM** Active **TO** Released **WHEN** a release succeeds before `expiry_at`: the full held amount returns to the acquisition period - `inst-lst-release`
 3. [x] - `p1` - **FROM** Active **TO** AutoReleased **WHEN** the sweeper reclaims a lease whose `expiry_at` has passed; semantically the lease is already released from `expiry_at` onward (I4), so this physical transition only reconciles the row and emits the `lease-auto-released` event - `inst-lst-autorelease`
 4. [x] - `p1` - **FROM** Active **TO** ResolvedByDeactivation **WHEN** the owning Quota's deactivation cascade resolves the lease atomically with the deactivation transaction (owned by the quota-lifecycle feature, `cpt-cf-quota-enforcement-flow-quota-deactivate`) - `inst-lst-deactivate`
 
 All four non-initial states are terminal (closed enum); commit and release against any terminal state, or against an
-expired `Active` row, return `LEASE_NOT_ACTIVE`. Between `expiry_at` and physical reclamation a row may still read
+expired `Active` row, return `LEASE_NOT_ACTIVE`, except a call that repeats the key of the commit or release that
+resolved the lease: it gets the stored outcome. Between `expiry_at` and physical reclamation a row may still read
 `Active` in storage; every reader and writer overrides that reading per
 `cpt-cf-quota-enforcement-algo-lazy-expiry`. Only an acquisition locks `lease_capacity_counters`; no transition writes it.
 
@@ -275,8 +290,9 @@ endpoints and the SDK methods `QuotaEnforcementApi::acquire_lease`,
 `amount <= 0` **MUST** be rejected with `INVALID_AMOUNT`, and requests with a missing `ttl` or a `ttl` outside
 `[min_lease_ttl, max_lease_ttl]` **MUST** be rejected with `TTL_OUT_OF_BOUNDS` without clamping; both fail-fasts fire
 before idempotency lookup, multi-quota evaluation, or any hold acquisition and persist nothing. All three operations
-**MUST** reuse the consumption-operations idempotency machinery unchanged under the distinct operation types
-`reserve`, `commit`, and `release`, with acquire replay returning the original `AcquireLeaseOutcome`, commit/release
+**MUST** reuse the consumption-operations idempotency rules (key scope, request fingerprint, replay, payload
+mismatch) under the distinct operation types `reserve`, `commit`, and `release`; commit and release answer a replay
+inside their transaction, under the key lock, with no lookup before it and no in-process replay cache, with acquire replay returning the original `AcquireLeaseOutcome`, commit/release
 replay returning the original Decision, and payload divergence returning `IDEMPOTENCY_PAYLOAD_MISMATCH`. Commit **MUST**
 reject `actual_amount > reserved_amount` with
 `OVER_COMMIT_NOT_AUTHORIZED`, and commit or release against an expired or resolved lease **MUST** return
@@ -291,8 +307,8 @@ reject `actual_amount > reserved_amount` with
 `cpt-cf-quota-enforcement-constraint-security-context`
 
 **Touches**:
-- API: `POST /v1/quota-enforcement/leases`, `POST /v1/quota-enforcement/leases/{token}/commit`,
-  `POST /v1/quota-enforcement/leases/{token}/release`
+- API: `POST /quota-enforcement/v1/leases`, `POST /quota-enforcement/v1/leases/{token}/commit`,
+  `POST /quota-enforcement/v1/leases/{token}/release`
 - DB: `cpt-cf-quota-enforcement-db-schema`
 - Entities: `Lease`, `LeaseToken`, `AcquireLeaseRequest`, `CommitLeaseRequest`, `ReleaseLeaseRequest`, `Decision`
 
@@ -306,7 +322,7 @@ locks taken in ascending lexicographic `quota_id` order (ADR-0002) so concurrent
 deadlock. The per-`(tenant, metric)` active-lease cap (default 1000, `lease_capacity_config` overrides, I7) **MUST**
 be enforced atomically same-tx with the lease insert, rejecting over-cap requests with
 `LEASE_INFLIGHT_LIMIT_EXCEEDED` regardless of underlying Quota capacity; expired leases do not count toward the cap.
-The per-metric acquisition contention timeout (default 0 ms fail-fast, `contention_timeout_config`, I8) **MUST**
+The per-metric acquisition contention timeout (default 50 ms, `contention_timeout_config`, I8) **MUST**
 bound the wait on contended rows, rejecting with `LEASE_CONTENTION_TIMEOUT` and no holds. The system **MUST** populate
 `lease_contention_rejected_total`, `lease_acquisition_wait_seconds`, and `lease_inflight_limit_exceeded_total`, each
 labelled by canonical registered `metric`, so operators can distinguish and localize contention rejections from
@@ -435,14 +451,17 @@ election TTL plus observation lag. No promise beyond the PRD threshold is added.
   `LEASE_INFLIGHT_LIMIT_EXCEEDED` (429) even though Quota capacity remains, and
   `lease_inflight_limit_exceeded_total` increments with the canonical registered `metric` label; letting held leases
   expire frees the cap without any sweeper run
-- [ ] With the contention timeout at the 0 ms default, an acquire that hits a contended counter row fails with
+- [ ] An acquire that waits on a contended row for less than the contention timeout (default 50 ms) succeeds; one that
+  waits longer, or that hits a contended row with the timeout set to 0 ms, fails with
   `LEASE_CONTENTION_TIMEOUT` (409) holding nothing; `lease_contention_rejected_total` and
   `lease_acquisition_wait_seconds` are populated with the canonical registered `metric` label for both rejected and
   successful acquisitions
-- [ ] A commit with `actual_amount < reserved_amount` debits `actual_amount` and returns the difference to each
-  affected Quota; a commit with `actual_amount > reserved_amount` fails with `OVER_COMMIT_NOT_AUTHORIZED`; commit and
-  release against an expired, committed, released, auto-released, or resolved-by-deactivation lease fail with
-  `LEASE_NOT_ACTIVE`; commit and release replays return the stored outcome with no second counter effect
+- [ ] A commit with `actual_amount < reserved_amount` debits `actual_amount` and unwinds the difference from the
+  holds, last entry of each chain first, for a cascade, an AND, and their mix, and writes a returnable charge; a
+  commit with `actual_amount > reserved_amount` fails with `OVER_COMMIT_NOT_AUTHORIZED`; commit and release against an
+  expired, committed, released, auto-released, or resolved-by-deactivation lease fail with `LEASE_NOT_ACTIVE`; commit
+  and release replays, the loser of two concurrent calls with one key included, return the stored outcome with no
+  second counter effect
 - [ ] A lease acquired in period `P` and committed after the `P`/`P+1` boundary mutates period `P`'s counter only,
   with `P+1`'s consumed and remaining unchanged; release and auto-release after the boundary return capacity to `P`
   only; a commit after the Quota's `validity_end` succeeds when the lease TTL is still live
@@ -453,8 +472,7 @@ election TTL plus observation lag. No promise beyond the PRD threshold is added.
   the expired lease fails with `LEASE_NOT_ACTIVE`; the `lease_unreclaimed_expired` gauge reports the backlog by
   canonical registered `metric`; after the sweeper resumes, rows transition to `AutoReleased` and the deferred
   `lease-auto-released` events are enqueued
-- [ ] The sweeper reclaims expired lease rows within 1 hour of expiry and enqueues exactly one `lease-auto-released` event per lease, carrying the lease ID, owning subject
-  context, held amount, affected Quotas, and expiry timestamp, in the same transaction as the state transition
+- [ ] The sweeper reclaims expired lease rows within 1 hour of expiry and enqueues exactly one `lease-auto-released` event per lease, carrying the lease ID, the tenant, held amount, affected Quotas, and expiry timestamp, in the same transaction as the state transition
 - [ ] One `LeaseSweeper` leader runs at a time across replicas in steady state; killing the leader makes a survivor
   the leader of `SingletonScope::LeaseSweeper` within one election TTL plus observation lag, and the survivor resumes
   reclamation
@@ -463,7 +481,7 @@ election TTL plus observation lag. No promise beyond the PRD threshold is added.
 - [ ] The disaster-recovery drill (full restart of gear and storage backend) shows evaluation and lease operations
   resuming within 15 minutes, with no manual lease recovery step and the sweeper election rejoined automatically
 - [ ] Metrics scrape shows the four lease instruments labelled by canonical registered `metric`, with no `tenant_id`,
-  `subject_id`, `quota_id`, `idempotency_key`, `lease_token`, projection-type, caller, or raw/unregistered metric label
+  `subject_id`, `quota_id`, `idempotency_key`, `lease_token`, subject-type, caller, or raw/unregistered metric label
 
 ## 7. Additional Context (optional)
 
@@ -475,15 +493,11 @@ election TTL plus observation lag. No promise beyond the PRD threshold is added.
   this feature enqueues its events same-tx (I11) and invokes the shared routine at its mutation call sites. The
   cluster coordination adapter and its run-while-leader semantics are the foundation's; this feature owns the
   sweep body (tick and batch loop on the adapter's cancellation token).
-- **Upstream alignment items (tracked upstream prerequisites)**: the DESIGN sequence names a
-  `system:quota-enforcement-sweeper` identity for the sweeper, but `SecurityContext` carries
-  no service-identity field; this document treats the sweeper as an internal background task and leaves the identity
-  representation as a tracked upstream DESIGN item. The SDK acquire path returns the DESIGN-defined
-  `AcquireLeaseOutcome` (`Acquired { token }` or `Denied { decision }`), so a `Denied` reserve surfaces as a Decision
-  verdict at HTTP 200 per PRD §3.4 without abusing the error channel.
-- **Idempotency subject key**: reserve fingerprints its complete authorized, catalogue-mapped applicable-subject set. The lease row
-  persists that `IdempotencySubjectKey`, and commit/release reuse it rather than resolving against the current
-  catalogue. This preserves both complete-projection coverage and stable follow-up replay scope.
+- **Upstream alignment items (tracked upstream prerequisites)**: the sweeper is a background task with no
+  `SecurityContext` and is recorded as the actor `lease-sweeper` (DESIGN, SecurityContext propagation). The SDK
+  acquire path returns the DESIGN-defined `AcquireLeaseOutcome` (`Acquired { token, expires_at }` or `Denied {
+  decision }`), so a `Denied` reserve surfaces as a Decision verdict at HTTP 200 per PRD §3.4 without abusing the
+  error channel.
 - **Rust contract notes**: `LeaseManager` and the sweeper call the async Tokio-based storage plugin; the sweeper is a
   single Tokio task whose leadership state is process-local, so no shared mutable state crosses tasks without the
   storage plugin or the cluster election as the synchronization owner. Commit and release hold no in-process lock

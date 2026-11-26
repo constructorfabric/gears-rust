@@ -1,0 +1,22 @@
+{
+  "$id": "gts://gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Example quota subject type that an operator registers for user principals; its id is the user id.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.quota.subj.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "format": "uuid",
+          "description": "The user id."
+        }
+      }
+    }
+  ]
+}

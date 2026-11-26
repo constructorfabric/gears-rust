@@ -7,12 +7,12 @@
 use std::fmt;
 
 use authz_resolver_sdk::{AccessDenial, EnforcerError};
-use quota_enforcement_sdk::{LeaseToken, PolicyId, PolicyScope, StorageError};
+use quota_enforcement_sdk::engine::DebitPlanInvariant;
+use quota_enforcement_sdk::{
+    LeaseToken, PolicyId, PolicyScope, QuotaMetadataViolation, StorageError,
+};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
-
-use super::ports::metrics::ValidationReason;
-use quota_enforcement_sdk::engine::DebitPlanInvariant;
 
 use super::tokens;
 
@@ -50,7 +50,7 @@ pub enum Dependency {
     Pdp,
     /// The types registry.
     TypesRegistry,
-    /// The projection contract catalogue built from the configured projections.
+    /// The metric catalogue.
     Catalog,
     /// The statically registered resolution engines and their artifacts.
     Engine,
@@ -152,8 +152,17 @@ pub enum DomainError {
         /// Which invariant, from the closed set of four.
         invariant: DebitPlanInvariant,
     },
-    /// A type or internal failure inside the engine. The detail is for the
-    /// log; the response carries an opaque `Internal`.
+    /// The active Policy cannot read the request's metric object or the
+    /// metadata of an applicable Quota. No counter moved.
+    #[error("engine {engine_id} could not evaluate the policy: {detail}")]
+    PolicyEvaluationFailed {
+        /// The engine that reported the type error.
+        engine_id: String,
+        /// What the engine reported, for the log.
+        detail: String,
+    },
+    /// An internal failure inside the engine. The detail is for the log; the
+    /// response carries an opaque `Internal`.
     #[error("engine {engine_id} failed: {detail}")]
     EngineFailure {
         /// The engine that failed.
@@ -183,15 +192,6 @@ pub enum DomainError {
     /// The types registry could not answer.
     #[error("types registry unavailable: {0}")]
     TypesRegistryUnavailable(String),
-    /// The configured projection contract catalogue failed a bootstrap
-    /// consistency check. `subject` names the offending definition.
-    #[error("projection contract catalogue rejected {subject}: {reason}")]
-    CatalogInvalid {
-        /// Which check failed.
-        reason: ValidationReason,
-        /// The GTS id, metric, or pair the check failed on.
-        subject: String,
-    },
     /// No plugin instance matched the configured vendor.
     #[error("no {kind} plugin instance registered for vendor {vendor}")]
     PluginNotFound {
@@ -276,7 +276,7 @@ pub enum DomainError {
     },
     // --- snapshot reads ---
     /// A snapshot request is refused: its shape before the PDP, or a subject
-    /// the catalogue does not map after it. `index` names the subject when the
+    /// its metric does not admit after it. `index` names the subject when the
     /// refusal is about one.
     #[error("invalid snapshot {field}: {reason}")]
     InvalidSnapshot {
@@ -302,6 +302,25 @@ pub enum DomainError {
         reserved: u64,
         /// Requested at commit.
         actual: u64,
+    },
+    /// A return asks for more than remains of its charge.
+    #[error("return of {requested} exceeds the {remaining} that remains of the charge")]
+    ReturnExceedsCharge {
+        /// The amount the return asked for.
+        requested: u64,
+        /// What remains of the charge.
+        remaining: u64,
+    },
+    /// No Quota of the charge can take the returned amount.
+    #[error("no quota of the charge can take the returned amount")]
+    ReturnNotApplicable,
+    /// A return names a metric type other than its charge's.
+    #[error("metric type {requested} is not the charge's {charged}")]
+    MetricTypeMismatch {
+        /// The metric type the request named.
+        requested: String,
+        /// The metric type of the charge.
+        charged: String,
     },
     /// Same idempotency scope, different payload.
     #[error("idempotency key replayed with a different payload")]
@@ -368,10 +387,10 @@ pub enum DomainError {
     /// The target period is closed.
     #[error("the target period is closed")]
     PeriodClosed,
-    /// The metric is not registered.
+    /// The metric type is not registered.
     #[error("metric {metric} is not registered")]
     MetricNotRegistered {
-        /// The metric.
+        /// The metric type.
         metric: String,
     },
     /// The metric is not quota-gated.
@@ -380,16 +399,17 @@ pub enum DomainError {
         /// The metric.
         metric: String,
     },
-    /// The projection is registered but outside the configured catalogue.
-    #[error("projection {projection} is not resolvable in the configured catalogue")]
+    /// The metric has no served catalogue entry: its type is not a valid
+    /// metric type.
+    #[error("metric {metric} has no served catalogue entry")]
     ProjectionNotResolvable {
-        /// The projection type identifier.
-        projection: String,
+        /// The metric type.
+        metric: String,
     },
-    /// The projection is not registered.
-    #[error("projection {projection} is not registered")]
+    /// The subject type is not registered.
+    #[error("subject type {projection} is not registered")]
     ProjectionNotRegistered {
-        /// The projection type.
+        /// The subject type.
         projection: String,
     },
 
@@ -410,18 +430,12 @@ pub enum DomainError {
     /// Raised by the gear's pre-check and by storage on the merged row (I14).
     #[error("notification thresholds require a bounded cap")]
     ThresholdsRequireBoundedCap,
-    /// Quota metadata violates the metric owner's constraint contract.
-    #[error("metadata violates constraint contract {contract}")]
-    ConstraintContractMismatch {
-        /// The constraint contract type.
-        contract: String,
-    },
-    /// The metric is registered but its instance carries no usable
-    /// classification (kind and enforcement mode). Never defaulted.
-    #[error("metric {metric} carries no usable classification")]
-    MetricClassificationInvalid {
-        /// The metric.
-        metric: String,
+    /// A condition of the Quota metadata does not fit the metric type;
+    /// nothing was written.
+    #[error("quota metadata rejected: {} violation(s)", violations.len())]
+    QuotaMetadataRejected {
+        /// One violation per condition that does not fit, in key order.
+        violations: Vec<QuotaMetadataViolation>,
     },
 
     /// Last-resort opaque failure. Never carries caller-facing detail.
@@ -441,11 +455,24 @@ pub enum DomainError {
 }
 
 impl DomainError {
+    /// A dependency did not answer: the same call can succeed later. A
+    /// cluster failure is not one here: the election is resolved from the
+    /// bound profile, so it fails on configuration.
+    #[must_use]
+    pub const fn is_dependency_outage(&self) -> bool {
+        matches!(
+            self,
+            Self::PdpUnavailable(_)
+                | Self::TypesRegistryUnavailable(_)
+                | Self::BackendUnavailable(_)
+        )
+    }
+
     /// Closed reason token when the PDP permit carried no usable constraints.
     pub const CONSTRAINT_COMPILE_FAILED: &'static str = "CONSTRAINT_COMPILE_FAILED";
     /// Closed reason token when the PDP permitted a scope that matches nothing.
     pub const SCOPE_MATCHES_NOTHING: &str = "SCOPE_MATCHES_NOTHING";
-    /// Closed reason token when a projection is registered but not configured.
+    /// Closed reason token when a metric has no served catalogue entry.
     pub const PROJECTION_NOT_RESOLVABLE: &'static str = "PROJECTION_NOT_RESOLVABLE";
     /// Closed reason token when storage caught a subject outside the scope.
     pub const SUBJECT_OUT_OF_SCOPE: &'static str = "SUBJECT_OUT_OF_SCOPE";
@@ -517,6 +544,17 @@ impl From<StorageError> for DomainError {
             StorageError::BatchTimeout => Self::BatchTimeout,
             StorageError::OverCommitNotAuthorized { reserved, actual } => {
                 Self::OverCommitNotAuthorized { reserved, actual }
+            }
+            StorageError::ReturnExceedsCharge {
+                requested,
+                remaining,
+            } => Self::ReturnExceedsCharge {
+                requested,
+                remaining,
+            },
+            StorageError::ReturnNotApplicable => Self::ReturnNotApplicable,
+            StorageError::MetricTypeMismatch { requested, charged } => {
+                Self::MetricTypeMismatch { requested, charged }
             }
             StorageError::IdempotencyPayloadMismatch => Self::IdempotencyPayloadMismatch,
             StorageError::VersionConflict { expected, actual } => {

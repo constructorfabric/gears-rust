@@ -19,9 +19,7 @@ use toolkit_db::Db;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt;
-use toolkit_security::{
-    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
-};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
 use super::super::entity::quota_consumption_counter;
@@ -36,19 +34,11 @@ const DAY_ONE: OffsetDateTime = datetime!(2026-03-17 10:00:00 UTC);
 /// The next day: the period of `DAY_ONE` has elapsed.
 const DAY_TWO: OffsetDateTime = datetime!(2026-03-18 10:00:00 UTC);
 
-const TENANT_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~";
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("context")
-}
+const TENANT_PROJECTION: &str = "gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~";
 
 fn tenant_subject(tenant: TenantId) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(TENANT_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(TENANT_PROJECTION).expect("type id"),
         subject_id: tenant.as_uuid().to_string(),
     }
 }
@@ -146,7 +136,7 @@ impl Harness {
     ) -> Result<quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>, StorageError>
     {
         self.store
-            .bulk_read_quota_snapshot(&ctx(), scope, pairs, page)
+            .bulk_read_quota_snapshot(scope, pairs, page, false)
             .await
     }
 }
@@ -350,7 +340,7 @@ async fn a_read_writes_nothing_and_reports_the_computed_window() {
     // The single read behind preview follows the same rule.
     let single = h
         .store
-        .read_quota_snapshot(&ctx(), &scope_for(tenant()), &pairs[0])
+        .read_quota_snapshot(&scope_for(tenant()), &pairs[0])
         .await
         .expect("single read");
 
@@ -487,17 +477,77 @@ async fn under_a_subtree_grant_both_reads_return_only_the_visible_quota() {
     );
     let single = h
         .store
-        .read_quota_snapshot(&ctx(), &subtree_of(parent), &pairs[0])
+        .read_quota_snapshot(&subtree_of(parent), &pairs[0])
         .await
         .expect("single read under the subtree grant");
     assert_eq!(single.len(), 1);
     let none = h
         .store
-        .read_quota_snapshot(&ctx(), &subtree_of(parent), &pairs[1])
+        .read_quota_snapshot(&subtree_of(parent), &pairs[1])
         .await
         .expect("single read of an invisible target");
     assert!(none.is_empty());
     assert!(h.periods(inside).await.is_empty());
     assert!(h.periods(beyond).await.is_empty());
+    h.down().await;
+}
+
+#[tokio::test]
+async fn an_in_window_read_leaves_out_quotas_outside_their_window_before_the_page_is_cut() {
+    let h = Harness::up().await;
+    let window = |start, end| ValidityWindow { start, end };
+    for (subject, validity) in [
+        ("u1", window(None, Some(datetime!(2026-03-17 09:59:59 UTC)))),
+        ("u2", window(Some(datetime!(2026-03-17 10:00:01 UTC)), None)),
+    ] {
+        h.create(QuotaDraft {
+            validity_window: Some(validity),
+            ..draft(tenant(), subject, Some(100))
+        })
+        .await;
+    }
+    let bounded = h
+        .create(QuotaDraft {
+            validity_window: Some(window(Some(DAY_ONE), Some(DAY_ONE))),
+            ..draft(tenant(), "u3", Some(100))
+        })
+        .await;
+    let open = h.allocation(tenant(), user("u4")).await;
+    let pairs = [pair(
+        tenant(),
+        vec![user("u1"), user("u2"), user("u3"), user("u4")],
+    )];
+
+    let first = h
+        .store
+        .bulk_read_quota_snapshot(&scope_for(tenant()), &pairs, PageRequest::first(1), true)
+        .await
+        .expect("page 1");
+    let second = h
+        .store
+        .bulk_read_quota_snapshot(
+            &scope_for(tenant()),
+            &pairs,
+            PageRequest {
+                limit: 1,
+                cursor: first.next_cursor.clone(),
+            },
+            true,
+        )
+        .await
+        .expect("page 2");
+    let all = h
+        .bulk(&scope_for(tenant()), &pairs, PageRequest::first(10))
+        .await
+        .expect("every quota");
+
+    assert_eq!(
+        ids(&first),
+        vec![bounded],
+        "the window bounds are inclusive"
+    );
+    assert_eq!(ids(&second), vec![open]);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(all.items.len(), 4, "without the flag every quota is read");
     h.down().await;
 }

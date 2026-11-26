@@ -38,22 +38,24 @@ fn invalid(field: &'static str, reason: &'static str) -> DomainError {
     DomainError::InvalidArgument { field, reason }
 }
 
-/// A subject reference on the wire.
+/// A quota subject on the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(request, response)]
+#[schema(as = QuotaSubjectRefDto)]
 #[serde(deny_unknown_fields)]
 pub struct SubjectRefDto {
-    /// Concrete owner projection type id.
-    pub projection_type: String,
+    /// Quota subject type id, derived from `gts.cf.core.quota.subj.v1~`.
+    #[serde(rename = "type")]
+    pub subject_type: String,
     /// Subject identifier.
-    pub subject_id: String,
+    pub id: String,
 }
 
 impl From<SubjectRef> for SubjectRefDto {
     fn from(subject: SubjectRef) -> Self {
         Self {
-            projection_type: subject.projection_type.as_ref().to_owned(),
-            subject_id: subject.subject_id,
+            subject_type: subject.subject_type.as_ref().to_owned(),
+            id: subject.subject_id,
         }
     }
 }
@@ -62,11 +64,11 @@ impl TryFrom<SubjectRefDto> for SubjectRef {
     type Error = DomainError;
 
     fn try_from(dto: SubjectRefDto) -> Result<Self, Self::Error> {
-        let projection_type = GtsTypeId::try_new(&dto.projection_type)
-            .map_err(|_| invalid("subject.projection_type", tokens::PROJECTION_INVALID))?;
+        let subject_type = GtsTypeId::try_new(&dto.subject_type)
+            .map_err(|_| invalid("subject.type", tokens::SUBJECT_TYPE_INVALID))?;
         Ok(Self {
-            projection_type,
-            subject_id: dto.subject_id,
+            subject_type,
+            subject_id: dto.id,
         })
     }
 }
@@ -104,7 +106,7 @@ impl From<ValidityWindowDto> for ValidityWindow {
     }
 }
 
-/// Body of `POST /quotas`. No `constraint_contract`: the gear resolves it.
+/// Body of `POST /quotas`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
@@ -113,7 +115,7 @@ pub struct CreateQuotaDto {
     pub tenant_id: Uuid,
     /// Explicit target subject.
     pub subject: SubjectRefDto,
-    /// Registered metric instance id.
+    /// Metric type id.
     pub metric: String,
     /// Quota type instance id under `gts.cf.core.qe.quota_type.v1~`; `rate` is
     /// reserved and answers `501`.
@@ -140,7 +142,10 @@ pub struct CreateQuotaDto {
     /// Informational fail-open hint.
     #[serde(default)]
     pub fail_open_hint: bool,
-    /// Metadata validated against the metric owner's constraint contract.
+    /// The Quota's conditions over the `metadata` of a request's metric object:
+    /// each key is a string, integer or boolean property of the metric type's
+    /// `metadata`, each value a value of that type or a non-empty list of them.
+    /// The Quota applies to a request only when all of them hold.
     #[serde(default)]
     #[schema(value_type = Option<Object>)]
     pub metadata: Option<Map<String, Value>>,
@@ -239,16 +244,6 @@ impl From<UpdateQuotaDto> for UpdateQuotaRequest {
     }
 }
 
-/// The contract reference snapshotted with a Quota.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[toolkit_macros::api_dto(response)]
-pub struct ContractRefDto {
-    /// Constraint contract type id.
-    pub type_id: String,
-    /// Major version of the contract.
-    pub version: u32,
-}
-
 /// The public view of a Quota: the stored record plus the server-computed
 /// facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +255,7 @@ pub struct QuotaViewDto {
     pub tenant_id: Uuid,
     /// Bound subject.
     pub subject: SubjectRefDto,
-    /// Metric instance id.
+    /// Metric type id.
     pub metric: String,
     /// Quota type instance id.
     pub quota_type: String,
@@ -283,8 +278,6 @@ pub struct QuotaViewDto {
     pub source: String,
     /// `active` or `deactivated`.
     pub status: String,
-    /// The contract the metadata was validated against.
-    pub constraint_contract: ContractRefDto,
     /// Record version.
     pub record_version: u32,
     /// Creation time, RFC 3339.
@@ -297,8 +290,8 @@ pub struct QuotaViewDto {
     pub updated_at: OffsetDateTime,
     /// Server-computed: the response time lies within the validity window.
     pub currently_within_window: bool,
-    /// Registry-reported metric kind, `counter` or `gauge`; `null` only when
-    /// the registry no longer knows the metric.
+    /// The `kind` trait of the metric type, `counter` or `gauge`; `null` when
+    /// the metric has no served catalogue entry.
     pub metric_kind: Option<String>,
 }
 
@@ -322,10 +315,6 @@ impl From<QuotaView> for QuotaViewDto {
             status: match quota.status {
                 QuotaStatus::Active => "active".to_owned(),
                 QuotaStatus::Deactivated => "deactivated".to_owned(),
-            },
-            constraint_contract: ContractRefDto {
-                type_id: quota.constraint_contract.type_id.as_ref().to_owned(),
-                version: quota.constraint_contract.version,
             },
             record_version: quota.record_version,
             created_at: quota.created_at,

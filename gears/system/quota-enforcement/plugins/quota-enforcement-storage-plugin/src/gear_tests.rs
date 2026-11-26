@@ -18,7 +18,7 @@ use types_registry_sdk::{InstanceQuery, RegisterResult, TypesRegistryClient};
 
 use super::{INSTANCE_SEGMENT, StoragePluginGear};
 use crate::infra::storage::Migrator;
-use crate::test_support::{draft, tenant};
+use crate::test_support::{actor, draft, tenant};
 
 /// A real in-process types-registry seeded with the process inventory (the
 /// storage plugin spec among it) and switched to ready, as at run time.
@@ -103,7 +103,7 @@ async fn init_binds_the_plugin_to_the_database_and_bootstrap_works_through_it() 
     assert!(!gear.notification_outbox().is_bound());
     let err = plugin
         .create_quota(
-            &security_ctx(),
+            &actor(),
             &toolkit_security::AccessScope::for_tenant(tenant().as_uuid()),
             draft(tenant(), "u1", Some(1)),
             &[crate::test_support::quota_changed(tenant())],
@@ -116,7 +116,6 @@ async fn init_binds_the_plugin_to_the_database_and_bootstrap_works_through_it() 
     );
     let page = plugin
         .read_quotas(
-            &security_ctx(),
             &toolkit_security::AccessScope::allow_all(),
             quota_enforcement_sdk::QuotaFilter::default(),
             quota_enforcement_sdk::PageRequest::default(),
@@ -124,14 +123,6 @@ async fn init_binds_the_plugin_to_the_database_and_bootstrap_works_through_it() 
         .await
         .expect("reads need no outbox");
     assert!(page.items.is_empty());
-}
-
-fn security_ctx() -> toolkit_security::SecurityContext {
-    toolkit_security::SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
 }
 
 #[tokio::test]

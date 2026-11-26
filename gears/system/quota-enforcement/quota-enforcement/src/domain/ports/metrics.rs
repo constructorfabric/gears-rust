@@ -8,11 +8,11 @@
 //!
 //! Cardinality rule (`cpt-cf-quota-enforcement-constraint-bounded-cardinality`):
 //! every label value is a `&'static str` from a closed enum, or a
-//! [`MetricLabel`], whose values are the metrics the catalogue admitted when
-//! the gear started — a set closed at bootstrap. `tenant_id`,
+//! [`MetricLabel`], whose values are the metric types the catalogue serves —
+//! types the registry holds, never raw caller input. `tenant_id`,
 //! `subject_id`, `quota_id`, `policy_id`, idempotency keys, lease tokens,
-//! projection types, caller attribution, and raw metric input never appear as
-//! labels. They belong to spans and structured logs.
+//! subject types, and caller attribution never appear as labels. They belong
+//! to spans and structured logs.
 
 use std::fmt;
 use std::sync::Arc;
@@ -28,19 +28,18 @@ pub const SURFACE_LABEL: &str = "surface";
 /// Label key of the lease instruments.
 pub const METRIC_LABEL: &str = "metric";
 
-/// A `metric` label value: the canonical id of a metric the catalogue admitted
-/// at bootstrap.
+/// A `metric` label value: the id of a metric type the catalogue serves.
 ///
-/// Only [`MetricClassifications`](crate::domain::catalog::MetricClassifications)
-/// makes one, from its frozen snapshot, so the values an instrument can carry
-/// are exactly the admitted metrics and never raw caller input.
+/// It is made only from a metric the catalogue served, so the values an
+/// instrument can carry are registered metric types and never raw caller
+/// input.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MetricLabel(Arc<str>);
 
 impl MetricLabel {
-    /// The label of an admitted metric. Crate-private: the classification
-    /// snapshot is the only caller.
+    /// The label of a served metric. Crate-private: `metric` must have passed
+    /// the catalogue.
     pub(crate) fn admitted(metric: &quota_enforcement_sdk::MetricId) -> Self {
         Self(Arc::from(metric.as_str()))
     }
@@ -165,8 +164,10 @@ pub enum OperationKind {
     Debit,
     /// Return consumption to one Quota.
     Credit,
-    /// Reverse a committed debit.
+    /// Give back what remains of a charge.
     Rollback,
+    /// Give back part of a charge.
+    Return,
     /// Evaluate without mutating.
     Preview,
     /// Acquire a lease.
@@ -179,10 +180,11 @@ pub enum OperationKind {
 
 impl OperationKind {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Debit,
         Self::Credit,
         Self::Rollback,
+        Self::Return,
         Self::Preview,
         Self::Reserve,
         Self::Commit,
@@ -196,6 +198,7 @@ impl OperationKind {
             Self::Debit => "debit",
             Self::Credit => "credit",
             Self::Rollback => "rollback",
+            Self::Return => "return",
             Self::Preview => "preview",
             Self::Reserve => "reserve",
             Self::Commit => "commit",
@@ -212,11 +215,13 @@ pub enum RetentionTable {
     Idempotency,
     /// The operation ledger.
     OperationLog,
+    /// Deleted charges of the charge ledger.
+    Charges,
 }
 
 impl RetentionTable {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 2] = [Self::Idempotency, Self::OperationLog];
+    pub const ALL: [Self; 3] = [Self::Idempotency, Self::OperationLog, Self::Charges];
 
     /// Stable label value.
     #[must_use]
@@ -224,27 +229,28 @@ impl RetentionTable {
         match self {
             Self::Idempotency => "idempotency",
             Self::OperationLog => "operation_log",
+            Self::Charges => "charges",
         }
     }
 }
 
 /// Closed `surface` set of the contract-validation counters (DESIGN section
-/// 5.16): where a contract or admitted-metric check ran.
+/// 4.1): where a metric type or subject check ran.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-contract-validation-telemetry:p1
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValidationSurface {
-    /// Subject mapping and operation metadata at evaluation ingress.
+    /// A subject of an evaluation or snapshot request.
     RequestSubject,
-    /// The optional resource projection at evaluation ingress.
-    RequestResource,
+    /// The metric object of an evaluation request.
+    RequestMetric,
     /// The public shape of the caller-supplied attribution, before the PDP.
     CallerAttribution,
-    /// A Quota write's arbitration metadata or projection reference.
-    Arbitration,
-    /// A Policy write's contract references.
-    PolicyPair,
-    /// The catalogue consistency set at bootstrap.
+    /// The subject or metadata of a Quota write.
+    QuotaWrite,
+    /// A Policy write.
+    Policy,
+    /// A read of the metric catalogue.
     Bootstrap,
 }
 
@@ -252,10 +258,10 @@ impl ValidationSurface {
     /// Every value, for conformance tests.
     pub const ALL: [Self; 6] = [
         Self::RequestSubject,
-        Self::RequestResource,
+        Self::RequestMetric,
         Self::CallerAttribution,
-        Self::Arbitration,
-        Self::PolicyPair,
+        Self::QuotaWrite,
+        Self::Policy,
         Self::Bootstrap,
     ];
 
@@ -264,10 +270,10 @@ impl ValidationSurface {
     pub const fn as_label(self) -> &'static str {
         match self {
             Self::RequestSubject => "request_subject",
-            Self::RequestResource => "request_resource",
+            Self::RequestMetric => "request_metric",
             Self::CallerAttribution => "caller_attribution",
-            Self::Arbitration => "arbitration",
-            Self::PolicyPair => "policy_pair",
+            Self::QuotaWrite => "quota_write",
+            Self::Policy => "policy",
             Self::Bootstrap => "bootstrap",
         }
     }
@@ -279,75 +285,52 @@ impl fmt::Display for ValidationSurface {
     }
 }
 
-/// Closed `reason` set of `contract_validation_failures_total`: why a
-/// contract instance or a catalogue entry was rejected. Also the reason a
-/// bootstrap consistency check names in [`crate::domain::error::DomainError`].
+/// Closed `reason` set of `contract_validation_failures_total`: why a request,
+/// a write, or a catalogue entry was rejected.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValidationReason {
     /// The public request shape was malformed (missing field, empty id,
-    /// duplicate kind, repeated tenant scope, unparsable id).
+    /// duplicate subject type, malformed type id).
     ShapeInvalid,
     /// The required metadata object was absent.
     MetadataMissing,
-    /// The subject kind is not a scope the catalogue knows.
-    KindUnknown,
-    /// The subject kind is known but does not admit the metric.
-    KindNotAdmitted,
-    /// A metadata or resource document violated its contract schema.
+    /// A document, or a condition of Quota metadata, violated the resolved
+    /// schema of its type.
     SchemaViolation,
-    /// A resolved contract schema could not be compiled.
+    /// A resolved schema could not be compiled.
     SchemaInvalid,
-    /// A referenced type is not registered.
+    /// A subject type is not registered.
     Unregistered,
-    /// A referenced type is abstract where a concrete one is required.
+    /// A type is abstract where a concrete one is required.
     Abstract,
-    /// A referenced type does not derive from the required QE base.
+    /// A type does not derive from the required base.
     NotDerived,
-    /// A projection's `scope` trait is not a registered scope instance.
-    ScopeInvalid,
-    /// An admitted metric is not registered.
+    /// A metric type is not registered.
     MetricUnregistered,
-    /// An admitted metric is registered but not an instance of the metric base.
-    MetricNotInstance,
-    /// Two configured projections admit the same `(metric, scope)` pair.
-    DuplicatePair,
-    /// An admitted metric has no concrete request contract.
-    RequestContractMissing,
-    /// An admitted metric has more than one concrete request contract.
-    RequestContractAmbiguous,
-    /// A request contract's attached constraint contract is unusable.
-    ConstraintInvalid,
-    /// A QE-owned definition exists in the registry with different content.
-    DefinitionConflict,
-    /// A projection is registered but outside the configured catalogue.
+    /// A metric type's own version is major 0: types-registry admits any
+    /// revision of such a type, so QE does not serve it.
+    MajorVersionZero,
+    /// A trait of a metric type is wrong.
+    TraitInvalid,
+    /// A write names a metric whose catalogue entry is unavailable.
     ProjectionNotResolvable,
-    /// The configured catalogue is incompatible with an active Quota.
-    IncompatibleState,
 }
 
 impl ValidationReason {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 11] = [
         Self::ShapeInvalid,
         Self::MetadataMissing,
-        Self::KindUnknown,
-        Self::KindNotAdmitted,
         Self::SchemaViolation,
         Self::SchemaInvalid,
         Self::Unregistered,
         Self::Abstract,
         Self::NotDerived,
-        Self::ScopeInvalid,
         Self::MetricUnregistered,
-        Self::MetricNotInstance,
-        Self::DuplicatePair,
-        Self::RequestContractMissing,
-        Self::RequestContractAmbiguous,
-        Self::ConstraintInvalid,
-        Self::DefinitionConflict,
+        Self::MajorVersionZero,
+        Self::TraitInvalid,
         Self::ProjectionNotResolvable,
-        Self::IncompatibleState,
     ];
 
     /// Stable label value.
@@ -356,23 +339,15 @@ impl ValidationReason {
         match self {
             Self::ShapeInvalid => "shape_invalid",
             Self::MetadataMissing => "metadata_missing",
-            Self::KindUnknown => "kind_unknown",
-            Self::KindNotAdmitted => "kind_not_admitted",
             Self::SchemaViolation => "schema_violation",
             Self::SchemaInvalid => "schema_invalid",
             Self::Unregistered => "unregistered",
             Self::Abstract => "abstract",
             Self::NotDerived => "not_derived",
-            Self::ScopeInvalid => "scope_invalid",
             Self::MetricUnregistered => "metric_unregistered",
-            Self::MetricNotInstance => "metric_not_instance",
-            Self::DuplicatePair => "duplicate_pair",
-            Self::RequestContractMissing => "request_contract_missing",
-            Self::RequestContractAmbiguous => "request_contract_ambiguous",
-            Self::ConstraintInvalid => "constraint_invalid",
-            Self::DefinitionConflict => "definition_conflict",
+            Self::MajorVersionZero => "major_version_zero",
+            Self::TraitInvalid => "trait_invalid",
             Self::ProjectionNotResolvable => "projection_not_resolvable",
-            Self::IncompatibleState => "incompatible_state",
         }
     }
 }
@@ -380,6 +355,34 @@ impl ValidationReason {
 impl fmt::Display for ValidationReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_label())
+    }
+}
+
+/// Closed `phase` set of `catalog_read_failures_total`: which kind of
+/// registry read failed.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CatalogReadPhase {
+    /// The read at start of the metric types of the active Quotas and Policies.
+    Start,
+    /// The read of a type a request or a write names for the first time.
+    FirstUse,
+    /// The scheduled conditional read of every held type.
+    Scheduled,
+}
+
+impl CatalogReadPhase {
+    /// Every value, for conformance tests.
+    pub const ALL: [Self; 3] = [Self::Start, Self::FirstUse, Self::Scheduled];
+
+    /// Stable label value.
+    #[must_use]
+    pub const fn as_label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::FirstUse => "first_use",
+            Self::Scheduled => "scheduled",
+        }
     }
 }
 
@@ -422,6 +425,10 @@ pub trait QeMetrics: Send + Sync {
     /// `idempotency_replays_total{operation}` += 1.
     fn record_idempotency_replay(&self, operation: OperationKind);
 
+    /// `contention_rejected_total{operation}` += 1: an operation refused on
+    /// the contention timeout. A batch counts as a debit.
+    fn record_contention_rejected(&self, operation: OperationKind);
+
     /// `retention_reclaimed_total{table}` += `rows`.
     fn record_retention_reclaimed(&self, table: RetentionTable, rows: u64);
 
@@ -449,6 +456,18 @@ pub trait QeMetrics: Send + Sync {
     /// `outbox_rejections_total{queue}` += 1: the notification queue
     /// dead-lettered one event.
     fn record_outbox_rejection(&self);
+
+    /// `policy_evaluation_failures_total{engine_id, metric}` += 1.
+    fn record_policy_evaluation_failure(&self, engine: EngineLabel, metric: &MetricLabel);
+
+    /// `catalog_read_failures_total{phase}` += 1.
+    fn record_catalog_read_failure(&self, phase: CatalogReadPhase);
+
+    /// `catalog_last_scheduled_read_timestamp_seconds` := now.
+    fn record_catalog_scheduled_read(&self);
+
+    /// `catalog_unavailable_metrics` := `count`.
+    fn set_catalog_unavailable_metrics(&self, count: u64);
 }
 
 /// One backlog sample: expired, unreclaimed leases per admitted metric.
@@ -469,6 +488,38 @@ pub struct NoopLeaseBacklog;
 
 impl LeaseBacklogSink for NoopLeaseBacklog {
     fn publish(&self, _backlog: Option<LeaseBacklog>) {}
+}
+
+/// The allocation charges of one metric that hold an amount on an active
+/// Quota and are older than the replay window.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HeldCharges {
+    /// How many there are.
+    pub count: u64,
+    /// Age of the oldest, in seconds; zero when there are none.
+    pub oldest_age_secs: u64,
+}
+
+/// One sample of the held allocation charges, per admitted metric.
+pub type ChargeBacklog = Vec<(MetricLabel, HeldCharges)>;
+
+/// Where the retention sweeper publishes what
+/// `allocation_charges_past_replay_window{metric}` and
+/// `allocation_charge_max_age_seconds{metric}` observe. `None` withdraws the
+/// sample: a replica that does not lead has nothing to report.
+pub trait ChargeBacklogSink: Send + Sync {
+    /// Replace the published sample.
+    fn publish(&self, backlog: Option<ChargeBacklog>);
+}
+
+/// Publishes nothing. For tests and pre-init contexts.
+#[domain_model]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopChargeBacklog;
+
+impl ChargeBacklogSink for NoopChargeBacklog {
+    fn publish(&self, _backlog: Option<ChargeBacklog>) {}
 }
 
 /// Records nothing. For tests and pre-init contexts.
@@ -500,6 +551,7 @@ impl QeMetrics for NoopMetrics {
     fn record_admitted_metric_violation(&self, _surface: ValidationSurface) {}
     fn record_evaluation(&self, _operation: OperationKind, _elapsed: std::time::Duration) {}
     fn record_idempotency_replay(&self, _operation: OperationKind) {}
+    fn record_contention_rejected(&self, _operation: OperationKind) {}
     fn record_retention_reclaimed(&self, _table: RetentionTable, _rows: u64) {}
     fn record_retention_failure(&self, _table: RetentionTable) {}
     fn record_lease_acquisition_wait(&self, _: &MetricLabel, _: std::time::Duration) {}
@@ -512,6 +564,10 @@ impl QeMetrics for NoopMetrics {
     ) {
     }
     fn record_outbox_rejection(&self) {}
+    fn record_policy_evaluation_failure(&self, _: EngineLabel, _: &MetricLabel) {}
+    fn record_catalog_read_failure(&self, _: CatalogReadPhase) {}
+    fn record_catalog_scheduled_read(&self) {}
+    fn set_catalog_unavailable_metrics(&self, _: u64) {}
 }
 
 /// The telemetry label of a linked engine: its own `id()`.

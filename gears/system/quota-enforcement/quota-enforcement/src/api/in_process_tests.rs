@@ -16,12 +16,11 @@ use super::InProcessQuotaManager;
 use crate::domain::Service;
 use crate::domain::admission::Admission;
 use crate::domain::bootstrap::Bound;
-use crate::domain::catalog::{CatalogBuilder, CatalogConfig, MetricClassifications};
 use crate::domain::quotas::QuotaLimits;
 use crate::domain::readiness::Readiness;
 use crate::test_support::{
-    FakeContractRegistry, FakeMetricRegistry, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
-    METRIC_TOKENS, NoopCoordinator, PermitTenantsPdp, RecordingMetrics, ctx, tenant,
+    METRIC_TOKENS, NoopCoordinator, PermitTenantsPdp, RecordingMetrics, USER_SUBJECT_TYPE, ctx,
+    mrw_storage, tenant, test_catalog,
 };
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -32,7 +31,7 @@ fn spec() -> QuotaSpec {
     QuotaSpec {
         tenant_id: tenant(),
         subject: SubjectRef {
-            projection_type: type_id(LLM_USER_PROJECTION),
+            subject_type: type_id(USER_SUBJECT_TYPE),
             subject_id: "u1".to_owned(),
         },
         metric: MetricId::parse(METRIC_TOKENS).expect("metric"),
@@ -43,10 +42,7 @@ fn spec() -> QuotaSpec {
         notification_thresholds: Vec::new(),
         validity_window: None,
         fail_open_hint: false,
-        metadata: json!({ "regions": ["eu"], "weight": 5 })
-            .as_object()
-            .cloned()
-            .expect("object"),
+        metadata: serde_json::Map::new(),
         source: QuotaSource::Operator,
     }
 }
@@ -80,25 +76,11 @@ fn unbound_service_with(pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> A
 }
 
 async fn bound_service() -> Arc<Service> {
-    bound_service_over(Arc::new(InMemoryStorage::new())).await
+    bind(unbound_service(), mrw_storage().await)
 }
 
-/// [`bound_service`] over a storage the caller prepared, e.g. bootstrapped
-/// with the global policy so operations can evaluate.
-async fn bound_service_over(storage: Arc<InMemoryStorage>) -> Arc<Service> {
-    bind(unbound_service(), storage).await
-}
-
-async fn bind(service: Arc<Service>, storage: Arc<InMemoryStorage>) -> Arc<Service> {
-    let registry = Arc::new(FakeContractRegistry::llm_gateway());
-    let metrics = RecordingMetrics::default();
-    let catalog = CatalogBuilder::new(registry.as_ref(), &metrics)
-        .build(&CatalogConfig {
-            subject_projections: vec![type_id(LLM_USER_PROJECTION), type_id(LLM_TENANT_PROJECTION)],
-            resource_projections: Vec::new(),
-        })
-        .await
-        .expect("catalogue");
+fn bind(service: Arc<Service>, storage: Arc<InMemoryStorage>) -> Arc<Service> {
+    let (catalog, _) = test_catalog();
     service
         .bind(Bound {
             engines: Arc::new(crate::domain::engines::linked_registry().expect("engines")),
@@ -108,16 +90,7 @@ async fn bind(service: Arc<Service>, storage: Arc<InMemoryStorage>) -> Arc<Servi
             )),
             storage,
             coordinator: Arc::new(NoopCoordinator),
-            catalog: Arc::new(catalog),
-            registry,
-            metric_registry: Arc::new(FakeMetricRegistry::classified()),
-            classifications: Arc::new(MetricClassifications::from_pairs([(
-                MetricId::parse(METRIC_TOKENS).expect("metric"),
-                crate::domain::ports::metric_registry::MetricDescriptor {
-                    kind: quota_enforcement_sdk::MetricKind::Counter,
-                    mode: crate::domain::ports::metric_registry::MetricMode::QuotaGated,
-                },
-            )])),
+            catalog,
         })
         .expect("bind");
     service
@@ -277,18 +250,20 @@ fn policy_spec() -> quota_enforcement_sdk::PolicySpec {
 fn attribution() -> quota_enforcement_sdk::EvaluationAttribution {
     quota_enforcement_sdk::EvaluationAttribution {
         tenant_id: tenant(),
-        metric: METRIC_TOKENS.to_owned(),
         subjects: vec![quota_enforcement_sdk::SubjectClaim {
-            kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+            subject_type: USER_SUBJECT_TYPE.to_owned(),
             id: "u1".to_owned(),
         }],
-        metadata: Some(
-            json!({ "region": "eu" })
-                .as_object()
-                .cloned()
-                .expect("object"),
-        ),
-        resource: None,
+        metric: quota_enforcement_sdk::MetricRef {
+            metric_type: METRIC_TOKENS.to_owned(),
+            id: None,
+            metadata: Some(
+                json!({ "region": "eu" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        },
     }
 }
 
@@ -380,7 +355,6 @@ async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
                     attribution: attribution(),
                     original_operation: quota_enforcement_sdk::RollbackableOperation::Debit,
                     original_idempotency_key: "d".to_owned(),
-                    idempotency_key: "r".to_owned(),
                 },
             )
             .await
@@ -414,6 +388,7 @@ async fn before_bootstrap_every_operator_and_enforcement_call_is_not_ready() {
                     tenant_id: tenant(),
                     token,
                     actual_amount: None,
+                    metric_type: None,
                     idempotency_key: "c".to_owned(),
                 },
             )
@@ -443,8 +418,7 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
     let service = bind(
         unbound_service_with(Arc::new(crate::test_support::PermitUnconstrainedPdp)),
         Arc::new(InMemoryStorage::new()),
-    )
-    .await;
+    );
     let operator = super::InProcessQuotaOperator::new(service);
     let created = operator
         .create_policy(&ctx(), policy_spec())
@@ -545,16 +519,8 @@ async fn the_operator_client_drives_a_policy_through_its_versions() {
 #[tokio::test]
 async fn the_enforcement_client_debits_previews_rolls_back_and_settles_leases() {
     use quota_enforcement_sdk::{AcquireLeaseOutcome, DecisionResult, QuotaEnforcementApi};
-    let storage = Arc::new(InMemoryStorage::new());
-    {
-        use quota_enforcement_sdk::QuotaEnforcementStoragePluginV1;
-        let mut bundle = quota_enforcement_sdk::testing::bundle_with_global_policy();
-        if let Some(policy) = bundle.global_policy.as_mut() {
-            policy.engine_id = "most-restrictive-wins".to_owned();
-        }
-        storage.bootstrap(&bundle).await.expect("bootstrap");
-    }
-    let service = bound_service_over(Arc::clone(&storage)).await;
+    let storage = mrw_storage().await;
+    let service = bind(unbound_service(), Arc::clone(&storage));
     let quota = InProcessQuotaManager::new(Arc::clone(&service))
         .create_quota(&ctx(), spec())
         .await
@@ -595,7 +561,6 @@ async fn the_enforcement_client_debits_previews_rolls_back_and_settles_leases() 
                 attribution: attribution(),
                 original_operation: quota_enforcement_sdk::RollbackableOperation::Debit,
                 original_idempotency_key: "d1".to_owned(),
-                idempotency_key: "rb1".to_owned(),
             },
         )
         .await
@@ -637,6 +602,7 @@ async fn the_enforcement_client_debits_previews_rolls_back_and_settles_leases() 
                 tenant_id: tenant(),
                 token: committed,
                 actual_amount: Some(12),
+                metric_type: None,
                 idempotency_key: "c1".to_owned(),
             },
         )

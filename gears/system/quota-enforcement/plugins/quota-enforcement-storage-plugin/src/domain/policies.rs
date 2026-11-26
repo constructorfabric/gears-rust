@@ -2,10 +2,9 @@
 //! [`PolicyStore`] port, which already speaks the contract's types.
 
 use quota_enforcement_sdk::{
-    NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
-    PolicyVersion, PolicyVersionMeta, StorageError, TransitionOutcome,
+    Actor, NotificationEvent, PageRequest, PageResult, PolicyDraft, PolicyId, PolicyScope,
+    PolicyUpdate, PolicyVersion, PolicyVersionMeta, StorageError, TransitionOutcome,
 };
-use toolkit_security::SecurityContext;
 
 use super::bootstrap::StoragePlugin;
 
@@ -17,11 +16,11 @@ impl StoragePlugin {
     /// As the contract documents.
     pub async fn create_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         draft: PolicyDraft,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
-        self.policies.create_policy(ctx, draft, events).await
+        self.policies.create_policy(actor, draft, events).await
     }
 
     /// Forwarded to [`super::ports::PolicyStore::update_policy`].
@@ -31,13 +30,13 @@ impl StoragePlugin {
     /// As the contract documents.
     pub async fn update_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         update: PolicyUpdate,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
         self.policies
-            .update_policy(ctx, policy_id, update, events)
+            .update_policy(actor, policy_id, update, events)
             .await
     }
 
@@ -48,14 +47,14 @@ impl StoragePlugin {
     /// As the contract documents.
     pub async fn rollback_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         target_version: u32,
         comment: Option<String>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<PolicyVersion>, StorageError> {
         self.policies
-            .rollback_policy(ctx, policy_id, target_version, comment, events)
+            .rollback_policy(actor, policy_id, target_version, comment, events)
             .await
     }
 
@@ -66,13 +65,13 @@ impl StoragePlugin {
     /// As the contract documents.
     pub async fn delete_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<()>, StorageError> {
         self.policies
-            .delete_policy(ctx, policy_id, comment, events)
+            .delete_policy(actor, policy_id, comment, events)
             .await
     }
 

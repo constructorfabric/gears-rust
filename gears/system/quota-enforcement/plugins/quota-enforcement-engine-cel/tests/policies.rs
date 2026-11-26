@@ -1,7 +1,3 @@
-//! Behaviour of the bounded CEL engine against the acceptance scenarios of
-//! `features/resolution-policy-engine.md`: save-time diagnostics, the PRD §5.9
-//! split cascade and region gating, and the runtime failures that must surface
-//! as engine errors rather than a mutated counter.
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
@@ -12,43 +8,41 @@ use time::OffsetDateTime;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const METRIC: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1";
-const OTHER_METRIC: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.request.v1";
+const METRIC: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
+const OTHER_METRIC: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_requests.v1~";
+const USER: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const TENANT: &str = "gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~";
+const DEVICE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.device.v1~";
 
-/// One admitted metric: a `region` on the request, `regions` on the Quota.
-fn snapshot_for(metric: &str) -> Result<PolicySchemaSnapshot, Box<dyn std::error::Error>> {
-    Ok(PolicySchemaSnapshot {
-        schemas: BTreeMap::default(),
-        inputs: EnvironmentInputs::ALL,
-        environments: vec![MetricEnvironmentSchema {
-            metric: MetricId::parse(metric)?,
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "request": { "type": "object", "properties": {
-                        "region": { "type": "string", "enum": ["eu", "us"] }
-                    }},
-                    "resource": { "type": "null" },
-                    "arbitration": { "type": "object", "properties": {
-                        "regions": { "type": "array", "items": { "type": "string", "enum": ["eu", "us"] } },
-                        "weight": { "type": "integer" }
-                    }}
-                }
-            }),
-        }],
+fn metric_type(metadata: &Value) -> Value {
+    json!({
+        "type": "object",
+        "allOf": [
+            { "type": "object", "properties": {
+                "type": { "type": "string" },
+                "id": { "type": "string" },
+                "metadata": { "type": "object" }
+            }},
+            { "type": "object", "properties": { "metadata": metadata } }
+        ]
     })
 }
 
-fn snapshot() -> Result<PolicySchemaSnapshot, Box<dyn std::error::Error>> {
-    snapshot_for(METRIC)
+fn snapshot_of(metadata: &Value) -> PolicySchemaSnapshot {
+    PolicySchemaSnapshot {
+        schemas: BTreeMap::from([(METRIC.to_owned(), metric_type(metadata))]),
+        inputs: EnvironmentInputs::ALL,
+    }
+}
+
+fn snapshot() -> PolicySchemaSnapshot {
+    snapshot_of(&json!({ "type": "object", "properties": {
+        "region": { "type": "string", "enum": ["eu", "us"] }
+    }}))
 }
 
 fn compile(expr: &str) -> Result<std::sync::Arc<dyn ValidatedConfig>, EngineConfigError> {
-    let snapshot = snapshot().map_err(|e| EngineConfigError {
-        message: e.to_string(),
-        line: None,
-        column: None,
-    })?;
+    let snapshot = snapshot();
     CelEngine.validate_config(EngineValidationInput {
         raw: &json!({ "expr": expr }),
         schemas: &snapshot,
@@ -56,12 +50,24 @@ fn compile(expr: &str) -> Result<std::sync::Arc<dyn ValidatedConfig>, EngineConf
 }
 
 fn quota(cap: Option<u64>, consumed: u64) -> Result<QuotaSnapshot, Box<dyn std::error::Error>> {
+    quota_of(USER, cap, consumed)
+}
+
+fn tenant_quota(
+    cap: Option<u64>,
+    consumed: u64,
+) -> Result<QuotaSnapshot, Box<dyn std::error::Error>> {
+    quota_of(TENANT, cap, consumed)
+}
+
+fn quota_of(
+    subject_type: &str,
+    cap: Option<u64>,
+    consumed: u64,
+) -> Result<QuotaSnapshot, Box<dyn std::error::Error>> {
     Ok(QuotaSnapshot {
         quota_id: QuotaId::generate(),
-        subject: serde_json::from_value(json!({
-            "projection_type": "gts.cf.core.qe.subj.v1~cf.test.qe.user.v1~",
-            "subject_id": "alice"
-        }))?,
+        subject: serde_json::from_value(json!({ "type": subject_type, "id": "alice" }))?,
         metric: MetricId::parse(METRIC)?,
         quota_type: QuotaType::Consumption,
         enforcement_mode: EnforcementMode::Hard,
@@ -76,16 +82,25 @@ fn quota(cap: Option<u64>, consumed: u64) -> Result<QuotaSnapshot, Box<dyn std::
 }
 
 struct Scenario<'a> {
-    quotas: &'a [(&'a QuotaSnapshot, QuotaScopeTier, Value)],
+    quotas: &'a [&'a QuotaSnapshot],
     amount: u64,
     request: Value,
     cost_limit: u64,
     metric: &'a str,
+    metric_id: Option<&'a str>,
 }
 
 fn evaluate(expr: &str, scenario: &Scenario<'_>) -> Result<Decision, Box<dyn std::error::Error>> {
+    evaluate_under(&snapshot(), expr, scenario)
+}
+
+fn evaluate_under(
+    schemas: &PolicySchemaSnapshot,
+    expr: &str,
+    scenario: &Scenario<'_>,
+) -> Result<Decision, Box<dyn std::error::Error>> {
     let policy = PolicyVersion {
-        schema_snapshot: snapshot()?,
+        schema_snapshot: schemas.clone(),
         policy_id: PolicyId::global(),
         version: 1,
         scope: PolicyScope::Global,
@@ -102,10 +117,9 @@ fn evaluate(expr: &str, scenario: &Scenario<'_>) -> Result<Decision, Box<dyn std
     let input: Vec<_> = scenario
         .quotas
         .iter()
-        .map(|(snapshot, tier, arbitration)| EvaluationQuota {
+        .map(|snapshot| EvaluationQuota {
             snapshot,
-            tier: *tier,
-            arbitration,
+            tier: QuotaScopeTier::of(&snapshot.subject),
         })
         .collect();
     let budget = EvaluationBudget::new(
@@ -120,52 +134,53 @@ fn evaluate(expr: &str, scenario: &Scenario<'_>) -> Result<Decision, Box<dyn std
         time: OffsetDateTime::UNIX_EPOCH,
         quotas: &input,
         request: &scenario.request,
-        resource: &Value::Null,
+        metric_id: scenario.metric_id,
         budget,
     };
-    let artifact = compile(expr)?;
-    Ok(CelEngine.evaluate(&context, artifact.as_ref())?)
+    let artifact = CelEngine.validate_config(EngineValidationInput {
+        raw: &json!({ "expr": expr }),
+        schemas,
+    })?;
+    let decision = CelEngine.evaluate(&context, artifact.as_ref())?;
+    Ok(EvaluationOutcome::validate(decision, &context)?.into_decision())
 }
 
-fn eu() -> Value {
-    json!({ "regions": ["eu"] })
+fn entry(quota: &QuotaSnapshot, amount: u64) -> QuotaDebitPlan {
+    QuotaDebitPlan {
+        quota_id: quota.quota_id,
+        amount,
+    }
 }
 
 /// The PRD §5.9 split cascade: user takes what it has left, tenant the rest.
 const SPLIT: &str = r#"
-cel.bind(user, quotas.filter(q, q.tier == "user")[0],
+cel.bind(user, quotas.filter(q, q.tier == "subject")[0],
 cel.bind(tenant, quotas.filter(q, q.tier == "tenant")[0],
 cel.bind(first, user.remaining < amount ? user.remaining : amount,
-  { "debit_plan": [
+  { "debit_plan": [[
       { "id": user.id, "amount": first },
       { "id": tenant.id, "amount": amount - first }
-  ] })))"#;
+  ]] })))"#;
 
 #[test]
 fn split_cascade_debits_the_user_remainder_then_the_tenant() -> TestResult {
     let user = quota(Some(100), 80)?;
-    let tenant = quota(Some(10_000), 300)?;
+    let tenant = tenant_quota(Some(10_000), 300)?;
     let decision = evaluate(
         SPLIT,
         &Scenario {
-            quotas: &[
-                (&user, QuotaScopeTier::User, eu()),
-                (&tenant, QuotaScopeTier::Tenant, eu()),
-            ],
+            quotas: &[&user, &tenant],
             amount: 50,
             request: json!({ "region": "eu" }),
             cost_limit: 100_000,
             metric: METRIC,
+            metric_id: None,
         },
     )?;
     assert_eq!(decision.result, DecisionResult::Allowed);
     assert_eq!(
-        decision.debit_plan.get(&user.quota_id),
-        Some(&QuotaDebitPlan { amount: 20 })
-    );
-    assert_eq!(
-        decision.debit_plan.get(&tenant.quota_id),
-        Some(&QuotaDebitPlan { amount: 30 })
+        decision.debit_plan,
+        vec![vec![entry(&user, 20), entry(&tenant, 30)]]
     );
     assert_eq!(decision.diagnostics["engine_id"], json!("cel"));
     assert_eq!(
@@ -177,32 +192,22 @@ fn split_cascade_debits_the_user_remainder_then_the_tenant() -> TestResult {
 
 const REGION_GATE: &str = r#"
 { "debit_plan": quotas
-    .filter(q, request.region in q.arbitration.regions)
-    .map(q, { "id": q.id, "amount": amount }) }"#;
+    .filter(q, request.region == "eu")
+    .map(q, [{ "id": q.id, "amount": amount }]) }"#;
 
 #[test]
-fn region_gating_debits_only_the_matching_subset() -> TestResult {
-    let eu_quota = quota(Some(100), 0)?;
-    let us_quota = quota(Some(100), 0)?;
+fn a_request_predicate_selects_the_quotas_to_debit() -> TestResult {
+    let user = quota(Some(100), 0)?;
+    let tenant = tenant_quota(Some(100), 0)?;
     let scenario = |region: &str| Scenario {
         quotas: &[],
         amount: 7,
         request: json!({ "region": region }),
         cost_limit: 100_000,
         metric: METRIC,
+        metric_id: None,
     };
-    let quotas = [
-        (
-            &eu_quota,
-            QuotaScopeTier::Tenant,
-            json!({ "regions": ["eu"] }),
-        ),
-        (
-            &us_quota,
-            QuotaScopeTier::Tenant,
-            json!({ "regions": ["us"] }),
-        ),
-    ];
+    let quotas = [&user, &tenant];
     let decision = evaluate(
         REGION_GATE,
         &Scenario {
@@ -212,8 +217,8 @@ fn region_gating_debits_only_the_matching_subset() -> TestResult {
     )?;
     assert_eq!(decision.result, DecisionResult::Allowed);
     assert_eq!(
-        decision.debit_plan.keys().copied().collect::<Vec<_>>(),
-        vec![eu_quota.quota_id]
+        decision.debit_plan,
+        vec![vec![entry(&user, 7)], vec![entry(&tenant, 7)]]
     );
 
     // A predicate that matches nothing is a denial the operator can act on,
@@ -221,12 +226,8 @@ fn region_gating_debits_only_the_matching_subset() -> TestResult {
     let none = evaluate(
         REGION_GATE,
         &Scenario {
-            quotas: &[(
-                &eu_quota,
-                QuotaScopeTier::Tenant,
-                json!({ "regions": ["us"] }),
-            )],
-            ..scenario("eu")
+            quotas: &quotas,
+            ..scenario("us")
         },
     )?;
     assert_eq!(
@@ -246,11 +247,12 @@ fn an_explicit_deny_carries_its_reason_and_violators() -> TestResult {
     let decision = evaluate(
         r#"{ "deny": { "reason": "REGION_CLOSED", "violated_quota_ids": quotas.map(q, q.id) } }"#,
         &Scenario {
-            quotas: &[(&q, QuotaScopeTier::User, eu())],
+            quotas: &[&q],
             amount: 1,
             request: json!({ "region": "eu" }),
             cost_limit: 100_000,
             metric: METRIC,
+            metric_id: None,
         },
     )?;
     assert_eq!(
@@ -286,20 +288,20 @@ fn save_time_rejects_syntax_unknown_fields_and_incompatible_pairs_with_positions
         .expect_err("zone");
     assert!(err.message.contains("absent"), "{err:?}");
 
-    // Scalar compared with a collection: the ADR-0007 cardinality check.
-    let err = compile(
-        r#"{ "debit_plan": quotas.filter(q, request.region == q.arbitration.regions).map(q, { "id": q.id, "amount": amount }) }"#,
-    ).map(|_| ()).expect_err("cardinality");
-    assert!(err.message.contains("incompatible"), "{err:?}");
+    // There is no resource.
+    let err = compile(r#"{ "deny": { "reason": resource.metadata.kind } }"#)
+        .map(|_| ())
+        .expect_err("resource");
+    assert!(err.message.contains("unknown variable"), "{err:?}");
 
-    // Paired fields with disjoint declared domains would make the Quota inert.
+    // Paired request fields with disjoint declared domains would make a Quota inert.
     let err = compile(
-        r#"{ "debit_plan": quotas.filter(q, "apac" in q.arbitration.regions).map(q, { "id": q.id, "amount": amount }) }"#,
+        r#"{ "debit_plan": quotas.filter(q, request.region == "apac").map(q, [{ "id": q.id, "amount": amount }]) }"#,
     ).map(|_| ()).expect_err("domains");
     assert!(err.message.contains("disjoint"), "{err:?}");
 
     // Only `expr`, and only a string.
-    let snapshot = snapshot().expect("snapshot");
+    let snapshot = snapshot();
     for raw in [
         json!({}),
         json!({ "expr": 1 }),
@@ -318,15 +320,6 @@ fn save_time_rejects_syntax_unknown_fields_and_incompatible_pairs_with_positions
     }
     let oversized = format!("{{ \"deny\": {{ \"reason\": \"{}\" }} }}", "x".repeat(9000));
     assert!(compile(&oversized).is_err(), "source bound");
-    assert!(
-        CelEngine
-            .validate_config(EngineValidationInput {
-                raw: &json!({ "expr": "1" }),
-                schemas: &PolicySchemaSnapshot::default(),
-            })
-            .is_err(),
-        "no environment to check against"
-    );
 }
 
 #[test]
@@ -335,7 +328,7 @@ fn a_literal_record_with_the_wrong_shape_is_refused_before_persistence() {
         "1",
         r#"{ "allow": true }"#,
         r#"{ "debit_plan": 1 }"#,
-        r#"{ "debit_plan": [ { "id": 1, "amount": "x" } ] }"#,
+        r#"{ "debit_plan": [[ { "id": 1, "amount": "x" } ]] }"#,
         r#"{ "deny": "no" }"#,
     ] {
         assert!(compile(expr).is_err(), "{expr}");
@@ -343,30 +336,165 @@ fn a_literal_record_with_the_wrong_shape_is_refused_before_persistence() {
 }
 
 #[test]
-fn runtime_refuses_negative_duplicate_and_foreign_amounts() -> TestResult {
+fn an_and_debits_the_whole_amount_from_every_chain() -> TestResult {
+    let user = quota(Some(100), 0)?;
+    let device = quota(Some(100), 0)?;
+    let decision = evaluate(
+        r#"{ "debit_plan": quotas.map(q, [{ "id": q.id, "amount": amount }]) }"#,
+        &Scenario {
+            quotas: &[&user, &device],
+            amount: 50,
+            request: json!({ "region": "eu" }),
+            cost_limit: 100_000,
+            metric: METRIC,
+            metric_id: None,
+        },
+    )?;
+    assert_eq!(
+        decision.debit_plan,
+        vec![vec![entry(&user, 50)], vec![entry(&device, 50)]]
+    );
+    Ok(())
+}
+
+/// A user-to-tenant cascade, and the device cap counting the whole operation.
+const MIX: &str = r#"
+cel.bind(user, quotas.filter(q, q.subject_type == "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~")[0],
+cel.bind(tenant, quotas.filter(q, q.tier == "tenant")[0],
+cel.bind(device, quotas.filter(q, q.subject_type == "gts.cf.core.quota.subj.v1~acme.core.quota.device.v1~")[0],
+cel.bind(first, user.remaining < amount ? user.remaining : amount,
+  { "debit_plan": [
+      [ { "id": user.id, "amount": first }, { "id": tenant.id, "amount": amount - first } ],
+      [ { "id": device.id, "amount": amount } ]
+  ] }))))"#;
+
+#[test]
+fn a_mix_cascades_one_chain_and_ands_another() -> TestResult {
+    let user = quota(Some(100), 80)?;
+    let tenant = tenant_quota(Some(10_000), 0)?;
+    let device = quota_of(DEVICE, Some(100), 0)?;
+    let decision = evaluate(
+        MIX,
+        &Scenario {
+            quotas: &[&user, &tenant, &device],
+            amount: 50,
+            request: json!({ "region": "eu" }),
+            cost_limit: 100_000,
+            metric: METRIC,
+            metric_id: None,
+        },
+    )?;
+    assert_eq!(
+        decision.debit_plan,
+        vec![
+            vec![entry(&user, 20), entry(&tenant, 30)],
+            vec![entry(&device, 50)]
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_flat_plan_is_refused_at_save_time_and_at_evaluation() -> TestResult {
+    let err = compile(r#"{ "debit_plan": quotas.map(q, { "id": q.id, "amount": amount }) }"#)
+        .map(|_| ())
+        .expect_err("a computed flat plan");
+    assert!(err.message.contains("list of chains"), "{err:?}");
+    let err = compile(r#"{ "debit_plan": [ { "id": quotas[0].id, "amount": amount } ] }"#)
+        .map(|_| ())
+        .expect_err("a literal flat plan");
+    assert!(err.message.contains("list of chains"), "{err:?}");
+
+    let q = quota(Some(100), 0)?;
+    let flat = json!({ "plan": [ { "id": q.quota_id, "amount": 5 } ] });
+    let err = evaluate_under(
+        &PolicySchemaSnapshot::default(),
+        r#"{ "debit_plan": request.plan }"#,
+        &Scenario {
+            quotas: &[&q],
+            amount: 5,
+            request: flat,
+            cost_limit: 100_000,
+            metric: METRIC,
+            metric_id: None,
+        },
+    )
+    .expect_err("an untyped flat plan");
+    assert!(err.to_string().contains("list of chains"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn a_plan_breaking_the_chain_rules_is_refused_at_the_boundary() -> TestResult {
+    let user = quota(Some(100), 0)?;
+    let tenant = tenant_quota(Some(100), 0)?;
+    let scenario = |expr: &str| {
+        evaluate(
+            expr,
+            &Scenario {
+                quotas: &[&user, &tenant],
+                amount: 5,
+                request: json!({ "region": "eu" }),
+                cost_limit: 100_000,
+                metric: METRIC,
+                metric_id: None,
+            },
+        )
+    };
+    let short = scenario(
+        r#"{ "debit_plan": [[ { "id": quotas[0].id, "amount": 1 }, { "id": quotas[1].id, "amount": 1 } ]] }"#,
+    )
+    .expect_err("a chain that does not add up");
+    assert!(short.to_string().contains("chain_sum_mismatch"), "{short}");
+    let twice = scenario(
+        r#"{ "debit_plan": quotas.map(q, [{ "id": q.id, "amount": amount }]) + quotas.map(q, [{ "id": q.id, "amount": amount }]) }"#,
+    )
+    .expect_err("a quota in two chains");
+    assert!(twice.to_string().contains("duplicate_quota"), "{twice}");
+    Ok(())
+}
+
+#[test]
+fn a_plan_repeating_one_quota_with_huge_amounts_reports_the_duplicate() -> TestResult {
+    let q = quota(Some(100), 0)?;
+    let huge = r#"[{ "id": quotas[0].id, "amount": amount }]"#;
+    let err = evaluate(
+        &format!(r#"{{ "debit_plan": [{huge}, {huge}, {huge}] }}"#),
+        &Scenario {
+            quotas: &[&q],
+            amount: i64::MAX.unsigned_abs(),
+            request: json!({ "region": "eu" }),
+            cost_limit: 100_000,
+            metric: METRIC,
+            metric_id: None,
+        },
+    )
+    .expect_err("a quota in three chains");
+    assert!(err.to_string().contains("duplicate_quota"), "{err}");
+    Ok(())
+}
+
+#[test]
+fn runtime_refuses_negative_and_foreign_amounts() -> TestResult {
     let q = quota(Some(100), 0)?;
     let base = |expr: &str| {
         evaluate(
             expr,
             &Scenario {
-                quotas: &[(&q, QuotaScopeTier::User, eu())],
+                quotas: &[&q],
                 amount: 5,
                 request: json!({ "region": "eu" }),
                 cost_limit: 100_000,
                 metric: METRIC,
+                metric_id: None,
             },
         )
     };
-    let negative = base(r#"{ "debit_plan": quotas.map(q, { "id": q.id, "amount": -1 }) }"#)
+    let negative = base(r#"{ "debit_plan": quotas.map(q, [{ "id": q.id, "amount": -1 }]) }"#)
         .expect_err("negative");
     assert!(negative.to_string().contains("negative"), "{negative}");
-    let duplicate = base(
-        r#"{ "debit_plan": quotas.map(q, { "id": q.id, "amount": 1 }) + quotas.map(q, { "id": q.id, "amount": 1 }) }"#,
-    )
-    .expect_err("duplicate");
-    assert!(duplicate.to_string().contains("twice"), "{duplicate}");
     let foreign =
-        base(r#"{ "debit_plan": [ { "id": "not-a-uuid", "amount": 1 } ] }"#).expect_err("uuid");
+        base(r#"{ "debit_plan": [[ { "id": "not-a-uuid", "amount": 1 } ]] }"#).expect_err("uuid");
     assert!(foreign.to_string().contains("UUID"), "{foreign}");
     Ok(())
 }
@@ -375,13 +503,14 @@ fn runtime_refuses_negative_duplicate_and_foreign_amounts() -> TestResult {
 fn cost_exhaustion_surfaces_as_an_engine_error() -> TestResult {
     let q = quota(Some(100), 0)?;
     let err = evaluate(
-        r#"{ "debit_plan": [1,2,3,4,5,6,7,8].map(a, [1,2,3,4,5,6,7,8].map(b, a * b)).map(l, { "id": quotas[0].id, "amount": 0 }) }"#,
+        r#"{ "debit_plan": [1,2,3,4,5,6,7,8].map(a, [1,2,3,4,5,6,7,8].map(b, a * b)).map(l, [{ "id": quotas[0].id, "amount": 0 }]) }"#,
         &Scenario {
-            quotas: &[(&q, QuotaScopeTier::User, eu())],
+            quotas: &[&q],
             amount: 5,
             request: json!({ "region": "eu" }),
             cost_limit: 300,
             metric: METRIC,
+            metric_id: None,
         },
     )
     .expect_err("budget");
@@ -393,13 +522,14 @@ fn cost_exhaustion_surfaces_as_an_engine_error() -> TestResult {
 fn a_metric_outside_the_validated_set_is_refused_not_approximated() -> TestResult {
     let q = quota(Some(100), 0)?;
     let err = evaluate(
-        r#"{ "debit_plan": quotas.map(q, { "id": q.id, "amount": amount }) }"#,
+        r#"{ "debit_plan": quotas.map(q, [{ "id": q.id, "amount": amount }]) }"#,
         &Scenario {
-            quotas: &[(&q, QuotaScopeTier::User, eu())],
+            quotas: &[&q],
             amount: 5,
             request: json!({ "region": "eu" }),
             cost_limit: 100_000,
             metric: OTHER_METRIC,
+            metric_id: None,
         },
     )
     .expect_err("other metric");
@@ -414,16 +544,14 @@ fn a_metric_outside_the_validated_set_is_refused_not_approximated() -> TestResul
 #[test]
 fn repeated_evaluation_of_one_context_is_byte_identical() -> TestResult {
     let user = quota(Some(100), 80)?;
-    let tenant = quota(Some(10_000), 300)?;
+    let tenant = tenant_quota(Some(10_000), 300)?;
     let scenario = Scenario {
-        quotas: &[
-            (&user, QuotaScopeTier::User, eu()),
-            (&tenant, QuotaScopeTier::Tenant, eu()),
-        ],
+        quotas: &[&user, &tenant],
         amount: 50,
         request: json!({ "region": "eu" }),
         cost_limit: 100_000,
         metric: METRIC,
+        metric_id: None,
     };
     let first = serde_json::to_vec(&evaluate(SPLIT, &scenario)?)?;
     let second = serde_json::to_vec(&evaluate(SPLIT, &scenario)?)?;
@@ -463,14 +591,14 @@ fn every_path_must_produce_a_complete_decision_record() {
         // an empty literal record
         "{}",
         // an entry without its amount
-        r#"{ "debit_plan": [ { "id": quotas[0].id } ] }"#,
+        r#"{ "debit_plan": [[ { "id": quotas[0].id } ]] }"#,
         // a second element that disagrees with the first
-        r#"{ "debit_plan": [ { "id": quotas[0].id, "amount": 1 }, { "id": quotas[0].id, "amount": true } ] }"#,
+        r#"{ "debit_plan": [[ { "id": quotas[0].id, "amount": 1 }, { "id": quotas[0].id, "amount": true } ]] }"#,
         // one valid branch does not vouch for the other
-        r#"amount > 1 ? { "debit_plan": [ { "id": quotas[0].id, "amount": 1 } ] } : { "deny": 1 }"#,
+        r#"amount > 1 ? { "debit_plan": [[ { "id": quotas[0].id, "amount": 1 } ]] } : { "deny": 1 }"#,
         r#"cel.bind(x, 1, amount > 1 ? { "deny": { "reason": "a" } } : { "deny": { "cause": "b" } })"#,
         // an extra field on an entry
-        r#"{ "debit_plan": [ { "id": quotas[0].id, "amount": 1, "note": "x" } ] }"#,
+        r#"{ "debit_plan": [[ { "id": quotas[0].id, "amount": 1, "note": "x" } ]] }"#,
         // deny without a reason
         r#"{ "deny": { "violated_quota_ids": [] } }"#,
     ] {
@@ -478,10 +606,10 @@ fn every_path_must_produce_a_complete_decision_record() {
     }
     // And the shapes that are legitimate on every path.
     for expr in [
-        r#"amount > 1 ? { "debit_plan": [ { "id": quotas[0].id, "amount": 1 } ] } : { "deny": { "reason": "small" } }"#,
-        r#"cel.bind(first, quotas[0], { "debit_plan": [ { "id": first.id, "amount": amount } ] })"#,
+        r#"amount > 1 ? { "debit_plan": [[ { "id": quotas[0].id, "amount": 1 } ]] } : { "deny": { "reason": "small" } }"#,
+        r#"cel.bind(first, quotas[0], { "debit_plan": [[ { "id": first.id, "amount": amount } ]] })"#,
         r#"{ "debit_plan": [] }"#,
-        r#"{ "debit_plan": quotas.map(q, { "id": q.id, "amount": q.remaining < amount ? q.remaining : amount }) }"#,
+        r#"{ "debit_plan": quotas.map(q, [{ "id": q.id, "amount": q.remaining < amount ? q.remaining : amount }]) }"#,
     ] {
         assert!(compile(expr).is_ok(), "refused: {expr}");
     }
@@ -489,27 +617,12 @@ fn every_path_must_produce_a_complete_decision_record() {
 
 #[test]
 fn a_field_outside_the_integer_profile_is_reachable_but_unusable() {
-    let snapshot = PolicySchemaSnapshot {
-        schemas: BTreeMap::default(),
-        inputs: EnvironmentInputs::ALL,
-        environments: vec![MetricEnvironmentSchema {
-            metric: MetricId::parse(METRIC).expect("metric"),
-            schema: json!({
-                "type": "object",
-                "properties": {
-                    "request": { "type": "object", "properties": {
-                        "rate": { "type": "number" },
-                        "region": { "type": "string" },
-                        "extra": { "type": "object" }
-                    }},
-                    "resource": { "type": "null" },
-                    "arbitration": { "type": "object", "properties": {
-                        "cap": { "type": ["integer", "null"] }
-                    }}
-                }
-            }),
-        }],
-    };
+    let snapshot = snapshot_of(&json!({ "type": "object", "properties": {
+        "rate": { "type": "number" },
+        "region": { "type": "string" },
+        "extra": { "type": "object" },
+        "limit": { "type": ["integer", "null"] }
+    }}));
     let compile = |expr: &str| {
         CelEngine
             .validate_config(EngineValidationInput {
@@ -521,7 +634,7 @@ fn a_field_outside_the_integer_profile_is_reachable_but_unusable() {
     // A `number` is not an integer: arithmetic on it is refused at save time
     // rather than failing on the first fractional value at evaluation.
     let err =
-        compile(r#"{ "debit_plan": [ { "id": quotas[0].id, "amount": request.rate + 1 } ] }"#)
+        compile(r#"{ "debit_plan": [[ { "id": quotas[0].id, "amount": request.rate + 1 } ]] }"#)
             .expect_err("number arithmetic");
     assert!(err.message.contains("outside the integer-only"), "{err:?}");
     assert!(compile(r#"{ "deny": { "reason": request.rate > 1 ? "a" : "b" } }"#).is_err());
@@ -531,78 +644,110 @@ fn a_field_outside_the_integer_profile_is_reachable_but_unusable() {
     );
     // A nullable integer is an integer operand; evaluation refuses the null.
     assert!(
-        compile(r#"{ "debit_plan": quotas.filter(q, q.arbitration.cap > 1).map(q, { "id": q.id, "amount": 1 }) }"#)
+        compile(r#"{ "debit_plan": quotas.filter(q, request.limit > 1).map(q, [{ "id": q.id, "amount": 1 }]) }"#)
             .is_ok()
     );
     // A free-form object's members are untyped and therefore unusable.
     assert!(compile(r#"{ "deny": { "reason": request.extra.note } }"#).is_err());
 }
 
-/// The gear persists only the contracts the artifact reports reading; an input
-/// it never touched becomes an object with no properties, and the resource slot
-/// collapses to `null`.
-fn prune(full: &PolicySchemaSnapshot, inputs: EnvironmentInputs) -> PolicySchemaSnapshot {
-    let unread = json!({ "type": "object", "properties": {} });
-    let mut pruned = full.clone();
-    pruned.inputs = inputs;
-    for environment in &mut pruned.environments {
-        if !inputs.request {
-            environment.schema["properties"]["request"] = unread.clone();
-        }
-        if !inputs.resource {
-            environment.schema["properties"]["resource"] = json!({ "type": "null" });
-        }
-        if !inputs.arbitration {
-            environment.schema["properties"]["arbitration"] = unread.clone();
-        }
-    }
-    pruned
-}
-
-/// A contract reached through brackets is the same dependency as one reached
-/// through a dot. Under-reporting it persists a closure the policy cannot be
-/// rebuilt from, so each case walks the whole write path: compile against the
-/// full environment, prune to the reported inputs, rebuild from the pruned
-/// closure exactly as a restart does.
 #[test]
-fn a_contract_read_through_brackets_is_reported_and_the_pruned_closure_still_rebuilds() -> TestResult
-{
+fn inputs_read_through_brackets_are_reported() -> TestResult {
     let cases = [
         (
-            r#"{ "debit_plan": quotas.filter(q, size(q['arbitration'].regions) > 0).map(q, { "id": q.id, "amount": amount }) }"#,
-            EnvironmentInputs {
-                request: false,
-                resource: false,
-                arbitration: true,
-            },
+            r#"{ "debit_plan": quotas.filter(q, q['tier'] == "subject").map(q, [{ "id": q.id, "amount": amount }]) }"#,
+            EnvironmentInputs { request: false },
         ),
         (
             r#"{ "deny": { "reason": request['region'] } }"#,
-            EnvironmentInputs {
-                request: true,
-                resource: false,
-                arbitration: false,
-            },
-        ),
-        (
-            r#"{ "deny": { "reason": request.region + quotas[0]['arbitration']['regions'][0] } }"#,
-            EnvironmentInputs {
-                request: true,
-                resource: false,
-                arbitration: true,
-            },
+            EnvironmentInputs { request: true },
         ),
     ];
     for (expr, expected) in cases {
-        let artifact = compile(expr)?;
-        assert_eq!(artifact.inputs(), expected, "{expr}");
-        let pruned = prune(&snapshot()?, expected);
-        CelEngine
-            .validate_config(EngineValidationInput {
-                raw: &json!({ "expr": expr }),
-                schemas: &pruned,
-            })
-            .map_err(|e| format!("{expr} does not rebuild from its own closure: {e}"))?;
+        assert_eq!(compile(expr)?.inputs(), expected, "{expr}");
+    }
+    Ok(())
+}
+
+#[test]
+fn a_quota_carries_no_metadata() {
+    for expr in [
+        r#"{ "deny": { "reason": quotas[0].arbitration.region } }"#,
+        r#"{ "deny": { "reason": quotas[0]['metadata']['region'] } }"#,
+    ] {
+        assert!(compile(expr).is_err(), "accepted: {expr}");
+    }
+}
+
+#[test]
+fn each_quota_exposes_its_subject_type_and_tier() -> TestResult {
+    let user = quota(Some(100), 0)?;
+    let tenant = tenant_quota(Some(100), 0)?;
+    let decision = evaluate(
+        &format!(
+            r#"{{ "debit_plan": quotas.filter(q, q.subject_type == "{USER}" && q.tier == "subject").map(q, [{{ "id": q.id, "amount": amount }}]) }}"#
+        ),
+        &Scenario {
+            quotas: &[&tenant, &user],
+            amount: 3,
+            request: json!({ "region": "eu" }),
+            cost_limit: 100_000,
+            metric: METRIC,
+            metric_id: None,
+        },
+    )?;
+    assert_eq!(decision.debit_plan, vec![vec![entry(&user, 3)]]);
+    Ok(())
+}
+
+#[test]
+fn a_policy_reads_the_id_of_the_requests_metric() -> TestResult {
+    let expr = r#"metric_id == "blocked" ? { "deny": { "reason": "blocked" } } : { "debit_plan": [[{ "id": quotas[0].id, "amount": amount }]] }"#;
+    let q = quota(Some(100), 0)?;
+    for (metric_id, allowed) in [
+        (Some("blocked"), false),
+        (Some("other"), true),
+        (None, true),
+    ] {
+        let decision = evaluate(
+            expr,
+            &Scenario {
+                quotas: &[&q],
+                amount: 2,
+                request: json!({}),
+                cost_limit: 100_000,
+                metric: METRIC,
+                metric_id,
+            },
+        )?;
+        assert_eq!(
+            decision.result == DecisionResult::Allowed,
+            allowed,
+            "{metric_id:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_empty_snapshot_leaves_request_untyped_and_serves_any_metric() -> TestResult {
+    let global = PolicySchemaSnapshot::default();
+    let expr = r#"{ "debit_plan": quotas.filter(q, request.zone == "eu").map(q, [{ "id": q.id, "amount": amount }]) }"#;
+    let q = quota(Some(100), 0)?;
+    for metric in [METRIC, OTHER_METRIC] {
+        let decision = evaluate_under(
+            &global,
+            expr,
+            &Scenario {
+                quotas: &[&q],
+                amount: 2,
+                request: json!({ "zone": "eu" }),
+                cost_limit: 100_000,
+                metric,
+                metric_id: None,
+            },
+        )?;
+        assert_eq!(decision.result, DecisionResult::Allowed, "{metric}");
     }
     Ok(())
 }
@@ -660,7 +805,7 @@ fn each_type_rule_refuses_its_own_misuse() {
         ),
         (
             r#"{ "debit_plan": [1] }"#.to_owned(),
-            "list of `{id, amount}` records",
+            "list of chains of `{id, amount}` records",
         ),
     ];
     for (expr, expected) in cases {
@@ -695,21 +840,9 @@ const SHIPPED_COST_LIMIT: u64 = 10_000;
 #[test]
 fn the_prd_policies_fit_the_shipped_cost_limit_with_a_realistic_quota_set() -> TestResult {
     let owned: Vec<QuotaSnapshot> = (0..20)
-        .map(|i| quota(Some(10_000), i * 10))
+        .map(|i| quota_of(if i == 0 { USER } else { TENANT }, Some(10_000), i * 10))
         .collect::<Result<_, _>>()?;
-    let arbitration = json!({ "regions": ["eu", "us"], "weight": 3 });
-    let quotas: Vec<_> = owned
-        .iter()
-        .enumerate()
-        .map(|(i, q)| {
-            let tier = if i == 0 {
-                QuotaScopeTier::User
-            } else {
-                QuotaScopeTier::Tenant
-            };
-            (q, tier, arbitration.clone())
-        })
-        .collect();
+    let quotas: Vec<_> = owned.iter().collect();
     for (name, expr) in [("split", SPLIT), ("region gate", REGION_GATE)] {
         let decision = evaluate(
             expr,
@@ -719,6 +852,7 @@ fn the_prd_policies_fit_the_shipped_cost_limit_with_a_realistic_quota_set() -> T
                 request: json!({ "region": "eu" }),
                 cost_limit: SHIPPED_COST_LIMIT,
                 metric: METRIC,
+                metric_id: None,
             },
         )
         .map_err(|e| format!("{name}: {e}"))?;
@@ -727,31 +861,26 @@ fn the_prd_policies_fit_the_shipped_cost_limit_with_a_realistic_quota_set() -> T
     Ok(())
 }
 
-/// Twenty quotas whose arbitration data each sits near the default 4 KiB
-/// metadata bound: together past one value's 64 KiB, each well within it.
+/// Twenty quotas, the realistic upper end of an applicable set.
 fn heavy_quotas() -> Result<Vec<QuotaSnapshot>, Box<dyn std::error::Error>> {
-    (0..20).map(|_| quota(Some(10_000), 0)).collect()
-}
-
-fn heavy_arbitration() -> Value {
-    json!({ "regions": ["eu", "us"], "weight": 3, "note": "x".repeat(3500) })
+    (0..20)
+        .map(|i| quota_of(if i == 0 { USER } else { TENANT }, Some(10_000), 0))
+        .collect()
 }
 
 #[test]
 fn a_large_quota_set_binds_within_the_shipped_cost_limit() -> TestResult {
     let owned = heavy_quotas()?;
-    let quotas: Vec<_> = owned
-        .iter()
-        .map(|q| (q, QuotaScopeTier::Tenant, heavy_arbitration()))
-        .collect();
+    let quotas: Vec<_> = owned.iter().collect();
     let decision = evaluate(
-        r#"{ "debit_plan": [ { "id": quotas[0].id, "amount": amount } ] }"#,
+        r#"{ "debit_plan": [[ { "id": quotas[0].id, "amount": amount } ]] }"#,
         &Scenario {
             quotas: &quotas,
             amount: 5,
             request: json!({ "region": "eu" }),
             cost_limit: SHIPPED_COST_LIMIT,
             metric: METRIC,
+            metric_id: None,
         },
     )?;
     assert_eq!(decision.result, DecisionResult::Allowed);
@@ -761,18 +890,7 @@ fn a_large_quota_set_binds_within_the_shipped_cost_limit() -> TestResult {
 #[test]
 fn the_prd_policies_filter_a_large_quota_set_within_the_shipped_cost_limit() -> TestResult {
     let owned = heavy_quotas()?;
-    let quotas: Vec<_> = owned
-        .iter()
-        .enumerate()
-        .map(|(i, q)| {
-            let tier = if i == 0 {
-                QuotaScopeTier::User
-            } else {
-                QuotaScopeTier::Tenant
-            };
-            (q, tier, heavy_arbitration())
-        })
-        .collect();
+    let quotas: Vec<_> = owned.iter().collect();
     for (name, expr, debited) in [("split", SPLIT, 2), ("region gate", REGION_GATE, 20)] {
         let decision = evaluate(
             expr,
@@ -782,11 +900,16 @@ fn the_prd_policies_filter_a_large_quota_set_within_the_shipped_cost_limit() -> 
                 request: json!({ "region": "eu" }),
                 cost_limit: SHIPPED_COST_LIMIT,
                 metric: METRIC,
+                metric_id: None,
             },
         )
         .map_err(|e| format!("{name}: {e}"))?;
         assert_eq!(decision.result, DecisionResult::Allowed, "{name}");
-        assert_eq!(decision.debit_plan.len(), debited, "{name}");
+        assert_eq!(
+            decision.debit_plan.iter().flatten().count(),
+            debited,
+            "{name}"
+        );
     }
     Ok(())
 }

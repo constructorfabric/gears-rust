@@ -1,5 +1,6 @@
-//! The consumption primitives: debit, credit, rollback, the snapshot read, and
-//! the reclamation the retention sweeper drives.
+//! The consumption primitives: debit, credit, the snapshot read, and the
+//! reclamation the retention sweeper drives. Return and rollback live in
+//! `return_store`.
 //!
 //! Every mutation is one transaction that moves the counters, writes the
 //! idempotency record, appends the operation-log row, and enqueues the events
@@ -15,22 +16,21 @@
 use std::sync::Arc;
 
 use quota_enforcement_sdk::{
-    ApplicableQuotas, AppliedMutation, AttributionDigest, CounterSnapshot, DECISION_BLOB_VERSION,
-    Decision, DecisionResult, EvaluatedDebit, EvaluatedMutation, EvaluationContext,
-    EvaluationFailure, EvaluationQuota, IdempotencyRecord, IdempotencyScope, IdempotencySubjectKey,
+    ApplicableQuotas, AppliedMutation, AttributionDigest, ChargeReturn, CounterSnapshot,
+    DECISION_BLOB_VERSION, Decision, DecisionResult, EvaluatedDebit, EvaluatedMutation,
+    EvaluationContext, EvaluationFailure, EvaluationQuota, IdempotencyRecord, IdempotencyScope,
     IdempotencyWrite, MutationResult, NO_APPLICABLE_QUOTA, NotificationEvent,
     NotificationEventKind, NotificationScope, OperationType, PageRequest, PageResult,
     PartialIdempotencyWrite, PayloadHash, PeriodId, PeriodType, PeriodWindow, PolicyScope,
     PolicyVersion, Quota, QuotaId, QuotaScopeTier, QuotaSnapshot, QuotaStatus, QuotaType,
     Retention, RollbackTarget, StorageError, TenantId, ThresholdCrossing, TransitionOutcome,
-    threshold_crossings,
+    conditions_hold, plan_entries, plan_of, threshold_crossings,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError};
 use toolkit_db::{Db, DbError};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::config_cache::{ConfigCache, ConfigSnapshot, DEFAULT_REFRESH};
@@ -40,8 +40,8 @@ use super::policy_store::{decode_version, scope_key};
 use super::quota_mapping::{self, MappingError};
 use super::repo::operation_log_repo::Entry;
 use super::repo::{
-    RowWait, consumption_counter_repo as counter_repo, idempotency_repo as idem_repo, lease_repo,
-    operation_log_repo, policy_repo, quota_repo,
+    RowWait, charge_repo, consumption_counter_repo as counter_repo, idempotency_repo as idem_repo,
+    lease_repo, operation_log_repo, policy_repo, quota_repo,
 };
 use crate::domain::ports::Actor;
 use crate::infra::outbox::{
@@ -67,7 +67,6 @@ pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 // @cpt-state:cpt-cf-quota-enforcement-state-consumption-period:p1
 // @cpt-state:cpt-cf-quota-enforcement-state-idempotency-record:p1
 // @cpt-flow:cpt-cf-quota-enforcement-flow-credit:p1
-// @cpt-flow:cpt-cf-quota-enforcement-flow-rollback:p1
 // @cpt-algo:cpt-cf-quota-enforcement-algo-lazy-expiry:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-lazy-expiry:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-counter-period:p1
@@ -93,10 +92,6 @@ pub(super) enum TxError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Enqueue(#[from] EnqueueError),
-    /// The row a pre-transaction read decided the lock order from is no longer
-    /// the row under the lock. Internal: the primitive restarts.
-    #[error("the located record changed before it was locked")]
-    Rediscover,
     /// Another transaction committed this idempotency scope first. Internal:
     /// it never reaches a caller, it rolls this transaction back so the loser
     /// can resolve the winner's record. It carries the scope because credit
@@ -155,11 +150,7 @@ pub(super) fn lift(operation: &'static str, error: TxError) -> StorageError {
         TxError::Map(error) => corrupt(operation, &error),
         TxError::Json(error) => corrupt(operation, &error),
         TxError::Enqueue(error) => corrupt(operation, &error),
-        // Both are consumed by a retry loop; seeing either here means the loop
-        // gave up.
-        TxError::Rediscover => StorageError::Unavailable(format!(
-            "{operation}: the located record changed before it could be locked"
-        )),
+        // Consumed by a retry loop; seeing it here means the loop gave up.
         TxError::Raced(_) => StorageError::Unavailable(format!(
             "{operation} failed: the idempotency key is being written concurrently"
         )),
@@ -174,9 +165,8 @@ pub(super) fn lift(operation: &'static str, error: TxError) -> StorageError {
 /// cloned, which is why the contract passes it as a handle.
 pub(super) struct OwnedMutation {
     pub(super) applicable: ApplicableQuotas,
-    request: Value,
-    resource: Value,
-    user_projection: Option<gts::GtsTypeId>,
+    pub(super) request: Value,
+    metric_id: Option<String>,
     limits: quota_enforcement_sdk::engine::EvaluationLimits,
     pub(super) amount: u64,
     pub(super) idempotency: IdempotencyWrite,
@@ -189,8 +179,7 @@ impl OwnedMutation {
         Self {
             applicable: mutation.applicable.clone(),
             request: mutation.request.clone(),
-            resource: mutation.resource.clone(),
-            user_projection: mutation.user_projection.cloned(),
+            metric_id: mutation.metric_id.map(str::to_owned),
             limits: mutation.limits,
             amount: mutation.amount,
             idempotency: mutation.idempotency.clone(),
@@ -200,17 +189,32 @@ impl OwnedMutation {
     }
 }
 
-/// One counter movement, as the record stores it. Rollback reverses exactly
-/// these, against the period each was attributed to (I5).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One counter movement of a plan entry. A charge keeps one entry per
+/// movement, against the period it was attributed to (I5).
+#[derive(Debug, Clone)]
 pub(super) struct AppliedEntry {
     pub(super) quota_id: Uuid,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) period_id: Option<Uuid>,
     pub(super) amount: u64,
     /// Counter value after the movement, for the caller's mutation result.
-    #[serde(default)]
     pub(super) value: u64,
+    /// Chain of the plan entry this movement applied.
+    pub(super) chain: u32,
+    /// Position of that entry inside its chain.
+    pub(super) position: u32,
+}
+
+impl AppliedEntry {
+    /// The entry as part of a plan, tagged with its `(chain, position)`.
+    pub(super) fn planned(&self) -> ((u32, u32), quota_enforcement_sdk::QuotaDebitPlan) {
+        (
+            (self.chain, self.position),
+            quota_enforcement_sdk::QuotaDebitPlan {
+                quota_id: QuotaId::new(self.quota_id),
+                amount: self.amount,
+            },
+        )
+    }
 }
 
 /// What a debit committed, before it becomes the caller's result.
@@ -288,6 +292,7 @@ pub(super) async fn ensure_current_period(
 pub(super) async fn settle_elapsed_rows(
     tx: &impl DBRunner,
     scope: &AccessScope,
+    actor: &Actor,
     quota: &Quota,
     now: OffsetDateTime,
     enqueuer: &Arc<dyn NotificationEnqueuer>,
@@ -339,6 +344,7 @@ pub(super) async fn settle_elapsed_rows(
             continue;
         }
         let event = quota_event(
+            actor,
             quota,
             NotificationEventKind::PeriodRollover,
             json!({
@@ -361,7 +367,8 @@ pub(super) async fn settle_elapsed_rows(
     Ok(())
 }
 
-fn quota_event(
+pub(super) fn quota_event(
+    actor: &Actor,
     quota: &Quota,
     kind: NotificationEventKind,
     payload: Value,
@@ -370,6 +377,7 @@ fn quota_event(
     NotificationEvent {
         event_id: quota_enforcement_sdk::EventId::generate(),
         kind,
+        actor: actor.clone(),
         scope: NotificationScope::Tenant {
             tenant_id: quota.tenant_id,
         },
@@ -435,9 +443,11 @@ pub(super) async fn unreturned_expired(
     // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-return
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn debit_counter(
     tx: &impl DBRunner,
     scope: &AccessScope,
+    actor: &Actor,
     quota: &Quota,
     amount: u64,
     now: OffsetDateTime,
@@ -530,6 +540,7 @@ pub(super) async fn debit_counter(
         && !silent
     {
         let event = quota_event(
+            actor,
             quota,
             NotificationEventKind::ThresholdCrossed,
             json!({
@@ -553,6 +564,8 @@ pub(super) async fn debit_counter(
             period_id,
             amount,
             value: post,
+            chain: 0,
+            position: 0,
         },
         if silent { None } else { crossing },
     ))
@@ -648,7 +661,6 @@ pub(super) async fn credit_counter(
 pub(super) fn scope_key_of(scope_of: &IdempotencyScope) -> idem_repo::ScopeKey<'_> {
     idem_repo::ScopeKey {
         tenant_id: scope_of.tenant_id.as_uuid(),
-        subject_key: scope_of.subject_key.as_bytes(),
         operation_type: scope_of.operation_type.as_str(),
         idem_key: &scope_of.key,
     }
@@ -668,15 +680,79 @@ pub(super) fn decision_of(blob: &str) -> Result<Decision, TxError> {
     Ok(serde_json::from_str(blob)?)
 }
 
+/// What answers a repeated request: a charge or an idempotency record.
+pub(super) struct StoredRecord {
+    pub(super) payload_hash: Vec<u8>,
+    pub(super) blob: String,
+    engine_id: Option<String>,
+    policy_id: Option<String>,
+    policy_version: Option<i32>,
+    created_at: OffsetDateTime,
+    /// For a charge, the end of its return window.
+    pub(super) expires_at: OffsetDateTime,
+}
+
+impl From<charge::Model> for StoredRecord {
+    fn from(row: charge::Model) -> Self {
+        Self {
+            payload_hash: row.payload_hash,
+            blob: row.decision_blob,
+            engine_id: row.engine_id,
+            policy_id: row.policy_id,
+            policy_version: row.policy_version,
+            created_at: row.created_at,
+            expires_at: row.return_window_end,
+        }
+    }
+}
+
+impl From<idempotency_row::Model> for StoredRecord {
+    fn from(row: idempotency_row::Model) -> Self {
+        Self {
+            payload_hash: row.payload_hash,
+            blob: row.decision_blob,
+            engine_id: row.engine_id,
+            policy_id: row.policy_id,
+            policy_version: row.policy_version,
+            created_at: row.created_at,
+            expires_at: row.expires_at,
+        }
+    }
+}
+
+/// The record under `of`. A debit or a commit is answered by its charge for as
+/// long as the charge lives, otherwise by its unexpired idempotency record.
+pub(super) async fn find_stored(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    of: &IdempotencyScope,
+    now: OffsetDateTime,
+    lock: Option<RowWait>,
+) -> Result<Option<StoredRecord>, ScopeError> {
+    let key = scope_key_of(of);
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-window
+    if matches!(
+        of.operation_type,
+        OperationType::Debit | OperationType::Commit
+    ) && let Some(charge) = charge_repo::find(runner, scope, &key, now).await?
+    {
+        return Ok(Some(charge.into()));
+    }
+    // @cpt-end:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-window
+    Ok(idem_repo::find(runner, scope, &key, now, lock)
+        .await?
+        .map(StoredRecord::from))
+}
+
 /// What an existing record says about this attempt.
 pub(super) enum Replay {
     /// No record: the operation is new.
     Fresh,
     /// The same payload was recorded; return what it decided.
-    Stored(Box<idempotency_row::Model>),
+    Stored(Box<StoredRecord>),
 }
 
-use super::entity::idempotency_record as idempotency_row;
+use super::entity::{charge, charge_entry, idempotency_record as idempotency_row};
 
 /// Look up the record under `write`'s scope, refusing a divergent payload.
 pub(super) async fn replay_of(
@@ -686,17 +762,17 @@ pub(super) async fn replay_of(
     now: OffsetDateTime,
     lock: Option<RowWait>,
 ) -> Result<Replay, TxError> {
-    let key = scope_key_of(&write.scope);
-    let Some(row) = idem_repo::find(tx, scope, &key, now, lock).await? else {
+    let Some(stored) = find_stored(tx, scope, &write.scope, now, lock).await? else {
         return Ok(Replay::Fresh);
     };
-    if row.payload_hash != write.payload_hash.as_bytes() {
+    if stored.payload_hash != write.payload_hash.as_bytes() {
         return Err(StorageError::IdempotencyPayloadMismatch.into());
     }
-    Ok(Replay::Stored(Box::new(row)))
+    Ok(Replay::Stored(Box::new(stored)))
 }
 
-/// Retention deadline of a record written now for `(tenant, metric)`.
+/// Retention deadline of a record written now for `(tenant, metric)`; for a
+/// charge, the end of its return window.
 pub(super) fn expires_at(
     config: &ConfigSnapshot,
     tenant: TenantId,
@@ -709,22 +785,16 @@ pub(super) fn expires_at(
 /// Everything a record write needs beyond its scope.
 pub(super) struct RecordWrite<'a> {
     pub(super) write: &'a IdempotencyWrite,
-    /// What a replay answers with. A debit, credit or rollback records its
-    /// decision; an acquisition records its whole outcome, because a replay
-    /// must return the token it issued and not merely the verdict.
+    /// What a replay answers with. A denied debit or a credit records its
+    /// decision; an acquisition records its whole outcome,
+    /// because a replay must return the token it issued and not merely the
+    /// verdict.
     pub(super) blob: RecordBlob<'a>,
-    pub(super) entries: Option<&'a [AppliedEntry]>,
-    pub(super) authorized: Option<AttributionDigest>,
     pub(super) policy: Option<&'a PolicyVersion>,
     pub(super) expires_at: OffsetDateTime,
     pub(super) now: OffsetDateTime,
 }
 
-/// Insert the record, reporting a lost primary-key race as [`TxError::Raced`]
-/// so the whole transaction rolls back.
-///
-/// An expired row under the same key is deleted first: a replay past the
-/// retention window is a new operation, so the key must be free for it.
 /// What a record stores under its key.
 pub(super) enum RecordBlob<'a> {
     /// The transaction's decision, wrapped with its schema version.
@@ -733,6 +803,11 @@ pub(super) enum RecordBlob<'a> {
     Verbatim(&'a str),
 }
 
+/// Insert the record, reporting a lost primary-key race as [`TxError::Raced`]
+/// so the whole transaction rolls back.
+///
+/// An expired row under the same key is deleted first: a replay past the
+/// retention window is a new operation, so the key must be free for it.
 pub(super) async fn write_record(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -740,11 +815,6 @@ pub(super) async fn write_record(
 ) -> Result<(), TxError> {
     let key = scope_key_of(&record.write.scope);
     idem_repo::delete_expired_at_key(tx, scope, &key, record.now).await?;
-    let entries = record
-        .entries
-        .filter(|entries| !entries.is_empty())
-        .map(serde_json::to_string)
-        .transpose()?;
     let new = idem_repo::NewRecord {
         key,
         payload_hash: record.write.payload_hash.as_bytes(),
@@ -752,8 +822,6 @@ pub(super) async fn write_record(
             RecordBlob::Decision(decision) => versioned_blob(decision)?,
             RecordBlob::Verbatim(blob) => blob.to_owned(),
         },
-        applied_entries: entries,
-        attribution_hash: record.authorized.map(|d| d.as_bytes().to_vec()),
         engine_id: record.policy.map(|p| p.engine_id.clone()),
         policy_id: record.policy.map(|p| p.policy_id.to_string()),
         policy_version: record.policy.and_then(|p| i32::try_from(p.version).ok()),
@@ -770,42 +838,99 @@ pub(super) async fn write_record(
     }
 }
 
-fn record_to_model(row: idempotency_row::Model) -> Result<IdempotencyRecord, TxError> {
-    let bad = |what: &str| {
+/// Everything the charge of an allowed debit or a lease commit records.
+pub(super) struct ChargeWrite<'a> {
+    pub(super) write: &'a IdempotencyWrite,
+    pub(super) decision: &'a Decision,
+    pub(super) policy: Option<&'a PolicyVersion>,
+    pub(super) authorized: AttributionDigest,
+    pub(super) metric: &'a str,
+    pub(super) amount: u64,
+    pub(super) entries: &'a [AppliedEntry],
+    pub(super) return_window_end: OffsetDateTime,
+    pub(super) now: OffsetDateTime,
+}
+
+/// Write the charge, which is the operation's idempotency record (ADR-0011),
+/// in the transaction of its counters. A deleted charge under the scope is
+/// replaced; a live one is [`TxError::Raced`].
+pub(super) async fn write_charge(
+    tx: &impl DBRunner,
+    scope: &AccessScope,
+    charge: &ChargeWrite<'_>,
+) -> Result<(), TxError> {
+    let (row, entries) = charge_rows(charge)?;
+    charge_repo::delete_deleted_at_key(tx, scope, &scope_key_of(&charge.write.scope), charge.now)
+        .await?;
+    match charge_repo::insert(tx, scope, row, entries).await? {
+        idem_repo::Inserted::Yes => Ok(()),
+        idem_repo::Inserted::Raced => Err(TxError::Raced(Box::new(charge.write.clone()))),
+    }
+}
+
+/// The rows of `charge`: the charge and its entries, before the holding flags
+/// and the expiry are set.
+pub(super) fn charge_rows(
+    charge: &ChargeWrite<'_>,
+) -> Result<(charge::Model, Vec<charge_entry::Model>), TxError> {
+    let column = |what: &str| {
         TxError::Storage(StorageError::Internal(format!(
-            "idempotency record has an unreadable {what}"
+            "the {what} of a charge does not fit its column"
         )))
     };
-    let subject_key: [u8; 32] = row
-        .subject_key
-        .clone()
-        .try_into()
-        .map_err(|_| bad("subject key"))?;
-    let payload_hash: [u8; 32] = row
-        .payload_hash
-        .clone()
-        .try_into()
-        .map_err(|_| bad("payload hash"))?;
-    let operation_type = OperationType::ALL
-        .into_iter()
-        .find(|op| op.as_str() == row.operation_type)
-        .ok_or_else(|| bad("operation type"))?;
+    let id = Uuid::now_v7();
+    let tenant_id = charge.write.scope.tenant_id.as_uuid();
+    let mut entries = Vec::with_capacity(charge.entries.len());
+    for entry in charge.entries {
+        entries.push(charge_entry::Model {
+            charge_id: id,
+            chain: i32::try_from(entry.chain).map_err(|_| column("chain"))?,
+            position: i32::try_from(entry.position).map_err(|_| column("position"))?,
+            tenant_id,
+            quota_id: entry.quota_id,
+            period_id: entry.period_id,
+            charged: i64::try_from(entry.amount).map_err(|_| column("charged amount"))?,
+            returned: 0,
+            holding: false,
+        });
+    }
+    let row = charge::Model {
+        id,
+        tenant_id,
+        operation: charge.write.scope.operation_type.as_str().to_owned(),
+        idem_key: charge.write.scope.key.clone(),
+        payload_hash: charge.write.payload_hash.as_bytes().to_vec(),
+        attribution_digest: charge.authorized.as_bytes().to_vec(),
+        decision_blob: versioned_blob(charge.decision)?,
+        engine_id: charge.policy.map(|p| p.engine_id.clone()),
+        policy_id: charge.policy.map(|p| p.policy_id.to_string()),
+        policy_version: charge.policy.and_then(|p| i32::try_from(p.version).ok()),
+        metric: charge.metric.to_owned(),
+        amount: i64::try_from(charge.amount).map_err(|_| column("amount"))?,
+        created_at: charge.now,
+        return_window_end: charge.return_window_end,
+        kept_until: None,
+        expires_at: None,
+    };
+    Ok((row, entries))
+}
+
+fn record_to_model(
+    scope_of: &IdempotencyScope,
+    row: StoredRecord,
+) -> Result<IdempotencyRecord, TxError> {
+    let payload_hash: [u8; 32] = row.payload_hash.try_into().map_err(|_| {
+        TxError::Storage(StorageError::Internal(
+            "idempotency record has an unreadable payload hash".to_owned(),
+        ))
+    })?;
     Ok(IdempotencyRecord {
-        scope: IdempotencyScope {
-            tenant_id: TenantId::new(row.tenant_id),
-            subject_key: IdempotencySubjectKey::from_bytes(subject_key),
-            operation_type,
-            key: row.idem_key,
-        },
+        scope: scope_of.clone(),
         payload_hash: PayloadHash::from_bytes(payload_hash),
-        decision_blob: serde_json::from_str(&row.decision_blob)?,
+        decision_blob: serde_json::from_str(&row.blob)?,
         engine_id: row.engine_id,
         policy_id: row.policy_id.map(quota_enforcement_sdk::PolicyId::new),
         policy_version: row.policy_version.and_then(|v| u32::try_from(v).ok()),
-        attribution_hash: row
-            .attribution_hash
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .map(AttributionDigest::from_bytes),
         created_at: row.created_at,
         expires_at: row.expires_at,
     })
@@ -850,17 +975,20 @@ impl SqlConsumptionStore {
         self.config.read(&self.db, self.now()).await
     }
 
-    /// The Quotas of an applicable set, locked ascending by id (ADR-0002).
+    /// The Quotas of `mutation`'s applicable set, locked ascending by id
+    /// (ADR-0002), that are active and whose conditions hold on its request
+    /// (I15). The conditions are judged on the locked rows.
     pub(super) async fn lock_applicable(
         tx: &impl DBRunner,
         scope: &AccessScope,
-        applicable: &ApplicableQuotas,
+        mutation: &OwnedMutation,
         wait: RowWait,
     ) -> Result<Vec<Quota>, TxError> {
+        let applicable = &mutation.applicable;
         let subjects: Vec<(String, String)> = applicable
             .subjects
             .iter()
-            .map(|s| (s.projection_type.to_string(), s.subject_id.clone()))
+            .map(|s| (s.subject_type.to_string(), s.subject_id.clone()))
             .collect();
         let ids = quota_repo::find_applicable_ids(
             tx,
@@ -875,7 +1003,9 @@ impl SqlConsumptionStore {
         for id in ids {
             if let Some(row) = quota_repo::find_by_id(tx, scope, id, Some(wait)).await? {
                 let quota = quota_mapping::row_to_quota(row)?;
-                if quota.status == QuotaStatus::Active {
+                if quota.status == QuotaStatus::Active
+                    && conditions_hold(&quota.metadata, &mutation.request)
+                {
                     quotas.push(quota);
                 }
             }
@@ -958,20 +1088,11 @@ impl SqlConsumptionStore {
         budget: Option<quota_enforcement_sdk::engine::EvaluationBudget>,
     ) -> Result<(PolicyVersion, Decision), TxError> {
         let policy = Self::select_policy(tx, &mutation.applicable.metric).await?;
-        let arbitration: Vec<Value> = snapshots
-            .iter()
-            .map(|s| Value::Object(s.metadata.clone()))
-            .collect();
         let evaluation: Vec<EvaluationQuota<'_>> = snapshots
             .iter()
-            .zip(&arbitration)
-            .map(|(snapshot, arbitration)| EvaluationQuota {
+            .map(|snapshot| EvaluationQuota {
                 snapshot,
-                tier: match &mutation.user_projection {
-                    Some(user) if snapshot.subject.projection_type == *user => QuotaScopeTier::User,
-                    _ => QuotaScopeTier::Tenant,
-                },
-                arbitration,
+                tier: QuotaScopeTier::of(&snapshot.subject),
             })
             .collect();
         // Resolve the budget from the version selected by this transaction,
@@ -992,7 +1113,7 @@ impl SqlConsumptionStore {
             time: now,
             quotas: &evaluation,
             request: &mutation.request,
-            resource: &mutation.resource,
+            metric_id: mutation.metric_id.as_deref(),
             budget,
         };
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-engine
@@ -1012,10 +1133,11 @@ impl SqlConsumptionStore {
     }
 
     /// Apply a validated plan: settle what the plan's Quotas outgrew, then move
-    /// each counter in plan order.
+    /// each counter, in ascending `quota_id` order (ADR-0002).
     pub(super) async fn apply_plan(
         tx: &impl DBRunner,
         scope: &AccessScope,
+        actor: &Actor,
         quotas: &[Quota],
         decision: &Decision,
         now: OffsetDateTime,
@@ -1023,22 +1145,27 @@ impl SqlConsumptionStore {
     ) -> Result<Applied, TxError> {
         let mut entries = Vec::new();
         let mut crossings = Vec::new();
-        for (quota_id, plan) in &decision.debit_plan {
+        let mut planned: Vec<_> = plan_entries(&decision.debit_plan).collect();
+        planned.sort_by_key(|(_, plan)| plan.quota_id);
+        for ((chain, position), plan) in planned {
+            let quota_id = plan.quota_id;
             let quota = quotas
                 .iter()
-                .find(|quota| quota.id == *quota_id)
+                .find(|quota| quota.id == quota_id)
                 .ok_or_else(|| {
                     TxError::Storage(StorageError::Internal(format!(
                         "the plan names quota {quota_id}, which is not applicable"
                     )))
                 })?;
             if quota.quota_type == QuotaType::Consumption {
-                settle_elapsed_rows(tx, scope, quota, now, enqueuer, RowWait::Nowait).await?;
+                settle_elapsed_rows(tx, scope, actor, quota, now, enqueuer, RowWait::Nowait)
+                    .await?;
             }
             // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-apply
             let (entry, crossing) = debit_counter(
                 tx,
                 scope,
+                actor,
                 quota,
                 plan.amount,
                 now,
@@ -1047,7 +1174,11 @@ impl SqlConsumptionStore {
             )
             .await?;
             // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-apply
-            entries.push(entry);
+            entries.push(AppliedEntry {
+                chain,
+                position,
+                ..entry
+            });
             crossings.extend(crossing);
         }
         Ok(Applied { entries, crossings })
@@ -1235,6 +1366,16 @@ pub(super) fn counters_of(entries: &[AppliedEntry]) -> Vec<CounterSnapshot> {
         .collect()
 }
 
+/// Who a transaction acts as, and what it reads the time and configuration
+/// from and enqueues into.
+#[derive(Clone, Copy)]
+struct TxEnv<'a> {
+    actor: &'a Actor,
+    clock: &'a Clock,
+    enqueuer: &'a Arc<dyn NotificationEnqueuer>,
+    config: &'a ConfigSnapshot,
+}
+
 impl SqlConsumptionStore {
     /// One attempt of `apply_debit_plan`: lock, replay or evaluate, apply,
     /// record, all in the caller's transaction.
@@ -1251,8 +1392,7 @@ impl SqlConsumptionStore {
             enqueuer,
             config,
         } = *env;
-        let quotas =
-            Self::lock_applicable(tx, scope, &mutation.applicable, RowWait::Nowait).await?;
+        let quotas = Self::lock_applicable(tx, scope, mutation, RowWait::Nowait).await?;
         // Rank 2: the scope's stripe keeps out a writer of the
         // same key over other Quotas (I8).
         lock_scopes::<TxError>(tx, &[&mutation.idempotency.scope]).await?;
@@ -1264,7 +1404,7 @@ impl SqlConsumptionStore {
         {
             // Replays return the recorded decision without side effects.
             return Ok(TransitionOutcome::NoOp(EvaluatedDebit {
-                decision: decision_of(&row.decision_blob)?,
+                decision: decision_of(&row.blob)?,
                 mutation: MutationResult::default(),
                 retention: Retention::Recorded {
                     expires_at: row.expires_at,
@@ -1281,34 +1421,50 @@ impl SqlConsumptionStore {
                 retention: Retention::Unrecorded,
             }));
         }
-        let applied = if matches!(decision.result, DecisionResult::Allowed) {
-            Self::apply_plan(tx, scope, &quotas, &decision, now, enqueuer).await?
-        } else {
-            Applied {
-                entries: Vec::new(),
-                crossings: Vec::new(),
-            }
-        };
         let expires_at = expires_at(
             config,
             mutation.applicable.tenant_id,
             mutation.applicable.metric.as_str(),
             now,
         );
-        write_record(
-            tx,
-            scope,
-            &RecordWrite {
-                write: &mutation.idempotency,
-                blob: RecordBlob::Decision(&decision),
-                entries: Some(&applied.entries),
-                authorized: Some(mutation.authorized),
-                policy: Some(&policy),
-                expires_at,
-                now,
-            },
-        )
-        .await?;
+        let applied = if matches!(decision.result, DecisionResult::Allowed) {
+            let applied =
+                Self::apply_plan(tx, scope, actor, &quotas, &decision, now, enqueuer).await?;
+            write_charge(
+                tx,
+                scope,
+                &ChargeWrite {
+                    write: &mutation.idempotency,
+                    decision: &decision,
+                    policy: Some(&policy),
+                    authorized: mutation.authorized,
+                    metric: mutation.applicable.metric.as_str(),
+                    amount: mutation.amount,
+                    entries: &applied.entries,
+                    return_window_end: expires_at,
+                    now,
+                },
+            )
+            .await?;
+            applied
+        } else {
+            write_record(
+                tx,
+                scope,
+                &RecordWrite {
+                    write: &mutation.idempotency,
+                    blob: RecordBlob::Decision(&decision),
+                    policy: Some(&policy),
+                    expires_at,
+                    now,
+                },
+            )
+            .await?;
+            Applied {
+                entries: Vec::new(),
+                crossings: Vec::new(),
+            }
+        };
         let mut result = MutationResult {
             counters: counters_of(&applied.entries),
             threshold_crossings: applied.crossings,
@@ -1343,303 +1499,17 @@ impl SqlConsumptionStore {
     }
 }
 
-/// What an unlocked read of a rollback's original record found: the Quotas to
-/// lock first, and the identity the locked row must still have.
-#[derive(Debug, Clone, Default)]
-struct Discovered {
-    quotas: Vec<Uuid>,
-    identity: Option<(OffsetDateTime, Vec<u8>)>,
-}
-
-/// Who a transaction acts as, and what it reads the time and configuration
-/// from and enqueues into.
-#[derive(Clone, Copy)]
-struct TxEnv<'a> {
-    actor: &'a Actor,
-    clock: &'a Clock,
-    enqueuer: &'a Arc<dyn NotificationEnqueuer>,
-    config: &'a ConfigSnapshot,
-}
-
-impl SqlConsumptionStore {
-    /// One attempt of `apply_rollback`, in the caller's transaction.
-    async fn rollback_in_tx(
-        tx: &impl DBRunner,
-        scope: &AccessScope,
-        target: &RollbackTarget,
-        idempotency: &IdempotencyWrite,
-        events: &[NotificationEvent],
-        discovered: &Discovered,
-        env: &TxEnv<'_>,
-    ) -> Result<TransitionOutcome<AppliedMutation>, TxError> {
-        // Rank 1: the Quotas the original moved, ascending, so
-        // a concurrent debit replaying the same key — which
-        // holds its Quotas and then wants the record — cannot
-        // deadlock against this one.
-        let mut ordered_quotas = discovered.quotas.clone();
-        ordered_quotas.sort_unstable();
-        ordered_quotas.dedup();
-        for quota_id in &ordered_quotas {
-            // Deactivated rows included: a rollback reverses a
-            // Quota that has since been deactivated.
-            quota_repo::find_by_id(tx, scope, *quota_id, Some(RowWait::Nowait)).await?;
-        }
-        // Rank 2: the stripes of this rollback's own scope and
-        // of the original's, whose record it marks (I8).
-        lock_scopes::<TxError>(tx, &[&idempotency.scope, &target.original]).await?;
-        let now = (env.clock)();
-        // Check the rollback key first so replay outlives the
-        // original record's retention window.
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
-        if let Replay::Stored(stored) =
-            replay_of(tx, scope, idempotency, now, Some(RowWait::Nowait)).await?
-        {
-            return Ok(TransitionOutcome::NoOp(AppliedMutation {
-                decision: decision_of(&stored.decision_blob)?,
-                mutation: MutationResult::default(),
-                expires_at: stored.expires_at,
-            }));
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
-        let (original, entries) = Self::locked_original(tx, scope, target, discovered, now).await?;
-        let original_key = scope_key_of(&target.original);
-        let already_reversed = original.reversed_by_key.is_some();
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-apply
-        let (reversed, quotas) = if already_reversed {
-            (Vec::new(), Vec::new())
-        } else {
-            Self::reverse_entries(tx, scope, target, &entries, now).await?
-        };
-        let plan = if already_reversed {
-            std::collections::BTreeMap::new()
-        } else {
-            reversed
-                .iter()
-                .map(|entry| {
-                    (
-                        QuotaId::new(entry.quota_id),
-                        quota_enforcement_sdk::QuotaDebitPlan {
-                            amount: entry.amount,
-                        },
-                    )
-                })
-                .collect()
-        };
-        let decision = Decision::allowed_with_plan(plan);
-        let metric = quotas
-            .first()
-            .map_or_else(String::new, |quota| quota.metric.as_str().to_owned());
-        let expires_at = expires_at(env.config, idempotency.scope.tenant_id, &metric, now);
-        write_record(
-            tx,
-            scope,
-            &RecordWrite {
-                write: idempotency,
-                blob: RecordBlob::Decision(&decision),
-                entries: None,
-                authorized: None,
-                policy: None,
-                expires_at,
-                now,
-            },
-        )
-        .await?;
-        if !already_reversed {
-            // Reversal happens once however many rollback keys
-            // target the original.
-            idem_repo::mark_reversed(tx, scope, &original_key, &idempotency.scope.key).await?;
-            for (entry, quota) in reversed.iter().zip(&quotas) {
-                operation_log_repo::append(
-                    tx,
-                    scope,
-                    Entry {
-                        tenant_id: quota.tenant_id.as_uuid(),
-                        quota_id: entry.quota_id,
-                        operation: operation_log_repo::OP_ROLLBACK,
-                        actor: env.actor,
-                        record_version: 1,
-                        detail: String::new(),
-                        occurred_at: now,
-                    },
-                )
-                .await?;
-                // Emitted even inside the settlement window:
-                // ADR-0004 silences adjusted and threshold events
-                // there, not this one.
-                let event = quota_event(
-                    quota,
-                    NotificationEventKind::QuotaRollbackApplied,
-                    json!({
-                        "original_idempotency_key": target.original.key,
-                        "rolled_back_amount": entry.amount,
-                        "quota_id": QuotaId::new(entry.quota_id),
-                        "principal": env.actor.subject_id,
-                    }),
-                    now,
-                );
-                env.enqueuer
-                    .enqueue_all(tx, std::slice::from_ref(&event))
-                    .await?;
-            }
-            env.enqueuer.enqueue_all(tx, events).await?;
-            // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-apply
-        }
-        Ok(TransitionOutcome::Applied(AppliedMutation {
-            decision,
-            mutation: MutationResult {
-                counters: counters_of(&reversed),
-                threshold_crossings: Vec::new(),
-                event_ids: if already_reversed {
-                    Vec::new()
-                } else {
-                    events.iter().map(|e| e.event_id).collect()
-                },
-            },
-            expires_at,
-        }))
-    }
-
-    /// The rollback's original record, locked and re-verified: still the row
-    /// discovery read, authorized under the request's attribution, and a real
-    /// movement (or a lease commit of zero). Returns it with its entries.
-    async fn locked_original(
-        tx: &impl DBRunner,
-        scope: &AccessScope,
-        target: &RollbackTarget,
-        discovered: &Discovered,
-        now: OffsetDateTime,
-    ) -> Result<(idempotency_row::Model, Vec<AppliedEntry>), TxError> {
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-unknown-if
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-unknown
-        let unknown = || StorageError::OperationNotFound {
-            key: target.original.key.clone(),
-        };
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-lookup
-        let original_key = scope_key_of(&target.original);
-        let original = idem_repo::find(tx, scope, &original_key, now, Some(RowWait::Nowait))
-            .await?
-            .ok_or_else(unknown)?;
-        // The unlocked read decided which Quotas to lock. If
-        // the row is not the one that was read — the key can
-        // expire and be reused by another debit over other
-        // Quotas — nothing here holds the right locks, so the
-        // transaction gives up and the primitive rediscovers
-        // rather than reaching for a rank-1 lock mid-way.
-        if discovered
-            .identity
-            .as_ref()
-            .is_none_or(|(created_at, payload_hash)| {
-                *created_at != original.created_at || *payload_hash != original.payload_hash
-            })
-        {
-            return Err(TxError::Rediscover);
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-lookup
-        // Bind authorization to the original metric and resource,
-        // not only its subjects.
-        let authorized = original
-            .attribution_hash
-            .clone()
-            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-            .map(AttributionDigest::from_bytes);
-        if authorized != Some(target.authorized) {
-            return Err(unknown().into());
-        }
-        let entries: Vec<AppliedEntry> = match &original.applied_entries {
-            Some(json) => serde_json::from_str(json)?,
-            None => Vec::new(),
-        };
-        // A debit that moved nothing is not a committed debit:
-        // a denial records no movement either and must stay
-        // irreversible. A lease commit of zero is a real
-        // operation that kept nothing, so it reverses as a
-        // successful no-op.
-        if entries.is_empty() && target.original.operation_type != OperationType::Commit {
-            return Err(unknown().into());
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-unknown
-        // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-unknown-if
-        Ok((original, entries))
-    }
-
-    /// Lock every Quota and counter row the original moved, refuse a period
-    /// that has settled, and credit each entry back. Returns the reversed
-    /// entries with their new values, and the Quotas in the same order.
-    async fn reverse_entries(
-        tx: &impl DBRunner,
-        scope: &AccessScope,
-        target: &RollbackTarget,
-        entries: &[AppliedEntry],
-        now: OffsetDateTime,
-    ) -> Result<(Vec<AppliedEntry>, Vec<Quota>), TxError> {
-        let unknown = || StorageError::OperationNotFound {
-            key: target.original.key.clone(),
-        };
-        let mut reversed = Vec::new();
-        let mut quotas = Vec::new();
-        let mut ordered = entries.to_vec();
-        ordered.sort_by_key(|entry| entry.quota_id);
-        for entry in &ordered {
-            let row = quota_repo::find_by_id(tx, scope, entry.quota_id, Some(RowWait::Nowait))
-                .await?
-                .ok_or_else(unknown)?;
-            // A Quota deactivated since is still reversed:
-            // deactivation forbids new consumption, not the
-            // undo of a committed one.
-            let quota = quota_mapping::row_to_quota(row)?;
-            if let Some(period_id) = entry.period_id {
-                let period = counter_repo::find_by_period_id_for_update(
-                    tx,
-                    scope,
-                    period_id,
-                    RowWait::Nowait,
-                )
-                .await?
-                .ok_or_else(unknown)?;
-                // Closure is settlement-keyed here: the closing
-                // period stays reversible until its rollover
-                // event has been emitted.
-                // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-settled-if
-                // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-settled
-                if period.is_settled {
-                    return Err(StorageError::PeriodClosed.into());
-                }
-                // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-settled
-                // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-settled-if
-            }
-            quotas.push(quota);
-        }
-        for entry in &ordered {
-            let value = credit_counter(
-                tx,
-                scope,
-                entry.quota_id,
-                entry.period_id,
-                entry.amount,
-                now,
-                RowWait::Nowait,
-            )
-            .await?;
-            reversed.push(AppliedEntry {
-                value,
-                ..entry.clone()
-            });
-        }
-        Ok((reversed, quotas))
-    }
-}
-
 #[async_trait::async_trait]
 impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     async fn apply_debit_plan(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
         const OPERATION: &str = "apply debit plan";
-        let actor = actor_of(ctx);
+        let actor = actor.clone();
         let config = self.config().await?;
         let budget = ContentionBudget::of(&config, [mutation.applicable.metric.as_str()]);
         // Each retry is a complete transaction.
@@ -1678,7 +1548,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                     // record; if it has since gone, run the operation again.
                     if let Some(record) = self.winner_of(&lost).await? {
                         return Ok(TransitionOutcome::NoOp(EvaluatedDebit {
-                            decision: decision_of(&record.decision_blob)
+                            decision: decision_of(&record.blob)
                                 .map_err(|error| lift(OPERATION, error))?,
                             mutation: MutationResult::default(),
                             retention: Retention::Recorded {
@@ -1701,17 +1571,18 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
 
     async fn apply_batch_debit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
-        self.apply_batch_debit_impl(ctx, scope, batch, events).await
+        self.apply_batch_debit_impl(actor, scope, batch, events)
+            .await
     }
 
     async fn apply_credit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         amount: u64,
@@ -1719,7 +1590,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
         const OPERATION: &str = "apply credit";
-        let actor = actor_of(ctx);
+        let actor = actor.clone();
         let metric = self
             .metric_of(scope, quota_id.as_uuid())
             .await
@@ -1764,10 +1635,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                             if quota.tenant_id != TenantId::new(idempotency.tenant_id.as_uuid()) {
                                 return Err(StorageError::SubjectOutOfScope.into());
                             }
-                            let write = idempotency.clone().complete(
-                                IdempotencySubjectKey::of(std::slice::from_ref(&quota.subject)),
-                                OperationType::Credit,
-                            );
+                            let write = idempotency.clone().complete(OperationType::Credit);
                             // Rank 2: the scope's stripe (I8).
                             lock_scopes::<TxError>(tx, &[&write.scope]).await?;
                             // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
@@ -1775,9 +1643,8 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                 replay_of(tx, scope, &write, now, Some(RowWait::Nowait)).await?
                             {
                                 return Ok(TransitionOutcome::NoOp(AppliedMutation {
-                                    decision: decision_of(&stored.decision_blob)?,
+                                    decision: decision_of(&stored.blob)?,
                                     mutation: MutationResult::default(),
-                                    expires_at: stored.expires_at,
                                 }));
                             }
                             // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-idem
@@ -1807,6 +1674,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                 settle_elapsed_rows(
                                     tx,
                                     scope,
+                                    &actor,
                                     &quota,
                                     now,
                                     &enqueuer,
@@ -1833,24 +1701,19 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                 period_id,
                                 amount,
                                 value,
+                                chain: 0,
+                                position: 0,
                             };
-                            let decision = Decision::allowed_with_plan(
-                                [(quota_id, quota_enforcement_sdk::QuotaDebitPlan { amount })]
-                                    .into_iter()
-                                    .collect(),
-                            );
+                            let decision = Decision::allowed_with_plan(plan_of([entry.planned()]));
                             let expires_at =
                                 expires_at(&config, quota.tenant_id, quota.metric.as_str(), now);
-                            // A credit evaluates no policy, so its record carries
-                            // neither engine attribution nor a reversible movement.
+                            // A credit evaluates no policy and writes no charge.
                             write_record(
                                 tx,
                                 scope,
                                 &RecordWrite {
                                     write: &write,
                                     blob: RecordBlob::Decision(&decision),
-                                    entries: None,
-                                    authorized: None,
                                     policy: None,
                                     expires_at,
                                     now,
@@ -1872,6 +1735,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                             )
                             .await?;
                             let adjusted = quota_event(
+                                &actor,
                                 &quota,
                                 NotificationEventKind::QuotaCounterAdjusted,
                                 // The consumer identity the operation was authorized
@@ -1880,7 +1744,7 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                 json!({
                                     "credited_amount": amount,
                                     "quota_id": quota_id,
-                                    "principal": actor.subject_id,
+                                    "principal": actor.to_string(),
                                 }),
                                 now,
                             );
@@ -1896,7 +1760,6 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
                                     threshold_crossings: Vec::new(),
                                     event_ids: events.iter().map(|e| e.event_id).collect(),
                                 },
-                                expires_at,
                             }))
                         })
                     }),
@@ -1923,118 +1786,24 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
         ))
     }
 
-    async fn apply_rollback(
+    async fn apply_return(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
-        target: &RollbackTarget,
-        idempotency: &IdempotencyWrite,
+        ret: &ChargeReturn,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
-        const OPERATION: &str = "apply rollback";
-        let actor = actor_of(ctx);
-        // One budget for the whole call, rediscoveries included, named by the
-        // metric of the first Quota the original moved.
-        let config = self.config().await?;
-        let budget = self
-            .rollback_budget(&config, scope, target)
-            .await
-            .map_err(|error| lift(OPERATION, error))?;
-        // The original row lock normally serializes rollbacks; the arbiter also
-        // protects a reused key that reaches different Quotas.
-        for attempt in 0..RACE_ATTEMPTS {
-            // Rank-free: which Quotas the original moved, so they can be locked
-            // first. A record is immutable once written, so this is either the
-            // row the transaction will lock or one whose key expired and was
-            // reused — which the identity check below catches.
-            let original = {
-                let conn = self
-                    .db
-                    .conn()
-                    .map_err(|error| lift(OPERATION, TxError::Db(error)))?;
-                let key = scope_key_of(&target.original);
-                idem_repo::find(&conn, scope, &key, (self.clock)(), None)
-                    .await
-                    .map_err(|error| lift(OPERATION, error.into()))?
-            };
-            let discovered = match &original {
-                Some(row) => Discovered {
-                    quotas: serde_json::from_str::<Vec<AppliedEntry>>(
-                        row.applied_entries.as_deref().unwrap_or("[]"),
-                    )
-                    .map_err(|error| lift(OPERATION, error.into()))?
-                    .into_iter()
-                    .map(|entry| entry.quota_id)
-                    .collect(),
-                    identity: Some((row.created_at, row.payload_hash.clone())),
-                },
-                None => Discovered::default(),
-            };
-            // A refused lock rolls this transaction back and runs it
-            // again under the budget; a race goes to the arbiter below.
-            let result = with_budget(budget, || {
-                let actor = actor.clone();
-                let wakes = AttemptWakes::begin(&self.enqueuer);
-                let enqueuer = wakes.enqueuer();
-                let clock = Arc::clone(&self.clock);
-                let scope = scope.clone();
-                let events = events.to_vec();
-                let idempotency = idempotency.clone();
-                let target = target.clone();
-                let discovered = discovered.clone();
-                let config = Arc::clone(&config);
-                settling(
-                    wakes,
-                    self.db.transaction_ref_mapped(move |tx| {
-                        Box::pin(async move {
-                            let env = TxEnv {
-                                actor: &actor,
-                                clock: &clock,
-                                enqueuer: &enqueuer,
-                                config: &config,
-                            };
-                            Self::rollback_in_tx(
-                                tx,
-                                &scope,
-                                &target,
-                                &idempotency,
-                                &events,
-                                &discovered,
-                                &env,
-                            )
-                            .await
-                        })
-                    }),
-                )
-            })
-            .await;
-            match result {
-                Ok(outcome) => return Ok(outcome),
-                Err(TxError::Rediscover) => {
-                    // The record under the lock was not the one discovery read,
-                    // so this attempt held the wrong Quota locks. The whole
-                    // transaction rolled back, leaving nothing half written;
-                    // the next attempt rediscovers and locks afresh.
-                    if attempt + 1 == RACE_ATTEMPTS {
-                        return Err(lift(OPERATION, TxError::Rediscover));
-                    }
-                }
-                Err(TxError::Raced(lost)) => {
-                    if let Some(outcome) = self.applied_winner(OPERATION, &lost).await? {
-                        return Ok(outcome);
-                    }
-                    if attempt + 1 == RACE_ATTEMPTS {
-                        return Err(lift(OPERATION, TxError::Raced(lost)));
-                    }
-                }
-                Err(error) => return Err(lift(OPERATION, error)),
-            }
-        }
-        Err(unavailable(
-            OPERATION,
-            "idempotency arbiter",
-            &"the key is being written concurrently",
-        ))
+        self.apply_return_impl(actor, scope, ret, events).await
+    }
+
+    async fn apply_rollback(
+        &self,
+        actor: &Actor,
+        scope: &AccessScope,
+        target: &RollbackTarget,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.apply_rollback_impl(actor, scope, target, events).await
     }
 
     // The counter and the expired holds that correct it are two statements, so
@@ -2043,7 +1812,6 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     // post-return correction and over-report usage, denying work that fits.
     async fn read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
@@ -2052,12 +1820,13 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
 
     async fn bulk_read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
+        in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
-        self.bulk_read_quota_snapshot_impl(scope, pairs, page).await
+        self.bulk_read_quota_snapshot_impl(scope, pairs, page, in_window_only)
+            .await
     }
 
     async fn lookup_idempotency(
@@ -2066,7 +1835,6 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
     ) -> Result<Option<IdempotencyRecord>, StorageError> {
         const OPERATION: &str = "lookup idempotency";
         let now = self.now();
-        let key = scope_key_of(scope_of);
         // A lookup is the caller's own key; the tenant scope it carries is the
         // one the PDP authorized for this operation.
         let scope = AccessScope::allow_all();
@@ -2074,10 +1842,12 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             .db
             .conn()
             .map_err(|error| unavailable(OPERATION, "connection", &error))?;
-        let row = idem_repo::find(&conn, &scope, &key, now, None)
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-lookup
+        let row = find_stored(&conn, &scope, scope_of, now, None)
             .await
             .map_err(|error| lift(OPERATION, error.into()))?;
-        row.map(record_to_model)
+        // @cpt-end:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-lookup
+        row.map(|row| record_to_model(scope_of, row))
             .transpose()
             .map_err(|error| lift(OPERATION, error))
     }
@@ -2088,42 +1858,34 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
         before: OffsetDateTime,
     ) -> Result<u64, StorageError> {
         const OPERATION: &str = "reclaim idempotency";
-        let doomed = {
-            let conn = self
-                .db
-                .conn()
-                .map_err(|error| unavailable(OPERATION, "connection", &error))?;
-            idem_repo::select_expired(&conn, &AccessScope::allow_all(), batch_size, before)
-                .await
-                .map_err(|error| lift(OPERATION, error.into()))?
-        };
-        // One short transaction per key, under the writers' protocol: the
-        // scope's stripe first — skipped, not waited on, while a writer holds
-        // it — then a delete that re-checks the expiry, so a record a writer
-        // put in place of the expired one since the selection survives.
-        let mut deleted = 0;
-        for (tenant_id, subject_key, operation_type, idem_key) in doomed {
-            deleted += self
-                .db
-                .transaction_ref_mapped(move |tx| {
-                    Box::pin(async move {
-                        let scope = AccessScope::allow_all();
-                        let key = idem_repo::ScopeKey {
-                            tenant_id,
-                            subject_key: &subject_key,
-                            operation_type: &operation_type,
-                            idem_key: &idem_key,
-                        };
-                        if !idem_repo::try_lock_stripe(tx, idem_repo::stripe_of(&key)).await? {
-                            return Ok::<_, TxError>(0);
-                        }
-                        Ok(idem_repo::delete_if_expired(tx, &scope, &key, before).await?)
-                    })
+        // One transaction per batch, under the writers' protocol: the scopes'
+        // stripes first — skipped, not waited on, while a writer holds one —
+        // then a delete that re-checks the expiry, so a record a writer put
+        // in place of an expired one since the selection survives. Charges
+        // live in their own table and are never touched here.
+        self.db
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    let all = AccessScope::allow_all();
+                    let doomed = idem_repo::select_expired(tx, &all, batch_size, before).await?;
+                    let mut keys: Vec<_> = doomed
+                        .iter()
+                        .map(
+                            |(tenant_id, operation_type, idem_key)| idem_repo::ScopeKey {
+                                tenant_id: *tenant_id,
+                                operation_type,
+                                idem_key,
+                            },
+                        )
+                        .collect();
+                    let stripes: Vec<i32> = keys.iter().map(idem_repo::stripe_of).collect();
+                    let locked = idem_repo::try_lock_stripes(tx, &stripes).await?;
+                    keys.retain(|key| locked.contains(&idem_repo::stripe_of(key)));
+                    Ok::<_, TxError>(idem_repo::delete_if_expired(tx, &all, &keys, before).await?)
                 })
-                .await
-                .map_err(|error| lift(OPERATION, error))?;
-        }
-        Ok(deleted)
+            })
+            .await
+            .map_err(|error| lift(OPERATION, error))
     }
 
     async fn reclaim_operation_log(
@@ -2140,42 +1902,24 @@ impl crate::domain::ports::ConsumptionStore for SqlConsumptionStore {
             .await
             .map_err(|error| lift(OPERATION, error.into()))
     }
+
+    async fn reclaim_expired_charges(
+        &self,
+        batch_size: u32,
+        now: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        self.reclaim_expired_charges_impl(batch_size, now).await
+    }
+
+    async fn read_held_allocation_charge_stats(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<quota_enforcement_sdk::HeldAllocationCharges>, StorageError> {
+        self.read_held_allocation_charge_stats_impl(before).await
+    }
 }
 
 impl SqlConsumptionStore {
-    /// A rollback's contention budget, named by the metric of the first Quota
-    /// the original moved, read without a lock; the platform default when the
-    /// original is absent or moved nothing.
-    async fn rollback_budget(
-        &self,
-        config: &ConfigSnapshot,
-        scope: &AccessScope,
-        target: &RollbackTarget,
-    ) -> Result<ContentionBudget, TxError> {
-        let original = {
-            let conn = self.db.conn().map_err(TxError::Db)?;
-            idem_repo::find(
-                &conn,
-                scope,
-                &scope_key_of(&target.original),
-                self.now(),
-                None,
-            )
-            .await?
-        };
-        let first = match original.and_then(|row| row.applied_entries) {
-            Some(entries) => serde_json::from_str::<Vec<AppliedEntry>>(&entries)?
-                .first()
-                .map(|entry| entry.quota_id),
-            None => None,
-        };
-        let metric = match first {
-            Some(quota_id) => self.metric_of(scope, quota_id).await?,
-            None => None,
-        };
-        Ok(ContentionBudget::of(config, metric.as_deref()))
-    }
-
     /// The metric of a Quota, read without a lock: it names the contention
     /// budget, which has to be known before the first lock is taken. `None`
     /// for an unknown Quota, whose transaction then reports it properly.
@@ -2198,16 +1942,15 @@ impl SqlConsumptionStore {
     pub(super) async fn winner_of(
         &self,
         lost: &IdempotencyWrite,
-    ) -> Result<Option<idempotency_row::Model>, StorageError> {
+    ) -> Result<Option<StoredRecord>, StorageError> {
         const OPERATION: &str = "resolve idempotency race";
         let now = self.now();
-        let key = scope_key_of(&lost.scope);
         let scope = AccessScope::allow_all();
         let conn = self
             .db
             .conn()
             .map_err(|error| unavailable(OPERATION, "connection", &error))?;
-        let Some(row) = idem_repo::find(&conn, &scope, &key, now, None)
+        let Some(row) = find_stored(&conn, &scope, &lost.scope, now, None)
             .await
             .map_err(|error| lift(OPERATION, error.into()))?
         else {
@@ -2229,23 +1972,15 @@ impl SqlConsumptionStore {
         let Some(row) = self.winner_of(lost).await? else {
             return Ok(None);
         };
-        let decision = decision_of(&row.decision_blob).map_err(|error| lift(operation, error))?;
+        let decision = decision_of(&row.blob).map_err(|error| lift(operation, error))?;
         Ok(Some(TransitionOutcome::NoOp(AppliedMutation {
             decision,
             mutation: MutationResult::default(),
-            expires_at: row.expires_at,
         })))
-    }
-}
-
-pub(super) fn actor_of(ctx: &SecurityContext) -> Actor {
-    Actor {
-        subject_id: ctx.subject_id(),
-        subject_type: None,
     }
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "consumption_store_tests.rs"]
-mod tests;
+pub(super) mod tests;

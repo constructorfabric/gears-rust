@@ -18,7 +18,7 @@ use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
 
-use crate::domain::catalog::MetricClassifications;
+use crate::domain::catalog::{CatalogEntry, MetricCatalog, MetricMode};
 use crate::domain::ports::metrics::{LeaseBacklogSink, MetricLabel};
 
 const LOG_TARGET: &str = "qe.lease-sweeper";
@@ -49,7 +49,7 @@ pub struct LeaseSweepReport {
 #[domain_model]
 pub struct LeaseSweeper {
     storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
-    classifications: Arc<MetricClassifications>,
+    catalog: Arc<MetricCatalog>,
     backlog: Arc<dyn LeaseBacklogSink>,
     timing: LeaseSweepTiming,
 }
@@ -60,13 +60,13 @@ impl LeaseSweeper {
     #[must_use]
     pub fn new(
         storage: Arc<dyn QuotaEnforcementStoragePluginV1>,
-        classifications: Arc<MetricClassifications>,
+        catalog: Arc<MetricCatalog>,
         backlog: Arc<dyn LeaseBacklogSink>,
         timing: LeaseSweepTiming,
     ) -> Self {
         Self {
             storage,
-            classifications,
+            catalog,
             backlog,
             timing,
         }
@@ -115,24 +115,42 @@ impl LeaseSweeper {
         // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-return
     }
 
+    /// Read the metric types of `counts` this replica does not hold, so a
+    /// metric that only another replica has served is not left out of the
+    /// sample. A read that fails leaves them out.
+    async fn hold_metrics(&self, counts: &[(quota_enforcement_sdk::MetricId, u64)]) {
+        let metrics = counts.iter().map(|(metric, _)| metric.as_gts());
+        if let Err(error) = self.catalog.load(metrics).await {
+            tracing::warn!(
+                target: LOG_TARGET,
+                error = %error,
+                "could not read the metric types of the lease backlog; metrics this replica \
+                 does not hold are left out of the sample"
+            );
+        }
+    }
+
     /// Sample the expired-but-unreclaimed backlog into the gauge cell.
     ///
-    /// Storage names only the metrics that have a backlog, so every
+    /// Storage names only the metrics that have a backlog, so every served
     /// quota-gated metric starts at zero: a healthy empty backlog is a zero,
     /// told apart from missing telemetry, which is no data point at all. A
-    /// metric outside the bootstrap snapshot has no label and is left out,
-    /// which keeps the label set closed.
+    /// metric with no served catalogue entry has no label and is left out,
+    /// which keeps the label set to registered metric types.
     async fn publish_backlog(&self, now: OffsetDateTime) {
         match self.storage.count_expired_unreclaimed_leases(now).await {
             Ok(counts) => {
                 let mut backlog: BTreeMap<MetricLabel, u64> = self
-                    .classifications
-                    .quota_gated_labels()
-                    .map(|label| (label.clone(), 0))
+                    .catalog
+                    .served_entries()
+                    .iter()
+                    .filter(|served| served.mode() == MetricMode::QuotaGated)
+                    .map(|served| (served.label().clone(), 0))
                     .collect();
+                self.hold_metrics(&counts).await;
                 for (metric, count) in counts {
-                    if let Some(label) = self.classifications.label(&metric) {
-                        *backlog.entry(label).or_default() += count;
+                    if let Some(CatalogEntry::Served(served)) = self.catalog.peek(&metric) {
+                        *backlog.entry(served.label().clone()).or_default() += count;
                     }
                 }
                 self.backlog.publish(Some(backlog.into_iter().collect()));

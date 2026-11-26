@@ -26,9 +26,9 @@ use quota_enforcement_sdk::engine::PolicySchemaSnapshot;
 use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, DeliveryOutcome, EvaluatedMutation, EventId,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, MetricId, NotificationDeliveryV1,
-    NotificationEvent, NotificationEventKind, NotificationScope, OperationType, PayloadHash,
-    PeriodType, PolicyDraft, PolicyScope, QuotaDraft, QuotaType, SubjectRef, TenantId,
+    IdempotencyScope, IdempotencyWrite, MetricId, NotificationDeliveryV1, NotificationEvent,
+    NotificationEventKind, NotificationScope, OperationType, PayloadHash, PeriodType, PolicyDraft,
+    PolicyScope, QuotaDraft, QuotaType, SubjectRef, TenantId,
 };
 use sea_orm_migration::MigratorTrait as _;
 use testcontainers::runners::AsyncRunner;
@@ -38,7 +38,7 @@ use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::{DeadLetterFilter, DeadLetterScope, OutboxHandle, Records};
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::infra::outbox::NOTIFICATION_POLL_INTERVAL;
@@ -52,8 +52,8 @@ mod common;
 
 use common::{allow_all, limits};
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 /// Well within the reconciler's idle minute: a delivery this fast came from
 /// the commit's wake.
 const PROMPTLY: Duration = Duration::from_secs(5);
@@ -63,23 +63,14 @@ fn tenant() -> TenantId {
 }
 
 fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: None,
     }
-}
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
 }
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -89,6 +80,7 @@ fn changed(tenant: TenantId) -> NotificationEvent {
     NotificationEvent {
         event_id: EventId::generate(),
         kind: NotificationEventKind::QuotaChanged,
+        actor: actor(),
         scope: NotificationScope::Tenant { tenant_id: tenant },
         quota_id: None,
         policy_id: None,
@@ -259,7 +251,7 @@ impl PgHarness {
         let enqueuer: Arc<dyn NotificationOutbox> = Arc::clone(&outbox) as _;
         SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer))
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     engine_id: "cel".to_owned(),
@@ -325,7 +317,6 @@ impl PgHarness {
         let idempotency = IdempotencyWrite {
             scope: IdempotencyScope {
                 tenant_id: tenant(),
-                subject_key: IdempotencySubjectKey::of(&applicable.subjects),
                 operation_type: OperationType::Debit,
                 key: format!("debit-{holder}-{amount}"),
             },
@@ -334,14 +325,13 @@ impl PgHarness {
         let null = serde_json::Value::Null;
         self.store
             .apply_debit_plan(
-                &ctx(),
+                &actor(),
                 &AccessScope::for_tenant(tenant().as_uuid()),
                 &EvaluatedMutation {
                     applicable: &applicable,
                     amount,
                     request: &null,
-                    resource: &null,
-                    user_projection: None,
+                    metric_id: None,
                     limits: limits(),
                     idempotency: &idempotency,
                     authorized: AttributionDigest::from_bytes([7; 32]),

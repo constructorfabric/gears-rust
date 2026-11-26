@@ -1,11 +1,11 @@
 use quota_enforcement_sdk::{
     LEASE_RESOURCE, LeaseToken, OPERATION_RESOURCE, POLICY_RESOURCE, PolicyId, QUOTA_RESOURCE,
+    QuotaMetadataViolation,
 };
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use uuid::Uuid;
 
 use crate::domain::error::{Dependency, DomainError, PluginKind, ResourceKind};
-use crate::domain::ports::metrics::ValidationReason;
 use quota_enforcement_sdk::engine::DebitPlanInvariant;
 
 fn status(err: DomainError) -> u16 {
@@ -32,16 +32,16 @@ fn every_variant_family_maps_to_its_documented_status() {
         ),
         (
             DomainError::ProjectionNotResolvable {
-                projection: "gts.x~".to_owned(),
+                metric: "gts.x~".to_owned(),
             },
             400,
         ),
         (
-            DomainError::CatalogInvalid {
-                reason: ValidationReason::Abstract,
-                subject: "gts.x~".to_owned(),
+            DomainError::PolicyEvaluationFailed {
+                engine_id: "cel".to_owned(),
+                detail: "no such key: regions".to_owned(),
             },
-            503,
+            400,
         ),
         (
             DomainError::LeaseNotActive {
@@ -153,14 +153,11 @@ fn every_variant_family_maps_to_its_documented_status() {
         (DomainError::CapMustBeNonNegative { cap: -1 }, 400),
         (DomainError::ThresholdsRequireBoundedCap, 400),
         (
-            DomainError::ConstraintContractMismatch {
-                contract: "gts.x~".to_owned(),
-            },
-            400,
-        ),
-        (
-            DomainError::MetricClassificationInvalid {
-                metric: "gts.m".to_owned(),
+            DomainError::QuotaMetadataRejected {
+                violations: vec![QuotaMetadataViolation {
+                    path: String::new(),
+                    reason: "not empty".to_owned(),
+                }],
             },
             400,
         ),
@@ -337,18 +334,29 @@ fn quota_lifecycle_rejections_carry_their_tokens_and_subjects() {
             "notification_thresholds",
         ),
         (
-            DomainError::ConstraintContractMismatch {
-                contract: "gts.cf.core.qe.constraint.v1~x.y.z.w.v1~".to_owned(),
+            DomainError::QuotaMetadataRejected {
+                violations: vec![QuotaMetadataViolation {
+                    path: "/regions".to_owned(),
+                    reason: "must be a list".to_owned(),
+                }],
             },
-            "CONSTRAINT_CONTRACT_MISMATCH",
-            "metadata",
+            "QUOTA_METADATA_REJECTED",
+            "metadata/regions",
         ),
         (
-            DomainError::MetricClassificationInvalid {
-                metric: "gts.cf.core.qe.metric_type.v1~cf.test.qe.m.v1".to_owned(),
+            DomainError::ProjectionNotResolvable {
+                metric: "gts.cf.core.quota.metric.v1~cf.test.qe.m.v1~".to_owned(),
             },
-            "METRIC_CLASSIFICATION_INVALID",
-            "gts.cf.core.qe.metric_type.v1~cf.test.qe.m.v1",
+            "PROJECTION_NOT_RESOLVABLE",
+            "gts.cf.core.quota.metric.v1~cf.test.qe.m.v1~",
+        ),
+        (
+            DomainError::PolicyEvaluationFailed {
+                engine_id: "cel".to_owned(),
+                detail: "no such key".to_owned(),
+            },
+            "POLICY_EVALUATION_FAILED",
+            "policy",
         ),
     ];
     for (err, token, subject) in cases {
@@ -462,8 +470,8 @@ fn a_bulk_item_error_keeps_its_category_and_names_the_item() {
     );
 }
 
-/// The variants the status table does not reach: each keeps its documented
-/// status and names its own precondition token or dependency on the wire.
+// The variants the status table does not reach: each keeps its documented
+// status and names its own precondition token or dependency on the wire.
 #[test]
 fn the_remaining_variants_map_to_their_status_and_their_own_token() {
     let cases: Vec<(DomainError, u16, &str)> = vec![
@@ -474,6 +482,27 @@ fn the_remaining_variants_map_to_their_status_and_their_own_token() {
             },
             400,
             "OVER_COMMIT_NOT_AUTHORIZED",
+        ),
+        (
+            DomainError::ReturnExceedsCharge {
+                requested: 9,
+                remaining: 5,
+            },
+            400,
+            "RETURN_EXCEEDS_CHARGE",
+        ),
+        (
+            DomainError::ReturnNotApplicable,
+            400,
+            "RETURN_NOT_APPLICABLE",
+        ),
+        (
+            DomainError::MetricTypeMismatch {
+                requested: "gts.a".to_owned(),
+                charged: "gts.b".to_owned(),
+            },
+            400,
+            "METRIC_TYPE_MISMATCH",
         ),
         (
             DomainError::MetricNotRegistered {

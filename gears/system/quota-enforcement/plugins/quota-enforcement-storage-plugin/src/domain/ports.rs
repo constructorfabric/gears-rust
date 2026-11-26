@@ -1,23 +1,19 @@
 //! Ports the storage plugin's domain depends on. The SQL adapters live in
 //! `infra::storage`; the domain never imports them.
 
-use std::collections::HashSet;
-
 use async_trait::async_trait;
 use quota_enforcement_sdk::{
     ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, BulkCreateEnvelope, BulkCreated,
-    BulkDeactivateEnvelope, BulkDeactivated, BulkUpdateEnvelope, BulkUpdated, ConfigDefaults,
-    DeactivateOutcome, EvaluatedDebit, EvaluatedLease, EvaluatedMutation, ExpiredLease,
-    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseToken, MetricId, NotificationEvent,
-    PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId, PolicyScope,
-    PolicyUpdate, PolicyVersion, PolicyVersionMeta, ProjectionBinding, Quota, QuotaDraft,
-    QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError,
-    TransitionOutcome,
+    BulkDeactivateEnvelope, BulkDeactivated, BulkUpdateEnvelope, BulkUpdated, ChargeReturn,
+    ConfigDefaults, DeactivateOutcome, EvaluatedDebit, EvaluatedLease, EvaluatedMutation,
+    ExpiredLease, HeldAllocationCharges, IdempotencyRecord, IdempotencyScope, LeaseToken, MetricId,
+    NotificationEvent, PageRequest, PageResult, PartialIdempotencyWrite, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, Quota, QuotaDraft, QuotaFilter,
+    QuotaId, QuotaPatch, QuotaSnapshot, RollbackTarget, StorageError, TransitionOutcome,
 };
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
-use toolkit_security::{AccessScope, SecurityContext};
-use uuid::Uuid;
+use toolkit_security::AccessScope;
 
 /// What a `seed_defaults` call did.
 #[domain_model]
@@ -91,13 +87,6 @@ pub enum StoreError {
     /// The continuation cursor does not decode.
     #[error("malformed continuation cursor")]
     InvalidCursor,
-    /// The patch is not one the gear can produce: a `metadata` change without
-    /// the contract it was validated against.
-    #[error("invalid patch: {detail}")]
-    InvalidPatch {
-        /// What is missing.
-        detail: String,
-    },
     /// A filter exceeds the plugin's bounds.
     #[error("invalid filter: {detail}")]
     InvalidFilter {
@@ -151,15 +140,7 @@ impl StoreError {
     }
 }
 
-/// Who performed a mutation, for the operation log.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Actor {
-    /// The caller's subject id.
-    pub subject_id: Uuid,
-    /// The caller's subject type, when the security context carries one.
-    pub subject_type: Option<String>,
-}
+pub use quota_enforcement_sdk::Actor;
 
 /// Schema metadata and the platform-default configuration rows.
 /// The plugin's one notification outbox pipeline.
@@ -234,11 +215,6 @@ pub trait QuotaStore: Send + Sync {
         page: PageRequest,
     ) -> Result<PageResult<Quota>, StoreError>;
 
-    /// Distinct `(metric, projection_type)` pairs of active Quotas.
-    async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StoreError>;
-
     /// Active-Quota counts behind the lifecycle gauges.
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StoreError>;
 
@@ -281,7 +257,7 @@ pub trait ConsumptionStore: Send + Sync {
     /// The contract's variants for `apply_debit_plan`.
     async fn apply_debit_plan(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
@@ -294,7 +270,7 @@ pub trait ConsumptionStore: Send + Sync {
     /// The contract's variants for `apply_batch_debit`.
     async fn apply_batch_debit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
         events: &[NotificationEvent],
@@ -308,7 +284,7 @@ pub trait ConsumptionStore: Send + Sync {
     /// The contract's variants for `apply_credit`.
     async fn apply_credit(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         amount: u64,
@@ -316,18 +292,29 @@ pub trait ConsumptionStore: Send + Sync {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Reverse the committed debit the target names, against its acquisition
-    /// period.
+    /// Give back part of the charge `ret` names.
+    ///
+    /// # Errors
+    ///
+    /// The contract's variants for `apply_return`.
+    async fn apply_return(
+        &self,
+        actor: &Actor,
+        scope: &AccessScope,
+        ret: &ChargeReturn,
+        events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
+
+    /// Give back everything that remains of the charge the target names.
     ///
     /// # Errors
     ///
     /// The contract's variants for `apply_rollback`.
     async fn apply_rollback(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         target: &RollbackTarget,
-        idempotency: &IdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
@@ -339,7 +326,6 @@ pub trait ConsumptionStore: Send + Sync {
     /// `Unavailable` when the backend cannot answer.
     async fn read_quota_snapshot(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
@@ -353,10 +339,10 @@ pub trait ConsumptionStore: Send + Sync {
     /// when the backend cannot answer.
     async fn bulk_read_quota_snapshot(
         &self,
-        ctx: &SecurityContext,
         scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
+        in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError>;
 
     /// The unexpired record under `scope_of`, if one exists.
@@ -390,6 +376,27 @@ pub trait ConsumptionStore: Send + Sync {
         batch_size: u32,
         before: OffsetDateTime,
     ) -> Result<u64, StorageError>;
+
+    /// Remove up to `batch_size` charges deleted at `now`.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn reclaim_expired_charges(
+        &self,
+        batch_size: u32,
+        now: OffsetDateTime,
+    ) -> Result<u64, StorageError>;
+
+    /// The held allocation charges past their return window, per metric.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when the backend cannot answer.
+    async fn read_held_allocation_charge_stats(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<HeldAllocationCharges>, StorageError>;
 }
 
 /// Versioned platform policies. Every mutation is one transaction that moves
@@ -408,7 +415,7 @@ pub trait PolicyStore: Send + Sync {
     /// backend failure commits no version, audit row or event.
     async fn create_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         draft: PolicyDraft,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError>;
@@ -420,7 +427,7 @@ pub trait PolicyStore: Send + Sync {
     /// failure. Nothing is written unless the whole transition commits.
     async fn update_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         update: PolicyUpdate,
         events: &[NotificationEvent],
@@ -434,7 +441,7 @@ pub trait PolicyStore: Send + Sync {
     /// target is `NoOp`, not an error, and writes no audit row or event.
     async fn rollback_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         target_version: u32,
         comment: Option<String>,
@@ -449,7 +456,7 @@ pub trait PolicyStore: Send + Sync {
     /// failure. A repeat against an already-deleted policy is `NoOp`.
     async fn delete_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
@@ -518,7 +525,7 @@ pub trait LeaseStore: Send + Sync {
     /// The contract's variants for `acquire_lease`.
     async fn acquire_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         ttl: std::time::Duration,
@@ -530,12 +537,17 @@ pub trait LeaseStore: Send + Sync {
     /// # Errors
     ///
     /// The contract's variants for `commit_lease`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the settlement names its lease, amount, metric, key and events"
+    )]
     async fn commit_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
+        metric: Option<&MetricId>,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
@@ -547,7 +559,7 @@ pub trait LeaseStore: Send + Sync {
     /// The contract's variants for `release_lease`.
     async fn release_lease(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         token: LeaseToken,
         idempotency: &PartialIdempotencyWrite,

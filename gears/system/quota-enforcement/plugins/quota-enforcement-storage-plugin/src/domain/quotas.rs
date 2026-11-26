@@ -2,18 +2,15 @@
 //! [`QuotaStore`] port with the contract's signatures. The
 //! `impl QuotaEnforcementStoragePluginV1 for StoragePlugin` delegates here.
 //!
-//! The security context contributes the actor of the operation log; the access
-//! scope is what the PDP authorized, re-applied by `SecureORM` on every row.
-
-use std::collections::HashSet;
+//! The actor is what the operation log records; the access scope is what
+//! admission returned, re-applied by `SecureORM` on every row.
 
 use quota_enforcement_sdk::{
     ActiveQuotaCounts, BulkCreateEnvelope, BulkCreated, BulkDeactivateEnvelope, BulkDeactivated,
     BulkUpdateEnvelope, BulkUpdated, DeactivateOutcome, NotificationEvent, PageRequest, PageResult,
-    ProjectionBinding, Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError,
-    TransitionOutcome,
+    Quota, QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, StorageError, TransitionOutcome,
 };
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 
 use super::bootstrap::{FromStore, StoragePlugin};
 use super::ports::{Actor, QuotaStore};
@@ -33,13 +30,13 @@ impl StoragePlugin {
     /// `Internal` for a draft that does not fit its columns.
     pub async fn create_quota(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         draft: QuotaDraft,
         events: &[NotificationEvent],
     ) -> Result<QuotaId, StorageError> {
         self.quotas
-            .create_quota(&actor_of(ctx), scope, draft, events)
+            .create_quota(actor, scope, draft, events)
             .await
             .map_err(StorageError::from_store)
     }
@@ -52,14 +49,14 @@ impl StoragePlugin {
     /// `ThresholdsRequireBoundedCap` (I14), `Unavailable`.
     pub async fn update_quota(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         patch: QuotaPatch,
         events: &[NotificationEvent],
     ) -> Result<Quota, StorageError> {
         self.quotas
-            .update_quota(&actor_of(ctx), scope, quota_id, patch, events)
+            .update_quota(actor, scope, quota_id, patch, events)
             .await
             .map_err(StorageError::from_store)
     }
@@ -72,13 +69,13 @@ impl StoragePlugin {
     /// `QuotaNotFound`, `QuotaDeactivated`, `Unavailable`.
     pub async fn deactivate_quota(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         scope: &AccessScope,
         quota_id: QuotaId,
         events: &[NotificationEvent],
     ) -> Result<DeactivateOutcome, StorageError> {
         self.quotas
-            .deactivate_quota(&actor_of(ctx), scope, quota_id, events)
+            .deactivate_quota(actor, scope, quota_id, events)
             .await
             .map_err(StorageError::from_store)
     }
@@ -90,11 +87,11 @@ impl StoragePlugin {
     /// As the contract documents for `bulk_create_quotas`.
     pub async fn bulk_create_quotas(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &BulkCreateEnvelope,
     ) -> Result<TransitionOutcome<BulkCreated>, StorageError> {
         self.quotas
-            .bulk_create_quotas(&actor_of(ctx), envelope)
+            .bulk_create_quotas(actor, envelope)
             .await
             .map_err(StorageError::from_store)
     }
@@ -106,11 +103,11 @@ impl StoragePlugin {
     /// As the contract documents for `bulk_update_quotas`.
     pub async fn bulk_update_quotas(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &BulkUpdateEnvelope,
     ) -> Result<TransitionOutcome<BulkUpdated>, StorageError> {
         self.quotas
-            .bulk_update_quotas(&actor_of(ctx), envelope)
+            .bulk_update_quotas(actor, envelope)
             .await
             .map_err(StorageError::from_store)
     }
@@ -122,11 +119,11 @@ impl StoragePlugin {
     /// As the contract documents for `bulk_deactivate_quotas`.
     pub async fn bulk_deactivate_quotas(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &BulkDeactivateEnvelope,
     ) -> Result<TransitionOutcome<BulkDeactivated>, StorageError> {
         self.quotas
-            .bulk_deactivate_quotas(&actor_of(ctx), envelope)
+            .bulk_deactivate_quotas(actor, envelope)
             .await
             .map_err(StorageError::from_store)
     }
@@ -139,27 +136,12 @@ impl StoragePlugin {
     /// an over-long id filter.
     pub async fn read_quotas(
         &self,
-        _ctx: &SecurityContext,
         scope: &AccessScope,
         filter: QuotaFilter,
         page: PageRequest,
     ) -> Result<PageResult<Quota>, StorageError> {
         self.quotas
             .read_quotas(scope, filter, page)
-            .await
-            .map_err(StorageError::from_store)
-    }
-
-    /// Distinct `(metric, projection_type)` pairs of active Quotas.
-    ///
-    /// # Errors
-    ///
-    /// `Unavailable`; `Internal` for a row that does not read back.
-    pub async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StorageError> {
-        self.quotas
-            .read_active_projection_bindings()
             .await
             .map_err(StorageError::from_store)
     }
@@ -174,14 +156,6 @@ impl StoragePlugin {
             .read_active_quota_counts()
             .await
             .map_err(StorageError::from_store)
-    }
-}
-
-/// The operation-log actor of a security context.
-fn actor_of(ctx: &SecurityContext) -> Actor {
-    Actor {
-        subject_id: ctx.subject_id(),
-        subject_type: ctx.subject_type().map(str::to_owned),
     }
 }
 

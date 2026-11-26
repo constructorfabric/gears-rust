@@ -147,7 +147,6 @@ async fn create_then_read_round_trips_every_column_and_writes_the_side_rows() {
     assert_eq!(quota.metadata, draft.metadata);
     assert_eq!(quota.source, draft.source);
     assert_eq!(quota.status, QuotaStatus::Active);
-    assert_eq!(quota.constraint_contract, draft.constraint_contract);
     assert_eq!(quota.record_version, 1);
     assert_eq!(quota.created_at, quota.updated_at);
 
@@ -159,8 +158,7 @@ async fn create_then_read_round_trips_every_column_and_writes_the_side_rows() {
     let log = h.log(id).await;
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].operation, OP_QUOTA_CREATE);
-    assert_eq!(log[0].actor_subject_id, actor().subject_id);
-    assert_eq!(log[0].actor_subject_type, actor().subject_type);
+    assert_eq!(log[0].actor, actor().to_string());
     assert_eq!(log[0].record_version, Some(1));
 
     let messages = enqueued_messages(&h.db).await;
@@ -485,7 +483,6 @@ async fn an_update_applies_every_field_bumps_the_version_once_and_logs_field_nam
                 notification_thresholds: Some(vec![25, 75]),
                 validity_window: Some(ValidityWindowPatch::Clear),
                 metadata: Some(json!({ "weight": 9 }).as_object().cloned().expect("object")),
-                constraint_contract: Some(contract_v2()),
                 enforcement_mode: Some(EnforcementMode::Hard),
                 fail_open_hint: Some(true),
             },
@@ -496,11 +493,6 @@ async fn an_update_applies_every_field_bumps_the_version_once_and_logs_field_nam
     assert_eq!(patched.notification_thresholds, vec![25, 75]);
     assert_eq!(patched.validity_window, None);
     assert_eq!(patched.metadata["weight"], json!(9));
-    assert_eq!(
-        patched.constraint_contract,
-        contract_v2(),
-        "the reference moves with the metadata"
-    );
     assert!(patched.fail_open_hint);
     assert_eq!(patched.record_version, 2);
     assert!(patched.updated_at >= patched.created_at);
@@ -516,7 +508,7 @@ async fn an_update_applies_every_field_bumps_the_version_once_and_logs_field_nam
     assert_eq!(log[1].record_version, Some(2));
     assert_eq!(
         log[1].detail,
-        "cap,notification_thresholds,validity_window,metadata,constraint_contract,enforcement_mode,fail_open_hint"
+        "cap,notification_thresholds,validity_window,metadata,enforcement_mode,fail_open_hint"
     );
     assert_eq!(enqueued_messages(&h.db).await.len(), 2);
 
@@ -525,30 +517,7 @@ async fn an_update_applies_every_field_bumps_the_version_once_and_logs_field_nam
         .await
         .expect_err("unknown id");
     assert!(matches!(err, StoreError::QuotaNotFound { .. }), "{err:?}");
-
-    let err = h
-        .update(
-            id,
-            QuotaPatch {
-                metadata: Some(json!({ "weight": 1 }).as_object().cloned().expect("object")),
-                ..QuotaPatch::default()
-            },
-        )
-        .await
-        .expect_err("a metadata patch without its contract is refused before any write");
-    assert!(matches!(err, StoreError::InvalidPatch { .. }), "{err:?}");
-    assert_eq!(h.get(id).await, patched, "nothing written");
-    assert_eq!(h.log(id).await.len(), 2);
     h.down().await;
-}
-
-fn contract_v2() -> quota_enforcement_sdk::ContractRef {
-    quota_enforcement_sdk::ContractRef {
-        type_id: gts::GtsTypeId::new(
-            "gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v2~",
-        ),
-        version: 2,
-    }
 }
 
 #[tokio::test]
@@ -663,7 +632,40 @@ async fn deactivation_flips_the_status_once_and_is_terminal() {
 }
 
 #[tokio::test]
-async fn bindings_and_counts_cover_active_rows_only() {
+async fn counts_carry_each_distinct_condition_set_of_the_active_rows_once() {
+    let h = Harness::up().await;
+    let conditioned = |subject: &str, conditions: serde_json::Value| {
+        let mut draft = draft(tenant(), subject, Some(1));
+        draft.metadata = conditions.as_object().cloned().expect("object");
+        draft
+    };
+    h.create(draft(tenant(), "u0", Some(1))).await;
+    h.create(conditioned("u1", serde_json::json!({ "region": "eu" })))
+        .await;
+    h.create(conditioned("u2", serde_json::json!({ "region": "eu" })))
+        .await;
+    h.create(conditioned("u3", serde_json::json!({ "region": "us" })))
+        .await;
+    let gone = h
+        .create(conditioned("u4", serde_json::json!({ "region": "ap" })))
+        .await;
+    h.store
+        .deactivate_quota(&actor(), &scope_for(tenant()), gone, &[])
+        .await
+        .expect("deactivated");
+
+    let counts = h.store.read_active_quota_counts().await.expect("counts");
+    let sets: Vec<_> = counts
+        .conditions
+        .iter()
+        .map(|set| (set.metadata["region"].as_str().expect("region"), set.quotas))
+        .collect();
+    assert_eq!(sets, [("eu", 2), ("us", 1)]);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn counts_cover_active_rows_only() {
     let h = Harness::up().await;
     h.create(draft(tenant(), "u1", Some(0))).await;
     h.create(draft(tenant(), "u2", None)).await;
@@ -675,19 +677,6 @@ async fn bindings_and_counts_cover_active_rows_only() {
         .deactivate_quota(&actor(), &scope_for(tenant()), gone, &[])
         .await
         .expect("deactivated");
-
-    let bindings = h
-        .store
-        .read_active_projection_bindings()
-        .await
-        .expect("bindings");
-    assert_eq!(bindings.len(), 1, "distinct over active rows: {bindings:?}");
-    let binding = bindings.iter().next().expect("one");
-    assert_eq!(
-        binding.metric.as_str(),
-        draft(tenant(), "x", None).metric.as_str()
-    );
-    assert_eq!(binding.projection_type, user("x").projection_type);
 
     let counts = h.store.read_active_quota_counts().await.expect("counts");
     assert_eq!(counts.cap_zero, 1);

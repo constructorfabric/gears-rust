@@ -5,6 +5,11 @@
 //! gear's bootstrap and readiness paths run against a complete contract
 //! (foundation `DoD`, "Workspace and Crate Skeletons").
 //!
+//! The double knows only the default rows of the configuration tables
+//! (contention timeout, active-lease cap, idempotency retention): the contract
+//! has no method that writes a per-tenant or per-metric row, so behaviour under
+//! such a row is tested against the reference plugin.
+//!
 //! The double accepts an injected failure through `fail_with`, which makes
 //! every later call return that error until `clear_failure`. Singleton
 //! coordination is not a plugin contract of this gear: it is consumed from the
@@ -16,7 +21,7 @@
     reason = "test support: fixtures are built from constant, well-formed inputs"
 )]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,7 +31,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_gts::gts_id;
-use toolkit_security::{AccessScope, ScopeFilter, ScopeValue, SecurityContext, pep_properties};
+use toolkit_security::{AccessScope, ScopeFilter, ScopeValue, pep_properties};
 use uuid::Uuid;
 
 use crate::bulk::{
@@ -38,16 +43,17 @@ use crate::engine::{
     QuotaScopeTier,
 };
 use crate::models::{
-    ActiveQuotaCounts, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchRecord,
-    BootstrapBundle, CapPatch, ConfigDefaults, ContractRef, DeactivateOutcome, DebitPlan, Decision,
-    DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EventId, ExpiredLease,
-    IdempotencyRecord, IdempotencyScope, IdempotencyWrite, LeaseHold, LeaseState, LeaseToken,
-    MetricId, MutationResult, NotificationEvent, NotificationEventKind, NotificationScope,
-    OperationType, PageRequest, PageResult, PartialIdempotencyWrite, PeriodId, PeriodType,
-    PeriodWindow, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersion,
-    PolicyVersionMeta, PolicyVersionState, ProjectionBinding, Quota, QuotaDraft, QuotaFilter,
-    QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus, QuotaType, Retention,
-    RollbackTarget, SubjectRef, TenantId, TransitionOutcome, ValidityWindowPatch,
+    ActiveQuotaCounts, Actor, ApplicableQuotas, AppliedMutation, AttributionDigest, BatchRecord,
+    BootstrapBundle, CapPatch, ChargeReturn, ConfigDefaults, DeactivateOutcome, DebitPlan,
+    Decision, DecisionResult, EnforcementMode, EvaluatedDebit, EvaluatedLease, EventId,
+    ExpiredLease, HeldAllocationCharges, HeldEntry, IdempotencyRecord, IdempotencyScope,
+    IdempotencyWrite, LeaseHold, LeaseState, LeaseToken, MetricId, MutationResult,
+    NotificationEvent, NotificationEventKind, NotificationScope, OperationType, PageRequest,
+    PageResult, PartialIdempotencyWrite, PeriodId, PeriodType, PeriodWindow, PolicyDraft, PolicyId,
+    PolicyScope, PolicyUpdate, PolicyVersion, PolicyVersionMeta, PolicyVersionState, Quota,
+    QuotaDraft, QuotaFilter, QuotaId, QuotaPatch, QuotaSnapshot, QuotaSource, QuotaStatus,
+    QuotaType, Retention, RollbackTarget, SubjectRef, TenantId, TransitionOutcome,
+    ValidityWindowPatch,
 };
 use crate::notifications::{
     DeliveryOutcome, DispatchError, NotificationDeliveryHandle, NotificationDeliveryV1, QuotaEvent,
@@ -69,22 +75,20 @@ pub fn test_tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(0x7e57_0000_0000_0000_0000_0000_0000_0001))
 }
 
-/// A registered-looking metric instance id.
+/// A metric type id derived from the quota metric base.
 #[must_use]
 pub fn test_metric() -> MetricId {
     MetricId::parse(gts_id!(
-        "cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1"
+        "cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~"
     ))
     .expect("well-formed metric id")
 }
 
-/// A user-scope subject under a test owner projection.
+/// A subject of a user subject type derived from the quota subject base.
 #[must_use]
 pub fn test_subject(subject_id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::new(gts_id!(
-            "cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"
-        )),
+        subject_type: GtsTypeId::new(gts_id!("cf.core.quota.subj.v1~acme.core.quota.user.v1~")),
         subject_id: subject_id.to_owned(),
     }
 }
@@ -105,12 +109,6 @@ pub fn quota_draft(subject: SubjectRef, cap: Option<u64>) -> QuotaDraft {
         fail_open_hint: false,
         metadata: serde_json::Map::new(),
         source: QuotaSource::Licensing,
-        constraint_contract: ContractRef {
-            type_id: GtsTypeId::new(gts_id!(
-                "cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~"
-            )),
-            version: 1,
-        },
     }
 }
 
@@ -139,12 +137,10 @@ pub fn consumption_quota_draft(
 struct LeaseRow {
     tenant_id: TenantId,
     metric: MetricId,
-    subject_key: crate::models::IdempotencySubjectKey,
-    /// The attribution the acquisition was authorized under, so a rollback of
-    /// this lease's commit can prove it reverses its own operation.
+    /// The attribution digest the acquisition was admitted under, which the
+    /// charge of its commit takes.
     authorized: AttributionDigest,
-    /// What the acquisition asked for, which the commit's share is measured
-    /// against. The plan's holds need not sum to it.
+    /// What the acquisition asked for; the holds of every chain add up to it.
     reserved_amount: u64,
     holds: Vec<HeldRow>,
     state: LeaseState,
@@ -160,6 +156,8 @@ struct LeaseRow {
 #[derive(Clone)]
 struct HeldRow {
     hold: LeaseHold,
+    /// `(chain, position)` of the plan entry this hold applied.
+    slot: (u32, u32),
     returned: bool,
 }
 
@@ -192,28 +190,50 @@ pub struct PeriodRowView {
     pub settled: bool,
 }
 
-/// One counter movement of a committed debit, kept so a rollback can reverse
+/// One counter movement of a committed debit, kept so a return can give back
 /// exactly what was applied, against the period it was attributed to (I5).
 #[derive(Clone)]
 struct AppliedEntry {
     quota_id: QuotaId,
     period_id: Option<PeriodId>,
     amount: u64,
+    /// `(chain, position)` of the plan entry this movement applied.
+    slot: (u32, u32),
 }
 
-/// What a committed debit left behind for a later rollback: the attribution it
-/// was authorized under, the movements to reverse, and whether some rollback
-/// already reversed them.
+/// The charge of an allowed debit or a lease commit (ADR-0011): the record of
+/// that operation and what each of its entries charged and has had returned.
 #[derive(Clone)]
-struct AppliedDebit {
+struct ChargeRow {
+    /// Names this charge, apart from a later one under the same key.
+    id: Uuid,
+    /// Its `expires_at` is the end of the return window.
+    record: IdempotencyRecord,
     authorized: AttributionDigest,
-    entries: Vec<AppliedEntry>,
-    reversed_by_key: Option<String>,
+    metric: MetricId,
+    /// Kept at least until then by the last return or rollback.
+    kept_until: Option<OffsetDateTime>,
+    entries: Vec<ChargeEntry>,
+}
+
+/// The record of one applied return, deleted with its charge.
+#[derive(Clone)]
+struct ReturnRow {
+    charge_id: Uuid,
+    charge: IdempotencyScope,
+    amount: u64,
+}
+
+#[derive(Clone)]
+struct ChargeEntry {
+    charged: AppliedEntry,
+    returned: u64,
 }
 
 #[derive(Clone)]
 struct LogEntry {
     at: OffsetDateTime,
+    actor: Actor,
     operation: &'static str,
     quota_ids: Vec<QuotaId>,
 }
@@ -240,27 +260,35 @@ struct StorageState {
     current_period: BTreeMap<QuotaId, PeriodId>,
     leases: BTreeMap<LeaseToken, LeaseRow>,
     idempotency: HashMap<IdempotencyScope, IdempotencyRecord>,
-    /// Plugin-private movement log of committed debits, keyed by their scope.
-    applied: HashMap<IdempotencyScope, AppliedDebit>,
+    /// Charges, keyed by the scope of their debit or commit.
+    charges: HashMap<IdempotencyScope, ChargeRow>,
+    /// Return records, keyed by the scope of the return's key.
+    returns: HashMap<IdempotencyScope, ReturnRow>,
     policies: BTreeMap<PolicyId, Vec<PolicyVersion>>,
     events: Vec<NotificationEvent>,
     policy_audit: Vec<PolicyTransitionAudit>,
     log: Vec<LogEntry>,
+    /// Every `AccessScope` a scoped call received, in call order.
+    scopes: Vec<AccessScope>,
     failure: Option<StorageError>,
     /// Test-controlled clock. `None` reads the wall clock.
     now_override: Option<OffsetDateTime>,
     /// When set, [`QuotaEnforcementStoragePluginV1::lookup_idempotency`]
     /// answers `None` even for a record that exists.
     hide_lookups: bool,
+    /// How many of the next lookups answer `None`.
+    hidden_lookups: usize,
 }
 
 /// What one atomic envelope decided: the policy its items selected, their
 /// decisions in submission order, and whether the batch committed. A batch that
 /// did not commit leaves the counters exactly as it found them.
 struct BatchRun {
-    policy: Option<PolicyVersion>,
+    /// The policy each item selected.
+    policies: Vec<PolicyVersion>,
     decisions: Vec<Decision>,
-    entries: Vec<AppliedEntry>,
+    /// The movements of each item.
+    entries: Vec<Vec<AppliedEntry>>,
     committed: bool,
 }
 
@@ -273,7 +301,7 @@ pub struct PolicyTransitionAudit {
     pub version: u32,
     /// Transition kind.
     pub kind: &'static str,
-    /// Actor from the authenticated security context.
+    /// The actor of the transition.
     pub actor: String,
     /// Transition-specific operator comment.
     pub comment: Option<String>,
@@ -336,7 +364,7 @@ impl NotificationDeliveryHandle for DeliveryHandle {
 pub struct RecordingSink {
     id: String,
     script: Mutex<std::collections::VecDeque<Result<(), DispatchError>>>,
-    received: Mutex<Vec<(SecurityContext, QuotaEvent)>>,
+    received: Mutex<Vec<QuotaEvent>>,
 }
 
 impl RecordingSink {
@@ -358,9 +386,9 @@ impl RecordingSink {
         sink
     }
 
-    /// Every call so far: the caller's context and the event.
+    /// Every event received so far.
     #[must_use]
-    pub fn received(&self) -> Vec<(SecurityContext, QuotaEvent)> {
+    pub fn received(&self) -> Vec<QuotaEvent> {
         self.received.lock().clone()
     }
 }
@@ -371,12 +399,8 @@ impl QuotaNotificationSinkV1 for RecordingSink {
         &self.id
     }
 
-    async fn dispatch(
-        &self,
-        ctx: &SecurityContext,
-        event: QuotaEvent,
-    ) -> Result<(), DispatchError> {
-        self.received.lock().push((ctx.clone(), event));
+    async fn dispatch(&self, event: QuotaEvent) -> Result<(), DispatchError> {
+        self.received.lock().push(event);
         self.script.lock().pop_front().unwrap_or(Ok(()))
     }
 }
@@ -608,6 +632,23 @@ impl InMemoryStorage {
         self.state.lock().defaults
     }
 
+    /// The actor of every operation-log entry, oldest first.
+    #[must_use]
+    pub fn operation_log_actors(&self) -> Vec<Actor> {
+        self.state
+            .lock()
+            .log
+            .iter()
+            .map(|entry| entry.actor.clone())
+            .collect()
+    }
+
+    /// Every `AccessScope` a scoped call received, in call order.
+    #[must_use]
+    pub fn scopes(&self) -> Vec<AccessScope> {
+        self.state.lock().scopes.clone()
+    }
+
     /// Every event enqueued so far, in order.
     #[must_use]
     pub fn events(&self) -> Vec<NotificationEvent> {
@@ -675,6 +716,12 @@ impl InMemoryStorage {
     /// inside its own row locks.
     pub fn hide_idempotency_lookups(&self) {
         self.state.lock().hide_lookups = true;
+    }
+
+    /// Make only the next `count` replay lookups miss: the window in which a
+    /// record is committed after one lookup and before the next.
+    pub fn hide_next_idempotency_lookups(&self, count: usize) {
+        self.state.lock().hidden_lookups = count;
     }
 
     /// Drive the double's clock. `None` restores the wall clock.
@@ -746,7 +793,7 @@ impl InMemoryStorage {
         outcome: &impl serde::Serialize,
     ) -> Result<(), StorageError> {
         let blob = Self::blob(&BulkRecord::new(outcome))?;
-        Self::remember(st, write, blob, None, None);
+        Self::remember(st, write, blob, None);
         Ok(())
     }
 
@@ -779,6 +826,7 @@ impl InMemoryStorage {
     /// Insert a new Quota and enqueue its events, as `create_quota` does.
     fn create_in(
         st: &mut StorageState,
+        actor: &Actor,
         draft: QuotaDraft,
         events: &[NotificationEvent],
     ) -> QuotaId {
@@ -801,7 +849,6 @@ impl InMemoryStorage {
                 metadata: draft.metadata,
                 source: draft.source,
                 status: QuotaStatus::Active,
-                constraint_contract: draft.constraint_contract,
                 record_version: 1,
                 created_at: now,
                 updated_at: now,
@@ -817,13 +864,14 @@ impl InMemoryStorage {
                 event
             })
             .collect();
-        Self::push_events(st, &events);
+        Self::push_events(st, actor, &events);
         id
     }
 
     /// Apply a patch under the I6 and I14 guards, as `update_quota` does.
     fn update_in(
         st: &mut StorageState,
+        actor: &Actor,
         quota_id: QuotaId,
         patch: QuotaPatch,
         events: &[NotificationEvent],
@@ -866,13 +914,7 @@ impl InMemoryStorage {
             };
         }
         if let Some(metadata) = patch.metadata {
-            let contract = patch.constraint_contract.ok_or_else(|| {
-                StorageError::Internal(
-                    "metadata patch without the contract it was validated against".to_owned(),
-                )
-            })?;
             quota.metadata = metadata;
-            quota.constraint_contract = contract;
         }
         if let Some(mode) = patch.enforcement_mode {
             quota.enforcement_mode = mode;
@@ -883,7 +925,7 @@ impl InMemoryStorage {
         quota.record_version += 1;
         quota.updated_at = OffsetDateTime::now_utc();
         let updated = quota.clone();
-        Self::push_events(st, events);
+        Self::push_events(st, actor, events);
         Ok(updated)
     }
 
@@ -891,6 +933,7 @@ impl InMemoryStorage {
     /// does.
     fn deactivate_in(
         st: &mut StorageState,
+        actor: &Actor,
         quota_id: QuotaId,
         events: &[NotificationEvent],
     ) -> Result<DeactivateOutcome, StorageError> {
@@ -935,6 +978,7 @@ impl InMemoryStorage {
                     quota_id: hold.quota_id,
                     period_id: hold.period_id,
                     amount: hold.held_amount,
+                    slot: (0, 0),
                 },
             );
         }
@@ -954,6 +998,7 @@ impl InMemoryStorage {
             let event = NotificationEvent {
                 event_id: EventId::generate(),
                 kind: NotificationEventKind::LeaseResolvedByDeactivation,
+                actor: actor.clone(),
                 scope: NotificationScope::Tenant {
                     tenant_id: *tenant_id,
                 },
@@ -969,10 +1014,14 @@ impl InMemoryStorage {
             };
             st.events.push(event);
         }
-        Self::push_events(st, events);
+        Self::push_events(st, actor, events);
         Ok(DeactivateOutcome {
             resolved_leases: resolved,
         })
+    }
+
+    fn record_scope(&self, scope: &AccessScope) {
+        self.state.lock().scopes.push(scope.clone());
     }
 
     /// The transaction clock: a test-set instant, or the wall clock.
@@ -984,6 +1033,7 @@ impl InMemoryStorage {
     /// row, as a real plugin does in the same transaction.
     fn push_events_for(
         st: &mut StorageState,
+        actor: &Actor,
         events: &[NotificationEvent],
         operation: &'static str,
         quota_ids: Vec<QuotaId>,
@@ -992,18 +1042,24 @@ impl InMemoryStorage {
         let at = Self::now(st);
         st.log.push(LogEntry {
             at,
+            actor: actor.clone(),
             operation,
             quota_ids,
         });
         events.iter().map(|e| e.event_id).collect()
     }
 
-    fn push_events(st: &mut StorageState, events: &[NotificationEvent]) -> Vec<EventId> {
-        Self::push_events_for(st, events, "mutation", Vec::new())
+    fn push_events(
+        st: &mut StorageState,
+        actor: &Actor,
+        events: &[NotificationEvent],
+    ) -> Vec<EventId> {
+        Self::push_events_for(st, actor, events, "mutation", Vec::new())
     }
 
     fn event(
         st: &StorageState,
+        actor: &Actor,
         kind: NotificationEventKind,
         quota: &Quota,
         payload: Value,
@@ -1011,6 +1067,7 @@ impl InMemoryStorage {
         NotificationEvent {
             event_id: EventId::generate(),
             kind,
+            actor: actor.clone(),
             scope: NotificationScope::Tenant {
                 tenant_id: quota.tenant_id,
             },
@@ -1063,7 +1120,12 @@ impl InMemoryStorage {
     /// Settle every elapsed, unsettled row of `quota_id`, emitting one
     /// rollover event each. Only a mutation against the current period calls
     /// this, so a dry run never enqueues an event.
-    fn settle_elapsed_rows(st: &mut StorageState, quota_id: QuotaId, now: OffsetDateTime) {
+    fn settle_elapsed_rows(
+        st: &mut StorageState,
+        actor: &Actor,
+        quota_id: QuotaId,
+        now: OffsetDateTime,
+    ) {
         let closing: Vec<PeriodId> = st
             .periods
             .iter()
@@ -1083,6 +1145,7 @@ impl InMemoryStorage {
             };
             let event = Self::event(
                 st,
+                actor,
                 NotificationEventKind::PeriodRollover,
                 &quota,
                 serde_json::json!({
@@ -1162,6 +1225,7 @@ impl InMemoryStorage {
                     quota_id,
                     period_id: held.hold.period_id,
                     amount: held.hold.held_amount,
+                    slot: held.slot,
                 });
             }
         }
@@ -1177,6 +1241,7 @@ impl InMemoryStorage {
     /// threshold events out of that window.
     fn debit_counter(
         st: &mut StorageState,
+        actor: &Actor,
         quota_id: QuotaId,
         amount: u64,
         now: OffsetDateTime,
@@ -1233,6 +1298,7 @@ impl InMemoryStorage {
             if !silent {
                 let event = Self::event(
                     st,
+                    actor,
                     NotificationEventKind::ThresholdCrossed,
                     &quota,
                     serde_json::json!({
@@ -1249,6 +1315,7 @@ impl InMemoryStorage {
             quota_id,
             period_id,
             amount,
+            slot: (0, 0),
         })
     }
 
@@ -1283,7 +1350,7 @@ impl InMemoryStorage {
         st: &StorageState,
         write: &IdempotencyWrite,
     ) -> Result<Option<Value>, StorageError> {
-        let Some(existing) = st.idempotency.get(&write.scope) else {
+        let Some(existing) = Self::stored(st, &write.scope) else {
             return Ok(None);
         };
         if existing.payload_hash != write.payload_hash {
@@ -1292,33 +1359,248 @@ impl InMemoryStorage {
         Ok(Some(existing.decision_blob.clone()))
     }
 
-    /// Record what this transaction decided, attributed to the policy it
-    /// selected. A primitive that evaluates nothing records no attribution.
+    /// The record under `scope`: the live charge of a debit or commit, else
+    /// the idempotency record.
+    fn stored<'s>(st: &'s StorageState, scope: &IdempotencyScope) -> Option<&'s IdempotencyRecord> {
+        Self::live_charge(st, scope)
+            .map(|charge| &charge.record)
+            .or_else(|| st.idempotency.get(scope))
+    }
+
+    /// The charge under `scope` unless it is deleted (ADR-0011): the replay
+    /// window has passed since its creation and its last return or rollback,
+    /// and no allocation entry holds an amount on an active Quota.
+    fn live_charge<'s>(st: &'s StorageState, scope: &IdempotencyScope) -> Option<&'s ChargeRow> {
+        st.charges
+            .get(scope)
+            .filter(|charge| Self::charge_live(st, charge, Self::now(st)))
+    }
+
+    /// Whether `scope` admits the Quotas of every entry of `charge`, as the SQL
+    /// storage reads a charge and its entries under the caller's scope.
+    fn charge_admitted(st: &StorageState, scope: &InMemoryScope<'_>, charge: &ChargeRow) -> bool {
+        charge.entries.iter().all(|entry| {
+            st.quotas
+                .get(&entry.charged.quota_id)
+                .is_some_and(|quota| scope.admits(quota))
+        })
+    }
+
+    fn charge_live(st: &StorageState, charge: &ChargeRow, now: OffsetDateTime) -> bool {
+        now < charge.record.expires_at
+            || charge.kept_until.is_some_and(|kept| now < kept)
+            || Self::holds_active_allocation(st, charge)
+    }
+
+    fn holds_active_allocation(st: &StorageState, charge: &ChargeRow) -> bool {
+        charge.entries.iter().any(|entry| {
+            entry.returned < entry.charged.amount
+                && st.quotas.get(&entry.charged.quota_id).is_some_and(|quota| {
+                    quota.quota_type == QuotaType::Allocation && quota.status == QuotaStatus::Active
+                })
+        })
+    }
+
+    /// Give back `amount` of the live charge under `scope` (ADR-0011): unwind
+    /// it over the entries, grow each reached entry's returned amount, and
+    /// lower the counters of the entries whose Quota takes a return. Returns
+    /// the reached entries and the counters that moved.
+    fn give_back(
+        st: &mut StorageState,
+        actor: &Actor,
+        scope: &IdempotencyScope,
+        amount: u64,
+        operation: &'static str,
+    ) -> Result<(DebitPlan, MutationResult), StorageError> {
+        let now = Self::now(st);
+        let charge = Self::live_charge(st, scope).cloned().ok_or_else(|| {
+            StorageError::OperationNotFound {
+                key: scope.key.clone(),
+            }
+        })?;
+        let held: Vec<HeldEntry> = charge
+            .entries
+            .iter()
+            .map(|entry| HeldEntry {
+                chain: entry.charged.slot.0,
+                position: entry.charged.slot.1,
+                held: entry.charged.amount - entry.returned,
+            })
+            .collect();
+        let remaining = Self::remaining(&held);
+        let exceeds = StorageError::ReturnExceedsCharge {
+            requested: amount,
+            remaining,
+        };
+        if amount > remaining {
+            return Err(exceeds);
+        }
+        let taken = crate::models::unwind(&held, amount).map_err(|_| exceeds)?;
+        let can_take = |st: &StorageState, entry: &ChargeEntry| {
+            let Some(quota) = st.quotas.get(&entry.charged.quota_id) else {
+                return false;
+            };
+            match quota.quota_type {
+                QuotaType::Allocation => true,
+                QuotaType::Consumption => {
+                    now < charge.record.expires_at
+                        && entry
+                            .charged
+                            .period_id
+                            .and_then(|id| st.periods.get(&id))
+                            .is_some_and(|row| !row.settled)
+                }
+                QuotaType::Rate => false,
+            }
+        };
+        if !charge
+            .entries
+            .iter()
+            .zip(&taken)
+            .any(|(entry, take)| *take > 0 && can_take(st, entry))
+        {
+            return Err(StorageError::ReturnNotApplicable);
+        }
+        let mut reached = Vec::new();
+        let mut moved = Vec::new();
+        for (entry, take) in charge.entries.iter().zip(&taken) {
+            if *take == 0 {
+                continue;
+            }
+            let part = AppliedEntry {
+                amount: *take,
+                ..entry.charged.clone()
+            };
+            if can_take(st, entry) {
+                Self::credit_counter(st, &part, now);
+                moved.push(part.clone());
+            }
+            reached.push(part);
+        }
+        let retention = st.defaults.map_or(86_400, |d| d.idempotency_retention_secs);
+        if let Some(stored) = st.charges.get_mut(scope) {
+            for (entry, take) in stored.entries.iter_mut().zip(&taken) {
+                entry.returned += take;
+            }
+            stored.kept_until = Some(now + Duration::from_secs(retention));
+        }
+        let mut result = Self::counters_of(st, &moved);
+        if let Some(quota) = moved
+            .first()
+            .and_then(|entry| st.quotas.get(&entry.quota_id))
+            .cloned()
+        {
+            // Emitted even inside the settlement window: ADR-0004 silences
+            // adjusted and threshold events there, not this one.
+            let event = Self::event(
+                st,
+                actor,
+                NotificationEventKind::QuotaRollbackApplied,
+                &quota,
+                serde_json::json!({
+                    "operation": scope.operation_type.as_str(),
+                    "idempotency_key": scope.key,
+                    "returned_amount": amount,
+                    "remaining_amount": remaining - amount,
+                    "affected_quotas": moved.iter().map(|entry| entry.quota_id).collect::<Vec<_>>(),
+                    "principal": actor.to_string(),
+                }),
+            );
+            result.event_ids.push(event.event_id);
+            st.events.push(event);
+        }
+        Self::push_events_for(
+            st,
+            actor,
+            &[],
+            operation,
+            moved.iter().map(|entry| entry.quota_id).collect(),
+        );
+        Ok((Self::plan_of_entries(&reached), result))
+    }
+
+    /// What remains of a charge: the least any chain still holds.
+    fn remaining(held: &[HeldEntry]) -> u64 {
+        let mut chains: BTreeMap<u32, u64> = BTreeMap::new();
+        for entry in held {
+            *chains.entry(entry.chain).or_default() += entry.held;
+        }
+        chains.into_values().min().unwrap_or(0)
+    }
+
+    /// The record of what this transaction decided, attributed to the policy
+    /// it selected, kept for the replay window.
+    fn record_of(
+        st: &StorageState,
+        write: &IdempotencyWrite,
+        blob: Value,
+        policy: Option<&PolicyVersion>,
+    ) -> IdempotencyRecord {
+        let retention = st.defaults.map_or(86_400, |d| d.idempotency_retention_secs);
+        let now = Self::now(st);
+        IdempotencyRecord {
+            scope: write.scope.clone(),
+            payload_hash: write.payload_hash,
+            decision_blob: blob,
+            engine_id: policy.map(|p| p.engine_id.clone()),
+            policy_id: policy.map(|p| p.policy_id.clone()),
+            policy_version: policy.map(|p| p.version),
+            created_at: now,
+            expires_at: now + Duration::from_secs(retention),
+        }
+    }
+
+    /// Record what this transaction decided. A primitive that evaluates
+    /// nothing records no policy.
     fn remember(
         st: &mut StorageState,
         write: &IdempotencyWrite,
         blob: Value,
         policy: Option<&PolicyVersion>,
-        authorized: Option<AttributionDigest>,
     ) -> OffsetDateTime {
-        let retention = st.defaults.map_or(86_400, |d| d.idempotency_retention_secs);
-        let now = Self::now(st);
-        let expires_at = now + Duration::from_secs(retention);
-        st.idempotency.insert(
+        let record = Self::record_of(st, write, blob, policy);
+        let expires_at = record.expires_at;
+        st.idempotency.insert(write.scope.clone(), record);
+        expires_at
+    }
+
+    /// Write the charge of an allowed debit or a lease commit, which is its
+    /// record. Returns the end of its return window.
+    fn charge(
+        st: &mut StorageState,
+        write: &IdempotencyWrite,
+        blob: Value,
+        policy: Option<&PolicyVersion>,
+        authorized: AttributionDigest,
+        metric: &MetricId,
+        entries: &[AppliedEntry],
+    ) -> OffsetDateTime {
+        let record = Self::record_of(st, write, blob, policy);
+        let expires_at = record.expires_at;
+        st.charges.insert(
             write.scope.clone(),
-            IdempotencyRecord {
-                scope: write.scope.clone(),
-                payload_hash: write.payload_hash,
-                decision_blob: blob,
-                engine_id: policy.map(|p| p.engine_id.clone()),
-                policy_id: policy.map(|p| p.policy_id.clone()),
-                policy_version: policy.map(|p| p.version),
-                attribution_hash: authorized,
-                created_at: now,
-                expires_at,
+            ChargeRow {
+                id: Uuid::now_v7(),
+                record,
+                authorized,
+                metric: metric.clone(),
+                kept_until: None,
+                entries: entries
+                    .iter()
+                    .map(|entry| ChargeEntry {
+                        charged: entry.clone(),
+                        returned: 0,
+                    })
+                    .collect(),
             },
         );
         expires_at
+    }
+
+    /// Whether `scope` of a batch item names a record of a single debit: a
+    /// `debit` charge or the record of a denied debit.
+    fn item_key_taken(st: &StorageState, scope: &IdempotencyScope) -> bool {
+        Self::stored(st, scope).is_some()
     }
 
     /// The versioned blob a record stores: the decision plus its schema
@@ -1336,11 +1618,9 @@ impl InMemoryStorage {
 
     /// A stored record's retention, for the replay that returns it.
     fn retention_of(st: &StorageState, scope: &IdempotencyScope) -> Retention {
-        st.idempotency
-            .get(scope)
-            .map_or(Retention::Unrecorded, |record| Retention::Recorded {
-                expires_at: record.expires_at,
-            })
+        Self::stored(st, scope).map_or(Retention::Unrecorded, |record| Retention::Recorded {
+            expires_at: record.expires_at,
+        })
     }
 
     /// What a primitive that evaluates no policy applied: a credit, a rollback
@@ -1400,23 +1680,17 @@ impl InMemoryStorage {
         let snapshots: Vec<QuotaSnapshot> = st
             .quotas
             .values()
-            .filter(|q| Self::matches(q, mutation.applicable))
+            .filter(|q| {
+                Self::matches(q, mutation.applicable)
+                    && crate::conditions_hold(&q.metadata, mutation.request)
+            })
             .map(|q| Self::snapshot(st, q))
-            .collect();
-        let arbitration: Vec<Value> = snapshots
-            .iter()
-            .map(|s| Value::Object(s.metadata.clone()))
             .collect();
         let quotas: Vec<EvaluationQuota<'_>> = snapshots
             .iter()
-            .zip(&arbitration)
-            .map(|(snapshot, arbitration)| EvaluationQuota {
+            .map(|snapshot| EvaluationQuota {
                 snapshot,
-                tier: match mutation.user_projection {
-                    Some(user) if &snapshot.subject.projection_type == user => QuotaScopeTier::User,
-                    _ => QuotaScopeTier::Tenant,
-                },
-                arbitration,
+                tier: QuotaScopeTier::of(&snapshot.subject),
             })
             .collect();
         // Resolve the budget from the version selected by this transaction,
@@ -1438,7 +1712,7 @@ impl InMemoryStorage {
                 time: OffsetDateTime::now_utc(),
                 quotas: &quotas,
                 request: mutation.request,
-                resource: mutation.resource,
+                metric_id: mutation.metric_id,
                 budget,
             };
             (mutation.evaluate)(&context).map_err(|failure| match failure {
@@ -1465,11 +1739,12 @@ impl InMemoryStorage {
     /// more before anything is kept.
     fn run_batch(
         st: &mut StorageState,
+        actor: &Actor,
         batch: &EvaluatedBatch<'_>,
     ) -> Result<BatchRun, StorageError> {
         let mut decisions = Vec::with_capacity(batch.items.len());
-        let mut entries = Vec::new();
-        let mut policy = None;
+        let mut entries = Vec::with_capacity(batch.items.len());
+        let mut policies = Vec::with_capacity(batch.items.len());
         let mut denied = false;
         let now = Self::now(st);
         if batch.timer.arm().is_zero() {
@@ -1479,36 +1754,27 @@ impl InMemoryStorage {
             let item = entry.item;
             let budget = EvaluationBudget::within(batch.timer.remaining(), batch.limits.cost_limit)
                 .ok_or(StorageError::BatchTimeout)?;
-            let idempotency = IdempotencyWrite {
-                scope: item
-                    .item_scope
-                    .clone()
-                    .unwrap_or_else(|| batch.envelope.scope.clone()),
-                payload_hash: batch.envelope.payload_hash,
-            };
             let (selected, decision) = Self::evaluated_within(
                 st,
                 &EvaluatedMutation {
                     applicable: &item.applicable,
                     amount: item.amount,
                     request: &item.request,
-                    resource: &item.resource,
-                    user_projection: entry.user_projection,
+                    metric_id: item.metric_id.as_deref(),
                     limits: batch.limits,
-                    idempotency: &idempotency,
+                    idempotency: &item.idempotency,
                     authorized: item.authorized,
                     evaluate: Arc::clone(&batch.evaluate),
                 },
                 Some(budget),
             )
             .map_err(Self::batch_timeout)?;
-            // The record carries the first item's policy; each decision
-            // carries its own attribution.
-            policy.get_or_insert(selected);
+            policies.push(selected);
             if matches!(decision.result, DecisionResult::Denied { .. }) {
                 denied = true;
+                entries.push(Vec::new());
             } else {
-                entries.extend(Self::debit(st, &decision.debit_plan, now)?);
+                entries.push(Self::debit(st, actor, &decision.debit_plan, now)?);
             }
             decisions.push(decision);
         }
@@ -1516,7 +1782,7 @@ impl InMemoryStorage {
             return Err(StorageError::BatchTimeout);
         }
         Ok(BatchRun {
-            policy,
+            policies,
             decisions,
             entries,
             committed: !denied,
@@ -1538,18 +1804,35 @@ impl InMemoryStorage {
     /// mutation and settling any period the plan's Quotas have outgrown.
     fn debit(
         st: &mut StorageState,
+        actor: &Actor,
         plan: &DebitPlan,
         now: OffsetDateTime,
     ) -> Result<Vec<AppliedEntry>, StorageError> {
-        for id in plan.keys() {
-            Self::active_quota(st, *id)?;
+        for (_, entry) in crate::models::plan_entries(plan) {
+            Self::active_quota(st, entry.quota_id)?;
         }
-        for id in plan.keys() {
-            Self::settle_elapsed_rows(st, *id, now);
+        for (_, entry) in crate::models::plan_entries(plan) {
+            Self::settle_elapsed_rows(st, actor, entry.quota_id, now);
         }
-        plan.iter()
-            .map(|(id, entry)| Self::debit_counter(st, *id, entry.amount, now))
+        crate::models::plan_entries(plan)
+            .map(|(slot, entry)| {
+                Self::debit_counter(st, actor, entry.quota_id, entry.amount, now)
+                    .map(|applied| AppliedEntry { slot, ..applied })
+            })
             .collect()
+    }
+
+    /// The plan a set of movements applied.
+    fn plan_of_entries(entries: &[AppliedEntry]) -> DebitPlan {
+        crate::models::plan_of(entries.iter().map(|entry| {
+            (
+                entry.slot,
+                crate::models::QuotaDebitPlan {
+                    quota_id: entry.quota_id,
+                    amount: entry.amount,
+                },
+            )
+        }))
     }
 
     /// Counter state after a set of movements, each reported against the row it
@@ -1641,18 +1924,24 @@ impl InMemoryStorage {
             .find(|v| v.state == PolicyVersionState::Active)
     }
 
-    /// Settle a lease: commit keeps its apportioned share and returns the rest,
-    /// release keeps nothing. The two differ only in what they keep and in the
+    /// Settle a lease: commit unwinds the unused part from the holds and keeps
+    /// the rest, release keeps nothing. The two differ only in what they keep and in the
     /// terminal state they leave behind, so they share one body.
     ///
     /// The idempotency scope is completed from the key the acquisition
     /// persisted, never from caller input, and the replay check runs before the
     /// lease-state guards, so a settlement that already succeeded replays even
     /// though its lease is no longer active.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the contract's commit arguments plus the operation"
+    )]
     fn settle(
         &self,
+        actor: &Actor,
         token: LeaseToken,
         actual_amount: Option<u64>,
+        metric: Option<&MetricId>,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
         operation: OperationType,
@@ -1664,59 +1953,57 @@ impl InMemoryStorage {
                 .filter(|lease| lease.tenant_id == idempotency.tenant_id)
                 .cloned()
                 .ok_or(StorageError::LeaseNotFound { token })?;
-            let write = idempotency.clone().complete(lease.subject_key, operation);
+            let write = idempotency.clone().complete(operation);
             if let Some(blob) = Self::replayed(st, &write)? {
-                let expires_at = Self::retention_of(st, &write.scope)
-                    .expires_at()
-                    .unwrap_or_else(|| Self::now(st));
                 return Ok(TransitionOutcome::NoOp(AppliedMutation {
                     decision: Self::decision_from(blob)?,
                     mutation: MutationResult::default(),
-                    expires_at,
                 }));
             }
             let now = Self::now(st);
             if lease.state != LeaseState::Active || lease.expires_at <= now {
                 return Err(StorageError::LeaseNotActive { token });
             }
-            let amounts: Vec<u64> = lease.holds.iter().map(|h| h.hold.held_amount).collect();
-            let reserved = std::num::NonZeroU64::new(lease.reserved_amount);
+            if let Some(metric) = metric.filter(|metric| **metric != lease.metric) {
+                return Err(StorageError::MetricTypeMismatch {
+                    requested: metric.as_str().to_owned(),
+                    charged: lease.metric.as_str().to_owned(),
+                });
+            }
             let actual = actual_amount.unwrap_or(lease.reserved_amount);
-            let kept =
-                match reserved {
-                    Some(reserved) => crate::models::apportion(&amounts, actual, reserved)
-                        .map_err(|error| match error {
-                            crate::models::ApportionError::OverCommit => {
-                                StorageError::OverCommitNotAuthorized {
-                                    reserved: reserved.get(),
-                                    actual,
-                                }
-                            }
-                            crate::models::ApportionError::Overflow => {
-                                StorageError::Internal(error.to_string())
-                            }
-                        })?,
-                    // An acquisition never reserves zero, so this is unreachable;
-                    // returning everything is the safe reading of "kept nothing".
-                    None => vec![0; amounts.len()],
-                };
-            let mut entries = Vec::with_capacity(amounts.len());
-            for (held_row, kept) in lease.holds.iter().zip(&kept) {
-                let hold = &held_row.hold;
-                let returned = hold.held_amount.saturating_sub(*kept);
+            if actual > lease.reserved_amount {
+                return Err(StorageError::OverCommitNotAuthorized {
+                    reserved: lease.reserved_amount,
+                    actual,
+                });
+            }
+            let entries_held: Vec<crate::models::HeldEntry> = lease
+                .holds
+                .iter()
+                .map(|row| crate::models::HeldEntry {
+                    chain: row.slot.0,
+                    position: row.slot.1,
+                    held: row.hold.held_amount,
+                })
+                .collect();
+            let returns = crate::models::unwind(&entries_held, lease.reserved_amount - actual)
+                .map_err(|error| StorageError::Internal(error.to_string()))?;
+            let mut entries = Vec::with_capacity(returns.len());
+            for (held_row, returned) in lease.holds.iter().zip(returns) {
                 let entry = AppliedEntry {
-                    quota_id: hold.quota_id,
-                    period_id: hold.period_id,
+                    quota_id: held_row.hold.quota_id,
+                    period_id: held_row.hold.period_id,
                     amount: returned,
+                    slot: held_row.slot,
                 };
                 // Against the acquisition period, whatever period the wall
                 // clock is in now (I5).
                 Self::credit_counter(st, &entry, now);
-                if *kept > 0 {
+                let kept = held_row.hold.held_amount - returned;
+                if kept > 0 {
                     entries.push(AppliedEntry {
-                        quota_id: hold.quota_id,
-                        period_id: hold.period_id,
-                        amount: *kept,
+                        amount: kept,
+                        ..entry
                     });
                 }
             }
@@ -1729,37 +2016,26 @@ impl InMemoryStorage {
                     held.returned = true;
                 }
             }
-            let plan: DebitPlan = entries
-                .iter()
-                .map(|entry| {
-                    (
-                        entry.quota_id,
-                        crate::models::QuotaDebitPlan {
-                            amount: entry.amount,
-                        },
-                    )
-                })
-                .collect();
             // Settling evaluates nothing: the plan was fixed at acquisition.
-            let decision = Self::applied(plan);
+            let decision = Self::applied(Self::plan_of_entries(&entries));
             let mut result = Self::counters_of(st, &entries);
             let blob = Self::versioned_blob(&decision)?;
-            let expires_at = Self::remember(st, &write, blob, None, None);
             if operation == OperationType::Commit {
-                // A commit produces a debit addressable by this call's key, so
-                // a rollback can reverse exactly what it kept. A zero commit
-                // records no movement and reverses as a successful no-op.
-                st.applied.insert(
-                    write.scope.clone(),
-                    AppliedDebit {
-                        authorized: lease.authorized,
-                        entries: entries.clone(),
-                        reversed_by_key: None,
-                    },
+                Self::charge(
+                    st,
+                    &write,
+                    blob,
+                    None,
+                    lease.authorized,
+                    &lease.metric,
+                    &entries,
                 );
+            } else {
+                Self::remember(st, &write, blob, None);
             }
             result.event_ids = Self::push_events_for(
                 st,
+                actor,
                 events,
                 match operation {
                     OperationType::Release => "lease_release",
@@ -1770,7 +2046,6 @@ impl InMemoryStorage {
             Ok(TransitionOutcome::Applied(AppliedMutation {
                 decision,
                 mutation: result,
-                expires_at,
             }))
         })
     }
@@ -1802,22 +2077,6 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         Ok(())
     }
 
-    async fn read_active_projection_bindings(
-        &self,
-    ) -> Result<HashSet<ProjectionBinding>, StorageError> {
-        let st = self.state.lock();
-        Self::check(&st)?;
-        Ok(st
-            .quotas
-            .values()
-            .filter(|quota| quota.status == QuotaStatus::Active)
-            .map(|quota| ProjectionBinding {
-                metric: quota.metric.clone(),
-                projection_type: quota.subject.projection_type.clone(),
-            })
-            .collect())
-    }
-
     async fn read_active_quota_counts(&self) -> Result<ActiveQuotaCounts, StorageError> {
         let st = self.state.lock();
         Self::check(&st)?;
@@ -1833,25 +2092,40 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 Some(_) => {}
             }
             *counts.by_metric.entry(quota.metric.clone()).or_insert(0) += 1;
+            if quota.metadata.is_empty() {
+                continue;
+            }
+            match counts
+                .conditions
+                .iter_mut()
+                .find(|set| set.metric == quota.metric && set.metadata == quota.metadata)
+            {
+                Some(set) => set.quotas += 1,
+                None => counts.conditions.push(crate::ActiveConditions {
+                    metric: quota.metric.clone(),
+                    metadata: quota.metadata.clone(),
+                    quotas: 1,
+                }),
+            }
         }
         Ok(counts)
     }
 
     async fn create_quota(
         &self,
-        _ctx: &SecurityContext,
+        actor: &Actor,
         _scope: &AccessScope,
         draft: QuotaDraft,
         events: &[NotificationEvent],
     ) -> Result<QuotaId, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
-        Ok(Self::create_in(&mut st, draft, events))
+        Ok(Self::create_in(&mut st, actor, draft, events))
     }
 
     async fn update_quota(
         &self,
-        _ctx: &SecurityContext,
+        actor: &Actor,
         _scope: &AccessScope,
         quota_id: QuotaId,
         patch: QuotaPatch,
@@ -1859,24 +2133,24 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
     ) -> Result<Quota, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
-        Self::update_in(&mut st, quota_id, patch, events)
+        Self::update_in(&mut st, actor, quota_id, patch, events)
     }
 
     async fn deactivate_quota(
         &self,
-        _ctx: &SecurityContext,
+        actor: &Actor,
         _scope: &AccessScope,
         quota_id: QuotaId,
         events: &[NotificationEvent],
     ) -> Result<DeactivateOutcome, StorageError> {
         let mut st = self.state.lock();
         Self::check(&st)?;
-        Self::deactivate_in(&mut st, quota_id, events)
+        Self::deactivate_in(&mut st, actor, quota_id, events)
     }
 
     async fn bulk_create_quotas(
         &self,
-        _ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &BulkCreateEnvelope,
     ) -> Result<TransitionOutcome<BulkCreated>, StorageError> {
         self.transact(|st| {
@@ -1888,7 +2162,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 if entry.draft.tenant_id != envelope.tenant_id {
                     return Err(StorageError::SubjectOutOfScope.at_item(index));
                 }
-                let quota_id = Self::create_in(st, entry.draft.clone(), &entry.events);
+                let quota_id = Self::create_in(st, actor, entry.draft.clone(), &entry.events);
                 items.push(BulkCreatedItem {
                     index,
                     idempotency_key: entry.idempotency_key.clone(),
@@ -1903,7 +2177,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn bulk_update_quotas(
         &self,
-        _ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &BulkUpdateEnvelope,
     ) -> Result<TransitionOutcome<BulkUpdated>, StorageError> {
         self.transact(|st| {
@@ -1916,9 +2190,14 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             for (index, entry) in envelope.items.iter().enumerate() {
                 Self::visible(st, envelope.tenant_id, entry.quota_id)
                     .map_err(|e| e.at_item(index))?;
-                let updated =
-                    Self::update_in(st, entry.quota_id, entry.patch.clone(), &entry.events)
-                        .map_err(|e| e.at_item(index))?;
+                let updated = Self::update_in(
+                    st,
+                    actor,
+                    entry.quota_id,
+                    entry.patch.clone(),
+                    &entry.events,
+                )
+                .map_err(|e| e.at_item(index))?;
                 items.push(BulkUpdatedItem {
                     index,
                     idempotency_key: entry.idempotency_key.clone(),
@@ -1934,7 +2213,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn bulk_deactivate_quotas(
         &self,
-        _ctx: &SecurityContext,
+        actor: &Actor,
         envelope: &BulkDeactivateEnvelope,
     ) -> Result<TransitionOutcome<BulkDeactivated>, StorageError> {
         self.transact(|st| {
@@ -1947,7 +2226,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             for (index, entry) in envelope.items.iter().enumerate() {
                 Self::visible(st, envelope.tenant_id, entry.quota_id)
                     .map_err(|e| e.at_item(index))?;
-                let deactivated = Self::deactivate_in(st, entry.quota_id, &entry.events)
+                let deactivated = Self::deactivate_in(st, actor, entry.quota_id, &entry.events)
                     .map_err(|e| e.at_item(index))?;
                 items.push(BulkDeactivatedItem {
                     index,
@@ -1964,7 +2243,6 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn read_quotas(
         &self,
-        _ctx: &SecurityContext,
         _scope: &AccessScope,
         filter: QuotaFilter,
         page: PageRequest,
@@ -1999,11 +2277,12 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn apply_debit_plan(
         &self,
-        _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<EvaluatedDebit>, StorageError> {
+        self.record_scope(scope);
         self.transact(|st| {
             if let Some(blob) = Self::replayed(st, mutation.idempotency)? {
                 // Replays return the recorded decision without side effects.
@@ -2023,34 +2302,30 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     retention: Retention::Unrecorded,
                 }));
             }
-            let entries = Self::debit(st, &decision.debit_plan, now)?;
+            let entries = Self::debit(st, actor, &decision.debit_plan, now)?;
             let mut counters = Self::counters_of(st, &entries);
             let blob = Self::versioned_blob(&decision)?;
-            let expires_at = Self::remember(
-                st,
-                mutation.idempotency,
-                blob,
-                Some(&policy),
-                Some(mutation.authorized),
-            );
-            if entries.is_empty() {
+            if !matches!(decision.result, DecisionResult::Allowed) {
                 // A recorded denial occupies its key but emits no mutation event.
+                let expires_at = Self::remember(st, mutation.idempotency, blob, Some(&policy));
                 return Ok(TransitionOutcome::Applied(EvaluatedDebit {
                     decision,
                     mutation: counters,
                     retention: Retention::Recorded { expires_at },
                 }));
             }
-            st.applied.insert(
-                mutation.idempotency.scope.clone(),
-                AppliedDebit {
-                    authorized: mutation.authorized,
-                    entries: entries.clone(),
-                    reversed_by_key: None,
-                },
+            let expires_at = Self::charge(
+                st,
+                mutation.idempotency,
+                blob,
+                Some(&policy),
+                mutation.authorized,
+                &mutation.applicable.metric,
+                &entries,
             );
             counters.event_ids = Self::push_events_for(
                 st,
+                actor,
                 events,
                 "debit",
                 entries.iter().map(|e| e.quota_id).collect(),
@@ -2065,11 +2340,12 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn apply_batch_debit(
         &self,
-        _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         batch: &EvaluatedBatch<'_>,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+        self.record_scope(scope);
         self.transact(|st| {
             if let Some(blob) = Self::replayed(st, batch.envelope)? {
                 let decisions = serde_json::from_value::<BatchRecord>(blob)
@@ -2087,40 +2363,54 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                         .collect(),
                 ));
             }
+            // A batch is replayed only as a whole: an item key that names a
+            // record of a single debit refuses it.
+            if let Some(index) = batch
+                .items
+                .iter()
+                .position(|entry| Self::item_key_taken(st, &entry.item.idempotency.scope))
+            {
+                return Err(StorageError::IdempotencyPayloadMismatch.at_item(index));
+            }
             // Each item observes prior items in the batch. Staging preserves
             // all-or-nothing counters and threshold events.
             let staged = st.clone();
-            let run = Self::run_batch(st, batch)?;
+            let run = Self::run_batch(st, actor, batch)?;
             if !run.committed {
                 *st = staged;
             }
-            let retention_scope = batch.envelope.scope.clone();
             let blob = Self::blob(&BatchRecord::new(run.decisions.clone()))?;
             // A denied envelope still occupies its idempotency key.
-            let expires_at = Self::remember(st, batch.envelope, blob, run.policy.as_ref(), None);
-            let _ = retention_scope;
+            let expires_at = Self::remember(st, batch.envelope, blob, run.policies.first());
+            let moved: Vec<AppliedEntry> = run.entries.iter().flatten().cloned().collect();
             if run.committed {
-                if !run.entries.is_empty() {
-                    st.applied.insert(
-                        batch.envelope.scope.clone(),
-                        AppliedDebit {
-                            authorized: batch.items.first().map_or_else(
-                                || AttributionDigest::from_bytes([0; 32]),
-                                |entry| entry.item.authorized,
-                            ),
-                            entries: run.entries.clone(),
-                            reversed_by_key: None,
-                        },
+                for (((entry, decision), policy), applied) in batch
+                    .items
+                    .iter()
+                    .zip(&run.decisions)
+                    .zip(&run.policies)
+                    .zip(&run.entries)
+                {
+                    let blob = Self::versioned_blob(decision)?;
+                    Self::charge(
+                        st,
+                        &entry.item.idempotency,
+                        blob,
+                        Some(policy),
+                        entry.item.authorized,
+                        &entry.item.applicable.metric,
+                        applied,
                     );
                 }
                 Self::push_events_for(
                     st,
+                    actor,
                     events,
                     "batch-debit",
-                    run.entries.iter().map(|e| e.quota_id).collect(),
+                    moved.iter().map(|e| e.quota_id).collect(),
                 );
             }
-            let counters = Self::counters_of(st, &run.entries);
+            let counters = Self::counters_of(st, &moved);
             Ok(TransitionOutcome::Applied(
                 run.decisions
                     .into_iter()
@@ -2140,34 +2430,30 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn apply_credit(
         &self,
-        ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         quota_id: QuotaId,
         amount: u64,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
-        let principal = ctx.subject_id();
+        self.record_scope(scope);
+        let scope = InMemoryScope::of(scope)?;
+        let principal = actor.to_string();
         self.transact(|st| {
             // Check replay before fresh-credit guards so an earlier success
             // still replays after deactivation.
             let quota = st
                 .quotas
                 .get(&quota_id)
+                .filter(|quota| scope.admits(quota))
                 .cloned()
                 .ok_or(StorageError::QuotaNotFound { id: quota_id })?;
-            let write = idempotency.clone().complete(
-                crate::models::IdempotencySubjectKey::of(std::slice::from_ref(&quota.subject)),
-                OperationType::Credit,
-            );
+            let write = idempotency.clone().complete(OperationType::Credit);
             if let Some(blob) = Self::replayed(st, &write)? {
-                let expires_at = Self::retention_of(st, &write.scope)
-                    .expires_at()
-                    .unwrap_or_else(|| Self::now(st));
                 return Ok(TransitionOutcome::NoOp(AppliedMutation {
                     decision: Self::decision_from(blob)?,
                     mutation: MutationResult::default(),
-                    expires_at,
                 }));
             }
             if quota.status == QuotaStatus::Deactivated {
@@ -2185,7 +2471,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     return Err(StorageError::PeriodClosed);
                 }
                 Self::ensure_current_row(st, quota_id, now);
-                Self::settle_elapsed_rows(st, quota_id, now);
+                Self::settle_elapsed_rows(st, actor, quota_id, now);
             }
             let entry = AppliedEntry {
                 quota_id,
@@ -2193,19 +2479,22 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     .then(|| Self::ensure_current_row(st, quota_id, now))
                     .filter(|_| true),
                 amount,
+                slot: (0, 0),
             };
             Self::credit_counter(st, &entry, now);
             let entries = [entry];
             let mut result = Self::counters_of(st, &entries);
-            let plan: DebitPlan =
-                BTreeMap::from([(quota_id, crate::models::QuotaDebitPlan { amount })]);
-            let decision = Self::applied(plan);
+            let decision = Self::applied(vec![vec![crate::models::QuotaDebitPlan {
+                quota_id,
+                amount,
+            }]]);
             // A credit evaluates no policy, so its record carries neither
             // engine attribution nor a reversible movement.
             let blob = Self::versioned_blob(&decision)?;
-            let expires_at = Self::remember(st, &write, blob, None, None);
+            Self::remember(st, &write, blob, None);
             let adjusted = Self::event(
                 st,
+                actor,
                 NotificationEventKind::QuotaCounterAdjusted,
                 &quota,
                 serde_json::json!({
@@ -2215,147 +2504,133 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 }),
             );
             st.events.push(adjusted);
-            result.event_ids = Self::push_events_for(st, events, "credit", vec![quota_id]);
+            result.event_ids = Self::push_events_for(st, actor, events, "credit", vec![quota_id]);
             Ok(TransitionOutcome::Applied(AppliedMutation {
                 decision,
                 mutation: result,
-                expires_at,
+            }))
+        })
+    }
+
+    async fn apply_return(
+        &self,
+        actor: &Actor,
+        scope: &AccessScope,
+        ret: &ChargeReturn,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.record_scope(scope);
+        let scope = InMemoryScope::of(scope)?;
+        self.transact(|st| {
+            let key = ret.scope();
+            if let Some(row) = st.returns.get(&key).cloned() {
+                let recorded = st
+                    .charges
+                    .get(&row.charge)
+                    .filter(|charge| charge.id == row.charge_id)
+                    .filter(|charge| Self::charge_live(st, charge, Self::now(st)))
+                    .filter(|charge| Self::charge_admitted(st, &scope, charge))
+                    .cloned();
+                match recorded {
+                    Some(charge) => {
+                        if row.charge != ret.charge || row.amount != ret.amount {
+                            return Err(StorageError::IdempotencyPayloadMismatch);
+                        }
+                        if charge.metric != ret.metric {
+                            return Err(StorageError::MetricTypeMismatch {
+                                requested: ret.metric.as_str().to_owned(),
+                                charged: charge.metric.as_str().to_owned(),
+                            });
+                        }
+                        return Ok(TransitionOutcome::NoOp(AppliedMutation {
+                            decision: Self::applied(Vec::new()),
+                            mutation: MutationResult::default(),
+                        }));
+                    }
+                    // Deleted with its charge.
+                    None => {
+                        st.returns.remove(&key);
+                    }
+                }
+            }
+            let charge = Self::live_charge(st, &ret.charge)
+                .filter(|charge| Self::charge_admitted(st, &scope, charge))
+                .cloned()
+                .ok_or_else(|| StorageError::OperationNotFound {
+                    key: ret.charge.key.clone(),
+                })?;
+            if charge.metric != ret.metric {
+                return Err(StorageError::MetricTypeMismatch {
+                    requested: ret.metric.as_str().to_owned(),
+                    charged: charge.metric.as_str().to_owned(),
+                });
+            }
+            let (plan, result) = Self::give_back(st, actor, &ret.charge, ret.amount, "return")?;
+            st.returns.insert(
+                key,
+                ReturnRow {
+                    charge_id: charge.id,
+                    charge: ret.charge.clone(),
+                    amount: ret.amount,
+                },
+            );
+            Ok(TransitionOutcome::Applied(AppliedMutation {
+                decision: Self::applied(plan),
+                mutation: result,
             }))
         })
     }
 
     async fn apply_rollback(
         &self,
-        ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         target: &RollbackTarget,
-        idempotency: &IdempotencyWrite,
-        events: &[NotificationEvent],
+        _events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
-        let principal = ctx.subject_id();
+        self.record_scope(scope);
+        let scope = InMemoryScope::of(scope)?;
         self.transact(|st| {
-            // The rollback's own key is checked first, so a replay survives the
-            // original record's retention window.
-            if let Some(blob) = Self::replayed(st, idempotency)? {
-                let expires_at = Self::retention_of(st, &idempotency.scope)
-                    .expires_at()
-                    .unwrap_or_else(|| Self::now(st));
-                return Ok(TransitionOutcome::NoOp(AppliedMutation {
-                    decision: Self::decision_from(blob)?,
-                    mutation: MutationResult::default(),
-                    expires_at,
-                }));
-            }
-            let unknown = || StorageError::OperationNotFound {
-                key: target.original.key.clone(),
-            };
-            let committed = st
-                .applied
-                .get(&target.original)
+            let charge = Self::live_charge(st, &target.original)
+                .filter(|charge| charge.authorized == target.authorized)
+                .filter(|charge| Self::charge_admitted(st, &scope, charge))
                 .cloned()
-                .ok_or_else(unknown)?;
-            // Bind authorization to the original metric and resource, not only
-            // its subjects.
-            if committed.authorized != target.authorized {
-                return Err(unknown());
-            }
-            // A debit that moved nothing is not a committed debit: a denial
-            // records no movement either, and must stay irreversible. A lease
-            // commit of zero is a real operation that kept nothing, so it
-            // reverses as a successful no-op.
-            if committed.entries.is_empty()
-                && target.original.operation_type != crate::models::OperationType::Commit
-            {
-                return Err(unknown());
-            }
-            for entry in &committed.entries {
-                if entry
-                    .period_id
-                    .and_then(|id| st.periods.get(&id))
-                    .is_some_and(|row| row.settled)
-                {
-                    // Closure is settlement-keyed here: the closing period stays
-                    // reversible until its rollover event has been emitted.
-                    return Err(StorageError::PeriodClosed);
-                }
-            }
-            let plan: DebitPlan = committed
+                .ok_or_else(|| StorageError::OperationNotFound {
+                    key: target.original.key.clone(),
+                })?;
+            let held: Vec<HeldEntry> = charge
                 .entries
                 .iter()
-                .map(|entry| {
-                    (
-                        entry.quota_id,
-                        crate::models::QuotaDebitPlan {
-                            amount: entry.amount,
-                        },
-                    )
+                .map(|entry| HeldEntry {
+                    chain: entry.charged.slot.0,
+                    position: entry.charged.slot.1,
+                    held: entry.charged.amount - entry.returned,
                 })
                 .collect();
-            let already_reversed = committed.reversed_by_key.is_some();
-            let entries: Vec<AppliedEntry> = if already_reversed {
-                // Reversal happens once. A second rollback under another key is
-                // an idempotent no-op that still records its own outcome.
-                Vec::new()
-            } else {
-                let now = Self::now(st);
-                for entry in &committed.entries {
-                    Self::credit_counter(st, entry, now);
-                }
-                committed.entries.clone()
-            };
-            let decision = Self::applied(if already_reversed {
-                BTreeMap::new()
-            } else {
-                plan
-            });
-            let mut result = Self::counters_of(st, &entries);
-            let blob = Self::versioned_blob(&decision)?;
-            let expires_at = Self::remember(st, idempotency, blob, None, None);
-            if !already_reversed {
-                if let Some(record) = st.applied.get_mut(&target.original) {
-                    record.reversed_by_key = Some(idempotency.scope.key.clone());
-                }
-                for entry in &entries {
-                    let Some(quota) = st.quotas.get(&entry.quota_id).cloned() else {
-                        continue;
-                    };
-                    // Emitted even inside the settlement window: ADR-0004
-                    // silences adjusted and threshold events there, not this one.
-                    let event = Self::event(
-                        st,
-                        NotificationEventKind::QuotaRollbackApplied,
-                        &quota,
-                        serde_json::json!({
-                            "original_idempotency_key": target.original.key,
-                            "rolled_back_amount": entry.amount,
-                            "quota_id": entry.quota_id,
-                            "principal": principal,
-                        }),
-                    );
-                    st.events.push(event);
-                }
-                result.event_ids = Self::push_events_for(
-                    st,
-                    events,
-                    "rollback",
-                    entries.iter().map(|e| e.quota_id).collect(),
-                );
+            let remaining = Self::remaining(&held);
+            if remaining == 0 {
+                return Ok(TransitionOutcome::NoOp(AppliedMutation {
+                    decision: Self::applied(Vec::new()),
+                    mutation: MutationResult::default(),
+                }));
             }
+            let (plan, result) =
+                Self::give_back(st, actor, &target.original, remaining, "rollback")?;
             Ok(TransitionOutcome::Applied(AppliedMutation {
-                decision,
+                decision: Self::applied(plan),
                 mutation: result,
-                expires_at,
             }))
         })
     }
 
     async fn acquire_lease(
         &self,
-        _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         mutation: &EvaluatedMutation<'_>,
         ttl: Duration,
     ) -> Result<TransitionOutcome<EvaluatedLease>, StorageError> {
+        self.record_scope(scope);
         self.transact(|st| {
             if let Some(blob) = Self::replayed(st, mutation.idempotency)? {
                 // Persist the acquisition outcome because subjects may hold
@@ -2392,7 +2667,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 if live >= cap {
                     return Err(StorageError::LeaseInflightLimitExceeded);
                 }
-                let entries = Self::debit(st, &decision.debit_plan, now)?;
+                let entries = Self::debit(st, actor, &decision.debit_plan, now)?;
                 let token = LeaseToken::generate();
                 let expires_at = now + ttl;
                 st.leases.insert(
@@ -2400,7 +2675,6 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                     LeaseRow {
                         tenant_id: mutation.applicable.tenant_id,
                         metric: mutation.applicable.metric.clone(),
-                        subject_key: mutation.idempotency.scope.subject_key,
                         authorized: mutation.authorized,
                         reserved_amount: mutation.amount,
                         // The acquisition period is fixed here; commit and
@@ -2414,6 +2688,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                                     held_amount: entry.amount,
                                     period_id: entry.period_id,
                                 },
+                                slot: entry.slot,
                                 returned: false,
                             })
                             .collect(),
@@ -2431,29 +2706,27 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 expires_at,
             };
             let blob = Self::blob(&acquired)?;
-            Self::remember(
-                st,
-                mutation.idempotency,
-                blob,
-                Some(&policy),
-                Some(mutation.authorized),
-            );
+            Self::remember(st, mutation.idempotency, blob, Some(&policy));
             Ok(TransitionOutcome::Applied(acquired))
         })
     }
 
     async fn commit_lease(
         &self,
-        _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         token: LeaseToken,
         actual_amount: Option<u64>,
+        metric: Option<&MetricId>,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
+        self.record_scope(scope);
         self.settle(
+            actor,
             token,
             actual_amount,
+            metric,
             idempotency,
             events,
             OperationType::Commit,
@@ -2462,21 +2735,30 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn release_lease(
         &self,
-        _ctx: &SecurityContext,
-        _scope: &AccessScope,
+        actor: &Actor,
+        scope: &AccessScope,
         token: LeaseToken,
         idempotency: &PartialIdempotencyWrite,
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError> {
-        self.settle(token, Some(0), idempotency, events, OperationType::Release)
+        self.record_scope(scope);
+        self.settle(
+            actor,
+            token,
+            Some(0),
+            None,
+            idempotency,
+            events,
+            OperationType::Release,
+        )
     }
 
     async fn read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         scope: &AccessScope,
         applicable: &ApplicableQuotas,
     ) -> Result<Vec<QuotaSnapshot>, StorageError> {
+        self.record_scope(scope);
         let scope = InMemoryScope::of(scope)?;
         self.transact(|st| {
             let matched: Vec<QuotaId> = st
@@ -2491,11 +2773,12 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn bulk_read_quota_snapshot(
         &self,
-        _ctx: &SecurityContext,
         scope: &AccessScope,
         pairs: &[ApplicableQuotas],
         page: PageRequest,
+        in_window_only: bool,
     ) -> Result<PageResult<QuotaSnapshot>, StorageError> {
+        self.record_scope(scope);
         let scope = InMemoryScope::of(scope)?;
         // Keyset on `quota_id`: the cursor holds only the last id returned.
         let after = page
@@ -2513,11 +2796,16 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             page.limit
         } as usize;
         self.transact(|st| {
+            let now = Self::now(st);
             let mut selected = Vec::new();
             for quota in st.quotas.values() {
                 if after.is_some_and(|after| quota.id <= after)
                     || !pairs.iter().any(|pair| Self::matches(quota, pair))
                     || !scope.admits(quota)
+                    || (in_window_only
+                        && quota
+                            .validity_window
+                            .is_some_and(|window| !window.contains(now)))
                 {
                     continue;
                 }
@@ -2540,7 +2828,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
 
     async fn create_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         mut draft: PolicyDraft,
         events: &[NotificationEvent],
     ) -> Result<PolicyVersion, StorageError> {
@@ -2558,14 +2846,14 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             PolicyScope::Global => PolicyId::global(),
             PolicyScope::Metric { .. } => PolicyId::new(Uuid::now_v7().to_string()),
         };
-        draft.created_by = ctx.subject_id().to_string();
+        draft.created_by = actor.to_string();
         let version = new_version(policy_id.clone(), 1, draft);
         st.policies.insert(policy_id.clone(), vec![version.clone()]);
         st.policy_audit.push(PolicyTransitionAudit {
             policy_id,
             version: 1,
             kind: "create",
-            actor: ctx.subject_id().to_string(),
+            actor: actor.to_string(),
             comment: version.comment.clone(),
         });
         let events: Vec<_> = events
@@ -2578,13 +2866,13 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 event
             })
             .collect();
-        Self::push_events(&mut st, &events);
+        Self::push_events(&mut st, actor, &events);
         Ok(version)
     }
 
     async fn update_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         update: PolicyUpdate,
         events: &[NotificationEvent],
@@ -2616,7 +2904,7 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             .ok_or_else(|| StorageError::Internal("policy version exhausted".into()))?;
         next.state = PolicyVersionState::Active;
         next.created_at = OffsetDateTime::now_utc();
-        next.created_by = ctx.subject_id().to_string();
+        next.created_by = actor.to_string();
         next.comment = update.comment;
         if let Some(snapshot) = update.schema_snapshot {
             next.schema_snapshot = snapshot;
@@ -2636,16 +2924,16 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             policy_id,
             version: next.version,
             kind: "update",
-            actor: ctx.subject_id().to_string(),
+            actor: actor.to_string(),
             comment: next.comment.clone(),
         });
-        Self::push_events(&mut st, events);
+        Self::push_events(&mut st, actor, events);
         Ok(next)
     }
 
     async fn rollback_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         target_version: u32,
         comment: Option<String>,
@@ -2690,16 +2978,16 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             policy_id,
             version: target_version,
             kind: "rollback",
-            actor: ctx.subject_id().to_string(),
+            actor: actor.to_string(),
             comment,
         });
-        Self::push_events(&mut st, events);
+        Self::push_events(&mut st, actor, events);
         Ok(TransitionOutcome::Applied(result))
     }
 
     async fn delete_policy(
         &self,
-        ctx: &SecurityContext,
+        actor: &Actor,
         policy_id: PolicyId,
         comment: Option<String>,
         events: &[NotificationEvent],
@@ -2727,10 +3015,10 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             policy_id,
             version,
             kind: "delete",
-            actor: ctx.subject_id().to_string(),
+            actor: actor.to_string(),
             comment,
         });
-        Self::push_events(&mut st, events);
+        Self::push_events(&mut st, actor, events);
         Ok(TransitionOutcome::Applied(()))
     }
 
@@ -2821,12 +3109,16 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
         &self,
         scope: &IdempotencyScope,
     ) -> Result<Option<IdempotencyRecord>, StorageError> {
-        let st = self.state.lock();
+        let mut st = self.state.lock();
         Self::check(&st)?;
         if st.hide_lookups {
             return Ok(None);
         }
-        Ok(st.idempotency.get(scope).cloned())
+        if st.hidden_lookups > 0 {
+            st.hidden_lookups -= 1;
+            return Ok(None);
+        }
+        Ok(Self::stored(&st, scope).cloned())
     }
 
     async fn count_expired_unreclaimed_leases(
@@ -2878,12 +3170,12 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                         quota_id: held.hold.quota_id,
                         period_id: held.hold.period_id,
                         amount: held.hold.held_amount,
+                        slot: held.slot,
                     });
                 }
                 reclaimed.push(ExpiredLease {
                     token: *token,
                     tenant_id: lease.tenant_id,
-                    subject_key: lease.subject_key,
                     holds: lease.holds.iter().map(|held| held.hold.clone()).collect(),
                     expired_at: lease.expires_at,
                 });
@@ -2902,6 +3194,9 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
                 let event = NotificationEvent {
                     event_id: EventId::generate(),
                     kind: NotificationEventKind::LeaseAutoReleased,
+                    actor: Actor::Task {
+                        task: crate::models::BackgroundTask::LeaseSweeper,
+                    },
                     scope: NotificationScope::Tenant {
                         tenant_id: lease.tenant_id,
                     },
@@ -2982,6 +3277,60 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             }
         });
         Ok((before_len - st.log.len()) as u64)
+    }
+
+    async fn reclaim_expired_charges(
+        &self,
+        batch_size: u32,
+        now: OffsetDateTime,
+    ) -> Result<u64, StorageError> {
+        let mut st = self.state.lock();
+        Self::check(&st)?;
+        let deleted: Vec<IdempotencyScope> = st
+            .charges
+            .iter()
+            .filter(|(_, charge)| !Self::charge_live(&st, charge, now))
+            .take(batch_size as usize)
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        for scope in &deleted {
+            st.charges.remove(scope);
+        }
+        let charges = std::mem::take(&mut st.charges);
+        st.returns.retain(|_, row| {
+            charges
+                .get(&row.charge)
+                .is_some_and(|charge| charge.id == row.charge_id)
+        });
+        st.charges = charges;
+        Ok(deleted.len() as u64)
+    }
+
+    async fn read_held_allocation_charge_stats(
+        &self,
+        before: OffsetDateTime,
+    ) -> Result<Vec<HeldAllocationCharges>, StorageError> {
+        let st = self.state.lock();
+        Self::check(&st)?;
+        let mut stats: Vec<HeldAllocationCharges> = Vec::new();
+        for charge in st.charges.values() {
+            if charge.record.expires_at > before || !Self::holds_active_allocation(&st, charge) {
+                continue;
+            }
+            let created = charge.record.created_at;
+            match stats.iter_mut().find(|row| row.metric == charge.metric) {
+                Some(row) => {
+                    row.count += 1;
+                    row.oldest_created_at = row.oldest_created_at.min(created);
+                }
+                None => stats.push(HeldAllocationCharges {
+                    metric: charge.metric.clone(),
+                    count: 1,
+                    oldest_created_at: created,
+                }),
+            }
+        }
+        Ok(stats)
     }
 }
 
@@ -3129,12 +3478,10 @@ impl ScriptedEvaluator {
                     .quotas
                     .iter()
                     .map(|q| {
-                        (
-                            q.snapshot.quota_id,
-                            crate::models::QuotaDebitPlan {
-                                amount: context.amount,
-                            },
-                        )
+                        vec![crate::models::QuotaDebitPlan {
+                            quota_id: q.snapshot.quota_id,
+                            amount: context.amount,
+                        }]
                     })
                     .collect(),
                 diagnostics: BTreeMap::new(),

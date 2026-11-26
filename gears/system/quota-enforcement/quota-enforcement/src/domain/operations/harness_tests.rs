@@ -1,6 +1,4 @@
 #![allow(clippy::expect_used)]
-//! The consumption operations over real engines and the in-memory storage
-//! double, shared by the service and lease test modules.
 
 use std::sync::Arc;
 
@@ -8,23 +6,20 @@ use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use gts::GtsTypeId;
 use quota_enforcement_sdk::testing::{InMemoryStorage, bundle_with_global_policy};
 use quota_enforcement_sdk::{
-    DebitRequest, EnforcementMode, EvaluationAttribution, MetricKind, QuotaDraft,
+    DebitRequest, EnforcementMode, EvaluationAttribution, MetricRef, QuotaDraft,
     QuotaEnforcementStoragePluginV1, QuotaId, QuotaSource, QuotaType, SubjectClaim, SubjectRef,
 };
 use serde_json::json;
-use toolkit_security::AccessScope;
+use toolkit_security::{AccessScope, PlatformIdentity};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 
 use super::{IdempotencyCache, Operations};
-use crate::domain::admission::Admission;
-use crate::domain::attribution::Attribution;
-use crate::domain::catalog::{
-    CatalogBuilder, CatalogConfig, MetricClassifications, ProjectionContractCatalog,
-};
+use crate::domain::admission::{Admission, Gate};
+use crate::domain::catalog::{MetricCatalog, MetricMode};
 use crate::domain::engines::{PolicyArtifactCache, linked_registry};
-use crate::domain::ports::metric_registry::{MetricDescriptor, MetricMode};
 use crate::test_support::{
-    FakeContractRegistry, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION, METRIC_TOKENS,
-    PermitTenantsPdp, RecordingMetrics, ctx, tenant,
+    METRIC_TOKENS, PermitTenantsPdp, RecordingMetrics, USER_SUBJECT_TYPE, actor, caller,
+    catalog_over, metric_type_document, platform_registry, tenant,
 };
 
 pub(super) fn type_id(raw: &str) -> GtsTypeId {
@@ -39,10 +34,10 @@ pub(super) fn evaluation_limits() -> quota_enforcement_sdk::engine::EvaluationLi
 }
 
 pub(super) struct Harness {
-    pub(super) catalog: ProjectionContractCatalog,
+    pub(super) catalog: Arc<MetricCatalog>,
+    pub(super) registry: Arc<MockTypesRegistry>,
     pub(super) admission: Admission,
     pub(super) storage: Arc<InMemoryStorage>,
-    pub(super) classifications: MetricClassifications,
     pub(super) cache: IdempotencyCache,
     pub(super) engines: Arc<crate::domain::engines::EngineRegistry>,
     pub(super) artifacts: Arc<PolicyArtifactCache>,
@@ -54,8 +49,8 @@ impl Harness {
         Self::with_pdp(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await
     }
 
-    /// A second replica over the same storage: its own empty replay cache, so
-    /// a replay has to come from the record rather than from memory.
+    // A second replica over the same storage: its own empty replay cache, so
+    // a replay has to come from the record rather than from memory.
     pub(super) async fn new_over(other: &Self) -> Self {
         let mut replica =
             Self::with_pdp(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
@@ -63,8 +58,6 @@ impl Harness {
         replica
     }
 
-    /// A harness whose storage admits at most `cap` live leases per
-    /// `(tenant, metric)`.
     pub(super) async fn with_lease_cap(cap: u32) -> Self {
         let mut harness = Self::new().await;
         let storage = Arc::new(InMemoryStorage::new());
@@ -85,17 +78,22 @@ impl Harness {
 
     pub(super) async fn over(pdp: Arc<dyn AuthZResolverApi>, mode: MetricMode) -> Self {
         let metrics = Arc::new(RecordingMetrics::default());
-        let registry = FakeContractRegistry::llm_gateway();
-        let catalog = CatalogBuilder::new(&registry, metrics.as_ref())
-            .build(&CatalogConfig {
-                subject_projections: vec![
-                    type_id(LLM_USER_PROJECTION),
-                    type_id(LLM_TENANT_PROJECTION),
-                ],
-                resource_projections: Vec::new(),
-            })
-            .await
-            .expect("catalogue");
+        let registry = platform_registry();
+        if mode == MetricMode::Direct {
+            registry.seed(
+                METRIC_TOKENS,
+                metric_type_document(
+                    METRIC_TOKENS,
+                    json!({
+                        "kind": "counter",
+                        "admitted_subjects": [USER_SUBJECT_TYPE],
+                        "enforcement": "direct",
+                    }),
+                    json!({ "region": { "type": "string" }, "model": { "type": "string" } }),
+                ),
+            );
+        }
+        let catalog = catalog_over(&registry, metrics.clone());
         let storage = Arc::new(InMemoryStorage::new());
         // The seeded policy names the engine this deployment actually links,
         // so the transaction's own evaluation runs the real MRW engine.
@@ -106,18 +104,11 @@ impl Harness {
             policy.timeout_ms = Some(60_000);
         }
         storage.bootstrap(&bundle).await.expect("bootstrap");
-        let classifications = MetricClassifications::from_pairs([(
-            quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
-            MetricDescriptor {
-                kind: MetricKind::Counter,
-                mode,
-            },
-        )]);
         Self {
             catalog,
+            registry,
             admission: Admission::new(PolicyEnforcer::new(pdp), metrics.clone()),
             storage,
-            classifications,
             cache: IdempotencyCache::new(16, std::time::Duration::from_secs(5)),
             engines: Arc::new(linked_registry().expect("engines")),
             artifacts: Arc::new(PolicyArtifactCache::new(
@@ -129,11 +120,17 @@ impl Harness {
     }
 
     pub(super) fn operations(&self) -> Operations<'_> {
+        self.built(self.admission.pdp(caller()))
+    }
+
+    pub(super) fn trusted(&self, caller: Option<PlatformIdentity>) -> Operations<'_> {
+        self.built(self.admission.trusted(caller))
+    }
+
+    fn built<'a>(&'a self, admission: Gate<'a>) -> Operations<'a> {
         Operations {
-            admission: &self.admission,
-            attribution: Attribution::new(&self.admission, &self.catalog, self.metrics.as_ref()),
+            admission,
             catalog: &self.catalog,
-            classifications: &self.classifications,
             storage: self.storage.as_ref(),
             engines: Arc::clone(&self.engines),
             artifacts: Arc::clone(&self.artifacts),
@@ -148,14 +145,23 @@ impl Harness {
     }
 
     pub(super) async fn quota(&self, cap: Option<u64>) -> QuotaId {
+        self.quota_with(cap, serde_json::Map::new()).await
+    }
+
+    /// A Quota with the conditions `metadata`.
+    pub(super) async fn quota_with(
+        &self,
+        cap: Option<u64>,
+        metadata: serde_json::Map<String, serde_json::Value>,
+    ) -> QuotaId {
         self.storage
             .create_quota(
-                &ctx(),
+                &actor(),
                 &AccessScope::allow_all(),
                 QuotaDraft {
                     tenant_id: tenant(),
                     subject: SubjectRef {
-                        projection_type: type_id(LLM_USER_PROJECTION),
+                        subject_type: type_id(USER_SUBJECT_TYPE),
                         subject_id: "u-1".to_owned(),
                     },
                     metric: quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric"),
@@ -166,12 +172,8 @@ impl Harness {
                     notification_thresholds: Vec::new(),
                     validity_window: None,
                     fail_open_hint: false,
-                    metadata: serde_json::Map::new(),
+                    metadata,
                     source: QuotaSource::Operator,
-                    constraint_contract: quota_enforcement_sdk::ContractRef {
-                        type_id: type_id(crate::test_support::LLM_TOKEN_CONSTRAINT),
-                        version: 1,
-                    },
                 },
                 &[],
             )
@@ -187,18 +189,20 @@ impl Harness {
 pub(super) fn attribution() -> EvaluationAttribution {
     EvaluationAttribution {
         tenant_id: tenant(),
-        metric: METRIC_TOKENS.to_owned(),
         subjects: vec![SubjectClaim {
-            kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+            subject_type: USER_SUBJECT_TYPE.to_owned(),
             id: "u-1".to_owned(),
         }],
-        metadata: Some(
-            json!({ "region": "eu-west-1" })
-                .as_object()
-                .cloned()
-                .expect("object"),
-        ),
-        resource: None,
+        metric: MetricRef {
+            metric_type: METRIC_TOKENS.to_owned(),
+            id: None,
+            metadata: Some(
+                json!({ "region": "eu-west-1" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        },
     }
 }
 

@@ -7,13 +7,31 @@ use time::OffsetDateTime;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+const METRIC: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
+const USER: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const DEVICE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.device.v1~";
+const TENANT: &str = "gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~";
+
 fn quota(cap: Option<u64>, consumed: u64) -> Result<QuotaSnapshot, Box<dyn std::error::Error>> {
+    quota_of(USER, cap, consumed)
+}
+
+fn tenant_quota(
+    cap: Option<u64>,
+    consumed: u64,
+) -> Result<QuotaSnapshot, Box<dyn std::error::Error>> {
+    quota_of(TENANT, cap, consumed)
+}
+
+fn quota_of(
+    subject_type: &str,
+    cap: Option<u64>,
+    consumed: u64,
+) -> Result<QuotaSnapshot, Box<dyn std::error::Error>> {
     Ok(QuotaSnapshot {
         quota_id: QuotaId::generate(),
-        subject: serde_json::from_value(
-            json!({"projection_type":"gts.cf.core.qe.subj.v1~cf.test.qe.user.v1~", "subject_id":"alice"}),
-        )?,
-        metric: MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")?,
+        subject: serde_json::from_value(json!({"type": subject_type, "id": "alice"}))?,
+        metric: MetricId::parse(METRIC)?,
         quota_type: QuotaType::Consumption,
         enforcement_mode: EnforcementMode::Hard,
         cap,
@@ -27,7 +45,7 @@ fn quota(cap: Option<u64>, consumed: u64) -> Result<QuotaSnapshot, Box<dyn std::
 }
 
 fn evaluate(
-    quotas: &[(&QuotaSnapshot, QuotaScopeTier)],
+    quotas: &[&QuotaSnapshot],
     amount: u64,
 ) -> Result<Decision, Box<dyn std::error::Error>> {
     let policy = PolicyVersion {
@@ -44,13 +62,12 @@ fn evaluate(
         created_by: "operator".into(),
         comment: None,
     };
-    let metric = MetricId::parse("gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.token.v1")?;
+    let metric = MetricId::parse(METRIC)?;
     let input: Vec<_> = quotas
         .iter()
-        .map(|(snapshot, tier)| EvaluationQuota {
+        .map(|snapshot| EvaluationQuota {
             snapshot,
-            tier: *tier,
-            arbitration: &Value::Null,
+            tier: QuotaScopeTier::of(&snapshot.subject),
         })
         .collect();
     let budget = EvaluationBudget::new(
@@ -65,7 +82,7 @@ fn evaluate(
         time: OffsetDateTime::UNIX_EPOCH,
         quotas: &input,
         request: &Value::Null,
-        resource: &Value::Null,
+        metric_id: None,
         budget,
     };
     let artifact = MostRestrictiveWins.validate_config(EngineValidationInput {
@@ -75,46 +92,37 @@ fn evaluate(
     Ok(MostRestrictiveWins.evaluate(&context, artifact.as_ref())?)
 }
 
+fn one_entry(quota_id: QuotaId, amount: u64) -> DebitPlan {
+    vec![vec![QuotaDebitPlan { quota_id, amount }]]
+}
+
+fn charged(decision: &Decision) -> Vec<QuotaId> {
+    decision
+        .debit_plan
+        .iter()
+        .flatten()
+        .map(|entry| entry.quota_id)
+        .collect()
+}
+
 #[test]
 fn tenant_satisfies_when_user_does_not() -> TestResult {
     let user = quota(Some(100), 80)?;
-    let tenant = quota(Some(10000), 300)?;
-    let decision = evaluate(
-        &[
-            (&user, QuotaScopeTier::User),
-            (&tenant, QuotaScopeTier::Tenant),
-        ],
-        50,
-    )?;
+    let tenant = tenant_quota(Some(10000), 300)?;
+    let decision = evaluate(&[&user, &tenant], 50)?;
     assert_eq!(decision.result, DecisionResult::Allowed);
-    assert_eq!(decision.debit_plan.len(), 1);
-    assert_eq!(
-        decision.debit_plan.get(&tenant.quota_id),
-        Some(&QuotaDebitPlan { amount: 50 })
-    );
+    assert_eq!(decision.debit_plan, one_entry(tenant.quota_id, 50));
     Ok(())
 }
 
 #[test]
 fn tier_precedes_boundedness_and_order_is_irrelevant() -> TestResult {
     let user = quota(None, 0)?;
-    let tenant = quota(Some(50), 0)?;
-    let first = evaluate(
-        &[
-            (&user, QuotaScopeTier::User),
-            (&tenant, QuotaScopeTier::Tenant),
-        ],
-        50,
-    )?;
-    let second = evaluate(
-        &[
-            (&tenant, QuotaScopeTier::Tenant),
-            (&user, QuotaScopeTier::User),
-        ],
-        50,
-    )?;
+    let tenant = tenant_quota(Some(50), 0)?;
+    let first = evaluate(&[&user, &tenant], 50)?;
+    let second = evaluate(&[&tenant, &user], 50)?;
     assert_eq!(first, second);
-    assert!(first.debit_plan.contains_key(&user.quota_id));
+    assert_eq!(charged(&first), vec![user.quota_id]);
     Ok(())
 }
 
@@ -124,34 +132,20 @@ fn bounded_then_smallest_remaining_then_id() -> TestResult {
     let large = quota(Some(90), 0)?;
     let a = quota(Some(50), 0)?;
     let b = quota(Some(50), 0)?;
-    let result = evaluate(
-        &[
-            (&unbounded, QuotaScopeTier::User),
-            (&large, QuotaScopeTier::User),
-            (&b, QuotaScopeTier::User),
-            (&a, QuotaScopeTier::User),
-        ],
-        20,
-    )?;
-    assert_eq!(
-        result.debit_plan.keys().copied().collect::<Vec<_>>(),
-        vec![a.quota_id.min(b.quota_id)]
-    );
+    let result = evaluate(&[&unbounded, &large, &b, &a], 20)?;
+    assert_eq!(charged(&result), vec![a.quota_id.min(b.quota_id)]);
     Ok(())
 }
 
 #[test]
 fn all_violators_are_returned_and_windows_are_inclusive() -> TestResult {
     let mut a = quota(Some(0), 0)?;
-    let b = quota(Some(2), 1)?;
+    let b = tenant_quota(Some(2), 1)?;
     a.validity_window = Some(ValidityWindow {
         start: Some(OffsetDateTime::UNIX_EPOCH),
         end: Some(OffsetDateTime::UNIX_EPOCH),
     });
-    let result = evaluate(
-        &[(&a, QuotaScopeTier::User), (&b, QuotaScopeTier::Tenant)],
-        5,
-    )?;
+    let result = evaluate(&[&a, &b], 5)?;
     let DecisionResult::Denied {
         mut violated_quota_ids,
         ..
@@ -164,12 +158,7 @@ fn all_violators_are_returned_and_windows_are_inclusive() -> TestResult {
     expected.sort_unstable();
     assert_eq!(violated_quota_ids, expected);
     assert!(result.debit_plan.is_empty());
-    assert_eq!(
-        evaluate(&[(&a, QuotaScopeTier::User)], 0)?
-            .debit_plan
-            .get(&a.quota_id),
-        Some(&QuotaDebitPlan { amount: 0 })
-    );
+    assert_eq!(evaluate(&[&a], 0)?.debit_plan, one_entry(a.quota_id, 0));
     Ok(())
 }
 
@@ -180,10 +169,7 @@ fn empty_and_expired_sets_deny() -> TestResult {
         start: None,
         end: Some(OffsetDateTime::UNIX_EPOCH - time::Duration::seconds(1)),
     });
-    for result in [
-        evaluate(&[], 1)?,
-        evaluate(&[(&expired, QuotaScopeTier::User)], 1)?,
-    ] {
+    for result in [evaluate(&[], 1)?, evaluate(&[&expired], 1)?] {
         assert_eq!(
             result.result,
             DecisionResult::Denied {
@@ -199,16 +185,28 @@ fn empty_and_expired_sets_deny() -> TestResult {
 #[test]
 fn repeated_evaluation_of_one_context_is_byte_identical() -> TestResult {
     let user = quota(Some(100), 80)?;
-    let tenant = quota(Some(10_000), 300)?;
-    let inputs = [
-        (&user, QuotaScopeTier::User),
-        (&tenant, QuotaScopeTier::Tenant),
-    ];
+    let tenant = tenant_quota(Some(10_000), 300)?;
+    let inputs = [&user, &tenant];
     // An allowed and a denied verdict, each evaluated twice from one context.
     for amount in [50, 50_000] {
         let first = serde_json::to_vec(&evaluate(&inputs, amount)?)?;
         let second = serde_json::to_vec(&evaluate(&inputs, amount)?)?;
         assert_eq!(first, second, "amount {amount}");
     }
+    Ok(())
+}
+
+#[test]
+fn every_subject_type_but_the_tenant_is_the_subject_tier() -> TestResult {
+    let tenant = tenant_quota(Some(10), 0)?;
+    let user = quota_of(USER, Some(30), 0)?;
+    let device = quota_of(DEVICE, Some(20), 0)?;
+    assert_eq!(QuotaScopeTier::of(&tenant.subject), QuotaScopeTier::Tenant);
+    assert_eq!(QuotaScopeTier::of(&user.subject), QuotaScopeTier::Subject);
+    assert_eq!(QuotaScopeTier::of(&device.subject), QuotaScopeTier::Subject);
+    let decision = evaluate(&[&tenant, &user, &device], 5)?;
+    assert_eq!(charged(&decision), vec![device.quota_id]);
+    let spilled = evaluate(&[&tenant, &user, &device], 25)?;
+    assert_eq!(charged(&spilled), vec![user.quota_id]);
     Ok(())
 }

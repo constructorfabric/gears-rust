@@ -90,6 +90,10 @@ equivalence tests verifying byte-identical Decisions under the same idempotency 
 
 ## More Information
 
+Since ADR-0013 an Engine does not read Quota Metadata: it holds the conditions that QE core judges before the Engine
+runs. The decision of this record stands with that reading: the conditions are judged at the same step, on the rows
+that the transaction has locked, so a change of a Quota's metadata is seen together with its counters.
+
 Closes the design-time question of when the Engine snapshots Quota Metadata during evaluation
 (`cpt-cf-quota-enforcement-fr-quota-metadata`, `cpt-cf-quota-enforcement-fr-attribute-based-quota-selection`).
 

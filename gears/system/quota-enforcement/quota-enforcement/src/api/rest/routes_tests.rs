@@ -13,8 +13,7 @@ use uuid::Uuid;
 use super::{PATH_PREFIX, register_routes};
 use crate::domain::Service;
 use crate::test_support::{
-    LLM_USER_PROJECTION, METRIC_TOKENS, PermitTenantsPdp, bound_service, ctx, tenant,
-    unbound_service,
+    METRIC_TOKENS, PermitTenantsPdp, USER_SUBJECT_TYPE, bound_service, ctx, tenant, unbound_service,
 };
 
 fn permitting() -> Arc<PermitTenantsPdp> {
@@ -62,14 +61,14 @@ async fn send(
 fn create_body() -> Value {
     json!({
         "tenant_id": tenant().as_uuid(),
-        "subject": { "projection_type": LLM_USER_PROJECTION, "subject_id": "u1" },
+        "subject": { "type": USER_SUBJECT_TYPE, "id": "u1" },
         "metric": METRIC_TOKENS,
         "quota_type": "gts.cf.core.qe.quota_type.v1~cf.core.qe.consumption.v1",
         "period": "gts.cf.core.qe.period_type.v1~cf.core.qe.month.v1",
         "enforcement_mode": "gts.cf.core.qe.enforcement_type.v1~cf.core.qe.hard.v1",
         "cap": 100,
         "notification_thresholds": [50],
-        "metadata": { "regions": ["eu"], "weight": 5 },
+        "metadata": {},
         "source": "gts.cf.core.qe.source_type.v1~cf.core.qe.operator.v1"
     })
 }
@@ -110,11 +109,12 @@ async fn create_answers_201_with_the_view_and_a_location_header() {
     assert_eq!(body["record_version"], json!(1));
     assert_eq!(body["currently_within_window"], json!(true));
     assert_eq!(body["metric_kind"], json!("counter"));
-    assert_eq!(body["metadata"]["weight"], json!(5));
+    assert_eq!(body["metadata"], json!({}));
     assert_eq!(
-        body["constraint_contract"]["type_id"],
-        json!("gts.cf.core.qe.constraint.v1~cf.genai.llm_gateway.token_constraint.v1~")
+        body["subject"],
+        json!({ "type": USER_SUBJECT_TYPE, "id": "u1" })
     );
+    assert!(body.get("constraint_contract").is_none());
 }
 
 #[tokio::test]
@@ -166,7 +166,7 @@ async fn shape_rejections_carry_their_tokens_and_statuses() {
                 b
             },
             StatusCode::BAD_REQUEST,
-            "CONSTRAINT_CONTRACT_MISMATCH",
+            "QUOTA_METADATA_REJECTED",
         ),
         (
             {
@@ -300,7 +300,7 @@ async fn the_list_filters_through_odata_and_pages_forward_with_a_bound_cursor() 
     assert!(body["page_info"]["prev_cursor"].is_null(), "{body}");
 
     let every_field = format!(
-        "tenant_id eq {} and projection_type eq '{LLM_USER_PROJECTION}' and subject_id eq 'u1' \
+        "tenant_id eq {} and subject_type eq '{USER_SUBJECT_TYPE}' and subject_id eq 'u1' \
          and metric eq '{METRIC_TOKENS}' and status eq 'active' and id eq {third}",
         tenant().as_uuid()
     );
@@ -399,7 +399,7 @@ async fn the_list_refuses_what_its_grammar_does_not_hold_with_a_400_naming_why()
         (
             format!(
                 "$filter={}",
-                enc(&format!("projection_type eq '{LLM_USER_PROJECTION}'"))
+                enc(&format!("subject_type eq '{USER_SUBJECT_TYPE}'"))
             ),
             "LIST_SUBJECT_INCOMPLETE",
         ),
@@ -445,13 +445,13 @@ async fn the_openapi_document_publishes_the_list_allow_list_and_its_one_order() 
         .build_openapi(&toolkit::api::OpenApiInfo::default())
         .expect("spec");
     let spec = serde_json::to_value(&spec).expect("spec json");
-    let list = &spec["paths"]["/v1/quota-enforcement/quotas"]["get"];
+    let list = &spec["paths"]["/quota-enforcement/v1/quotas"]["get"];
     assert_eq!(
         list["x-odata-filter"]["allowedFields"],
         json!({
             "id": ["eq", "in"],
             "tenant_id": ["eq"],
-            "projection_type": ["eq"],
+            "subject_type": ["eq"],
             "subject_id": ["eq"],
             "metric": ["eq"],
             "status": ["eq"]
@@ -473,7 +473,7 @@ async fn the_openapi_document_publishes_the_list_allow_list_and_its_one_order() 
     }
     for gone in [
         "tenant_id",
-        "projection_type",
+        "subject_type",
         "subject_id",
         "metric",
         "status",

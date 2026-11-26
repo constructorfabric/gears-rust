@@ -12,7 +12,7 @@ pub struct Model {
     /// Tenant id, or `*` for every tenant.
     #[sea_orm(primary_key, auto_increment = false)]
     pub tenant_key: String,
-    /// Metric instance id, or `*` for every metric.
+    /// Metric type id, or `*` for every metric.
     #[sea_orm(primary_key, auto_increment = false)]
     pub metric_key: String,
     /// Retention window in seconds.

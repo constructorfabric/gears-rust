@@ -1,0 +1,24 @@
+{
+  "$id": "gts://gts.cf.core.quota.subj.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Abstract base of quota subject types: whom a quota applies to. A request and a quota name a subject as its type, derived from this base, and an id. The operator registers the subject types of principals; a module registers the subject types of what it charges.",
+  "x-gts-abstract": true,
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "x-gts-type-ref": "/$id",
+      "description": "The concrete quota subject type."
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Opaque subject id. A derived type may narrow its format; a derived type that restates id restates minLength too."
+    }
+  },
+  "required": [
+    "type",
+    "id"
+  ]
+}

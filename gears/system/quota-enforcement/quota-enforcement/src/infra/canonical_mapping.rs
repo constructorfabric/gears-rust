@@ -6,6 +6,7 @@
 //! classify backend failures with `toolkit-db` helpers the domain layer must
 //! not import.
 
+use quota_enforcement_sdk::QuotaMetadataViolation;
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 
 use crate::domain::error::{DomainError, ResourceKind};
@@ -43,6 +44,7 @@ pub mod reason {
 
 impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
+        log_dropped_cause(&err);
         match err {
             // --- bulk envelopes: the item's own error, pointed at the item ---
             DomainError::BulkItem { index, cause } => at_item(index, Self::from(*cause)),
@@ -50,8 +52,7 @@ impl From<DomainError> for CanonicalError {
             // --- quota lifecycle, decided before storage (400 / 501) ---
             DomainError::CapMustBeNonNegative { .. }
             | DomainError::ThresholdsRequireBoundedCap
-            | DomainError::ConstraintContractMismatch { .. }
-            | DomainError::MetricClassificationInvalid { .. }
+            | DomainError::QuotaMetadataRejected { .. }
             | DomainError::NotYetImplemented { .. } => quota_lifecycle(err),
 
             DomainError::InvalidPolicy {
@@ -77,13 +78,24 @@ impl From<DomainError> for CanonicalError {
             DomainError::ProjectionNotRegistered { projection } => {
                 QuotaResource::invalid_argument()
                     .with_field_violation(
-                        "projection_type",
-                        format!("projection {projection} is not registered"),
+                        "subject.type",
+                        format!("subject type {projection} is not registered"),
                         "PROJECTION_NOT_REGISTERED",
                     )
                     .with_resource(projection)
                     .create()
             }
+            DomainError::ReturnExceedsCharge { .. }
+            | DomainError::ReturnNotApplicable
+            | DomainError::MetricTypeMismatch { .. } => charge_return(err),
+            DomainError::MetricNotRegistered { metric } => QuotaResource::invalid_argument()
+                .with_field_violation(
+                    "metric",
+                    format!("metric type {metric} is not registered"),
+                    "METRIC_NOT_REGISTERED",
+                )
+                .with_resource(metric)
+                .create(),
 
             // --- 400 FailedPrecondition ---
             DomainError::LeaseNotActive { token } => LeaseResource::failed_precondition()
@@ -125,13 +137,6 @@ impl From<DomainError> for CanonicalError {
                     "PERIOD_CLOSED",
                 )
                 .create(),
-            DomainError::MetricNotRegistered { metric } => QuotaResource::failed_precondition()
-                .with_precondition_violation(
-                    metric.clone(),
-                    format!("metric {metric} is not registered"),
-                    "METRIC_NOT_REGISTERED",
-                )
-                .create(),
             DomainError::MetricNotQuotaGated { metric } => QuotaResource::failed_precondition()
                 .with_precondition_violation(
                     metric.clone(),
@@ -139,17 +144,20 @@ impl From<DomainError> for CanonicalError {
                     "METRIC_NOT_QUOTA_GATED",
                 )
                 .create(),
-            DomainError::ProjectionNotResolvable { projection } => {
-                QuotaResource::failed_precondition()
-                    .with_precondition_violation(
-                        "subject.projection_type",
-                        format!(
-                            "projection {projection} is not resolvable in the configured catalogue"
-                        ),
-                        DomainError::PROJECTION_NOT_RESOLVABLE,
-                    )
-                    .create()
-            }
+            DomainError::ProjectionNotResolvable { metric } => QuotaResource::failed_precondition()
+                .with_precondition_violation(
+                    metric.clone(),
+                    format!("metric {metric} has no served catalogue entry"),
+                    DomainError::PROJECTION_NOT_RESOLVABLE,
+                )
+                .create(),
+            DomainError::PolicyEvaluationFailed { .. } => PolicyResource::failed_precondition()
+                .with_precondition_violation(
+                    "policy",
+                    "the active policy cannot evaluate the request",
+                    "POLICY_EVALUATION_FAILED",
+                )
+                .create(),
             // --- engine evaluation (504 / 429 / 500) ---
             DomainError::EngineTimeout { .. }
             | DomainError::EngineCostExceeded { .. }
@@ -172,12 +180,14 @@ impl From<DomainError> for CanonicalError {
             // --- 404 NotFound ---
             DomainError::NotFound { kind, id } => not_found(kind, id),
 
+            // --- 409 AlreadyExists (a retry with the same key does not pass) ---
+            DomainError::IdempotencyPayloadMismatch => OperationResource::already_exists(
+                "IDEMPOTENCY_PAYLOAD_MISMATCH: idempotency key replayed with a different payload",
+            )
+            .with_resource("idempotency_key")
+            .create(),
+
             // --- 409 Aborted (safe to retry) ---
-            DomainError::IdempotencyPayloadMismatch => {
-                OperationResource::aborted("idempotency key replayed with a different payload")
-                    .with_reason("IDEMPOTENCY_PAYLOAD_MISMATCH")
-                    .create()
-            }
             DomainError::VersionConflict { expected, actual } => PolicyResource::aborted(format!(
                 "version conflict: expected {expected}, found {actual}"
             ))
@@ -237,19 +247,35 @@ impl From<DomainError> for CanonicalError {
                     reason::DEPENDENCY_UNAVAILABLE
                 ))
                 .create(),
-            // A rejected catalogue never leaves bootstrap; the gear is not ready.
-            DomainError::CatalogInvalid { .. } => CanonicalError::service_unavailable()
-                .with_detail(format!(
-                    "{}: projection contract catalogue rejected",
-                    reason::NOT_READY
-                ))
-                .create(),
 
             // --- 500 Internal (opaque; never carries internal detail) ---
             DomainError::SchemaVersionMismatch { .. } | DomainError::Internal(_) => {
                 CanonicalError::internal("internal error").create()
             }
         }
+    }
+}
+
+/// A server-side failure is answered with its category only; its cause is
+/// logged here, the one place every answer passes, so it is not lost. A PDP
+/// outage is not logged again: admission logs it, with the actor and the
+/// action.
+fn log_dropped_cause(err: &DomainError) {
+    match err {
+        DomainError::SchemaVersionMismatch { .. }
+        | DomainError::EngineFailure { .. }
+        | DomainError::Internal(_) => {
+            tracing::error!(target: "qe.errors", error = %err, "internal error; the answer carries no detail");
+        }
+        DomainError::BackendUnavailable(_)
+        | DomainError::TypesRegistryUnavailable(_)
+        | DomainError::PluginNotFound { .. }
+        | DomainError::PluginClientNotRegistered { .. }
+        | DomainError::InvalidPluginInstance { .. }
+        | DomainError::ClusterUnavailable(_) => {
+            tracing::warn!(target: "qe.errors", error = %err, "a dependency failed; the answer names only the dependency");
+        }
+        _ => {}
     }
 }
 
@@ -326,6 +352,41 @@ fn not_found(kind: ResourceKind, id: String) -> CanonicalError {
     }
 }
 
+/// The lifts of the rejections of a return or a rollback.
+fn charge_return(err: DomainError) -> CanonicalError {
+    match err {
+        DomainError::ReturnExceedsCharge {
+            requested,
+            remaining,
+        } => OperationResource::failed_precondition()
+            .with_precondition_violation(
+                "amount",
+                format!("return of {requested} exceeds the {remaining} that remains of the charge"),
+                "RETURN_EXCEEDS_CHARGE",
+            )
+            .create(),
+        DomainError::ReturnNotApplicable => OperationResource::failed_precondition()
+            .with_precondition_violation(
+                "amount",
+                "no quota of the charge can take the returned amount",
+                "RETURN_NOT_APPLICABLE",
+            )
+            .create(),
+        DomainError::MetricTypeMismatch { requested, charged } => {
+            OperationResource::invalid_argument()
+                .with_field_violation(
+                    "metric",
+                    format!("metric type {requested} is not the charge's {charged}"),
+                    "METRIC_TYPE_MISMATCH",
+                )
+                .create()
+        }
+        other => CanonicalError::from(other),
+    }
+}
+
+const QUOTA_METADATA_REJECTED: &str = "QUOTA_METADATA_REJECTED";
+
 fn quota_lifecycle(err: DomainError) -> CanonicalError {
     match err {
         // --- 400 InvalidArgument ---
@@ -344,23 +405,30 @@ fn quota_lifecycle(err: DomainError) -> CanonicalError {
                 "THRESHOLDS_REQUIRE_BOUNDED_CAP",
             )
             .create(),
-        DomainError::ConstraintContractMismatch { contract } => {
-            QuotaResource::failed_precondition()
-                .with_precondition_violation(
-                    "metadata",
-                    format!("metadata violates constraint contract {contract}"),
-                    "CONSTRAINT_CONTRACT_MISMATCH",
+        DomainError::QuotaMetadataRejected { violations } => {
+            let field = |path: &str| format!("metadata{path}");
+            let mut items = violations.into_iter();
+            let first = items.next().unwrap_or_else(|| QuotaMetadataViolation {
+                path: String::new(),
+                reason: "does not fit the metric type".to_owned(),
+            });
+            items
+                .fold(
+                    QuotaResource::invalid_argument().with_field_violation(
+                        field(&first.path),
+                        first.reason,
+                        QUOTA_METADATA_REJECTED,
+                    ),
+                    |builder, item| {
+                        builder.with_field_violation(
+                            field(&item.path),
+                            item.reason,
+                            QUOTA_METADATA_REJECTED,
+                        )
+                    },
                 )
-                .with_resource(contract)
                 .create()
         }
-        DomainError::MetricClassificationInvalid { metric } => QuotaResource::failed_precondition()
-            .with_precondition_violation(
-                metric.clone(),
-                format!("metric {metric} carries no usable classification"),
-                "METRIC_CLASSIFICATION_INVALID",
-            )
-            .create(),
         // --- 501 Unimplemented ---
         // The builder has no reason slot; the token leads the detail, as the
         // 503 lifts do.

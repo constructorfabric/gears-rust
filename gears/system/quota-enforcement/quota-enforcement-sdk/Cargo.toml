@@ -47,11 +47,10 @@ time = { workspace = true }
 
 # Canonical digests: the idempotency subject key and the request payload hash
 
-# GTS types. `inventory` carries the QE-owned GTS definitions into the
-# process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).
 gts = { workspace = true }
 toolkit-gts = { workspace = true }
 inventory = { workspace = true }
+quota-resolver-sdk = { workspace = true }
 
 # `AccessScope` and `SecurityContext` on the plugin contract signatures.
 toolkit-security = { workspace = true }

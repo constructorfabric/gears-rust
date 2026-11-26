@@ -178,25 +178,24 @@ fn a_scope_maps_to_the_same_stripe_everywhere() {
     use crate::infra::storage::repo::idempotency_repo::{ScopeKey, stripe_of};
     let key = ScopeKey {
         tenant_id: uuid::Uuid::nil(),
-        subject_key: &[1; 32],
         operation_type: "debit",
         idem_key: "k1",
     };
     // Pinned from an independent FNV-1a computation: a change here remaps
     // every scope, which two versions running side by side must never do.
-    assert_eq!(stripe_of(&key), 47_844);
+    assert_eq!(stripe_of(&key), 2_916);
     assert_eq!(
         stripe_of(&ScopeKey {
             operation_type: "credit",
             ..key
         }),
-        32_968
+        26_376
     );
     assert_eq!(
         stripe_of(&ScopeKey {
             idem_key: "k2",
             ..key
         }),
-        49_149
+        4_221
     );
 }

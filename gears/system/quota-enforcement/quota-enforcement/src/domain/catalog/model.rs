@@ -1,306 +1,213 @@
-//! The catalogue's entities and its read API.
-//!
-//! Every contract is validated by the `gts` payload validator compiled from
-//! its resolved type, the one the registry itself validates with. The
-//! dialect the schema declares applies, with format assertion on, and
-//! `x-gts-type-ref`, `x-gts-instance-ref` and `x-gts-pattern-ref` are compiled
-//! as keywords of the schema itself. A GTS reference constraint therefore
-//! counts toward a branch's validity like `type` or `format` does: a `oneOf`
-//! over two branches that differ only in their entity reference picks exactly
-//! one, and a branch that carries no GTS constraint is not "matched" by
-//! default. The request path then validates a document with no allocation
-//! beyond the envelope it wraps.
+//! A catalogue entry and the checks that build it from a registered metric
+//! type (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`). An entry is
+//! built from the registry content alone, so every replica that reads the
+//! same content builds the same entry.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
 use gts::{GtsId, GtsTypeId, PayloadValidationError, PayloadValidator};
-use quota_enforcement_sdk::{ContractRef, METRIC_BASE_TYPE, MetricId, SubjectScope};
+use quota_enforcement_sdk::{MetricId, MetricKind};
+use quota_resolver_sdk::{
+    QUOTA_METRIC_TYPE_ID, QUOTA_SUBJECT_TYPE_ID, QUOTA_TENANT_SUBJECT_TYPE_ID,
+};
+use serde::Deserialize;
 use serde_json::Value;
 use toolkit_macros::domain_model;
 
-/// A well-formed instance id whose declaring type is the metric base. Whether
-/// the registry knows it is a separate question the bootstrap answers.
-#[must_use]
-pub fn parse_metric_under_base(text: &str) -> Option<MetricId> {
-    let parsed = GtsId::try_new(text).ok()?;
-    if parsed.is_type() || parsed.get_type_id().as_deref() != Some(METRIC_BASE_TYPE) {
-        return None;
-    }
-    MetricId::parse(text).ok()
-}
+use crate::domain::ports::metrics::{MetricLabel, ValidationReason};
+use crate::domain::ports::type_registry::RegisteredType;
 
-/// A resolved contract schema compiled for validation.
+/// The `enforcement` trait of a metric type.
 #[domain_model]
-pub struct CompiledContract {
-    validator: PayloadValidator,
-    schema: Arc<Value>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricMode {
+    /// Operations on the metric are checked against quotas.
+    QuotaGated,
+    /// The metric is not checked against quotas; debit and lease acquisition
+    /// are refused.
+    Direct,
 }
 
-impl CompiledContract {
-    /// Wrap the payload validator and the resolved schema it was compiled from.
+/// The traits of the metric base, as the registry merges them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricTraits {
+    kind: MetricKind,
+    #[serde(default)]
+    admitted_subjects: Vec<String>,
+    #[serde(default = "quota_gated")]
+    enforcement: MetricMode,
+}
+
+const fn quota_gated() -> MetricMode {
+    MetricMode::QuotaGated
+}
+
+/// A metric type that passed every check: what requests and writes use.
+#[domain_model]
+pub struct ServedMetric {
+    id: MetricId,
+    kind: MetricKind,
+    mode: MetricMode,
+    admitted_subjects: Vec<GtsTypeId>,
+    schema: Arc<Value>,
+    validator: PayloadValidator,
+    label: MetricLabel,
+}
+
+impl ServedMetric {
+    /// The metric type.
     #[must_use]
-    pub fn new(validator: PayloadValidator, schema: Value) -> Self {
-        Self {
-            validator,
-            schema: Arc::new(schema),
-        }
+    pub fn id(&self) -> &MetricId {
+        &self.id
     }
 
-    /// The resolved schema used by this immutable catalogue, without a registry read.
+    /// The `kind` trait.
+    #[must_use]
+    pub fn kind(&self) -> MetricKind {
+        self.kind
+    }
+
+    /// The `enforcement` trait.
+    #[must_use]
+    pub fn mode(&self) -> MetricMode {
+        self.mode
+    }
+
+    /// The resolved schema of the metric type.
     #[must_use]
     pub fn schema(&self) -> &Value {
         &self.schema
     }
 
-    /// The contract type.
+    /// The `metric` label of the instruments.
     #[must_use]
-    pub fn type_id(&self) -> &GtsTypeId {
-        self.validator.type_id()
+    pub fn label(&self) -> &MetricLabel {
+        &self.label
     }
 
-    /// Validate the whole `document` (the `{type, metadata}` envelope, never
-    /// the inner object alone) against the schema and its entity references
-    /// in one pass. The diagnostics are for the log;
-    /// callers surface a closed reason token.
+    /// Whether the metric's quotas may count `subject_type`: the tenant type
+    /// always, any other type when it is an admitted type or derives from one.
+    #[must_use]
+    pub fn admits(&self, subject_type: &GtsTypeId) -> bool {
+        subject_type.as_ref() == QUOTA_TENANT_SUBJECT_TYPE_ID
+            || self
+                .admitted_subjects
+                .iter()
+                .any(|admitted| subject_type.as_ref().starts_with(admitted.as_ref()))
+    }
+
+    /// Validate the whole metric object against the resolved schema.
     ///
     /// # Errors
     ///
-    /// Returns the JSON Schema violations found or, only when none is, the
-    /// GTS reference violations. A rejection too costly to explain is
-    /// reported as one unexplained reason.
+    /// The violations, for the log.
     pub fn validate(&self, document: &Value) -> Result<(), Vec<String>> {
-        self.validator
-            .validate(document)
-            .map_err(|error| match error {
-                PayloadValidationError::Constraints(violations) => violations,
-                PayloadValidationError::References(violations) => violations
-                    .into_iter()
-                    .map(|v| format!("{}: {}", v.field_path, v.reason))
-                    .collect(),
-                PayloadValidationError::Unexplained(reason) => vec![reason],
-            })
+        validate(&self.validator, document)
     }
 }
 
-impl fmt::Debug for CompiledContract {
+impl fmt::Debug for ServedMetric {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CompiledContract")
-            .field("type_id", self.type_id())
+        f.debug_struct("ServedMetric")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("mode", &self.mode)
+            .field("admitted_subjects", &self.admitted_subjects)
             .finish_non_exhaustive()
     }
 }
 
-/// A configured concrete subject projection: the type half of a Quota's
-/// subject identity.
+/// One metric type the catalogue has read.
 #[domain_model]
-#[derive(Debug)]
-pub struct SubjectProjectionContract {
-    /// The projection type, derived from `gts.cf.core.qe.subj.v1~`.
-    pub type_id: GtsTypeId,
-    /// The scope its `scope` trait declares.
-    pub scope: SubjectScope,
-    /// The metrics its `admitted_metrics` trait declares.
-    pub admitted_metrics: HashSet<MetricId>,
+#[derive(Debug, Clone)]
+pub enum CatalogEntry {
+    /// Requests and writes for the metric run.
+    Served(Arc<ServedMetric>),
+    /// The type is not a valid metric type; requests and writes that check
+    /// the metric type fail with `FailedPrecondition`.
+    Unavailable {
+        /// The failed check.
+        reason: ValidationReason,
+    },
 }
 
-/// A configured concrete resource projection.
-#[domain_model]
-#[derive(Debug)]
-pub struct ResourceProjectionContract {
-    /// The projection type, derived from `gts.cf.core.qe.res.v1~`.
-    pub type_id: GtsTypeId,
-    /// Validates the complete `{type, id?, metadata}` document.
-    pub contract: CompiledContract,
+/// Build the entry of `registered`.
+// @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-concrete
+#[must_use]
+pub fn build_entry(registered: RegisteredType) -> CatalogEntry {
+    let unavailable = |reason| CatalogEntry::Unavailable { reason };
+    if registered.is_abstract {
+        return unavailable(ValidationReason::Abstract);
+    }
+    if !derives_from(&registered.id, QUOTA_METRIC_TYPE_ID) {
+        return unavailable(ValidationReason::NotDerived);
+    }
+    if own_major(&registered.id).is_none_or(|major| major == 0) {
+        return unavailable(ValidationReason::MajorVersionZero);
+    }
+    let Ok(traits) = MetricTraits::deserialize(&registered.effective_traits) else {
+        return unavailable(ValidationReason::TraitInvalid);
+    };
+    let mut admitted_subjects = Vec::with_capacity(traits.admitted_subjects.len());
+    for raw in &traits.admitted_subjects {
+        match GtsTypeId::try_new(raw) {
+            Ok(id) if id.as_ref().starts_with(QUOTA_SUBJECT_TYPE_ID) => admitted_subjects.push(id),
+            _ => return unavailable(ValidationReason::TraitInvalid),
+        }
+    }
+    let Ok(validator) = registered.payload else {
+        return unavailable(ValidationReason::SchemaInvalid);
+    };
+    // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-index
+    let id = MetricId::new(registered.id);
+    let label = MetricLabel::admitted(&id);
+    CatalogEntry::Served(Arc::new(ServedMetric {
+        id,
+        kind: traits.kind,
+        mode: traits.enforcement,
+        admitted_subjects,
+        schema: Arc::new(registered.schema),
+        validator,
+        label,
+    }))
+    // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-index
+}
+// @cpt-end:cpt-cf-quota-enforcement-algo-catalog-bootstrap:p1:inst-cat-concrete
+
+/// Whether `id` is a type derived from `base` (never `base` itself). GTS ids
+/// are chained, so the prefix is the ancestry.
+#[must_use]
+pub fn derives_from(id: &GtsTypeId, base: &str) -> bool {
+    id.as_ref().len() > base.len() && id.as_ref().starts_with(base)
 }
 
-/// The constraint contract attached to a metric request contract.
-#[domain_model]
-#[derive(Debug)]
-pub struct ConstraintContract {
-    /// The contract at the version its id declares.
-    pub reference: ContractRef,
-    /// Validates the `{type, metadata}` envelope of a Quota's metadata.
-    pub contract: CompiledContract,
+/// The major version of the type's own segment.
+fn own_major(id: &GtsTypeId) -> Option<u32> {
+    GtsId::try_new(id.as_ref())
+        .ok()?
+        .segments()
+        .last()?
+        .ver_major_opt()
 }
 
-/// The one request contract of an admitted metric.
-#[domain_model]
-#[derive(Debug)]
-pub struct MetricRequestContract {
-    /// The contract type, derived from `gts.cf.core.qe.request.v1~`.
-    pub type_id: GtsTypeId,
-    /// The metric its `metric` trait names.
-    pub metric: MetricId,
-    /// The constraint contract its `constraint_contract` trait attaches.
-    pub constraint: ConstraintContract,
-    /// Validates the `{type, metadata}` envelope of operation metadata.
-    pub contract: CompiledContract,
-}
-
-/// Everything the catalogue knows about one admitted metric.
-#[derive(Debug)]
-struct MetricEntry {
-    request: MetricRequestContract,
-    /// The reverse index: which configured projection admits the metric at
-    /// each scope. Unique per pair by construction.
-    by_scope: HashMap<SubjectScope, GtsTypeId>,
-}
-
-/// Why a `(metric, kind)` pair has no projection.
-#[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CatalogMiss {
-    /// No configured projection admits the metric at any scope.
-    MetricNotAdmitted,
-    /// The kind is a scope no configured projection declares.
-    KindUnknown,
-    /// The kind is a known scope, but no projection admits the metric there.
-    KindNotAdmitted,
-}
-
-/// The immutable process-local catalogue. Built once at bootstrap, read on
-/// every subject-based request without a registry call.
+/// Validate `document` with `validator`, flattening the diagnostics.
 ///
-/// `cpt-cf-quota-enforcement-dod-projection-catalog` stays open until the
-/// active-Quota compatibility check runs against the database.
-#[domain_model]
-#[derive(Debug)]
-pub struct ProjectionContractCatalog {
-    subjects: HashMap<GtsTypeId, SubjectProjectionContract>,
-    resources: HashMap<GtsTypeId, ResourceProjectionContract>,
-    metrics: HashMap<MetricId, MetricEntry>,
-    scopes: HashSet<SubjectScope>,
-}
-
-impl ProjectionContractCatalog {
-    /// A catalogue with no projections. Every mapping misses.
-    #[must_use]
-    pub fn empty() -> Self {
-        Self {
-            subjects: HashMap::new(),
-            resources: HashMap::new(),
-            metrics: HashMap::new(),
-            scopes: HashSet::new(),
-        }
-    }
-
-    /// Assemble the catalogue from validated parts. The builder has already
-    /// proven `(metric, scope)` uniqueness and that every admitted metric has
-    /// exactly one request contract.
-    pub(super) fn assemble(
-        subjects: Vec<SubjectProjectionContract>,
-        resources: Vec<ResourceProjectionContract>,
-        requests: Vec<MetricRequestContract>,
-    ) -> Self {
-        let mut metrics: HashMap<MetricId, MetricEntry> = requests
+/// # Errors
+///
+/// The JSON Schema violations or, when there are none, the GTS reference
+/// violations.
+pub fn validate(validator: &PayloadValidator, document: &Value) -> Result<(), Vec<String>> {
+    validator.validate(document).map_err(|error| match error {
+        PayloadValidationError::Constraints(violations) => violations,
+        PayloadValidationError::References(violations) => violations
             .into_iter()
-            .map(|request| {
-                (
-                    request.metric.clone(),
-                    MetricEntry {
-                        request,
-                        by_scope: HashMap::new(),
-                    },
-                )
-            })
-            .collect();
-        let mut scopes = HashSet::new();
-        for projection in &subjects {
-            scopes.insert(projection.scope.clone());
-            for metric in &projection.admitted_metrics {
-                if let Some(entry) = metrics.get_mut(metric) {
-                    entry
-                        .by_scope
-                        .insert(projection.scope.clone(), projection.type_id.clone());
-                }
-            }
-        }
-        Self {
-            subjects: subjects
-                .into_iter()
-                .map(|p| (p.type_id.clone(), p))
-                .collect(),
-            resources: resources
-                .into_iter()
-                .map(|r| (r.type_id.clone(), r))
-                .collect(),
-            metrics,
-            scopes,
-        }
-    }
-
-    /// The projection that admits `metric` at `scope`.
-    ///
-    /// # Errors
-    ///
-    /// Returns which part of the pair the catalogue does not know.
-    pub fn map_subject(
-        &self,
-        metric: &MetricId,
-        scope: &SubjectScope,
-    ) -> Result<&GtsTypeId, CatalogMiss> {
-        let entry = self
-            .metrics
-            .get(metric)
-            .ok_or(CatalogMiss::MetricNotAdmitted)?;
-        entry
-            .by_scope
-            .get(scope)
-            .ok_or(if self.scopes.contains(scope) {
-                CatalogMiss::KindNotAdmitted
-            } else {
-                CatalogMiss::KindUnknown
-            })
-    }
-
-    /// The request contract of an admitted metric.
-    #[must_use]
-    pub fn request_contract(&self, metric: &MetricId) -> Option<&MetricRequestContract> {
-        self.metrics.get(metric).map(|e| &e.request)
-    }
-
-    /// A configured resource projection.
-    #[must_use]
-    pub fn resource_projection(&self, type_id: &GtsTypeId) -> Option<&ResourceProjectionContract> {
-        self.resources.get(type_id)
-    }
-
-    /// A configured subject projection.
-    #[must_use]
-    pub fn subject_projection(&self, type_id: &GtsTypeId) -> Option<&SubjectProjectionContract> {
-        self.subjects.get(type_id)
-    }
-
-    /// True when `projection` is configured and admits `metric`.
-    #[must_use]
-    pub fn admits(&self, projection: &GtsTypeId, metric: &MetricId) -> bool {
-        self.subjects
-            .get(projection)
-            .is_some_and(|p| p.admitted_metrics.contains(metric))
-    }
-
-    /// True when some configured projection declares `scope`.
-    #[must_use]
-    pub fn knows_scope(&self, scope: &SubjectScope) -> bool {
-        self.scopes.contains(scope)
-    }
-
-    /// The configured subject projections.
-    pub fn subject_projections(&self) -> impl Iterator<Item = &SubjectProjectionContract> {
-        self.subjects.values()
-    }
-
-    /// The configured resource projections.
-    pub fn resource_projections(&self) -> impl Iterator<Item = &ResourceProjectionContract> {
-        self.resources.values()
-    }
-
-    /// The admitted metrics.
-    pub fn admitted_metrics(&self) -> impl Iterator<Item = &MetricId> {
-        self.metrics.keys()
-    }
+            .map(|v| format!("{}: {}", v.field_path, v.reason))
+            .collect(),
+        PayloadValidationError::Unexplained(reason) => vec![reason],
+    })
 }
 
 #[cfg(test)]

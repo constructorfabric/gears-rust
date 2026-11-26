@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::{
     CatalogSection, ElectionTimingConfig, GaugesSection, LeasesSection, MetricsConfig,
     NotificationsSection, OperationsSection, PoliciesSection, QuotaEnforcementConfig,
-    QuotasSection, SnapshotSection,
+    QuotasSection, RetentionSection, SnapshotSection,
 };
 
 #[test]
@@ -107,57 +107,93 @@ fn unknown_keys_are_rejected_and_partial_configs_use_defaults() {
 }
 
 #[test]
-fn the_catalog_section_accepts_type_ids_and_rejects_instances_and_duplicates() {
-    let section = CatalogSection {
-        subject_projections: vec![
-            "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~".to_owned(),
-            "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.tenant.v1~".to_owned(),
-        ],
-        resource_projections: vec![
-            "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~".to_owned(),
-        ],
-    };
-    section.validate().expect("valid");
-    let domain = section.to_domain().expect("lowers");
-    assert_eq!(domain.subject_projections.len(), 2);
-    assert_eq!(domain.resource_projections.len(), 1);
-    assert!(
-        CatalogSection::default().validate().is_ok(),
-        "empty is a valid catalogue"
-    );
+fn the_catalog_section_bounds_each_registry_read() {
+    let section = CatalogSection::default();
+    section.validate().expect("defaults are valid");
+    assert_eq!(section.read_timeout(), Duration::from_secs(2));
+    assert_eq!(section.read_interval(), Duration::from_secs(60));
+    assert_eq!(section.unknown_memory().ttl, Duration::from_secs(10));
+    assert_eq!(section.unknown_memory().capacity.get(), 10_000);
+    for (field, zero) in [
+        (
+            "read_timeout_ms",
+            CatalogSection {
+                read_timeout_ms: 0,
+                ..CatalogSection::default()
+            },
+        ),
+        (
+            "read_interval_secs",
+            CatalogSection {
+                read_interval_secs: 0,
+                ..CatalogSection::default()
+            },
+        ),
+        (
+            "unknown_ttl_secs",
+            CatalogSection {
+                unknown_ttl_secs: 0,
+                ..CatalogSection::default()
+            },
+        ),
+        (
+            "unknown_capacity",
+            CatalogSection {
+                unknown_capacity: 0,
+                ..CatalogSection::default()
+            },
+        ),
+    ] {
+        let err = zero.validate().expect_err("zero rejected");
+        assert!(err.to_string().contains(field), "{err}");
+    }
+    for (field, over) in [
+        (
+            "read_timeout_ms",
+            CatalogSection {
+                read_timeout_ms: CatalogSection::READ_TIMEOUT_CEILING_MS + 1,
+                ..CatalogSection::default()
+            },
+        ),
+        (
+            "read_interval_secs",
+            CatalogSection {
+                read_interval_secs: CatalogSection::SECS_CEILING + 1,
+                ..CatalogSection::default()
+            },
+        ),
+        (
+            "unknown_ttl_secs",
+            CatalogSection {
+                unknown_ttl_secs: u64::MAX,
+                ..CatalogSection::default()
+            },
+        ),
+    ] {
+        let err = over.validate().expect_err("over the ceiling");
+        assert!(err.to_string().contains(field), "{err}");
+    }
+    for batch_size in [0, 10_001] {
+        let bad = RetentionSection {
+            batch_size,
+            ..RetentionSection::default()
+        };
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
 
-    let instance = CatalogSection {
-        subject_projections: vec!["gts.cf.core.qe.scope.v1~cf.core.qe.user.v1".to_owned()],
-        ..CatalogSection::default()
-    };
-    let err = instance
-        .validate()
-        .expect_err("an instance id is not a type id");
-    assert!(err.to_string().contains("subject_projections[0]"), "{err}");
-
-    let duplicate = CatalogSection {
-        resource_projections: vec![
-            "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~".to_owned(),
-            "gts.cf.core.qe.res.v1~cf.genai.llm_gateway.model.v1~".to_owned(),
-        ],
-        ..CatalogSection::default()
-    };
-    let err = duplicate.validate().expect_err("duplicates rejected");
-    assert!(err.to_string().contains("twice"), "{err}");
-
-    let cfg: QuotaEnforcementConfig = serde_json::from_str(
-        r#"{ "catalog": { "subject_projections": ["gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~"] } }"#,
-    )
-    .expect("partial catalog section");
-    assert_eq!(cfg.catalog.subject_projections.len(), 1);
-    assert!(cfg.catalog.resource_projections.is_empty());
-    assert!(
-        serde_json::from_str::<QuotaEnforcementConfig>(
-            r#"{ "catalog": { "request_contracts": [] } }"#
-        )
-        .is_err(),
-        "request contracts are discovered, never configured"
-    );
+    let cfg: QuotaEnforcementConfig =
+        serde_json::from_str(r#"{ "catalog": { "read_timeout_ms": 500 } }"#).expect("partial");
+    assert_eq!(cfg.catalog.read_timeout(), Duration::from_millis(500));
+    for retired in [
+        r#"{ "quotas": { "metric_cache_entries": 256 } }"#,
+        r#"{ "quotas": { "metric_cache_ttl_secs": 60 } }"#,
+        r#"{ "quotas": { "metric_cache_stale_grace_secs": 300 } }"#,
+    ] {
+        assert!(
+            serde_json::from_str::<QuotaEnforcementConfig>(retired).is_err(),
+            "{retired}"
+        );
+    }
 }
 
 #[test]
@@ -168,8 +204,6 @@ fn the_quotas_section_defaults_to_the_prd_bounds_and_rejects_each_zero_or_oversi
     assert_eq!(limits.metadata_max_bytes, 4096);
     assert_eq!(limits.list_max_limit, 500);
     assert_eq!(limits.list_max_ids, 100);
-    assert_eq!(section.metric_cache_ttl(), Duration::from_mins(1));
-    assert_eq!(section.metric_cache_stale_grace(), Duration::from_mins(5));
 
     let cases: Vec<(QuotasSection, &str)> = vec![
         (
@@ -185,20 +219,6 @@ fn the_quotas_section_defaults_to_the_prd_bounds_and_rejects_each_zero_or_oversi
                 ..QuotasSection::default()
             },
             "metadata_max_bytes",
-        ),
-        (
-            QuotasSection {
-                metric_cache_entries: 0,
-                ..QuotasSection::default()
-            },
-            "metric_cache_entries",
-        ),
-        (
-            QuotasSection {
-                metric_cache_ttl_secs: 0,
-                ..QuotasSection::default()
-            },
-            "metric_cache_ttl_secs",
         ),
         (
             QuotasSection {
@@ -219,15 +239,6 @@ fn the_quotas_section_defaults_to_the_prd_bounds_and_rejects_each_zero_or_oversi
         let err = section.validate().expect_err("rejected");
         assert!(err.to_string().contains(field), "{field}: {err}");
     }
-    assert!(
-        QuotasSection {
-            metric_cache_stale_grace_secs: 0,
-            ..QuotasSection::default()
-        }
-        .validate()
-        .is_ok(),
-        "a zero grace serves nothing stale and is allowed"
-    );
 }
 
 #[test]
@@ -479,6 +490,10 @@ fn the_batch_bounds_default_to_the_platform_values_and_reject_zero() {
     for bad in [
         OperationsSection {
             max_batch_items: 0,
+            ..OperationsSection::default()
+        },
+        OperationsSection {
+            max_batch_items: 1_001,
             ..OperationsSection::default()
         },
         OperationsSection {

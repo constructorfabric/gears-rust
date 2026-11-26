@@ -9,7 +9,7 @@
 //! evaluation driver and the double only; `span_overhead_over_the_sql_plugin`
 //! times the whole gear.
 //!
-//! What they deliberately exclude: the PDP round trip, catalogue mapping, and
+//! What they deliberately exclude: the PDP round trip, subject admission, and
 //! HTTP. Those are network and policy costs that would swamp the arithmetic
 //! this feature owns, and they are measured where they belong.
 //!
@@ -35,28 +35,25 @@ use quota_enforcement_sdk::testing::{
 };
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, Decision, DecisionResult, EvaluatedMutation,
-    IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, MetricId, OperationType,
-    PartialIdempotencyWrite, PayloadHash, QuotaEnforcementStoragePluginV1, QuotaId, SubjectRef,
-    TenantId,
+    IdempotencyScope, IdempotencyWrite, MetricId, OperationType, PartialIdempotencyWrite,
+    PayloadHash, QuotaEnforcementStoragePluginV1, QuotaId, SubjectRef, TenantId,
 };
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::runtime::Runtime;
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-const METRIC: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.tokens.v1";
+const METRIC: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 
 fn tenant() -> TenantId {
     TenantId::new(Uuid::from_u128(1))
 }
 
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
+fn actor() -> quota_enforcement_sdk::Actor {
+    quota_enforcement_sdk::Actor::Caller {
+        subject_id: Uuid::from_u128(0x5eed),
+    }
 }
 
 fn metric() -> MetricId {
@@ -83,7 +80,6 @@ fn write_as(key: &str, operation_type: OperationType) -> IdempotencyWrite {
     IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
             operation_type,
             key: key.to_owned(),
         },
@@ -121,7 +117,7 @@ fn seeded(runtime: &Runtime, quotas: usize) -> (Arc<InMemoryStorage>, Vec<QuotaI
             draft.metric = metric();
             ids.push(
                 storage
-                    .create_quota(&ctx(), &AccessScope::allow_all(), draft, &[])
+                    .create_quota(&actor(), &AccessScope::allow_all(), draft, &[])
                     .await
                     .expect("quota"),
             );
@@ -151,7 +147,7 @@ fn debit(c: &mut Criterion) {
     let metrics: Arc<dyn quota_enforcement::domain::ports::metrics::QeMetrics> =
         Arc::new(NoopMetrics);
     let null = serde_json::Value::Null;
-    let security = ctx();
+    let actor = actor();
     let access = AccessScope::allow_all();
 
     let mut group = c.benchmark_group("debit");
@@ -184,8 +180,7 @@ fn debit(c: &mut Criterion) {
                         applicable: &applicable,
                         amount: 1,
                         request: &null,
-                        resource: &null,
-                        user_projection: None,
+                        metric_id: None,
                         limits: limits(),
                         idempotency: &idempotency,
                         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -195,8 +190,7 @@ fn debit(c: &mut Criterion) {
                     // the artifact on the first miss, then every later call is
                     // warm, because the cache outlives the store.
                     let outcome = runtime.block_on(
-                        prepared
-                            .run(|| storage.apply_debit_plan(&security, &access, &mutation, &[])),
+                        prepared.run(|| storage.apply_debit_plan(&actor, &access, &mutation, &[])),
                     );
                     let applied = outcome.expect("debit");
                     let decision = &applied.get().decision;
@@ -222,7 +216,7 @@ fn lease(c: &mut Criterion) {
     let metrics: Arc<dyn quota_enforcement::domain::ports::metrics::QeMetrics> =
         Arc::new(NoopMetrics);
     let null = serde_json::Value::Null;
-    let security = ctx();
+    let actor = actor();
     let access = AccessScope::allow_all();
     let applicable = applicable(subjects(1));
 
@@ -245,8 +239,7 @@ fn lease(c: &mut Criterion) {
                         applicable: &applicable,
                         amount: 1,
                         request: &null,
-                        resource: &null,
-                        user_projection: None,
+                        metric_id: None,
                         limits: limits(),
                         idempotency: &idempotency,
                         authorized: AttributionDigest::from_bytes([7; 32]),
@@ -255,7 +248,7 @@ fn lease(c: &mut Criterion) {
                     let acquired = runtime
                         .block_on(prepared.run(|| {
                             storage.acquire_lease(
-                                &security,
+                                &actor,
                                 &access,
                                 &mutation,
                                 Duration::from_secs(60),
@@ -270,9 +263,10 @@ fn lease(c: &mut Criterion) {
                     };
                     let committed = runtime
                         .block_on(storage.commit_lease(
-                            &security,
+                            &actor,
                             &access,
                             token,
+                            None,
                             None,
                             &commit,
                             &[],
@@ -303,9 +297,8 @@ fn payload_digest(c: &mut Criterion) {
     let payload = json!({
         "attribution": {
             "tenant_id": tenant().as_uuid(),
-            "metric": METRIC,
-            "subjects": [{ "kind": "user", "id": "u0" }],
-            "metadata": { "region": "eu-west-1" }
+            "subjects": [{ "type": "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~", "id": "u0" }],
+            "metric": { "type": METRIC, "metadata": { "region": "eu-west-1" } }
         },
         "amount": 1
     });
@@ -324,7 +317,7 @@ fn replay_cache_hit(c: &mut Criterion) {
         scope.clone(),
         ReplayRecord {
             payload_hash: PayloadHash::from_bytes([2; 32]),
-            decision: Decision::allowed_with_plan(std::collections::BTreeMap::new()),
+            decision: Decision::allowed_with_plan(Vec::new()),
             expires_at: now + time::Duration::hours(1),
         },
         now,

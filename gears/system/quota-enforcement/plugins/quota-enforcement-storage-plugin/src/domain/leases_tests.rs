@@ -5,23 +5,14 @@ use std::sync::Arc;
 use quota_enforcement_sdk::{
     LeaseToken, PartialIdempotencyWrite, PayloadHash, StorageError, TenantId,
 };
-use toolkit_security::{AccessScope, SecurityContext};
+use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::StoragePlugin;
 use crate::infra::storage::SqlFoundationStore;
 use crate::test_support::{
-    FakeConsumptionStore, FakeLeaseStore, FakePolicyStore, FakeQuotaStore, tenant, test_db,
+    FakeConsumptionStore, FakeLeaseStore, FakePolicyStore, FakeQuotaStore, actor, test_db,
 };
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_type("service")
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
-}
 
 async fn plugin() -> StoragePlugin {
     StoragePlugin::new(
@@ -42,21 +33,22 @@ async fn settlements_reach_the_lease_store_with_the_token_they_name() {
         key: "k".to_owned(),
         payload_hash: PayloadHash::from_bytes([1; 32]),
     };
-    let ctx = ctx();
+    let actor = actor();
 
     let committed = plugin
         .commit_lease(
-            &ctx,
+            &actor,
             &AccessScope::allow_all(),
             token,
             Some(1),
+            None,
             &partial,
             &[],
         )
         .await;
     assert!(matches!(committed, Err(StorageError::LeaseNotFound { token: t }) if t == token));
     let released = plugin
-        .release_lease(&ctx, &AccessScope::allow_all(), token, &partial, &[])
+        .release_lease(&actor, &AccessScope::allow_all(), token, &partial, &[])
         .await;
     assert!(matches!(released, Err(StorageError::LeaseNotFound { token: t }) if t == token));
 }

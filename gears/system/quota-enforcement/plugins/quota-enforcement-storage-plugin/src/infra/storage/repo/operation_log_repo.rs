@@ -52,8 +52,7 @@ pub async fn append(
             tenant_id: ActiveValue::Set(entry.tenant_id),
             quota_id: ActiveValue::Set(Some(entry.quota_id)),
             operation: ActiveValue::Set(entry.operation.to_owned()),
-            actor_subject_id: ActiveValue::Set(entry.actor.subject_id),
-            actor_subject_type: ActiveValue::Set(entry.actor.subject_type.clone()),
+            actor: ActiveValue::Set(entry.actor.to_string()),
             record_version: ActiveValue::Set(Some(entry.record_version)),
             detail: ActiveValue::Set(entry.detail),
             occurred_at: ActiveValue::Set(entry.occurred_at),
@@ -89,6 +88,8 @@ pub const OP_DEBIT: &str = "operation.debit";
 pub const OP_CREDIT: &str = "operation.credit";
 /// Operation name of a rollback.
 pub const OP_ROLLBACK: &str = "operation.rollback";
+/// Operation name of a return.
+pub const OP_RETURN: &str = "operation.return";
 /// Operation name of one entry of an applied batch debit.
 pub const OP_BATCH_DEBIT: &str = "operation.batch_debit";
 

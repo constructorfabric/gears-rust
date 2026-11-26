@@ -20,7 +20,7 @@
 //! Requires Docker. Run with
 //! `cargo test -p cf-gears-quota-enforcement-storage-plugin --features postgres --test snapshot_integration_pg`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,9 +31,9 @@ use quota_enforcement_sdk::engine::{
 use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, CapPatch, EvaluatedMutation, IdempotencyScope,
-    IdempotencySubjectKey, IdempotencyWrite, MetricId, OperationType, PageRequest, PageResult,
-    PayloadHash, PeriodType, PolicyDraft, PolicyScope, QuotaDraft, QuotaId, QuotaPatch,
-    QuotaSnapshot, QuotaType, StorageError, SubjectRef, TenantId,
+    IdempotencyWrite, MetricId, OperationType, PageRequest, PageResult, PayloadHash, PeriodType,
+    PolicyDraft, PolicyScope, QuotaDraft, QuotaId, QuotaPatch, QuotaSnapshot, QuotaType,
+    StorageError, SubjectRef, TenantId,
 };
 use sea_orm::EntityTrait as _;
 use sea_orm_migration::prelude::*;
@@ -46,9 +46,7 @@ use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_db::{ConnectOpts, connect_db};
-use toolkit_security::{
-    AccessScope, ScopeConstraint, ScopeFilter, SecurityContext, pep_properties,
-};
+use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
 use quota_enforcement_storage_plugin::infra::storage::Migrator;
@@ -62,8 +60,8 @@ mod common;
 
 use common::{allow_all, limits};
 
-const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
-const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
+const USER_SUBJECT_TYPE: &str = "gts.cf.core.quota.subj.v1~acme.core.quota.user.v1~";
+const METRIC_TOKENS: &str = "gts.cf.core.quota.metric.v1~cf.genai.llm_gateway.ai_tokens_input.v1~";
 /// A Tuesday, inside an ordinary day period.
 const DAY_ONE: OffsetDateTime = datetime!(2026-03-17 10:00:00 UTC);
 const DAY_TWO: OffsetDateTime = datetime!(2026-03-18 10:00:00 UTC);
@@ -77,23 +75,14 @@ fn scope() -> AccessScope {
 }
 
 fn actor() -> Actor {
-    Actor {
+    Actor::Caller {
         subject_id: Uuid::from_u128(0x5eed),
-        subject_type: None,
     }
-}
-
-fn ctx() -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::from_u128(0x5eed))
-        .subject_tenant_id(tenant().as_uuid())
-        .build()
-        .expect("security context")
 }
 
 fn subject(id: &str) -> SubjectRef {
     SubjectRef {
-        projection_type: GtsTypeId::try_new(USER_PROJECTION).expect("type id"),
+        subject_type: GtsTypeId::try_new(USER_SUBJECT_TYPE).expect("type id"),
         subject_id: id.to_owned(),
     }
 }
@@ -287,7 +276,7 @@ impl PgHarness {
         let enqueuer: Arc<dyn NotificationOutbox> = bound;
         SqlPolicyStore::new(db.clone(), Arc::clone(&enqueuer))
             .create_policy(
-                &ctx(),
+                &actor(),
                 PolicyDraft {
                     scope: PolicyScope::Global,
                     engine_id: "cel".to_owned(),
@@ -430,7 +419,6 @@ async fn debit_with(
     let idempotency = IdempotencyWrite {
         scope: IdempotencyScope {
             tenant_id: tenant(),
-            subject_key: IdempotencySubjectKey::of(&applicable.subjects),
             operation_type: OperationType::Debit,
             key: key.to_owned(),
         },
@@ -439,14 +427,13 @@ async fn debit_with(
     let null = serde_json::Value::Null;
     store
         .apply_debit_plan(
-            &ctx(),
+            &actor(),
             &scope(),
             &EvaluatedMutation {
                 applicable: &applicable,
                 amount,
                 request: &null,
-                resource: &null,
-                user_projection: None,
+                metric_id: None,
                 limits: limits(),
                 idempotency: &idempotency,
                 authorized: AttributionDigest::from_bytes([7; 32]),
@@ -488,44 +475,6 @@ fn gated_evaluator() -> (Arc<TransactionEvaluator>, GateHandle) {
     )
 }
 
-/// Counts the statements `sqlx` reports while it dispatches for one future.
-#[derive(Clone, Default)]
-struct Statements(Arc<AtomicUsize>);
-
-impl Statements {
-    /// `op`'s output and the statements it issued.
-    async fn during<T>(op: impl std::future::Future<Output = T>) -> (T, usize) {
-        use tracing::instrument::WithSubscriber as _;
-        let counter = Self::default();
-        let out = op
-            .with_subscriber(tracing::Dispatch::new(counter.clone()))
-            .await;
-        (out, counter.0.load(Ordering::SeqCst))
-    }
-}
-
-impl tracing::Subscriber for Statements {
-    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        metadata.target() == "sqlx::query"
-    }
-
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
-    }
-
-    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
-
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-
-    fn event(&self, _: &tracing::Event<'_>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn enter(&self, _: &tracing::span::Id) {}
-
-    fn exit(&self, _: &tracing::span::Id) {}
-}
-
 fn of(page: &PageResult<QuotaSnapshot>, id: QuotaId) -> &QuotaSnapshot {
     page.items
         .iter()
@@ -544,10 +493,10 @@ async fn a_page_reads_one_snapshot_while_writers_commit_around_it() {
     let read = tokio::spawn(async move {
         reader
             .bulk_read_quota_snapshot(
-                &ctx(),
                 &scope(),
                 &[applicable(tenant(), "u1")],
                 PageRequest::first(10),
+                false,
             )
             .await
     });
@@ -583,10 +532,10 @@ async fn a_page_reads_one_snapshot_while_writers_commit_around_it() {
     let fresh = h
         .store
         .bulk_read_quota_snapshot(
-            &ctx(),
             &scope(),
             &[applicable(tenant(), "u1")],
             PageRequest::first(10),
+            false,
         )
         .await
         .expect("fresh page");
@@ -603,7 +552,7 @@ async fn a_period_row_committed_after_the_snapshot_is_neither_seen_nor_duplicate
 
     let read = tokio::spawn(async move {
         reader
-            .read_quota_snapshot(&ctx(), &scope(), &applicable(tenant(), "u1"))
+            .read_quota_snapshot(&scope(), &applicable(tenant(), "u1"))
             .await
     });
     gate.wait_until_reached().await;
@@ -648,7 +597,7 @@ async fn under_a_subtree_grant_both_reads_return_only_what_they_see() {
 
     let page = h
         .store
-        .bulk_read_quota_snapshot(&ctx(), &subtree, &pairs, PageRequest::first(10))
+        .bulk_read_quota_snapshot(&subtree, &pairs, PageRequest::first(10), false)
         .await
         .expect("bulk read under the subtree grant");
     let seen: Vec<QuotaId> = page
@@ -659,13 +608,13 @@ async fn under_a_subtree_grant_both_reads_return_only_what_they_see() {
     assert_eq!(seen, vec![inside]);
     let single = h
         .store
-        .read_quota_snapshot(&ctx(), &subtree, &pairs[0])
+        .read_quota_snapshot(&subtree, &pairs[0])
         .await
         .expect("single read under the subtree grant");
     assert_eq!(single.len(), 1);
     let none = h
         .store
-        .read_quota_snapshot(&ctx(), &subtree, &pairs[1])
+        .read_quota_snapshot(&subtree, &pairs[1])
         .await
         .expect("single read of an invisible target");
     assert!(none.is_empty());
@@ -684,7 +633,7 @@ async fn a_read_across_the_boundary_writes_nothing_and_the_crossing_debit_settle
     h.set_now(DAY_TWO);
     let read = h
         .store
-        .read_quota_snapshot(&ctx(), &scope(), &applicable(tenant(), "u1"))
+        .read_quota_snapshot(&scope(), &applicable(tenant(), "u1"))
         .await
         .expect("read");
     assert_eq!(read[0].consumed, 0, "day two reads as zero");
@@ -717,9 +666,9 @@ async fn a_read_finishes_while_a_debit_holds_the_quota_and_writes_nothing() {
     // The debit holds the Quota row and has found no period row.
     held.wait_until_reached().await;
 
-    let (ctx, scope, target) = (ctx(), scope(), applicable(tenant(), "u1"));
+    let (scope, target) = (scope(), applicable(tenant(), "u1"));
     let snapshots = {
-        let read = h.store.read_quota_snapshot(&ctx, &scope, &target);
+        let read = h.store.read_quota_snapshot(&scope, &target);
         tokio::pin!(read);
         loop {
             tokio::select! {
@@ -763,10 +712,10 @@ async fn a_debit_is_not_refused_while_a_read_is_in_flight() {
         async move {
             store
                 .bulk_read_quota_snapshot(
-                    &ctx(),
                     &scope(),
                     &[applicable(tenant(), "u1"), applicable(tenant(), "u2")],
                     PageRequest::first(10),
+                    false,
                 )
                 .await
         }
@@ -776,7 +725,8 @@ async fn a_debit_is_not_refused_while_a_read_is_in_flight() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // At the 0 ms default a debit meeting a held row is refused at once.
+    // A debit meeting a row the read held would be refused once the 50 ms
+    // default budget ran out, since the read waits on the blocker.
     debit_with(Arc::clone(&h.store), "u1", 7, "first", allow_all())
         .await
         .expect("the debit is not refused");
@@ -805,14 +755,14 @@ async fn a_page_issues_as_many_statements_for_twenty_quotas_as_for_two() {
         .iter()
         .map(|holder| applicable(tenant(), holder))
         .collect();
-    let (ctx, scope) = (ctx(), scope());
+    let scope = scope();
     let read = |pairs| {
         h.store
-            .bulk_read_quota_snapshot(&ctx, &scope, pairs, PageRequest::first(100))
+            .bulk_read_quota_snapshot(&scope, pairs, PageRequest::first(100), false)
     };
 
-    let (two, small) = Statements::during(read(&pairs[..1])).await;
-    let (twenty, large) = Statements::during(read(&pairs)).await;
+    let (two, small) = common::Statements::during(read(&pairs[..1])).await;
+    let (twenty, large) = common::Statements::during(read(&pairs)).await;
     assert_eq!(two.expect("read").items.len(), 2);
     assert_eq!(twenty.expect("read").items.len(), 20);
     assert!(small > 0, "the counter sees the read's statements");
@@ -820,5 +770,57 @@ async fn a_page_issues_as_many_statements_for_twenty_quotas_as_for_two() {
         large, small,
         "a page's statements do not grow with its Quotas"
     );
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_in_window_page_is_filled_from_the_quotas_inside_their_window() {
+    let h = PgHarness::up().await;
+    let window = |start, end| quota_enforcement_sdk::ValidityWindow { start, end };
+    for validity in [
+        window(None, Some(datetime!(2026-03-17 09:59:59 UTC))),
+        window(Some(datetime!(2026-03-17 10:00:01 UTC)), None),
+    ] {
+        h.create(QuotaDraft {
+            validity_window: Some(validity),
+            ..allocation(tenant(), "u1", 10)
+        })
+        .await;
+    }
+    let bounded = h
+        .create(QuotaDraft {
+            validity_window: Some(window(Some(DAY_ONE), Some(DAY_ONE))),
+            ..allocation(tenant(), "u1", 10)
+        })
+        .await;
+    let open = h.create(allocation(tenant(), "u1", 10)).await;
+    let read = |cursor: Option<String>| {
+        let store = Arc::clone(&h.store);
+        async move {
+            store
+                .bulk_read_quota_snapshot(
+                    &scope(),
+                    &[applicable(tenant(), "u1")],
+                    PageRequest { limit: 1, cursor },
+                    true,
+                )
+                .await
+                .expect("page")
+        }
+    };
+
+    let first = read(None).await;
+    let second = read(first.next_cursor.clone()).await;
+
+    assert_eq!(
+        first.items.iter().map(|s| s.quota_id).collect::<Vec<_>>(),
+        [bounded],
+        "the window bounds are inclusive"
+    );
+    assert_eq!(
+        second.items.iter().map(|s| s.quota_id).collect::<Vec<_>>(),
+        [open]
+    );
+    assert_eq!(second.next_cursor, None);
     h.down().await;
 }

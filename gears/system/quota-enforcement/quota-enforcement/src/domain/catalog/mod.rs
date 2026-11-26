@@ -1,23 +1,12 @@
-//! The projection contract catalogue (`features/projection-contracts.md`,
-//! ADR-0007): the immutable, process-local snapshot of the configured owner
-//! projections and per-metric contracts that the Gateway validates against
-//! without a registry call.
+//! The metric catalogue (`features/projection-contracts.md`, ADR-0012): one
+//! entry per metric type QE has read, served or unavailable, and the cache of
+//! registered subject types.
 //!
-//! - [`model`]: the catalogue and the compiled contracts it holds.
-//! - [`builder`]: the bootstrap consistency set that produces it, and the
-//!   compatibility check against active Quotas.
-//! - [`membership`]: the reference check Quota and Policy writes run.
+//! - [`model`]: an entry and the checks that build it.
+//! - [`metric_catalog`]: the catalogue, filled on first use.
 
-pub mod builder;
-pub mod classifications;
-pub mod membership;
+pub mod metric_catalog;
 pub mod model;
 
-pub use builder::{CatalogBuilder, CatalogConfig};
-pub use classifications::MetricClassifications;
-pub use membership::check_projection_reference;
-pub use model::{
-    CatalogMiss, CompiledContract, ConstraintContract, MetricRequestContract,
-    ProjectionContractCatalog, ResourceProjectionContract, SubjectProjectionContract,
-    parse_metric_under_base,
-};
+pub use metric_catalog::{MetricCatalog, UnknownMemory};
+pub use model::{CatalogEntry, MetricMode, ServedMetric};

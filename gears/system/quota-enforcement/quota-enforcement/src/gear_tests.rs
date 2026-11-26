@@ -21,6 +21,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;
 use toolkit::config::ConfigProvider;
+use toolkit::gts_publication::GtsPublicationCapability as _;
 use toolkit::lifecycle::ReadySignal;
 use toolkit::{ClientHub, Gear, GearCtx, HealthcheckResult, RestApiCapability};
 use toolkit_canonical_errors::CanonicalError;
@@ -32,11 +33,10 @@ use crate::api::rest::routes::PATH_PREFIX;
 use crate::domain::notifications::DeliveryLifecycle;
 use crate::domain::{Dependency, DomainError, ReadinessState};
 use crate::test_support::{
-    ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
-    OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, in_process_registry,
-    llm_gateway_documents, metric_base_documents, plugin_instance_document, register_pdp,
-    register_sink, register_storage, sink_instance, storage_instance, tenant, wire_cluster,
-    wire_cluster_with,
+    ClusterFixture, FailingPdp, OtherProfile, PermitTenantsPdp, USER_SUBJECT_TYPE,
+    ctx as security_ctx, hub_with_registry, in_process_registry, plugin_instance_document,
+    register_pdp, register_sink, register_storage, sink_instance, storage_instance, tenant,
+    wire_cluster, wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -63,23 +63,26 @@ fn make_ctx_wired(hub: Arc<ClientHub>, wiring: serde_json::Value) -> GearCtx {
                 "sweeper_stop_timeout_secs": 1,
                 "quotas": { "metadata_max_bytes": 1024, "list_max_limit": 50 },
                 "gauges": { "refresh_secs": 1, "refresh_deadline_secs": 1, "stale_after_secs": 3 },
-                "catalog": {
-                    "subject_projections": [LLM_USER_PROJECTION, LLM_TENANT_PROJECTION],
-                    "resource_projections": [LLM_MODEL_RESOURCE]
-                }
+                "catalog": { "read_timeout_ms": 500 }
             }
         }
     });
     if !wiring.is_null() {
         cfg["quota-enforcement"]["clients"]["provides"] = wiring;
     }
+    let config = StaticConfigProvider { root: cfg };
+    let manifest = QuotaEnforcementGear::default()
+        .descriptor()
+        .build_gts_manifest(&config)
+        .expect("the resolver plugin instance");
     GearCtx::new(
         QuotaEnforcementGear::MODULE_NAME,
         Uuid::from_u128(1),
-        Arc::new(StaticConfigProvider { root: cfg }),
+        Arc::new(config),
         hub,
         CancellationToken::new(),
     )
+    .with_gts_publication_manifest_for_test(Arc::new(manifest))
 }
 
 /// Which cluster profile the test binds.
@@ -105,17 +108,15 @@ fn environment(
 }
 
 /// [`environment`] with the given PDP double registered as the client. The
-/// types registry is the real in-process one, holding the storage plugin
-/// instance, the `llm_gateway` owner set, and the two metrics it admits.
+/// legacy types registry is the real in-process one holding the storage plugin
+/// instance; the platform registry holds the metric and subject type fixtures.
 fn environment_with_pdp(
     with_storage_client: bool,
     cluster: ClusterBinding,
     pdp: Arc<dyn AuthZResolverApi>,
 ) -> (Arc<ClientHub>, Arc<InMemoryStorage>, ClusterFixture) {
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
-    let mut documents = llm_gateway_documents();
-    documents.extend(metric_base_documents());
-    documents.push(plugin_instance_document(&storage_fixture));
+    let documents = vec![plugin_instance_document(&storage_fixture)];
     let hub = hub_with_registry(in_process_registry(documents));
     register_pdp(&hub, pdp);
     let storage = Arc::new(InMemoryStorage::new());
@@ -187,18 +188,10 @@ async fn init_then_serve_bootstraps_signals_ready_and_stops_on_cancel() {
         service.coordinator().is_ok(),
         "the cluster election was resolved in start"
     );
-    let catalog = service
-        .catalog()
-        .expect("the catalogue was published by bootstrap");
+    assert!(service.catalog().is_ok(), "bootstrap bound the catalogue");
+    assert!(service.operations(&security_ctx()).is_ok());
     assert!(
-        catalog
-            .subject_projection(&gts::GtsTypeId::new(LLM_USER_PROJECTION))
-            .is_some(),
-        "the configured projection resolved from the real registry"
-    );
-    assert!(service.attribution().is_ok());
-    assert!(
-        service.quotas().is_ok(),
+        service.quotas(&security_ctx()).is_ok(),
         "the quota lifecycle is served once storage is bound"
     );
     assert_eq!(storage.bootstrap_calls(), 1);
@@ -303,6 +296,7 @@ async fn commit_one_event(
     storage: &dyn QuotaEnforcementStoragePluginV1,
 ) -> quota_enforcement_sdk::NotificationEvent {
     let event = crate::domain::quotas::events::quota_changed(
+        crate::test_support::actor(),
         tenant(),
         None,
         None,
@@ -311,11 +305,11 @@ async fn commit_one_event(
     );
     storage
         .create_quota(
-            &security_ctx(),
+            &crate::test_support::actor(),
             &toolkit_security::AccessScope::allow_all(),
             quota_draft(
                 SubjectRef {
-                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
                     subject_id: format!("u-{}", Uuid::new_v4()),
                 },
                 Some(10),
@@ -358,9 +352,7 @@ async fn sql_plugin_ctx(hub: Arc<ClientHub>) -> GearCtx {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serve_delivers_what_the_published_sql_plugin_commits_to_a_registered_sink() {
     let sink_fixture = sink_instance("cf.core._.qe_sink_audit.v1", "acme");
-    let mut documents = llm_gateway_documents();
-    documents.extend(metric_base_documents());
-    documents.push(plugin_instance_document(&sink_fixture));
+    let documents = vec![plugin_instance_document(&sink_fixture)];
     let hub = hub_with_registry(in_process_registry(documents));
     register_pdp(
         &hub,
@@ -404,8 +396,8 @@ async fn serve_delivers_what_the_published_sql_plugin_commits_to_a_registered_si
     }
     let received = sink.received();
     assert_eq!(received.len(), 1);
-    assert_eq!(received[0].1.event_id, event.event_id);
-    assert!(!received[0].0.is_anonymous());
+    assert_eq!(received[0].event_id, event.event_id);
+    assert_eq!(received[0].actor, event.actor);
 
     cancel.cancel();
     handle
@@ -449,6 +441,48 @@ async fn the_in_process_client_answers_not_ready_before_bootstrap_binds_storage(
     fixture.stop().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn serve_waits_for_a_dependency_that_does_not_answer_and_then_becomes_ready() {
+    let (hub, storage, fixture) = environment(true, ClusterBinding::QuotaEnforcement);
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    let ctx = make_ctx(hub);
+    gear.init(&ctx).await.expect("init");
+    let service = gear.service().expect("service");
+    storage.fail_with(quota_enforcement_sdk::StorageError::Unavailable(
+        "down".to_owned(),
+    ));
+
+    let (tx, mut rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
+    );
+
+    while storage.bootstrap_calls() < 2 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rx.try_recv().is_err(), "not ready while storage is down");
+    assert!(matches!(
+        service.readiness().snapshot(),
+        ReadinessState::Failed {
+            dependency: Dependency::Storage,
+            ..
+        }
+    ));
+
+    storage.clear_failure();
+    rx.await.expect("ready once storage answers");
+    assert!(service.readiness().is_ready());
+
+    cancel.cancel();
+    handle
+        .await
+        .expect("serve task joins")
+        .expect("serve returns Ok on shutdown");
+    fixture.stop().await;
+}
+
 #[tokio::test]
 async fn serve_fails_and_never_signals_ready_when_bootstrap_fails() {
     let (hub, storage, fixture) = environment(false, ClusterBinding::QuotaEnforcement);
@@ -482,10 +516,10 @@ async fn serve_fails_and_never_signals_ready_when_bootstrap_fails() {
     fixture.stop().await;
 }
 
-#[tokio::test]
-async fn serve_fails_on_the_pdp_dependency_when_the_registered_pdp_does_not_answer() {
+#[tokio::test(start_paused = true)]
+async fn serve_waits_on_the_pdp_dependency_while_the_registered_pdp_does_not_answer() {
     // Init accepts the registered client; the bootstrap probe finds the PDP
-    // behind it unreachable, so the gear never reports ready.
+    // behind it unreachable, so the gear does not report ready and tries again.
     let (hub, storage, fixture) =
         environment_with_pdp(true, ClusterBinding::QuotaEnforcement, Arc::new(FailingPdp));
     let gear = Arc::new(QuotaEnforcementGear::default());
@@ -494,22 +528,16 @@ async fn serve_fails_on_the_pdp_dependency_when_the_registered_pdp_does_not_answ
         .await
         .expect("init sees a registered client");
 
-    let (tx, rx) = oneshot::channel();
-    let err = gear
-        .clone()
-        .serve(CancellationToken::new(), ReadySignal::from_sender(tx))
-        .await
-        .expect_err("the PDP does not answer");
-    assert!(
-        format!("{err:#}").contains("authorization service unavailable"),
-        "{err:#}"
+    let (tx, mut rx) = oneshot::channel();
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(
+        gear.clone()
+            .serve(cancel.clone(), ReadySignal::from_sender(tx)),
     );
-    assert!(rx.await.is_err(), "the ready signal is never sent");
-    assert_eq!(
-        storage.bootstrap_calls(),
-        1,
-        "storage bootstrap and the cluster resolve ran before the PDP probe"
-    );
+    while storage.bootstrap_calls() < 2 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(rx.try_recv().is_err(), "the ready signal is not sent");
 
     let service = gear.service().expect("service");
     assert!(matches!(
@@ -522,6 +550,13 @@ async fn serve_fails_on_the_pdp_dependency_when_the_registered_pdp_does_not_answ
     let check = gear.healthcheck(&ctx).expect("health check");
     let result = check.check().await;
     assert_eq!(result.code.as_deref(), Some("qe_pdp_unavailable"));
+
+    cancel.cancel();
+    let err = handle
+        .await
+        .expect("serve task joins")
+        .expect_err("a shutdown during bootstrap is an error of the entry");
+    assert!(format!("{err:#}").contains("shutdown"), "{err:#}");
     fixture.stop().await;
 }
 
@@ -598,6 +633,7 @@ async fn shutdown_stops_delivery_at_once_and_aborts_leader_tasks_after_one_budge
         ("gauge", stuck()),
         ("retention", stuck()),
         ("lease", stuck()),
+        ("catalogue read", stuck()),
     ];
     let aborts: Vec<_> = tasks.iter().map(|(_, task)| task.abort_handle()).collect();
     let delivery = DeliveryLifecycle::default();
@@ -672,9 +708,7 @@ impl AuthZResolverApi for NarrowingPdp {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay_visible() {
-    let mut documents = llm_gateway_documents();
-    documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(in_process_registry(Vec::new()));
     let pdp = Arc::new(NarrowingPdp {
         narrowed: std::sync::atomic::AtomicBool::new(false),
     });
@@ -699,7 +733,7 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
     let spec = |subject: &str| quota_enforcement_sdk::QuotaSpec {
         tenant_id: tenant(),
         subject: SubjectRef {
-            projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+            subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
             subject_id: subject.to_owned(),
         },
         metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
@@ -711,10 +745,7 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
         notification_thresholds: Vec::new(),
         validity_window: None,
         fail_open_hint: false,
-        metadata: json!({ "regions": ["eu"], "weight": 5 })
-            .as_object()
-            .cloned()
-            .expect("object"),
+        metadata: serde_json::Map::new(),
         source: quota_enforcement_sdk::QuotaSource::Operator,
     };
     let created = client
@@ -786,9 +817,7 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_operation() {
-    let mut documents = llm_gateway_documents();
-    documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(in_process_registry(Vec::new()));
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -815,7 +844,7 @@ async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_o
             quota_enforcement_sdk::QuotaSpec {
                 tenant_id: tenant(),
                 subject: SubjectRef {
-                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
                     subject_id: "u-1".to_owned(),
                 },
                 metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
@@ -827,10 +856,7 @@ async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_o
                 notification_thresholds: Vec::new(),
                 validity_window: None,
                 fail_open_hint: false,
-                metadata: json!({ "regions": ["eu"], "weight": 5 })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
+                metadata: serde_json::Map::new(),
                 source: quota_enforcement_sdk::QuotaSource::Operator,
             },
         )
@@ -847,13 +873,15 @@ async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_o
             quota_enforcement_sdk::DebitRequest {
                 attribution: quota_enforcement_sdk::EvaluationAttribution {
                     tenant_id: tenant(),
-                    metric: crate::test_support::METRIC_TOKENS.to_owned(),
                     subjects: vec![quota_enforcement_sdk::SubjectClaim {
-                        kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+                        subject_type: USER_SUBJECT_TYPE.to_owned(),
                         id: "u-1".to_owned(),
                     }],
-                    metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
-                    resource: None,
+                    metric: quota_enforcement_sdk::MetricRef {
+                        metric_type: crate::test_support::METRIC_TOKENS.to_owned(),
+                        id: None,
+                        metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
+                    },
                 },
                 amount: 1,
                 idempotency_key: "traced".to_owned(),
@@ -904,7 +932,7 @@ async fn bulk_step_spans(
     let spec = |subject: String| quota_enforcement_sdk::QuotaSpec {
         tenant_id: tenant(),
         subject: SubjectRef {
-            projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+            subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
             subject_id: subject,
         },
         metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
@@ -916,10 +944,7 @@ async fn bulk_step_spans(
         notification_thresholds: Vec::new(),
         validity_window: None,
         fail_open_hint: false,
-        metadata: json!({ "regions": ["eu"], "weight": 5 })
-            .as_object()
-            .cloned()
-            .expect("object"),
+        metadata: serde_json::Map::new(),
         source: quota_enforcement_sdk::QuotaSource::Operator,
     };
     let create = quota_enforcement_sdk::BulkCreateQuotasRequest {
@@ -1003,9 +1028,7 @@ async fn bulk_step_spans(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_envelopes_over_the_sql_plugin_open_the_same_spans_for_one_item_and_for_ten() {
-    let mut documents = llm_gateway_documents();
-    documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(in_process_registry(Vec::new()));
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -1109,9 +1132,7 @@ where
 #[ignore = "timing harness, run on demand"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn span_overhead_over_the_sql_plugin() {
-    let mut documents = llm_gateway_documents();
-    documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(in_process_registry(Vec::new()));
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -1137,7 +1158,7 @@ async fn span_overhead_over_the_sql_plugin() {
             quota_enforcement_sdk::QuotaSpec {
                 tenant_id: tenant(),
                 subject: SubjectRef {
-                    projection_type: gts::GtsTypeId::new(LLM_USER_PROJECTION),
+                    subject_type: gts::GtsTypeId::new(USER_SUBJECT_TYPE),
                     subject_id: "u-1".to_owned(),
                 },
                 metric: quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_TOKENS)
@@ -1149,10 +1170,7 @@ async fn span_overhead_over_the_sql_plugin() {
                 notification_thresholds: Vec::new(),
                 validity_window: None,
                 fail_open_hint: false,
-                metadata: json!({ "regions": ["eu"], "weight": 5 })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
+                metadata: serde_json::Map::new(),
                 source: quota_enforcement_sdk::QuotaSource::Operator,
             },
         )
@@ -1163,13 +1181,15 @@ async fn span_overhead_over_the_sql_plugin() {
         .expect("consumer client");
     let attribution = || quota_enforcement_sdk::EvaluationAttribution {
         tenant_id: tenant(),
-        metric: crate::test_support::METRIC_TOKENS.to_owned(),
         subjects: vec![quota_enforcement_sdk::SubjectClaim {
-            kind: quota_enforcement_sdk::SCOPE_USER.to_owned(),
+            subject_type: USER_SUBJECT_TYPE.to_owned(),
             id: "u-1".to_owned(),
         }],
-        metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
-        resource: None,
+        metric: quota_enforcement_sdk::MetricRef {
+            metric_type: crate::test_support::METRIC_TOKENS.to_owned(),
+            id: None,
+            metadata: json!({ "region": "eu-west-1" }).as_object().cloned(),
+        },
     };
 
     plain_and_formatted("debit", |key| {
@@ -1219,6 +1239,7 @@ async fn span_overhead_over_the_sql_plugin() {
                         tenant_id: tenant(),
                         token,
                         actual_amount: None,
+                        metric_type: None,
                         idempotency_key: format!("{key}-commit"),
                     },
                 )
@@ -1309,8 +1330,12 @@ async fn init_publishes_all_three_contracts_and_rest_mounts_every_internal_route
         .expect("routes")
         .layer(Extension(security_ctx()));
     for path in INTERNAL_ROUTES {
-        let (status, _) =
-            post_json(&app, &format!("/quota-enforcement/v1{path}"), &json!({})).await;
+        let (status, _) = post_json(
+            &app,
+            &format!("/quota-enforcement/v1/internal{path}"),
+            &json!({}),
+        )
+        .await;
         assert_ne!(status, StatusCode::NOT_FOUND, "{path} is not mounted");
     }
     fixture.stop().await;
@@ -1355,7 +1380,7 @@ async fn rest_client_wiring_cannot_redirect_the_server_handlers() {
         .layer(Extension(security_ctx()));
     let (status, internal) = post_json(
         &app,
-        "/quota-enforcement/v1/quotas/read",
+        "/quota-enforcement/v1/internal/quotas/read",
         &serde_json::to_value(&read).expect("request"),
     )
     .await;
@@ -1392,4 +1417,63 @@ async fn a_local_builder_without_the_registered_service_is_an_error_not_a_panic(
     assert!(QuotaEnforcementGear::build_manager(&ctx, policies.clone()).is_err());
     assert!(QuotaEnforcementGear::build_enforcement(&ctx, policies.clone()).is_err());
     assert!(QuotaEnforcementGear::build_operator(&ctx, policies).is_err());
+}
+
+#[tokio::test]
+async fn init_binds_the_resolver_plugin_to_its_published_instance() {
+    use quota_resolver_sdk::{QuotaResolverPluginClient, QuotaResolverPluginSpecV1};
+    use toolkit::client_hub::ClientScope;
+    use toolkit::gts::PluginV1;
+
+    let (hub, _storage, fixture) = environment(true, ClusterBinding::QuotaEnforcement);
+    let ctx = make_ctx(hub.clone());
+    let manifest = ctx.gts_publication_manifest().expect("published");
+    let (id, document) = PluginV1::<QuotaResolverPluginSpecV1>::build_registration(
+        super::RESOLVER_PLUGIN_SEGMENT,
+        "constructorfabric",
+        100,
+    )
+    .expect("instance");
+    assert_eq!(
+        manifest.documents(),
+        [(
+            types_registry_sdk::GtsId::try_new(id.as_ref()).expect("id"),
+            document
+        )],
+        "one instance, the default vendor and priority"
+    );
+    let scope = ClientScope::gts_id(id.as_ref());
+    assert!(
+        hub.try_get_scoped::<dyn QuotaResolverPluginClient>(&scope)
+            .is_none()
+    );
+
+    QuotaEnforcementGear::default()
+        .init(&ctx)
+        .await
+        .expect("init");
+
+    assert!(
+        hub.try_get_scoped::<dyn QuotaResolverPluginClient>(&scope)
+            .is_some()
+    );
+    fixture.stop().await;
+}
+
+#[test]
+fn the_resolver_plugin_instance_takes_vendor_and_priority_from_the_config() {
+    let config = StaticConfigProvider {
+        root: json!({ "quota-enforcement": { "config": {
+            "resolver_plugin": { "vendor": "acme", "priority": 7 }
+        } } }),
+    };
+
+    let manifest = QuotaEnforcementGear::default()
+        .descriptor()
+        .build_gts_manifest(&config)
+        .expect("manifest");
+
+    let (_, document) = &manifest.documents()[0];
+    assert_eq!(document["vendor"], json!("acme"));
+    assert_eq!(document["priority"], json!(7));
 }

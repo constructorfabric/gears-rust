@@ -27,9 +27,9 @@ use crate::models::{
 };
 
 /// HTTP projection of [`QuotaManagerApi`].
-#[toolkit::rest_contract(base_path = "/quota-enforcement/v1")]
+#[toolkit::rest_contract(base_path = "/quota-enforcement/v1/internal")]
 pub trait QuotaManagerApiRest: QuotaManagerApi {
-    /// `POST /quota-enforcement/v1/quotas/create`.
+    /// `POST /quota-enforcement/v1/internal/quotas/create`.
     #[post("/quotas/create")]
     async fn create_quota(
         &self,
@@ -37,7 +37,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         spec: QuotaSpec,
     ) -> Result<QuotaId, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/update`.
+    /// `POST /quota-enforcement/v1/internal/quotas/update`.
     #[post("/quotas/update")]
     async fn update_quota(
         &self,
@@ -45,7 +45,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         request: UpdateQuotaRequest,
     ) -> Result<(), CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/deactivate`.
+    /// `POST /quota-enforcement/v1/internal/quotas/deactivate`.
     #[post("/quotas/deactivate")]
     async fn deactivate_quota(
         &self,
@@ -53,7 +53,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         quota_id: QuotaId,
     ) -> Result<DeactivateOutcome, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/read`.
+    /// `POST /quota-enforcement/v1/internal/quotas/read`.
     #[post("/quotas/read")]
     #[retryable]
     async fn read_quotas(
@@ -62,7 +62,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         request: ReadQuotasRequest,
     ) -> Result<PageResult<QuotaView>, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/credit`.
+    /// `POST /quota-enforcement/v1/internal/quotas/credit`.
     #[post("/quotas/credit")]
     #[retryable]
     async fn credit(
@@ -71,7 +71,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         request: CreditRequest,
     ) -> Result<Decision, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/bulk-create`.
+    /// `POST /quota-enforcement/v1/internal/quotas/bulk-create`.
     #[post("/quotas/bulk-create")]
     #[retryable]
     async fn bulk_create_quotas(
@@ -80,7 +80,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         request: BulkCreateQuotasRequest,
     ) -> Result<BulkCreated, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/bulk-update`.
+    /// `POST /quota-enforcement/v1/internal/quotas/bulk-update`.
     #[post("/quotas/bulk-update")]
     #[retryable]
     async fn bulk_update_quotas(
@@ -89,7 +89,7 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
         request: BulkUpdateQuotasRequest,
     ) -> Result<BulkUpdated, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/quotas/bulk-deactivate`.
+    /// `POST /quota-enforcement/v1/internal/quotas/bulk-deactivate`.
     #[post("/quotas/bulk-deactivate")]
     #[retryable]
     async fn bulk_deactivate_quotas(
@@ -100,9 +100,9 @@ pub trait QuotaManagerApiRest: QuotaManagerApi {
 }
 
 /// HTTP projection of [`QuotaEnforcementApi`].
-#[toolkit::rest_contract(base_path = "/quota-enforcement/v1")]
+#[toolkit::rest_contract(base_path = "/quota-enforcement/v1/internal")]
 pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
-    /// `POST /quota-enforcement/v1/operations/debit`.
+    /// `POST /quota-enforcement/v1/internal/operations/debit`.
     #[post("/operations/debit")]
     #[retryable]
     async fn debit(
@@ -111,7 +111,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: DebitRequest,
     ) -> Result<Decision, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/operations/rollback`.
+    /// `POST /quota-enforcement/v1/internal/operations/rollback`.
     #[post("/operations/rollback")]
     #[retryable]
     async fn rollback(
@@ -120,7 +120,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: RollbackRequest,
     ) -> Result<Decision, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/operations/preview`.
+    /// `POST /quota-enforcement/v1/internal/operations/preview`.
     #[post("/operations/preview")]
     #[retryable]
     async fn evaluate_preview(
@@ -129,7 +129,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: PreviewRequest,
     ) -> Result<DecisionPreview, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/leases/acquire`.
+    /// `POST /quota-enforcement/v1/internal/leases/acquire`.
     #[post("/leases/acquire")]
     #[retryable]
     async fn acquire_lease(
@@ -138,7 +138,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: AcquireLeaseRequest,
     ) -> Result<AcquireLeaseOutcome, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/leases/commit`.
+    /// `POST /quota-enforcement/v1/internal/leases/commit`.
     #[post("/leases/commit")]
     #[retryable]
     async fn commit_lease(
@@ -147,7 +147,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: CommitLeaseRequest,
     ) -> Result<Decision, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/leases/release`.
+    /// `POST /quota-enforcement/v1/internal/leases/release`.
     #[post("/leases/release")]
     #[retryable]
     async fn release_lease(
@@ -156,7 +156,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: ReleaseLeaseRequest,
     ) -> Result<Decision, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/operations/batch-debit`.
+    /// `POST /quota-enforcement/v1/internal/operations/batch-debit`.
     #[post("/operations/batch-debit")]
     #[retryable]
     async fn batch_debit(
@@ -165,7 +165,7 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
         request: BatchDebitRequest,
     ) -> Result<BatchDecision, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/snapshot`.
+    /// `POST /quota-enforcement/v1/internal/snapshot`.
     #[post("/snapshot")]
     #[retryable]
     async fn snapshot(
@@ -176,9 +176,9 @@ pub trait QuotaEnforcementApiRest: QuotaEnforcementApi {
 }
 
 /// HTTP projection of [`QuotaOperatorApi`].
-#[toolkit::rest_contract(base_path = "/quota-enforcement/v1")]
+#[toolkit::rest_contract(base_path = "/quota-enforcement/v1/internal")]
 pub trait QuotaOperatorApiRest: QuotaOperatorApi {
-    /// `POST /quota-enforcement/v1/policies/create`.
+    /// `POST /quota-enforcement/v1/internal/policies/create`.
     #[post("/policies/create")]
     async fn create_policy(
         &self,
@@ -186,7 +186,7 @@ pub trait QuotaOperatorApiRest: QuotaOperatorApi {
         spec: PolicySpec,
     ) -> Result<PolicyVersion, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/policies/update`.
+    /// `POST /quota-enforcement/v1/internal/policies/update`.
     #[post("/policies/update")]
     async fn update_policy(
         &self,
@@ -194,7 +194,7 @@ pub trait QuotaOperatorApiRest: QuotaOperatorApi {
         request: UpdatePolicyRequest,
     ) -> Result<PolicyVersion, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/policies/rollback`.
+    /// `POST /quota-enforcement/v1/internal/policies/rollback`.
     #[post("/policies/rollback")]
     async fn rollback_policy(
         &self,
@@ -202,7 +202,7 @@ pub trait QuotaOperatorApiRest: QuotaOperatorApi {
         request: RollbackPolicyRequest,
     ) -> Result<PolicyVersion, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/policies/delete`.
+    /// `POST /quota-enforcement/v1/internal/policies/delete`.
     #[post("/policies/delete")]
     async fn delete_policy(
         &self,
@@ -210,7 +210,7 @@ pub trait QuotaOperatorApiRest: QuotaOperatorApi {
         request: DeletePolicyRequest,
     ) -> Result<(), CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/policies/read`.
+    /// `POST /quota-enforcement/v1/internal/policies/read`.
     #[post("/policies/read")]
     #[retryable]
     async fn read_policy(
@@ -219,7 +219,7 @@ pub trait QuotaOperatorApiRest: QuotaOperatorApi {
         request: ReadPolicyRequest,
     ) -> Result<PolicyVersion, CanonicalError>;
 
-    /// `POST /quota-enforcement/v1/policies/versions`.
+    /// `POST /quota-enforcement/v1/internal/policies/versions`.
     #[post("/policies/versions")]
     #[retryable]
     async fn list_policy_versions(

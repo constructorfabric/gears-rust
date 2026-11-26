@@ -15,11 +15,10 @@ use std::time::Instant;
 use tracing::Instrument as _;
 
 use quota_enforcement_sdk::{
-    AppliedMutation, CreditRequest, DebitRequest, Decision, DecisionPreview, DecisionResult,
-    EvaluatedMutation, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, MetricId,
-    OperationType, PartialIdempotencyWrite, PayloadHash, PreviewRequest,
-    QuotaEnforcementStoragePluginV1, Retention, RollbackRequest, RollbackTarget, TransitionOutcome,
-    positive_amount,
+    AppliedMutation, ChargeReturn, CreditRequest, DebitRequest, Decision, DecisionPreview,
+    DecisionResult, EvaluatedMutation, IdempotencyScope, IdempotencyWrite, MetricId, OperationType,
+    PartialIdempotencyWrite, PayloadHash, PreviewRequest, QuotaEnforcementStoragePluginV1,
+    Retention, RollbackRequest, RollbackTarget, TransitionOutcome, positive_amount,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -27,9 +26,9 @@ use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 
 use super::idempotency::{IdempotencyCache, ReplayRecord};
-use crate::domain::admission::{Admission, AdmissionTarget};
-use crate::domain::attribution::{AdmittedEvaluation, Attribution};
-use crate::domain::catalog::MetricClassifications;
+use crate::domain::admission::{AdmissionTarget, Gate};
+use crate::domain::attribution::{AdmittedEvaluation, Attribution, MappedAttribution};
+use crate::domain::catalog::{MetricCatalog, MetricMode, ServedMetric};
 use crate::domain::engines::{EngineRegistry, PolicyArtifactCache, PreparedEvaluation};
 use crate::domain::error::DomainError;
 use crate::domain::pep::{actions, resources};
@@ -43,17 +42,10 @@ use crate::domain::tokens;
 /// breach.
 #[domain_model]
 pub struct Operations<'a> {
-    /// The PEP boundary, for the operations that name a Quota rather than an
-    /// attribution.
-    pub admission: &'a Admission,
-    /// Ingress for the operations that carry an attribution.
-    pub attribution: Attribution<'a>,
-    /// The published catalogue, for the one mapping the pipeline needs beyond
-    /// ingress: which projection this metric treats as its user tier.
-    pub catalog: &'a crate::domain::catalog::ProjectionContractCatalog,
-    /// Metric classifications frozen at bootstrap. The evaluation path does
-    /// not call the types registry.
-    pub classifications: &'a MetricClassifications,
+    /// Admission in the mode these operations are built over.
+    pub admission: Gate<'a>,
+    /// The metric catalogue.
+    pub catalog: &'a MetricCatalog,
     /// The active storage plugin.
     pub storage: &'a dyn QuotaEnforcementStoragePluginV1,
     /// Statically linked engines.
@@ -82,18 +74,60 @@ pub struct Operations<'a> {
 #[derive(Clone, Copy)]
 struct PreviewSubject<'a> {
     metric: &'a MetricId,
+    metric_id: Option<&'a str>,
     amount: u64,
     snapshots: &'a [quota_enforcement_sdk::QuotaSnapshot],
-    user_projection: Option<&'a gts::GtsTypeId>,
     request: &'a Value,
-    resource: &'a Value,
 }
 
-/// What a debit's payload digest covers.
+/// Give back part of a charge (ADR-0011). Only the quota resolver plugin
+/// sends it; it names the charge only, so it carries no attribution.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReturnRequest {
+    /// The charge's tenant.
+    pub tenant_id: quota_enforcement_sdk::TenantId,
+    /// Which kind of operation wrote the charge.
+    pub operation: quota_enforcement_sdk::RollbackableOperation,
+    /// Idempotency key of the charged operation.
+    pub charge_key: String,
+    /// The metric type the amount is counted in; it must be the charge's.
+    pub metric: MetricId,
+    /// Amount to give back. Signed as [`quota_enforcement_sdk::DebitRequest::amount`] is.
+    pub amount: i64,
+    /// Key of this return, unique per tenant.
+    pub idempotency_key: String,
+}
+
+/// What a debit's payload digest covers: its request fingerprint, which a
+/// batch item's charge carries too. The subjects are the admitted set, the
+/// tenant first and the rest ordered by type, so a retry that lists them in
+/// another order, or names the tenant that the first attempt left implicit,
+/// is the same request. The `metadata` is the admitted one, in its canonical
+/// form, so a retry that writes an integer as `5.0` is the same request too.
+/// The amount is as sent.
+#[domain_model]
 #[derive(Serialize)]
-struct DebitPayload<'a> {
-    attribution: &'a quota_enforcement_sdk::EvaluationAttribution,
+pub(super) struct DebitPayload<'a> {
+    tenant_id: quota_enforcement_sdk::TenantId,
+    subjects: &'a [quota_enforcement_sdk::SubjectRef],
+    metric_type: &'a str,
+    metric_id: Option<&'a str>,
+    metadata: &'a serde_json::Map<String, serde_json::Value>,
     amount: i64,
+}
+
+impl<'a> DebitPayload<'a> {
+    pub(super) fn of(admitted: &'a AdmittedEvaluation, amount: i64) -> Self {
+        Self {
+            tenant_id: admitted.attribution.tenant_id,
+            subjects: &admitted.attribution.subjects,
+            metric_type: admitted.metric.id().as_str(),
+            metric_id: admitted.metric_id.as_deref(),
+            metadata: &admitted.request,
+            amount,
+        }
+    }
 }
 
 /// What a credit's payload digest covers.
@@ -103,29 +137,15 @@ struct CreditPayload {
     amount: i64,
 }
 
-/// What a rollback's payload digest covers.
-#[derive(Serialize)]
-struct RollbackPayload<'a> {
-    attribution: &'a quota_enforcement_sdk::EvaluationAttribution,
-    original_idempotency_key: &'a str,
-    // Omitted for a debit, so a record stored before leases still replays.
-    #[serde(skip_serializing_if = "reverses_a_debit")]
-    original_operation: quota_enforcement_sdk::RollbackableOperation,
-}
-
-// Serde passes the field by reference.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn reverses_a_debit(operation: &quota_enforcement_sdk::RollbackableOperation) -> bool {
-    matches!(
-        operation,
-        quota_enforcement_sdk::RollbackableOperation::Debit
-    )
-}
-
 // @cpt-dod:cpt-cf-quota-enforcement-dod-evaluation-orchestrator:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-consumption-endpoints:p1
 // @cpt-dod:cpt-cf-quota-enforcement-dod-idempotency:p1
 impl Operations<'_> {
+    /// Ingress for the operations that carry an attribution.
+    pub(super) fn attribution(&self) -> Attribution<'_> {
+        Attribution::new(&self.admission, self.catalog, self.metrics.as_ref())
+    }
+
     /// Charge `amount` against every applicable Quota.
     ///
     /// # Errors
@@ -136,62 +156,49 @@ impl Operations<'_> {
     // @cpt-flow:cpt-cf-quota-enforcement-flow-debit:p1
     // @cpt-algo:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1
     // @cpt-algo:cpt-cf-quota-enforcement-algo-idempotency-replay:p1
-    #[tracing::instrument(name = "quota_enforcement.operations.debit", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
-    pub async fn debit(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: DebitRequest,
-    ) -> Result<Decision, DomainError> {
+    #[tracing::instrument(name = "quota_enforcement.operations.debit", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric.metric_type))]
+    pub async fn debit(&self, request: DebitRequest) -> Result<Decision, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-spans
         let started = Instant::now();
-        let outcome = self.debit_inner(ctx, request).await;
+        let outcome = self.debit_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Debit, started.elapsed());
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-spans
         outcome
     }
 
-    async fn debit_inner(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: DebitRequest,
-    ) -> Result<Decision, DomainError> {
+    async fn debit_inner(&self, request: DebitRequest) -> Result<Decision, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-amount-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-amount
         let amount = self.validate_amount(request.amount)?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-amount
         // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-amount-if
-        self.validate_key(&request.idempotency_key)?;
-        // Hash caller input before catalogue mapping for stable replay checks.
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-request
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-trust
-        let payload_hash = digest(&DebitPayload {
-            attribution: &request.attribution,
-            amount: request.amount,
-        })?;
-        // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-trust
-        // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-request
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-resolve
         let admitted = self
-            .attribution
-            .admit_evaluation(
-                ctx,
-                &resources::OPERATION,
-                actions::DEBIT,
-                request.attribution,
-            )
+            .attribution()
+            .admit_evaluation(&resources::OPERATION, actions::DEBIT, request.attribution)
             .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-resolve
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-request
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-trust
+        let payload_hash = digest(&DebitPayload::of(&admitted, request.amount))?;
+        // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-trust
+        // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-request
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-gated-if
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-gated
-        self.classifications.ensure_quota_gated(&admitted.metric)?;
+        ensure_quota_gated(&admitted.metric)?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-gated
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-gated-if
 
         // @cpt-begin:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-scope
         // @cpt-begin:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-independent
-        let scope = Self::scope_of(&admitted, OperationType::Debit, request.idempotency_key);
+        let scope = Self::scope_of(
+            &admitted.attribution,
+            OperationType::Debit,
+            request.idempotency_key,
+        );
         // @cpt-end:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-independent
         // @cpt-end:cpt-cf-quota-enforcement-algo-idempotency-replay:p1:inst-idem-scope
         // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-idem
@@ -208,8 +215,7 @@ impl Operations<'_> {
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-idem
 
         let applicable = applicable_of(&admitted);
-        let user_projection = self.user_projection(&admitted.metric);
-        let (request_value, resource_value) = policy_values(&admitted);
+        let request_value = Value::Object(admitted.request.clone());
         let write = IdempotencyWrite {
             scope: scope.clone(),
             payload_hash,
@@ -226,8 +232,7 @@ impl Operations<'_> {
             applicable: &applicable,
             amount,
             request: &request_value,
-            resource: &resource_value,
-            user_projection: user_projection.as_ref(),
+            metric_id: admitted.metric_id.as_deref(),
             limits: self.evaluation,
             idempotency: &write,
             authorized: admitted.authorized,
@@ -238,14 +243,19 @@ impl Operations<'_> {
         let outcome = prepared
             .run(|| {
                 self.storage.apply_debit_plan(
-                    ctx,
+                    &admitted.attribution.actor,
                     &admitted.attribution.access_scope,
                     &mutation,
                     // Storage supplies counter and threshold event details.
                     &[],
                 )
             })
-            .await?;
+            .await;
+        if matches!(outcome, Err(DomainError::LeaseContentionTimeout)) {
+            self.metrics
+                .record_lease_contention_rejected(admitted.metric.label());
+        }
+        let outcome = self.contended(OperationKind::Debit, outcome)?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-scope
         // @cpt-end:cpt-cf-quota-enforcement-flow-debit:p1:inst-deb-pipeline
         let replayed = matches!(outcome, TransitionOutcome::NoOp(_));
@@ -287,29 +297,21 @@ impl Operations<'_> {
     /// admission error; the storage error of the mutation.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-credit:p1
     #[tracing::instrument(name = "quota_enforcement.operations.credit", skip_all, fields(tenant_id = %request.tenant_id, quota_id = %request.quota_id))]
-    pub async fn credit(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: CreditRequest,
-    ) -> Result<Decision, DomainError> {
+    pub async fn credit(&self, request: CreditRequest) -> Result<Decision, DomainError> {
         let started = Instant::now();
-        let outcome = self.credit_inner(ctx, request).await;
+        let outcome = self.credit_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Credit, started.elapsed());
         outcome
     }
 
-    async fn credit_inner(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: CreditRequest,
-    ) -> Result<Decision, DomainError> {
+    async fn credit_inner(&self, request: CreditRequest) -> Result<Decision, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-amount-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-amount
         let amount = self.validate_amount(request.amount)?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-amount
         // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-amount-if
-        self.validate_key(&request.idempotency_key)?;
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-request
         let payload_hash = digest(&CreditPayload {
             quota_id: request.quota_id,
@@ -319,14 +321,12 @@ impl Operations<'_> {
         let admitted = self
             .admission
             .admit(
-                ctx,
                 &resources::OPERATION,
                 actions::CREDIT,
                 AdmissionTarget::tenant(request.tenant_id),
             )
             .instrument(admission_span(1))
             .await?;
-        // Storage completes the idempotency scope from the locked Quota row.
         let partial = PartialIdempotencyWrite {
             tenant_id: request.tenant_id,
             key: request.idempotency_key,
@@ -335,80 +335,63 @@ impl Operations<'_> {
         let outcome = self
             .storage
             .apply_credit(
-                ctx,
+                &admitted.actor,
                 &admitted.access_scope,
                 request.quota_id,
                 amount,
                 &partial,
                 &[],
             )
-            .await?;
+            .await
+            .map_err(DomainError::from);
+        let outcome = self.contended(OperationKind::Credit, outcome)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-return
         Ok(self.applied(outcome, OperationKind::Credit))
         // @cpt-end:cpt-cf-quota-enforcement-flow-credit:p1:inst-cre-return
     }
 
-    /// Reverse a committed debit.
+    /// Give back everything that remains of a charge. It names an existing
+    /// charge, so it makes no catalogue check and runs while the metric is
+    /// unavailable. It has no key of its own: on a charge with nothing left
+    /// it succeeds and changes nothing.
     ///
     /// # Errors
     ///
     /// `InvalidArgument` for a missing key; the admission error; `NotFound`
-    /// when no committed debit answers the request under the recomputed scope
-    /// and authorized attribution.
+    /// when no live charge answers the request under its scope and authorized
+    /// attribution digest; `FailedPrecondition` (`RETURN_NOT_APPLICABLE`)
+    /// when no Quota of the charge can take what remains.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-rollback:p1
-    #[tracing::instrument(name = "quota_enforcement.operations.rollback", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
-    pub async fn rollback(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: RollbackRequest,
-    ) -> Result<Decision, DomainError> {
+    #[tracing::instrument(name = "quota_enforcement.operations.rollback", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric.metric_type))]
+    pub async fn rollback(&self, request: RollbackRequest) -> Result<Decision, DomainError> {
         let started = Instant::now();
-        let outcome = self.rollback_inner(ctx, request).await;
+        let outcome = self.rollback_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Rollback, started.elapsed());
         outcome
     }
 
-    async fn rollback_inner(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: RollbackRequest,
-    ) -> Result<Decision, DomainError> {
-        self.validate_key(&request.idempotency_key)?;
-        self.validate_key(&request.original_idempotency_key)?;
+    async fn rollback_inner(&self, request: RollbackRequest) -> Result<Decision, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-request
-        let payload_hash = digest(&RollbackPayload {
-            attribution: &request.attribution,
-            original_idempotency_key: &request.original_idempotency_key,
-            original_operation: request.original_operation,
-        })?;
+        self.validate_key(
+            "original_idempotency_key",
+            &request.original_idempotency_key,
+        )?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-request
-        // Re-authorize the original debit attribution before reversing it.
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-authz
         let admitted = self
-            .attribution
-            .admit_evaluation(
-                ctx,
+            .attribution()
+            .admit_reversal(
                 &resources::OPERATION,
                 actions::ROLLBACK,
                 request.attribution,
             )
             .instrument(admission_span(1))
             .await?;
-        let scope = Self::scope_of(&admitted, OperationType::Rollback, request.idempotency_key);
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
-        if let Some(decision) = self
-            .replay(&scope, payload_hash, OperationKind::Rollback)
-            .await?
-        {
-            return Ok(decision);
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-idem
+        // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-authz
         let target = RollbackTarget {
             original: IdempotencyScope {
                 tenant_id: admitted.attribution.tenant_id,
-                subject_key: IdempotencySubjectKey::of(&admitted.attribution.subjects),
-                // A debit and a lease commit are separate namespaces under the
-                // same key; the caller says which one it reverses.
                 operation_type: request.original_operation.operation_type(),
                 key: request.original_idempotency_key,
             },
@@ -417,20 +400,81 @@ impl Operations<'_> {
         let outcome = self
             .storage
             .apply_rollback(
-                ctx,
+                &admitted.attribution.actor,
                 &admitted.attribution.access_scope,
                 &target,
-                &IdempotencyWrite {
-                    scope: scope.clone(),
-                    payload_hash,
-                },
                 &[],
             )
-            .await?;
-        let decision = self.applied_cached(outcome, OperationKind::Rollback, scope, payload_hash);
+            .await
+            .map_err(DomainError::from);
+        let outcome = self.contended(OperationKind::Rollback, outcome)?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-return
-        Ok(decision)
+        Ok(outcome.into_inner().decision)
         // @cpt-end:cpt-cf-quota-enforcement-flow-rollback:p1:inst-rlb-return
+    }
+
+    /// Give back part of a charge. Reached only through the resolver plugin,
+    /// over trusted admission; it names only the charge and compares no
+    /// attribution digest.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for a non-positive amount or a missing key, and
+    /// `METRIC_TYPE_MISMATCH` for a metric type other than the charge's;
+    /// `NotFound` (`UNKNOWN_OPERATION`) for an unknown or deleted charge;
+    /// `FailedPrecondition` (`RETURN_EXCEEDS_CHARGE`,
+    /// `RETURN_NOT_APPLICABLE`); `AlreadyExists` on a payload mismatch, which a
+    /// retry with the same key does not pass.
+    // @cpt-flow:cpt-cf-quota-enforcement-flow-return:p1
+    #[tracing::instrument(name = "quota_enforcement.operations.return", skip_all, fields(tenant_id = %request.tenant_id, metric = %request.metric.as_str()))]
+    pub async fn return_amount(&self, request: ReturnRequest) -> Result<(), DomainError> {
+        let started = Instant::now();
+        let outcome = self.return_inner(request).await;
+        self.metrics
+            .record_evaluation(OperationKind::Return, started.elapsed());
+        outcome
+    }
+
+    async fn return_inner(&self, request: ReturnRequest) -> Result<(), DomainError> {
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-return:p1:inst-rtn-amount
+        let amount = self.validate_amount(request.amount)?;
+        // @cpt-end:cpt-cf-quota-enforcement-flow-return:p1:inst-rtn-amount
+        self.validate_key("idempotency_key", &request.idempotency_key)?;
+        self.validate_key("charge_key", &request.charge_key)?;
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-return:p1:inst-rtn-request
+        let admitted = self
+            .admission
+            .admit(
+                &resources::OPERATION,
+                actions::RETURN,
+                AdmissionTarget::tenant(request.tenant_id),
+            )
+            .instrument(admission_span(1))
+            .await?;
+        // @cpt-end:cpt-cf-quota-enforcement-flow-return:p1:inst-rtn-request
+        let ret = ChargeReturn {
+            charge: IdempotencyScope {
+                tenant_id: request.tenant_id,
+                operation_type: request.operation.operation_type(),
+                key: request.charge_key,
+            },
+            metric: request.metric,
+            amount,
+            key: request.idempotency_key,
+        };
+        let outcome = self
+            .storage
+            .apply_return(&admitted.actor, &admitted.access_scope, &ret, &[])
+            .await
+            .map_err(DomainError::from);
+        let outcome = self.contended(OperationKind::Return, outcome)?;
+        if matches!(outcome, TransitionOutcome::NoOp(_)) {
+            self.metrics
+                .record_idempotency_replay(OperationKind::Return);
+        }
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-return:p1:inst-rtn-return
+        Ok(())
+        // @cpt-end:cpt-cf-quota-enforcement-flow-return:p1:inst-rtn-return
     }
 
     /// Evaluate without mutating anything and without occupying a key.
@@ -439,49 +483,41 @@ impl Operations<'_> {
     ///
     /// The errors of [`Self::debit`], minus the idempotency ones.
     // @cpt-flow:cpt-cf-quota-enforcement-flow-evaluate-preview:p1
-    #[tracing::instrument(name = "quota_enforcement.operations.preview", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric))]
-    pub async fn preview(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: PreviewRequest,
-    ) -> Result<DecisionPreview, DomainError> {
+    #[tracing::instrument(name = "quota_enforcement.operations.preview", skip_all, fields(tenant_id = %request.attribution.tenant_id, metric = %request.attribution.metric.metric_type))]
+    pub async fn preview(&self, request: PreviewRequest) -> Result<DecisionPreview, DomainError> {
         let started = Instant::now();
-        let outcome = self.preview_inner(ctx, request).await;
+        let outcome = self.preview_inner(request).await;
         self.metrics
             .record_evaluation(OperationKind::Preview, started.elapsed());
         outcome
     }
 
-    async fn preview_inner(
-        &self,
-        ctx: &toolkit_security::SecurityContext,
-        request: PreviewRequest,
-    ) -> Result<DecisionPreview, DomainError> {
+    async fn preview_inner(&self, request: PreviewRequest) -> Result<DecisionPreview, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-request
         let amount = self.validate_amount(request.amount)?;
         let admitted = self
-            .attribution
-            .admit_evaluation(
-                ctx,
-                &resources::OPERATION,
-                actions::PREVIEW,
-                request.attribution,
-            )
+            .attribution()
+            .admit_evaluation(&resources::OPERATION, actions::PREVIEW, request.attribution)
             .instrument(admission_span(1))
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-request
-        self.classifications.ensure_quota_gated(&admitted.metric)?;
+        ensure_quota_gated(&admitted.metric)?;
         let applicable = applicable_of(&admitted);
-        let user_projection = self.user_projection(&admitted.metric);
         // @cpt-begin:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-read
         // @cpt-begin:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-nopersist
-        let snapshots = self
+        let request_value = Value::Object(admitted.request.clone());
+        // Only the Quotas whose conditions hold apply, as in a debit (I15).
+        let snapshots: Vec<_> = self
             .storage
-            .read_quota_snapshot(ctx, &admitted.attribution.access_scope, &applicable)
-            .await?;
+            .read_quota_snapshot(&admitted.attribution.access_scope, &applicable)
+            .await?
+            .into_iter()
+            .filter(|snapshot| {
+                quota_enforcement_sdk::conditions_hold(&snapshot.metadata, &request_value)
+            })
+            .collect();
         // @cpt-end:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-nopersist
         // @cpt-end:cpt-cf-quota-enforcement-flow-evaluate-preview:p1:inst-prv-read
-        let (request_value, resource_value) = policy_values(&admitted);
         let prepared = PreparedEvaluation::new(
             Arc::clone(&self.engines),
             Arc::clone(&self.artifacts),
@@ -493,12 +529,11 @@ impl Operations<'_> {
             .preview_decision(
                 &prepared,
                 &PreviewSubject {
-                    metric: &admitted.metric,
+                    metric: admitted.metric.id(),
+                    metric_id: admitted.metric_id.as_deref(),
                     amount,
                     snapshots: &snapshots,
-                    user_projection: user_projection.as_ref(),
                     request: &request_value,
-                    resource: &resource_value,
                 },
             )
             .await?;
@@ -517,11 +552,10 @@ impl Operations<'_> {
     ) -> Result<Decision, DomainError> {
         let PreviewSubject {
             metric,
+            metric_id,
             amount,
             snapshots,
-            user_projection,
             request,
-            resource,
         } = *subject;
         // Match transaction policy selection: metric first, then global.
         let policy = match self
@@ -540,26 +574,12 @@ impl Operations<'_> {
                     DomainError::Internal("no active global resolution policy is seeded".to_owned())
                 })?,
         };
-        let arbitration: Vec<Value> = snapshots
-            .iter()
-            .map(|snapshot| Value::Object(snapshot.metadata.clone()))
-            .collect();
         let quotas: Vec<quota_enforcement_sdk::engine::EvaluationQuota<'_>> = snapshots
             .iter()
-            .zip(&arbitration)
-            .map(
-                |(snapshot, arbitration)| quota_enforcement_sdk::engine::EvaluationQuota {
-                    snapshot,
-                    // Match transaction tier resolution.
-                    tier: match user_projection {
-                        Some(user) if snapshot.subject.projection_type == *user => {
-                            quota_enforcement_sdk::engine::QuotaScopeTier::User
-                        }
-                        _ => quota_enforcement_sdk::engine::QuotaScopeTier::Tenant,
-                    },
-                    arbitration,
-                },
-            )
+            .map(|snapshot| quota_enforcement_sdk::engine::EvaluationQuota {
+                snapshot,
+                tier: quota_enforcement_sdk::engine::QuotaScopeTier::of(&snapshot.subject),
+            })
             .collect();
         let budget = self
             .evaluation
@@ -573,7 +593,7 @@ impl Operations<'_> {
             time: OffsetDateTime::now_utc(),
             quotas: &quotas,
             request,
-            resource,
+            metric_id,
             budget,
         };
         // Use the mutation path's bounded artifact-preparation retry.
@@ -604,40 +624,23 @@ impl Operations<'_> {
     }
 
     /// Every write carries a key. An empty one would make the scope
-    /// meaningless rather than absent.
-    pub(super) fn validate_key(&self, key: &str) -> Result<(), DomainError> {
-        if key.trim().is_empty() {
+    /// meaningless rather than absent, and an over-long one would fail in the
+    /// storage index as a backend error rather than as the caller's.
+    pub(super) fn validate_key(&self, field: &'static str, key: &str) -> Result<(), DomainError> {
+        if let Some(reason) = key_fault(key) {
             self.metrics.record_denial(DenialReason::InvalidArgument);
-            return Err(DomainError::InvalidArgument {
-                field: "idempotency_key",
-                reason: tokens::IDEMPOTENCY_KEY_REQUIRED,
-            });
+            return Err(DomainError::InvalidArgument { field, reason });
         }
         Ok(())
     }
 
-    /// The projection this metric treats as its user tier, when the catalogue
-    /// admits one.
-    ///
-    /// The engine ranks a user-scoped Quota above a tenant-scoped one, so a
-    /// deployment whose metric has no user projection simply has one tier. A
-    /// catalogue miss is not an error here: ingress already proved the metric
-    /// is admitted, and a metric admitted only at tenant scope is ordinary.
-    pub(super) fn user_projection(&self, metric: &MetricId) -> Option<gts::GtsTypeId> {
-        self.catalog
-            .map_subject(metric, &quota_enforcement_sdk::SubjectScope::user())
-            .ok()
-            .cloned()
-    }
-
     pub(super) fn scope_of(
-        admitted: &AdmittedEvaluation,
+        attribution: &MappedAttribution,
         operation_type: OperationType,
         key: String,
     ) -> IdempotencyScope {
         IdempotencyScope {
-            tenant_id: admitted.attribution.tenant_id,
-            subject_key: IdempotencySubjectKey::of(&admitted.attribution.subjects),
+            tenant_id: attribution.tenant_id,
             operation_type,
             key,
         }
@@ -678,6 +681,18 @@ impl Operations<'_> {
         Ok(Some(replay.decision))
     }
 
+    /// Count an operation the storage refused on the contention timeout.
+    pub(super) fn contended<T>(
+        &self,
+        operation: OperationKind,
+        outcome: Result<T, DomainError>,
+    ) -> Result<T, DomainError> {
+        if matches!(outcome, Err(DomainError::LeaseContentionTimeout)) {
+            self.metrics.record_contention_rejected(operation);
+        }
+        outcome
+    }
+
     pub(super) fn applied(
         &self,
         outcome: TransitionOutcome<AppliedMutation>,
@@ -687,29 +702,6 @@ impl Operations<'_> {
             self.metrics.record_idempotency_replay(operation);
         }
         outcome.into_inner().decision
-    }
-
-    fn applied_cached(
-        &self,
-        outcome: TransitionOutcome<AppliedMutation>,
-        operation: OperationKind,
-        scope: IdempotencyScope,
-        payload_hash: PayloadHash,
-    ) -> Decision {
-        if matches!(outcome, TransitionOutcome::NoOp(_)) {
-            self.metrics.record_idempotency_replay(operation);
-        }
-        let applied = outcome.into_inner();
-        self.idempotency.insert(
-            scope,
-            ReplayRecord {
-                payload_hash,
-                decision: applied.decision.clone(),
-                expires_at: applied.expires_at,
-            },
-            OffsetDateTime::now_utc(),
-        );
-        applied.decision
     }
 
     pub(super) fn count_denial(&self, decision: &Decision) {
@@ -726,21 +718,19 @@ pub(super) fn applicable_of(
     quota_enforcement_sdk::ApplicableQuotas {
         tenant_id: admitted.attribution.tenant_id,
         subjects: admitted.attribution.subjects.clone(),
-        metric: admitted.metric.clone(),
+        metric: admitted.metric.id().clone(),
     }
 }
 
-/// The two Policy-visible documents, as the engine sees them.
-pub(super) fn policy_values(admitted: &AdmittedEvaluation) -> (Value, Value) {
-    let request = Value::Object(admitted.input.request.clone());
-    let resource = admitted
-        .input
-        .resource
-        .as_ref()
-        .map_or(Value::Null, |projection| {
-            serde_json::to_value(projection).unwrap_or(Value::Null)
+/// Debit and lease acquisition take capacity, so a metric whose enforcement
+/// is `direct` refuses them.
+pub(super) fn ensure_quota_gated(metric: &ServedMetric) -> Result<(), DomainError> {
+    if metric.mode() == MetricMode::Direct {
+        return Err(DomainError::MetricNotQuotaGated {
+            metric: metric.id().to_string(),
         });
-    (request, resource)
+    }
+    Ok(())
 }
 
 /// An evaluation failure as the storage contract reports it, so the shared
@@ -758,6 +748,17 @@ fn storage_failure(
             engine_id: engine_id.to_owned(),
             failure,
         },
+    }
+}
+
+/// Why an idempotency key is refused, if it is.
+pub(crate) fn key_fault(key: &str) -> Option<&'static str> {
+    if key.trim().is_empty() {
+        Some(tokens::IDEMPOTENCY_KEY_REQUIRED)
+    } else if key.chars().count() > crate::domain::quotas::validation::IDEMPOTENCY_KEY_MAX_LEN {
+        Some(tokens::IDEMPOTENCY_KEY_TOO_LONG)
+    } else {
+        None
     }
 }
 

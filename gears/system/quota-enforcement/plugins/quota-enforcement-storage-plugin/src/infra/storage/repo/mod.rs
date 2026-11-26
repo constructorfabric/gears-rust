@@ -6,6 +6,7 @@ use sea_orm::QuerySelect;
 use sea_orm::sea_query::{LockBehavior, LockType};
 
 pub mod allocation_counter_repo;
+pub mod charge_repo;
 pub mod config_repo;
 pub mod consumption_counter_repo;
 pub mod idempotency_repo;
@@ -18,11 +19,11 @@ pub mod policy_repo;
 
 /// How a locking read behaves when another transaction holds the row.
 ///
-/// The contention-budgeted primitives — debit, credit, rollback and the three
-/// lease operations (I8) — always read `Nowait`: a held row is refused at once
-/// and the primitive retries under its budget, so none of their transactions
-/// ever queues behind another and a wait can never run past the budget. The
-/// paths I8 does not cover (Quota lifecycle, the deactivation cascade, the
+/// The contention-budgeted primitives — debit, credit, return, rollback and
+/// the three lease operations (I8) — always read `Nowait`: a held row is
+/// refused at once and the primitive retries under its budget, so none of
+/// their transactions ever queues behind another and a wait can never run past
+/// the budget. The paths I8 does not cover (Quota lifecycle, the deactivation cascade, the
 /// sweeper) keep queueing.
 ///
 /// `SQLite` has no row locks and drops the clause either way.

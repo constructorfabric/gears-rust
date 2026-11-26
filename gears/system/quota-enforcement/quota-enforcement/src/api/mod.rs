@@ -8,4 +8,5 @@
 
 pub mod healthcheck;
 pub mod in_process;
+pub mod resolver_plugin;
 pub mod rest;

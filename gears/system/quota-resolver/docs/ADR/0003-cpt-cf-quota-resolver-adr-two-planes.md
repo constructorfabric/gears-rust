@@ -20,6 +20,7 @@ date: 2026-11-11
   - [(a) Platform-plane writes, principal as data](#a-platform-plane-writes-principal-as-data)
   - [(b) Writes on both planes, user context forwarded](#b-writes-on-both-planes-user-context-forwarded)
   - [(c) Caller security context in the plugin contract](#c-caller-security-context-in-the-plugin-contract)
+  - [(d) Tenant plane only, S2S token per tenant](#d-tenant-plane-only-s2s-token-per-tenant)
 - [More Information](#more-information)
 - [Traceability](#traceability)
 
@@ -50,6 +51,11 @@ a module charge the user of a request, and which operations are reachable from t
   tenant-plane write routes are internal.
 * (c) As (a), but the resolver passes caller security context through the plugin contract and prescribes a policy
   check in the backend.
+* (d) The tenant plane only, for platform services too: a service gets a tenant `SecurityContext` from a token that the
+  identity provider (IdP) issues for the service's own client id and secret (OAuth2 client credentials, S2S), and a
+  policy check authorizes it, as toolkit
+  [ADR-0008](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md) describes for work within a
+  tenant.
 
 ## Decision Outcome
 
@@ -72,15 +78,19 @@ neither forwarded to the resolver nor synthesized by it. The resolver maps the p
 
 On the tenant plane the subject is the caller's principal, mapped the same way, and the tenant is the caller's tenant.
 
-The resolver performs no policy check and passes no caller identity to the plugin. It trusts platform-plane callers
+The resolver performs no policy check. It passes the platform identity that it receives from the caller to the plugin, only
+for the backend's record of operations. It trusts platform-plane callers
 for the target data they provide and trusts the backend to decide which quotas apply to the fixed tenant and subjects.
 
-This is an exception to the toolkit's two-plane rule (`cpt-cf-adr-two-plane-auth`, "Which plane?"), which puts
-operations within a tenant, writes included, on the tenant plane with a policy check. The toolkit has no way to
-authorize a trusted service that charges many tenants: a tenant `SecurityContext` binds one tenant, and the policy
-decision point does not evaluate `PlatformSecurityContext`. The exception ends when the toolkit evaluates policies for
-platform-plane callers, keyed on the calling service and set at platform level, so the charged tenant cannot deny its
-own charge. The resolver then adopts that check without changing its contracts.
+This is an exception to the toolkit's two-plane rule (toolkit ADR-0008, "Which plane?"), which puts
+operations within a tenant, writes and service-to-service calls included, on the tenant plane with a policy check.
+The toolkit has no way to authorize a trusted service that charges many tenants (option (d)): a tenant
+`SecurityContext` binds one tenant, toolkit ADR-0008 forbids building one by hand for a target tenant, and
+the policy decision point does not evaluate `PlatformSecurityContext`. The exception ends when the toolkit evaluates
+policies for platform-plane callers, keyed on the calling service and set at platform level, so the charged tenant
+cannot deny its own charge
+([#6037](https://github.com/constructorfabric/gears-rust/issues/6037)). The resolver then adopts that check without
+changing its contracts.
 
 ### Consequences
 
@@ -89,10 +99,16 @@ own charge. The resolver then adopts that check without changing its contracts.
 * The resolver cannot check that a principal passed as data is the user of the module's request; it trusts the
   platform-plane caller, as for any other subject.
 * Until the exception ends, any service with a platform credential can charge, return, or read quotas of any subject
-  in any tenant. No component checks which service may do so, and the backend cannot record which service made a
-  charge.
+  in any tenant. No component checks which service may do so.
+* The backend records the platform identity with every charge, but this is not an audit log. The identity names the
+  calling service only when the caller runs in another process. In one process, which is the default deployment, the
+  platform gives a caller no identity of its own: the resolver receives a marker that names no module
+  ([gears-rust#6036](https://github.com/constructorfabric/gears-rust/issues/6036)). The record names the charging
+  module in every deployment when the platform closes that gap; the resolver's contracts do not change then.
 * A backend that also has its own API gains a second entry into its operations: the in-process plugin. The backend's
-  own policy check covers only its API; the plugin is reachable only through the resolver and is not authorized.
+  own policy check covers only its API; the plugin is reachable by any module of the same process and is not
+  authorized. This adds no access: a module of the process can already call the resolver's platform plane, which
+  reaches the same operations. The platform does not treat the process as a security boundary.
 * An authenticated user receives the state of the quotas that the backend applies to the mapped subject and requested
   metrics, including quotas of the tenant. The resolver returns the backend's page unchanged.
 
@@ -110,7 +126,7 @@ the resolver returns the plugin's quota-state page unchanged.
 * Good, because every charge is authenticated the same way, by the platform credential of the calling module.
 * Good, because the tenant plane is read-only and safe to publish at the edge.
 * Bad, because the resolver trusts the module to pass the right principal.
-* Bad, because no component authorizes the calling service, which is an exception to `cpt-cf-adr-two-plane-auth`.
+* Bad, because no component authorizes the calling service, which is an exception to toolkit ADR-0008.
 
 ### (b) Writes on both planes, user context forwarded
 
@@ -126,9 +142,22 @@ the resolver returns the plugin's quota-state page unchanged.
   into the resolver.
 * Bad, because every module could require policy grants for every user it serves.
 
+### (d) Tenant plane only, S2S token per tenant
+
+* Good, because every charge passes a policy check, as toolkit ADR-0008 asks for work within a tenant.
+* Bad, because a client-credentials request names no tenant: the token yields the context of the one tenant that the
+  IdP binds to the client. A service that charges many tenants needs an IdP client per tenant or a token exchange per
+  tenant, which the platform does not have, and pays an IdP round trip per tenant.
+* Bad, because building a tenant `SecurityContext` by hand instead is what toolkit ADR-0008 forbids as the
+  seam where cross-tenant leaks start.
+* Bad, because a policy of the charged tenant could deny the charge of that tenant.
+
 ## More Information
 
 Principal types and their hierarchy: issue #5446.
+
+Authorization of platform-plane callers, the exit condition of the exception:
+[#6037](https://github.com/constructorfabric/gears-rust/issues/6037).
 
 Two-plane authentication: [ADR-0008](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md).
 

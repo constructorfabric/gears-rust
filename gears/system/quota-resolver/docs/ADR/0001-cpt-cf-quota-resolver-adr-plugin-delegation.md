@@ -54,8 +54,8 @@ receives the tenant and quota subjects only; principal mapping happens before de
 
 ### Consequences
 
-* The SDK crate defines the two public contracts, the plugin contract, their data types, the quota subject base and
-  tenant types, and the plugin GTS type.
+* The SDK crate defines the two public contracts, the plugin contract, their data types, the GTS types that every
+  backend shares (quota subject base, tenant subject type, metric base), and the plugin GTS type.
 * A backend registers a plugin in its process. The plugin converts the resolver requests to backend operations and
   backend results to resolver results.
 * The operations exposed are the subset consumers need: debit, lease, return, and quota state. The backend's other

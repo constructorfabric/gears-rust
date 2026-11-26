@@ -6,14 +6,11 @@ use quota_enforcement_sdk::testing::InMemoryStorage;
 use super::Service;
 use crate::domain::admission::Admission;
 use crate::domain::bootstrap::Bound;
-use crate::domain::catalog::{MetricClassifications, ProjectionContractCatalog};
 use crate::domain::error::{Dependency, DomainError};
 use crate::domain::ports::metrics::NoopMetrics;
 use crate::domain::quotas::QuotaLimits;
 use crate::domain::readiness::Readiness;
-use crate::test_support::{
-    FakeContractRegistry, FakeMetricRegistry, NoopCoordinator, PermitTenantsPdp, tenant,
-};
+use crate::test_support::{NoopCoordinator, PermitTenantsPdp, caller, tenant, test_catalog};
 
 fn limits() -> QuotaLimits {
     QuotaLimits {
@@ -63,9 +60,12 @@ fn dependencies_are_not_ready_until_bound_and_bind_happens_once() {
             dependency: Dependency::Catalog
         })
     );
-    assert!(svc.attribution().is_err(), "no catalogue, no ingress");
+    assert!(
+        svc.operations(caller()).is_err(),
+        "no storage, no operations"
+    );
     assert_eq!(
-        svc.quotas().err(),
+        svc.quotas(caller()).err(),
         Some(DomainError::NotReady {
             dependency: Dependency::Storage
         }),
@@ -80,20 +80,57 @@ fn dependencies_are_not_ready_until_bound_and_bind_happens_once() {
         )),
         storage: Arc::new(InMemoryStorage::new()),
         coordinator: Arc::new(NoopCoordinator),
-        catalog: Arc::new(ProjectionContractCatalog::empty()),
-        registry: Arc::new(FakeContractRegistry::empty()),
-        metric_registry: Arc::new(FakeMetricRegistry::empty()),
-        classifications: Arc::new(MetricClassifications::default()),
+        catalog: test_catalog().0,
     };
     svc.bind(bound.clone()).expect("first bind");
     assert!(svc.storage().is_ok());
     assert!(svc.coordinator().is_ok());
     assert!(svc.catalog().is_ok());
-    assert!(svc.attribution().is_ok());
-    assert_eq!(svc.quotas().expect("lifecycle").limits(), limits());
+    assert!(svc.operations(caller()).is_ok());
+    assert_eq!(svc.quotas(caller()).expect("lifecycle").limits(), limits());
     assert!(matches!(svc.bind(bound), Err(DomainError::Internal(_))));
     assert!(
         !svc.readiness().is_ready(),
         "binding does not imply readiness; bootstrap marks it"
     );
+}
+
+#[tokio::test]
+async fn policy_management_over_trusted_admission_is_refused_before_storage() {
+    let storage = crate::test_support::mrw_storage().await;
+    let svc = crate::test_support::bound_service_over(
+        Arc::new(crate::test_support::UncallablePdp),
+        Arc::clone(&storage),
+    )
+    .await;
+    let audit = storage.policy_audit().len();
+    let policies = svc
+        .policies_over(svc.admission().trusted(None))
+        .expect("bound");
+    let global = quota_enforcement_sdk::PolicyId::global();
+
+    let refusals = [
+        policies
+            .create(quota_enforcement_sdk::PolicySpec {
+                scope: quota_enforcement_sdk::PolicyScope::Global,
+                engine_id: "most-restrictive-wins".to_owned(),
+                engine_config: serde_json::json!({}),
+                timeout_ms: None,
+                description: None,
+                comment: None,
+            })
+            .await
+            .err(),
+        policies.rollback(global.clone(), 1, None).await.err(),
+        policies.delete(global.clone(), None).await.err(),
+        policies.read(&global, None).await.err(),
+    ];
+
+    for refusal in refusals {
+        assert!(
+            matches!(refusal, Some(DomainError::PdpDenied { .. })),
+            "{refusal:?}"
+        );
+    }
+    assert_eq!(storage.policy_audit().len(), audit, "nothing was written");
 }
