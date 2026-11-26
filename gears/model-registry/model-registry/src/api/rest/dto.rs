@@ -148,13 +148,13 @@ pub struct UpdateProviderRequestDto {
 
 #[api_dto(response)]
 #[derive(Debug, Clone)]
-pub struct ApprovalDto {
+pub struct ModelApprovalDto {
     pub state: String,
     pub decided_by: Uuid,
     pub decided_at: DateTime<Utc>,
 }
 
-impl From<ApprovalV1> for ApprovalDto {
+impl From<ApprovalV1> for ModelApprovalDto {
     fn from(a: ApprovalV1) -> Self {
         Self {
             state: a.state.as_str().to_owned(),
@@ -269,14 +269,14 @@ impl From<ModelInfoV1> for ModelInfoDto {
 /// `ModelV1` on the wire: the full record the resolution routes return.
 #[api_dto(response)]
 #[derive(Debug, Clone)]
-pub struct ModelDto {
+pub struct RegistryModelDto {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub provider_id: Uuid,
     pub name: String,
     pub canonical_id: String,
     pub sharing_mode: String,
-    pub approval: ApprovalDto,
+    pub approval: ModelApprovalDto,
     pub info: ModelInfoDto,
     /// Row version; the `ETag` of single-entry responses.
     pub version: i64,
@@ -286,7 +286,7 @@ pub struct ModelDto {
     pub updated_by: Uuid,
 }
 
-impl From<ModelV1> for ModelDto {
+impl From<ModelV1> for RegistryModelDto {
     fn from(m: ModelV1) -> Self {
         Self {
             id: m.id,
@@ -306,7 +306,7 @@ impl From<ModelV1> for ModelDto {
     }
 }
 
-/// `ModelEntryV1`, flattened: the `ModelDto` fields plus the flags.
+/// `ModelEntryV1`, flattened: the `RegistryModelDto` fields plus the flags.
 #[allow(clippy::struct_excessive_bools)]
 #[api_dto(response)]
 #[derive(Debug, Clone)]
@@ -317,7 +317,7 @@ pub struct ModelEntryDto {
     pub name: String,
     pub canonical_id: String,
     pub sharing_mode: String,
-    pub approval: ApprovalDto,
+    pub approval: ModelApprovalDto,
     pub info: ModelInfoDto,
     /// Row version; the `ETag` of single-entry responses.
     pub version: i64,
@@ -333,7 +333,7 @@ pub struct ModelEntryDto {
 
 impl From<ModelEntryV1> for ModelEntryDto {
     fn from(e: ModelEntryV1) -> Self {
-        let m = ModelDto::from(e.model);
+        let m = RegistryModelDto::from(e.model);
         Self {
             id: m.id,
             tenant_id: m.tenant_id,
@@ -610,7 +610,7 @@ mod tests {
         entry.provider_enabled = true;
         entry.available_for_eval = true;
         let entry = serde_json::to_value(ModelEntryDto::from(entry)).expect("serializes");
-        let full = serde_json::to_value(ModelDto::from(model)).expect("serializes");
+        let full = serde_json::to_value(RegistryModelDto::from(model)).expect("serializes");
 
         for key in ["base_url", "secret_ref", "provider_settings", "cost"] {
             assert!(full["info"].get(key).is_some(), "{key}");

@@ -15,8 +15,8 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::dto::{
-    CreateModelRequestDto, CreateProviderRequestDto, ModelDto, ModelEntryDto, ProviderEntryDto,
-    UpdateModelRequestDto, UpdateProviderRequestDto,
+    CreateModelRequestDto, CreateProviderRequestDto, ModelEntryDto, ProviderEntryDto,
+    RegistryModelDto, UpdateModelRequestDto, UpdateProviderRequestDto,
 };
 use super::parse;
 use crate::domain::error::DomainError;
@@ -70,9 +70,9 @@ pub async fn resolve_model(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Svc,
     Path(canonical_id): Path<String>,
-) -> ApiResult<JsonBody<ModelDto>> {
+) -> ApiResult<JsonBody<RegistryModelDto>> {
     let model = svc.resolve_model(&ctx, &canonical_id).await?;
-    Ok(Json(ModelDto::from(model)))
+    Ok(Json(RegistryModelDto::from(model)))
 }
 
 /// `GET /model-registry/v1/available-models`
@@ -82,7 +82,7 @@ pub async fn list_available_models(
     OData(query): OData,
 ) -> ApiResult<JsonBody<Page<serde_json::Value>>> {
     let page = svc.list_available_models(&ctx, &query).await?;
-    Ok(projected::<ModelDto, _>(page, &OData(query)))
+    Ok(projected::<RegistryModelDto, _>(page, &OData(query)))
 }
 
 // ==================== Providers ====================
