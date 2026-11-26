@@ -1299,6 +1299,9 @@ pub const CLUSTER_NODES: u16 = 3;
 pub async fn start_redis_cluster() -> (ContainerAsync<Redis>, RedisClusterConfig, Vec<u16>) {
     let (container, base) = start_multinode(CLUSTER_NODES, |base| {
         let ports: Vec<u16> = (0..CLUSTER_NODES).map(|offset| base + offset).collect();
+        // Redis 8.12+ refuses to start a cluster node without TLS while
+        // `cluster-bus-port-protected-mode` is on (the default); this
+        // throwaway fixture runs without TLS, so it turns the check off.
         let servers = ports
             .iter()
             .map(|port| {
@@ -1306,8 +1309,8 @@ pub async fn start_redis_cluster() -> (ContainerAsync<Redis>, RedisClusterConfig
                     "redis-server --port {port} --cluster-enabled yes \
                      --cluster-config-file node-{port}.conf --cluster-node-timeout 5000 \
                      --cluster-announce-ip 127.0.0.1 --cluster-announce-port {port} \
-                     --cluster-announce-bus-port {bus} --save '' --appendonly no \
-                     --notify-keyspace-events {KEYSPACE_FLAGS} &",
+                     --cluster-announce-bus-port {bus} --cluster-bus-port-protected-mode no \
+                     --save '' --appendonly no --notify-keyspace-events {KEYSPACE_FLAGS} &",
                     bus = port + CLUSTER_BUS_OFFSET
                 )
             })

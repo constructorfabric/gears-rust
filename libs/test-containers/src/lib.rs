@@ -126,7 +126,12 @@ pub const CLICKHOUSE_IMAGE: &str = "clickhouse/clickhouse-server";
 pub const CLICKHOUSE_TAG: &str = "25.6";
 
 /// Tag of the official `redis` image.
-pub const REDIS_TAG: &str = "8-alpine";
+///
+/// Pinned to a minor: `8-alpine` moved to 8.12, which made
+/// `cluster-bus-port-protected-mode` default to `yes` and broke the
+/// redis-cluster-plugin Cluster fixture. That fixture now passes the option,
+/// which Redis before 8.12 rejects at startup.
+pub const REDIS_TAG: &str = "8.12-alpine";
 
 /// Tag of the official `apache/kafka` (JVM) image, run as a single `KRaft`
 /// node. Its `Kafka Server started` log line is what the image module waits
@@ -451,7 +456,7 @@ mod tests {
         assert_eq!(MARIADB_TAG, "11.8");
         assert_eq!(CLICKHOUSE_IMAGE, "clickhouse/clickhouse-server");
         assert_eq!(CLICKHOUSE_TAG, "25.6");
-        assert_eq!(REDIS_TAG, "8-alpine");
+        assert_eq!(REDIS_TAG, "8.12-alpine");
         assert_eq!(KAFKA_TAG, "4.3.1");
         assert_eq!(NETSHOOT_IMAGE, "nicolaka/netshoot");
         assert_eq!(
