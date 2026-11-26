@@ -223,6 +223,14 @@ async fn absence_is_never_kept() {
     );
 }
 
+/// Read `TYPE` through the cache and return its lifecycle.
+async fn lifecycle_read(f: &Fixture) -> crate::models::LifecycleStatus {
+    match f.lookup(gts_key(TYPE), full(), false).await {
+        EntityLookup::Found { entity, .. } => entity.lifecycle_status,
+        other => panic!("found: {other:?}"),
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_observed_registration_or_deletion_leaves_a_known_identity_alone() {
     let f = fixture(WINDOW);
@@ -230,20 +238,34 @@ async fn an_observed_registration_or_deletion_leaves_a_known_identity_alone() {
         .resolve_type_uuid(&ctx(), &type_id(TYPE))
         .await
         .expect("registered");
+    // A snapshot inside its window, so only an invalidation sends the next read on.
+    assert_eq!(
+        lifecycle_read(&f).await,
+        crate::models::LifecycleStatus::Active
+    );
 
     let registered = f.register(registration(TYPE, "v2", Some(1))).await;
     assert!(matches!(
         registered.items[0].outcome,
         RegistrationOutcome::Succeeded { .. }
     ));
+    let before = f.recorder.batch_count();
+    assert_eq!(
+        lifecycle_read(&f).await,
+        crate::models::LifecycleStatus::Active
+    );
+    assert_eq!(
+        f.recorder.batch_count(),
+        before + 1,
+        "the registration invalidated the snapshot"
+    );
+
     let deleted = f.delete(deletion(&[(TYPE, 2)], false)).await;
     assert!(matches!(
         deleted.items[0].outcome,
         crate::models::DeletionOutcome::Succeeded { .. }
     ));
-    let before = f.recorder.batch_count();
     assert_eq!(f.recorder.resolution_count(), 1);
-
     assert_eq!(
         f.cache
             .resolve_type_id(&ctx(), uuid(TYPE))
@@ -251,11 +273,12 @@ async fn an_observed_registration_or_deletion_leaves_a_known_identity_alone() {
             .expect("known"),
         type_id(TYPE)
     );
-    assert_eq!(f.recorder.resolution_count(), 1);
-    assert_eq!(f.recorder.batch_count(), before);
-    assert!(
-        f.lookup(gts_key(TYPE), full(), false).await != EntityLookup::NotFound,
-        "the snapshot entry was invalidated and is read anew"
+    assert_eq!(f.recorder.resolution_count(), 1, "the pair is still known");
+    let before = f.recorder.batch_count();
+    assert_eq!(
+        lifecycle_read(&f).await,
+        crate::models::LifecycleStatus::Deleted,
+        "the deletion invalidated the snapshot, so the tombstone is read"
     );
     assert_eq!(f.recorder.batch_count(), before + 1);
 }

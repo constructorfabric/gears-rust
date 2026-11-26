@@ -32,7 +32,9 @@
 //! tombstones. Cache misses fetch the stored pair through
 //! [`PlatformTypesRegistryApi::batch_resolve_identities`] or
 //! [`TypesRegistryApi::batch_resolve_identities`]. For deterministic UUIDs before
-//! registration, use [`GtsId::to_uuid`].
+//! registration, use [`GtsId::to_uuid`]. Whatever the implementation, a resolution
+//! reply that is incomplete, contradicts itself or answers a key not asked fails as
+//! `Internal`.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -872,7 +874,8 @@ async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
 type Resolved<T> = (<T as Kinded>::Id, Uuid);
 
 /// Resolve distinct keys in bounded batches like [`get_many`].
-/// Return `None` for absent or wrong-kind entities. Any batch failure stops the call.
+/// Return `None` for absent or wrong-kind entities. Any batch failure, including a
+/// reply [`checked_resolutions`] refuses, stops the call.
 async fn resolve_many<R: EntityReads + ?Sized, K: Send, T: Kinded>(
     reads: &R,
     keys: Vec<(K, EntityKey)>,
@@ -880,7 +883,8 @@ async fn resolve_many<R: EntityReads + ?Sized, K: Send, T: Kinded>(
     let mut out = Vec::with_capacity(keys.len());
     let (distinct, mut askers) = distinct(keys);
     for chunk in distinct.chunks(MAX_BATCH_GET_KEYS) {
-        let mut identities = reads.batch_resolve(chunk.to_vec()).await?;
+        let mut identities =
+            checked_resolutions(chunk, reads.batch_resolve(chunk.to_vec()).await?)?;
         for key in chunk {
             let identity = identities.remove(key).ok_or_else(|| unresolved(key))?;
             let answer = match identity {
@@ -898,9 +902,8 @@ async fn resolve_one<R: EntityReads + ?Sized, T: Kinded>(
     reads: &R,
     key: EntityKey,
 ) -> Result<Resolved<T>, CanonicalError> {
-    let identity = reads
-        .batch_resolve(vec![key.clone()])
-        .await?
+    let asked = [key.clone()];
+    let identity = checked_resolutions(&asked, reads.batch_resolve(asked.to_vec()).await?)?
         .remove(&key)
         .ok_or_else(|| unresolved(&key))?;
     match identity {
@@ -941,8 +944,8 @@ fn resolved<T: Kinded>(identity: &EntityIdentity) -> Result<Option<Resolved<T>>,
 /// ```
 ///
 /// # Errors
-/// The read's error; `Internal` when it leaves a key unanswered or answers it with a
-/// snapshot its own data contradicts.
+/// The read's error; `Internal` when it leaves a key unanswered, answers it with a
+/// snapshot its own data contradicts, or answers a key not asked.
 #[cfg(any(test, feature = "test-util"))]
 pub async fn resolve_through_batch_get<F, Fut>(
     keys: Vec<EntityKey>,
@@ -976,6 +979,12 @@ fn identities(
             Some(EntityLookup::Unchanged { .. }) | None => return Err(unanswered(key)),
         };
         out.insert(key.clone(), identity);
+    }
+    if let Some(extra) = read.0.keys().next() {
+        return Err(resolution_fault(
+            extra,
+            "an answer although it was not asked",
+        ));
     }
     Ok(out)
 }

@@ -193,8 +193,9 @@ impl Held {
 
     /// Share byte-identical documents in the same field. JSON value equality can
     /// hide signed zero or key order differences. Compare each distinct sibling
-    /// document at most once, and only if its measured size matches.
-    fn share(&mut self, weight: &Weight, siblings: &[(&Self, &Weight)]) {
+    /// document at most once, and only if its measured size matches. Serializes, so
+    /// call it outside the store lock, with [`Store::siblings`] taken under it.
+    pub fn share(&mut self, weight: &Weight, siblings: &[(Self, Weight)]) {
         for (at, field) in DOCUMENTS.into_iter().enumerate() {
             let Some(held) = self.documents[at].as_mut() else {
                 continue;
@@ -557,6 +558,23 @@ impl Store {
     /// Remember up to `bound` identity pairs for resolution.
     pub fn remember_identities(&mut self, bound: usize) {
         self.identities = Identities::new(bound);
+    }
+
+    /// The snapshots of the entity `key` spells other than the one answering `reader`,
+    /// which a reply would replace: what a new snapshot may [share](Held::share) with.
+    pub fn siblings(&self, key: &EntityKey, reader: Option<Uuid>) -> Vec<(Held, Weight)> {
+        let Some(uuid) = self.resident(key) else {
+            return Vec::new();
+        };
+        let replaced = self.slot(uuid, reader);
+        self.scopes
+            .get(&uuid)
+            .into_iter()
+            .flatten()
+            .filter(|scope| replaced != Some((uuid, **scope)))
+            .filter_map(|scope| self.entries.peek(&(uuid, *scope)))
+            .map(|entry| (entry.snapshot.clone(), entry.weight.clone()))
+            .collect()
     }
 
     /// Limit confirmations independently of the number of readers and entities.
@@ -936,12 +954,13 @@ impl Store {
     }
 
     /// Replace the snapshot resident in `scope` and return the number of capacity
-    /// evictions. An oversized replacement drops the stale entry. Measure `weight`
-    /// before locking. Callers check [identity conflicts](Self::conflict) first.
-    /// Insertion still drops a conflicting resident alias to preserve uniqueness.
+    /// evictions. An oversized replacement drops the stale entry. Measure `weight` and
+    /// [share](Held::share) documents before locking: admission compares no documents.
+    /// Callers check [identity conflicts](Self::conflict) first. Insertion still drops
+    /// a conflicting resident alias to preserve uniqueness.
     pub fn insert(
         &mut self,
-        mut snapshot: Held,
+        snapshot: Held,
         covers: FieldSelection,
         weight: Weight,
         etag: Validator,
@@ -966,15 +985,6 @@ impl Store {
         if !self.fits(&weight, &etag) {
             return 0;
         }
-        let siblings: Vec<(&Held, &Weight)> = self
-            .scopes
-            .get(&uuid)
-            .into_iter()
-            .flatten()
-            .filter_map(|other| self.entries.peek(&(uuid, *other)))
-            .map(|entry| (&entry.snapshot, &entry.weight))
-            .collect();
-        snapshot.share(&weight, &siblings);
         let mut evictions = 0;
         // Recharged each round: an eviction may leave a shared document to this one.
         // `used <= bound` holds throughout, so the subtraction cannot underflow.

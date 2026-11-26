@@ -3010,7 +3010,7 @@ Rust API; REST contracts and dependency versions are unchanged.
 - [x] Enforce the per-snapshot byte charge from SPEC §8.3. Merges reuse measured fields. Size and clone outside the store lock and release it before network I/O.
 - [x] A metadata-only publisher confirmation (SPEC D18) changes no cached representation; the publisher stamp is not cached
 - [x] Entries are indexed by identifier and by UUID, so either resolution direction hits one snapshot
-- [x] Never cached, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource
+- [x] Never cached as snapshots, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource. Discovery items may still teach and classify ID/UUID pairs in the separate identity LRU.
 - [x] An entry tracks the normalized set of fields it can serve. The tenant cache checks visibility separately from field coverage
 - [x] `freshness_window`, `max_size_bytes` and `max_entries` configure the snapshot cache; the four old keys become accepted-and-ignored in T38, when the old cache goes
 - [x] Authenticated readers share fresh global snapshots. Tenant-owned snapshots are per reader tenant, share byte-identical documents in the same field, and require confirmation for the same read context (SPEC §8.3).
@@ -3021,7 +3021,7 @@ Rust API; REST contracts and dependency versions are unchanged.
 - [x] Test: `0s` window never serves a cached entry
 - [x] Test: terminal outcome invalidates under identifier **and** UUID; a bare `202` invalidates nothing
 - [x] Test: byte bound evicts on one 1MB document where a thousand small entries do not
-- [x] Test: each of the four never-cached cases
+- [x] Test: each of the four never-cached cases leaves no snapshot; a discovery page teaches only identity pairs
 - [x] Test: projections of one entity share one entry when compatible. Default and reordered selections normalize, and the REST parser folds field case.
 - [x] Test: a failed read leaves no entry and does not extend an existing window
 - [x] Test: expired, unchanged entries keep the snapshot. Assert that revalidation transfers no full snapshot.

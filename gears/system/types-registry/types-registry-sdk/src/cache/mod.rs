@@ -365,11 +365,79 @@ impl ReadCache {
             };
             fetch(inner).await?.0
         };
-        let verified = verify(&plans, &selection, self.max_size_bytes, answers)?;
+        let mut verified = verify(&plans, &selection, self.max_size_bytes, answers)?;
+        self.share(&plans, &mut verified, reader);
         let response = respond(&plans, &selection, &verified)?;
         self.settle(&plans, &verified, now, reader, tickets.context.as_ref())?;
         drop(tickets);
         Ok(response)
+    }
+
+    /// Share the documents of every tenant snapshot this batch may keep with
+    /// byte-identical documents of the entity's other snapshots. Candidates are taken
+    /// under the lock only now, so a pending read holds no other snapshot alive. Bytes
+    /// are compared outside the lock. A sibling dropped before the commit shares
+    /// harmlessly.
+    fn share(
+        &self,
+        plans: &[(EntityKey, Plan)],
+        verified: &mut [Option<Verified>],
+        reader: Option<Uuid>,
+    ) {
+        // Shared snapshots have no siblings: platform reads and global replies keep one.
+        let Some(tenant) = reader else {
+            return;
+        };
+        // Skip replies the commit cannot keep beside their siblings: oversized ones, and
+        // those changing the validator sent, which retire every snapshot of the entity.
+        // The reader's own snapshot may be evicted before the commit, so it decides nothing.
+        let keeps = || {
+            plans
+                .iter()
+                .zip(verified.iter())
+                .map(|((_, plan), answer)| {
+                    let (
+                        Plan::Remote { sent, ticket, .. },
+                        Some(Verified::Found {
+                            keep: Some(kept),
+                            etag,
+                            ..
+                        }),
+                    ) = (plan, answer)
+                    else {
+                        return None;
+                    };
+                    (Scope::of(kept.snapshot.meta(), Some(tenant)) != Scope::Shared
+                        && kept.weight.fits(self.max_size_bytes, etag)
+                        && sent.as_ref().is_none_or(|held| held == etag))
+                    .then_some((kept, ticket))
+                })
+        };
+        if keeps().all(|kept| kept.is_none()) {
+            return;
+        }
+        let candidates: Vec<Vec<(Held, Weight)>> = {
+            let store = self.store();
+            keeps()
+                .map(|kept| match kept {
+                    // A fenced reply never fills.
+                    Some((kept, ticket)) if store.quiet_since(ticket) => {
+                        let entity = EntityKey::GtsUuid(kept.snapshot.meta().gts_uuid);
+                        store.siblings(&entity, reader)
+                    }
+                    _ => Vec::new(),
+                })
+                .collect()
+        };
+        for (answer, siblings) in verified.iter_mut().zip(&candidates) {
+            if let Some(Verified::Found {
+                keep: Some(kept), ..
+            }) = answer
+                && !siblings.is_empty()
+            {
+                kept.snapshot.share(&kept.weight, siblings);
+            }
+        }
     }
 
     /// Commit snapshots only after all pairs have passed the shared identity checks.

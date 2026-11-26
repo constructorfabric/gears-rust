@@ -735,11 +735,19 @@ fn a_resolution_neither_erases_nor_extends_a_read_proof() {
     );
 }
 
+/// Admit `snapshot` into `scope` as a read does: sharing documents first.
 fn put_in(store: &mut Store, snapshot: &Arc<Entity>, scope: Scope) -> u64 {
+    let mut held = Held::new((**snapshot).clone());
+    let weight = super::weight(snapshot);
+    let reader = match scope {
+        Scope::Shared => None,
+        Scope::Tenant(tenant) => Some(tenant),
+    };
+    held.share(&weight, &store.siblings(&key(snapshot), reader));
     store.insert(
-        Held::new((**snapshot).clone()),
+        held,
         FieldSelection::full(),
-        super::weight(snapshot),
+        weight,
         etag("v1"),
         Instant::now(),
         scope,
@@ -820,6 +828,28 @@ fn sibling_snapshots_hold_one_copy_of_an_equal_document_until_the_last_leaves() 
     );
 }
 
+/// Admission compares no documents under the lock: an equal document not shared
+/// beforehand is held and charged apart.
+#[test]
+fn admission_alone_shares_no_document() {
+    let mut store = Store::new(1024 * 1024, 2);
+    let snapshot = entity(TYPE, Some(json!({ "a": "b".repeat(100) })));
+    put_in(&mut store, &snapshot, tenant(1));
+    store.insert(
+        Held::new((*snapshot).clone()),
+        FieldSelection::full(),
+        super::weight(&snapshot),
+        etag("v1"),
+        Instant::now(),
+        tenant(2),
+    );
+    assert!(!Arc::ptr_eq(
+        &content_of(&store, &key(&snapshot), 1),
+        &content_of(&store, &key(&snapshot), 2)
+    ));
+    assert_eq!(store.used(), 2 * resident_bytes(&snapshot));
+}
+
 #[test]
 fn admitting_a_sibling_that_evicts_the_only_other_holder_charges_the_document() {
     let mut store = Store::new(1024 * 1024, 1);
@@ -868,7 +898,9 @@ fn invalidation_drops_every_tenants_snapshot() {
 }
 
 /// Sharing never changes what a tenant's snapshot holds: values `serde_json` calls
-/// equal but that serialize differently are held apart.
+/// equal but that serialize differently are held apart. Their lengths differ, so the
+/// size check alone separates them; the byte comparison itself is covered by
+/// `documents_of_one_size_but_different_bytes_are_held_apart`.
 #[test]
 fn documents_equal_as_values_but_not_as_bytes_are_held_apart() {
     let mut store = Store::new(1024 * 1024, 1);
@@ -907,21 +939,32 @@ fn a_reinserted_snapshot_does_not_revive_proofs_through_a_sibling() {
     );
 }
 
+/// Both tenants' snapshots carry the same pair, so only recency shows which one a
+/// resolution used: Bob's, the least recent, survives the next admission.
 #[test]
 fn a_read_proof_resolves_from_the_readers_own_snapshot() {
     let window = std::time::Duration::from_secs(30);
-    let mut store = Store::new(1024 * 1024, 4);
+    let mut store = Store::new(1024 * 1024, 2);
     store.track_visibility();
     let snapshot = owned(TYPE);
     let bob = reader(20, 2);
     let at = Instant::now();
-    put_in(&mut store, &snapshot, tenant(1));
     put_in(&mut store, &snapshot, tenant(2));
+    put_in(&mut store, &snapshot, tenant(1));
     store.confirm_visible(&key(&snapshot), &bob, &etag("v1"), at);
     assert!(
         store
             .resolvable(&spelled(&snapshot), &bob, at, window)
             .is_some()
+    );
+    assert_eq!(
+        put_in(&mut store, &entity(&instance_id(1), None), Scope::Shared),
+        1
+    );
+    assert_eq!(
+        store.scopes(&key(&snapshot)),
+        [tenant(2)],
+        "the resolution promoted Bob's snapshot, not tenant 1's"
     );
 }
 
@@ -987,6 +1030,7 @@ fn documents_of_one_size_but_different_bytes_are_held_apart() {
     let mut store = Store::new(1024 * 1024, 2);
     let first = entity(TYPE, Some(json!([-0.0, 0.0])));
     let second = entity(TYPE, Some(json!([0.0, -0.0])));
+    assert_eq!(first.content, second.content, "equal as values");
     assert_eq!(weight(&first), weight(&second), "the case under test");
     put_in(&mut store, &first, tenant(1));
     put_in(&mut store, &second, tenant(2));

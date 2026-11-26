@@ -4,7 +4,7 @@ use toolkit_security::SecurityContext;
 
 use super::*;
 use crate::cache::CachedTypesRegistry;
-use crate::cache::store::Scope;
+use crate::cache::store::{ReadContext, Scope};
 use crate::contract::TypesRegistryApi;
 use crate::models::{Entity, Ownership};
 
@@ -752,6 +752,41 @@ async fn tenant_snapshots_of_one_entity_share_their_documents() {
     );
 }
 
+/// A read holds no other tenant's documents while its registry call is pending:
+/// sharing candidates are taken only once a reply is ready to keep.
+#[tokio::test(start_paused = true)]
+async fn a_pending_read_keeps_no_dropped_sibling_document_alive() {
+    let (registry, cache) = owner_and_descendant();
+    found_as(&cache, &tenant(1), full()).await;
+    let key = gts_key(TYPE);
+    let document = Arc::downgrade(
+        cache
+            .cache
+            .store()
+            .peek(&key, Some(Uuid::from_u128(1)))
+            .expect("resident")
+            .snapshot
+            .documents()[0]
+            .as_ref()
+            .expect("content"),
+    );
+    let ctx = tenant(2);
+    let context = ReadContext::of(&ctx);
+    let request = BatchGetEntitiesRequest::new([key.clone().into()]).with_projection(full());
+    cache
+        .cache
+        .read(request, Some(&context), |request| {
+            cache.cache.store().invalidate(&key, None);
+            assert!(
+                document.upgrade().is_none(),
+                "the pending read holds tenant 1's dropped document"
+            );
+            TypesRegistryApi::batch_get_entities(registry.as_ref(), &ctx, request)
+        })
+        .await
+        .expect("read");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_late_cold_fill_leaves_another_tenants_fresh_snapshot() {
     let (registry, cache) = owner_and_descendant();
@@ -1435,9 +1470,19 @@ async fn global_answers_take_no_per_entity_slots() {
     );
     let alice = subject(10, Some("a"));
     get(&cache, &alice, &[TYPE]).await;
+    // Forced, so that each global reply reaches the commit path.
     for ctx in [subject(11, None), subject(12, None)] {
-        get(&cache, &ctx, &[OTHER]).await;
+        let forced = BatchGetEntitiesRequest {
+            fresh: true,
+            ..BatchGetEntitiesRequest::new([gts_key(OTHER).into()]).with_projection(full())
+        };
+        cache.batch_get_entities(&ctx, forced).await.expect("read");
     }
+    assert_eq!(
+        read_keys(&registry),
+        3,
+        "both global reads reached the registry"
+    );
     let before = read_keys(&registry);
     get(&cache, &alice, &[TYPE]).await;
     assert_eq!(

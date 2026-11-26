@@ -780,3 +780,131 @@ fn an_inconsistent_resolution_is_refused_whole() {
         assert!(internal(&error), "{what}: {error:?}");
     }
 }
+
+/// A tenant registry whose batch resolution answers `answers` whatever it is asked.
+struct Rigged {
+    answers: Answers,
+}
+
+#[async_trait]
+impl TypesRegistryApi for Rigged {
+    async fn batch_get_entities(
+        &self,
+        _ctx: &SecurityContext,
+        _request: BatchGetEntitiesRequest,
+    ) -> Result<BatchGetEntitiesResponse, CanonicalError> {
+        unreachable!("the helpers resolve through batch resolution")
+    }
+    async fn list_entities(
+        &self,
+        _ctx: &SecurityContext,
+        _request: ListEntitiesRequest,
+    ) -> Result<ListEntitiesResponse, CanonicalError> {
+        unreachable!("the helpers resolve through batch resolution")
+    }
+    async fn batch_resolve_identities(
+        &self,
+        _ctx: &SecurityContext,
+        _keys: Vec<EntityKey>,
+    ) -> Result<HashMap<EntityKey, Option<EntityIdentity>>, CanonicalError> {
+        Ok(self.answers.clone())
+    }
+}
+
+/// The `resolve_*` helpers hold any implementation to the checks every SDK client
+/// applies: a reply that pairs two identifiers with one Registry Reference, names
+/// another entity, or answers a key not asked fails as `Internal`.
+#[tokio::test]
+async fn the_resolve_helpers_refuse_a_contradictory_batch_resolution() {
+    let ctx = SecurityContext::builder()
+        .subject_id(Uuid::from_u128(0x00C0_FFEE))
+        .subject_tenant_id(Uuid::from_u128(0x7E4A))
+        .build()
+        .expect("a caller context");
+    let shared = EntityIdentity {
+        gts_id: GtsId::try_new(DELETED_TYPE).expect("identifier"),
+        gts_uuid: uuid(TYPE),
+    };
+    let one_reference_for_two = Rigged {
+        answers: HashMap::from([
+            (by_id(TYPE), Some(identity_of(TYPE))),
+            (by_id(DELETED_TYPE), Some(shared)),
+        ]),
+    };
+    assert_kind(
+        one_reference_for_two
+            .resolve_type_uuids(&ctx, &[type_id(TYPE), type_id(DELETED_TYPE)])
+            .await,
+        internal,
+    );
+
+    let another_entity = Rigged {
+        answers: HashMap::from([(by_id(TYPE), Some(identity_of(DELETED_TYPE)))]),
+    };
+    assert_kind(
+        another_entity.resolve_type_uuid(&ctx, &type_id(TYPE)).await,
+        internal,
+    );
+    assert_kind(
+        another_entity
+            .resolve_type_uuids(&ctx, &[type_id(TYPE)])
+            .await,
+        internal,
+    );
+
+    let unasked = Rigged {
+        answers: HashMap::from([
+            (by_id(TYPE), Some(identity_of(TYPE))),
+            (by_id(DELETED_TYPE), Some(identity_of(DELETED_TYPE))),
+        ]),
+    };
+    assert_kind(
+        unasked.resolve_type_uuid(&ctx, &type_id(TYPE)).await,
+        internal,
+    );
+    assert_kind(
+        unasked.resolve_type_uuids(&ctx, &[type_id(TYPE)]).await,
+        internal,
+    );
+}
+
+/// [`resolve_through_batch_get`] holds a test double's read to the resolver contract:
+/// an answer for a key it was not asked fails the batch as `Internal`.
+#[tokio::test]
+async fn resolving_through_a_batch_read_refuses_an_answer_not_asked() {
+    let asked = by_id(TYPE);
+    let result = resolve_through_batch_get(vec![asked.clone()], |_| async {
+        let found = |id: &str| EntityLookup::Found {
+            entity: Box::new(light_entity(id)),
+            etag: crate::Validator::from_bytes(b"etag".to_vec()),
+        };
+        Ok(BatchGetEntitiesResponse(HashMap::from([
+            (by_id(TYPE), found(TYPE)),
+            (by_id(DELETED_TYPE), found(DELETED_TYPE)),
+        ])))
+    })
+    .await;
+    assert!(
+        matches!(result, Err(CanonicalError::Internal { .. })),
+        "{result:?}"
+    );
+}
+
+/// The mandatory fields of an Active global entity named `id`.
+fn light_entity(id: &str) -> crate::Entity {
+    let gts_id = GtsId::try_new(id).expect("identifier");
+    let (gts_uuid, kind) = (gts_id.to_uuid(), crate::EntityKind::of(&gts_id));
+    crate::Entity {
+        gts_id,
+        gts_uuid,
+        kind,
+        lifecycle_status: crate::LifecycleStatus::Active,
+        ownership: crate::Ownership::Global,
+        origin: None,
+        content: None,
+        resolved_schema: None,
+        effective_traits: None,
+        effective_traits_schema: None,
+        provenance: None,
+    }
+}
