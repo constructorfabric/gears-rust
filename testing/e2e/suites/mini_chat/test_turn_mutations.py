@@ -152,6 +152,7 @@ class TestTurnRetry:
         (req,) = mock_provider.get_captured_requests()
         assert provider_input(req) == [*history, ("user", question)]
 
+    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_retry_over_context_budget_400(self, chat_with_model, mock_provider):
         """A 6000-byte question sent on gpt-5.2 is over the context budget of
@@ -337,7 +338,7 @@ class TestTurnEdit:
         assert list_messages(chat_id) == before
         assert poll_turn(chat_id, rid)["state"] == "done"
 
-    @pytest.mark.usefixtures("offline_only")
+    @pytest.mark.usefixtures("offline_only", "outbox_capture")
     @pytest.mark.timeout(30)
     def test_edit_content_over_context_budget_400(self, chat_with_model, mock_provider):
         """Edit content of 6000 bytes on gpt-4.1-mini-tiny-ctx (2200 tokens)

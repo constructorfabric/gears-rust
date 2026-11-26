@@ -1354,6 +1354,7 @@ class TestUploadMultipartErrors:
 class TestFileSearchToolEvents:
     """Provider-native file_search calls are sent as tool events and counted."""
 
+    @pytest.mark.usefixtures("outbox_capture")
     def test_file_search_tool_events_and_counter(self, chat):
         """With a ready document the mock `FILESEARCH:*` answer runs one
         file_search: `file_search` tool events `start` (empty `details`) then

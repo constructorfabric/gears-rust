@@ -34,6 +34,7 @@ from .conftest import (
     get_quota_status,
     open_stream,
     outbox_payloads,
+    outbox_table,
     provider_file_id,
     provider_usage,
     query_db,
@@ -193,7 +194,7 @@ CLEANUP_MAX_ATTEMPTS = 5
 def _dead_letters(chat_id: str) -> list[dict]:
     """Dead-lettered outbox messages whose payload mentions `chat_id`."""
     return query_db(
-        "SELECT partition_id, seq, payload, last_error FROM toolkit_outbox_dead_letters "
+        f"SELECT partition_id, seq, payload, last_error FROM {outbox_table('dead_letters')} "
         # CAST: see outbox_payloads in conftest.py (LIKE never matches a
         # BLOB on SQLite built with SQLITE_LIKE_DOESNT_MATCH_BLOBS).
         "WHERE CAST(payload AS TEXT) LIKE ?",
@@ -205,7 +206,7 @@ def _processed_seq(partition_id: int) -> int:
     """The outbox processor's committed offset of a partition: messages with
     `seq` up to it are never delivered again."""
     (row,) = query_db(
-        "SELECT processed_seq FROM toolkit_outbox_processor WHERE partition_id = ?",
+        f"SELECT processed_seq FROM {outbox_table('processor')} WHERE partition_id = ?",
         (partition_id,),
     )
     return row["processed_seq"]
@@ -296,6 +297,7 @@ class TestProviderCleanupOpenAI:
         the cleanup is retried `max_attempts` times and ends in `failed`."""
         check_attachment_cleanup_403_ends_failed(mock_provider, STANDARD_MODEL)
 
+    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_vector_store_delete_500_is_dead_lettered(self, mock_provider):
         """19-18: every vector store delete of a deleted chat answers 500:
@@ -329,6 +331,7 @@ class TestProviderCleanupAzure:
         the cleanup is retried `max_attempts` times and ends in `failed`."""
         check_attachment_cleanup_403_ends_failed(mock_provider, DEFAULT_MODEL)
 
+    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_vector_store_delete_500_is_dead_lettered(self, mock_provider):
         """19-18 (azure): every vector store delete of a deleted chat answers 500:
@@ -438,6 +441,7 @@ class TestCleanupWorkerDB:
         assert [(r["cleanup_status"], r["cleanup_attempts"]) for r in rows] == [("done", 0)], rows
         _assert_file_deleted_once(request, mock_provider, file_id)
 
+    @pytest.mark.usefixtures("outbox_capture")
     def test_chat_deletion_enqueues_chat_cleanup_event(self, server):
         """DELETE chat → one chat cleanup outbox payload with the chat's
         tenant, deletion time and a system request id."""
@@ -452,6 +456,7 @@ class TestCleanupWorkerDB:
             assert key in payloads[0], payloads[0]
         assert wait_cleanup_terminal([att_id]) == {att_id: "done"}
 
+    @pytest.mark.usefixtures("outbox_capture")
     def test_attachment_deletion_enqueues_cleanup_event(self, request, server, mock_provider):
         """DELETE attachment → one per-attachment cleanup outbox payload with
         the provider file id; the cleanup deletes that file."""
@@ -492,6 +497,7 @@ class TestCleanupWorkerDB:
         for file_id in file_ids:
             _assert_file_deleted_once(request, mock_provider, file_id)
 
+    @pytest.mark.usefixtures("outbox_capture")
     def test_second_delete_chat_404_single_cleanup_event(self, server):
         """A second DELETE of a chat is 404 and enqueues no second cleanup event."""
         chat_id = create_chat()["id"]
@@ -502,6 +508,7 @@ class TestCleanupWorkerDB:
         assert len(chat_cleanup_payloads(chat_id)) == 1
         assert wait_cleanup_terminal([att_id]) == {att_id: "done"}
 
+    @pytest.mark.usefixtures("outbox_capture")
     def test_chat_without_attachments_still_enqueues(self, server):
         """DELETE of an empty chat still enqueues one chat cleanup event
         (reason `chat_soft_delete`)."""
