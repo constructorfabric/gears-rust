@@ -75,7 +75,7 @@ On the tenant plane the subject is the caller's principal, mapped the same way, 
 The resolver performs no policy check and passes no caller identity to the plugin. It trusts platform-plane callers
 for the target data they provide and trusts the backend to decide which quotas apply to the fixed tenant and subjects.
 
-This is an exception to the toolkit's two-plane rule (`cpt-cf-adr-two-plane-auth`, "Which plane?"), which puts
+This is an exception to the toolkit's two-plane rule ([toolkit ADR-0008](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md), "Which plane?"), which puts
 operations within a tenant, writes included, on the tenant plane with a policy check. The toolkit has no way to
 authorize a trusted service that charges many tenants: a tenant `SecurityContext` binds one tenant, and the policy
 decision point does not evaluate `PlatformSecurityContext`. The exception ends when the toolkit evaluates policies for
@@ -110,7 +110,7 @@ the resolver returns the plugin's quota-state page unchanged.
 * Good, because every charge is authenticated the same way, by the platform credential of the calling module.
 * Good, because the tenant plane is read-only and safe to publish at the edge.
 * Bad, because the resolver trusts the module to pass the right principal.
-* Bad, because no component authorizes the calling service, which is an exception to `cpt-cf-adr-two-plane-auth`.
+* Bad, because no component authorizes the calling service, which is an exception to [toolkit ADR-0008](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md).
 
 ### (b) Writes on both planes, user context forwarded
 

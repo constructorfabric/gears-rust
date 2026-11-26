@@ -1072,7 +1072,7 @@ jobs:
     environment: *ci-cache-env
     env:
       ONNXRUNTIME_VERSION: "1.29.0"
-      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+      ONNXRUNTIME_SHA256: "4557021fec4da3924e2e12ff44b1cc50b176de0d2c5c7daa89ab11c208b3a454"
       # sentence-transformers/all-MiniLM-L6-v2: the MiniLM-class model
       # ADR-0005 names, 384 dimensions, mean-pooled and L2-normalized.
       MODEL_URL: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx"
@@ -1144,11 +1144,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -sL --fail -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
-          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
-          tar xzf /tmp/onnxruntime.tgz -C /tmp
-          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+          # The NuGet package, not the GitHub release tarball: github.com/microsoft/onnxruntime
+          # returned 404 on 2026-11-26. Microsoft also ships the runtime as a signed .nupkg (a zip).
+          curl -sL --fail -o /tmp/onnxruntime.nupkg \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ONNXRUNTIME_VERSION}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.nupkg" | sha256sum --check
+          dir="/tmp/onnxruntime-${ONNXRUNTIME_VERSION}"
+          python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract(sys.argv[2], sys.argv[3])' \
+            /tmp/onnxruntime.nupkg runtimes/linux-x64/native/libonnxruntime.so "$dir"
+          echo "ORT_DYLIB_PATH=$dir/runtimes/linux-x64/native/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: Fetch the model and tokenizer
         shell: bash
@@ -1213,9 +1217,9 @@ jobs:
       # Runtime with minor version >= 24; older builds fail `ort`'s version
       # check on load. Bump alongside `ort`'s pinned version.
       ONNXRUNTIME_VERSION: "1.29.0"
-      # sha256 of onnxruntime-linux-x64-1.29.0.tgz. Recompute and bump
-      # alongside ONNXRUNTIME_VERSION.
-      ONNXRUNTIME_SHA256: "c3fddc4f139a045b0c4902c57410f0694f1c2fdf9b6939fbe38b1aeae7cd14ba"
+      # sha256 of microsoft.ml.onnxruntime.1.29.0.nupkg (NuGet). Recompute and
+      # bump alongside ONNXRUNTIME_VERSION.
+      ONNXRUNTIME_SHA256: "4557021fec4da3924e2e12ff44b1cc50b176de0d2c5c7daa89ab11c208b3a454"
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1281,11 +1285,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -sL --fail -o /tmp/onnxruntime.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}.tgz"
-          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.tgz" | sha256sum --check
-          tar xzf /tmp/onnxruntime.tgz -C /tmp
-          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ONNXRUNTIME_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+          # The NuGet package, not the GitHub release tarball: github.com/microsoft/onnxruntime
+          # returned 404 on 2026-11-26. Microsoft also ships the runtime as a signed .nupkg (a zip).
+          curl -sL --fail -o /tmp/onnxruntime.nupkg \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ONNXRUNTIME_VERSION}/microsoft.ml.onnxruntime.${ONNXRUNTIME_VERSION}.nupkg"
+          echo "${ONNXRUNTIME_SHA256}  /tmp/onnxruntime.nupkg" | sha256sum --check
+          dir="/tmp/onnxruntime-${ONNXRUNTIME_VERSION}"
+          python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extract(sys.argv[2], sys.argv[3])' \
+            /tmp/onnxruntime.nupkg runtimes/linux-x64/native/libonnxruntime.so "$dir"
+          echo "ORT_DYLIB_PATH=$dir/runtimes/linux-x64/native/libonnxruntime.so" >> "$GITHUB_ENV"
 
       - name: cargo test (file-parser, magika feature)
         shell: bash

@@ -239,7 +239,8 @@ def test_the_inbox_lists_counts_and_votes_on_both_gears_units_through_their_door
                 state: pricing["by_state"][state] + products["by_state"][state]
                 for state in ("pending", "approved", "rejected", "withdrawn")
             },
-            "by_kind": {**pricing["by_kind"], **products["by_kind"]},
+            # No orders source in this deployment: its kind is always counted, at zero.
+            "by_kind": {"order": 0, **pricing["by_kind"], **products["by_kind"]},
             "total": pricing["total"] + products["total"],
             "sources": BOTH_OK,
         }
@@ -247,6 +248,7 @@ def test_the_inbox_lists_counts_and_votes_on_both_gears_units_through_their_door
         assert _inbox_counts(api, book_id=book1) == {
             "by_state": {"pending": 1, "approved": 0, "rejected": 0, "withdrawn": 0},
             "by_kind": {
+                "order": 0,
                 "prices": 1,
                 "plan_revision": 0,
                 "sku_publish": 0,
