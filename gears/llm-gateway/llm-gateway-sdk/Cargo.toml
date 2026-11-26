@@ -32,4 +32,4 @@ gts = { workspace = true }
 toolkit-gts = { workspace = true }
 toolkit = { workspace = true }
 
-model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.2.2", path = "../../model-registry/model-registry-sdk" }
+model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.2.3", path = "../../model-registry/model-registry-sdk" }

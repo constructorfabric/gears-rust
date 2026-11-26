@@ -17,8 +17,8 @@ workspace = true
 
 [dependencies]
 # Local dependencies
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.26", path = "../../credstore-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.6.1", path = "../../../system/types-registry/types-registry-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.27", path = "../../credstore-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.6.2", path = "../../../system/types-registry/types-registry-sdk" }
 types-registry = { workspace = true }
 
 # ToolKit dependencies

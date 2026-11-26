@@ -21,7 +21,7 @@ workspace = true
 # Local dependencies
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.46", path = "../../authn-resolver-sdk" }
 # Publishes through the consumed platform API (local or resolving REST client).
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.6.1", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"] }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.6.2", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"] }
 
 # ToolKit dependencies
 toolkit = { workspace = true }

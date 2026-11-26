@@ -35,7 +35,7 @@ magika = ["dep:magika", "dep:ort", "dep:tokio-util"]
 
 [dependencies]
 # Local dependencies
-file-parser-sdk = { package = "cf-gears-file-parser-sdk", version = "0.2.8", path = "../file-parser-sdk" }
+file-parser-sdk = { package = "cf-gears-file-parser-sdk", version = "0.2.9", path = "../file-parser-sdk" }
 
 # Core dependencies
 anyhow = { workspace = true }

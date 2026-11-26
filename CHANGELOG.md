@@ -9,6 +9,951 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.35](https://github.com/constructorfabric/gears-rust/compare/cf-gears-nodes-registry-sdk-v0.1.34...cf-gears-nodes-registry-sdk-v0.1.35) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors
+
+## [0.2.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-model-registry-sdk-v0.2.2...cf-gears-model-registry-sdk-v0.2.3) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata
+
+## [0.3.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-sdk-v0.3.4...cf-gears-file-storage-sdk-v0.3.5) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-canonical-errors
+
+## [0.2.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-parser-sdk-v0.2.8...cf-gears-file-parser-sdk-v0.2.9) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security
+
+## [0.2.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-settings-service-sdk-v0.2.6...cf-gears-settings-service-sdk-v0.2.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-remote-embedding-plugin-v0.1.6...cf-gears-graph-storage-remote-embedding-plugin-v0.1.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-graph-storage-sdk
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-onnx-embedding-plugin-v0.1.6...cf-gears-graph-storage-onnx-embedding-plugin-v0.1.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-graph-storage-sdk
+
+## [0.2.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-sqlite-event-broker-plugin-v0.2.6...cf-gears-sqlite-event-broker-plugin-v0.2.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-postgres-event-broker-plugin-v0.1.6...cf-gears-postgres-event-broker-plugin-v0.1.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mysql-event-broker-plugin-v0.1.6...cf-gears-mysql-event-broker-plugin-v0.1.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-memory-event-broker-plugin-v0.1.6...cf-gears-memory-event-broker-plugin-v0.1.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-kafka-event-broker-plugin-v0.1.6...cf-gears-kafka-event-broker-plugin-v0.1.7) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-event-broker-sdk
+
+## [0.2.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-ledger-sdk-v0.2.5...cf-gears-bss-ledger-sdk-v0.2.6) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata
+
+## [0.8.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-credstore-v0.8.2...cf-gears-credstore-v0.8.3) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-tenant-resolver-sdk, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-tenant-resolver, cf-gears-credstore-sdk, cf-gears-types-registry
+
+## [0.8.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-v0.8.1...cf-gears-types-registry-v0.8.2) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-db, cf-gears-toolkit-http, cf-gears-toolkit-contract, cf-gears-toolkit-odata, cf-gears-toolkit-http-middleware, cf-gears-toolkit, cf-gears-types-registry-sdk
+
+## [0.2.27](https://github.com/constructorfabric/gears-rust/compare/cf-gears-credstore-sdk-v0.2.26...cf-gears-credstore-sdk-v0.2.27) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.3.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-sdk-v0.3.8...cf-gears-cluster-sdk-v0.3.9) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-transport-grpc, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-contract, cf-gears-toolkit
+
+## [0.15.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-v0.15.1...cf-gears-account-management-v0.15.2) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-db, cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-tenant-resolver-sdk, cf-gears-account-management-sdk, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-authz-resolver, cf-gears-resource-group-sdk, cf-gears-resource-group, cf-gears-tenant-resolver
+
+## [0.2.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-v0.2.5...cf-gears-tenant-resolver-v0.2.6) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit, cf-gears-tenant-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-v0.6.1...cf-gears-resource-group-v0.6.2) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-db, cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-resource-group-sdk
+
+## [0.4.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-sdk-v0.4.0...cf-gears-resource-group-sdk-v0.4.1) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata
+
+## [0.5.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-v0.5.2...cf-gears-authz-resolver-v0.5.3) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-contract, cf-gears-toolkit, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-sdk-v0.6.1...cf-gears-types-registry-sdk-v0.6.2) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-http, cf-gears-toolkit-contract, cf-gears-toolkit
+
+## [0.7.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-sdk-v0.7.2...cf-gears-authz-resolver-sdk-v0.7.3) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-http, cf-gears-toolkit-contract, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.10.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.10.1...cf-gears-account-management-sdk-v0.10.2) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.4.15](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-sdk-v0.4.14...cf-gears-tenant-resolver-sdk-v0.4.15) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit
+
+## [0.15.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.15.1...cf-gears-toolkit-v0.15.2) - 2026-11-26
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security, cf-gears-toolkit-transport-grpc, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-trace-context, cf-gears-toolkit-db, cf-gears-toolkit-k8s-auth, cf-gears-system-sdks, cf-gears-toolkit-http, cf-gears-toolkit-contract, cf-gears-toolkit-odata, cf-gears-toolkit-http-middleware, cf-gears-toolkit-sdk
+
+## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-le-issue-admission-plugin-v0.1.4...cf-gears-le-issue-admission-plugin-v0.1.5) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-le-default-evaluator-v0.2.0...cf-gears-le-default-evaluator-v0.2.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-enforcement-v0.3.0...cf-gears-license-enforcement-v0.3.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-enforcement-sdk-v0.3.1...cf-gears-license-enforcement-sdk-v0.3.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.3.3...cf-gears-llm-gateway-sdk-v0.3.4) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-noop-usage-collector-plugin-v0.2.7...cf-gears-noop-usage-collector-plugin-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-firebase-authn-plugin-v0.2.4...cf-gears-firebase-authn-plugin-v0.2.5) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-keycloak-idp-plugin-v0.2.8...cf-gears-keycloak-idp-plugin-v0.2.9) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-flight-control-v0.1.8...cf-gears-flight-control-v0.1.9) - 2026-11-26
+
+### Fixed
+
+- *(toolkit)* [**breaking**] share and harden outbound internal-auth credential (by @fluiderson)
+
+### Other
+
+- release (by @MikeFalcon77)
+- Merge pull request #5724 from constructorfabric/fix/outbound-internal-auth-interceptor (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.6.1...cf-gears-oidc-authn-plugin-v0.6.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.17](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-conformance-v0.3.16...cf-gears-cluster-conformance-v0.3.17) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.30](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tr-authz-plugin-v0.1.29...cf-gears-tr-authz-plugin-v0.1.30) - 2026-11-26
+
+### Other
+
+- Merge pull request #6058 from fluiderson/feat/authz-batch-eval (by @entropyshift)
+- *(authz-resolver)* sync docs with code (by @fluiderson)
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @entropyshift
+* @fluiderson
+* @MikeFalcon77
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-timescaledb-usage-collector-plugin-v0.4.1...cf-gears-timescaledb-usage-collector-plugin-v0.4.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.2.3...cf-gears-static-tr-plugin-v0.2.4) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-license-plugin-v0.2.0...cf-gears-static-license-plugin-v0.2.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.27](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-idp-plugin-v0.1.26...cf-gears-static-idp-plugin-v0.1.27) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.24](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-credstore-plugin-v0.2.23...cf-gears-static-credstore-plugin-v0.2.24) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.2.3...cf-gears-static-authz-plugin-v0.2.4) - 2026-11-26
+
+### Other
+
+- Merge pull request #6058 from fluiderson/feat/authz-batch-eval (by @entropyshift)
+- *(authz-resolver)* sync docs with code (by @fluiderson)
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @entropyshift
+* @fluiderson
+* @MikeFalcon77
+
+## [0.4.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.4.3...cf-gears-static-authn-plugin-v0.4.4) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.49](https://github.com/constructorfabric/gears-rust/compare/cf-gears-single-tenant-tr-plugin-v0.1.48...cf-gears-single-tenant-tr-plugin-v0.1.49) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-simple-user-settings-v0.4.1...cf-gears-simple-user-settings-v0.4.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-simple-user-settings-sdk-v0.2.7...cf-gears-simple-user-settings-sdk-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-settings-service-v0.4.5...cf-gears-settings-service-v0.4.6) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-service-discovery-v0.4.4...cf-gears-service-discovery-v0.4.5) - 2026-11-26
+
+### Added
+
+- *(directory)* add DirectoryBackend persistence and replication seam (by @mattgarmon)
+- *(directory)* [**breaking**] remove deprecated GetOpenApiSpec (by @mattgarmon)
+- *(directory)* edge fetches OpenAPI doc from instance (by @mattgarmon)
+
+### Fixed
+
+- *(dylint)* fix dylint errors (by @mattgarmon)
+
+### Other
+
+- Merge pull request #6109 from constructorfabric/release-plz-2026-11-24T12-59-41Z (by @Artifizer)
+- release (by @MikeFalcon77)
+- Merge pull request #6059 from constructorfabric/mattgarmon/feature/directory-openapi (by @MikeFalcon77)
+
+### Contributors
+
+* @mattgarmon
+* @Artifizer
+* @MikeFalcon77
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rg-tr-plugin-v0.3.0...cf-gears-rg-tr-plugin-v0.3.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-storage-plugin-v0.4.4...cf-gears-quota-enforcement-storage-plugin-v0.4.5) - 2026-11-26
+
+### Fixed
+
+- *(quota-enforcement)* resolve a quota's leases under a grant for that quota alone (by @vgprod)
+- *(quota-enforcement)* settle a lease under a grant for that lease alone (by @vgprod)
+- *(quota-enforcement)* store the corrected total when a period closes (by @vgprod)
+
+### Other
+
+- Merge pull request #6104 from vgprod/fix/quota-enforcement-6050-6051 (by @nonameffh) - #6104
+- Merge pull request #5869 from vgprod/perf/quota-enforcement-lease-sql (by @nonameffh)
+- release (by @MikeFalcon77)
+- *(quota-enforcement)* start the load test's database through test_containers (by @vgprod)
+- *(quota-enforcement)* state config snapshot staleness for operators (by @vgprod)
+- Merge branch 'constructorfabric:main' into perf/quota-enforcement-lease-sql (by @vgprod)
+- *(quota-enforcement)* read the config snapshot once per call (by @vgprod)
+- *(quota-enforcement)* settle leases without the capacity row (by @vgprod)
+- *(quota-enforcement)* cache the configuration tables (by @vgprod)
+- *(quota-enforcement)* Postgres load test of the lease cycle (by @vgprod)
+
+### Contributors
+
+* @nonameffh
+* @MikeFalcon77
+* @vgprod
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-v0.6.1...cf-gears-quota-enforcement-v0.6.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-engine-most-restrictive-v0.1.7...cf-gears-quota-enforcement-engine-most-restrictive-v0.1.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-engine-cel-v0.1.7...cf-gears-quota-enforcement-engine-cel-v0.1.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.5.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-sdk-v0.5.4...cf-gears-quota-enforcement-sdk-v0.5.5) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.52](https://github.com/constructorfabric/gears-rust/compare/cf-gears-nodes-registry-v0.1.51...cf-gears-nodes-registry-v0.1.52) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-v0.6.1...cf-gears-mini-chat-v0.6.2) - 2026-11-26
+
+### Fixed
+
+- *(oagw)* [**breaking**] reasons on gateway 5xx, one credential-failure mapping (by @MikeFalcon77)
+
+### Other
+
+- Merge pull request #6109 from constructorfabric/release-plz-2026-11-24T12-59-41Z (by @Artifizer)
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+
+## [0.10.34](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-sdk-v0.10.33...cf-gears-mini-chat-sdk-v0.10.34) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-resolver-v0.3.0...cf-gears-license-resolver-v0.3.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-resolver-sdk-v0.3.0...cf-gears-license-resolver-sdk-v0.3.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-github-mirror-v0.3.1...cf-gears-github-mirror-v0.3.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-github-mirror-sdk-v0.3.3...cf-gears-github-mirror-sdk-v0.3.4) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-v0.5.1...cf-gears-file-storage-v0.5.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-parser-v0.2.7...cf-gears-file-parser-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-construct-v0.2.1...cf-gears-construct-v0.2.2) - 2026-11-26
+
+### Added
+
+- *(construct)* remove a tenant the platform deleted ([#6063](https://github.com/constructorfabric/gears-rust/pull/6063)) (by @tob71)
+
+### Fixed
+
+- *(oagw)* [**breaking**] reasons on gateway 5xx, one credential-failure mapping (by @MikeFalcon77)
+
+### Other
+
+- *(construct)* fix two broken intra-doc links ([#6120](https://github.com/constructorfabric/gears-rust/pull/6120)) (by @tob71)
+- Merge pull request #6109 from constructorfabric/release-plz-2026-11-24T12-59-41Z (by @Artifizer)
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @tob71
+* @Artifizer
+* @MikeFalcon77
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-v0.4.1...cf-gears-graph-storage-v0.4.2) - 2026-11-26
+
+### Added
+
+- *(graph-storage)* offboard a deleted tenant ([#6025](https://github.com/constructorfabric/gears-rust/pull/6025)) (by @tob71)
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+* @tob71
+
+## [0.5.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-sdk-v0.4.1...cf-gears-graph-storage-sdk-v0.5.0) - 2026-11-26
+
+### Added
+
+- *(graph-storage)* offboard a deleted tenant ([#6025](https://github.com/constructorfabric/gears-rust/pull/6025)) (by @tob71)
+
+### Contributors
+
+* @tob71
+
+## [0.2.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-construct-sdk-v0.2.4...cf-gears-construct-sdk-v0.2.5) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-v0.4.6...cf-gears-cluster-v0.4.7) - 2026-11-26
+
+### Added
+
+- *(directory)* [**breaking**] remove deprecated GetOpenApiSpec (by @mattgarmon)
+
+### Other
+
+- release (by @MikeFalcon77)
+- Merge pull request #6059 from constructorfabric/mattgarmon/feature/directory-openapi (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+* @mattgarmon
+
+## [0.2.6](https://github.com/constructorfabric/gears-rust/compare/cf-redis-cluster-plugin-v0.2.5...cf-redis-cluster-plugin-v0.2.6) - 2026-11-26
+
+### Fixed
+
+- *(test-containers)* start the Redis Cluster fixture on Redis 8.12 (by @MikeFalcon77)
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.5.8](https://github.com/constructorfabric/gears-rust/compare/cf-postgres-cluster-plugin-v0.5.7...cf-postgres-cluster-plugin-v0.5.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+- Merge pull request #5724 from constructorfabric/fix/outbound-internal-auth-interceptor (by @MikeFalcon77)
+- keep tracing callsite interest shared in scoped-capture tests (by @fluiderson)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.1.11](https://github.com/constructorfabric/gears-rust/compare/cf-k8s-cluster-plugin-v0.1.10...cf-k8s-cluster-plugin-v0.1.11) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-clickhouse-usage-collector-plugin-v0.2.1...cf-gears-clickhouse-usage-collector-plugin-v0.2.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-chat-engine-v0.4.1...cf-chat-engine-v0.4.2) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-http-json-plugin-v0.2.7...cf-gears-bss-rate-provider-http-json-plugin-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-ecb-plugin-v0.2.7...cf-gears-bss-rate-provider-ecb-plugin-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-v0.2.7...cf-gears-bss-rate-provider-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-sdk-v0.2.7...cf-gears-bss-rate-provider-sdk-v0.2.8) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.7.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-v0.7.0...cf-gears-usage-collector-v0.7.1) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.23](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-sdk-v0.3.22...cf-gears-usage-collector-sdk-v0.3.23) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.7.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.7.1...cf-gears-event-broker-v0.7.2) - 2026-11-26
+
+### Added
+
+- *(directory)* add DirectoryBackend persistence and replication seam (by @mattgarmon)
+- *(directory)* [**breaking**] remove deprecated GetOpenApiSpec (by @mattgarmon)
+
+### Other
+
+- Merge pull request #6109 from constructorfabric/release-plz-2026-11-24T12-59-41Z (by @Artifizer)
+- release (by @MikeFalcon77)
+- Merge pull request #6059 from constructorfabric/mattgarmon/feature/directory-openapi (by @MikeFalcon77)
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+* @mattgarmon
+
+## [0.2.17](https://github.com/constructorfabric/gears-rust/compare/cf-gears-standalone-cluster-plugin-v0.2.16...cf-gears-standalone-cluster-plugin-v0.2.17) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.7.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-api-gateway-v0.7.6...cf-gears-api-gateway-v0.7.7) - 2026-11-26
+
+### Added
+
+- *(directory)* add DirectoryBackend persistence and replication seam (by @mattgarmon)
+- *(directory)* [**breaking**] remove deprecated GetOpenApiSpec (by @mattgarmon)
+- *(directory)* edge fetches OpenAPI doc from instance (by @mattgarmon)
+
+### Fixed
+
+- *(toolkit)* [**breaking**] share and harden outbound internal-auth credential (by @fluiderson)
+
+### Other
+
+- Merge pull request #6109 from constructorfabric/release-plz-2026-11-24T12-59-41Z (by @Artifizer)
+- release (by @MikeFalcon77)
+- Merge pull request #6059 from constructorfabric/mattgarmon/feature/directory-openapi (by @MikeFalcon77)
+- Merge pull request #5724 from constructorfabric/fix/outbound-internal-auth-interceptor (by @MikeFalcon77)
+- keep tracing callsite interest shared in scoped-capture tests (by @fluiderson)
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+* @mattgarmon
+* @fluiderson
+
+## [0.5.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-grpc-hub-v0.5.4...cf-gears-grpc-hub-v0.5.5) - 2026-11-26
+
+### Added
+
+- *(directory)* [**breaking**] remove deprecated GetOpenApiSpec (by @mattgarmon)
+
+### Fixed
+
+- *(toolkit)* [**breaking**] share and harden outbound internal-auth credential (by @fluiderson)
+
+### Other
+
+- release (by @MikeFalcon77)
+- Merge pull request #6059 from constructorfabric/mattgarmon/feature/directory-openapi (by @MikeFalcon77)
+- Merge pull request #5724 from constructorfabric/fix/outbound-internal-auth-interceptor (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @mattgarmon
+
+## [0.3.5](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-v0.3.4...cf-gears-authn-resolver-v0.3.5) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.46](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-sdk-v0.3.45...cf-gears-authn-resolver-sdk-v0.3.46) - 2026-11-26
+
+### Other
+
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.10.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oagw-v0.10.0...cf-gears-oagw-v0.10.1) - 2026-11-26
+
+### Added
+
+- *(oagw)* OAuth2 client credentials auth plugin with private_key_jwt (by @MikeFalcon77)
+- *(oagw)* AWS SigV4 auth plugin (by @MikeFalcon77)
+
+### Fixed
+
+- *(dylint)* fix dylint errors (by @mattgarmon)
+- *(oagw)* [**breaking**] forward the raw query, route HEAD and OPTIONS (by @MikeFalcon77)
+- *(oagw)* [**breaking**] reasons on gateway 5xx, one credential-failure mapping (by @MikeFalcon77)
+
+### Other
+
+- Merge pull request #6118 from constructorfabric/mattgarmon/fix/dylint (by @Artifizer)
+- Merge pull request #6116 from constructorfabric/mikefalcon77/feat/oagw-oauth2-private-key-jwt (by @Artifizer)
+- Merge pull request #6096 from constructorfabric/mikefalcon77/feat/oagw-aws-sigv4-auth (by @Artifizer)
+- Merge pull request #6109 from constructorfabric/release-plz-2026-11-24T12-59-41Z (by @Artifizer)
+- release (by @MikeFalcon77)
+
+### Contributors
+
+* @Artifizer
+* @mattgarmon
+* @MikeFalcon77
+
+## [0.8.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oagw-sdk-v0.7.0...cf-gears-oagw-sdk-v0.8.0) - 2026-11-26
+
+### Added
+
+- *(oagw)* OAuth2 client credentials auth plugin with private_key_jwt (by @MikeFalcon77)
+- *(oagw)* AWS SigV4 auth plugin (by @MikeFalcon77)
+
+### Fixed
+
+- *(oagw)* [**breaking**] forward the raw query, route HEAD and OPTIONS (by @MikeFalcon77)
+- *(oagw)* [**breaking**] reasons on gateway 5xx, one credential-failure mapping (by @MikeFalcon77)
+
+### Other
+
+- Merge pull request #6116 from constructorfabric/mikefalcon77/feat/oagw-oauth2-private-key-jwt (by @Artifizer)
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+
+## [0.7.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-sdk-v0.7.1...cf-gears-event-broker-sdk-v0.7.2) - 2026-11-26
+
+### Other
+
+- update Cargo.lock dependencies
+
 ## [0.1.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-flight-control-v0.1.8...cf-gears-flight-control-v0.1.9) - 2026-11-25
 
 ### Other

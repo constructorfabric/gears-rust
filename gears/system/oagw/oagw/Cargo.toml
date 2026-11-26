@@ -50,7 +50,7 @@ cluster = ["dep:cluster-sdk"]
 grpc-client = ["cluster", "cluster-sdk/grpc-client"]
 
 [dependencies]
-oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.7.0", features = ["axum"] }
+oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.8.0", features = ["axum"] }
 toolkit = { workspace = true }
 toolkit-auth = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }

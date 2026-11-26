@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-sdk"
-version = "0.7.19"
+version = "0.7.20"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
