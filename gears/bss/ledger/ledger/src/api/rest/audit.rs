@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Json, Router, http::StatusCode};
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::canonical_prelude::CanonicalError;
-use toolkit::api::operation_builder::OperationBuilder;
+use toolkit::api::operation_builder::{OperationBuilder, ParamSpec};
 use toolkit_db::DbError;
 use toolkit_db::secure::{AccessScope, DbTx, TxConfig};
 use toolkit_security::SecurityContext;
@@ -113,6 +113,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .param(
+            ParamSpec::path("entryId")
+                .format("uuid")
+                .description("The journal entry whose audit dims to read."),
+        )
         .handler(audit_entry)
         .json_response_with_schema::<AuditEntryDto>(
             openapi,
@@ -139,6 +144,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
     .tag(TAG)
     .authenticated()
     .no_license_required()
+    .path_param("sourceDocType", "The source document type.")
+    .path_param(
+        "sourceBusinessId",
+        "The source document's business id within its type.",
+    )
     .handler(audit_document_history)
     .json_response_with_schema::<DocumentHistoryDto>(
         openapi,
@@ -310,6 +320,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .param(
+            ParamSpec::path("exportId")
+                .format("uuid")
+                .description("The audit-pack export job to poll."),
+        )
         .handler(audit_pack_get)
         .json_response_with_schema::<AuditPackExportDto>(
             openapi,

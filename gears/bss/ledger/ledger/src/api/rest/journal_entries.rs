@@ -43,7 +43,10 @@ use bss_ledger_sdk::api::LedgerClientV1;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::api::odata::OData;
 use toolkit::api::operation_builder::OperationBuilderODataExt;
-use toolkit::api::{OpenApiRegistry, operation_builder::OperationBuilder};
+use toolkit::api::{
+    OpenApiRegistry,
+    operation_builder::{OperationBuilder, ParamSpec},
+};
 use toolkit_odata::Page;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -168,6 +171,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .param(
+            ParamSpec::path("entryId")
+                .format("uuid")
+                .description("The posted entry to reverse."),
+        )
         .json_request::<ReversalRequestDto>(openapi, "Reversal reason + optional target period.")
         .handler(reverse_entry)
         .json_response_with_schema::<PostingRefDto>(
@@ -199,6 +207,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .param(
+            ParamSpec::path("entryId")
+                .format("uuid")
+                .description("The mis-mapped entry to correct."),
+        )
         .json_request::<MappingCorrectionRequestDto>(
             openapi,
             "Correction reason + the corrected lines.",
@@ -232,6 +245,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .param(
+            ParamSpec::path("entryId")
+                .format("uuid")
+                .description("The journal entry to read."),
+        )
         .handler(get_entry)
         .json_response_with_schema::<EntryDto>(openapi, StatusCode::OK, "The entry with its lines")
         .error_401(openapi)
@@ -294,6 +312,11 @@ pub fn router(state: Arc<ApiState>, openapi: &dyn OpenApiRegistry) -> Router {
         .tag(TAG)
         .authenticated()
         .no_license_required()
+        .param(
+            ParamSpec::path("entryId")
+                .format("uuid")
+                .description("The journal entry to annotate."),
+        )
         .json_request::<EntryAnnotationRequestDto>(openapi, "The annotation to set.")
         .handler(set_entry_annotation)
         .no_content_response(

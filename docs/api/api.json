@@ -34563,6 +34563,18 @@
       "get": {
         "description": "Returns the journal entry `{entryId}` (header + lines + audit dims) for the caller's own tenant. An entry outside the caller's authorized subtree yields 404 (no existence leak).",
         "operationId": "bss_ledger.get_entry",
+        "parameters": [
+          {
+            "description": "The journal entry to read.",
+            "in": "path",
+            "name": "entryId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -34630,6 +34642,18 @@
       "patch": {
         "description": "Sets ONE typed controlled non-financial note (`description`) on the entry (or one of its lines via `target_kind=LINE` + `target_line_id`). The note is screened for raw customer PII before any write (PII_IN_METADATA_VALUE). Every change is recorded in the `entry_annotation` current-state row + a secured-audit record, all under one SERIALIZABLE transaction. The gate is `(entry, annotate)` against the entry's tenant.",
         "operationId": "bss_ledger.set_entry_annotation",
+        "parameters": [
+          {
+            "description": "The journal entry to annotate.",
+            "in": "path",
+            "name": "entryId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -34731,6 +34755,18 @@
       "post": {
         "description": "Clears the mis-mapped original `{entryId}` with a strict reversal, then re-posts the corrected lines (MAPPING_CORRECTION, keyed on the invoice id + a stable correction id so a retry replays). The tenant is the caller's own.",
         "operationId": "bss_ledger.correct_mapping",
+        "parameters": [
+          {
+            "description": "The mis-mapped entry to correct.",
+            "in": "path",
+            "name": "entryId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -34829,6 +34865,18 @@
       "post": {
         "description": "Posts the reversing entry for `{entryId}`: the same accounts with each line's side flipped and its amount kept positive. The tenant is the caller's own. Reversing an entry that is itself a reversal is rejected (400 CANNOT_REVERSE_REVERSAL) — correct forward by re-posting, never stack reversals.",
         "operationId": "bss_ledger.reverse_entry",
+        "parameters": [
+          {
+            "description": "The posted entry to reverse.",
+            "in": "path",
+            "name": "entryId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -35089,6 +35137,26 @@
       "get": {
         "description": "Returns every journal entry for `(sourceDocType, sourceBusinessId)` in the caller's own tenant plus any reversal / mapping-correction that links to one of them, ordered by `created_seq`. PEP gate `(entry, audit_read)`; tenant-scoped (SQL-level BOLA).",
         "operationId": "bss_ledger.audit_document_history",
+        "parameters": [
+          {
+            "description": "The source document type.",
+            "in": "path",
+            "name": "sourceDocType",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The source document's business id within its type.",
+            "in": "path",
+            "name": "sourceBusinessId",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -35217,6 +35285,18 @@
       "get": {
         "description": "Returns the who/when/source/correlation dims of the journal entry `{entryId}` for the caller's own tenant (AC #8). An entry outside the caller's authorized scope yields 404 (no existence leak). PEP gate `(entry, audit_read)`.",
         "operationId": "bss_ledger.audit_entry",
+        "parameters": [
+          {
+            "description": "The journal entry whose audit dims to read.",
+            "in": "path",
+            "name": "entryId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -35362,6 +35442,18 @@
       "get": {
         "description": "Returns the audit-pack export `{exportId}` in the caller's own tenant: the job `status` and, once `succeeded`, the materialized CSV + data-row count. An export outside the caller's authorized scope yields 404 (no existence leak). PEP gate `(entry, audit_read)`.",
         "operationId": "bss_ledger.audit_pack_get",
+        "parameters": [
+          {
+            "description": "The audit-pack export job to poll.",
+            "in": "path",
+            "name": "exportId",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
