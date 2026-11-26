@@ -21,18 +21,14 @@ use crate::models::{
     Validator,
 };
 
-/// Who a tenant read is answered for: the subject, its type, home tenant and token
-/// scopes. From P1 the registry scopes reads per subject by ownership constraints, so a
-/// positive answer to one read context proves nothing to another.
+/// Visibility key for per-subject ownership constraints (P1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReadContext {
     subject: Uuid,
     subject_type: Option<Arc<str>>,
-    /// Visibility follows the home tenant's ancestor chain. A Context Tenant, once
-    /// the SDK carries one, joins rather than replaces it.
+    /// Visibility follows the home tenant. Add the Context Tenant when available.
     tenant: Uuid,
-    /// As presented. Equivalent spellings stay distinct rather than assuming how
-    /// the policy reads them.
+    /// Keep raw scope spellings because policy defines their equivalence.
     scopes: Arc<[String]>,
 }
 
@@ -47,18 +43,16 @@ impl ReadContext {
         }
     }
 
-    /// The tenant a read's representation is relative to: the home tenant until the
-    /// SDK carries a Context Tenant, which then takes its place here.
+    /// Representation tenant. A named Context Tenant will replace the home tenant here.
     pub fn tenant(&self) -> Uuid {
         self.tenant
     }
 }
 
-/// The readers one snapshot answers. `ownership` — and from P1 availability — is
-/// relative to the reader's Context Tenant, so a tenant-owned snapshot answers only the
-/// tenant it was read for. A global snapshot, and every snapshot of the platform
-/// cache, answers every reader. Ownership never changes, so an entity's snapshots are
-/// all `Shared` or all `Tenant`.
+/// Scope for serving, pinning and merging snapshots. Tenant-owned `ownership`
+/// is reader-relative, as availability will be in P1. P0 global and platform
+/// snapshots are shared. Immutable ownership keeps all snapshots of an entity
+/// in the same scope variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
     Shared,
@@ -75,8 +69,7 @@ impl Scope {
     }
 }
 
-/// The document fields, apart from the metadata, so that snapshots of one entity held
-/// for different tenants share equal documents.
+/// Document fields stored separately so tenants can share identical bytes.
 const DOCUMENTS: [EntityField; 4] = [
     EntityField::Content,
     EntityField::ResolvedSchema,
@@ -133,8 +126,7 @@ impl Held {
         &self.meta
     }
 
-    /// The snapshot as a read selecting `selection` is answered: every other field
-    /// dropped. Holds at least the applicable fields of `selection`.
+    /// Project a covering snapshot onto the requested applicable fields.
     pub fn project(&self, selection: &FieldSelection) -> Entity {
         let keep = |field: EntityField| selection.contains(field);
         let document = |at: usize| {
@@ -199,10 +191,9 @@ impl Held {
         }
     }
 
-    /// Hold a sibling's copy of each document that serializes, in the same field, to the
-    /// same bytes as the one held here. Value equality is not enough: `serde_json` calls
-    /// `-0.0` and `0.0` equal, and object key order may differ. Each distinct sibling
-    /// document is compared at most once, and only when its measured size matches.
+    /// Share byte-identical documents in the same field. JSON value equality can
+    /// hide signed zero or key order differences. Compare each distinct sibling
+    /// document at most once, and only if its measured size matches.
     fn share(&mut self, weight: &Weight, siblings: &[(&Self, &Weight)]) {
         for (at, field) in DOCUMENTS.into_iter().enumerate() {
             let Some(held) = self.documents[at].as_mut() else {
@@ -247,7 +238,7 @@ impl Held {
     }
 }
 
-/// That one entity is visible to one read context.
+/// Visibility evidence for one entity and read context.
 #[derive(Default)]
 struct Confirmation {
     /// From a read: the snapshot version it confirmed. Serves reads and resolutions.
@@ -269,8 +260,7 @@ impl Proof {
             && now.saturating_duration_since(self.at) < window
     }
 
-    /// Record a showing of `version`. A later reply from an earlier request never
-    /// moves the time back. Only one version is current, so another one is dead.
+    /// Replace a superseded proof. For the same version, keep the later request time.
     fn renew(slot: &mut Option<Self>, version: &Arc<()>, at: Instant) {
         match slot {
             Some(proof) if std::ptr::eq(proof.version.as_ptr(), Arc::as_ptr(version)) => {
@@ -422,8 +412,7 @@ struct Slot {
     last_event: u64,
 }
 
-/// How a read or an event names its one entity: the key alone, when nothing here knows
-/// its counterpart, or the pair the registry stated.
+/// A key and its registry-issued counterpart, if known.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spelling {
     Key(EntityKey),
@@ -474,8 +463,7 @@ impl Ticket {
     }
 }
 
-/// What one held document costs the store: it is charged once, when the first
-/// snapshot holds it, and released when the last one lets go.
+/// Charge a shared document from its first holder through its last.
 struct Charge {
     /// The snapshots holding it.
     holders: usize,
@@ -550,8 +538,7 @@ impl Store {
         Some(uuid)
     }
 
-    /// The resident snapshot of `gts_uuid` that answers `reader` (`None` on the platform
-    /// plane): the shared one, else the one read for that tenant.
+    /// The shared snapshot or the snapshot for this tenant (`None` on the platform plane).
     fn slot(&self, gts_uuid: Uuid, reader: Option<Uuid>) -> Option<(Uuid, Scope)> {
         let scopes = self.scopes.get(&gts_uuid)?;
         if scopes.contains(&Scope::Shared) {
@@ -577,8 +564,7 @@ impl Store {
         self.confirmations = NonZeroUsize::new(self.max_entries).map(LruCache::sparse);
     }
 
-    /// Whether the entity `gts_uuid` names is known to be global: from its resident
-    /// snapshot, or from what an entity-carrying reply said of its remembered pair.
+    /// Whether a snapshot or a classified identity pair establishes global ownership.
     pub fn known_global(&self, gts_uuid: Uuid) -> bool {
         self.any(gts_uuid).map_or_else(
             || self.identities.scope(gts_uuid) == Some(OwnershipScope::Global),
@@ -608,8 +594,7 @@ impl Store {
             .is_some_and(|uuid| self.known_global(uuid))
     }
 
-    /// What contradicts a reply giving the entity `gts_uuid` the `scope`: the scope its
-    /// resident snapshot or remembered pair already gives it, and which of them says so.
+    /// Return the conflicting ownership scope and its source for diagnostics.
     pub fn class_conflict(
         &self,
         gts_uuid: Uuid,
@@ -631,8 +616,7 @@ impl Store {
             .find(|(known, _)| *known != scope)
     }
 
-    /// The pair `key` names if it is known to be global: any authenticated reader may
-    /// see a global entity.
+    /// The pair for a known-global entity, visible to every authenticated reader.
     pub fn resolvable_global(&mut self, key: &EntityKey) -> Option<EntityIdentity> {
         let uuid = self.reference(key)?;
         if !self.known_global(uuid) {
@@ -697,9 +681,7 @@ impl Store {
         visible
     }
 
-    /// The pair `key` names, if `context` holds a fresh read of the resident
-    /// snapshot or a fresh showing of the remembered pair. Only a used store is
-    /// marked used.
+    /// Resolve from this context's fresh snapshot or identity proof. Promote only the store used.
     pub fn resolvable(
         &mut self,
         key: &EntityKey,
@@ -758,8 +740,7 @@ impl Store {
         let Some(uuid) = self.resident(key) else {
             return;
         };
-        // A global entity is served by its class alone; its own proof would only take a
-        // slot. A tenant-owned one is confirmed only in the snapshot read for this tenant.
+        // Global entities need no proof. Confirm tenant-owned snapshots only for their reader tenant.
         let Some(version) = self
             .entries
             .peek(&(uuid, Scope::Tenant(context.tenant)))
@@ -1075,8 +1056,7 @@ impl Store {
         }
     }
 
-    /// Drop the entity's snapshots other than the one that answers `reader`: its own
-    /// already carries the change that retires them.
+    /// Retire sibling snapshots when the reader's snapshot already has the new validator.
     pub fn retire_siblings(&mut self, key: &EntityKey, reader: Option<Uuid>) {
         let Some(uuid) = self.resident(key) else {
             return;

@@ -37,13 +37,9 @@ back their operation after `Retry-After`, capped by `retry.max_delay`, while run
 Failed read-back returns `Aborted` / `OPERATION_READ_FAILED` with the operation ID;
 replay the same key to recover it.
 
-The uncached `TypesRegistryApiRestClient` uses the same read models, projections
-and validators. It forwards the caller's bearer on tenant reads, retains no
-caller context and never uses the internal token. A missing
-bearer returns 401. Both reads use `ClientConfig::retry` and client-internal paths.
+The uncached `TypesRegistryApiRestClient` uses the same read models, projections and validators. It forwards the caller's bearer on tenant reads, retains no caller context and never uses the internal token. A missing bearer returns 401. Both reads use `ClientConfig::retry` and client-internal paths.
 
-`#[toolkit::consumes]` uses `PlatformTypesRegistryApiRestResolvingClient` and
-`TypesRegistryApiRestResolvingClient`. Cache hits skip directory lookup and HTTP.
+`#[toolkit::consumes]` uses `PlatformTypesRegistryApiRestResolvingClient` and `TypesRegistryApiRestResolvingClient`. Cache hits skip directory lookup and HTTP.
 Forwarded calls resolve the current endpoint or return `ServiceUnavailable`.
 `new` uses SDK defaults. Use `with_cache_settings` to override them.
 Set both entry limits to zero to disable retention. The
@@ -324,43 +320,18 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
 - `PublisherContext` is required but only forwarded/enforced in T44/T45;
   mixed-version publishers have no earlier guarantee.
 - Local clients trust both context types without validation or tenant scope (C2/C6).
-- Local and resolving REST clients use SDK caches. Each cache retains one snapshot
-  per entity and representation scope (below). Reads reuse covered fields and return only the requested projection.
-  Matching validators let replies merge; a new validator replaces the snapshot.
-  LRU limits default to 16 384 snapshots and 64 MiB. Each snapshot costs its compact
-  JSON documents, GTS ID, raw validator and 256 bytes of metadata allowance. Setting
-  `max_entries` or `max_size_bytes` to zero disables snapshot retention.
-- Snapshots are served for `freshness_window` (30 s), then revalidated in one batch.
-  Use `fresh` to check immediately. Observed terminal successes invalidate affected
-  platform entries. Unobserved changes may remain cached until expiry. The cache
-  skips `NotFound`, failed reads, discovery pages and operation resources.
-- `CachedTypesRegistry` shares a global entity's snapshot across tenants and keeps a
-  tenant-owned entity's snapshot per subject tenant, since its `ownership` is relative
-  to the reader; tenants' snapshots of one entity share equal documents, charged once.
-  For tenant-owned and unclassified entities, a read context's first read can confirm
-  its tenant's snapshot with its `ETag`. Up to
-  `max_entries` confirmations are retained for `freshness_window`, keyed by entity
-  and read context: subject, subject type,
-  subject tenant and the raw token scope list. Read contexts never share one,
-  since from P1 the registry scopes reads per subject by constraints the SDK
-  cannot apply. Another bearer with the same claims shares it. Anonymous calls
-  bypass the cache. REST misses require the caller's bearer. `NotFound` clears the
-  read context's confirmation for that key and fences its pending reads. Refusals
-  change no confirmation. A pair not known global resolves locally only when the
-  registry showed it to the same read context within the window, through a read or
-  a resolution; discovery shows such a pair to none. Global entities are readable by every
-  authenticated subject, so a fresh global snapshot and a known-global pair serve
-  every authenticated read context without a request of its own; a `NotFound` for a
-  global entity drops its shared snapshot. A pair a read or discovery classified as
-  global resolves for every authenticated reader, from a resident snapshot whatever
-  its freshness or from the identity LRU, since pairs never change.
-- Both caches learn both keys from exact reads, resolutions and discovery.
-  Discovery leaves snapshots and their freshness unchanged. The separate identity
-  LRU holds `max_identity_entries` pairs (16 384) without expiry and survives
-  observed mutations. Set the bound to zero to resolve from fresh snapshots (tenant
-  resolution of a known-global pair also accepts a stale one) or `:batchResolve`. After purge (ADR-0013, deferred) or when switching logical
-  registries, recreate the cached client or restart its consumer. Otherwise old
-  pairs may still resolve offline.
+- Local and resolving REST clients each cache up to 16 384 snapshots (`max_entries`) and 64 MiB (`max_size_bytes`). Either limit at zero disables snapshot retention.
+  The budget counts compact JSON documents, GTS IDs, raw validators and 256 bytes per snapshot. Snapshots of one entity share byte-identical documents in the same field.
+- Reads return the requested fields from a covering snapshot. Matching validators allow fields to merge within one scope. A changed validator replaces stale data.
+  After `freshness_window` (30 s), expired keys revalidate in one batch. Use `fresh` to check earlier. Observed terminal successes invalidate affected platform snapshots.
+  The cache skips absences, failed reads, discovery pages and operation resources.
+- Any authenticated reader can reuse a fresh global snapshot. Tenant-owned snapshots are per subject tenant because `ownership` is relative to the reader. The registry enforces per-subject visibility, so each read context must also confirm access.
+  Its first read can use the snapshot's `ETag`. The cache keeps up to `max_entries` confirmations for the freshness window, keyed by entity, subject ID, subject type, subject tenant and raw token scopes. Bearers with identical context fields share a confirmation. Anonymous calls bypass the cache. REST misses require the caller's bearer.
+- A read returning `NotFound` drops a global snapshot. For other entities it revokes only that context's confirmation for the key and fences its pending confirmations.
+  A refused request leaves prior confirmations in place.
+- Each client's identity LRU retains up to `max_identity_entries` registry-issued ID/UUID pairs (16 384 by default). Reads, resolutions and discovery supply pairs.
+  Discovery leaves snapshots and their freshness unchanged. Pairs survive expiry of snapshots and observed mutations because deleted entities still resolve.
+  Recreate the client or restart its consumer after purge (ADR-0013, deferred) or when switching logical registries, since old pairs can still resolve offline.
 - Legacy and new catalogues share seeds but no later writes until T38. Dependencies
   registered only through legacy cannot support publication through the new API.
 - Shared-database outbox polling can delay admission by one minute; keep
@@ -368,13 +339,9 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
 
 ## Reading
 
-Every `Entity` carries `ownership` (`Global`, `ContextTenant` or `AncestorTenant`). Remote clients
-require it, so upgrade the registry before the gears that read it over REST.
+Every `Entity` carries `ownership` (`Global`, `ContextTenant` or `AncestorTenant`). Remote clients require it, so upgrade the registry before the gears that read it over REST.
 
-Platform reads see global entities only. Read a tenant's own types under that
-tenant's service account through `TypesRegistryApi`; read platform contracts the
-gear uses for its own work through the platform client, which shares one cache
-across all callers.
+Platform reads see global entities only. Read a tenant's own types under that tenant's service account through `TypesRegistryApi`; read platform contracts the gear uses for its own work through the platform client, which shares one cache across all callers.
 
 ```rust,no_run
 use toolkit::client_hub::ClientHub;
@@ -423,9 +390,8 @@ cache, this flag has no effect.
 
 ### Conditional reads
 
-To refresh a held snapshot, use `BatchGetItem::new(key).revalidate(&previous_lookup)`.
-The `ETag` applies across projections. The SDK sends it only for the same entity
-and a projection the snapshot covers.
+To refresh a snapshot, use `BatchGetItem::new(key).revalidate(&previous_lookup)`.
+Reuse it only for the tenant that read it. The SDK checks entity and field coverage, but a P0 `ETag` is the same across projections and does not distinguish tenants.
 
 ```rust,no_run
 use toolkit_security::PlatformSecurityContext;
@@ -453,24 +419,16 @@ async fn refresh(
 ```
 
 Transports get the usable `ETag` from `item.if_none_match_for(&request.projection)`.
-Keep the original `Found` after an `Unchanged` reply. Passing `Unchanged` or
-`NotFound` to `revalidate` makes the next read unconditional.
+Keep the original `Found` after an `Unchanged` reply. Passing `Unchanged` or `NotFound` to `revalidate` makes the next read unconditional.
 
-`resolve_type_uuid` / `resolve_instance_uuid` map registered IDs to Registry
-References; `resolve_type_id` / `resolve_instance_id` reverse them. Plural forms
-follow `batch_get_*` rules. They take no read options and return stored identities
-for active and deleted entities. Both contracts use `batch_resolve_identities`
-(`POST {base}/entities:batchResolve`). Platform resolution checks the identity LRU,
-then fresh snapshots. Tenant resolution uses only snapshots with fresh visibility
-confirmation for the caller. The registry resolves the remaining keys without
-reading snapshots, validators or documents.
+`resolve_type_uuid` and `resolve_instance_uuid` map registered IDs to Registry References. `resolve_type_id` and `resolve_instance_id` reverse the mapping.
+Plural forms follow `batch_get_*` rules. These helpers take no read options.
+
+Platform resolution checks the identity LRU, then fresh snapshots. Tenant resolution can use a pair that a read or discovery classified as global even from a stale snapshot. Other pairs require a read or resolution confirmed for the same context within the window. Discovery alone cannot confirm access. Setting `max_identity_entries` to zero skips the identity LRU. Both contracts send misses to `batch_resolve_identities` (`POST {base}/entities:batchResolve`), which returns stored identities for active and deleted entities without loading snapshots, validators or documents.
 
 Clients reject incomplete, unexpected or contradictory results as `Internal`.
-Deploy the registry with `:batchResolve` before remote SDK consumers. Test doubles
-with only batch reads can use `types_registry_sdk::ext::resolve_through_batch_get`,
-under the `test-util` feature.
-Use the registry-issued UUID returned by `resolve_*_uuid` or already held in
-`EntityKey::GtsUuid` (ADR-0001).
+Deploy the registry with `:batchResolve` before remote SDK consumers. Test doubles with only batch reads can use `types_registry_sdk::ext::resolve_through_batch_get`, under the `test-util` feature.
+Use the registry-issued UUID returned by `resolve_*_uuid` or already held in `EntityKey::GtsUuid` (ADR-0001).
 
 Unknown or other-kind references return `NotFound` singly, `None` in batches;
 invalid/wrong-kind identifiers return `InvalidArgument` before reading.
@@ -593,10 +551,7 @@ async fn classify(
 
 ### Client cache metrics
 
-Local and REST caches use the global OpenTelemetry meter under the
-`cf-gears-types-registry-sdk` scope. On `ToolKit` hosts built with `otel`,
-enable `opentelemetry.metrics.enabled`. Other hosts install their provider
-before constructing clients.
+Local and REST caches use the global OpenTelemetry meter under the `cf-gears-types-registry-sdk` scope. On `ToolKit` hosts built with `otel`, enable `opentelemetry.metrics.enabled`. Other hosts install their provider before constructing clients.
 
 | Instrument | Labels in addition to `plane` | What it measures |
 |---|---|---|
@@ -605,10 +560,7 @@ before constructing clients.
 | `types_registry_client_cache_entries` | `cache` (`snapshot`, `identity`) | Resident entries summed across live cache instances |
 | `types_registry_client_cache_size` | | Total bytes charged against `max_size_bytes` across live clients |
 
-`plane` is `platform` or `tenant`. Hits stay local. Forwarded keys count as
-revalidations if they carry the cache's `ETag`, otherwise as misses, even if the
-registry call fails. Hit rate divides hits by all lookups. Occupancy series appear
-once the cache retains entries. Replacements and invalidations affect occupancy.
+`plane` is `platform` or `tenant`. Hits stay local. Forwarded keys count as revalidations if they carry the cache's `ETag`, otherwise as misses, even if the registry call fails. Hit rate divides hits by all lookups. Occupancy series appear once the cache retains entries. Replacements and invalidations affect occupancy.
 Capacity-driven removals also count as evictions.
 
 ### Reconciliation tracing
@@ -671,8 +623,7 @@ event carries `reconcile_id` directly.
   prerequisites; refused prerequisites block their dependents without supplying their old
   revisions. Independent candidates may still succeed, and dry runs validate against a
   disposable copy. Managed schemas must fully materialize, matching the real registry's
-  rejection of unresolved/circular schema resources. `Fault` delays or fails calls
-  (`Call::BatchResolve` for identities, `Call::BatchGet` for snapshots).
+  rejection of unresolved/circular schema resources. `Fault` delays or fails calls (`Call::BatchResolve` for identities, `Call::BatchGet` for snapshots).
   `reject` and `depends_on` steer admission, `strict()` panics on an unexpected call, and `calls`,
   `reads` and `submissions` record what happened. `install` registers it in a `ClientHub`
   under both contracts.

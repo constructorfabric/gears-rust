@@ -2,16 +2,11 @@
 
 End-to-end read scenarios cover exact `GET /entities/{entity_key}`, `:batchGet`, `:batchResolve` and conditional reads over live entities and tombstones. The local launcher uses **SQLite**; these tests do not prove PostgreSQL/MySQL or tenant/PDP behavior.
 
-[Read tests](../test_reading.py) and [resolution tests](../test_resolution.py) cover
-every scenario in the [suite index](../README.md). Each scenario uses named fixtures
-from `fixtures/reading/`, a fresh namespace and completed setup operations.
+[Read tests](../test_reading.py) and [resolution tests](../test_resolution.py) cover every scenario in the [suite index](../README.md). Each scenario uses named fixtures from `fixtures/reading/`, a fresh namespace and completed setup operations.
 Independent `other_*` and `device_*` entities check keys and omissions.
 
-Tests compare whole JSON responses. Exact and batch reads include `gts_id`,
-`gts_uuid`, `kind` and `lifecycle_status`. The default selection is document-free
-and inapplicable fields are omitted. Batch results must echo each distinct key.
-Exact and batch validators match byte for byte. A `304` carries its ETag and no
-body. Reads follow terminal operations without sleeps or retries.
+Tests compare whole JSON responses. Exact and batch reads include `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`. The default selection is document-free and inapplicable fields are omitted. Batch results must echo each distinct key.
+Exact and batch validators match byte for byte. A `304` carries its ETag and no body. Reads follow terminal operations without sleeps or retries.
 
 ## Contents
 
@@ -240,9 +235,7 @@ body. Reads follow terminal operations without sleeps or retries.
 
 **When:** GET `person_schema` and `person_instance` without `$select` and retain their ETags. GET each key with `$select=content` unconditionally, then again with `If-None-Match` set to its retained ETag. GET `other_schema` with `$select=content` as a contrasting key.
 
-**Then:** both content reads return `200` with the full authored content and the
-metadata ETag. After the client holds that content, conditional reads return
-bodyless `304` with the same ETag. The SDK binds conditions to held fields.
+**Then:** both content reads return `200` with the full authored content and the metadata ETag. After the client holds that content, conditional reads return bodyless `304` with the same ETag. The SDK binds conditions to held fields.
 `other_schema` returns its own document.
 
 ### TR-READ-304 — A base refresh invalidates its derived schema's ETag
@@ -257,9 +250,7 @@ bodyless `304` with the same ETag. The SDK binds conditions to held fields.
 
 ## Batch resolution
 
-Both `:batchResolve` routes return the stored `gts_id` and `gts_uuid` for each
-distinct key, including tombstones, or `not_found` for absent keys. Setup uses
-the platform API. Expected Registry References come from the fixture identifiers.
+Both `:batchResolve` routes return the stored `gts_id` and `gts_uuid` for each distinct key, including tombstones, or `not_found` for absent keys. Setup uses the platform API. Expected Registry References come from the fixture identifiers.
 
 ### TR-READ-401 — Both planes resolve every distinct key to its stored identity
 
@@ -267,15 +258,11 @@ the platform API. Expected Registry References come from the fixture identifiers
 
 **Given:** register `person_schema`, `person_instance`, `other_schema` and `other_instance` in one fresh namespace through the platform API. Prepare an absent valid GTS ID in that namespace and an unregistered UUID.
 
-**When:** send the same batch to the platform route (internal token) and tenant
-route (bearer): schema ID, uppercase schema Registry Reference, instance ID,
-repeated schema ID, lowercase schema Registry Reference, absent ID and absent UUID.
+**When:** send the same batch to the platform route (internal token) and tenant route (bearer): schema ID, uppercase schema Registry Reference, instance ID, repeated schema ID, lowercase schema Registry Reference, absent ID and absent UUID.
 
 **Then:** both planes return the same five results by echoed key in `200` responses.
 The schema resolves under its ID and canonical lowercase, hyphenated UUID.
-Repeated keys collapse. The instance returns its own identity. The two absent
-keys have `not_found` without identity. Lifecycle, validators, documents and
-unrequested `other_*` entities are omitted.
+Repeated keys collapse. The instance returns its own identity. The two absent keys have `not_found` without identity. Lifecycle, validators, documents and unrequested `other_*` entities are omitted.
 
 ### TR-READ-402 — A deleted entity keeps its identity
 
@@ -285,8 +272,7 @@ unrequested `other_*` entities are omitted.
 
 **When:** delete `person_schema` with a completed, succeeded operation and resolve the same three keys again.
 
-**Then:** both `200` responses match by echoed key. Both schema keys keep the same
-identity and the absent key stays `not_found`.
+**Then:** both `200` responses match by echoed key. Both schema keys keep the same identity and the absent key stays `not_found`.
 
 ### TR-READ-404 — A resolution takes no selection or condition
 

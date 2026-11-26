@@ -274,8 +274,7 @@ async fn verify(ctx: &GearCtx, expected: &[(GtsId, Value)]) -> Result<(), String
     }
 }
 
-/// Warm both published caches, then change the row behind them. A different tenant's
-/// first read and an explicit fresh read both reach the registry.
+/// Change a global row after warming both caches to distinguish a hit from revalidation.
 async fn probe_cache(
     ctx: &GearCtx,
     database: &std::path::Path,
@@ -376,9 +375,8 @@ async fn probe_cache(
     }
 }
 
-/// Simulate purge by removing a row with a zero freshness window. Snapshot
-/// reads and tenant resolution miss immediately. Only a warmed platform
-/// identity LRU still resolves the purged row.
+/// Simulate purge after identity-only lookups. With a zero window, only
+/// a retained platform pair resolves offline. The tenant pair has no global classification.
 async fn probe_identity(
     ctx: &GearCtx,
     database: &std::path::Path,
@@ -984,9 +982,7 @@ async fn the_published_apis_are_cached_and_tenants_share_a_global_snapshot() {
     probe(json!({ "entities": [base()] }), true).await;
 }
 
-/// The gear hands its cache settings to the published client: a zero window
-/// prevents it from serving a cached read. (`config_test` pins the mapping of
-/// every key, and the SDK cache tests each key's effect.)
+/// A zero window in the gear configuration forces published clients to revalidate.
 #[tokio::test]
 async fn the_client_cache_keys_configure_the_published_platform_api() {
     probe(

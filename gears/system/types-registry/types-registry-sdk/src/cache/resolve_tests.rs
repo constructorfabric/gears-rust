@@ -161,8 +161,7 @@ async fn a_mixed_batch_resolves_only_the_unknown_keys() {
     assert_eq!(f.recorder.batch_count(), 0);
 }
 
-/// Without an identity LRU, a fresh snapshot resolves either key.
-/// An expired one sends the key to batch resolution without refreshing the snapshot.
+/// A resolution miss leaves the expired snapshot untouched.
 #[tokio::test(start_paused = true)]
 async fn with_no_identity_store_only_a_fresh_resident_snapshot_answers() {
     let f = fixture_bound(WINDOW, 0);
@@ -224,8 +223,6 @@ async fn absence_is_never_kept() {
     );
 }
 
-/// A revision and a deletion change no identity: both stay known, and a deleted entity
-/// still resolves.
 #[tokio::test(start_paused = true)]
 async fn an_observed_registration_or_deletion_leaves_a_known_identity_alone() {
     let f = fixture(WINDOW);
@@ -263,8 +260,6 @@ async fn an_observed_registration_or_deletion_leaves_a_known_identity_alone() {
     assert_eq!(f.recorder.batch_count(), before + 1);
 }
 
-/// An identity hit leaves snapshot recency unchanged, so the next fill evicts
-/// the least-recently-used snapshot.
 #[tokio::test(start_paused = true)]
 async fn a_known_identity_does_not_extend_its_snapshot_s_recency() {
     let registry = MockTypesRegistry::new().completing_after(0);
@@ -413,8 +408,7 @@ async fn a_miss_by_another_spelling_leaves_the_resident_snapshot_s_recency() {
     assert_eq!(f.recorder.batch_count(), 5, "the resident was evicted");
 }
 
-/// Reject a conflicting reply against a pinned pair even if both stores evicted
-/// it during resolution.
+/// Evict the pinned pair from both stores while the request is in flight.
 #[tokio::test(start_paused = true)]
 async fn a_resolution_answer_contradicting_an_identity_it_holds_fails() {
     let f = fixture_with(
@@ -464,9 +458,7 @@ async fn a_resolution_answer_contradicting_an_identity_it_holds_fails() {
     assert!(f.cache.identity(&EntityKey::GtsUuid(held)).is_none());
 }
 
-/// A malformed resolution fails whole before any learning. Every malformed shape is
-/// covered where it is checked (`ext::checked_resolutions`); this pins that the
-/// cache checks before it learns.
+/// Malformed shapes are covered by `ext::checked_resolutions`.
 #[tokio::test(start_paused = true)]
 async fn a_malformed_resolution_fails_whole_and_teaches_nothing() {
     let f = fixture(WINDOW);
@@ -497,7 +489,7 @@ async fn a_malformed_resolution_fails_whole_and_teaches_nothing() {
     assert_eq!(f.recorder.resolution_count(), 2);
 }
 
-/// Resident snapshots reject conflicting pairs even without an identity LRU.
+/// Disable the identity LRU to isolate snapshot validation.
 #[tokio::test(start_paused = true)]
 async fn a_resolution_contradicting_a_resident_snapshot_fails() {
     let f = fixture_bound(WINDOW, 0);

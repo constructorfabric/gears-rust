@@ -101,16 +101,14 @@ pub trait PlatformTypesRegistryApi: Send + Sync {
 /// The tenant-plane Types Registry contract: the platform's reads, with the same models,
 /// projection and validators, under a tenant's [`SecurityContext`].
 ///
-/// Pass the host-authenticated caller's context. [`CachedTypesRegistry`](crate::CachedTypesRegistry)
-/// keeps visibility confirmations for tenant-owned entities per read context: subject,
-/// subject type, home tenant and the raw token scope list; global entities serve every
-/// authenticated reader. It trusts the context it is given, so a context reused
-/// after the registry refused its bearer can still hit within the freshness window.
-/// Anonymous calls bypass the cache. REST requests forward the caller's bearer.
+/// Pass the host-authenticated caller's context. Every authenticated reader can see
+/// global entities. Tenant-owned results require `read` or `list` authorization.
+/// Batch reads and identity resolutions must enforce the same read access.
 ///
-/// An implementation lets every authenticated reader see every global entity — `read`
-/// and `list` authorization constrains tenant-owned results only — and applies one read
-/// gate to batch reads and resolutions; the cache relies on both.
+/// [`CachedTypesRegistry`](crate::CachedTypesRegistry) keys tenant-owned visibility
+/// by subject, subject type, home tenant and raw token scopes. Reusing that context
+/// after a bearer refusal can still hit within the freshness window. Anonymous calls
+/// bypass the cache. REST calls forward the caller's bearer.
 ///
 /// Every method fails with `CanonicalError`; project it with
 /// [`TypesRegistryError::from`](crate::TypesRegistryError) for typed dispatch.

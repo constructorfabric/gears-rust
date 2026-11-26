@@ -430,8 +430,7 @@ async fn one_conditional_batch_carries_every_expired_key_and_only_those_validato
     assert_eq!(response.0[&gts_key(missing)], EntityLookup::NotFound);
 }
 
-/// A failed registry read propagates and caches nothing: a cold key stays cold, an
-/// expired entry is not served or extended. The next read fills, the one after hits.
+/// Check cold and expired keys, then retry to verify that the cache recovers.
 #[tokio::test(start_paused = true)]
 async fn a_failed_read_propagates_and_never_extends_the_window() {
     for expired in [false, true] {
@@ -723,9 +722,7 @@ async fn one_entry_answers_every_projection_it_covers_and_no_other() {
     assert_eq!(f.recorder.batch_count(), 2, "merged under one validator");
 }
 
-/// A wider read of a new state replaces the narrow snapshot it does not cover, so the
-/// next narrow hit serves the new state within the window. The entry cannot condition
-/// that read: only a caller's own validator is sent.
+/// A narrow snapshot cannot condition the wider read. Only the caller's validator applies.
 #[tokio::test(start_paused = true)]
 async fn a_wider_read_of_a_new_state_replaces_the_narrow_entry_it_does_not_cover() {
     for caller_condition in [false, true] {
@@ -759,7 +756,6 @@ async fn a_wider_read_of_a_new_state_replaces_the_narrow_entry_it_does_not_cover
     }
 }
 
-/// A hit is cut down to exactly the fields asked, as the registry would answer it.
 #[tokio::test(start_paused = true)]
 async fn a_wider_entry_answers_a_narrower_read_with_exactly_its_fields() {
     let f = fixture(WINDOW);
@@ -874,8 +870,7 @@ async fn a_long_caller_validator_is_forwarded_on_a_miss_and_compared_on_a_hit() 
     );
 }
 
-/// A malformed registry reply fails the whole read as `Internal` and caches none
-/// of it: the next read of the asked key goes to the registry with no validator.
+/// The retry must go to the registry without a validator.
 #[tokio::test(start_paused = true)]
 async fn a_malformed_reply_fails_the_read_and_caches_none_of_it() {
     use crate::models::{Entity, EntityKind};
@@ -1076,7 +1071,6 @@ async fn a_long_registry_etag_is_cached_and_sent_back_verbatim() {
     );
 }
 
-/// The cache cannot match a caller condition with insufficient field coverage.
 #[tokio::test(start_paused = true)]
 async fn a_caller_condition_that_does_not_cover_the_read_is_answered_in_full() {
     let f = fixture(WINDOW);
@@ -1186,7 +1180,6 @@ async fn a_terminal_registration_invalidates_every_projection_under_both_key_for
     assert_eq!(f.title(gts_key(TYPE), content_only(), false).await, "v2");
 }
 
-/// An accepted registration or deletion invalidates nothing until a poll sees it commit.
 #[tokio::test(start_paused = true)]
 async fn an_accepted_mutation_invalidates_nothing_until_a_poll_sees_it_commit() {
     for deletion_op in [false, true] {
@@ -1806,7 +1799,6 @@ async fn full_weight(registry: &MockTypesRegistry) -> usize {
     super::store::weight(&registry_snapshot(registry, TYPE).await).total()
 }
 
-/// An oversized same-validator replacement leaves the valid smaller snapshot resident.
 #[tokio::test(start_paused = true)]
 async fn an_oversized_answer_of_the_same_state_keeps_the_smaller_entry() {
     let big = json!({
@@ -1843,8 +1835,7 @@ async fn an_oversized_answer_of_the_same_state_keeps_the_smaller_entry() {
     assert_eq!(f.recorder.batch_count(), 3, "the documents were never kept");
 }
 
-/// Two projections that each fit but whose merge does not: the merge is refused
-/// and the resident projection keeps answering.
+/// Each projection fits on its own.
 #[tokio::test(start_paused = true)]
 async fn an_oversized_merge_of_complementary_projections_keeps_the_resident_one() {
     let big = json!({
@@ -1953,8 +1944,6 @@ fn assert_protocol_fault(result: Result<BatchGetEntitiesResponse, CanonicalError
     );
 }
 
-/// Reject a conflicting Registry Reference against the pinned pair even after
-/// both stores evict it.
 #[tokio::test(start_paused = true)]
 async fn a_revalidation_contradicting_its_pinned_pair_fails_after_both_stores_evicted_it() {
     let f = fixture_with(
@@ -2026,7 +2015,7 @@ async fn a_batch_contradicting_itself_fails_and_fills_nothing() {
     );
 }
 
-/// A resident snapshot rejects a conflicting reference even without an identity LRU.
+/// Disable the identity LRU to isolate the resident snapshot check.
 #[tokio::test(start_paused = true)]
 async fn an_answer_contradicting_a_resident_pair_fails_and_leaves_the_entry() {
     let f = fixture_with(
@@ -2075,7 +2064,6 @@ async fn an_answer_contradicting_the_resident_entry_of_its_key_names_both_pairs(
     );
 }
 
-/// A remembered pair holds after its snapshot was evicted.
 #[tokio::test(start_paused = true)]
 async fn an_answer_contradicting_a_remembered_pair_fails_after_its_snapshot_was_evicted() {
     let f = fixture_with(
@@ -2105,7 +2093,6 @@ async fn an_answer_contradicting_a_remembered_pair_fails_after_its_snapshot_was_
     assert_eq!(EntityKey::GtsUuid(known.gts_uuid), uuid_key(TYPE));
 }
 
-/// The first settled pair wins. A conflicting concurrent reply cannot replace it.
 #[tokio::test(start_paused = true)]
 async fn of_two_reads_answered_with_contradicting_pairs_the_later_settled_fails() {
     let f = fixture_with(

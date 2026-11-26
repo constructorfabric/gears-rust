@@ -1,11 +1,10 @@
-//! Positive-only LRU of registry-confirmed identity pairs. It has its own recency
-//! and no validator, expiry or mutation invalidation. Deleted entities still
-//! resolve in P0. A tenant cache answers a pair a read or discovery classified as
-//! global to every authenticated reader, and any other pair only to a read context
-//! that the registry showed it to.
+//! Positive LRU of registry-issued ID/UUID pairs with independent recency.
+//! Pairs have no validator or expiry and survive mutations because tombstones
+//! still resolve. A read or discovery can classify a pair as global for all
+//! authenticated readers. Other tenant hits require a read-context confirmation.
 //!
 //! After purge (ADR-0013, deferred) or a logical registry change, recreate the
-//! cached client or restart its consumer. `NotFound` alone leaves identities intact.
+//! client or restart its consumer. `NotFound` alone leaves pairs intact.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -17,8 +16,7 @@ use uuid::Uuid;
 
 use crate::models::{EntityIdentity, EntityKey, Ownership};
 
-/// Whether an entity is global or tenant-owned: the part of its [`Ownership`] that
-/// does not depend on the reader, so every read context agrees on it.
+/// Reader-independent part of [`Ownership`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnershipScope {
     Global,
@@ -52,8 +50,7 @@ pub struct Identities {
 
 struct Record {
     gts_id: Arc<GtsId>,
-    /// The entity's scope, once a reply carrying the entity said so. A bare
-    /// resolution leaves it unknown; a contradiction makes it unknown again.
+    /// Known after an entity read or discovery. A contradiction clears it.
     scope: Option<OwnershipScope>,
     /// Identifies this residency. Proofs hold it weakly, so eviction retires them
     /// even if the pair is learned again.

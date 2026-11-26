@@ -460,11 +460,8 @@ async fn await_completed(
     }
 }
 
-/// Cache hits bypass the directory. Misses surface its errors, and polling a
-/// successful registration invalidates the affected snapshot.
-/// Reads and identity resolutions are cached above endpoint resolution. An observed
-/// revision drops the snapshot but keeps the known identity, which still resolves
-/// while the directory is down; an unknown identifier then cannot.
+/// A directory outage distinguishes hits from forwarded calls. Polling a successful
+/// registration drops the snapshot while the known pair still resolves offline.
 #[tokio::test]
 async fn the_platform_resolving_client_caches_above_resolution() {
     use types_registry_sdk::{GtsTypeId, PlatformTypesRegistryApiExt};

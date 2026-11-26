@@ -138,7 +138,7 @@ impl TypesRegistryGear {
         )))
     }
 
-    /// Publish a separate tenant cache that shares snapshots across tenants.
+    /// Publish the tenant API with its own cache.
     fn seeded_tenant_api(
         ctx: &GearCtx,
         _policies: Arc<PolicyStack>,

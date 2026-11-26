@@ -196,9 +196,8 @@ impl PlatformTypesRegistryApi for PlatformResolving {
     }
 }
 
-/// Tenant cache over directory-resolved replicas. Hits need the read context's own confirmation.
-/// Registry requests forward the caller's bearer. Zero `max_entries` disables snapshot and
-/// confirmation retention; pairs follow `max_identity_entries` (see [`CacheSettings`]).
+/// Tenant cache over directory-resolved replicas. Hits follow [`crate::CachedTypesRegistry`]
+/// visibility rules. REST misses forward the caller's bearer. See [`CacheSettings`] for limits.
 pub struct TypesRegistryApiRestResolvingClient {
     inner: CachedTypesRegistry,
 }
@@ -249,7 +248,7 @@ impl TypesRegistryApi for TypesRegistryApiRestResolvingClient {
         self.inner.list_entities(ctx, request).await
     }
 
-    /// Pairs the registry showed this read context within the window resolve nothing.
+    /// Confirmed identity hits bypass directory resolution.
     async fn batch_resolve_identities(
         &self,
         ctx: &SecurityContext,

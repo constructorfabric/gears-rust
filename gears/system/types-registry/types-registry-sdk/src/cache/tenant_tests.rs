@@ -8,9 +8,7 @@ use crate::cache::store::Scope;
 use crate::contract::TypesRegistryApi;
 use crate::models::{Entity, Ownership};
 
-/// A tenant registry with entity visibility independent of the snapshot contents.
-/// Its entities are tenant-owned unless marked global, so a test opts into the
-/// shared global path explicitly.
+/// Test registry with configurable visibility. Entities are tenant-owned by default.
 struct TenantRegistry {
     registry: MockTypesRegistry,
     /// Entities answered as `Ownership::Global`.
@@ -207,8 +205,7 @@ async fn read_as(
     registry.calls.lock().expect("calls").clone()
 }
 
-/// From P1 the registry scopes reads per subject by ownership constraints, so only the read context
-/// that was answered reuses its confirmation. The snapshot itself is shared.
+/// Subjects in one tenant share snapshot bytes but require separate confirmations.
 #[tokio::test(start_paused = true)]
 async fn a_confirmation_serves_only_its_read_context() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -247,7 +244,6 @@ async fn a_confirmation_serves_only_its_read_context() {
         "another bearer with the same claims is the same read context"
     );
 
-    // A tenant-owned snapshot is the tenant's own: another tenant reads its own.
     for (other, sent, why) in [
         (
             subject(11, Some("bob")),
@@ -302,9 +298,8 @@ async fn a_confirmation_serves_only_its_read_context() {
     );
 }
 
-/// The cache keeps no record of refusals: a refused credential keeps earlier
-/// confirmations of its read context until they expire. The host authenticates
-/// every request, and per-entity denials arrive as `not_found`.
+/// The host authenticates each request. A refusal leaves prior confirmations usable
+/// until expiry. Per-entity denials arrive as `not_found`.
 #[tokio::test(start_paused = true)]
 async fn a_refusal_changes_no_confirmation() {
     for refusal in [
@@ -398,8 +393,6 @@ async fn anonymous_calls_never_reuse_the_tenant_cache() {
     );
 }
 
-/// Each tenant reads a tenant-owned entity into its own snapshot, labelled for it, and
-/// confirms its visibility independently; equal documents are held once.
 #[tokio::test(start_paused = true)]
 async fn tenants_keep_their_own_snapshots_and_confirm_visibility_independently() {
     let registry = Arc::new(TenantRegistry::new([Uuid::from_u128(2)]));
@@ -528,9 +521,7 @@ async fn a_tenant_read_releases_its_context_slot_when_done_or_dropped() {
     assert!(!in_flight(), "a completed read released it");
 }
 
-/// A `not_found` revokes and fences only the read context it answered, whether
-/// the other context is the same subject in another tenant or another subject
-/// of the same tenant.
+/// Vary subject and tenant independently to exercise both parts of the context key.
 #[tokio::test(start_paused = true)]
 async fn an_absent_read_fences_only_its_read_context() {
     let same_subject_in_tenant_2 = SecurityContext::builder()
@@ -708,9 +699,7 @@ fn owner_and_descendant() -> (Arc<TenantRegistry>, CachedTypesRegistry) {
     (registry, cache)
 }
 
-/// `ownership` is relative to the reader's tenant, so a tenant-owned snapshot read for
-/// one tenant is never served to, pinned by, or confirmed for another — even when the
-/// registry answers both under one validator.
+/// The owner and descendant receive the same validator but different ownership labels.
 #[tokio::test(start_paused = true)]
 async fn a_tenant_owned_snapshot_answers_only_the_tenant_it_was_read_for() {
     let (registry, cache) = owner_and_descendant();
@@ -733,8 +722,6 @@ async fn a_tenant_owned_snapshot_answers_only_the_tenant_it_was_read_for() {
     );
 }
 
-/// A wider read for one tenant does not merge into another tenant's snapshot, nor
-/// replace it.
 #[tokio::test(start_paused = true)]
 async fn a_wider_read_never_merges_into_another_tenants_snapshot() {
     let (registry, cache) = owner_and_descendant();
@@ -749,8 +736,7 @@ async fn a_wider_read_never_merges_into_another_tenants_snapshot() {
     );
 }
 
-/// Tenants' snapshots of one entity share equal documents: the second costs only its
-/// own metadata and validator.
+/// Only metadata and validator bytes are charged for the second tenant.
 #[tokio::test(start_paused = true)]
 async fn tenant_snapshots_of_one_entity_share_their_documents() {
     let (_, cache) = owner_and_descendant();
@@ -766,8 +752,6 @@ async fn tenant_snapshots_of_one_entity_share_their_documents() {
     );
 }
 
-/// Two tenants' first reads race: the later reply finds no snapshot of its own and
-/// leaves the other tenant's fresh one in place.
 #[tokio::test(start_paused = true)]
 async fn a_late_cold_fill_leaves_another_tenants_fresh_snapshot() {
     let (registry, cache) = owner_and_descendant();
@@ -811,9 +795,7 @@ fn identity(id: &str) -> EntityIdentity {
     EntityIdentity { gts_id, gts_uuid }
 }
 
-/// An empty or over-long resolution goes to the registry whole, known keys and
-/// repeats included, so the registry refuses it rather than the cache answering
-/// part of it.
+/// Preserve known keys and duplicates so the registry checks the original batch size.
 #[tokio::test(start_paused = true)]
 async fn an_over_long_or_empty_tenant_resolution_is_sent_whole_for_the_registry_to_refuse() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -980,8 +962,7 @@ async fn an_unconfirmed_context_s_resolution_leaves_the_snapshot_s_recency() {
     );
 }
 
-/// A registry resolution shows the pair to its read context only, for the window,
-/// without a resident snapshot.
+/// A resolution can confirm a pair even when no snapshot is resident.
 #[tokio::test(start_paused = true)]
 async fn a_resolution_shows_the_pair_to_its_read_context_only() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1018,8 +999,7 @@ async fn a_resolution_shows_the_pair_to_its_read_context_only() {
     );
 }
 
-/// A resolution answering other keys than asked fails whole: it teaches the read
-/// context neither the valid pair beside the malformed key nor its visibility.
+/// Even the valid pair beside the malformed key must stay unconfirmed.
 #[tokio::test(start_paused = true)]
 async fn a_malformed_resolution_fails_and_teaches_the_context_nothing() {
     type Tamper = fn(&mut HashMap<EntityKey, Option<EntityIdentity>>);
@@ -1184,7 +1164,6 @@ async fn an_absence_fences_a_resolution_in_flight() {
     }
 }
 
-/// A read shows its pair even when its snapshot is too large to keep.
 #[tokio::test(start_paused = true)]
 async fn a_read_too_large_to_keep_still_shows_its_pair() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1209,8 +1188,6 @@ async fn a_read_too_large_to_keep_still_shows_its_pair() {
     assert!(registry.resolutions().is_empty(), "shown by the read");
 }
 
-/// An `Unchanged` to a pinned snapshot shows its pair even if the snapshot is
-/// evicted while the read is in flight.
 #[tokio::test(start_paused = true)]
 async fn a_confirmed_pin_evicted_in_flight_still_shows_its_pair() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1258,7 +1235,6 @@ async fn a_confirmed_pin_evicted_in_flight_still_shows_its_pair() {
     );
 }
 
-/// Discovery is a `list`: it teaches pairs but shows them to no read context.
 #[tokio::test(start_paused = true)]
 async fn discovery_teaches_pairs_without_showing_them() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1285,7 +1261,6 @@ async fn discovery_teaches_pairs_without_showing_them() {
     assert_eq!(registry.resolutions().len(), 1, "not shown by discovery");
 }
 
-/// A resolution cannot pair a resident reference with another ID.
 #[tokio::test(start_paused = true)]
 async fn a_tenant_resolution_contradicting_a_resident_snapshot_fails() {
     let registry = Arc::new(MockTypesRegistry::new());
@@ -1338,7 +1313,6 @@ fn read_keys(registry: &TenantRegistry) -> usize {
     registry.calls.lock().expect("calls").len()
 }
 
-/// A tenant-owned snapshot still needs the reader's own confirmation.
 #[tokio::test(start_paused = true)]
 async fn a_tenant_owned_snapshot_still_needs_its_own_confirmation() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1356,8 +1330,7 @@ async fn a_tenant_owned_snapshot_still_needs_its_own_confirmation() {
     assert_eq!(read_keys(&registry), 3);
 }
 
-/// A pair resolves by its class only once an entity-carrying reply showed it global;
-/// a bare resolution leaves it unknown.
+/// A bare resolution returns no ownership label.
 #[tokio::test(start_paused = true)]
 async fn only_an_entity_carrying_reply_classifies_a_pair() {
     let registry = global_registry();
@@ -1387,8 +1360,6 @@ async fn only_an_entity_carrying_reply_classifies_a_pair() {
     assert_eq!(registry.resolutions().len(), 2, "discovery classified it");
 }
 
-/// The ownership of an admitted entity never changes, so a reply contradicting it is
-/// refused rather than learned.
 #[tokio::test(start_paused = true)]
 async fn a_contradictory_ownership_is_refused() {
     let registry = global_registry();
@@ -1418,8 +1389,7 @@ async fn a_contradictory_ownership_is_refused() {
     );
 }
 
-/// With no snapshot retained, the remembered pair's scope still refuses a
-/// contradicting reply, and the diagnostic says that is where it is known.
+/// The diagnostic must identify the remembered pair as the source of the conflict.
 #[tokio::test(start_paused = true)]
 async fn a_contradictory_ownership_against_a_remembered_pair_is_refused() {
     let registry = global_registry();
@@ -1451,7 +1421,6 @@ async fn a_contradictory_ownership_against_a_remembered_pair_is_refused() {
     );
 }
 
-/// Global answers keep no per-entity proofs, so they never evict a usable one.
 #[tokio::test(start_paused = true)]
 async fn global_answers_take_no_per_entity_slots() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1478,9 +1447,7 @@ async fn global_answers_take_no_per_entity_slots() {
     );
 }
 
-/// Any authenticated reader may see a global entity, so a fresh global snapshot
-/// serves every read context, whoever read it first, even after that reader's
-/// absence for another key; anonymous calls still bypass.
+/// An unrelated miss leaves the global snapshot available. Anonymous reads still bypass it.
 #[tokio::test(start_paused = true)]
 async fn any_authenticated_context_reads_a_fresh_global_snapshot() {
     let registry = global_registry();
@@ -1512,8 +1479,6 @@ async fn any_authenticated_context_reads_a_fresh_global_snapshot() {
     assert_eq!(read_keys(&registry), 3, "anonymous calls bypass the cache");
 }
 
-/// Sharing never extends a snapshot's own freshness: a stale global snapshot is
-/// revalidated, once, for whoever reads it next.
 #[tokio::test(start_paused = true)]
 async fn a_stale_global_snapshot_is_revalidated_for_its_next_reader() {
     let registry = global_registry();
@@ -1535,8 +1500,6 @@ async fn a_stale_global_snapshot_is_revalidated_for_its_next_reader() {
     );
 }
 
-/// Every reader sees a global entity, so a tenant read's `not_found` for one is
-/// everyone's absence: it drops the shared snapshot.
 #[tokio::test(start_paused = true)]
 async fn a_global_absence_drops_the_shared_snapshot() {
     let registry = global_registry();
@@ -1566,8 +1529,6 @@ async fn a_global_absence_drops_the_shared_snapshot() {
     assert_eq!(read_keys(&registry), before + 1);
 }
 
-/// A global absence invalidates the entity even if its snapshot was evicted while
-/// the read was in flight, so an older positive answer cannot refill it.
 #[tokio::test(start_paused = true)]
 async fn a_global_absence_fences_a_refill_after_an_eviction_in_flight() {
     let registry = global_registry();
@@ -1629,8 +1590,6 @@ async fn a_global_absence_fences_a_refill_after_an_eviction_in_flight() {
     );
 }
 
-/// A reply contradicting the class of the snapshot its read started from is refused,
-/// even after that snapshot was evicted.
 #[tokio::test(start_paused = true)]
 async fn a_reply_contradicting_its_evicted_snapshot_is_refused() {
     let registry = global_registry();
@@ -1669,8 +1628,7 @@ async fn a_reply_contradicting_its_evicted_snapshot_is_refused() {
     );
 }
 
-/// The class known when a read starts binds its reply even when the read had no
-/// snapshot of its own: another tenant's, evicted in flight, still told the class.
+/// The original class came from a snapshot that this tenant could not use.
 #[tokio::test(start_paused = true)]
 async fn a_reply_contradicting_another_tenants_evicted_snapshot_is_refused() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1721,8 +1679,7 @@ async fn a_reply_contradicting_another_tenants_evicted_snapshot_is_refused() {
     );
 }
 
-/// The plan keeps what it knew at the start: evicting the remembered global pair while
-/// the reads are in flight neither unclassifies the absence nor unfences either key.
+/// Eviction must preserve both the global classification and the fence on both keys.
 #[tokio::test(start_paused = true)]
 async fn an_absence_keeps_the_global_class_its_plan_knew() {
     let registry = global_registry();
@@ -1781,8 +1738,6 @@ async fn an_absence_keeps_the_global_class_its_plan_knew() {
     );
 }
 
-/// What becomes known meanwhile counts too: an absence planned before anything was
-/// known about the entity drops the global snapshot another reader filled in flight.
 #[tokio::test(start_paused = true)]
 async fn an_absence_drops_a_snapshot_classified_global_in_flight() {
     let registry = global_registry();
@@ -1822,8 +1777,6 @@ async fn an_absence_drops_a_snapshot_classified_global_in_flight() {
     );
 }
 
-/// A reply naming the read's remembered identifier with another Registry Reference is
-/// refused, even after the remembered pair was evicted in flight.
 #[tokio::test(start_paused = true)]
 async fn a_reply_contradicting_the_tickets_remembered_pair_is_refused() {
     let registry = global_registry();
@@ -1861,8 +1814,6 @@ async fn a_reply_contradicting_the_tickets_remembered_pair_is_refused() {
     );
 }
 
-/// A changed validator answering this reader's own condition is an observed change
-/// even when its snapshot was evicted in flight: no tenant's older snapshot survives.
 #[tokio::test(start_paused = true)]
 async fn a_changed_validator_after_the_readers_snapshot_left_drops_every_tenants() {
     let registry = Arc::new(TenantRegistry::new([]));
@@ -1915,8 +1866,6 @@ async fn a_changed_validator_after_the_readers_snapshot_left_drops_every_tenants
     );
 }
 
-/// An authoritative global absence fences reads taken after an intervening event even
-/// with nothing resident to drop, so an older positive reply cannot refill the entity.
 #[tokio::test(start_paused = true)]
 async fn a_global_absence_with_nothing_resident_still_fences_older_fills() {
     let registry = global_registry();
@@ -1978,9 +1927,7 @@ async fn a_global_absence_with_nothing_resident_still_fences_older_fills() {
     );
 }
 
-/// A changed validator answering the read's own condition retires other tenants'
-/// snapshots even when the reply is too large to keep and the reader's own smaller
-/// snapshot already carries it.
+/// The reader already holds a smaller snapshot under the new validator.
 #[tokio::test(start_paused = true)]
 async fn an_oversized_reply_to_a_changed_condition_retires_other_tenants_snapshots() {
     let registry = Arc::new(TenantRegistry::new([]));

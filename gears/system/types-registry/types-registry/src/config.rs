@@ -277,9 +277,8 @@ pub struct CacheSettings {
     pub max_size_bytes: ByteSize,
     /// Maximum number of snapshots per cache. Zero disables snapshot retention.
     pub max_entries: usize,
-    /// Identity LRU entries per cache, without expiry. Zero leaves resolution to
-    /// fresh snapshots or the registry. A tenant cache answers a pair only to a read
-    /// context that the registry showed it to.
+    /// Maximum ID/UUID pairs per cache, retained without expiry. Zero resolves
+    /// via eligible snapshots or the registry. See [`types_registry_sdk::CacheSettings`].
     pub max_identity_entries: usize,
     /// The legacy client's type-schema cache.
     pub type_schemas: SingleCacheSettings,

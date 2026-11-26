@@ -1,31 +1,25 @@
-//! The client-side representation cache (SPEC §8.3, DESIGN "The client-side cache").
+//! Client-side representation cache (SPEC §8.3, DESIGN "The client-side cache").
 //!
-//! # One batch read
+//! # Batch reads
 //!
-//! 1. Plan under the lock. A hit requires a fresh snapshot covering the projection
-//!    and, for tenant reads, visibility confirmed to the same read context (subject,
-//!    its type, home tenant and token scopes). A tenant read uses only the shared
-//!    snapshot of a global entity or the one read for its own tenant
-//!    ([`Scope`](store::Scope)): `ownership` is relative to the reader. `fresh`
-//!    forces a fetch.
-//! 2. Fetch remote keys in one `batchGet` outside the lock. A **pinned** read holds
-//!    a snapshot covering the projection and sends its `ETag`. Other reads forward
-//!    the caller's applicable validator.
-//! 3. Verify the whole batch, merge fields with matching `ETags` and build the response.
-//!    `Unchanged` confirms either the pinned snapshot ([`Verified::Confirmed`]) or
-//!    the caller's validator ([`Verified::Matched`]). A caller match confirms a
-//!    matching resident entry or drops a conflicting one.
+//! 1. Under the lock, look up a fresh snapshot covering the projection in the reader's
+//!    [scope](store::Scope). Tenant-owned hits also require that read context's visibility
+//!    confirmation. For registry reads, pin any covering snapshot. `fresh` forces a fetch.
+//! 2. Outside the lock, send one `batchGet` for all remote keys. Use the pinned
+//!    snapshot's `ETag` if available, otherwise the caller's applicable validator.
+//! 3. Verify the whole batch before merging fields with matching validators.
+//!    `Unchanged` confirms either the [pinned snapshot](Verified::Confirmed) or the
+//!    [caller's validator](Verified::Matched). A caller match confirms a matching
+//!    resident entry or drops a conflicting one.
 //! 4. Commit identities and snapshots under the lock. A tenant read's `NotFound`
-//!    revokes that read context's confirmation and fences its pending reads.
+//!    revokes that context's confirmation and fences its pending confirmations.
 //!
 //! # Why reads take tickets
 //!
-//! `ETags` cannot order revisions. A **ticket** records the event counter and the
-//! key's **spelling** (GTS ID, UUID or known pair) before the fetch. A read is
-//! **quiet** if no intervening event could concern that entity. Otherwise the event
-//! **fences** the read. A fenced reply can drop a conflicting snapshot but cannot
-//! fill or refresh one. For example, if the client observes a successful registration
-//! while a read is in flight, the old reply reaches its caller without refilling the cache.
+//! `ETags` cannot order revisions. Each read pins its key (GTS ID, UUID or known pair)
+//! and the event counter at lookup. If an intervening event could affect the entity,
+//! the reply can invalidate a conflicting snapshot but cannot fill or refresh one.
+//! The caller still receives the reply.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -59,22 +53,19 @@ use store::{ContextTicket, Held, ReadContext, Scope, Store, Ticket, Usage, Weigh
 /// Freshness and retention limits for Types Registry client caches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheSettings {
-    /// `0` is meaningful: every snapshot read revalidates.
+    /// Zero revalidates every snapshot read.
     pub freshness_window: Duration,
     /// Charges compact JSON documents (including selected `null`), GTS ID bytes,
     /// raw validator bytes and 256 bytes per entry. LRU eviction enforces the
     /// budget. Oversized entries bypass retention. Heap usage may be higher.
     pub max_size_bytes: usize,
-    /// Maximum number of resident snapshots. Zero disables snapshot retention and,
-    /// in a tenant cache, which uses the same limit for its visibility records,
-    /// every local tenant answer except a known-global pair from the identity LRU.
+    /// Maximum snapshots per cache. The tenant cache separately caps visibility
+    /// confirmations at this limit. At zero, only known-global pairs can hit on the tenant plane.
     pub max_entries: usize,
-    /// Identity LRU limit. Zero leaves resolution to resident snapshots or the registry.
-    /// A tenant cache answers a pair known global — classified by a read or discovery —
-    /// to every authenticated read context, from a resident snapshot whatever its
-    /// freshness or from this LRU. Any other pair it answers only to a read context
-    /// the registry showed it to within the window, so a zero window leaves only
-    /// known-global pairs to local tenant resolution.
+    /// Maximum remembered ID/UUID pairs. Zero resolves via snapshots or the registry.
+    /// Tenant resolution of a known-global pair can use a snapshot of any age. Other
+    /// pairs require a fresh confirmation for the read context. With a zero freshness
+    /// window, only known-global pairs resolve locally on the tenant plane.
     pub max_identity_entries: usize,
 }
 
@@ -150,9 +141,8 @@ enum Plan {
         sent: Option<Validator>,
         /// This read's ticket, taken with its lookup.
         ticket: Ticket,
-        /// The entity's scope if known when the read started, by any of its snapshots
-        /// or its remembered pair — even another tenant's, which the read may not use —
-        /// any of which may be gone before the answer arrives.
+        /// Ownership class at lookup, retained across eviction even if learned
+        /// from another tenant's snapshot.
         class: Option<OwnershipScope>,
     },
 }
@@ -401,7 +391,7 @@ impl ReadCache {
             .zip(verified)
             .filter_map(|((_, plan), answer)| identified(plan, answer.as_ref()))
             .map(|snapshot| (snapshot.gts_uuid, OwnershipScope::of(snapshot.ownership)));
-        // The pair a read's ticket started with may be evicted by now; it still binds both keys.
+        // A ticket's pair still binds both keys after eviction.
         for ((_, plan), answer) in plans.iter().zip(verified) {
             if let (Plan::Remote { ticket, .. }, Some(Verified::Found { snapshot, .. })) =
                 (plan, answer)
@@ -416,8 +406,7 @@ impl ReadCache {
                 .create());
             }
         }
-        // The snapshots and pair that told a read its class may be evicted by now; the
-        // class still binds the answer.
+        // The ownership class at lookup still binds the reply after eviction.
         for ((asked, plan), answer) in plans.iter().zip(verified) {
             if let (
                 Plan::Remote {
@@ -644,12 +633,8 @@ impl ReadCache {
             if !seen.insert(&item.key) {
                 continue;
             }
-            // The caller's validator must cover this key and projection.
             let caller = item.if_none_match_for(&request.projection).cloned();
-            // Use only snapshots that carry the requested key and answer this reader:
-            // a tenant-owned snapshot read for another tenant is not even a pin.
-            // Any authenticated reader may see a global snapshot; others need their
-            // own confirmation.
+            // Only the reader's scope can supply a pin. Global hits need no visibility proof.
             let global = store
                 .peek(&item.key, reader)
                 .is_some_and(|entry| entry.snapshot.meta().ownership == Ownership::Global);
@@ -825,20 +810,15 @@ fn commit(
         else {
             continue;
         };
-        // A tenant read's absence may be its own visibility, so the shared snapshot
-        // stays — unless it is global: every authenticated reader sees a global entity,
-        // so its absence is everyone's.
-        // What the plan held counts as much as what is resident now: an eviction in
-        // flight must not turn a global absence back into a private one.
+        // A tenant miss invalidates shared content only for a known-global entity.
+        // Check ownership at lookup and at commit to account for intervening evictions and fills.
         let global = *class == Some(OwnershipScope::Global) || store.key_known_global(asked);
         let absent = matches!(verified, Verified::NotFound);
         if context.is_some() && absent && !global {
             continue;
         }
-        // An absence with no snapshot to name the pair fences both keys of the pair the
-        // read started with.
+        // A miss still fences both keys if the ticket retained their pair.
         let pair = stated(plan, verified).or_else(|| absent.then(|| ticket.pair()).flatten());
-        // The validator of the entry that carries the spelling asked and answers this reader.
         let current = store.peek(asked, reader).map(|entry| entry.etag.clone());
         if !quiet {
             fence(
@@ -877,9 +857,7 @@ fn commit(
                         );
                     }
                     _ if same => {
-                        // Too large to keep, but this reader's snapshot already carries
-                        // the validator. A change from the condition sent still retires
-                        // other tenants' older snapshots.
+                        // Keep the smaller matching snapshot. A changed condition still retires siblings.
                         if sent.as_ref().is_some_and(|held| held != etag) {
                             store.retire_siblings(asked, reader);
                         }
@@ -894,7 +872,6 @@ fn commit(
                     store.confirm(asked, &ours.etag, sent_at, reader);
                 }
             }
-            // Confirm a matching resident validator and invalidate a conflicting one.
             Verified::Matched(etag) => match current {
                 Some(held) if held == *etag => store.confirm(asked, etag, sent_at, reader),
                 Some(_) => store.invalidate(asked, pair),
@@ -947,9 +924,7 @@ fn fence(
         Verified::Confirmed => resident.is_some_and(|ours| current == Some(&ours.etag)),
         Verified::NotFound => current.is_none(),
     };
-    // Evidence about the entity whatever this reader still holds: a changed validator
-    // answering the condition the read sent, or an authoritative absence (a tenant's
-    // private one never gets here).
+    // A changed condition or authoritative absence applies across reader scopes.
     let changed = match verified {
         Verified::Found { etag, .. } => sent.is_some_and(|held| held != etag),
         Verified::NotFound => true,
@@ -958,8 +933,7 @@ fn fence(
     if changed || current.is_some() && !agrees {
         store.invalidate(asked, pair);
     } else if !agrees {
-        // Nothing of this reader's scope to discard: another scope's snapshot, filled
-        // meanwhile, is no evidence of a conflict. Still fence older reads.
+        // Another scope's fill alone proves no conflict. Still fence older reads.
         store.record(asked, pair);
     }
 }
@@ -1217,19 +1191,16 @@ impl PlatformTypesRegistryApi for CachedPlatformTypesRegistry {
     }
 }
 
-/// Local or REST cache with one visibility confirmation per entity and read context:
-/// the subject, its type, home tenant and token scopes. From P1 the registry scopes
-/// reads per subject by ownership constraints the cache cannot apply, so confirmations are never
-/// shared between read contexts.
-/// A global entity's snapshot is shared by every tenant; a tenant-owned one is kept
-/// per home tenant, since its `ownership` is relative to the reader, and tenants'
-/// snapshots of one entity share equal documents. Pass a lookup to
-/// [`BatchGetItem::revalidate`] only for the tenant it was read for.
-/// The identity LRU is shared; a pair resolves locally only for a
-/// read context that a read or resolution showed it to within the window, unless it
-/// is known global: every authenticated reader may see a global entity, so a fresh
-/// global snapshot serves every authenticated context. Anonymous calls bypass the
-/// cache. REST misses require the caller's bearer.
+/// Tenant cache for local and REST clients. All authenticated readers share fresh
+/// global snapshots. Tenant-owned snapshots are per home tenant because `ownership`
+/// is reader-relative. Reuse a [`BatchGetItem::revalidate`] lookup only for that tenant.
+/// Snapshots of one entity share byte-identical documents.
+///
+/// The registry enforces visibility. For entities not known global, a local answer
+/// requires a fresh confirmation for the same subject, subject type, home tenant and
+/// raw token scopes. A read can confirm content and identity. A resolution confirms
+/// only the pair. Known-global pairs serve all authenticated readers. Anonymous calls
+/// bypass the cache. REST misses require the caller's bearer.
 pub struct CachedTypesRegistry {
     inner: Arc<dyn TypesRegistryApi>,
     cache: ReadCache,
@@ -1244,12 +1215,9 @@ impl std::fmt::Debug for CachedTypesRegistry {
 }
 
 impl CachedTypesRegistry {
-    /// Cache reads from `inner` using `settings`.
-    ///
-    /// `inner` must let every authenticated reader see every global entity, and gate
-    /// `batch_get_entities` and `batch_resolve_identities` alike: a global snapshot
-    /// read for one context serves all. The Types Registry local and REST clients
-    /// qualify.
+    /// Cache reads from `inner` using `settings`. Both Types Registry transports
+    /// meet the required contract. Every authenticated reader sees global entities,
+    /// and batch reads and resolutions enforce the same access rules.
     #[must_use]
     pub fn new(inner: Arc<dyn TypesRegistryApi>, settings: CacheSettings) -> Self {
         Self {

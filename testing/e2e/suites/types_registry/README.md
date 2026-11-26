@@ -1,12 +1,6 @@
 # Types Registry e2e suite
 
-Numbered e2e scenarios cover asynchronous admission (`202` + `GET /operations/{id}`),
-exact and batch reads, resolution, discovery and both API planes. Workflows default
-to `/types-registry/v2/platform/` with the internal token. Tenant read scenarios
-use `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit client
-and API path for either plane, including future tenant mutations. The
-[legacy suite](legacy/README.md) covers synchronous v1 (`200` + `results`)
-and has no reserved scenario IDs.
+Numbered e2e scenarios cover asynchronous admission (`202` + `GET /operations/{id}`), exact and batch reads, resolution, discovery and both API planes. Workflows default to `/types-registry/v2/platform/` with the internal token. Tenant read scenarios use `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit client and API path for either plane, including future tenant mutations. The [legacy suite](legacy/README.md) covers synchronous v1 (`200` + `results`) and has no reserved scenario IDs.
 
 ## Scenario index
 

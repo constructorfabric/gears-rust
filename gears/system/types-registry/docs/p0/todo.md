@@ -2990,20 +2990,12 @@ Rust API; REST contracts and dependency versions are unchanged.
 
 **Description:** Port the cache to the new `Entity` models as an SDK decorator over any `dyn PlatformTypesRegistryApi`, covering local and REST clients before T38's cutover (SPEC §8.3, DESIGN §3.3, P7/P22). T22d validators enable revalidation; T22b supplies projection isolation. Visibility and Context-Tenant dimensions stay fixed until P1 tenancy.
 
-**Delivered** in `TR-SDK/src/cache/` as `CachedPlatformTypesRegistry`,
-`CachedTypesRegistry` and `CacheSettings`. Both keys address one snapshot
-using the pair supplied by the registry. Platform identities have a separate LRU.
+**Delivered** in `TR-SDK/src/cache/` as `CachedPlatformTypesRegistry`, `CachedTypesRegistry` and `CacheSettings`. Registry-issued ID/UUID pairs index snapshots under both keys. The identity LRU has its own limit.
 
-- The late-fill guard orders events because validators cannot order revisions.
-  Reads pin tickets until completion, failure or drop. If a mutation or another
-  answer intervenes, the old read cannot fill. A conflicting reply drops the
-  resident snapshot so the next call refetches. Keys in one batch are checked
-  against the same pre-batch event state.
-- Missing or unexpected keys, wrong identities or fields, and `Unchanged`
-  without a matching sent validator fail the whole read as `Internal`. Only
-  the caller's own matching condition can yield `Unchanged` to that caller.
-- Empty and oversized batches go to the inner client intact. The registry
-  checks forwarded validator lengths.
+- Validators cannot order revisions. All tickets in a batch are checked against the same pre-commit event state and released on completion, error or drop.
+  A fenced reply cannot fill the cache and drops a conflicting resident snapshot.
+- Missing or unexpected keys, wrong identities or fields, and `Unchanged` with the wrong or missing validator fail the whole read as `Internal`. Only a match on the caller's own condition returns `Unchanged` to the caller.
+- Forward invalid batch sizes intact. The registry checks forwarded validator lengths.
 
 **Acceptance criteria:**
 - [x] Cache is typed on `Entity`; the `GtsTypeSchema` / `GtsInstance` implementation keeps serving the old trait until T38 deletes both
@@ -3021,7 +3013,7 @@ using the pair supplied by the registry. Platform identities have a separate LRU
 - [x] Never cached, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource
 - [x] An entry tracks the normalized set of fields it can serve. The tenant cache checks visibility separately from field coverage
 - [x] `freshness_window`, `max_size_bytes` and `max_entries` configure the snapshot cache; the four old keys become accepted-and-ignored in T38, when the old cache goes
-- [x] The tenant API shares a global snapshot across tenants and keeps a tenant-owned snapshot per reader tenant, sharing equal documents; it serves a fresh global snapshot to every authenticated read context and other snapshots only after the registry confirms them for the same read context (SPEC §8.3)
+- [x] Authenticated readers share fresh global snapshots. Tenant-owned snapshots are per reader tenant, share byte-identical documents in the same field, and require confirmation for the same read context (SPEC §8.3).
 
 **Verification:**
 - [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (runs SDK cache tests), plus `cargo test -p cf-gears-types-registry` for adapter parity

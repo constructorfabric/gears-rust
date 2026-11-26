@@ -657,11 +657,11 @@ The metatype is declared through the ordinary inventory path of §3.3, marked `x
 
 - [ ] `p1` - **ID**: `cpt-cf-types-registry-tech-read-authorization`
 
-Reads are authorized under two actions of their own, `read` and `list`, and those govern tenant-owned entries only. Global entries are platform contracts: every authenticated subject reads them on either plane, subject to lifecycle and availability. `cpt-cf-types-registry-fr-tenant-ownership` keeps tenant-owned entries authorized as well as visible; `cpt-cf-types-registry-fr-externally-managed-entities` names authorization in the invariant list every result passes before exposure.
+On the tenant plane, `read` and `list` constrain tenant-owned entries. Global contracts are readable on both planes, subject to authentication, lifecycle and availability. These rules apply to managed and external results (`cpt-cf-types-registry-fr-tenant-ownership`, `cpt-cf-types-registry-fr-externally-managed-entities`).
 
-Visibility cannot stand in for that check on tenant-owned entries because it is a property of the requesting **tenant**. Without a grant, every subject of a tenant — an ordinary end user, a narrowly scoped third-party token, a leaked service credential — reads every contract that tenant can see, and a tenant's own types describe its product's structure. Global contracts carry no such secret, and no grant closes them to an authenticated subject. `cpt-cf-adr-two-plane-auth` also puts the `PolicyEnforcer` on the tenant-plane path for entity state; AuthZ exemption belongs to the platform plane alone.
+Visibility follows the tenant. A scoped third-party token would otherwise see every contract its tenant can see, including types that describe its product's structure. The tenant plane therefore applies the `PolicyEnforcer` per subject (`cpt-cf-adr-two-plane-auth`).
 
-**One evaluation per request, enforced per row.** Every tenant-plane exact read, resolution and discovery request takes one decision under its action — `read` for `batchGet` and `batchResolve`, `list` for discovery — before the ancestor chain is fetched and before any entity lookup. It asks with `require_constraints: true` and advertises two properties in `supported_properties`: `ownership_scope` and `owner_tenant_id`. The PDP either denies, which excludes every tenant-owned row, or allows under constraints over those two properties. The registry compiles them into the tenant-owned branch of its own visibility fence:
+**One evaluation per request, enforced per row.** Before fetching ancestors or entities, evaluate `read` for exact reads, `batchGet` and `batchResolve`, or `list` for discovery. Set `require_constraints: true` and advertise `ownership_scope` and `owner_tenant_id` in `supported_properties`. Compile the full decision into the tenant-owned branch of the visibility predicate.
 
 ```text
 ownership_scope = GLOBAL
@@ -670,27 +670,27 @@ OR (ownership_scope = TENANT
     AND (<the PDP's whole DNF, compiled; FALSE on a deny>))
 ```
 
-The DNF is grouped whole inside the tenant branch, so a branch that names only `ownership_scope` can never reach a tenant-owned row outside the fence, and no constraint touches a global row: tenant isolation comes from the fence, not from the compiler accepting a branch.
+Grouping the whole DNF inside the tenant branch preserves the ancestor check even when a branch constrains only `ownership_scope`. Global rows remain readable.
 
 The block is schematic over logical values; `database.sql` encodes the scope as a smallint and forces `owner_tenant_id` NULL for a global row. The chain comes from the Tenant Hierarchy Client of §3.2 — cached, barrier traversal disabled, its version in the freshness validator — and the predicate rides `idx_tr_entity_visibility` on `(ownership_scope, owner_tenant_id, lifecycle_status, gts_id)`, whose chunking that file already describes as one global range plus one range per ancestor. Lifecycle is not part of visibility: a deleted entity still resolves, carrying deleted state.
 
-A key the constraints exclude answers `not_found`, exactly like an invisible or unissued one, so a restriction on one subject never discloses existence and `EntityLookup` keeps its four states. The three request shapes share one decision shape. A `batchGet` of 500 keys, a `batchResolve` and a discovery page each cost one evaluation, which `cpt-cf-types-registry-nfr-lookup-latency` can afford. Managed discovery needs no fetch-and-filter loop and no short pages, because the predicate rides the query before the page limit. Federated results, which the managed table does not hold, pass the same fence and compiled predicates in memory before exposure, where federated paging already allows short pages.
+Excluded, invisible and unissued keys all return `not_found`, preserving the four `EntityLookup` states. Even a 500-key `batchGet`, a batch resolution or a discovery page costs one evaluation (`cpt-cf-types-registry-nfr-lookup-latency`). Managed discovery filters before the page limit, keeping pages full. Federated results pass the same checks in memory before exposure and may yield short pages.
 
 The enforcer's fail-closed rules apply unchanged. An explicit deny excludes tenant-owned rows rather than refusing the request, so global entries stay readable. An allow without constraints is a compilation failure (500), never a fallback to the fence. An unknown operator rejects the response; a branch naming an unadvertised property is discarded and logged, and a response left without a valid branch is rejected. Reads opt into `allow_empty_scope`: a valid scope that matches nothing, such as `in(ownership_scope, [])`, excludes tenant-owned rows like a deny, so their keys answer `not_found` and discovery lists global entries only.
 
 The fence is never PDP-derived: constraints only narrow its tenant-owned branch. A policy can therefore scope one subject's data — a narrowly scoped token kept to global contracts, or to contracts owned by the subject tenant while those owned by its ancestors stay hidden, the shape the §3.3 discovery scope selector offers only as caller intent — but cannot widen it. An ancestor still cannot read a descendant's catalogue, which would take a vantage tenant of its own, capped locally at `descendants_inclusive(subject_tenant)`; ADR-0009 confines cross-boundary access to operator flows — a deletion Dry Run's dependents and purge reports — and no requirement asks for more.
 
-**The chain is the subject's, never the Context Tenant's**, which `cpt-cf-types-registry-fr-tenant-ownership` states as a requirement rather than leaving to design. The two coincide by default on this plane, so the difference surfaces only when a caller names a descendant — and there, using the Context Tenant would hand an ancestor that descendant's private contracts for the asking. Constraints only narrow the fence, so policy cannot compensate, which is exactly why the rule lives here rather than in policy. The Context Tenant's chain is fetched only when one is named and availability is selected, cached separately, and used for availability alone (ADR-0010).
+Visibility always uses the **subject tenant's ancestor chain** (`cpt-cf-types-registry-fr-tenant-ownership`). Using a named descendant's chain would expose that descendant's private contracts to its ancestor. Fetch and cache the named Context Tenant's chain separately only when availability is selected (ADR-0010).
 
 `in_tenant_subtree` is not advertised, although it looks like the predicate this gear should take. It requires a `tenant_closure` projection the registry does not hold, and its direction is the opposite of the one needed: it scopes owners downward from a root, while contract visibility runs upward from the subject. `eq` and `in` over the two advertised properties express every restriction above.
 
 **Reads are not Region-scoped in P1.** `gts_id` stays out of `supported_properties` (*The PDP resource shape*): a Region is a prefix match that no standard predicate expresses. P1 therefore cannot say "this third-party token reads only `gts.acme.*`". Adding it takes a prefix predicate in the AuthZ SDK, after which `gts_id` joins the advertised properties and the same compilation applies to exact reads and discovery alike, with no protocol change here.
 
-The decision — a deny or a set of constraints — is cached, because `cpt-cf-types-registry-nfr-lookup-latency` does not survive a PDP round trip per read. The cache follows the platform's rules (authorization DESIGN, *Authorization Decision Caching*): the key covers every decision-relevant input — subject and its attributes, `token_scopes`, action, resource type, tenant context, supported properties, capabilities (fixed empty for this PEP), `require_constraints`, and any credential-derived plugin input — reuse is bypassed whenever equivalence is uncertain, and no entry outlives the shorter of the PDP's TTL and the presenting token's validity. This is the one authoritative decision the gear takes from process-local state, so §1.3's rule against that is bounded here rather than excepted. Allow and deny are cached alike, so a revoked grant keeps working and a freshly issued one stays inert until that bound. Constraints name no entity, so one entry serves every key of every request with the same inputs.
+Cache allow and deny decisions under the platform rules (*Authorization Decision Caching*) to meet `cpt-cf-types-registry-nfr-lookup-latency`. The cache key covers subject and attributes, `token_scopes`, action, resource type, tenant context, supported properties, capabilities (empty for this PEP), `require_constraints` and credential-derived plugin inputs. Skip reuse when equivalence is uncertain. Constraints are entity-independent, so one decision serves all keys with the same inputs. This bounds the process-local authority allowed by §1.3. Cached decisions may delay new or revoked grants only until the earlier of PDP expiry and token expiry.
 
-The client-side cache keeps evidence, not decisions. Global entries are readable by every authenticated subject, so a fresh global snapshot serves every authenticated read context of its representation scope (*The client-side cache*). Tenant-owned entries need per-entity proofs, keyed by the entity and a read context — subject, subject type, home tenant and raw token scopes, with Context Tenant joining once the SDK carries it — and C6 of the P0 SPEC lists what must hold before it reuses PDP-backed answers, credential equivalence and expiry among them. The SDK cannot apply constraints itself — snapshots carry no owner tenant, and a REST client never sees the PDP's answer — so a tenant cache keeps positive answers for tenant-owned entities per entity and read context, never shares one between subjects of one tenant, and takes none from discovery. The snapshot such an answer confirms is the one read for that Context Tenant, since `ownership` is relative to it (*The client-side cache*).
+The SDK sees neither owner IDs nor, over REST, PDP decisions. It can reuse a fresh global snapshot within its representation scope. For tenant-owned entities it needs a registry-confirmed read for the same entity and read context. Discovery supplies no such proof. See [The client-side cache](#the-client-side-cache) for scope and keying, and P0 SPEC C6 for credential equivalence and expiry before reusing PDP-backed answers.
 
-Naming a Context Tenant travels in `tenant_context.root_id` so that policy may condition on it. It does not move the relation check: the platform must authorize the subject-to-context relation, and §3.3 discharges that through the PDP-authorized `tenant-resolver.is_ancestor` call, which the read decision neither replaces nor duplicates. A cached decision could not stand in for it anyway, because that call also yields the chain version the validator carries.
+Pass a named Context Tenant in `tenant_context.root_id` for policy evaluation. Separately, the PDP-authorized `tenant-resolver.is_ancestor` call verifies the subject-to-context relation and supplies the validator's chain version (§3.3).
 
 Planes divide as everywhere else. A platform gear's startup reconciliation batch-reads under `PlatformSecurityContext` and is exempt; a tenant-plane registrant's reconciliation read sees its tenant-owned entities only under `read`, like any other tenant read, which is why `cpt-cf-types-registry-tech-inventory-registration` step 1 is subject to this subsection.
 
@@ -705,7 +705,7 @@ Four Instances of `gts.cf.toolkit.authz.permission.v1~`, submitted through the s
 | `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_read.v1` | `read` | once per request, constraints over ownership, Region-free in P1 |
 | `gts.cf.toolkit.authz.permission.v1~cf.types_registry._.entity_list.v1` | `list` | once per request, constraints over ownership, Region-free in P1 |
 
-`resource_type` is the bare metatype in all four. A write grant is narrowed to a Region through the binding; a read grant narrows by ownership through constraints, never by Region in P1. The release ships baseline `read` and `list` for every authenticated tenant subject, because a domain gear expanding a type filter under an end user's context would otherwise see global types only. Since reads require constraints, the baseline states its allowance as one: `eq(ownership_scope, TENANT)`, which leaves the visibility fence as the only limit on tenant-owned rows. The baseline is a default the effective policy replaces, never a branch unioned with a restriction: a subject kept to its own tenant's contracts receives only `eq(owner_tenant_id, <its tenant>)`, and one kept to global contracts a deny, because a union with the baseline branch would restore everything. That baseline travels by the same deferred binding, so §4's prerequisite gates the documented default posture and not only the Region-scoped case. Once it lands the default is indistinguishable from a registry without read grants, and what the two actions add is a gate that exists — one a deployment can close or narrow by ownership for a subject's tenant-owned reads.
+All four permissions use the bare metatype as `resource_type`. Write grants bind a Region. P1 read grants constrain ownership. The release gives every authenticated tenant subject baseline `read` and `list` grants with `eq(ownership_scope, TENANT)`, so a gear expanding a type filter sees the user's visible subtree. Effective policy **replaces** this baseline. A subject limited to its own contracts receives only `eq(owner_tenant_id, <its tenant>)`. A subject limited to global contracts receives a deny. Unioning either restriction with the baseline would restore the full visible subtree. The baseline depends on the deferred binding in §4.
 
 Three absences are deliberate. `purge` has no permission because the grant-free platform plane gates it by deployment policy (ADR-0013). `GET /operations/{operation_id}` has none because it returns a request receipt rather than entity state, and its idempotency scope already binds plane, owning tenant, and principal more tightly than a grant would — the enforcer governs the entity-state reads above, not this receipt. Derivation has none because it is a `register` of the derived candidate, bounded by registration policy.
 
@@ -1020,18 +1020,12 @@ Deletion has two spellings of one operation. `:batchDelete` is a body-based cust
 
 ##### Conditional reads
 
-A matching `If-None-Match` on an exact read returns a bodyless `304` with the
-`ETag` ([RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified)).
-In `:batchGet`, each item carries its own `if_none_match` and each `unchanged` result
-returns its `etag`. The batch status stays `200`. The route refuses an
-`If-None-Match` header because it cannot express per-key conditions.
+A matching `If-None-Match` on an exact read returns a bodyless `304` with the `ETag` ([RFC 9110 §15.4.5](https://www.rfc-editor.org/rfc/rfc9110#name-304-not-modified)).
+In `:batchGet`, each item carries its own `if_none_match` and each `unchanged` result returns its `etag`. The batch status stays `200`. The route refuses an `If-None-Match` header because it cannot express per-key conditions.
 
-The registry recomputes one validator per entity state across projections. Send it
-only for its entity and a projection the held snapshot covers. The SDK binds both
-in its typed condition. Raw HTTP callers track them.
+The registry recomputes one validator per entity state across projections. Send it only for its entity and a projection the held snapshot covers. The SDK binds both in its typed condition. Raw HTTP callers track them.
 
-The same validator can move between an exact read and a `:batchGet` item for the
-same entity when the held representation covers the requested `$select`.
+The same validator can move between an exact read and a `:batchGet` item for the same entity when the held representation covers the requested `$select`.
 
 | Surface | Hands the validator out as | Takes it back as |
 |---|---|---|
@@ -1057,23 +1051,14 @@ Per `cpt-cf-types-registry-principle-derive-not-store`, validators are computed 
 | routing generation | — | ✓ |
 | `external_revision` | — | ✓, verbatim |
 
-External validators include routing generation to reject tokens from an old source
-(ADR-0011). Only Type Schemas have a `resolution_fingerprint`. Tenant-plane reads
-include the subject visibility chain. A named Context Tenant contributes its
-identifier and its chain to every projection, including those without availability:
-`ownership` and availability are relative to it, and a chain version alone could
-coincide between two tenants. One chain fills both roles when the tenants coincide.
+External validators include routing generation to reject tokens from an old source (ADR-0011). Only Type Schemas have a `resolution_fingerprint`. Tenant-plane reads include the subject visibility chain. A named Context Tenant contributes its identifier and its chain to every projection, including those without availability: `ownership` and availability are relative to it, and a chain version alone could coincide between two tenants. One chain fills both roles when the tenants coincide.
 
 The plugin token must be scoped to `(entity, tenant)` and change whenever any source-owned response field that affects the platform-visible result changes: canonical content, the effective artifacts of a Type Schema, source lifecycle, ownership scope, or source-owned tenant enablement. It need not change for platform-owned availability or visibility, which the chain-version inputs above cover; equal tokens under equal platform inputs therefore identify an equal platform-visible result. A plugin unable to guarantee this must always answer conditional reads as changed. The registry cannot verify that source-owned state, so it delegates the comparison.
 
 ##### Projection is not a validator input
 
-A shared validator lets the client merge projections of one state and confirm them
-with one conditional read. It remains strong under RFC 9110. Each `$select` is a
-separate URI, and the validator changes whenever any projection's bytes change.
-A dependency refresh may also change the validator for byte-identical `content`,
-causing an extra transfer. Equal validators can occur on different entities, so
-each comparison uses the accompanying key.
+A shared validator lets the client merge projections of one state and confirm them with one conditional read. It remains strong under RFC 9110. Each `$select` is a separate URI, and the validator changes whenever any projection's bytes change.
+A dependency refresh may also change the validator for byte-identical `content`, causing an extra transfer. Equal validators can occur on different entities, so each comparison uses the accompanying key.
 
 ##### Wire form
 
@@ -1315,11 +1300,7 @@ The single-entity spelling: one item's worth of `:batchDelete`, with the item sp
 
 This spelling carries no `publisher`, so it is a tenant-plane route only; on the platform plane a deletion goes through `:batchDelete`.
 
-**Deletion uses `expected_resource_version` from the entity body.** The read
-validator includes `resolution_fingerprint`, which the write precondition omits
-and the worker's drift check still uses. Both deletion routes refuse `If-Match`
-to avoid giving one resource two incompatible token formats or accepting a
-condition they cannot enforce (RFC 9110 §13.1.1).
+**Deletion uses `expected_resource_version` from the entity body.** The read validator includes `resolution_fingerprint`, which the write precondition omits and the worker's drift check still uses. Both deletion routes refuse `If-Match` to avoid giving one resource two incompatible token formats or accepting a condition they cannot enforce (RFC 9110 §13.1.1).
 
 **A precondition failure stays asynchronous.** The split is by mistake class, not by route:
 
@@ -1800,56 +1781,19 @@ Kind narrowing costs no round trip: the kind is the trailing `~` of the identifi
 
 The P1 SDK cache required by `cpt-cf-types-registry-fr-client-cache` lives in each consumer, not the registry. Server-side and replica caches validate against committed tokens before use. The SDK cache instead makes the explicit bounded-freshness trade below and offers authoritative reads through `fresh` or a zero window.
 
-Each client instance stores one snapshot per entity and representation scope:
-the Context Tenant whenever the representation depends on it, one shared scope
-otherwise. `ownership` of a tenant-owned entity depends on it — an owner reads
-`context_tenant` where its descendant reads `ancestor_tenant`, possibly under one
-validator — and so, once availability is tenant-relative, does any entity read with
-`availability`, global ones and platform reads naming a Context Tenant included. P0
-has no availability, so there a global entity, and every platform snapshot, has one
-shared scope. The identity pair never depends on the reader and stays shared. A
-read never answers from, pins, merges into or confirms a snapshot of another scope.
-Byte-identical compact JSON in the same document field of an entity's snapshots is
-held once, so the byte bound charges it once however many tenants hold it. It serves
-only fields it holds. A reply under the same validator adds fields if the merge
-fits. A new validator answering the read's own condition, or conflicting with the
-reader's own snapshot, drops the entity's other snapshots even when the replacement
-is too large to keep; the reader's own goes too, unless it already carries the new
-validator. The registry supplies the identifier and
-Registry Reference that address an entity's snapshots (ADR-0001).
+Each client indexes snapshots by the registry-issued ID/UUID pair (ADR-0001) and representation scope. In P0, global and platform snapshots are shared.
+Tenant-owned snapshots are per reader tenant because an owner sees `context_tenant` where a descendant sees `ancestor_tenant`, potentially under the same validator.
+Once availability is tenant-relative, selecting `availability` also scopes a snapshot to the Context Tenant, including global entities and platform reads naming one.
 
-The identity LRU learns positive pairs from checked reads, resolutions and discovery.
-It has its own entry limit and no expiry. A tenant client answers a pair known global
-— classified by a read or discovery — to every authenticated read context, and any other
-pair only to a read context that a read or resolution showed it to within the window. Observed mutations leave identities
-intact because tombstones still resolve. A lookup checks the identity LRU,
-then a fresh resident snapshot — or, for tenant resolution of a pair known global, any
-resident one — then `:batchResolve`. After purge or a logical registry
-change, recreate the cached client or restart its consumer.
+Reads, pins, merges and confirmations stay within one scope. A snapshot serves only covered fields and merges fields under the same validator if they fit.
+Across scopes, byte-identical compact JSON in the same document field of one entity is stored and charged once. A cold read in one scope leaves other snapshots to expire.
+A reply whose validator differs from the condition sent or the reader's resident snapshot invalidates sibling snapshots even when oversized. The reader's snapshot can survive if it already carries the new validator. Callers must likewise reuse a `BatchGetItem::revalidate` lookup only for its original tenant. The SDK checks entity and field coverage.
 
-A global entity's fresh snapshot serves every authenticated read context of its
-representation scope — all of them in P0 — and a tenant read's `NotFound` for one
-drops it, since its absence is everyone's. For other
-entities, a separate LRU holds up to `max_entries` confirmations keyed by entity and
-read context: subject, subject type, subject tenant — joined by the Context Tenant
-once the SDK carries one — and raw token scopes. Anonymous calls bypass it. `NotFound` revokes and
-fences that read context's confirmation. Refusals change none: a context reused
-after the registry refused its bearer keeps them until the window ends. Authorization
-and visibility changes can take effect at the next registry read, which `fresh`
-forces. The cache serves content the consumer already holds. Authorization
-remains the registry's responsibility. Read constraints select rows, not
-representations, so subjects of one Context Tenant share its snapshot while each read
-context keeps its own confirmation for tenant-owned entities. Global entities are
-readable by every authenticated subject, so a fresh global snapshot serves every
-authenticated read context of its scope, and a pair known global every authenticated
-read context, without a confirmation of its own. The
-class a read knows when it starts — from any scope's snapshot or the identity LRU —
-binds its reply, so a reply contradicting it fails even after those are evicted.
+A fresh global snapshot serves every authenticated context within its scope.
+A tenant read returning `NotFound` drops that snapshot. For other entities, subjects in the same Context Tenant share representation bytes, but visibility depends on registry-enforced read constraints. A separate LRU holds up to `max_entries` confirmations keyed by entity, subject, subject type, subject tenant and raw token scopes. Include the Context Tenant once the SDK carries it. `NotFound` revokes the affected confirmation and fences pending confirmations for that context. A bearer refusal leaves existing confirmations usable until expiry. Anonymous calls bypass the cache. Use `fresh` to check authorization and visibility at the registry.
 
-A snapshot read for one scope is not an observed mutation of another: a tenant whose
-first read meets a newer revision leaves other tenants' snapshots to their own windows.
-A caller that keeps its own lookups binds each to the tenant it read for:
-`BatchGetItem::revalidate` checks entity and coverage, not the reader.
+Identity pairs are shared across scopes. A bounded identity LRU learns positive pairs from checked reads, resolutions and discovery. Pairs have no expiry and survive mutations because tombstones still resolve. Resolution checks this LRU, then resident snapshots, then `:batchResolve`. Platform resolution requires a fresh snapshot on fallback. For tenant resolution, a pair classified as global by a read or discovery is visible to every authenticated context even from a stale snapshot.
+Other pairs require a read or resolution confirmed for the same context within the window. An ownership class known at lookup binds the reply even if its source is evicted. After purge or a logical registry change, recreate the client or restart its consumer.
 
 ##### Freshness window
 
