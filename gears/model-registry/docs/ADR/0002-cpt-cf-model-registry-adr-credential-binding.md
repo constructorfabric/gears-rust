@@ -168,7 +168,7 @@ Revisit triggers:
 * LLM Gateway loads credentials under an identity other than the evaluating caller's.
 * CredStore changes the `inheritance` or `own` semantics of `get_record`.
 
-Related: [CredStore ADR-0004](../../../credstore/docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (one record, `secret` only under `$select`, the basis for a metadata-only read), [CredStore ADR-0008](../../../credstore/docs/ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) (suppression), [CredStore ADR-0009](../../../credstore/docs/ADR/0009-cpt-cf-credstore-adr-no-ancestor-disclosure.md) (no owner in responses). The LLM Gateway side of the chain is `cpt-cf-llm-gateway-component-credential-broker-v1` and `cpt-cf-llm-gateway-constraint-key-destination-binding-v1` in the [LLM Gateway DESIGN](../../../llm-gateway/docs/DESIGN.md).
+Related: [CredStore ADR-0004](../../../credstore/docs/ADR/0004-cpt-cf-credstore-adr-secret-value-exposure.md) (one record, `secret` only under `$select`, the basis for a metadata-only read), [CredStore ADR-0008](../../../credstore/docs/ADR/0008-cpt-cf-credstore-adr-suppression-fallback.md) (suppression), [CredStore ADR-0009](../../../credstore/docs/ADR/0009-cpt-cf-credstore-adr-no-ancestor-disclosure.md) (no owner in responses). The LLM Gateway side of the chain is `cpt-cf-llm-gateway-constraint-no-credential-persistence-v1` and `cpt-cf-llm-gateway-constraint-key-destination-binding-v1` in the [LLM Gateway DESIGN](../../../llm-gateway/docs/DESIGN.md).
 
 ## Traceability
 
