@@ -1115,7 +1115,7 @@ mod tests {
         let row = |ownership_scope, owner_tenant_id| EntityRow {
             id: 1,
             gts_uuid: Uuid::nil(),
-            gts_id: "gts.cf.core.example.type.v1~".to_owned(),
+            gts_id: toolkit_gts::gts_id!("cf.core.example.type.v1~").to_owned(),
             entity_kind: EntityKind::TypeSchema,
             family_id: 1,
             ownership_scope,
@@ -1136,8 +1136,10 @@ mod tests {
         assert!(matches!(refused, ServiceError::CorruptDocument(_)));
         assert_eq!(
             refused.to_string(),
-            "a stored entity is invalid: entity 'gts.cf.core.example.type.v1~' is tenant-owned, \
-             which P0 never stores"
+            format!(
+                "a stored entity is invalid: entity '{}' is tenant-owned, which P0 never stores",
+                toolkit_gts::gts_id!("cf.core.example.type.v1~")
+            )
         );
     }
 

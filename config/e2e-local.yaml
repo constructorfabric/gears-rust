@@ -210,6 +210,13 @@ gears:
       # profile turns it off for TR-REG-902. Vendor `acme` is open only in that
       # suite's own namespace (TR-REG-904); every other region stays closed.
       allow_compatibility_force: true
+      # The RG and AM suites revise a schema through the REST API and expect
+      # the next RG/AM write to apply it. Under the default 30 s window their
+      # in-process clients keep serving the old snapshot, so revalidate every
+      # read here.
+      local_client:
+        cache:
+          freshness_window: 0s
       registration_policy:
         "gts.acme.e2e.*":
           allowed_vendors: [acme]
