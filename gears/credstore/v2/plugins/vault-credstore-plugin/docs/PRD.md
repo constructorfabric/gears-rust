@@ -288,7 +288,7 @@ The plugin **MUST** pass every check of the SDK conformance suite (`credstore_sd
 
 - [ ] `p1` - **ID**: `cpt-cf-credstore-vault-nfr-bounded-latency`
 
-Every Vault request **MUST** be bounded by `timeout_secs` (default 5 s). With the defaults a `put` therefore returns within about 10 s (two calls), a `get` or `delete_key` within about 15 s (three attempts plus backoff of at most 0.3 s) and a `destroy(Below)` within about 30 s (two calls). The gear's write-intent lease is far above the `put` bound by its own configuration floor.
+Every Vault request **MUST** be bounded by `timeout_secs` (default 5 s). With the defaults a `put` therefore returns within about 10 s (the `max_versions` call and the write, neither retried), a `get` or `delete_key` within about 15 s (three attempts plus backoff of at most 0.3 s) and a `destroy(Below)` within about 30 s (the metadata read and the destroy, each with its own attempts). These are client-side bounds. The gear's write-intent lease is sized against something else: the time Vault may still apply a request it has received (its maximum request duration, 90 s by default). That is a deployment requirement of the gear (CredStore DESIGN §6.2, "Lease requirement"), and the configuration floor of 60 s does not meet it by itself.
 
 - **Threshold**: The configured bounds hold in the failure-injection unit tests (a scripted transport counts attempts; the HTTP client enforces the timeout).
 - **Rationale**: The gear adds no timeouts of its own for backend I/O and relies on the plugin's.
@@ -311,7 +311,7 @@ After the host started, the plugin **MUST** recover without a restart from a Vau
 | Performance and capacity | Partly required | Latency bounds are defined in §6.1. Throughput is bounded by Vault; the plugin adds no caching and no batching. |
 | Reliability and availability | Required here | Retries, classification and recovery are defined in §5.3 and §6.1. High availability of Vault itself is the operator's. |
 | Security and privacy | Required here and inherited | Non-disclosure is defined in §6.1; encryption at rest is Vault's, encryption in transit is the operator's choice of an `https://` address. |
-| Observability and operations | Partly required | The plugin logs through `tracing` (warnings on a rejected token, a given-up call and an unreadable entry) and emits no metrics of its own; the gear records outcome and latency of every plugin call. |
+| Observability and operations | Partly required | The plugin logs through `tracing` (warnings on a rejected token, a given-up call and a token source that cannot be read) and emits no metrics of its own; the gear records outcome and latency of every plugin call. |
 | Deployment and upgrade | Required here | Mount requirements, the ACL policy and the sidecar pattern are documented; upgrades need no data migration. |
 | UX, accessibility, and internationalization | Not applicable | No end-user interface. |
 | Regulatory and geographic controls | Inherited | Data placement is decided by where the Vault server runs. |

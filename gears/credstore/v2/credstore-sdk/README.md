@@ -176,7 +176,7 @@ also need `tokio` with `rt` and `macros`):
 
 ```toml
 [dev-dependencies]
-credstore-sdk = { package = "cf-gears-credstore-v2-sdk", version = "0.1", features = ["conformance"] }
+cf-gears-credstore-v2-sdk = { version = "0.1", features = ["conformance"] }
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 

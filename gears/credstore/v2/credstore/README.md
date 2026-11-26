@@ -93,8 +93,8 @@ This module depends on `tenant-resolver`, and consumes `types-registry` and
 declarations (the credential types, the permissions, the audit topic and event
 type, and the SDK's plugin spec) through `gts_publication` before `init`. The secret value is stored in a plugin (e.g.
 `cf-gears-static-credstore-plugin-v2`, or
-[`cf-gears-vault-credstore-plugin-v2`](../plugins/vault-credstore-plugin/README.md)
-(prototype), backed by Vault/OpenBao).
+[`cf-gears-vault-credstore-plugin-v2`](../plugins/vault-credstore-plugin/README.md),
+backed by Vault/OpenBao).
 
 A credential is created in one request — a `PUT` on the record address
 carries the record and a tri-state `secret` together: a string writes it,

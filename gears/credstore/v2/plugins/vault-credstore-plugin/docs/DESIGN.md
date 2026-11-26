@@ -50,7 +50,7 @@ The adjacent [PRD](./PRD.md) is authoritative for WHAT, WHY, actors and acceptan
 
 The plugin is a thin, stateless adapter running as an in-process ToolKit gear (`vault-credstore-plugin-v2`) next to the CredStore gear. It implements one ClientHub contract, `CredStorePluginClientV2`, registered **scoped** under its types-registry catalogue instance so that CredStore selects it by vendor and priority. It keeps no state beyond the cached token and talks to Vault over HTTP with a token: no login method, no renewal, no background task, no startup probe.
 
-Every operation is one or two Vault KV v2 calls:
+Every operation maps directly onto the Vault KV v2 API:
 
 - `put` is two `POST`s: the first sets the key's own `max_versions` to 100 through the metadata endpoint, the second creates a new version; Vault returns the version number, which is the `ValueVersion`.
 - `get` is one `GET` of a named version.
@@ -118,11 +118,11 @@ flowchart LR
 
 ### 2.1 Design Principles
 
-#### One contract call, at most two Vault calls
+#### A thin adapter over KV v2
 
 - [ ] `p3` - **ID**: `cpt-cf-credstore-vault-principle-thin-adapter`
 
-The plugin does not cache values, batch calls, list keys or keep any state of the store. The only state is the cached token. `destroy(Below)` is the one operation that needs two calls, because KV v2 has no "destroy everything below N" call.
+The plugin does not cache values, batch calls, list keys or keep any state of the store. The only state is the cached token. `put` sets the key's `max_versions` and then writes the version; `destroy(Below)` reads the key's metadata and then destroys, because KV v2 has no "destroy everything below N" call.
 
 #### A definite answer is never retried
 
@@ -251,7 +251,7 @@ A soft-deleted version has `destroyed = false` and a `deletion_time`: it is incl
 
 #### Vault answers the plugin relies on
 
-Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server) and pinned by the integration tests (`tests/vault_behaviour.rs`); the same suites were run against OpenBao 2.7.3 (2026-11-25) and all pass; the retention test pins the rule of each backend: Vault keeps the larger of the mount's and the key's `max_versions`, OpenBao lets a non-zero key value win over the mount's, and the plugin's key limit of 100 holds under both (see [TESTING.md](./TESTING.md)).
+Observed against `hashicorp/vault` 2.1.1 and 1.21 (dev server); the answers the plugin acts on are pinned by the integration tests (`tests/vault_behaviour.rs`), the other rows are observations; the same suites were run against OpenBao 2.7.3 (2026-11-25) and all pass; the retention test pins the rule of each backend: Vault keeps the larger of the mount's and the key's `max_versions`, OpenBao lets a non-zero key value win over the mount's, and the plugin's key limit of 100 holds under both (see [TESTING.md](./TESTING.md)).
 
 | Situation | Vault's answer |
 |---|---|
@@ -282,7 +282,7 @@ pub fn client_from_config(
 ) -> anyhow::Result<Arc<dyn CredStorePluginClientV2>>
 ```
 
-For a process that has no ClientHub and does not run the gear (an operator's value-migration binary that writes into this plugin; see the CredStore value-migration guide, Part 2), the crate root re-exports `client_from_config`. It is the construction the gear's `init` performs, factored into `factory.rs` so the two cannot drift apart:
+For a process that has no ClientHub and does not run the gear (an operator's value-migration binary that writes into this plugin), the crate root re-exports `client_from_config`. It is the construction the gear's `init` performs, factored into `factory.rs` so the two cannot drift apart:
 
 1. `cfg.validate()` (the rules of the configuration reference below), failing with an error that names the key and never contains the token;
 2. `ReqwestTransport::from_config`: resolves an inline or `token_env` token, builds the HTTP client with `timeout_secs`; a `token_file` is read on the first request;
@@ -569,7 +569,7 @@ Other deployments follow the same shape: any process that keeps a valid token in
 |---|---|---|
 | Vault unreachable, timeouts, `5xx`, `429` | Idempotent calls retried within their budget, then `Unavailable`; `put` fails after one attempt of either of its calls (the metadata call or the data call) | Restore Vault; the gear keeps cleanup debts and retries those of a live record on a later access (a deleted record's failed purge waits for a possible external job) |
 | Vault sealed (`503`) | As above; the message includes `Vault is sealed` | Unseal |
-| Token revoked, expired, or policy too narrow (`403`) | Token source re-read once; if unchanged or still rejected, `CredentialsRejected` with a `403` message and a `warn` log naming the token source, never the token | Renew the token or fix the policy; a changed `token_file` is picked up without restart |
+| Token revoked, expired, or policy too narrow (`403`) | Token source re-read once; if unchanged or still rejected, `CredentialsRejected` with a `403` message and a `warn` log that never carries the token | Renew the token or fix the policy; a changed `token_file` is picked up without restart |
 | `token_file` missing, empty or malformed | `Unavailable` for the calls that need a token; startup is not affected | Provide the file |
 | `token_env` unset or empty, inline token empty or malformed | Startup fails with the key named | Fix the configuration |
 | Mount does not exist or is misspelled | `Internal` for every operation (`no handler for route` text); `delete_key` does not report success | Fix `mount`, or enable the mount |
@@ -609,7 +609,7 @@ Observability: the plugin emits no metrics; the CredStore gear records outcome a
 | Level | Event |
 |---|---|
 | `info` | Startup: vendor, priority, address, mount, prefix, token source name, retry attempts; a token source that holds a new token after a `403` |
-| `warn` | A call given up after its attempts; Vault answered `403` after the re-read; a token source that could not be read; a stored entry that is not a readable value |
+| `warn` | A call given up after its attempts; Vault answered `403` after the re-read; a token source that could not be read |
 | `debug` | Each operation with tenant id, record id and version; each transient failure and retry |
 
 ## 5. Traceability

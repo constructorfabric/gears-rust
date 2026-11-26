@@ -7,7 +7,7 @@
 - v2 is not registered in the server: its REST routes and database connection are not wired into any binary until the switch.
 - v2 carries no `gear.gdl`: it is not a product gear until the switch.
 - The v2 gears are declared under the names `credstore-v2`, `static-credstore-plugin-v2` and `vault-credstore-plugin-v2` until the switch: `cargo gears` refuses two gears with one name in the workspace.
-- No gear, plugin or app depends on the v2 crates; consumers keep using v1.
+- No gear, plugin or app uses v2 at run time; consumers keep using v1. `model-registry` already builds against the v2 SDK (`get_record` only) and gets a v2 client at the switch.
 - v1 and v2 must never be linked into one binary: they will share the gear name, routes and metric names at the switch.
 - The v2 crates are `publish = false`; their package names differ from v1 until the switch.
 - v1 and its database stay untouched until the switch.
