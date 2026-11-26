@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import subprocess
 import unittest
@@ -35,6 +36,15 @@ class Eligibility(unittest.TestCase):
 
     def test_minor_major_nonzero(self):
         self.assertTrue(elig("cargo", [("x", "minor")], title="Bump x from 1.2.0 to 1.3.0"))
+
+    def test_cargo_patch_unknown_from_vetoed(self):
+        self.assertFalse(elig("cargo", [("x", "patch")], title="Bump the group"))
+
+    def test_cargo_zero_zero_patch(self):
+        self.assertFalse(elig("cargo", [("x", "patch")], title="Bump x from 0.0.1 to 0.0.2"))
+
+    def test_cargo_zero_zero_minor(self):
+        self.assertFalse(elig("cargo", [("x", "minor")], title="Bump x from 0.0.3 to 0.1.0"))
 
     def test_major(self):
         self.assertFalse(elig("cargo", [("x", "major")]))
@@ -192,6 +202,55 @@ class CiVerdict(unittest.TestCase):
         r[1]["state"] = "PENDING"
         self.assertEqual(verdict(rollup=r), "wait")
 
+    def run_check(self, conclusion, started, workflow="CI", name="build", status="COMPLETED"):
+        return {"__typename": "CheckRun", "workflowName": workflow, "name": name, "status": status,
+                "conclusion": conclusion, "startedAt": started, "completedAt": started}
+
+    def test_cancelled_check_superseded_by_newer_green(self):
+        r = ok_rollup()[1:] + [self.run_check("CANCELLED", "2026-01-01T00:00:00Z"),
+                               self.run_check("SUCCESS", "2026-01-01T01:00:00Z")]
+        self.assertEqual(verdict(rollup=r), "green")
+
+    def test_cancelled_check_without_newer_stays_red(self):
+        r = ok_rollup()[1:] + [self.run_check("SUCCESS", "2026-01-01T00:00:00Z", workflow="Other"),
+                               self.run_check("CANCELLED", "2026-01-01T01:00:00Z")]
+        self.assertEqual(verdict(rollup=r), "red")
+
+    def test_newer_failure_beats_older_green(self):
+        r = ok_rollup()[1:] + [self.run_check("SUCCESS", "2026-01-01T00:00:00Z"),
+                               self.run_check("FAILURE", "2026-01-01T01:00:00Z")]
+        self.assertEqual(verdict(rollup=r), "red")
+
+    def test_status_contexts_not_deduplicated(self):
+        r = ok_rollup() + [{"__typename": "StatusContext", "context": "DCO", "state": "FAILURE"}]
+        self.assertEqual(verdict(rollup=r), "red")
+
+    def test_failed_push_check_not_hidden_by_later_green_event(self):
+        r = ok_rollup()[1:] + [self.run_check("FAILURE", "2026-01-01T00:00:00Z"),
+                               self.run_check("SUCCESS", "2026-01-01T01:00:00Z")]
+        self.assertEqual(verdict(rollup=r), "red")
+
+    def test_cancelled_check_newer_missing_timestamp_stays_red(self):
+        newer = self.run_check("SUCCESS", "")
+        r = ok_rollup()[1:] + [self.run_check("CANCELLED", "2026-01-01T00:00:00Z"), newer]
+        self.assertEqual(verdict(rollup=r), "red")
+
+    def test_failed_push_run_not_hidden_by_later_green_pull_request_run(self):
+        runs = [{"workflow_id": 1, "event": "push", "run_number": 1, "status": "completed", "conclusion": "failure"},
+                {"workflow_id": 1, "event": "pull_request", "run_number": 2, "status": "completed",
+                 "conclusion": "success"}]
+        self.assertEqual(verdict(runs=runs, total=2), "red")
+
+    def test_failed_run_same_event_not_hidden_by_later_green(self):
+        runs = [{"workflow_id": 1, "event": "push", "run_number": 1, "status": "completed", "conclusion": "failure"},
+                {"workflow_id": 1, "event": "push", "run_number": 2, "status": "completed", "conclusion": "success"}]
+        self.assertEqual(verdict(runs=runs, total=2), "red")
+
+    def test_cancelled_run_newer_missing_run_number_stays_red(self):
+        runs = [{"workflow_id": 1, "event": "push", "run_number": 1, "status": "completed", "conclusion": "cancelled"},
+                {"workflow_id": 1, "event": "push", "status": "completed", "conclusion": "success"}]
+        self.assertEqual(verdict(runs=runs, total=2), "red")
+
     def test_young_head(self):
         self.assertEqual(verdict(age_min=29), "wait")
 
@@ -299,9 +358,11 @@ def commit(login="dependabot[bot]", headline="chore(deps): bump x", parents=1,
         sig = {"isValid": True, "wasSignedByGitHub": True}
     if authors is None:
         authors = [{"user": {"login": login}}]
+    if isinstance(authors, list):
+        authors = {"totalCount": len(authors), "nodes": authors}
     return {"oid": "a", "messageHeadline": headline, "messageBody": body,
             "committedDate": "2026-01-01T00:00:00Z", "parents": {"totalCount": parents},
-            "authors": {"nodes": authors}, "signature": sig}
+            "authors": authors, "signature": sig}
 
 
 class Trust(unittest.TestCase):
@@ -335,6 +396,11 @@ class Trust(unittest.TestCase):
     def test_mixed_authors(self):
         authors = [{"user": {"login": "dependabot[bot]"}}, {"user": {"login": "someone"}}]
         self.assertFalse(s.is_trusted_commit(commit(authors=authors)))
+
+    def test_more_authors_than_returned(self):
+        c = commit()
+        c["authors"]["totalCount"] = 11
+        self.assertFalse(s.is_trusted_commit(c))
 
     def test_empty_authors(self):
         self.assertFalse(s.is_trusted_commit(commit(authors=[])))
@@ -370,6 +436,8 @@ def fake_read(commits, total=None, view=None, runs=RUNS, runs_total=None, thr=No
     def read(self, *args):
         if args[0] != "api":
             return VIEW if view is None else view
+        if args[1].endswith("/reviews?per_page=100"):
+            return []
         if "actions/runs" in args[1]:
             return {"total_count": len(runs) if runs_total is None else runs_total,
                     "workflow_runs": runs}
@@ -379,7 +447,8 @@ def fake_read(commits, total=None, view=None, runs=RUNS, runs_total=None, thr=No
     return read
 
 
-GOOD = commit(body=msg(("x", "patch")))
+DBOT = {"title": "t", "author": {"login": "app/dependabot"}}
+GOOD = commit(headline="chore(deps): bump x from 1.0.0 to 1.0.1", body=msg(("x", "patch")))
 TIMEOUT = subprocess.TimeoutExpired(["gh"], 60)
 
 
@@ -433,6 +502,92 @@ class Failures(unittest.TestCase):
     def test_approve_failure_skips_merge(self):
         row, calls = self.live_run(["event=APPROVE"])
         self.assertEqual((row[-1], len(calls)), ("merge FAILED (timeout)", 1))
+
+    def approve_recovery(self, fail, reviews, approve_stdout='{"id": 99}'):
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append(args)
+            if "event=APPROVE" in args:
+                if fail:
+                    raise TIMEOUT
+                return mock.Mock(stdout=approve_stdout)
+            return mock.Mock(stdout="{}")
+
+        def read(self, *args):
+            if args[0] == "api" and args[1].endswith("/reviews?per_page=100"):
+                if isinstance(reviews, Exception):
+                    raise reviews
+                return reviews
+            return fake_read([GOOD])(self, *args)
+        with mock.patch.object(s.Gh, "read_json", read), \
+                mock.patch("subprocess.run", side_effect=fake_run):
+            row = s.process(s.Gh("o/r", True), PR, s.Budget(), NOW)
+        return row, calls
+
+    @staticmethod
+    def rv(id, sha="a", login="deps-bot[bot]", utype="Bot", state="APPROVED"):
+        return {"id": id, "state": state, "commit_id": sha, "user": {"login": login, "type": utype}}
+
+    def test_approve_timeout_dismisses_matching_bot_approval(self):
+        row, calls = self.approve_recovery(True, [self.rv(5)])
+        self.assertEqual(row[-1], "merge FAILED (timeout); approval dismissed")
+        self.assertIn("repos/o/r/pulls/7/reviews/5/dismissals", calls[-1])
+
+    def test_approve_timeout_spares_human_other_sha_and_dependabot(self):
+        reviews = [self.rv(1, login="human", utype="User"), self.rv(2, sha="b"),
+                   self.rv(3, login="dependabot[bot]"), self.rv(4, state="COMMENTED")]
+        row, calls = self.approve_recovery(True, reviews)
+        self.assertEqual((row[-1], len(calls)), ("merge FAILED (timeout)", 1))
+
+    def test_approve_non_dict_response_handled(self):
+        row, calls = self.approve_recovery(False, [self.rv(5)], approve_stdout="[1]")
+        self.assertEqual(row[-1], "merge FAILED (bad data); approval dismissed")
+
+    def test_approve_lookup_failure_says_approval_may_remain(self):
+        row, _ = self.approve_recovery(True, TIMEOUT)
+        self.assertEqual(row[-1], "merge FAILED (timeout); approval lookup FAILED (timeout), approval may remain")
+
+    def policy_error(self):
+        return subprocess.CalledProcessError(
+            1, "gh", stderr="Repository rule violations: At least 1 approving review is required")
+
+    def test_policy_rejection_stops_further_merges(self):
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append(args)
+            if "merge" in args:
+                raise self.policy_error()
+            return mock.Mock(stdout='{"id": 99}')
+
+        gh = s.Gh("o/r", True)
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD])), \
+                mock.patch("subprocess.run", side_effect=fake_run), redirect_stderr(io.StringIO()):
+            first = s.process(gh, PR, s.Budget(), NOW)
+            calls.clear()
+            second = s.process(gh, PR, s.Budget(), NOW)
+        self.assertEqual((first[-1], second[-1], calls),
+                         ("merge FAILED (exit 1); approval dismissed", s.MERGE_BLOCKED_ROW, []))
+
+    def test_non_policy_failure_does_not_block_merges(self):
+        err = subprocess.CalledProcessError(1, "gh", stderr="HTTP 502 bad gateway")
+        gh = s.Gh("o/r", True)
+        with mock.patch.object(s.Gh, "read_json", fake_read([GOOD])), \
+                mock.patch("subprocess.run", side_effect=lambda args, **kw: (_ for _ in ()).throw(err)
+                           if "merge" in args else mock.Mock(stdout='{"id": 99}')), \
+                redirect_stderr(io.StringIO()):
+            s.process(gh, PR, s.Budget(), NOW)
+        self.assertFalse(gh.merge_blocked)
+
+    def test_fetch_labels_failure_after_approval_dismisses(self):
+        row, calls = self.live_hold([set(), TIMEOUT])
+        self.assertEqual(row[-1], "merge FAILED (timeout); approval dismissed")
+        self.assertIn("repos/o/r/pulls/7/reviews/99/dismissals", calls[-1])
+
+    def test_bad_data_after_approval_dismisses(self):
+        row, calls = self.live_hold([set(), KeyError("labels")])
+        self.assertEqual(row[-1], "merge FAILED (bad data); approval dismissed")
 
     def live_hold(self, label_reads):
         calls = []
@@ -566,6 +721,16 @@ class Helpers(unittest.TestCase):
         out = s.md_title("x" * 300)
         self.assertEqual((len(out), out[-1]), (100, "…"))
 
+    def test_reason_and_eco_escaped(self):
+        self.assertEqual(s.md_title("a|b `c`"), "a\\|b \\`c\\`")
+
+    def test_row_cells_escaped(self):
+        c = commit(headline="Bump x", body="Updates `x` from 1.0.0 to 1.0.1\n" + msg(("x|y", "major")))
+        pr = dict(PR, headRefName="dependabot/cargo/x")
+        with mock.patch.object(s.Gh, "read_json", fake_read([c])):
+            row = s.process(s.Gh("o/r", False), pr, s.Budget(), NOW)
+        self.assertEqual(row[3], "no: x\\|y: major")
+
     def test_add_label_rest(self):
         gh = mock.Mock()
         s.add_label(gh, 7, "deps:hold")
@@ -597,7 +762,7 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_argv(["--live"], {"GITHUB_REPOSITORY": "o/r"}), (2, 0))
 
     def test_dry_run_makes_no_writes(self):
-        prs = [{"number": i, "title": "t", "headRefName": "dependabot/cargo/x"} for i in (1, 2, 3)]
+        prs = [dict(DBOT, number=i, headRefName="dependabot/cargo/x") for i in (1, 2, 3)]
         inner = fake_read([GOOD])
 
         def read(self, *args):
@@ -609,8 +774,75 @@ class Main(unittest.TestCase):
             rc, _ = self.run_argv([], {"GITHUB_REPOSITORY": "o/r"})
         self.assertEqual(write.call_count, 0)
 
+    def test_dry_run_only_reads(self):
+        prs = [dict(DBOT, number=7, headRefName="dependabot/cargo/x")]
+        inner = fake_read([GOOD])
+        argvs = []
+
+        def fake_run(args, **kw):
+            argvs.append(args)
+            if args[1:3] == ["label", "list"]:
+                out = []
+            elif args[1:3] == ["pr", "list"]:
+                out = prs
+            else:
+                out = inner(None, *args[1:])
+            return mock.Mock(stdout=json.dumps(out))
+        with mock.patch("subprocess.run", side_effect=fake_run), \
+                mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "o/r"}, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py"]), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            s.main()
+        writes = [a for a in argvs if "-X" in a or any(x.startswith("event=") for x in a)
+                  or a[1:3] in (["pr", "merge"], ["pr", "review"], ["pr", "comment"],
+                                ["pr", "edit"], ["label", "create"])]
+        self.assertEqual((len(argvs) > 3, writes), (True, []))
+
+    def test_list_uses_no_author_search_and_filters_in_python(self):
+        prs = [dict(DBOT, number=1, headRefName="b"),
+               {"number": 2, "title": "t", "headRefName": "b", "author": {"login": "someone"}},
+               {"number": 3, "title": "t", "headRefName": "b"},
+               {"number": 4, "title": "t", "headRefName": "b", "author": None}]
+        list_args = []
+
+        def read(self, *args):
+            if args[:2] == ("pr", "list"):
+                list_args.extend(args)
+                return prs
+            return []
+        with mock.patch.object(s.Gh, "read_json", read), \
+                mock.patch.object(s, "process", return_value=["#1", "t", "?", "no", "wait", "x"]) as proc, \
+                mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "o/r"}, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py"]), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            s.main()
+        self.assertEqual(("--author" in list_args, "number,title,headRefName,author" in list_args,
+                          [c.args[1]["number"] for c in proc.call_args_list]), (False, True, [1]))
+
+    def test_bad_data_row_counts_as_failure(self):
+        prs = [dict(DBOT, number=1, headRefName="b")]
+        out = io.StringIO()
+        with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \
+                mock.patch.object(s, "process", side_effect=KeyError("committedDate")), \
+                mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "o/r"}, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py"]), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            rc = s.main()
+        self.assertEqual((rc, "read FAILED (bad data)" in out.getvalue()), (1, True))
+
+    def test_list_truncation_counts_unfiltered(self):
+        prs = [{"number": i, "title": "t", "headRefName": "b", "author": {"login": "x"}}
+               for i in range(s.PR_LIST_LIMIT)]
+        out = io.StringIO()
+        with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \
+                mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "o/r"}, clear=True), \
+                mock.patch("sys.argv", ["dependabot_sweeper.py"]), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            rc = s.main()
+        self.assertEqual((rc, f"PR list hit the limit of {s.PR_LIST_LIMIT}" in out.getvalue()), (1, True))
+
     def test_deadline_defers_rest(self):
-        prs = [{"number": i, "title": "t", "headRefName": "b"} for i in (1, 2, 3)]
+        prs = [dict(DBOT, number=i, headRefName="b") for i in (1, 2, 3)]
         out = io.StringIO()
         clock = iter([0, 0, 1000, 1000, 1000])
         with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \
@@ -624,7 +856,7 @@ class Main(unittest.TestCase):
                          (0, 1, True))
 
     def test_deadline_counts_setup_time(self):
-        prs = [{"number": i, "title": "t", "headRefName": "b"} for i in (1, 2)]
+        prs = [dict(DBOT, number=i, headRefName="b") for i in (1, 2)]
         out = io.StringIO()
         clock = iter([0, 400, 400])  # label and PR-list reads already used 400 s of the budget
         with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \
@@ -654,7 +886,7 @@ class Main(unittest.TestCase):
         self.assertEqual(self.run_main(read), 1)
 
     def test_list_limit_warns_and_fails(self):
-        prs = [{"number": i, "title": "t", "headRefName": "b"} for i in range(s.PR_LIST_LIMIT)]
+        prs = [dict(DBOT, number=i, headRefName="b") for i in range(s.PR_LIST_LIMIT)]
         out = io.StringIO()
         env = {"GITHUB_REPOSITORY": "o/r"}
         with mock.patch.object(s.Gh, "read_json", lambda self, *a: prs if a[:2] == ("pr", "list") else []), \

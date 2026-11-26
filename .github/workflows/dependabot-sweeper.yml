@@ -1,7 +1,7 @@
 # Dependabot sweeper: merges safe, green Dependabot PRs and heals or escalates red ones.
 #
-# Why a schedule sweeper: the "Protect main" ruleset requires one approving review but NO
-# status checks, and auto-merge is disabled, so nothing stops a red PR from being merged.
+# Why a schedule sweeper: the "Protect main" ruleset requires NO status checks, and auto-merge
+# is disabled, so nothing stops a red PR from being merged.
 # The script (.github/scripts/dependabot_sweeper.py) is therefore the gate and evaluates
 # checks strictly: no checks, or any pending/unknown check, means wait; any failure means red.
 #
@@ -22,15 +22,22 @@
 # not draft, not on hold (`deps:hold`), has no requested changes and no unresolved threads.
 #
 # Rollout switch: the workflow runs dry-run (read-only GITHUB_TOKEN, table in the job summary)
-# until an admin creates the App, sets repo variable DEPS_BOT_APP_ID and sets repo variable
-# DEPENDABOT_SWEEPER_MODE=live. A manual run with `live: true` also goes live (only if the
-# App id is set).
+# until an admin creates the App, sets repo variable DEPS_BOT_APP_CLIENT_ID and sets repo
+# variable DEPENDABOT_SWEEPER_MODE=live. A manual run with `live: true` also goes live (only
+# if the App client id is set); `dry_run: true` forces dry-run even when the mode is `live`.
 #
-# Admin setup (keeps the App key away from modified workflows): create the environment
-# `deps-bot` with deployment branches restricted to `main` only; store DEPS_BOT_PRIVATE_KEY
-# as an ENVIRONMENT secret of `deps-bot` (never a repo secret); DEPS_BOT_APP_ID is a repo
-# variable. Only the `sweep-live` job uses the environment; the script also refuses
-# `--live` outside refs/heads/main.
+# Live merging requires an admin to add the deps-bot App as a bypass actor (mode: pull
+# requests) on the "Protect main" ruleset: the ruleset requires an approval from a specific
+# team, and a GitHub App cannot be a team member, so its approval cannot satisfy it. Without
+# the bypass the merge is rejected; the script then withdraws its approval and stops merging
+# for the rest of the run.
+#
+# Admin setup (keeps the App key away from modified workflows): create the `deps-bot`
+# environment (deployment branches: main only) BEFORE setting the variables; otherwise Actions
+# auto-creates it without a branch policy. Store DEPS_BOT_PRIVATE_KEY as an ENVIRONMENT secret
+# of `deps-bot` (never a repo secret); DEPS_BOT_APP_CLIENT_ID is a repo variable. Only the
+# `sweep-live` job uses the environment; the script also refuses `--live` outside
+# refs/heads/main.
 # App installation permissions (must match the `permission-*` inputs of the token step in
 # `sweep-live`; the installation must grant at least these): Contents: write, Pull requests:
 # write, Issues: write (labels use the Issues API), Actions: read, Checks: read, Commit
@@ -44,6 +51,10 @@ on:
     inputs:
       live:
         description: "Perform merges, approvals, comments and labels (default: dry-run)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Force dry-run even when DEPENDABOT_SWEEPER_MODE is live"
         type: boolean
         default: false
   pull_request:
@@ -80,7 +91,8 @@ jobs:
     name: Sweep Dependabot PRs (dry-run)
     if: >-
       github.event_name != 'pull_request' &&
-      !((inputs.live == true || vars.DEPENDABOT_SWEEPER_MODE == 'live') && vars.DEPS_BOT_APP_ID != '')
+      !((inputs.live == true || vars.DEPENDABOT_SWEEPER_MODE == 'live') && inputs.dry_run != true &&
+        vars.DEPS_BOT_APP_CLIENT_ID != '')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Dry-run reads PRs and their checks with GITHUB_TOKEN; it never writes.
@@ -108,7 +120,8 @@ jobs:
     name: Sweep Dependabot PRs (live)
     if: >-
       github.event_name != 'pull_request' &&
-      (inputs.live == true || vars.DEPENDABOT_SWEEPER_MODE == 'live') && vars.DEPS_BOT_APP_ID != ''
+      (inputs.live == true || vars.DEPENDABOT_SWEEPER_MODE == 'live') && inputs.dry_run != true &&
+      vars.DEPS_BOT_APP_CLIENT_ID != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: deps-bot
@@ -127,7 +140,7 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ vars.DEPS_BOT_APP_ID }}
+          client-id: ${{ vars.DEPS_BOT_APP_CLIENT_ID }}
           private-key: ${{ secrets.DEPS_BOT_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write

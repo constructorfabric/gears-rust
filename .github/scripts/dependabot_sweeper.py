@@ -33,10 +33,12 @@ MAX_RECREATES = 3
 STALE_HOURS = 72
 GH_TIMEOUT = 60  # seconds, per gh call
 PR_LIST_LIMIT = 500
-# Measured from the top of main(). The deadline plus one worst-case PR (4 reads + 3 writes at
-# GH_TIMEOUT = 420 s) must fit under the 15 min job timeout, or the runner kills the job before
-# write_summary runs.
-RUN_DEADLINE_SECONDS = 300
+# Measured from the top of main(). The deadline plus one worst-case PR must fit under the 15 min
+# job timeout, or the runner kills the job before write_summary runs. Worst merge path: 9 calls
+# (4 reads + 2 fetch_labels + approve + merge + dismiss) x GH_TIMEOUT = 540 s; 240 + 540 = 780 s
+# leaves margin under 900 s. A failed approve call costs 4 reads + 1 fetch_labels + approve +
+# reviews read + dismiss = 8 calls (one stray approval), within that bound.
+RUN_DEADLINE_SECONDS = 240
 LIVE_REF = "refs/heads/main"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 TITLE_MAX = 100
@@ -97,11 +99,16 @@ def _major(version):
     return int(m.group(1)) if m else None
 
 
-def _cargo_entry_veto(name, entries_count, from_versions):
-    """Reason string if a cargo minor bump is not provably non-breaking, else None."""
+def _from_version(name, entries_count, from_versions):
     frm = from_versions.get(name)
     if frm is None and entries_count == 1:
         frm = from_versions.get(None)
+    return frm
+
+
+def _cargo_entry_veto(name, entries_count, from_versions):
+    """Reason string if a cargo minor bump is not provably non-breaking, else None."""
+    frm = _from_version(name, entries_count, from_versions)
     major = _major(frm)
     if major is None:
         return f"{name}: minor, from-version unknown"
@@ -116,8 +123,14 @@ def _entry_veto(ecosystem, name, utype, entries_count, from_versions):
         return f"{name}: no update-type (cargo)" if ecosystem == "cargo" else None
     if utype not in SAFE_TYPES:
         return f"{name}: {utype.replace('version-update:semver-', '')}"
-    if ecosystem == "cargo" and utype == MINOR:
-        return _cargo_entry_veto(name, entries_count, from_versions)
+    if ecosystem == "cargo":
+        frm = _from_version(name, entries_count, from_versions)
+        if _major(frm) is None:
+            return f"{name}: from-version unknown"
+        if frm.lstrip("v").startswith("0.0."):
+            return f"{name}: 0.0.x update is breaking in cargo"
+        if utype == MINOR:
+            return _cargo_entry_veto(name, entries_count, from_versions)
     return None
 
 
@@ -155,22 +168,57 @@ def classify_checks(rollup):
     return "green"
 
 
+def _check_time(c):
+    # An unfinished run reports completedAt 0001-01-01, which sorts below any real startedAt.
+    return max(c.get("startedAt") or "", c.get("completedAt") or "")
+
+
+def _latest_checks(rollup):
+    """Drop a CANCELLED CheckRun only when a newer entry with the same (workflow, check name) exists.
+
+    Every other entry is kept: a failed run is never hidden by a later green one (a different
+    event of the same workflow is a different gate). A missing timestamp keeps the entry.
+    """
+    groups = {}
+    for c in rollup:
+        if c.get("__typename") == "CheckRun" and c.get("name"):
+            groups.setdefault((c.get("workflowName") or "", c["name"]), []).append(_check_time(c))
+    out = []
+    for c in rollup:
+        key = (c.get("workflowName") or "", c.get("name"))
+        when = _check_time(c)
+        superseded = (
+            c.get("__typename") == "CheckRun" and c.get("name") and c.get("conclusion") == "CANCELLED"
+            and when and any(o > when for o in groups[key])
+        )
+        if not superseded:
+            out.append(c)
+    return out
+
+
 def _check_name(c):
     return c.get("context") if c.get("__typename") == "StatusContext" else c.get("name")
 
 
 def _latest_runs(workflow_runs):
-    """Keep only the latest run per workflow (a re-run supersedes its cancelled predecessor); keyless runs stay."""
-    latest, keyless = {}, []
-    for i, r in enumerate(workflow_runs):
-        key = r.get("workflow_id") or r.get("name")
-        if key is None:
-            keyless.append(r)
-            continue
-        rank = (r.get("run_number") or 0, r.get("created_at") or "", i)
-        if key not in latest or rank > latest[key][0]:
-            latest[key] = (rank, r)
-    return [r for _, r in latest.values()] + keyless
+    """Drop a cancelled run only when a newer run (higher run_number) of the same workflow and event exists.
+
+    Every other run is kept, so a failed push run is never hidden by a later green pull_request run.
+    A missing run_number keeps the run.
+    """
+    groups = {}
+    for r in workflow_runs:
+        key = (r.get("workflow_id") or r.get("name"), r.get("event"))
+        if key[0] is not None and r.get("run_number"):
+            groups.setdefault(key, []).append(r["run_number"])
+    return [
+        r for r in workflow_runs
+        if not (
+            r.get("conclusion") == "cancelled" and r.get("run_number")
+            and (r.get("workflow_id") or r.get("name")) is not None
+            and any(o > r["run_number"] for o in groups[(r.get("workflow_id") or r.get("name"), r.get("event"))])
+        )
+    ]
 
 
 def ci_verdict(rollup, workflow_runs, total_runs, head_age_min):
@@ -181,8 +229,10 @@ def ci_verdict(rollup, workflow_runs, total_runs, head_age_min):
     head commit old enough for late-registering checks to have appeared.
     Wait beats red, as in classify_checks; when in doubt, never green.
     """
+    truncated = bool(rollup) and len(rollup) >= ROLLUP_PAGE_LIMIT
+    rollup = _latest_checks(rollup or [])  # a re-run supersedes its cancelled predecessor
     verdicts = [classify_checks(rollup)]
-    if rollup and len(rollup) >= ROLLUP_PAGE_LIMIT:
+    if truncated:
         verdicts.append("wait")  # possibly truncated: an omitted failing context must not turn green
     for name in REQUIRED_CHECKS:
         found = [c for c in rollup or [] if _check_name(c) == name]
@@ -287,6 +337,11 @@ def has_head_approval(reviews, head_sha):
     )
 
 
+def is_dependabot_pr(pr):
+    author = pr.get("author")
+    return isinstance(author, dict) and author.get("login") == "app/dependabot"
+
+
 def is_dependabot(login):
     return (login or "").removesuffix("[bot]") == "dependabot"
 
@@ -297,9 +352,10 @@ def is_trusted_commit(c):
     A maintainer who syncs main into a Dependabot PR now handles that PR by
     hand; `@dependabot rebase` keeps it bot-only.
     """
-    nodes = (c.get("authors") or {}).get("nodes") or []
-    if not nodes:
-        return False
+    authors = c.get("authors") or {}
+    nodes = authors.get("nodes") or []
+    if not nodes or authors.get("totalCount") != len(nodes):
+        return False  # no authors, or more than the first page of them: fail closed
     for node in nodes:
         user = (node or {}).get("user")
         if not user or not is_dependabot(user.get("login")):
@@ -317,13 +373,15 @@ def describe(e):
         return "timeout"
     if isinstance(e, subprocess.CalledProcessError):
         return f"exit {e.returncode}"
-    return "bad JSON"
+    if isinstance(e, json.JSONDecodeError):
+        return "bad JSON"
+    return "bad data"
 
 
 COMMITS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
     "{pullRequest(number:$number){commits(first:100){totalCount nodes{commit{oid messageHeadline "
-    "messageBody committedDate parents{totalCount} authors(first:10){nodes{user{login}}} "
+    "messageBody committedDate parents{totalCount} authors(first:10){totalCount nodes{user{login}}} "
     "signature{isValid wasSignedByGitHub}}}}}}}"
 )
 
@@ -337,6 +395,7 @@ class Gh:
     def __init__(self, repo, live):
         self.repo = repo
         self.live = live
+        self.merge_blocked = False  # set once a merge is rejected by branch policy
 
     def read_json(self, *args):
         try:
@@ -352,16 +411,18 @@ class Gh:
         """The only mutating entry point; refuses outside --live.
 
         With capture=True the JSON written to stdout is parsed and returned.
+        stderr is always captured (merge rejections are classified from it) and echoed on failure.
         """
         if not self.live:
             raise RuntimeError("write() called in dry-run mode")
-        if not capture:
-            subprocess.run(["gh", *args], check=True, timeout=GH_TIMEOUT)
-            return None
-        res = subprocess.run(
-            ["gh", *args], check=True, timeout=GH_TIMEOUT, capture_output=True, text=True
-        )
-        return json.loads(res.stdout or "null")
+        try:
+            res = subprocess.run(
+                ["gh", *args], check=True, timeout=GH_TIMEOUT, capture_output=True, text=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(e.stderr, file=sys.stderr)
+            raise
+        return json.loads(res.stdout or "null") if capture else None
 
 
 def ensure_labels(gh):
@@ -442,10 +503,36 @@ def _is_untrusted(view, total, commits):
     )
 
 
+POLICY_MARKERS = ("review", "required", "ruleset", "base branch policy")
+MERGE_BLOCKED_ROW = "merge skipped: blocked by branch policy (see earlier row)"
+
+
+def _is_policy_block(e):
+    text = (getattr(e, "stderr", None) or "").lower()
+    return isinstance(e, subprocess.CalledProcessError) and any(m in text for m in POLICY_MARKERS)
+
+
+def _finish_merge(gh, n, sha, review_id, approved):
+    if approved and LABEL_HOLD in fetch_labels(gh, n):
+        return "skip: hold (appeared after approval)" + (
+            _dismiss_approval(gh, n, review_id, reason="deps:hold appeared")
+            if review_id is not None else "")
+    try:
+        gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash",
+                 "--match-head-commit", sha)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        if _is_policy_block(e):
+            gh.merge_blocked = True  # one policy rejection per run, not one per PR
+        raise
+    return "merge"
+
+
 def _merge(gh, n, view):
     """Approve (if needed) and squash-merge; return the outcome string."""
+    if gh.merge_blocked:
+        return MERGE_BLOCKED_ROW
     sha = view["headRefOid"]
-    review_id = None
+    review_id, approved = None, False
     # A hold label added after the decision is honoured by re-reading labels
     # before each irreversible step. This narrows the race, it does not close it.
     if LABEL_HOLD in fetch_labels(gh, n):
@@ -453,22 +540,37 @@ def _merge(gh, n, view):
     if not has_head_approval(view.get("reviews"), sha):
         # The approval is tied to the checked SHA; `--match-head-commit` is the
         # actual merge gate, and on failure the approval is withdrawn.
-        review = gh.write("api", f"repos/{gh.repo}/pulls/{n}/reviews", "-f",
-                          "event=APPROVE", "-f", f"commit_id={sha}", capture=True)
-        review_id = (review or {}).get("id")
-        if LABEL_HOLD in fetch_labels(gh, n):
-            return "skip: hold (appeared after approval)" + (
-                _dismiss_approval(gh, n, review_id, reason="deps:hold appeared")
-                if review_id is not None else "")
+        try:
+            review = gh.write("api", f"repos/{gh.repo}/pulls/{n}/reviews", "-f",
+                              "event=APPROVE", "-f", f"commit_id={sha}", capture=True)
+            if not isinstance(review, dict):
+                raise TypeError("approve response is not an object")
+        except (*GH_ERRORS, KeyError, ValueError, TypeError, AttributeError) as e:
+            # The POST may have landed before the failure: withdraw any bot approval on this sha.
+            return f"merge FAILED ({describe(e)})" + _withdraw_stray_approvals(gh, n, sha)
+        review_id, approved = review.get("id"), True
     try:
-        gh.write("pr", "merge", str(n), "--repo", gh.repo, "--squash",
-                 "--match-head-commit", sha)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        return _finish_merge(gh, n, sha, review_id, approved)
+    except (*GH_ERRORS, KeyError, ValueError, TypeError, AttributeError) as e:
         done = f"merge FAILED ({describe(e)})"
         if review_id is not None:
             done += _dismiss_approval(gh, n, review_id)
         return done
-    return "merge"
+
+
+def _withdraw_stray_approvals(gh, n, sha):
+    """After an approve call failed ambiguously: dismiss APPROVED bot reviews on `sha` (never Dependabot's)."""
+    try:
+        reviews = gh.read_json("api", f"repos/{gh.repo}/pulls/{n}/reviews?per_page=100")
+        stray = [
+            r["id"] for r in reviews
+            if r.get("state") == "APPROVED" and r.get("commit_id") == sha
+            and (r.get("user") or {}).get("type") == "Bot"
+            and not is_dependabot((r.get("user") or {}).get("login"))
+        ]
+    except (*GH_ERRORS, KeyError, ValueError, TypeError, AttributeError) as e:
+        return f"; approval lookup FAILED ({describe(e)}), approval may remain"
+    return "".join(_dismiss_approval(gh, n, rid, reason="approve call failed") for rid in stray)
 
 
 def _dismiss_approval(gh, n, review_id, reason="merge failed"):
@@ -496,7 +598,8 @@ def _execute(gh, n, view, action):
 
 def process(gh, pr, budget, now):
     n = pr["number"]
-    eco = ecosystem_from_branch(pr["headRefName"])
+    eco_raw = ecosystem_from_branch(pr["headRefName"])
+    eco = md_title(eco_raw) if eco_raw else None
     title = md_title(pr["title"])
     try:
         view, total, commits, unresolved, total_runs, runs = _fetch_state(gh, n)
@@ -506,7 +609,7 @@ def process(gh, pr, budget, now):
     untrusted = _is_untrusted(view, total, commits)
     message = head.get("messageHeadline", "") + "\n\n" + (head.get("messageBody") or "")
     ok, reason = eligibility(
-        eco, parse_metadata(message), parse_from_versions(head.get("messageHeadline", ""), head.get("messageBody"))
+        eco_raw, parse_metadata(message), parse_from_versions(head.get("messageHeadline", ""), head.get("messageBody"))
     )
     age_h = age_hours(head["committedDate"], now) if commits else 0
     checks = ci_verdict(view.get("statusCheckRollup"), runs, total_runs, age_h * 60)
@@ -525,7 +628,7 @@ def process(gh, pr, budget, now):
     elif action in (ACT_LABEL_MIGRATION, "recreate", "merge"):
         done = f"{action} (dry-run)"
     return [f"#{n}", title, eco or "?",
-            ("yes: " if ok else "no: ") + reason, checks, done]
+            ("yes: " if ok else "no: ") + md_title(reason), checks, done]
 
 
 def write_summary(text):
@@ -554,20 +657,24 @@ def main():
     labels_ok = ensure_labels(gh)
     try:
         prs = gh.read_json(
-            "pr", "list", "--repo", args.repo, "--state", "open", "--author", "app/dependabot",
-            "--json", "number,title,headRefName", "--limit", str(PR_LIST_LIMIT),
+            "pr", "list", "--repo", args.repo, "--state", "open",
+            "--json", "number,title,headRefName,author", "--limit", str(PR_LIST_LIMIT),
         )
     except GH_ERRORS as e:
         write_summary(f"### Dependabot sweeper: listing PRs FAILED ({describe(e)})\n")
         return 1
     budget, now, rows = Budget(), datetime.now(timezone.utc), []
-    ordered = sorted(prs, key=lambda p: p["number"])
+    # No --author: it goes through GitHub search, which can miss PRs; filter here instead.
+    ordered = sorted((p for p in prs if is_dependabot_pr(p)), key=lambda p: p["number"])
     deferred = 0
     for i, pr in enumerate(ordered):
         if time.monotonic() - start > RUN_DEADLINE_SECONDS:
             deferred = len(ordered) - i
             break
-        rows.append(process(gh, pr, budget, now))
+        try:
+            rows.append(process(gh, pr, budget, now))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            rows.append([f"#{pr.get('number', '?')}", "?", "?", "?", "?", "read FAILED (bad data)"])
     out = [f"### Dependabot sweeper ({'live' if args.live else 'dry-run'})", "",
            "| PR | Title | Ecosystem | Eligibility | Checks | Action |", "|---|---|---|---|---|---|"]
     out += ["| " + " | ".join(r) + " |" for r in rows]
