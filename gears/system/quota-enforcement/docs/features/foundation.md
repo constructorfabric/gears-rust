@@ -129,7 +129,7 @@ consumption-operations feature)
 
 ### Authorized Operation Admission
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-authorized-admission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-authorized-admission`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-consumer`
 
@@ -157,8 +157,8 @@ attribution for the action rollback, and QE then checks that it is the attributi
 **Steps**:
 1. [x] - `p1` - Caller sends an operation request with a platform bearer token; a call on the resolver plugin path carries no token, skips step 2, and enters at step 3 without a `SecurityContext` - `inst-adm-request`
 2. [x] - `p1` - Platform `api-gateway` authenticates and populates the service principal in `SecurityContext`; target attribution remains untrusted request data - `inst-adm-authn`
-3. [ ] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
-   1. [ ] - `p1` - **IF** the operation runs in trusted mode: refuse policy management; otherwise **RETURN** control to the handler with an `AccessScope` naming the request's tenant only, without a PDP call - `inst-adm-trusted`
+3. [x] - `p1` - Deserialize the request and run the operation's documented public target-shape checks; reject malformed shape with canonical `InvalidArgument` before any PDP call - `inst-adm-shape`
+   1. [x] - `p1` - **IF** the operation runs in trusted mode: refuse policy management; otherwise **RETURN** control to the handler with an `AccessScope` naming the request's tenant only, without a PDP call - `inst-adm-trusted`
 4. [x] - `p1` - API: call `PolicyEnforcer::access_scope(...)` with the requested operation and explicit target — the in-process PEP evaluates against `authz-resolver` and compiles the response itself within the configured `pdp_deadline_ms` (default 250 ms, at least 1 ms, and 0 fails startup; an overrun is a PDP-unreachable `EnforcerError`), returning `AccessScope` or `EnforcerError`; QE never sees the raw decision and keeps no PDP decision cache of its own - `inst-adm-pdp`
 5. [x] - `p1` - **IF** the call returns `EnforcerError` (denied, compile-failed, or PDP unreachable) - `inst-adm-deny-if`
    1. [x] - `p1` - **RETURN** the canonical error (`PermissionDenied` / `ServiceUnavailable`); no handler runs - `inst-adm-deny`
@@ -248,7 +248,7 @@ the trait names exists — no placeholder or `unimplemented!` method ever ships.
 
 ### Gateway Admission and Tenant Isolation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-gateway-admission`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-gateway-admission`
 
 The system **MUST** mount the Gateway into the platform `api-gateway`, reject unauthenticated requests before any
 handler, run phase-1 PDP admission via `authz-resolver-sdk::PolicyEnforcer` with fail-closed posture and no QE-side
@@ -324,7 +324,7 @@ coordination contract, plugin crate, or bootstrap probe ships.
 
 ### Telemetry Conventions
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-telemetry-conventions`
 
 The system **MUST** emit gear-specific instruments through the `QeMetrics` port and its `OpenTelemetry` adapter, exported over OTLP by the platform under the `otel` feature, enforcing
 the bounded-cardinality label discipline through the type system: every label value is a static token of a closed

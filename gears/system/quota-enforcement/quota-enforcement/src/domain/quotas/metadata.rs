@@ -54,7 +54,11 @@ pub fn check(
 
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-rejected-if
     if violations.is_empty() {
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-pii
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-return
         return Ok(());
+        // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-return
+        // @cpt-end:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-pii
     }
     // @cpt-begin:cpt-cf-quota-enforcement-algo-quota-metadata-validation:p1:inst-qmd-rejected
     metrics.record_contract_validation_failure(
@@ -80,8 +84,10 @@ pub(super) fn violations(
 ) -> Vec<QuotaMetadataViolation> {
     let mut declared = Map::new();
     metadata_properties(schema, &mut declared);
-    metadata
-        .iter()
+    let mut conditions: Vec<_> = metadata.iter().collect();
+    conditions.sort_unstable_by_key(|(name, _)| *name);
+    conditions
+        .into_iter()
         .filter_map(|(name, condition)| {
             let reason = reason(declared.get(name), condition)?;
             Some(QuotaMetadataViolation {

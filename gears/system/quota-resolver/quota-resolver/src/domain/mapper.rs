@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use toolkit::client_hub::ClientHub;
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_macros::domain_model;
 use toolkit_security::PlatformSecurityContext;
 use types_registry_sdk::{
     LifecycleStatus, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, ReadOptions,
@@ -21,6 +22,7 @@ const LOOKUP_BUDGET: Duration = Duration::from_secs(2);
 /// A registered type keeps its answer for the life of the process, because a
 /// GTS type id never changes its ancestors. An unregistered type is asked again
 /// on every call.
+#[domain_model]
 pub struct PrincipalMapper {
     entries: BTreeMap<String, String>,
     resolved: RwLock<HashMap<String, Option<String>>>,

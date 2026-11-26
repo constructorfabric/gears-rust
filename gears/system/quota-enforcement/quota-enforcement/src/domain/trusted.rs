@@ -13,6 +13,7 @@ use quota_enforcement_sdk::{
     AcquireLeaseOutcome, AcquireLeaseRequest, CommitLeaseRequest, DebitRequest, Decision,
     PageResult, QuotaSnapshot, ReleaseLeaseRequest, SnapshotRequest, TenantId,
 };
+use toolkit_macros::domain_model;
 use toolkit_security::PlatformIdentity;
 
 use super::error::DomainError;
@@ -22,6 +23,7 @@ use super::service::Service;
 /// platform identity of the resolver's caller (recorded as the actor, never
 /// authorized by, `None` for a caller in the resolver's process), and the
 /// request; the tenant replaces the one the request names.
+#[domain_model]
 pub struct TrustedOperations {
     service: Arc<Service>,
 }

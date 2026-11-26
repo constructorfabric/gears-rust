@@ -53,7 +53,9 @@ a module charge the user of a request, and which operations are reachable from t
   check in the backend.
 * (d) The tenant plane only, for platform services too: a service gets a tenant `SecurityContext` from a token that the
   identity provider (IdP) issues for the service's own client id and secret (OAuth2 client credentials, S2S), and a
-  policy check authorizes it, as `cpt-cf-adr-two-plane-auth` describes for work within a tenant.
+  policy check authorizes it, as toolkit
+  [ADR-0008](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md) describes for work within a
+  tenant.
 
 ## Decision Outcome
 
@@ -80,10 +82,10 @@ The resolver performs no policy check. It passes the platform identity that it r
 for the backend's record of operations. It trusts platform-plane callers
 for the target data they provide and trusts the backend to decide which quotas apply to the fixed tenant and subjects.
 
-This is an exception to the toolkit's two-plane rule (`cpt-cf-adr-two-plane-auth`, "Which plane?"), which puts
+This is an exception to the toolkit's two-plane rule (toolkit ADR-0008, "Which plane?"), which puts
 operations within a tenant, writes and service-to-service calls included, on the tenant plane with a policy check.
 The toolkit has no way to authorize a trusted service that charges many tenants (option (d)): a tenant
-`SecurityContext` binds one tenant, `cpt-cf-adr-two-plane-auth` forbids building one by hand for a target tenant, and
+`SecurityContext` binds one tenant, toolkit ADR-0008 forbids building one by hand for a target tenant, and
 the policy decision point does not evaluate `PlatformSecurityContext`. The exception ends when the toolkit evaluates
 policies for platform-plane callers, keyed on the calling service and set at platform level, so the charged tenant
 cannot deny its own charge
@@ -124,7 +126,7 @@ the resolver returns the plugin's quota-state page unchanged.
 * Good, because every charge is authenticated the same way, by the platform credential of the calling module.
 * Good, because the tenant plane is read-only and safe to publish at the edge.
 * Bad, because the resolver trusts the module to pass the right principal.
-* Bad, because no component authorizes the calling service, which is an exception to `cpt-cf-adr-two-plane-auth`.
+* Bad, because no component authorizes the calling service, which is an exception to toolkit ADR-0008.
 
 ### (b) Writes on both planes, user context forwarded
 
@@ -142,11 +144,11 @@ the resolver returns the plugin's quota-state page unchanged.
 
 ### (d) Tenant plane only, S2S token per tenant
 
-* Good, because every charge passes a policy check, as `cpt-cf-adr-two-plane-auth` asks for work within a tenant.
+* Good, because every charge passes a policy check, as toolkit ADR-0008 asks for work within a tenant.
 * Bad, because a client-credentials request names no tenant: the token yields the context of the one tenant that the
   IdP binds to the client. A service that charges many tenants needs an IdP client per tenant or a token exchange per
   tenant, which the platform does not have, and pays an IdP round trip per tenant.
-* Bad, because building a tenant `SecurityContext` by hand instead is what `cpt-cf-adr-two-plane-auth` forbids as the
+* Bad, because building a tenant `SecurityContext` by hand instead is what toolkit ADR-0008 forbids as the
   seam where cross-tenant leaks start.
 * Bad, because a policy of the charged tenant could deny the charge of that tenant.
 

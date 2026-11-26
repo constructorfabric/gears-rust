@@ -202,11 +202,13 @@ impl<'a> QuotaManagement<'a> {
         // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-metric-if
         // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid-if
         // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-pass
         if !draft.subject.is_tenant() {
             self.catalog
                 .check_subject(&draft.subject, ValidationSurface::QuotaWrite)
                 .await?;
         }
+        // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-pass
         // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid
         // @cpt-end:cpt-cf-quota-enforcement-algo-catalog-membership:p1:inst-mem-invalid-if
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-membership

@@ -228,7 +228,7 @@ that maximum, and ack only when every sink succeeded.
 
 ### Event Catalog Conformance
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-event-catalog`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-event-catalog`
 
 The system **MUST** deliver all eight catalog kinds — `threshold-crossed`, `period-rollover`, `lease-auto-released`,
 `lease-resolved-by-deactivation`, `quota-changed`, `quota-counter-adjusted`, `quota-rollback-applied`,

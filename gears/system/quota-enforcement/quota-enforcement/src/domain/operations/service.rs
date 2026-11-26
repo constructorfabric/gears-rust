@@ -106,6 +106,7 @@ pub struct ReturnRequest {
 /// is the same request. The `metadata` is the admitted one, in its canonical
 /// form, so a retry that writes an integer as `5.0` is the same request too.
 /// The amount is as sent.
+#[domain_model]
 #[derive(Serialize)]
 pub(super) struct DebitPayload<'a> {
     tenant_id: quota_enforcement_sdk::TenantId,

@@ -598,8 +598,9 @@ mapping to a subject type that the metric does not admit or that is not register
 * The tenant plane has no write operation; its only route, `quota-state`, is exposed.
 * No policy check runs in the resolver. Platform callers are trusted by the resolver, also for the principal they pass
   as data; on the tenant plane the context fixes the subject and the tenant (`cpt-cf-quota-resolver-adr-two-planes`).
-  No component checks which platform service may charge which tenant: this is an exception to
-  `cpt-cf-adr-two-plane-auth` until the toolkit authorizes platform-plane callers
+  No component checks which platform service may charge which tenant: this is an exception to toolkit
+  [ADR-0008](../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md) until the toolkit authorizes
+  platform-plane callers
   ([#6037](https://github.com/constructorfabric/gears-rust/issues/6037)).
 * The backend decides which quotas a quota state read returns; the resolver returns the backend's page unchanged.
 * A charge never carries a user's `SecurityContext`, and the resolver never synthesizes one. A module that reads its

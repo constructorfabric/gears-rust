@@ -150,7 +150,7 @@ itself is owned by the quota-lifecycle feature)
 2. [ ] - `p1` - Owner registers one concrete metric type per metric, derived from `gts.cf.core.quota.metric.v1~` and named under the owning module; its traits set `kind`, `enforcement`, and `admitted_subjects` (default empty: tenant quotas only; an owner that does not know the metric's kinds of subject admits the subject base `gts.cf.core.quota.subj.v1~`, which admits every subject type); its schema refines `metadata` - `inst-pub-attrs`
 3. [x] - `p1` - API: registration happens in `types-registry`; QE exposes no registration endpoint (`cpt-cf-quota-enforcement-constraint-types-registry-delegation`) - `inst-pub-registry`
 4. [ ] - `p1` - QE reads and checks the metric type by its id (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`): at start when an active Quota or Policy names it, otherwise when a request or a Quota or Policy write names it for the first time, and again on a bounded schedule; QE serves the metric from its `MetricCatalog` entry - `inst-pub-boot`
-5. [ ] - `p1` - **RETURN** any caller names quota subjects of admitted types and the metric type; a Quota is bound to a subject and a metric type, so every caller charges one shared set of quotas; another major version of the metric type is another metric with its own Quotas - `inst-pub-return`
+5. [x] - `p1` - **RETURN** any caller names quota subjects of admitted types and the metric type; a Quota is bound to a subject and a metric type, so every caller charges one shared set of quotas; another major version of the metric type is another metric with its own Quotas - `inst-pub-return`
 
 ### Evaluation Request Ingress Validation
 
@@ -176,18 +176,18 @@ itself is owned by the quota-lifecycle feature)
   reaches its time limit: canonical `ServiceUnavailable`
 
 **Steps**:
-1. [ ] - `p1` - Caller sends an evaluation operation carrying `tenant_id`, `subjects: [{type, id}]` (at least one), and `metric: {type, id?, metadata}`; platform authentication has attached the caller's `SecurityContext` and the DTO is deserialized - `inst-ing-request`
-2. [ ] - `p1` - Validate public request shape: required fields and container types, non-empty `tenant_id` and subject ids, at least one subject, no two subjects of one type, a subject of the tenant type only with `id == tenant_id`, a metric object with `type` and `metadata`, and the form of the type ids: `metric.type` is a GTS type id derived from `gts.cf.core.quota.metric.v1~` and each subject type a GTS type id derived from `gts.cf.core.quota.subj.v1~`; return canonical `InvalidArgument` before admission on failure - `inst-ing-shape`
-3. [ ] - `p1` - Admit the request in the mode of its path (`cpt-cf-quota-enforcement-flow-authorized-admission`): on QE's API, send the complete attribution (the tenant, the subjects, and the metric with its type and optional id) to PDP and fail closed on denial or PDP unavailability; on the resolver plugin path, trusted mode calls no PDP and scopes storage to `tenant_id` - `inst-ing-authz`
-4. [ ] - `p1` - Look up the entry of `metric.type` in the process-local `MetricCatalog`; a metric the catalogue holds needs no registry call; for a metric it does not hold, read the metric type by its id once, with a time limit, and build its entry (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`) - `inst-ing-lookup`
-5. [ ] - `p1` - **IF** the entry is unavailable - `inst-ing-unavail-if`
-   1. [ ] - `p1` - **RETURN** canonical `FailedPrecondition`; nothing changes and no Decision is produced - `inst-ing-unavail`
+1. [x] - `p1` - Caller sends an evaluation operation carrying `tenant_id`, `subjects: [{type, id}]` (at least one), and `metric: {type, id?, metadata}`; platform authentication has attached the caller's `SecurityContext` and the DTO is deserialized - `inst-ing-request`
+2. [x] - `p1` - Validate public request shape: required fields and container types, non-empty `tenant_id` and subject ids, at least one subject, no two subjects of one type, a subject of the tenant type only with `id == tenant_id`, a metric object with `type` and `metadata`, and the form of the type ids: `metric.type` is a GTS type id derived from `gts.cf.core.quota.metric.v1~` and each subject type a GTS type id derived from `gts.cf.core.quota.subj.v1~`; return canonical `InvalidArgument` before admission on failure - `inst-ing-shape`
+3. [x] - `p1` - Admit the request in the mode of its path (`cpt-cf-quota-enforcement-flow-authorized-admission`): on QE's API, send the complete attribution (the tenant, the subjects, and the metric with its type and optional id) to PDP and fail closed on denial or PDP unavailability; on the resolver plugin path, trusted mode calls no PDP and scopes storage to `tenant_id` - `inst-ing-authz`
+4. [x] - `p1` - Look up the entry of `metric.type` in the process-local `MetricCatalog`; a metric the catalogue holds needs no registry call; for a metric it does not hold, read the metric type by its id once, with a time limit, and build its entry (`cpt-cf-quota-enforcement-algo-catalog-bootstrap`) - `inst-ing-lookup`
+5. [x] - `p1` - **IF** the entry is unavailable - `inst-ing-unavail-if`
+   1. [x] - `p1` - **RETURN** canonical `FailedPrecondition`; nothing changes and no Decision is produced - `inst-ing-unavail`
 6. [ ] - `p1` - **IF** the read of a metric type the catalogue does not hold fails or reaches its time limit - `inst-ing-registry-if`
    1. [ ] - `p1` - **RETURN** canonical `ServiceUnavailable`; the caller may repeat the request - `inst-ing-registry`
-7. [ ] - `p1` - **IF** the metric type is not registered (an answer the catalogue remembers for a short time), or a subject type is not admitted (`cpt-cf-quota-enforcement-algo-subject-resolution`) - `inst-ing-metric-if`
-   1. [ ] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` by closed validation surface - `inst-ing-metric`
-8. [ ] - `p1` - Validate the whole metric object `{type, id?, metadata}` against the resolved schema of its metric type (never the `metadata` subschema alone); absent `metadata` was rejected before admission and is never defaulted to `{}`; a metric object that does not fit the held entry makes QE read the metric type again with a conditional read, at most once per metric in the time it remembers an unknown id, and check the object against a revised entry (ADR-0012); a metric object that still does not fit is canonical `InvalidArgument` - `inst-ing-metadata`
-9. [ ] - `p1` - Add the implicit tenant subject from `tenant_id` unless the request names it, and exclude the caller's identity from Policy input `request`, the `metadata` of the metric object - `inst-ing-map`
+7. [x] - `p1` - **IF** the metric type is not registered (an answer the catalogue remembers for a short time), or a subject type is not admitted (`cpt-cf-quota-enforcement-algo-subject-resolution`) - `inst-ing-metric-if`
+   1. [x] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` by closed validation surface - `inst-ing-metric`
+8. [x] - `p1` - Validate the whole metric object `{type, id?, metadata}` against the resolved schema of its metric type (never the `metadata` subschema alone); absent `metadata` was rejected before admission and is never defaulted to `{}`; a metric object that does not fit the held entry makes QE read the metric type again with a conditional read, at most once per metric in the time it remembers an unknown id, and check the object against a revised entry (ADR-0012); a metric object that still does not fit is canonical `InvalidArgument` - `inst-ing-metadata`
+9. [x] - `p1` - Add the implicit tenant subject from `tenant_id` unless the request names it, and exclude the caller's identity from Policy input `request`, the `metadata` of the metric object - `inst-ing-map`
 10. [x] - `p1` - **RETURN** the validated, admitted request to the evaluation pipeline; this validation runs at ingress of every debit, lease acquisition, preview, and each batch item, and its failures are canonical errors, never `Decision::Denied` (`cpt-cf-quota-enforcement-fr-contract-validation`) - `inst-ing-forward`
 
 ## 3. Processes / Business Logic (CDSL)
@@ -228,20 +228,20 @@ itself is owned by the quota-lifecycle feature)
 evaluation
 
 **Steps**:
-1. [ ] - `p1` - Reject an empty subject list, an empty subject id, two subjects of one type, a tenant subject whose id is not `tenant_id`, or a subject type id that does not have the form of a GTS type id derived from `gts.cf.core.quota.subj.v1~` (canonical `InvalidArgument` with no registry call) - `inst-res-shape`
-2. [ ] - `p1` - Require admission of the request in the mode of its path before any catalogue lookup (`cpt-cf-quota-enforcement-flow-authorized-admission`) - `inst-res-authz`
-3. [ ] - `p1` - Add the tenant subject `(gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~, tenant_id)` unless the request names it; it is the same subject either way - `inst-res-tenant`
-4. [ ] - `p1` - **FOR EACH** subject - `inst-res-each`
-   1. [ ] - `p1` - Check the subject type against the `admitted_subjects` trait of the metric type: the tenant type is always admitted, and a type is admitted when it equals an admitted type or derives from one (the admitted type id is a prefix of its chained GTS type id) - `inst-res-map`
-   2. [ ] - `p1` - For a type that step 4.1 admits, check that the type is registered and that the subject fits its schema, through the process-local cache of registered subject types: a type the cache does not hold is looked up in `types-registry` once, a registered type stays cached until a scheduled catalogue read finds it deleted (`inst-cat-refresh`), an unknown type is cached for a short time and is `InvalidArgument`, and a failed lookup is `ServiceUnavailable` - `inst-res-registered`
-   3. [ ] - `p1` - **IF** the type is not admitted - `inst-res-invalid-if`
+1. [x] - `p1` - Reject an empty subject list, an empty subject id, two subjects of one type, a tenant subject whose id is not `tenant_id`, or a subject type id that does not have the form of a GTS type id derived from `gts.cf.core.quota.subj.v1~` (canonical `InvalidArgument` with no registry call) - `inst-res-shape`
+2. [x] - `p1` - Require admission of the request in the mode of its path before any catalogue lookup (`cpt-cf-quota-enforcement-flow-authorized-admission`) - `inst-res-authz`
+3. [x] - `p1` - Add the tenant subject `(gts.cf.core.quota.subj.v1~cf.core.quota.tenant.v1~, tenant_id)` unless the request names it; it is the same subject either way - `inst-res-tenant`
+4. [x] - `p1` - **FOR EACH** subject - `inst-res-each`
+   1. [x] - `p1` - Check the subject type against the `admitted_subjects` trait of the metric type: the tenant type is always admitted, and a type is admitted when it equals an admitted type or derives from one (the admitted type id is a prefix of its chained GTS type id) - `inst-res-map`
+   2. [x] - `p1` - For a type that step 4.1 admits, check that the type is registered and that the subject fits its schema, through the process-local cache of registered subject types: a type the cache does not hold is looked up in `types-registry` once, a registered type stays cached until a scheduled catalogue read finds it deleted (`inst-cat-refresh`), an unknown type is cached for a short time and is `InvalidArgument`, and a failed lookup is `ServiceUnavailable` - `inst-res-registered`
+   3. [x] - `p1` - **IF** the type is not admitted - `inst-res-invalid-if`
       1. [x] - `p1` - **RETURN** canonical `InvalidArgument` before evaluation - `inst-res-invalid`
    4. [ ] - `p1` - Append `(subject_type, id)` - `inst-res-append`
 5. [x] - `p1` - **RETURN** the complete subject set for applicable-Quota lookup - `inst-res-return`
 
 ### Admission Check for Quota and Policy Writes
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-membership`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-membership`
 
 **Input**: the subject type and metric type of a Quota write, or the metric type that a Policy write names in its
 scope, and `MetricCatalog`
@@ -249,13 +249,13 @@ scope, and `MetricCatalog`
 **Output**: pass, or a canonical rejection before persistence
 
 **Steps**:
-1. [ ] - `p1` - Look up the metric's entry in `MetricCatalog`; for a metric the catalogue does not hold the write reads the metric type as a request does (`inst-ing-lookup`), with the same errors: a type that is not registered is canonical `InvalidArgument`, and a read that fails or reaches its time limit is `ServiceUnavailable`; the evaluation hot path never runs this check - `inst-mem-lookup`
-2. [ ] - `p1` - **IF** the metric's entry is unavailable; a Quota deactivation, a Policy rollback, and a Policy delete do not run this check - `inst-mem-entry-if`
-   1. [ ] - `p1` - **RETURN** rejection with `PROJECTION_NOT_RESOLVABLE`; increment `contract_validation_failures_total` with the closed write surface - `inst-mem-entry`
-3. [ ] - `p1` - **IF** a Quota write names a subject type that the `admitted_subjects` trait of its metric type does not admit - `inst-mem-metric-if`
-   1. [ ] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` with the closed write surface - `inst-mem-metric`
-4. [ ] - `p1` - **IF** the admitted subject type of a Quota write is unregistered - `inst-mem-invalid-if`
-   1. [ ] - `p1` - **RETURN** canonical rejection per `cpt-cf-quota-enforcement-fr-subject-type-registry`; increment `contract_validation_failures_total` with the closed write surface - `inst-mem-invalid`
+1. [x] - `p1` - Look up the metric's entry in `MetricCatalog`; for a metric the catalogue does not hold the write reads the metric type as a request does (`inst-ing-lookup`), with the same errors: a type that is not registered is canonical `InvalidArgument`, and a read that fails or reaches its time limit is `ServiceUnavailable`; the evaluation hot path never runs this check - `inst-mem-lookup`
+2. [x] - `p1` - **IF** the metric's entry is unavailable; a Quota deactivation, a Policy rollback, and a Policy delete do not run this check - `inst-mem-entry-if`
+   1. [x] - `p1` - **RETURN** rejection with `PROJECTION_NOT_RESOLVABLE`; increment `contract_validation_failures_total` with the closed write surface - `inst-mem-entry`
+3. [x] - `p1` - **IF** a Quota write names a subject type that the `admitted_subjects` trait of its metric type does not admit - `inst-mem-metric-if`
+   1. [x] - `p1` - **RETURN** canonical `InvalidArgument`; increment `admitted_metric_violations_total` with the closed write surface - `inst-mem-metric`
+4. [x] - `p1` - **IF** the admitted subject type of a Quota write is unregistered - `inst-mem-invalid-if`
+   1. [x] - `p1` - **RETURN** canonical rejection per `cpt-cf-quota-enforcement-fr-subject-type-registry`; increment `contract_validation_failures_total` with the closed write surface - `inst-mem-invalid`
 5. [x] - `p1` - **RETURN** pass; the quota-lifecycle and resolution-policy-engine features invoke this check inside their write paths, which own the writes themselves - `inst-mem-pass`
 
 ## 4. States (CDSL)
@@ -337,7 +337,7 @@ registry-resident; no QE-side table exists.
 
 ### Gateway Ingress Validation
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-ingress-validation`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-ingress-validation`
 
 The system **MUST** extend the foundation Gateway with fail-closed validation of debit, lease acquisition, preview,
 and each batch item: explicit `tenant_id`, at least one `{type, id}` subject, and a metric object
@@ -362,7 +362,7 @@ contain no `caller_type`, a field that names the kind of the caller.
 
 ### Subject Admission at Ingress
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-subject-resolution`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-subject-resolution`
 
 The system **MUST** shape-check `tenant_id` and the `{type, id}` subjects, require admission of the request, add the
 implicit tenant subject, and check every subject type against the `admitted_subjects` trait of the metric type (exact
@@ -403,7 +403,7 @@ rejected with `InvalidArgument`. The evaluation hot path **MUST NOT** run this c
 
 ### Contract-Validation Telemetry
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-contract-validation-telemetry`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-contract-validation-telemetry`
 
 The system **MUST** emit `contract_validation_failures_total` (rejected metric objects, rejected writes, and
 unavailable metric types, by closed validation surface/reason) and `admitted_metric_violations_total` (subject types a

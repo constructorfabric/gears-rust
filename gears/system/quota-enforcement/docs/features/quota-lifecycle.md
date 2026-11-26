@@ -113,7 +113,7 @@ invariant I15, consumption-operations and lease-operations features).
 
 ### Quota Create
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-create`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-create`
 
 Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 
@@ -141,12 +141,12 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
   (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with the violations; nothing is persisted
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /quota-enforcement/v1/quotas` with a `QuotaDraft` naming the explicit target `(subject_type, subject_id)`, `subject_type` derived from `gts.cf.core.quota.subj.v1~`, under PDP scope (management DTOs retain explicit target identity); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has returned the actor and the `AccessScope` - `inst-qcr-request`
+1. [x] - `p1` - Caller sends `POST /quota-enforcement/v1/quotas` with a `QuotaDraft` naming the explicit target `(subject_type, subject_id)`, `subject_type` derived from `gts.cf.core.quota.subj.v1~`, under PDP scope (management DTOs retain explicit target identity); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) has returned the actor and the `AccessScope` - `inst-qcr-request`
 2. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the draft - `inst-qcr-validate`
-3. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-metric-validation`; the metric's `kind`, `enforcement`, and admitted subject types come from the metric's `MetricCatalog` entry; for a metric the catalogue does not hold, the write reads the metric type as a request does (`cpt-cf-quota-enforcement-algo-catalog-membership`); a metric whose entry is unavailable is rejected with `PROJECTION_NOT_RESOLVABLE` - `inst-qcr-metric`
-4. [ ] - `p1` - Invoke `cpt-cf-quota-enforcement-algo-catalog-membership` (projection-contracts feature): the subject type must be registered, derived from `gts.cf.core.quota.subj.v1~`, and admitted by the `admitted_subjects` trait of the metric type (exact or derived type; the tenant type is always admitted) - `inst-qcr-membership`
-5. [ ] - `p1` - A subject of the tenant type must name the Quota's tenant; any other is rejected with `InvalidArgument` before persistence (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qcr-subject-scope`
-6. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` on the draft's `metadata`; a draft without `metadata` carries the empty object - `inst-qcr-metadata`
+3. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-metric-validation`; the metric's `kind`, `enforcement`, and admitted subject types come from the metric's `MetricCatalog` entry; for a metric the catalogue does not hold, the write reads the metric type as a request does (`cpt-cf-quota-enforcement-algo-catalog-membership`); a metric whose entry is unavailable is rejected with `PROJECTION_NOT_RESOLVABLE` - `inst-qcr-metric`
+4. [x] - `p1` - Invoke `cpt-cf-quota-enforcement-algo-catalog-membership` (projection-contracts feature): the subject type must be registered, derived from `gts.cf.core.quota.subj.v1~`, and admitted by the `admitted_subjects` trait of the metric type (exact or derived type; the tenant type is always admitted) - `inst-qcr-membership`
+5. [x] - `p1` - A subject of the tenant type must name the Quota's tenant; any other is rejected with `InvalidArgument` before persistence (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qcr-subject-scope`
+6. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` on the draft's `metadata`; a draft without `metadata` carries the empty object - `inst-qcr-metadata`
 7. [x] - `p1` - All validation above completes outside the storage transaction, so the database lock is held for the minimum window - `inst-qcr-outside-tx`
 8. [x] - `p1` - DB: `create_quota` in a single transaction: insert the `quotas` row (server-assigned UUIDv7 `quota_id`, status `active`), insert the `quota_allocation_counters` row for allocation type (consumption counter rows are created lazily by the first mutating operation), enqueue `quota-changed (change_kind='created')` in the outbox (I11), append the `operation_log` entry, and commit the transaction - `inst-qcr-persist`
 9. [x] - `p1` - **IF** the metric's catalogue entry is `Direct` - `inst-qcr-direct-if`
@@ -155,7 +155,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 
 ### Quota Update
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-update`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-update`
 
 **Actor**: `cpt-cf-quota-enforcement-actor-quota-manager` (and
 `cpt-cf-quota-enforcement-actor-platform-operator` through the same endpoint)
@@ -179,11 +179,11 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 1. [x] - `p1` - Caller sends `PATCH /quota-enforcement/v1/quotas/{id}` with a `QuotaUpdate` - `inst-qup-request`
 2. [x] - `p1` - **IF** the patch references `type = rate` - `inst-qup-rate-if`
    1. [x] - `p1` - **RETURN** `DomainError::NotYetImplemented`, canonicalized as `Unimplemented` (HTTP 501, `NOT_YET_IMPLEMENTED`); the rate check runs before the breaking-change gate, so an update referencing `rate` returns `Unimplemented` per the DESIGN rejection rule (`cpt-cf-quota-enforcement-fr-quota-type-rate-rejection`) - `inst-qup-rate`
-3. [ ] - `p1` - **IF** the patch changes metric, type, period, enforcement mode, or subject - `inst-qup-breaking-if`
+3. [x] - `p1` - **IF** the patch changes metric, type, period, enforcement mode, or subject - `inst-qup-breaking-if`
    1. [x] - `p1` - **RETURN** rejection; breaking changes are performed by deactivating the original Quota and creating a new one (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qup-breaking`
 4. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-draft-validation` on the patched shape (cap non-negative, thresholds-require-bounded-cap) and `cpt-cf-quota-enforcement-algo-metric-validation` (metric identity is revalidated at update time per `cpt-cf-quota-enforcement-fr-metric-identity-validation`) - `inst-qup-validate`
 5. [x] - `p1` - **IF** the patch carries `metadata` - `inst-qup-meta-if`
-   1. [ ] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` on the patched `metadata`; metadata changes never invalidate the quota ID - `inst-qup-meta`
+   1. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` on the patched `metadata`; metadata changes never invalidate the quota ID - `inst-qup-meta`
 6. [x] - `p1` - DB: `update_quota(quota_id, patch, events)` in a single transaction that also appends the `operation_log` entry (I1); the row is re-read under its row lock, so a Quota deactivated meanwhile is rejected with `QUOTA_DEACTIVATED` and nothing is written, and the cap-vs-consumed comparison is evaluated at the moment the transaction commits, in-tx with the same lock (I6), never at request-receipt time, so concurrent debits cannot race the guard - `inst-qup-persist`
 7. [x] - `p1` - **IF** the reduced or newly numeric cap is strictly below the active period's consumed amount (consumption type) or the in-flight count (allocation type) - `inst-qup-guard-if`
    1. [x] - `p1` - **RETURN** `CAP_BELOW_CONSUMED` (`DomainError::CapBelowConsumed`); the operator first issues credits, then reduces the cap - `inst-qup-guard`
@@ -291,11 +291,11 @@ error
 **Output**: accepted metadata, or rejection before persistence
 
 **Steps**:
-1. [ ] - `p1` - **IF** `metadata` is not a JSON object, or its canonical JSON serialization exceeds the single operator-configurable size limit (default 4 KB per Quota) - `inst-qmd-size-if`
+1. [x] - `p1` - **IF** `metadata` is not a JSON object, or its canonical JSON serialization exceeds the single operator-configurable size limit (default 4 KB per Quota) - `inst-qmd-size-if`
    1. [x] - `p1` - **RETURN** rejection at validation time (`cpt-cf-quota-enforcement-fr-quota-metadata`) - `inst-qmd-size`
-2. [ ] - `p1` - **FOR EACH** key of `metadata`, check the condition against the `metadata` schema of the metric type: the key names a declared property whose type is a string, an integer, or a boolean, and the value is a value of that type or a non-empty array of such values (`cpt-cf-quota-enforcement-adr-metric-types`) - `inst-qmd-conditions`
-3. [ ] - `p1` - **IF** a condition does not fit - `inst-qmd-rejected-if`
-   1. [ ] - `p1` - **RETURN** `QUOTA_METADATA_REJECTED` (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with one field violation per condition that does not fit: the place in the metadata and the reason; nothing is written; increment `contract_validation_failures_total` with the closed `quota_write` surface - `inst-qmd-rejected`
+2. [x] - `p1` - **FOR EACH** key of `metadata`, check the condition against the `metadata` schema of the metric type: the key names a declared property whose type is a string, an integer, or a boolean, and the value is a value of that type or a non-empty array of such values (`cpt-cf-quota-enforcement-adr-metric-types`) - `inst-qmd-conditions`
+3. [x] - `p1` - **IF** a condition does not fit - `inst-qmd-rejected-if`
+   1. [x] - `p1` - **RETURN** `QUOTA_METADATA_REJECTED` (`DomainError::QuotaMetadataRejected`, canonical `InvalidArgument`, 400) with one field violation per condition that does not fit: the place in the metadata and the reason; nothing is written; increment `contract_validation_failures_total` with the closed `quota_write` surface - `inst-qmd-rejected`
 4. [ ] - `p1` - Store the accepted metadata; evaluation does not check a stored value against the schema, and a Policy does not read Quota metadata. The lifecycle gauge refresh checks the conditions of the active Quotas against the current metric type and counts those that no longer fit in `quota_conditions_unfit_total` - `inst-qmd-once`
 5. [ ] - `p1` - At evaluation the storage plugin keeps a Quota in the applicable set only when all its conditions hold on the request's metadata (storage invariant I15); QE core never indexes metadata for direct query - `inst-qmd-opaque`
 6. [x] - `p1` - Metadata must not carry PII or other regulated data (Platform Operational Data per PRD §6.2); operators are responsible for the content respecting this classification - `inst-qmd-pii`

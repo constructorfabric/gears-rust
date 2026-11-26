@@ -78,10 +78,10 @@ Chosen option: (b).
 * QE reads through the platform-plane contract of types-registry, `PlatformTypesRegistryApi`, as other platform gears
   do. That contract has the conditional read; the older `TypesRegistryClient` does not. Every read asks the registry
   itself, not the cached copy of the registry client.
-* The catalogue does not use the cache that types-registry designs for its SDK client
-  (`cpt-cf-types-registry-tech-sdk-cache`), for two reasons. That cache is not implemented. And by its design it
-  confirms an entry with the registry on the request path after a freshness window and fails the read when the
-  registry does not answer, while QE must keep serving a metric it holds (below). The catalogue therefore has two
+* The catalogue does not use the cache that types-registry designs for its SDK client, for two reasons. That cache is
+  not implemented. And by its design it confirms an entry with the registry on the request path after a freshness
+  window and fails the read when the registry does not answer, while QE must keep serving a metric it holds (below).
+  The catalogue therefore has two
   parts. The entry that QE builds from a type document, with the compiled schema, the traits, and the served or
   unavailable state, stays in QE in any case. The storing of documents, the conditional reads, and the schedule are
   replaced by the SDK cache when it exists and can return the last content it holds while the registry does not

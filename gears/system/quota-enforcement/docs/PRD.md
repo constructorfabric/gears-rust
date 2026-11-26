@@ -3806,12 +3806,9 @@ on behalf of a tenant administrator)
 - **Informal upstream requirements**: no formal `UPSTREAM_REQS.md` is maintained for this gear
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: see [DESIGN §5 Traceability](./DESIGN.md) for the canonical ADR catalogue. Metric types:
-  `cpt-cf-quota-enforcement-adr-metric-types`
-  ([ADR-0013](./ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md)) and
-  `cpt-cf-quota-resolver-adr-metric-types`
-  ([Quota Resolver ADR-0004](../../quota-resolver/docs/ADR/0004-cpt-cf-quota-resolver-adr-metric-types.md)); metric
-  catalogue: `cpt-cf-quota-enforcement-adr-contract-catalogue`
-  ([ADR-0012](./ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md))
+  [ADR-0013](./ADR/0013-cpt-cf-quota-enforcement-adr-metric-types.md) and
+  [Quota Resolver ADR-0004](../../quota-resolver/docs/ADR/0004-cpt-cf-quota-resolver-adr-metric-types.md); metric
+  catalogue: [ADR-0012](./ADR/0012-cpt-cf-quota-enforcement-adr-contract-catalogue.md)
 - **Features**: feature specifications under `docs/features/` (twelve documents, one per DECOMPOSITION entry)
 - **Related gears**: [Usage Collector PRD](../../usage-collector/docs/PRD.md),
   [Account Management PRD](../../account-management/docs/PRD.md),
