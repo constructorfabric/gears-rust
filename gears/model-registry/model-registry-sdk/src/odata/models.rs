@@ -80,30 +80,30 @@ pub struct ModelQuery {
     // User-facing
     #[odata(filter(kind = "String"))]
     pub display_name: String,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub family: String,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub vendor: String,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub hosted_by: String,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub region: String,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub model_version: String,
     #[odata(filter(kind = "Bool"))]
     pub managed: bool,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub architecture: String,
-    #[odata(filter(kind = "String"))]
+    #[odata(filter(kind = "String", orderable = false))]
     pub format: String,
     #[odata(filter(kind = "I64"))]
     pub sort_order: i64,
-    #[odata(filter(kind = "DateTimeUtc"))]
+    #[odata(filter(kind = "DateTimeUtc", orderable = false))]
     pub last_release_at: DateTime<Utc>,
     // Context window
     #[odata(filter(kind = "I64"))]
     pub max_input_tokens: i64,
-    #[odata(filter(kind = "I64"))]
+    #[odata(filter(kind = "I64", orderable = false))]
     pub max_output_tokens: i64,
     // Audit
     #[odata(filter(kind = "DateTimeUtc"))]
@@ -117,7 +117,8 @@ pub struct ModelQuery {
 pub use ModelQueryFilterField as ModelFilterField;
 
 /// Nullable model fields: filterable, but a `$orderby` on one is rejected
-/// with `invalid_argument` (DESIGN §3.3).
+/// with `invalid_argument` (DESIGN §3.3). Declared `orderable = false` on
+/// [`ModelQuery`]; the tests pin this list to those declarations.
 pub const MODEL_FILTER_ONLY_FIELDS: &[ModelFilterField] = &[
     ModelFilterField::Family,
     ModelFilterField::Vendor,
@@ -129,15 +130,6 @@ pub const MODEL_FILTER_ONLY_FIELDS: &[ModelFilterField] = &[
     ModelFilterField::LastReleaseAt,
     ModelFilterField::MaxOutputTokens,
 ];
-
-impl ModelFilterField {
-    /// Whether the field is accepted in `$orderby`; false for the
-    /// [`MODEL_FILTER_ONLY_FIELDS`].
-    #[must_use]
-    pub fn orderable(self) -> bool {
-        !MODEL_FILTER_ONLY_FIELDS.contains(&self)
-    }
-}
 
 /// Schema marker binding [`ModelFilterField`] to the typed
 /// [`QueryBuilder`](toolkit_odata::QueryBuilder).

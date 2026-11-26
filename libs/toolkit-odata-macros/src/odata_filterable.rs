@@ -11,11 +11,13 @@ struct FilterableField {
     field_name: String,
     /// The `FieldKind` variant name (e.g., "String", "Uuid", "`DateTimeUtc`")
     kind: String,
+    /// `false` when the field is declared `orderable = false` (filter-only)
+    orderable: bool,
     /// Span for error reporting
     span: Span,
 }
 
-/// Parse #[odata(filter(kind = "..."))] attributes on struct fields
+/// Parse `#[odata(filter(kind = "...", orderable = false))]` attributes on struct fields
 fn parse_field_attrs(field: &syn::Field) -> syn::Result<Option<FilterableField>> {
     let Some(field_ident) = field.ident.as_ref() else {
         return Ok(None);
@@ -25,6 +27,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<Option<FilterableField>>
     let span = field.span();
 
     let mut found_kind: Option<String> = None;
+    let mut orderable = true;
 
     for attr in &field.attrs {
         // Look for #[odata(...)]
@@ -50,6 +53,17 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<Option<FilterableField>>
                                 "kind value must be a string literal",
                             ));
                         }
+                    } else if filter_meta.path.is_ident("orderable") {
+                        let value = filter_meta.value()?;
+                        let lit: Lit = value.parse()?;
+                        if let Lit::Bool(lit_bool) = lit {
+                            orderable = lit_bool.value;
+                        } else {
+                            return Err(syn::Error::new(
+                                filter_meta.path.span(),
+                                "orderable value must be a bool literal",
+                            ));
+                        }
                     }
                     Ok(())
                 })?;
@@ -62,6 +76,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<Option<FilterableField>>
         field_ident,
         field_name,
         kind,
+        orderable,
         span,
     }))
 }
@@ -151,6 +166,24 @@ pub fn expand_derive_odata_filterable(input: DeriveInput) -> syn::Result<TokenSt
             }
         });
 
+    // Emitted only when some field is filter-only; otherwise the trait
+    // default (every field orderable) applies.
+    let filter_only: Vec<_> = filterable_fields
+        .iter()
+        .zip(&enum_variants)
+        .filter(|(f, _)| !f.orderable)
+        .map(|(_, variant)| quote! { #filter_enum_name::#variant })
+        .collect();
+    let orderable_fn = if filter_only.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            fn orderable(&self) -> bool {
+                !::core::matches!(self, #(#filter_only)|*)
+            }
+        }
+    };
+
     // Generate the full implementation
     Ok(quote! {
         #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -175,6 +208,8 @@ pub fn expand_derive_odata_filterable(input: DeriveInput) -> syn::Result<TokenSt
                     #(#kind_match_arms),*
                 }
             }
+
+            #orderable_fn
         }
     })
 }

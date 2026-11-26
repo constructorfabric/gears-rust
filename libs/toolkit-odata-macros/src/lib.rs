@@ -35,6 +35,9 @@ mod odata_schema;
 ///     pub id: uuid::Uuid,
 ///     #[odata(filter(kind = "String"))]
 ///     pub email: String,
+///     // Filterable, but not offered or accepted in `$orderby`.
+///     #[odata(filter(kind = "String", orderable = false))]
+///     pub nickname: String,
 /// }
 /// ```
 #[proc_macro_derive(ODataFilterable, attributes(odata))]

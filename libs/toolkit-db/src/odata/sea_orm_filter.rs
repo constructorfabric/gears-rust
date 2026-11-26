@@ -88,20 +88,23 @@ pub trait FieldToColumn<F: FilterField> {
     }
 
     /// Whether `field` is admissible in `$orderby` (and therefore as
-    /// a key in cursor-based pagination). Default `true`. Implementors
-    /// override with `false` when the field has no honest ordering at
-    /// all (e.g. a derived-UUID comparison column). When the field IS
-    /// meaningfully orderable but its storage shape differs from its
-    /// wire shape (e.g. a SMALLINT-backed enum exposed as a string),
-    /// keep it orderable and override
+    /// a key in cursor-based pagination). Defaults to
+    /// [`FilterField::orderable`], the flag `with_odata_orderby` reads
+    /// to build the published contract; declare a filter-only field
+    /// there so the contract and this check agree. Override only when
+    /// the mapper must refuse more than the field declares (e.g. a
+    /// derived-UUID comparison column with no honest ordering). When
+    /// the field IS meaningfully orderable but its storage shape
+    /// differs from its wire shape (e.g. a SMALLINT-backed enum exposed
+    /// as a string), keep it orderable and override
     /// [`ODataFieldMapping::cursor_kind`] instead, so the cursor codec
     /// round-trips the storage-shaped token. The framework checks this
     /// in `paginate_odata_collect` before composing the effective
     /// order and rejects the `$orderby` clause as
     /// [`ODataError::InvalidOrderByField`] — keeping the diagnostic
     /// at the same site as unknown-field rejections.
-    fn is_orderable(_field: F) -> bool {
-        true
+    fn is_orderable(field: F) -> bool {
+        field.orderable()
     }
 }
 

@@ -1,0 +1,5 @@
+error: orderable value must be a bool literal
+ --> tests/ui/fail/orderable_not_bool.rs:5:37
+  |
+5 |     #[odata(filter(kind = "String", orderable = "no"))]
+  |                                     ^^^^^^^^^

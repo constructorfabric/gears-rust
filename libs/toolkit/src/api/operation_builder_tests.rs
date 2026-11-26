@@ -1037,3 +1037,81 @@ fn a_published_op_the_kind_refuses_is_refused_at_registration() {
 fn a_repeated_published_op_is_refused_at_registration() {
     register_filter::<BadOpsField<REPEATED_OPS>>();
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum SortableField {
+    Name,
+    Region,
+    CreatedAt,
+}
+
+impl toolkit_odata::filter::FilterField for SortableField {
+    const FIELDS: &'static [Self] = &[Self::Name, Self::Region, Self::CreatedAt];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Region => "region",
+            Self::CreatedAt => "created_at",
+        }
+    }
+
+    fn kind(&self) -> toolkit_odata::filter::FieldKind {
+        match self {
+            Self::Name | Self::Region => toolkit_odata::filter::FieldKind::String,
+            Self::CreatedAt => toolkit_odata::filter::FieldKind::DateTimeUtc,
+        }
+    }
+
+    fn orderable(&self) -> bool {
+        !matches!(self, Self::Region)
+    }
+}
+
+#[test]
+fn a_filter_only_field_is_left_out_of_the_orderby_contract() {
+    let registry = MockRegistry::new();
+    let _router = OperationBuilder::<Missing, Missing, ()>::get("/tests/v1/items")
+        .with_odata_filter::<SortableField>()
+        .with_odata_orderby::<SortableField>()
+        .anonymous()
+        .handler(test_handler)
+        .json_response(http::StatusCode::OK, "Success")
+        .register(Router::new(), &registry);
+
+    let ops = registry.operations.lock().unwrap();
+    let spec = &ops[0];
+    let description = spec
+        .params
+        .iter()
+        .find(|param| param.name == "$orderby")
+        .unwrap()
+        .description
+        .as_deref()
+        .unwrap();
+    assert_eq!(
+        description,
+        "OData v4 orderby expression\n- name asc\n- name desc\n- created_at asc\n- created_at desc"
+    );
+
+    let allowed = &spec
+        .vendor_extensions
+        .x_odata_orderby
+        .as_ref()
+        .unwrap()
+        .allowed_fields;
+    assert_eq!(
+        allowed,
+        &["name asc", "name desc", "created_at asc", "created_at desc"]
+    );
+
+    // Still filterable: the flag narrows `$orderby` only.
+    assert!(
+        spec.vendor_extensions
+            .x_odata_filter
+            .as_ref()
+            .unwrap()
+            .allowed_fields
+            .contains_key("region")
+    );
+}
