@@ -82,7 +82,9 @@ where
         self.query_param_typed(
             "limit",
             false,
-            "Page size; 20 by default, values above 100 are lowered to 100; alias `$top`",
+            "Page size; absent means the configured default page size (20 unless configured), \
+             larger values are lowered to the configured maximum (100 unless configured); \
+             alias `$top`",
             "integer",
         )
         .query_param(

@@ -57923,7 +57923,7 @@
             }
           },
           {
-            "description": "Page size; 20 by default, values above 100 are lowered to 100; alias `$top`",
+            "description": "Page size; absent means the configured default page size (20 unless configured), larger values are lowered to the configured maximum (100 unless configured); alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -58512,7 +58512,7 @@
             }
           },
           {
-            "description": "Page size; 20 by default, values above 100 are lowered to 100; alias `$top`",
+            "description": "Page size; absent means the configured default page size (20 unless configured), larger values are lowered to the configured maximum (100 unless configured); alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -59502,7 +59502,7 @@
             }
           },
           {
-            "description": "Page size; 20 by default, values above 100 are lowered to 100; alias `$top`",
+            "description": "Page size; absent means the configured default page size (20 unless configured), larger values are lowered to the configured maximum (100 unless configured); alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
