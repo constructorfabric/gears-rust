@@ -84,8 +84,6 @@ pub enum ToolRefusal {
         from: usize,
         to: usize,
     },
-    #[error("line {0} is a link, not a node; remove a link by its number, or give a node's number")]
-    NotANodeLink(usize),
 }
 
 #[domain_model]

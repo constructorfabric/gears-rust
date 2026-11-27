@@ -1346,3 +1346,39 @@ async fn a_node_the_subject_does_not_have_is_not_found() {
         "{missing:?}"
     );
 }
+
+#[tokio::test]
+async fn a_node_read_the_caller_may_not_make_is_audited_like_a_refused_profile_read() {
+    let linked = Linked::new();
+    let db = inmem_db().await;
+    let events = Arc::new(RecordingProfileEvents::default());
+    let service = profile_service_over(
+        &db,
+        Arc::new(CategoryResolver(&["person"])),
+        Arc::new(FixedFacts::with_links(
+            linked.facts.clone(),
+            linked.links.clone(),
+        )),
+        Uuid::new_v4(),
+        Arc::clone(&events),
+        CategoryCheck::OneCall,
+    );
+    let subject = Uuid::new_v4();
+
+    let refused = service
+        .read_node(
+            &subject_in(Uuid::new_v4(), subject),
+            None,
+            subject,
+            &linked.key(Category::PROJECT),
+        )
+        .await;
+
+    assert!(
+        matches!(refused, Err(DomainError::NoSuchFact(_))),
+        "{refused:?}"
+    );
+    let [event] = events.taken().try_into().expect("one event");
+    assert!(event.categories.is_empty());
+    assert_eq!(event.granted, [Category::PERSON]);
+}

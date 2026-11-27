@@ -629,3 +629,34 @@ async fn an_unreachable_profile_is_an_error() {
 
     assert!(chain.manage(in_a_while()).await.is_err());
 }
+
+#[tokio::test]
+async fn a_removal_that_would_take_a_node_under_review_with_it_is_dropped() {
+    // Line 4, the commitment owned by the project, is under review; the model removes the project, line 3.
+    let remove_project = ("remove", json!({ "number": 3, "confidence": 0.9 }));
+    let chain = Chain::new(
+        vec![Ok(tool_calls(&[remove_project], 900)), Ok(done(950))],
+        &[Ok(Written::Stored)],
+    );
+    let mut commitment = crate::test_support::stored_fact(
+        crate::domain::profile::Category::COMMITMENT,
+        "commitment",
+        json!({ "kind": "action", "text": "book the review" }),
+        1,
+    );
+    commitment.node_key = node_key(4);
+    chain.reviews.open_on(
+        crate::domain::subject_settings::SubjectKey {
+            tenant_id: TENANT,
+            subject_id: SUBJECT,
+        },
+        &commitment,
+    );
+
+    chain.process(&record()).await;
+
+    assert!(
+        chain.writer.plans().is_empty(),
+        "the removal would delete the commitment under review"
+    );
+}

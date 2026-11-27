@@ -580,11 +580,25 @@ impl ProfileReadService {
             construct,
             construct_scope,
             readable,
-            ..
+            served,
         } = self.access(ctx, tenant, subject_id).await?;
-        let gone = || DomainError::NoSuchFact(node.0.clone());
+        // A read the caller may not make is audited too, as the profile read audits its refusals.
+        let refused = |served: bool| {
+            self.ports.events.read(ProfileReadEvent {
+                tenant_id: key.tenant_id,
+                subject_id,
+                caller: ctx.subject_id(),
+                categories: Vec::new(),
+                granted: Category::all()
+                    .into_iter()
+                    .filter(|category| readable.contains(category))
+                    .collect(),
+                served,
+            });
+            DomainError::NoSuchFact(node.0.clone())
+        };
         if readable.is_empty() {
-            return Err(gone());
+            return Err(refused(served));
         }
         let stored = self.visible(&construct, &construct_scope, key).await?;
         let links = self
@@ -596,7 +610,7 @@ impl ProfileReadService {
         let held = stored
             .iter()
             .find(|fact| &fact.node_key == node && readable.contains(&fact.category))
-            .ok_or_else(gone)?;
+            .ok_or_else(|| refused(served))?;
         let readable_fact = |key: &NodeKey| {
             stored
                 .iter()
