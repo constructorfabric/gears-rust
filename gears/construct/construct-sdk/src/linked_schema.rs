@@ -138,6 +138,21 @@ impl Schema {
         self.links.iter().find(|kind| kind.name == name)
     }
 
+    /// The name of the node kind a node type id of any person names, whatever the prefix: `None` for a type id
+    /// that is no person's node kind type.
+    #[must_use]
+    pub fn node_kind_name(type_id: &str) -> Option<&str> {
+        let named = type_id
+            .strip_prefix(NODE_BASE)?
+            .strip_prefix("cf.construct.")?
+            .strip_suffix(".v1~")?;
+        let (prefix, name) = named.split_once('.')?;
+        let is_a_person_s = prefix.strip_prefix('u').is_some_and(|rest| {
+            rest.len() == 32 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        });
+        is_a_person_s.then_some(name)
+    }
+
     /// The type id of the node kind `name` for `prefix`.
     #[must_use]
     pub fn node_type_id(prefix: &SchemaPrefix, name: &str) -> String {

@@ -35,17 +35,7 @@ impl Category {
     /// The category whose graph node type is `type_id`, in the types of any person, or `None` for any other type.
     #[must_use]
     pub fn from_type_id(type_id: &str) -> Option<Self> {
-        let named = type_id
-            .strip_prefix("gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.")?
-            .strip_suffix(".v1~")?;
-        let (prefix, name) = named.split_once('.')?;
-        let prefix_is_a_person_s = prefix.strip_prefix('u').is_some_and(|rest| {
-            rest.len() == 32 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        });
-        if !prefix_is_a_person_s {
-            return None;
-        }
-        Self::from_name(name)
+        Self::from_name(Schema::node_kind_name(type_id)?)
     }
 
     /// The category whose plain name, the entity kind a plan step carries, is `name`, or `None` for any other

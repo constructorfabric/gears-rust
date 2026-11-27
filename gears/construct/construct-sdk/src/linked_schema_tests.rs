@@ -331,3 +331,21 @@ fn the_endpoints_of_a_link_type_are_its_kinds_for_that_person() {
         json!([Schema::node_type_id(&prefix(), "project")])
     );
 }
+
+#[test]
+fn a_node_type_id_names_its_kind_whatever_the_person() {
+    let id = Schema::node_type_id(&prefix(), "project");
+
+    assert_eq!(Schema::node_kind_name(&id), Some("project"));
+    assert_eq!(
+        Schema::node_kind_name(&Schema::link_type_id(&prefix(), "works_on")),
+        None
+    );
+    assert_eq!(
+        Schema::node_kind_name(
+            "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~"
+        ),
+        None,
+        "a type of the four categories is no person's kind"
+    );
+}
