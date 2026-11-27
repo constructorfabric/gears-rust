@@ -1608,10 +1608,24 @@ impl Hold<'_> {
 }
 
 /// Whether the write of `pending`, an earlier resolution of `request`, is
-/// in `facts`: its corrected fact is there, or its deleted fact is gone.
-fn landed(request: &ReviewRequest, pending: &Closed, facts: &SubjectFacts) -> bool {
+/// in `facts`: its corrected fact is there, or its deleted fact is gone. A
+/// correction changes the fact where it stands, so its key was there before
+/// the write: the correction landed when the fact holds another value than
+/// the one that was flagged.
+pub(crate) fn landed(request: &ReviewRequest, pending: &Closed, facts: &SubjectFacts) -> bool {
     let has = |key: &NodeKey| facts.facts.iter().any(|fact| &fact.node_key == key);
     match &pending.outcome {
+        ReviewOutcome::Corrected(new) if *new == request.fact_id => {
+            let flagged = match &request.status {
+                ReviewStatus::Open { value } => Some(value),
+                ReviewStatus::Closed(_) => None,
+            };
+            facts
+                .facts
+                .iter()
+                .find(|fact| &fact.node_key == new)
+                .is_some_and(|fact| flagged.is_none_or(|flagged| &fact.value != flagged))
+        }
         ReviewOutcome::Corrected(new) => has(new),
         ReviewOutcome::Deleted => !has(&request.fact_id),
         ReviewOutcome::Rejected => false,

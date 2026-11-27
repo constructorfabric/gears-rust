@@ -390,3 +390,60 @@ async fn a_forgotten_project_is_marked_with_its_message_and_that_message_does_no
         PlanDraft::new(&catalog, profile).for_message("connector-a", "chat_engine/thread-42/msg-9");
     assert!(other.apply(&add).is_ok());
 }
+
+#[tokio::test]
+async fn a_link_removed_and_linked_again_in_one_plan_stays() {
+    let profiles = Profiles::new();
+    let priya = Priya::new();
+    profiles.given(None, priya.steps()).await;
+
+    profiles
+        .given(
+            Some(1),
+            vec![
+                unlink("works_on", &priya.person, &priya.project),
+                link(
+                    "works_on",
+                    &priya.person,
+                    &priya.project,
+                    json!({ "role": "advisor" }),
+                ),
+            ],
+        )
+        .await;
+
+    let profile = profiles.read().await;
+    let works_on: Vec<&Link> = profile
+        .links
+        .iter()
+        .filter(|link| link.kind == "works_on")
+        .collect();
+    assert_eq!(works_on.len(), 1, "{:?}", profile.links);
+    assert_eq!(works_on[0].fields, json!({ "role": "advisor" }));
+}
+
+#[tokio::test]
+async fn a_record_with_a_long_provenance_is_stored_with_it_clipped() {
+    use crate::domain::plan::Origin;
+    let profiles = Profiles::new();
+    let mut plan = profiles.plan(
+        None,
+        vec![node("project", &key(), None, json!({ "name": "Atlas" }))],
+    );
+    plan.origin = Origin::Connector {
+        connector: "connector-a".to_owned(),
+        provenance: "p".repeat(900),
+        version: "v1".to_owned(),
+        type_id: construct_sdk::gts::CHAT_MESSAGE_TYPE.to_owned(),
+        observed_at: time::OffsetDateTime::UNIX_EPOCH,
+    };
+
+    let written = profiles.writer().write(&profiles.ctx, &plan).await.unwrap();
+
+    assert_eq!(written, Written::Stored);
+    let stored = profiles.stored().await;
+    assert_eq!(
+        stored[0].learned[0].message.as_deref().map(str::len),
+        Some(500)
+    );
+}

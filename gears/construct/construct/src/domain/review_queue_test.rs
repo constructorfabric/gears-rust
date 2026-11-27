@@ -1426,3 +1426,36 @@ async fn a_closed_or_unknown_request_cannot_be_resolved() {
         "a reviewer of another tenant does not find it: {elsewhere:?}"
     );
 }
+
+#[tokio::test]
+async fn a_correction_in_place_has_landed_only_when_the_fact_holds_another_value_than_the_flagged_one()
+ {
+    use crate::domain::review_queue::{Closed, ReviewOutcome, ReviewStatus, landed};
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    let ReviewStatus::Open { value: flagged } = request.status.clone() else {
+        panic!("open");
+    };
+    let pending = Closed {
+        outcome: ReviewOutcome::Corrected(request.fact_id.clone()),
+        by: fixture.reviewer,
+        at: time::OffsetDateTime::UNIX_EPOCH,
+        reason: None,
+    };
+    let facts = |value: Value| {
+        let mut fact =
+            crate::test_support::stored_fact(request.category, &request.property, value, 1);
+        fact.node_key = request.fact_id.clone();
+        crate::domain::profile_writes::SubjectFacts {
+            version: Some(1),
+            facts: vec![fact],
+            generation: 0,
+        }
+    };
+
+    assert!(
+        !landed(&request, &pending, &facts(flagged)),
+        "the write never landed"
+    );
+    assert!(landed(&request, &pending, &facts(json!({ "name": "Go" }))));
+}

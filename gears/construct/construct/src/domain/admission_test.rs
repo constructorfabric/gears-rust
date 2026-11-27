@@ -1216,3 +1216,67 @@ async fn a_link_to_a_node_admission_drops_is_dropped_with_it() {
         "the link to the dropped project goes with it"
     );
 }
+
+#[tokio::test]
+async fn a_node_owned_by_a_dropped_node_is_dropped_with_it_however_deep() {
+    use crate::domain::plan::{Change, NodeKey, Property, Step};
+    let fixture = AdmissionFixture::default();
+    let add = |kind: &str, key: &str, owner: Option<&str>, value: serde_json::Value| Step {
+        entity_kind: kind.to_owned(),
+        change: Change::AddEntity {
+            key: NodeKey(key.to_owned()),
+            owner: owner.map(|owner| NodeKey(owner.to_owned())),
+            properties: vec![Property::new(kind, value)],
+        },
+        confidence: Some(0.9),
+    };
+    let plan = crate::domain::plan::Plan {
+        steps: vec![
+            add(
+                "project",
+                "kept",
+                None,
+                serde_json::json!({ "name": "Atlas" }),
+            ),
+            add(
+                "project",
+                "blocked",
+                None,
+                serde_json::json!({ "name": "Orion" }),
+            ),
+            add(
+                "decision",
+                "child",
+                Some("blocked"),
+                serde_json::json!({ "text": "ship" }),
+            ),
+            add(
+                "question",
+                "grandchild",
+                Some("child"),
+                serde_json::json!({ "text": "when?" }),
+            ),
+            add(
+                "decision",
+                "sibling",
+                Some("kept"),
+                serde_json::json!({ "text": "wait" }),
+            ),
+        ],
+        ..connector_plan(Vec::new())
+    };
+    let blocked_value = found(SensitiveDataKind::Contacts, at(1, 0), Vec::new());
+
+    let admitted = admitted(admit(&fixture, plan, &[blocked_value]).await);
+
+    let kept: Vec<&str> = admitted
+        .plan
+        .steps
+        .iter()
+        .map(|step| match &step.change {
+            Change::AddEntity { key, .. } => key.0.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kept, ["kept", "sibling"]);
+}

@@ -492,20 +492,37 @@ fn drop_blocked_values(plan: &mut Plan, blocked_values: &BTreeSet<PropertyRef>) 
         }
         dropped_steps.push(index);
     }
-    // A link to a node that is not written would be an edge to nothing: it goes with the node.
-    let steps = std::mem::take(&mut plan.steps);
-    for (index, step) in kept_at.into_iter().zip(steps) {
-        let dangling = matches!(
-            &step.change,
-            super::plan::Change::AddLink { from, to, .. }
-                if dropped_nodes.contains(from) || dropped_nodes.contains(to)
-        );
-        if dangling {
+    // A link to a node that is not written would be an edge to nothing, and a node owned by one would point at
+    // nothing: they go with the node, however deep.
+    let mut remaining: Vec<(usize, super::plan::Step)> = kept_at
+        .into_iter()
+        .zip(std::mem::take(&mut plan.steps))
+        .collect();
+    loop {
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            remaining
+                .into_iter()
+                .partition(|(_, step)| match &step.change {
+                    super::plan::Change::AddLink { from, to, .. } => {
+                        dropped_nodes.contains(from) || dropped_nodes.contains(to)
+                    }
+                    super::plan::Change::AddEntity {
+                        owner: Some(owner), ..
+                    } => dropped_nodes.contains(owner),
+                    _ => false,
+                });
+        remaining = kept;
+        if gone.is_empty() {
+            break;
+        }
+        for (index, step) in gone {
+            if let super::plan::Change::AddEntity { key, .. } = &step.change {
+                dropped_nodes.push(key.clone());
+            }
             dropped_steps.push(index);
-        } else {
-            plan.steps.push(step);
         }
     }
+    plan.steps = remaining.into_iter().map(|(_, step)| step).collect();
     dropped_steps.sort_unstable();
     dropped_steps
     // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-steps

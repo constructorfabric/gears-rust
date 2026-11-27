@@ -522,6 +522,27 @@ fn changes(
             | Change::RemoveProperty { .. } => {}
         }
     }
+    // A link this plan removes and adds again stays: the ingest stores its edge, and the delete must not follow.
+    let added: Vec<(&str, &NodeKey, &NodeKey)> = plan
+        .steps
+        .iter()
+        .filter_map(|step| match &step.change {
+            Change::AddLink { kind, from, to, .. } => Some((kind.as_str(), from, to)),
+            _ => None,
+        })
+        .collect();
+    for step in &plan.steps {
+        let Change::RemoveLink { kind, from, to } = &step.change else {
+            continue;
+        };
+        if added.contains(&(kind.as_str(), from, to)) {
+            for held in stored.links.iter().filter(|held| {
+                held.link.kind == *kind && held.link.from == *from && held.link.to == *to
+            }) {
+                changes.unlinks.remove(&held.edge_key);
+            }
+        }
+    }
     Ok(changes)
 }
 

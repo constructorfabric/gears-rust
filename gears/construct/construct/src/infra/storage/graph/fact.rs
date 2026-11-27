@@ -262,9 +262,12 @@ pub fn record_of(plan: &Plan) -> Option<Value> {
         ..
     } = &plan.origin
     {
-        return Some(
-            json!({ "connector": connector, "provenance": provenance, "version": version }),
-        );
+        // The record's schema takes 500 characters of each; intake takes a provenance of 1024.
+        return Some(json!({
+            "connector": clipped(connector),
+            "provenance": clipped(provenance),
+            "version": clipped(version),
+        }));
     }
     None
 }
