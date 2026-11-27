@@ -1,6 +1,7 @@
 //! Integration tests for the `TenantRepoImpl` update paths in
 //! `repo_impl/updates.rs` — `update_tenant_mutable`, `set_status`,
-//! `schedule_deletion`, and `load_ancestor_chain_through_parent`.
+//! `erase_tenant_name`, `schedule_deletion`, and
+//! `load_ancestor_chain_through_parent`.
 //!
 //! `lifecycle_integration.rs` covers the happy status-flip / soft-delete
 //! paths; this suite targets the **guard and edge branches** those
@@ -147,6 +148,154 @@ async fn update_tenant_mutable_renames() {
     assert_eq!(out.name, "renamed");
     let row = fetch_tenant(&h.provider, id).await.unwrap().unwrap();
     assert_eq!(row.name, "renamed");
+}
+
+// =====================================================================
+// erase_tenant_name
+// =====================================================================
+
+#[tokio::test]
+async fn erase_tenant_name_not_found() {
+    let h = setup_sqlite().await.expect("setup");
+    let err = h
+        .repo
+        .erase_tenant_name(&allow_all(), Uuid::new_v4(), now())
+        .await
+        .expect_err("missing tenant must error");
+    assert!(matches!(err, DomainError::NotFound { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn erase_tenant_name_rejects_every_status_but_deleted() {
+    let h = setup_sqlite().await.expect("setup");
+    let root = Uuid::new_v4();
+    insert_tenant(&h.provider, root, None, "root", ACTIVE, false, 0)
+        .await
+        .expect("seed root");
+    let suspended = Uuid::new_v4();
+    insert_tenant(
+        &h.provider,
+        suspended,
+        Some(root),
+        "susp",
+        SUSPENDED,
+        false,
+        1,
+    )
+    .await
+    .expect("seed suspended");
+    let provisioning = Uuid::new_v4();
+    insert_provisioning_tenant(
+        &h.provider,
+        provisioning,
+        Some(root),
+        "prov",
+        1,
+        now(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed provisioning");
+
+    for (id, name) in [(root, "root"), (suspended, "susp"), (provisioning, "prov")] {
+        let err = h
+            .repo
+            .erase_tenant_name(&allow_all(), id, now())
+            .await
+            .expect_err("only a deleted tenant can be erased");
+        assert!(
+            matches!(err, DomainError::Conflict { .. }),
+            "{name}: got {err:?}"
+        );
+        let row = fetch_tenant(&h.provider, id).await.unwrap().unwrap();
+        assert_eq!(row.name, name, "{name}: the name is untouched");
+    }
+}
+
+#[tokio::test]
+async fn erase_tenant_name_replaces_the_name_with_the_id_and_nothing_else() {
+    let h = setup_sqlite().await.expect("setup");
+    let id = Uuid::new_v4();
+    let deleted_at = now() - time::Duration::hours(5);
+    insert_deleted_tenant(
+        &h.provider,
+        id,
+        None,
+        "Jane Doe Consulting",
+        0,
+        deleted_at,
+        Some(120),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed tombstone");
+    let before = fetch_tenant(&h.provider, id).await.unwrap().unwrap();
+    let erased_at = before.updated_at + time::Duration::seconds(1);
+
+    let out = h
+        .repo
+        .erase_tenant_name(&allow_all(), id, erased_at)
+        .await
+        .expect("erase");
+
+    assert_eq!(out.name, id.to_string());
+    assert_eq!(out.status, TenantStatus::Deleted);
+    let after = fetch_tenant(&h.provider, id).await.unwrap().unwrap();
+    assert_eq!(after.name, id.to_string());
+    assert_eq!(after.status, DELETED);
+    assert_eq!(after.updated_at, erased_at);
+    assert_eq!(
+        after.deleted_at.map(OffsetDateTime::unix_timestamp),
+        Some(deleted_at.unix_timestamp()),
+        "the deletion instant is kept"
+    );
+    assert_eq!(
+        after.retention_window_secs,
+        Some(120),
+        "the retention window is kept"
+    );
+}
+
+#[tokio::test]
+async fn erase_tenant_name_on_an_erased_tenant_is_a_noop() {
+    let h = setup_sqlite().await.expect("setup");
+    let id = Uuid::new_v4();
+    insert_deleted_tenant(
+        &h.provider,
+        id,
+        None,
+        "name",
+        0,
+        now(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("seed tombstone");
+    h.repo
+        .erase_tenant_name(&allow_all(), id, now())
+        .await
+        .expect("first erase");
+    let before = fetch_tenant(&h.provider, id).await.unwrap().unwrap();
+
+    let out = h
+        .repo
+        .erase_tenant_name(&allow_all(), id, now() + time::Duration::hours(1))
+        .await
+        .expect("second erase");
+
+    assert_eq!(out.name, id.to_string());
+    let after = fetch_tenant(&h.provider, id).await.unwrap().unwrap();
+    assert_eq!(
+        before.updated_at, after.updated_at,
+        "a second erasure must not bump updated_at"
+    );
 }
 
 // =====================================================================

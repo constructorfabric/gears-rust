@@ -781,3 +781,90 @@ async fn unauthenticated_request_missing_security_context_fails() {
         resp.status(),
     );
 }
+
+// ─── POST /tenants/{id}/erase (AIP-136 sub-resource) ─────────────────
+
+#[tokio::test]
+async fn erase_tenant_returns_200_and_later_reads_carry_the_id_as_name() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let child = Uuid::new_v4();
+    seed_active_child(&h, child, root, "Jane Doe Consulting", 1).await;
+
+    let services = build_services(&h);
+    let router = build_test_router(&services);
+
+    let delete_req = json_request(
+        "DELETE",
+        &format!("/account-management/v1/tenants/{child}"),
+        None,
+        ctx_for(root),
+    );
+    let delete_resp = router.clone().oneshot(delete_req).await.expect("router");
+    assert_eq!(delete_resp.status(), StatusCode::NO_CONTENT);
+
+    let erase_req = json_request(
+        "POST",
+        &format!("/account-management/v1/tenants/{child}/erase"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.clone().oneshot(erase_req).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(body["id"], child.to_string());
+    assert_eq!(body["name"], child.to_string());
+    assert_eq!(body["status"], "deleted");
+    assert!(
+        body["deleted_at"].is_string(),
+        "an erased tenant stays soft-deleted: {body}"
+    );
+
+    let get = json_request(
+        "GET",
+        &format!("/account-management/v1/tenants/{child}"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.oneshot(get).await.expect("router");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_body(resp).await;
+    assert_eq!(body["name"], child.to_string());
+}
+
+#[tokio::test]
+async fn erase_tenant_rejects_a_tenant_that_is_not_deleted_with_400() {
+    let h = setup_sqlite().await.expect("sqlite");
+    let root = Uuid::new_v4();
+    seed_root(&h, root).await;
+    let child = Uuid::new_v4();
+    seed_active_child(&h, child, root, "child", 1).await;
+
+    let services = build_services(&h);
+    let router = build_test_router(&services);
+
+    let erase_req = json_request(
+        "POST",
+        &format!("/account-management/v1/tenants/{child}/erase"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.clone().oneshot(erase_req).await.expect("router");
+    let (status, body) = response_problem(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.is_object(),
+        "expected canonical Problem envelope, got {body}"
+    );
+
+    let get = json_request(
+        "GET",
+        &format!("/account-management/v1/tenants/{child}"),
+        None,
+        ctx_for(root),
+    );
+    let resp = router.oneshot(get).await.expect("router");
+    let body = response_body(resp).await;
+    assert_eq!(body["name"], "child", "a refused erasure leaves the name");
+}

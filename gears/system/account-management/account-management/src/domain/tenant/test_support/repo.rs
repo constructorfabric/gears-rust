@@ -36,7 +36,7 @@ use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::integrity::{IntegrityCategory, RepairReport, Violation};
 use crate::domain::tenant::model::{
-    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantStatus,
+    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantStatus, erased_tenant_name,
 };
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::{
@@ -1234,6 +1234,45 @@ impl TenantRepo for FakeTenantRepo {
             });
         }
         Ok(updated)
+    }
+
+    async fn erase_tenant_name(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<TenantModel, DomainError> {
+        let mut state = self.state.lock().expect("lock");
+        let visible = visible_ids_for(&state, scope);
+        if let Some(ref vis) = visible
+            && !vis.contains(&tenant_id)
+        {
+            return Err(DomainError::NotFound {
+                detail: format!("tenant {tenant_id} not found"),
+                resource: tenant_id.to_string(),
+            });
+        }
+        let tenant = state
+            .tenants
+            .get_mut(&tenant_id)
+            .ok_or_else(|| DomainError::NotFound {
+                detail: format!("tenant {tenant_id} not found"),
+                resource: tenant_id.to_string(),
+            })?;
+        // Mirror the production guards in `repo_impl::updates::erase_tenant_name`.
+        if !matches!(tenant.status, TenantStatus::Deleted) {
+            return Err(DomainError::Conflict {
+                detail: format!(
+                    "tenant {tenant_id} is not deleted; only a deleted tenant can be erased"
+                ),
+            });
+        }
+        let erased_name = erased_tenant_name(tenant_id);
+        if tenant.name != erased_name {
+            tenant.name = erased_name;
+            tenant.updated_at = now;
+        }
+        Ok(tenant.clone())
     }
 
     async fn load_ancestor_chain_through_parent(

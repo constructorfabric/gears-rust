@@ -85,6 +85,7 @@ graph LR
 | `cpt-cf-account-management-fr-hierarchy-depth-limit` | Configurable advisory threshold with optional strict mode; depth computed from parent at creation time. |
 | `cpt-cf-account-management-fr-tenant-status-change` | `TenantService::update_status` applies `active` ↔ `suspended` transitions without cascading to children. Transition to `deleted` is rejected — deletion goes through `TenantService::delete_tenant` which enforces child/resource-ownership preconditions. |
 | `cpt-cf-account-management-fr-tenant-soft-delete` | `TenantService::delete_tenant` validates the target tenant is non-root, has no non-deleted children, and has no remaining tenant-owned resource associations in the Resource Group ownership graph before soft delete; schedules hard deletion after retention period. |
+| `cpt-cf-account-management-fr-tenant-erasure` | `TenantService::erase_tenant` gates on the separately grantable `erase` action, accepts only a `deleted` tenant, replaces `tenants.name` with the tenant id under SERIALIZABLE retry (status, `deleted_at` and retention untouched), then delivers `PrincipalLifecycleEvent::TenantErased` through the principal-lifecycle dispatcher; a hook failure fails the request as 503 or 500 with the erased name kept, so the idempotent retry re-delivers. Neither soft nor hard delete delivers `TenantErased`. |
 | `cpt-cf-account-management-fr-children-query` | Paginated children query with status filtering via OData `$filter` on the `parent_id` index. `recursive=true` widens the depth pin to `parent_id IN` the tenants of `tenant_id`'s closure subtree that are visible under the caller's PDP-emitted scope (which carries the barrier mode and any `descendant_status` restriction) — the direct-child carve-out generalised over the visible subtree — attaches per-row ancestor chains read from `tenant_closure`, and drops any row whose chain is not fully visible, so the result equals level-by-level iteration. A cursor is bound to its mode through the filter fingerprint. |
 | `cpt-cf-account-management-fr-tenant-read` | `TenantService::get_tenant` returns tenant details by identifier within the caller's authorized scope. |
 | `cpt-cf-account-management-fr-tenant-update` | `TenantService::update_tenant` mutates only `name` and `status` (`active` ↔ `suspended`); immutable hierarchy-defining fields are rejected with `CanonicalError::InvalidArgument` (HTTP 400); `status=deleted` is rejected with `CanonicalError::FailedPrecondition` (HTTP 400) — use `DELETE` endpoint. |
@@ -826,6 +827,7 @@ This interface owns tenant CRUD, direct-child discovery, and the public tenant v
 - tenant creation is externally observable only after the provisioning saga finalizes; transient `provisioning` state is internal and hidden from public reads
 - generic update operations may change mutable presentation and lifecycle fields only; hierarchy-defining fields and mode changes remain outside the generic update path
 - soft delete is the public delete boundary; retention cleanup, IdP deprovision, and RG cleanup remain background responsibilities
+- erasure (`POST /tenants/{tenant_id}/erase`) is a separate, explicit operation on a soft-deleted tenant: it replaces the tenant's name with its id and tells other gears through the principal-lifecycle `TenantErased` event; no delete, soft or hard, erases
 - all tenant reads and writes require framework-authenticated `SecurityContext`; token parsing, session renewal, and federation remain platform-owned and are documented in Section 4
 
 #### Mode Conversion Interface
@@ -1560,13 +1562,15 @@ AM uses `PolicyEnforcer` as the PEP boundary. AuthZ decisions are delegated to t
 
 | Action | Resource Type | Purpose |
 |--------|---------------|---------|
-| `create`, `read`, `update`, `delete`, `list_children` | Tenant | Tenant lifecycle and child discovery (direct, or recursive over the visible subtree) |
+| `create`, `read`, `update`, `delete`, `erase`, `list_children` | Tenant | Tenant lifecycle, erasure of a deleted tenant's name, and child discovery (direct, or recursive over the visible subtree) |
 | `request`, `cancel`, `reject`, `approve`, `list_own`, `list_inbound` | ConversionRequest | Create, discover, and resolve dual-consent conversion requests |
 | `create`, `update`, `delete`, `list` | User | IdP-backed user lifecycle operations exposed through the AM user proxy surface |
 | `read`, `write`, `delete`, `list` | TenantMetadata | Schema-scoped metadata CRUD and listing |
 | `create`, `list`, `rotate_secret`, `revoke` | ServiceAccount | IdP-backed machine-identity lifecycle. Per-verb rather than a read/write/delete triad: minting a credential and re-keying an existing account are separately grantable, so an operator who may rotate need not be able to create |
 
 `Tenant.list_children` remains separate from `Tenant.read` because hierarchy enumeration exposes collection-level structure and barrier-sensitive topology, not just one tenant object.
+
+`Tenant.erase` remains separate from `Tenant.delete` because an erasure is irreversible for every gear that keeps a copy of the name, not just for AM: a policy can let an administrator delete accounts without letting it erase them.
 
 `ServiceAccount` is a resource type of its own rather than a flavour of `User`, and the separation is a security boundary rather than taxonomy: a grant over users must not confer machine-credential minting, and `rotate_secret` has no user-side action to inherit a permission from. It is also distinct from the service-account *subject* classification type (`cf.core.security.subject_service.v1~`) — that is what an account IS when it authenticates, this is what RBAC protects when it is managed — and the two sit in separate namespaces (`cf.core.am` vs `cf.core.security`) and are compared for equality wherever either is classified, so neither can stand in for the other. The per-account `client_id` is not policy-visible: it is an IdP-side identifier in an adapter-chosen format, so a policy keyed on it could not be written portably; `RESOURCE_ID` carries the tenant id, which is also what lets the compiled subtree clamp resolve through the `tenants` entity.
 
@@ -1601,7 +1605,7 @@ The following bundles are design guidance for policy authors. They are not hardc
 | Audit retention, tamper evidence, immutable storage | [docs/security/SECURITY.md](../../../../docs/security/SECURITY.md) and platform audit sink | AM emits request-driven and `actor=system` lifecycle audit records with tenant and resource context |
 | Encryption in transit and at rest, secret management | [docs/security/SECURITY.md](../../../../docs/security/SECURITY.md) | AM relies on shared TLS, DB protection, and provider-managed credentials rather than custom gear crypto |
 | Security monitoring and alert routing | Platform SRE / security monitoring | AM exports domain metrics and traces so platform monitoring can detect IdP failures, integrity anomalies, and cleanup failures |
-| Privacy / legal process handling | Platform compliance program | AM minimizes persisted identity data, keeps audit user identities UUID-based, and does not store DSAR-heavy profile data locally |
+| Privacy / legal process handling | Platform compliance program | AM minimizes persisted identity data, keeps audit user identities UUID-based, and does not store DSAR-heavy profile data locally. On an erasure under account deletion AM replaces the deleted tenant's name with its id and delivers `TenantErased` to the gears that keep copies of it; a deletion alone erases nothing outside AM |
 
 ### Threat Modeling
 

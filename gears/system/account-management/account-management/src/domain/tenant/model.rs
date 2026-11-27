@@ -212,6 +212,15 @@ pub fn verify_tenant_name(label: &'static str, name: String) -> Result<TenantNam
     Ok(TenantName(trimmed.to_owned()))
 }
 
+/// The name an erased tenant carries: its own id, in the hyphenated
+/// form. An erasure replaces the name by the identifier, so every read
+/// after it shows the id where the name was. Always 36 characters, so it
+/// fits the `tenants.name` length check.
+#[must_use]
+pub fn erased_tenant_name(tenant_id: Uuid) -> String {
+    tenant_id.hyphenated().to_string()
+}
+
 /// Lift a SDK [`account_management_sdk::TenantStatus`] (3-variant,
 /// public surface) into the AM-internal 4-variant
 /// [`TenantStatus`]. Infallible because the SDK type cannot represent

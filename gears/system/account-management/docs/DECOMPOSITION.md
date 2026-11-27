@@ -225,6 +225,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - Update mutable tenant fields only (`name` and `active ↔ suspended` status transitions); immutable hierarchy-defining fields (`id`, `parent_id`, `tenant_type`, `self_managed`, `depth`) are rejected with `CanonicalError::InvalidArgument` (HTTP 400); `status=deleted` is rejected with `CanonicalError::FailedPrecondition` (HTTP 400) — soft-delete goes through the dedicated DELETE endpoint.
   - Tenant status change: administrator transitions between `active` and `suspended` without cascading to children; transition to `deleted` is not permitted via status change.
   - Soft-delete: non-root-only, requires zero non-deleted children and no remaining tenant-owned Resource Group associations; schedules hard-deletion after retention period; hard-delete runs leaf-first (`depth DESC`) and invokes IdP tenant-deprovisioning.
+  - Tenant erasure: an explicit operation on a soft-deleted tenant, under its own `erase` action, replaces the tenant's name with its id and delivers the principal-lifecycle `TenantErased` event; neither soft nor hard delete erases.
   - Configurable advisory hierarchy-depth threshold (default 10) with operator-visible warning signal (metric + structured log) when exceeded, plus an opt-in strict mode that rejects creation above the threshold with `tenant_depth_exceeded`.
   - Tenant closure ownership: AM owns the `tenant_closure` table with shape `(ancestor_id, descendant_id, barrier, descendant_status)`; closure rows exist only for SDK-visible statuses (`active`, `suspended`, `deleted`), never for transient `provisioning`; self-rows carry `barrier = 0`; all closure writes are transactional with the owning `tenants` write (activation, status change, hard-delete).
   - IdP tenant-side lifecycle hooks: `fr-idp-tenant-provision` invoked during tenant creation, `fr-idp-tenant-provision-failure` handling on provider errors, `fr-idp-tenant-deprovision` invoked during hard-delete — all through `IdpPluginClient`; providers MUST NOT silently no-op on mutating operations.
@@ -246,6 +247,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - [ ] `p1` - `cpt-cf-account-management-fr-hierarchy-depth-limit`
   - [ ] `p1` - `cpt-cf-account-management-fr-tenant-status-change`
   - [ ] `p1` - `cpt-cf-account-management-fr-tenant-soft-delete`
+  - [ ] `p1` - `cpt-cf-account-management-fr-tenant-erasure`
   - [ ] `p1` - `cpt-cf-account-management-fr-children-query`
   - [ ] `p1` - `cpt-cf-account-management-fr-tenant-read`
   - [ ] `p1` - `cpt-cf-account-management-fr-tenant-update`
@@ -282,6 +284,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - `GET /api/account-management/v1/tenants/{tenant_id}` (`getTenant`)
   - `PATCH /api/account-management/v1/tenants/{tenant_id}` (`updateTenant`)
   - `DELETE /api/account-management/v1/tenants/{tenant_id}` (`deleteTenant`)
+  - `POST /api/account-management/v1/tenants/{tenant_id}/erase` (`eraseTenant`)
   - `GET /api/account-management/v1/tenants/{tenant_id}/children` (`listChildren`)
 
 - **Sequences**:

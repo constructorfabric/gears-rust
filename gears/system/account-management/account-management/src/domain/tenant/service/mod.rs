@@ -40,7 +40,7 @@ pub(crate) mod pep {
     ///   *in* the parent's scope, and barriers naturally clamp the
     ///   PDP's `parent_id ∈ subtree(Y_caller)` query against
     ///   `tenant_closure.barrier`.
-    /// * `read`, `update`, `delete` — `OWNER_TENANT_ID = tenant.id`
+    /// * `read`, `update`, `delete`, `erase` — `OWNER_TENANT_ID = tenant.id`
     ///   (the row's own id). A tenant row IS its own scope: the
     ///   self-row `(id, id, barrier=0)` makes `id ∈ subtree(id)`
     ///   trivially true, while the strict-ancestor row `(M, T)`
@@ -52,7 +52,7 @@ pub(crate) mod pep {
     ///   the descendant's own id to consult it.
     ///
     /// `RESOURCE_ID` is conveyed via the standard `resource_id`
-    /// argument (the tenant id itself for `read` / `update` / `delete`,
+    /// argument (the tenant id itself for `read` / `update` / `delete` / `erase`,
     /// absent for `create` / `list_children` which have no single
     /// target tenant).
     pub const TENANT: ResourceType = ResourceType::from_static(
@@ -70,13 +70,17 @@ pub(crate) mod pep {
         pub const UPDATE: &str = "update";
         /// Action name for deleting a tenant.
         pub const DELETE: &str = "delete";
+        /// Action name for erasing the name of a deleted tenant. Its own
+        /// action rather than `delete`, so a policy can let a caller
+        /// delete a tenant without letting it erase one.
+        pub const ERASE: &str = "erase";
         /// Action name for listing a tenant's children.
         pub const LIST_CHILDREN: &str = "list_children";
 
         /// Every action in this vocabulary — see the note on the user
         /// service's `actions::ALL`. Add new actions here as well as above.
         #[cfg(test)]
-        pub const ALL: &[&str] = &[CREATE, READ, UPDATE, DELETE, LIST_CHILDREN];
+        pub const ALL: &[&str] = &[CREATE, READ, UPDATE, DELETE, ERASE, LIST_CHILDREN];
     }
 }
 
@@ -98,6 +102,7 @@ use crate::domain::metrics::{
     AM_DEPENDENCY_HEALTH, AM_HIERARCHY_DEPTH_EXCEEDANCE, AM_TENANT_RETENTION, MetricKind,
     emit_metric,
 };
+use crate::domain::principal_lifecycle::PrincipalLifecycleNotifier;
 use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::context::TenantContext;
 use crate::domain::tenant::hooks::TenantHardDeleteHook;
@@ -206,8 +211,13 @@ pub struct TenantService<R: TenantRepo> {
     /// stack) feeds the PDP the tenant hierarchy via the standard
     /// `in_tenant_subtree` constraint.
     enforcer: PolicyEnforcer,
+    /// Delivers `TenantErased` to other gears' principal-lifecycle
+    /// hooks after an erasure. `None` in tests that do not exercise
+    /// delivery; production wires the dispatcher.
+    lifecycle: Option<Arc<dyn PrincipalLifecycleNotifier>>,
 }
 
+mod erasure;
 pub(super) mod reaper;
 pub(super) mod retention;
 mod scope_util;
@@ -248,7 +258,20 @@ impl<R: TenantRepo> TenantService<R> {
             types_registry: None,
             platform_types_registry: None,
             enforcer,
+            lifecycle: None,
         }
+    }
+
+    /// Deliver `TenantErased` to the principal-lifecycle hooks other
+    /// gears register (see [`Self::erase_tenant`]). Production init
+    /// wires the same dispatcher the hard-delete pipeline uses.
+    #[must_use]
+    pub fn with_principal_lifecycle(
+        mut self,
+        notifier: Arc<dyn PrincipalLifecycleNotifier>,
+    ) -> Self {
+        self.lifecycle = Some(notifier);
+        self
     }
 
     /// Wire request reads under each caller's context and background reads through

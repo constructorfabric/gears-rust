@@ -219,6 +219,36 @@ pub async fn unsuspend_tenant(
     Ok(Json(TenantDto::from_sdk_tenant(tenant)))
 }
 
+/// `POST /account-management/v1/tenants/{tenant_id}/erase`
+///
+/// Erase a soft-deleted tenant's name: AM replaces it with the tenant
+/// id and delivers `TenantErased` to the principal-lifecycle hooks of
+/// other gears. Returns HTTP 200 with the post-erasure projection.
+/// Idempotent: a retry writes nothing and delivers the event again.
+///
+/// # Errors
+///
+/// Surfaces a canonical `Problem` envelope. Notable codes:
+/// `failed_precondition` (400 — target tenant is not `deleted`),
+/// `cross_tenant_denied` (403), `not_found` (404 — tenant missing or
+/// AM-internal `provisioning`), `aborted` (409 — serialization-
+/// conflict retry budget exhausted), `internal` (500 — a hook failed
+/// terminally; the name is already erased), `service_unavailable`
+/// (503 — PDP / DB transport failure, or a hook failed retryably; the
+/// name is already erased and a retry delivers the event again).
+#[tracing::instrument(
+    skip(svc, ctx),
+    fields(tenant_id = %tenant_id, request_id = Empty)
+)]
+pub async fn erase_tenant(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteTenantService>>,
+    Path(tenant_id): Path<Uuid>,
+) -> ApiResult<Json<TenantDto>> {
+    let tenant = svc.erase_tenant(&ctx, tenant_id).await?;
+    Ok(Json(TenantDto::from_sdk_tenant(tenant)))
+}
+
 /// `GET /account-management/v1/tenants/{tenant_id}/children`
 ///
 /// Direct children by default; with `recursive=true` every descendant

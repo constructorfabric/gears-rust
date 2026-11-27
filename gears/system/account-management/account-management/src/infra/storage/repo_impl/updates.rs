@@ -1,5 +1,5 @@
 //! Mutating writes outside the create/destroy lifecycle:
-//! `update_tenant_mutable`, `set_status`,
+//! `update_tenant_mutable`, `set_status`, `erase_tenant_name`,
 //! `load_ancestor_chain_through_parent`, `schedule_deletion`. All
 //! transactional writes go through
 //! [`super::helpers::with_serializable_retry`] under `SERIALIZABLE`
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use account_management_sdk::UpdateTenantRequest;
 
 use crate::domain::error::DomainError;
-use crate::domain::tenant::model::{TenantModel, TenantStatus};
+use crate::domain::tenant::model::{TenantModel, TenantStatus, erased_tenant_name};
 use crate::infra::storage::entity::{tenant_closure, tenants};
 
 use super::TenantRepoImpl;
@@ -263,6 +263,76 @@ pub(super) async fn set_status(
                     .map_err(map_scope_to_tx)?
                     .ok_or_else(|| DomainError::Internal {
                         diagnostic: format!("tenant {tenant_id} disappeared after set_status"),
+                        cause: None,
+                    })?;
+                entity_to_model(fresh).map_err(TxError::Domain)
+            })
+        })
+    })
+    .await
+}
+
+/// Replace the name of a soft-deleted tenant with its erased name under
+/// SERIALIZABLE isolation. The `Deleted` guard is re-read on every retry,
+/// so the write never lands on a tenant that is not under deletion. A row
+/// that already carries the erased name is returned without an UPDATE.
+/// Status, `deleted_at` and the retention columns are left alone, and
+/// `tenant_closure` is not touched: it carries no name.
+pub(super) async fn erase_tenant_name(
+    repo: &TenantRepoImpl,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    now: OffsetDateTime,
+) -> Result<TenantModel, DomainError> {
+    let scope = scope.clone();
+    let erased_name = erased_tenant_name(tenant_id);
+    with_serializable_retry(&repo.db, move || {
+        let scope = scope.clone();
+        let erased_name = erased_name.clone();
+        Box::new(move |tx: &DbTx<'_>| {
+            Box::pin(async move {
+                let row = tenants::Entity::find()
+                    .secure()
+                    .scope_with(&scope)
+                    .filter(id_eq(tenant_id))
+                    .one(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?
+                    .ok_or_else(|| DomainError::NotFound {
+                        detail: format!("tenant {tenant_id} not found"),
+                        resource: tenant_id.to_string(),
+                    })?;
+                if row.status != TenantStatus::Deleted.as_smallint() {
+                    return Err(DomainError::Conflict {
+                        detail: format!(
+                            "tenant {tenant_id} is not deleted; only a deleted tenant can be erased"
+                        ),
+                    }
+                    .into());
+                }
+                if row.name == erased_name {
+                    return entity_to_model(row).map_err(TxError::Domain);
+                }
+
+                tenants::Entity::update_many()
+                    .col_expr(tenants::Column::Name, Expr::value(erased_name))
+                    .col_expr(tenants::Column::UpdatedAt, Expr::value(now))
+                    .filter(id_eq(tenant_id))
+                    .secure()
+                    .scope_with(&scope)
+                    .exec(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?;
+
+                let fresh = tenants::Entity::find()
+                    .secure()
+                    .scope_with(&scope)
+                    .filter(id_eq(tenant_id))
+                    .one(tx)
+                    .await
+                    .map_err(map_scope_to_tx)?
+                    .ok_or_else(|| DomainError::Internal {
+                        diagnostic: format!("tenant {tenant_id} disappeared after erasure"),
                         cause: None,
                     })?;
                 entity_to_model(fresh).map_err(TxError::Domain)

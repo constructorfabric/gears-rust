@@ -4,8 +4,9 @@
 //! Management owns — access grants naming a user, records owned by a
 //! tenant, and so on. When AM deletes such a principal or tenant, that state
 //! must go too, or it lingers as orphans pointing at an identity that no
-//! longer exists. AM has no dependency on those gears, so it cannot clean up
-//! after them; instead it tells them.
+//! longer exists. When AM erases a deleted tenant's name, copies of that name
+//! kept elsewhere must go too. AM has no dependency on those gears, so it
+//! cannot clean up after them; instead it tells them.
 //!
 //! A gear that wants to hear about deletions implements
 //! [`PrincipalLifecycleHookV1`], publishes a
@@ -44,9 +45,9 @@
 //!   operation; see [`PrincipalLifecycleHookError`] for how each failure
 //!   class surfaces.
 //! * **At least once.** A failed operation is retried — by the client for a
-//!   user delete, by the next retention tick for a tenant hard-delete — and
-//!   every hook sees the event again, including hooks that succeeded the
-//!   first time. Hooks MUST be idempotent.
+//!   user delete or a tenant erasure, by the next retention tick for a tenant
+//!   hard-delete — and every hook sees the event again, including hooks that
+//!   succeeded the first time. Hooks MUST be idempotent.
 //! * **Cancellable.** AM awaits the hook under a time budget and drops it
 //!   when the budget runs out, when the caller of the operation goes away,
 //!   or when AM shuts down; the hook then stops at whatever await point it
@@ -59,15 +60,24 @@
 //!   that still exists. AM delivers it only for a user it confirmed, before
 //!   deleting, to belong to `tenant_id`; a delete request naming a user of
 //!   another tenant delivers nothing.
-//! * **Before the fact, for tenants.** `TenantHardDelete` is delivered
-//!   before AM tears the tenant down, so a hook can still read anything it
-//!   needs. AM does not proceed until every hook succeeded.
+//! * **Before the fact, for a tenant hard-delete.** `TenantHardDelete` is
+//!   delivered before AM tears the tenant down, so a hook can still read
+//!   anything it needs. AM does not proceed until every hook succeeded.
+//! * **After the fact, for a tenant erasure.** `TenantErased` is delivered
+//!   after AM replaced the tenant's name with its id, so a hook that reads
+//!   the tenant back never gets the erased name. AM reports the erasure as
+//!   done only once every hook has succeeded; until then the client retries
+//!   it, and each retry delivers the event again.
+//! * **Erasure is not deletion.** A hard delete never delivers
+//!   `TenantErased`, and an erasure never delivers `TenantHardDelete`. A
+//!   gear that keeps a deleted tenant's name — for reports on the periods
+//!   the tenant existed in, say — keeps it until it hears `TenantErased`.
 //! * **Already authorized.** AM has authorized the operation before it
 //!   delivers the event. The `SecurityContext` passed along identifies the
-//!   actor for audit only — the end user for a user delete, AM's system
-//!   actor for a retention sweep — and a hook MUST NOT gate its cleanup on
-//!   that actor's own permissions, which typically cannot see every scope
-//!   the cleanup has to reach.
+//!   actor for audit only — the end user for a user delete or a tenant
+//!   erasure, AM's system actor for a retention sweep — and a hook MUST NOT
+//!   gate its cleanup on that actor's own permissions, which typically
+//!   cannot see every scope the cleanup has to reach.
 
 use async_trait::async_trait;
 use toolkit_security::SecurityContext;
@@ -89,7 +99,19 @@ pub enum PrincipalLifecycleEvent {
     ///
     /// AM deprovisions the tenant's users as part of this teardown without
     /// delivering a `UserDeprovisioned` for each of them.
+    ///
+    /// A hard delete is not an erasure: a gear that keeps the tenant's name
+    /// after the tenant is gone may go on keeping it.
     TenantHardDelete { tenant_id: Uuid },
+    /// The name of a soft-deleted tenant was erased under its account's
+    /// deletion: AM replaced it with the tenant's id. A gear that keeps a
+    /// copy of the tenant's name, or a name the tenant gave to something it
+    /// owned, MUST remove it and show the id instead.
+    ///
+    /// Delivered only by an explicit erasure, never by a soft or hard
+    /// delete. The tenant stays soft-deleted and is hard-deleted at the end
+    /// of its retention window as before.
+    TenantErased { tenant_id: Uuid },
 }
 
 impl PrincipalLifecycleEvent {
@@ -100,6 +122,7 @@ impl PrincipalLifecycleEvent {
         match self {
             Self::UserDeprovisioned { .. } => "user_deprovisioned",
             Self::TenantHardDelete { .. } => "tenant_hard_delete",
+            Self::TenantErased { .. } => "tenant_erased",
         }
     }
 }

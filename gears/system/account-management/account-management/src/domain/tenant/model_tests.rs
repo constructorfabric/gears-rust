@@ -115,3 +115,19 @@ fn verify_tenant_name_trims_surrounding_whitespace() {
         "acme"
     );
 }
+
+#[test]
+fn erased_tenant_name_is_the_hyphenated_id_and_a_valid_name() {
+    let id = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+
+    let name = erased_tenant_name(id);
+
+    assert_eq!(name, "01234567-89ab-cdef-0123-456789abcdef");
+    assert_eq!(name.len(), 36, "fits the tenants.name length check");
+    assert_eq!(
+        verify_tenant_name("erase", name.clone())
+            .expect("an erased name passes the AM name rule")
+            .as_str(),
+        name
+    );
+}

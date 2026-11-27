@@ -370,6 +370,30 @@ pub trait TenantRepo: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<TenantModel, DomainError>;
 
+    /// Replace the name of a soft-deleted tenant with
+    /// [`erased_tenant_name`](crate::domain::tenant::model::erased_tenant_name)
+    /// — AM's own part of an erasure under account deletion. Nothing
+    /// else on the row changes: status, `deleted_at` and the retention
+    /// bookkeeping stay as they are, so the hard-delete sweep still
+    /// removes the row when its window ends.
+    ///
+    /// Idempotent: a row whose name is already the erased name is
+    /// returned as is, without an UPDATE, so `updated_at` is unchanged.
+    ///
+    /// The implementation MUST reject, re-checked on every SERIALIZABLE
+    /// retry so the erasure never lands on a tenant that is not deleted:
+    ///
+    /// * **Current row not in `Deleted`** — erasure applies only to a
+    ///   tenant under deletion. Returns [`DomainError::Conflict`].
+    /// * **Row missing or outside `scope`** — returns
+    ///   [`DomainError::NotFound`].
+    async fn erase_tenant_name(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<TenantModel, DomainError>;
+
     /// Return the closure-input ancestor chain for a new child whose
     /// parent is `parent_id`: `[parent_id, grandparent, ..., root]` in
     /// nearest-first order. The chain **includes `parent_id` itself**

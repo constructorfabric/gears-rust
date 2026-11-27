@@ -817,8 +817,9 @@ impl Gear for AccountManagementGear {
         // @cpt-end:cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger:p1:inst-flow-cascade-entry
 
         // Principal-lifecycle hooks: other gears register a hook to hear
-        // about user and tenant deletions. One dispatcher serves both the `delete_user` path
-        // (wired into `UserService` below) and the tenant hard-delete
+        // about user and tenant deletions and tenant erasures. One dispatcher serves the
+        // `delete_user` path (wired into `UserService` below), the tenant
+        // erasure (wired into `TenantService` below) and the tenant hard-delete
         // pipeline (this hook, registered after the user-groups cascade so
         // AM's own cleanup runs first). The dispatcher resolves hooks on
         // every delivery, so it is safe to build before the registry has
@@ -895,10 +896,12 @@ impl Gear for AccountManagementGear {
             enforcer,
             cfg,
         );
-        service = service.with_types_registry(
-            Arc::clone(&request_registry),
-            Arc::clone(&platform_registry),
-        );
+        service = service
+            .with_types_registry(
+                Arc::clone(&request_registry),
+                Arc::clone(&platform_registry),
+            )
+            .with_principal_lifecycle(Arc::clone(&principal_lifecycle));
 
         // The TR plugin is opt-in (`cfg.tr_plugin.enabled`, default false), so an
         // incidental AM dependency cannot become the sole resolver candidate.
