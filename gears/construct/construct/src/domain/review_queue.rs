@@ -1349,7 +1349,7 @@ impl ReviewQueueService {
             .remove(&construct, key, &request.fact_id, origin, deadline)
             .await?
         {
-            Removed::Removed(_) => Ok(true),
+            Removed::Removed(..) => Ok(true),
             Removed::Gone => {
                 found_gone(request);
                 Ok(false)

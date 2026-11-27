@@ -1172,3 +1172,97 @@ async fn a_message_is_learned_as_linked_nodes_shown_in_one_call_and_forgotten_wi
         "no link of the project is left: {priya_after:?}"
     );
 }
+
+#[tokio::test]
+async fn a_forget_closes_the_review_request_of_every_node_it_removes() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let reviews = Arc::new(crate::test_support::MemoryReviews::default());
+    let pipeline = assemble(
+        &cfg,
+        Some(learns_priya()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::clone(&reviews) as _,
+        crate::test_support::deletion_tables(&db),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+    intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            tenant,
+            chat_record(subject, "chat/t/1", "v1"),
+        )
+        .await
+        .expect("intake answers");
+    let reader = in_tenant(tenant);
+    let read_back = async {
+        loop {
+            let view = pipeline.profile.read(&reader, None, subject).await.unwrap();
+            if view.categories.iter().map(|g| g.facts.len()).sum::<usize>() == 3 {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let view = tokio::time::timeout(Duration::from_secs(30), read_back)
+        .await
+        .expect("the record is processed");
+    cancel.cancel();
+    running.await.unwrap();
+    let node = |kind: &str| {
+        view.categories
+            .iter()
+            .find(|group| group.category.name() == kind)
+            .and_then(|group| group.facts.first())
+            .cloned()
+            .unwrap()
+    };
+    let (project, promise) = (node("project"), node("commitment"));
+    assert_eq!(promise.owner.as_ref(), Some(&project.node_key));
+
+    // The subject flags the commitment, then forgets the project that owns it.
+    let owner = crate::test_support::context_of(subject, tenant);
+    pipeline
+        .review_queue
+        .flag(&owner, subject, &promise.node_key, None)
+        .await
+        .expect("the subject flags the commitment");
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &project.node_key)
+        .await
+        .expect("the subject forgets the project");
+
+    // The commitment went with the project: its request is closed, and the flagged value is no longer kept.
+    let open: Vec<_> = reviews
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(request, _)| request.fact_id == promise.node_key && request.is_open())
+        .map(|(request, _)| request.status.clone())
+        .collect();
+    assert!(
+        open.is_empty(),
+        "a removed node's review request is still open with its flagged value: {open:?}"
+    );
+}

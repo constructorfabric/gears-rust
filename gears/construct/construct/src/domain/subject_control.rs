@@ -432,7 +432,7 @@ impl FactDelete<'_> {
     pub(crate) async fn run(
         &self,
         fact_id: &NodeKey,
-        deleted: impl FnOnce(&StoredFact),
+        mut deleted: impl FnMut(&StoredFact),
     ) -> Result<(), DomainError> {
         // The context writes nothing, so the budget may cut it off.
         let (construct, _) = ProfileWrites::before_write(
@@ -455,9 +455,18 @@ impl FactDelete<'_> {
                     fact_id.0
                 )),
             })?;
-        if let Removed::Removed(fact) = &removed {
-            deleted(fact);
-        }
+        // A removal takes the nodes the fact owns with it, however deep, so each of them is deleted too: it gets its
+        // delete event, and its open review request closes as deleted.
+        let owned: &[StoredFact] = match &removed {
+            Removed::Removed(fact, owned) => {
+                deleted(fact);
+                for fact in owned {
+                    deleted(fact);
+                }
+                owned
+            }
+            Removed::Gone => &[],
+        };
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
         // A fact already gone may still have an open request left by an
         // earlier delete whose close failed; this closes it.
@@ -471,7 +480,7 @@ impl FactDelete<'_> {
             OutsideChange {
                 by: self.by,
                 outcome: ReviewOutcome::Deleted,
-                changed: matches!(removed, Removed::Removed(_)),
+                changed: matches!(removed, Removed::Removed(..)),
             },
         )
         .await
@@ -487,8 +496,34 @@ impl FactDelete<'_> {
             }
             other => other,
         })?;
+        for fact in owned {
+            close_on_change(
+                self.requests,
+                self.events,
+                self.writes,
+                self.scope,
+                self.key,
+                &fact.node_key,
+                OutsideChange {
+                    by: self.by,
+                    outcome: ReviewOutcome::Deleted,
+                    changed: true,
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                DomainError::Unavailable(_) | DomainError::Database(_) => {
+                    DomainError::Unavailable(format!(
+                        "fact {} is deleted, but the review request of the node {} it owned was \
+                         not closed: {err}",
+                        fact_id.0, fact.node_key.0
+                    ))
+                }
+                other => other,
+            })?;
+        }
         match removed {
-            Removed::Removed(_) => Ok(()),
+            Removed::Removed(..) => Ok(()),
             Removed::Gone if closed => Ok(()),
             Removed::Gone => Err(no_such_fact(fact_id)),
         }

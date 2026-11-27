@@ -447,3 +447,21 @@ async fn a_record_with_a_long_provenance_is_stored_with_it_clipped() {
         Some(500)
     );
 }
+
+#[test]
+fn the_record_keeps_a_long_provenance_whole() {
+    use crate::domain::plan::Origin;
+    let profiles = Profiles::new();
+    let mut plan = profiles.plan(None, Vec::new());
+    plan.origin = Origin::Connector {
+        connector: "connector-a".to_owned(),
+        provenance: "p".repeat(1024),
+        version: "v1".to_owned(),
+        type_id: construct_sdk::gts::CHAT_MESSAGE_TYPE.to_owned(),
+        observed_at: time::OffsetDateTime::UNIX_EPOCH,
+    };
+
+    let record = super::fact::record_of(&plan).expect("a connector record");
+
+    assert_eq!(record["provenance"].as_str().map(str::len), Some(1024));
+}

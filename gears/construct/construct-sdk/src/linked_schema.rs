@@ -326,6 +326,9 @@ fn record_schema() -> Value {
             "description": description,
         })
     };
+    // Intake takes a provenance of 1024 characters and the record keeps it whole: its identity uses all of it.
+    let mut provenance = text("The record's identity within the connector.");
+    provenance["maxLength"] = json!(1024);
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -333,7 +336,7 @@ fn record_schema() -> Value {
         "description": "The record a node or link came from, when it came from one: the connector that sent it and the record's identity.",
         "properties": {
             "connector": text("The connector that sent the record."),
-            "provenance": text("The record's identity within the connector."),
+            "provenance": provenance,
             "version": text("The record's version."),
         }
     })
