@@ -378,8 +378,9 @@ impl AdminFactsService {
     }
 
     /// Soft-delete the subject's fact `fact_id` as the subject's delete
-    /// does, with the administrator as origin. An open review request on the
-    /// fact closes as deleted.
+    /// does, with the administrator as origin. The nodes the fact owns go with
+    /// it, and the open review requests of the fact and of those nodes close
+    /// as deleted.
     ///
     /// NOT cancel-safe, as [`Self::edit`].
     ///
@@ -390,8 +391,9 @@ impl AdminFactsService {
     /// reviewer resolves the fact's request, when an earlier resolution
     /// closed it meanwhile, or when the delete was stored but the request did
     /// not close; unavailable when the profile kept changing, when the
-    /// writer failed and the delete may have landed, or when the fact's
-    /// request could not be closed, the last two of which a repeat finishes;
+    /// writer failed and the delete may have landed, or when the request of
+    /// the fact or of a node it owned could not be closed, the last two of
+    /// which a repeat finishes;
     /// otherwise as [`Self::read`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-admin-facts-delete:p2

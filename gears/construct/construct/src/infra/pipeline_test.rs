@@ -1480,3 +1480,68 @@ async fn a_delete_whose_every_close_failed_is_finished_by_its_repeat() {
     );
     assert_eq!(closers, (Some(learned.subject), Some(learned.subject)));
 }
+
+#[tokio::test]
+async fn a_close_that_fails_for_the_named_request_does_not_stop_the_close_of_the_owned_one() {
+    use crate::domain::error::DomainError;
+    let learned = learned_project_with_a_commitment().await;
+    learned.flags_both().await;
+    let owner = crate::test_support::context_of(learned.subject, learned.tenant);
+    *learned.reviews.close_open_fails_on.lock().unwrap() = Some(learned.project.node_key.clone());
+
+    let first = learned
+        .pipeline
+        .subject_control
+        .delete(&owner, learned.subject, &learned.project.node_key)
+        .await;
+
+    assert!(
+        matches!(first, Err(DomainError::Unavailable(_))),
+        "{first:?}"
+    );
+    assert_eq!(
+        learned.closed_as_deleted_by(&learned.promise),
+        Some(learned.subject),
+        "the owned request closed though the named one did not"
+    );
+    assert_eq!(
+        learned.closed_as_deleted_by(&learned.project),
+        None,
+        "still open"
+    );
+    *learned.reviews.close_open_fails_on.lock().unwrap() = None;
+
+    learned
+        .pipeline
+        .subject_control
+        .delete(&owner, learned.subject, &learned.project.node_key)
+        .await
+        .expect("the repeat closes the named request");
+
+    assert_eq!(
+        learned.closed_as_deleted_by(&learned.project),
+        Some(learned.subject)
+    );
+}
+
+#[tokio::test]
+async fn a_named_close_that_fails_once_is_closed_by_the_sweep_and_the_delete_is_done() {
+    let learned = learned_project_with_a_commitment().await;
+    learned.flags_both().await;
+    let owner = crate::test_support::context_of(learned.subject, learned.tenant);
+    *learned.reviews.close_open_fails_once_on.lock().unwrap() =
+        Some(learned.project.node_key.clone());
+
+    learned
+        .pipeline
+        .subject_control
+        .delete(&owner, learned.subject, &learned.project.node_key)
+        .await
+        .expect("the sweep closed what the named close could not");
+
+    let closers = (
+        learned.closed_as_deleted_by(&learned.promise),
+        learned.closed_as_deleted_by(&learned.project),
+    );
+    assert_eq!(closers, (Some(learned.subject), Some(learned.subject)));
+}

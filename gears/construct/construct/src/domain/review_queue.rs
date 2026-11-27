@@ -693,11 +693,18 @@ pub(crate) async fn close_orphaned(
     by: Uuid,
     except: Option<&NodeKey>,
 ) -> Result<usize, DomainError> {
-    let open = requests.under_review(scope, key).await?;
+    let read_failed = |err: DomainError| {
+        tracing::warn!(error = %err, "construct: the requests on removed nodes could not be read");
+        err
+    };
+    let open = requests
+        .under_review(scope, key)
+        .await
+        .map_err(read_failed)?;
     if open.is_empty() {
         return Ok(0);
     }
-    let live = writes.facts(key).await?.facts;
+    let live = writes.facts(key).await.map_err(read_failed)?.facts;
     let (mut closed, mut failed) = (0, None);
     for fact_id in open
         .iter()

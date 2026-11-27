@@ -254,7 +254,8 @@ impl SubjectControlService {
     /// Soft-delete one live fact of the subject: a plan with one removal,
     /// written against the profile's version, and read and written again
     /// after a short pause on a conflict, within the rerun limit and the
-    /// budget. An open review request on the fact closes as deleted.
+    /// budget. The nodes the fact owns go with it, and the open review requests of the fact and of those nodes
+    /// close as deleted.
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
     /// fact deleted without its delete event, and its review request open
@@ -268,9 +269,11 @@ impl SubjectControlService {
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact,
     /// also when a concurrent write removed it before a rerun; unavailable
     /// when the profile kept changing past the reruns or the budget, when the
-    /// writer failed and the fact is not seen gone after it, or when the
-    /// fact's review request could not be closed, the last two of which a
-    /// repeat of the delete finishes; otherwise as [`Self::view`].
+    /// writer failed and the fact is not seen gone after it, or when a review
+    /// request of the fact or of a node it owned could not be closed, the last
+    /// two of which a repeat of the delete finishes. A delete that closes a
+    /// request an earlier delete left open answers as done, whichever fact it
+    /// names; otherwise as [`Self::view`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-delete:p1
     /// @cpt-dod:cpt-cf-construct-dod-review-queue-subject-control:p1
@@ -508,8 +511,13 @@ impl FactDelete<'_> {
             }
             other => other,
         };
-        let closed = named.map_err(not_closed)?;
-        let swept = swept.map_err(not_closed)?;
+        // The sweep also closes the named request, which is gone with its fact: when it did everything, a failure
+        // of the close above is behind it.
+        let (closed, swept) = match (named, swept) {
+            (Ok(closed), Ok(swept)) => (closed, swept),
+            (Err(_), Ok(swept)) => (swept > 0, swept),
+            (_, Err(err)) => return Err(not_closed(err)),
+        };
         match removed {
             Removed::Removed(..) => Ok(()),
             // A repeat that closed a request has finished the delete.

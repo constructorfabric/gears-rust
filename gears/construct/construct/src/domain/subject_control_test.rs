@@ -1110,3 +1110,59 @@ async fn a_delete_records_the_event_of_each_node_it_takes_with_it_however_deep()
         );
     }
 }
+
+#[tokio::test]
+async fn every_request_of_a_removed_node_is_tried_when_the_first_close_fails() {
+    // Keys in the order the sweep goes through them: the owned nodes b and c, the first of which fails.
+    let named_key = |key: &str| NodeKey(format!("construct:t:{key}"));
+    let mut project = stored_fact(Category::PROJECT, "project", json!({ "name": "Atlas" }), 10);
+    project.node_key = named_key("a");
+    let mut commitment = stored_fact(
+        Category::COMMITMENT,
+        "commitment",
+        json!({ "kind": "promise", "text": "ship" }),
+        11,
+    );
+    commitment.node_key = named_key("b");
+    commitment.owner = Some(project.node_key.clone());
+    let mut decision = stored_fact(
+        Category::PRODUCT,
+        "product",
+        json!({ "name": "Atlas Cloud" }),
+        12,
+    );
+    decision.node_key = named_key("c");
+    decision.owner = Some(commitment.node_key.clone());
+    let fixture = Fixture::with_facts(
+        vec![project.clone(), commitment.clone(), decision.clone()],
+        0,
+    );
+    for fact in [&project, &commitment, &decision] {
+        fixture.reviews.open_on(fixture.key(), fact);
+    }
+    *fixture.reviews.close_open_fails_on.lock().unwrap() = Some(commitment.node_key.clone());
+    let service = fixture.service(Arc::new(AllowResolver));
+
+    let deleted = service
+        .delete(&fixture.owner(), fixture.subject, &project.node_key)
+        .await;
+
+    assert!(
+        matches!(deleted, Err(DomainError::Unavailable(_))),
+        "{deleted:?}"
+    );
+    let open: Vec<NodeKey> = fixture
+        .reviews
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(request, _)| request.is_open())
+        .map(|(request, _)| request.fact_id.clone())
+        .collect();
+    assert_eq!(
+        open,
+        [commitment.node_key],
+        "only the request whose close failed is left open"
+    );
+}

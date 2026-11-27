@@ -1458,7 +1458,22 @@ impl MemoryWriter {
                 _ => None,
             })
             .collect();
-        facts.retain(|fact| !removed.contains(&&fact.node_key));
+        // A removal takes the nodes the node owns with it, as the writer does.
+        let ownership = crate::domain::profile::owners(
+            facts
+                .iter()
+                .map(|fact| (&fact.node_key, fact.owner.as_ref())),
+        );
+        let taken: Vec<NodeKey> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::RemoveEntity { entity } => Some(entity),
+                _ => None,
+            })
+            .flat_map(|entity| crate::domain::profile::owned_by(&ownership, entity))
+            .collect();
+        facts.retain(|fact| !removed.contains(&&fact.node_key) && !taken.contains(&fact.node_key));
         if store {
             facts.extend(replaced);
         }
@@ -1634,6 +1649,8 @@ pub struct MemoryReviews {
     pub close_open_fails: std::sync::atomic::AtomicBool,
     /// Fail the close of an open request on this fact as unavailable, and of no other.
     pub close_open_fails_on: std::sync::Mutex<Option<crate::domain::plan::NodeKey>>,
+    /// Fail the next close of an open request on this fact as unavailable, once.
+    pub close_open_fails_once_on: std::sync::Mutex<Option<crate::domain::plan::NodeKey>>,
     /// Answer each claim this long after taking it, as a slow database
     /// that committed would.
     pub claim_delay: std::sync::Mutex<std::time::Duration>,
@@ -1978,6 +1995,23 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
             .close_open_fails
             .load(std::sync::atomic::Ordering::SeqCst)
         {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
+        let failing_once = {
+            let mut once = self.close_open_fails_once_on.lock().unwrap();
+            let fails = once.as_ref().is_some_and(|failing| {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(request, _)| request.id == key.id && &request.fact_id == failing)
+            });
+            if fails {
+                *once = None;
+            }
+            fails
+        };
+        if failing_once {
             return Err(DomainError::Unavailable("the database is down".to_owned()));
         }
         if let Some(failing) = self.close_open_fails_on.lock().unwrap().as_ref()
