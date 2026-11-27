@@ -11,7 +11,7 @@ use super::tools::{
 };
 use crate::domain::model_client::{ToolCall, ToolSpec};
 use crate::domain::plan::NodeKey;
-use crate::domain::profile::{Category, Fact, Link, Mark, Profile};
+use crate::domain::profile::{Category, Fact, Link, Mark, Profile, owned_by, ownership};
 
 /// A node a step names: one the profile holds, or one this plan adds, by its place among the added nodes.
 #[domain_model]
@@ -439,18 +439,16 @@ impl<'a> PlanDraft<'a> {
         // A node goes with the nodes it owns, however deep: the writer removes them with it. One already changed in
         // this plan stops the removal: a number names one step.
         let mut gone = vec![index];
-        let mut at = 0;
-        while at < gone.len() {
-            let owner = self.nodes[gone[at]].node_key.clone();
-            for (owned, fact) in self.nodes.iter().enumerate() {
-                if fact.owner.as_ref() == Some(&owner) && !gone.contains(&owned) {
-                    if self.taken.contains(&owned) {
-                        return Err(ToolRefusal::NumberUsed(owned + 1));
-                    }
-                    gone.push(owned);
-                }
+        let owners = ownership(&self.nodes);
+        for key in owned_by(&owners, &self.nodes[index].node_key) {
+            // The walk names only keys of `self.nodes`, so each has a place.
+            let Some(owned) = self.nodes.iter().position(|fact| fact.node_key == key) else {
+                continue;
+            };
+            if self.taken.contains(&owned) {
+                return Err(ToolRefusal::NumberUsed(owned + 1));
             }
-            at += 1;
+            gone.push(owned);
         }
         for step in &self.steps {
             if let DraftStep::Add {

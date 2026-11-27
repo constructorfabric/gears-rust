@@ -1382,3 +1382,79 @@ async fn a_node_read_the_caller_may_not_make_is_audited_like_a_refused_profile_r
     assert!(event.categories.is_empty());
     assert_eq!(event.granted, [Category::PERSON]);
 }
+
+/// One node read of the linked fixture, the way a caller who may read every category makes it, with the audit
+/// event it left.
+async fn audited_node_read(
+    personalization: bool,
+    node: impl FnOnce(&Linked) -> NodeKey,
+) -> (
+    Result<(), DomainError>,
+    crate::domain::profile_read::ProfileReadEvent,
+) {
+    let linked = Linked::new();
+    let node = node(&linked);
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    seed_subject_settings(
+        &db,
+        SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        },
+        SubjectSettings {
+            personalization_enabled: personalization,
+            erasure_in_progress: false,
+        },
+    )
+    .await;
+    let events = Arc::new(RecordingProfileEvents::default());
+    let service = profile_service_over(
+        &db,
+        Arc::new(AllowResolver),
+        Arc::new(FixedFacts::with_links(linked.facts, linked.links)),
+        Uuid::new_v4(),
+        Arc::clone(&events),
+        CategoryCheck::OneCall,
+    );
+    let read = service
+        .read_node(&subject_in(tenant, subject), None, subject, &node)
+        .await
+        .map(|_| ());
+    let [event] = events.taken().try_into().expect("one event");
+    (read, event)
+}
+
+#[tokio::test]
+async fn a_node_read_is_audited_with_the_categories_it_served() {
+    let (read, event) = audited_node_read(true, |linked| linked.key(Category::PERSON)).await;
+
+    assert!(read.is_ok(), "{read:?}");
+    assert!(event.served);
+    assert_eq!(event.granted, Category::all());
+    // The person, and what it is linked to: the projects it works on, and their commitments. Not the unlinked team.
+    assert_eq!(
+        event.categories,
+        [Category::COMMITMENT, Category::PERSON, Category::PROJECT]
+    );
+}
+
+#[tokio::test]
+async fn a_node_the_subject_does_not_hold_is_audited_as_served_and_refused() {
+    let (read, event) = audited_node_read(true, |_| NodeKey("construct:nothing".to_owned())).await;
+
+    assert!(matches!(read, Err(DomainError::NoSuchFact(_))), "{read:?}");
+    assert!(event.served);
+    assert_eq!(event.granted, Category::all());
+    assert!(event.categories.is_empty());
+}
+
+#[tokio::test]
+async fn a_node_read_with_personalization_off_is_audited_as_not_served() {
+    let (read, event) = audited_node_read(false, |linked| linked.key(Category::PERSON)).await;
+
+    assert!(matches!(read, Err(DomainError::NoSuchFact(_))), "{read:?}");
+    assert!(!event.served);
+    assert!(event.granted.is_empty(), "not asked when nothing is served");
+    assert!(event.categories.is_empty());
+}

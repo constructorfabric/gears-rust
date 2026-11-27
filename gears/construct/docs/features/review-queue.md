@@ -228,7 +228,7 @@ A delete and a correction are written against the profile's version, and read an
 **Steps**:
 1. [x] - `p1` - **IF** the deployment did not opt in to storing values without sensitive-data checks, not configured. Check the value against its property's schema first, so a value it does not take answers invalid even for a fact that is gone; a stored property no person type has is an internal error. Start the budget (20 seconds), and build Construct's context and scope for the tenant - `inst-correct-start`
 2. [x] - `p1` - Read the subject's facts, cut off when the budget runs out (unavailable) - `inst-correct-read`
-3. [x] - `p1` - Build a plan under a new node key, with the version just read and the writer as origin. For a replace: **IF** no live fact has the fact id, **RETURN** gone; one step replaces the fact with a new entity holding the new value. For an add: **IF** the subject holds the value, or a value of a one-valued property, **RETURN** held with that fact; one step adds a new entity holding it - `inst-correct-plan`
+3. [x] - `p1` - Build a plan with the version just read and the writer as origin. For a replace: **IF** no live fact has the fact id, **RETURN** gone; one step replaces the fact in place, under its own key, with the new value. For an add: **IF** the subject holds the value, or a value of a one-valued property, **RETURN** held with that fact; one step adds a new entity holding it - `inst-correct-plan`
 4. [x] - `p1` - Run the sensitive-data checks and Admission on it. **IF** a check fails, Admission drops the plan, or the value is blocked, **RETURN** nothing stored, with the reason - `inst-correct-admit`
 5. [x] - `p1` - For a correction, record it with the new key on the claim; **IF** the claim no longer holds the request, conflict. Write it through the profile writer, for at most 90 seconds; when the writer fails, read the facts once more and count the new key found there as stored. **IF** stored, **RETURN** the new key. On a conflict, pause briefly and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; then unavailable - `inst-correct-write`
 
@@ -275,7 +275,7 @@ A delete and a correction are written against the profile's version, and read an
 **Output**: The plan without the steps that touch a fact under review.
 
 **Steps**:
-1. [x] - `p1` - Read the fact ids of the subject's open requests as Construct, also for a manage-facts call, whose agent's scope may not reach them. Drop each step that replaces or removes one of them or adds a property to it, and log how many were dropped, without content - `inst-skip-drop`
+1. [x] - `p1` - Read the fact ids of the subject's open requests as Construct, also for a manage-facts call, whose agent's scope may not reach them. Drop each step that replaces or removes one of them, removes a node that owns one of them, or adds a property to it, and log how many were dropped, without content - `inst-skip-drop`
 
 ### Log the Review Queue's Events
 
@@ -362,7 +362,7 @@ The system **MUST** list the open requests of the caller's tenant, oldest first,
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-review-queue-one-step`
 
-The system **MUST** turn a corrected value into a plan with one replace step and a new node key, with the reviewer as origin, pass it through the sensitive-data checks and Admission, and store it through the profile writer against the profile's version, reading and writing again on a conflict. When nothing is stored the request **MUST** stay open and the answer **MUST** say why; when the fact is gone the request **MUST** close as deleted. A correction **MUST** run only where the deployment opted in to storing values without sensitive-data checks.
+The system **MUST** turn a corrected value into a plan with one replace step in place, with the reviewer as origin, pass it through the sensitive-data checks and Admission, and store it through the profile writer against the profile's version, reading and writing again on a conflict. When nothing is stored the request **MUST** stay open and the answer **MUST** say why; when the fact is gone the request **MUST** close as deleted. A correction **MUST** run only where the deployment opted in to storing values without sensitive-data checks.
 
 **Implements**:
 - `cpt-cf-construct-algo-review-queue-correct`
@@ -378,7 +378,7 @@ The system **MUST** turn a corrected value into a plan with one replace step and
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-review-queue-frozen`
 
-While a request is open, the profile read **MUST NOT** serve its fact, and processing **MUST** drop every step that would change or remove it, for records and for manage-facts calls alike. The subject's own view **MUST** still show it.
+While a request is open, the profile read **MUST NOT** serve its fact, and processing **MUST** drop every step that would change or remove it, also a removal of a node that owns it, for records and for manage-facts calls alike. The subject's own view **MUST** still show it.
 
 **Implements**:
 - `cpt-cf-construct-algo-review-queue-hide`

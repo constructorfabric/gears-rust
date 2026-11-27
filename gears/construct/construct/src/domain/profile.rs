@@ -136,6 +136,32 @@ impl Mark {
     }
 }
 
+/// The ownership of `facts`: each owned node's key with its owner's, for [`owned_by`]. Copies keys only.
+#[must_use]
+pub fn ownership(facts: &[Fact]) -> Vec<(NodeKey, NodeKey)> {
+    facts
+        .iter()
+        .filter_map(|fact| Some((fact.node_key.clone(), fact.owner.clone()?)))
+        .collect()
+}
+
+/// The keys of the nodes `node` owns, however deep, in `ownership` (from [`ownership`]). The planner's walk of "a
+/// node and what it owns"; the writer walks the stored nodes' payloads the same way (`with_owned`).
+#[must_use]
+pub fn owned_by(ownership: &[(NodeKey, NodeKey)], node: &NodeKey) -> Vec<NodeKey> {
+    let mut found: Vec<NodeKey> = Vec::new();
+    let mut parents = vec![node.clone()];
+    while let Some(parent) = parents.pop() {
+        for (owned, _) in ownership.iter().filter(|(_, owner)| *owner == parent) {
+            if owned != node && !found.contains(owned) {
+                found.push(owned.clone());
+                parents.push(owned.clone());
+            }
+        }
+    }
+    found
+}
+
 /// One stored link: its kind, the nodes at its ends and its fields.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]

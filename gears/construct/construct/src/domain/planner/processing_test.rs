@@ -7,7 +7,8 @@ use tokio::time::Instant;
 
 use super::processing::{Changes, ManageDeadlines, Managed, NothingStored, Written};
 use super::test_data::{
-    AGENT, Chain, Profiles, SUBJECT, TENANT, Writer, adding_rust, done, node_key, tool_calls,
+    AGENT, Answer, Chain, Profiles, SUBJECT, TENANT, Writer, adding_rust, done, node_key,
+    tool_calls,
 };
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelError;
@@ -254,21 +255,31 @@ async fn a_fact_candidate_never_removes_or_replaces_a_value() {
     );
 }
 
-/// The skill, fact 2, under an open review request.
-fn skill_under_review(chain: &Chain) {
-    let mut skill = crate::test_support::stored_fact(
-        crate::domain::profile::Category::PROJECT,
-        "project",
-        json!({ "name": "Atlas" }),
-        1,
-    );
-    skill.node_key = node_key(3);
+/// The fact `number` of the test profile, of `category`, under an open review request.
+fn node_under_review(
+    chain: &Chain,
+    category: crate::domain::profile::Category,
+    number: usize,
+    value: serde_json::Value,
+) {
+    let mut fact = crate::test_support::stored_fact(category, category.name(), value, 1);
+    fact.node_key = node_key(number);
     chain.reviews.open_on(
         crate::domain::subject_settings::SubjectKey {
             tenant_id: TENANT,
             subject_id: SUBJECT,
         },
-        &skill,
+        &fact,
+    );
+}
+
+/// The project, fact 3, under an open review request.
+fn project_under_review(chain: &Chain) {
+    node_under_review(
+        chain,
+        crate::domain::profile::Category::PROJECT,
+        3,
+        json!({ "name": "Atlas" }),
     );
 }
 
@@ -286,7 +297,7 @@ async fn a_step_on_a_fact_under_review_is_dropped_and_the_rest_written() {
         ],
         &[Ok(Written::Stored)],
     );
-    skill_under_review(&chain);
+    project_under_review(&chain);
 
     chain.process(&record()).await;
 
@@ -306,17 +317,8 @@ async fn a_step_on_a_fact_under_review_is_dropped_and_the_rest_written() {
 
 #[tokio::test]
 async fn a_call_whose_only_step_is_on_a_fact_under_review_stores_nothing() {
-    let chain = Chain::new(
-        vec![
-            Ok(tool_calls(
-                &[("remove", json!({ "number": 3, "confidence": 0.9 }))],
-                900,
-            )),
-            Ok(done(950)),
-        ],
-        &[Ok(Written::Stored)],
-    );
-    skill_under_review(&chain);
+    let chain = Chain::new(removing_the_project(), &[Ok(Written::Stored)]);
+    project_under_review(&chain);
 
     let managed = chain.manage(in_a_while()).await.expect("an answer");
 
@@ -360,17 +362,8 @@ fn soon_before_the_write() -> ManageDeadlines {
 
 #[tokio::test]
 async fn a_manage_call_reads_the_facts_under_review_as_construct_not_as_the_agent() {
-    let chain = Chain::new(
-        vec![
-            Ok(tool_calls(
-                &[("remove", json!({ "number": 3, "confidence": 0.9 }))],
-                900,
-            )),
-            Ok(done(950)),
-        ],
-        &[Ok(Written::Stored)],
-    );
-    skill_under_review(&chain);
+    let chain = Chain::new(removing_the_project(), &[Ok(Written::Stored)]);
+    project_under_review(&chain);
 
     let managed = chain
         .manage_as(toolkit_security::AccessScope::deny_all(), in_a_while())
@@ -399,7 +392,7 @@ async fn a_manage_call_drops_only_the_steps_on_a_fact_under_review() {
         ],
         &[Ok(Written::Stored)],
     );
-    skill_under_review(&chain);
+    project_under_review(&chain);
 
     let managed = chain.manage(in_a_while()).await.expect("an answer");
 
@@ -630,28 +623,30 @@ async fn an_unreachable_profile_is_an_error() {
     assert!(chain.manage(in_a_while()).await.is_err());
 }
 
+fn removing_the_project() -> Vec<Answer> {
+    vec![
+        Ok(tool_calls(
+            &[("remove", json!({ "number": 3, "confidence": 0.9 }))],
+            900,
+        )),
+        Ok(done(950)),
+    ]
+}
+
+fn commitment_under_review(chain: &Chain) {
+    node_under_review(
+        chain,
+        crate::domain::profile::Category::COMMITMENT,
+        4,
+        json!({ "kind": "action", "text": "book the review" }),
+    );
+}
+
 #[tokio::test]
 async fn a_removal_that_would_take_a_node_under_review_with_it_is_dropped() {
-    // Line 4, the commitment owned by the project, is under review; the model removes the project, line 3.
-    let remove_project = ("remove", json!({ "number": 3, "confidence": 0.9 }));
-    let chain = Chain::new(
-        vec![Ok(tool_calls(&[remove_project], 900)), Ok(done(950))],
-        &[Ok(Written::Stored)],
-    );
-    let mut commitment = crate::test_support::stored_fact(
-        crate::domain::profile::Category::COMMITMENT,
-        "commitment",
-        json!({ "kind": "action", "text": "book the review" }),
-        1,
-    );
-    commitment.node_key = node_key(4);
-    chain.reviews.open_on(
-        crate::domain::subject_settings::SubjectKey {
-            tenant_id: TENANT,
-            subject_id: SUBJECT,
-        },
-        &commitment,
-    );
+    // Line 4, the commitment the project owns, is under review; the model removes the project, line 3.
+    let chain = Chain::new(removing_the_project(), &[Ok(Written::Stored)]);
+    commitment_under_review(&chain);
 
     chain.process(&record()).await;
 
@@ -659,4 +654,38 @@ async fn a_removal_that_would_take_a_node_under_review_with_it_is_dropped() {
         chain.writer.plans().is_empty(),
         "the removal would delete the commitment under review"
     );
+}
+
+#[tokio::test]
+async fn a_manage_call_drops_a_removal_that_would_take_a_node_under_review() {
+    let chain = Chain::new(removing_the_project(), &[Ok(Written::Stored)]);
+    commitment_under_review(&chain);
+
+    let managed = chain.manage(in_a_while()).await.expect("an answer");
+
+    assert_eq!(managed, Managed::NothingStored(NothingStored::UnderReview));
+    assert!(chain.writer.plans().is_empty());
+}
+
+#[tokio::test]
+async fn a_removal_goes_through_while_a_node_it_does_not_take_is_under_review() {
+    // Line 1, the person's own node, is under review; the project and its commitment are not.
+    let chain = Chain::new(removing_the_project(), &[Ok(Written::Stored)]);
+    node_under_review(
+        &chain,
+        crate::domain::profile::Category::ME,
+        1,
+        json!({ "name": "Jane Doe" }),
+    );
+
+    chain.process(&record()).await;
+
+    let plans = chain.writer.plans();
+    let [plan] = plans.as_slice() else {
+        panic!("one write: {plans:?}");
+    };
+    assert!(matches!(
+        plan.steps.as_slice(),
+        [step] if matches!(&step.change, Change::RemoveEntity { entity } if *entity == node_key(3))
+    ));
 }
