@@ -423,7 +423,7 @@ async fn a_link_removed_and_linked_again_in_one_plan_stays() {
 }
 
 #[tokio::test]
-async fn a_record_with_a_long_provenance_is_stored_with_it_clipped() {
+async fn a_record_with_a_long_provenance_is_stored_with_its_message_clipped() {
     use crate::domain::plan::Origin;
     let profiles = Profiles::new();
     let mut plan = profiles.plan(

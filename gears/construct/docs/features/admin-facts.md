@@ -50,7 +50,7 @@ The PRD requires that a tenant administrator can read all facts of any subject i
 |-------|--------|
 | `GET /construct/v1/admin/subjects/{subject_id}/facts` | `200`, a page of the subject's facts |
 | `POST /construct/v1/admin/subjects/{subject_id}/facts` | `201`, the fact as stored |
-| `PUT /construct/v1/admin/subjects/{subject_id}/facts/{fact_id}` | `200`, the fact as stored, under its new id |
+| `PUT /construct/v1/admin/subjects/{subject_id}/facts/{fact_id}` | `200`, the fact as stored, under its own id |
 | `DELETE /construct/v1/admin/subjects/{subject_id}/facts/{fact_id}` | `204` |
 
 **Who may.** Every route needs the permission to administer a subject's facts: `administer` on `gts.cf.construct.subject.fact.v1~` in the caller's tenant, which Construct declares as a GTS permission instance. Only a constraint that names the caller's tenant, and nothing narrower, makes an administrator: the administrator does not act for the subject, so the AuthZ resolver is not asked about the subject. A caller without it gets `403`. Everything is scoped to the caller's tenant, so a subject of another tenant answers as one with no profile: its read is empty, and an edit or a delete of one of its facts answers `404`. The gateway rule on `/api/construct/v1/admin/**` is the deployment's to turn on.
@@ -59,7 +59,7 @@ The PRD requires that a tenant administrator can read all facts of any subject i
 
 **The add.** The body is `{property, value}`: one property of the person types, as a fact in the read and a reviewer's correction name it, and its value; the category comes from the property. A property name longer than 64 characters or of other characters than lower-case letters, digits and `_`, or a property no person type has, answers `400` naming `property`; a value its schema does not take answers `400` naming `value`; the answer and the log never repeat the name or the value. A value the subject holds already, or a second value of a one-valued property, answers `409` `ALREADY_HELD`, naming the fact that holds it, so the administrator edits it instead. The value then goes through the one-step plan path: a plan with one add step under a new node key, the administrator as origin, the sensitive-data checks and Admission like any plan, and the profile writer against the profile's version. A subject without a profile gets one: the plan is written against no version, as a first record is. The answer is `201` with `{fact_id, entity_kind, property, value, origin}`, the value as Admission let it through.
 
-**The edit.** The body is the add's, with the fact's own property; another property answers `400`. The fact gets a new id, as a reviewer's correction does. A fact the subject does not have, also one that goes away before the edit is written, answers `404` and stores nothing. The answer is `200` with the fact as stored, under its new id.
+**The edit.** The body is the add's, with the fact's own property; another property answers `400`. The fact keeps its id, as under a reviewer's correction: the edit replaces it in place. A fact the subject does not have, also one that goes away before the edit is written, answers `404` and stores nothing. The answer is `200` with the fact as stored, under its own id.
 
 **The delete.** A delete is the subject's delete with the administrator as origin: a soft delete written against the profile's version, read and written again on a conflict. A fact the subject does not have answers `404`. When the fact was deleted but a review request on it could not be closed, the answer is `503`, and a repeat closes it.
 
@@ -151,7 +151,7 @@ The PRD requires that a tenant administrator can read all facts of any subject i
 **Actor**: `cpt-cf-construct-actor-tenant-admin`
 
 **Success Scenarios**:
-- The administrator gets 200 with the fact as stored under its new id; an open review request on it closes as corrected.
+- The administrator gets 200 with the fact as stored under its own id; an open review request on it closes as corrected.
 
 **Error Scenarios**:
 - The platform refuses: 403.

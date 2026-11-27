@@ -103,7 +103,8 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
         Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
-    let worker = pipeline.worker.expect("processing is wired");
+    let mut pipeline = pipeline;
+    let worker = pipeline.worker.take().expect("processing is wired");
     let intake = IntakeFixture {
         hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
         ..IntakeFixture::default()
@@ -262,7 +263,8 @@ async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
         Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
-    let worker = pipeline.worker.expect("processing is wired");
+    let mut pipeline = pipeline;
+    let worker = pipeline.worker.take().expect("processing is wired");
     let load = worker.load();
     let intake = IntakeFixture {
         hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
@@ -774,7 +776,8 @@ async fn an_erased_subject_is_served_nothing_at_once_keeps_only_its_setting_and_
         Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
-    let worker = pipeline.worker.expect("processing is wired");
+    let mut pipeline = pipeline;
+    let worker = pipeline.worker.take().expect("processing is wired");
     let intake = IntakeFixture {
         hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
         generations_from: Some(Arc::clone(&pipeline.generations)),
@@ -1067,7 +1070,8 @@ async fn a_message_is_learned_as_linked_nodes_shown_in_one_call_and_forgotten_wi
         Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
-    let worker = pipeline.worker.expect("processing is wired");
+    let mut pipeline = pipeline;
+    let worker = pipeline.worker.take().expect("processing is wired");
     let intake = IntakeFixture {
         hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
         ..IntakeFixture::default()
@@ -1173,8 +1177,17 @@ async fn a_message_is_learned_as_linked_nodes_shown_in_one_call_and_forgotten_wi
     );
 }
 
-#[tokio::test]
-async fn a_forget_closes_the_review_request_of_every_node_it_removes() {
+/// A subject whose message was learned as a project that owns a commitment, over reviews kept in memory.
+struct Learned {
+    pipeline: super::pipeline::Pipeline,
+    reviews: Arc<crate::test_support::MemoryReviews>,
+    tenant: Uuid,
+    subject: Uuid,
+    project: crate::domain::profile_read::StoredFact,
+    promise: crate::domain::profile_read::StoredFact,
+}
+
+async fn learned_project_with_a_commitment() -> Learned {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
@@ -1196,7 +1209,8 @@ async fn a_forget_closes_the_review_request_of_every_node_it_removes() {
         Arc::new(crate::test_support::NoTenantResolver),
     )
     .expect("the pipeline assembles");
-    let worker = pipeline.worker.expect("processing is wired");
+    let mut pipeline = pipeline;
+    let worker = pipeline.worker.take().expect("processing is wired");
     let intake = IntakeFixture {
         hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
         ..IntakeFixture::default()
@@ -1239,30 +1253,164 @@ async fn a_forget_closes_the_review_request_of_every_node_it_removes() {
     let (project, promise) = (node("project"), node("commitment"));
     assert_eq!(promise.owner.as_ref(), Some(&project.node_key));
 
-    // The subject flags the commitment, then forgets the project that owns it.
-    let owner = crate::test_support::context_of(subject, tenant);
-    pipeline
-        .review_queue
-        .flag(&owner, subject, &promise.node_key, None)
-        .await
-        .expect("the subject flags the commitment");
-    pipeline
+    Learned {
+        pipeline,
+        reviews,
+        tenant,
+        subject,
+        project,
+        promise,
+    }
+}
+
+impl Learned {
+    /// The subject flags the commitment and the project that owns it.
+    async fn flags_both(&self) -> (Uuid, Uuid) {
+        let owner = crate::test_support::context_of(self.subject, self.tenant);
+        let mut ids = Vec::new();
+        for node in [&self.promise, &self.project] {
+            let request = self
+                .pipeline
+                .review_queue
+                .flag(&owner, self.subject, &node.node_key, None)
+                .await
+                .expect("the subject flags the node");
+            ids.push(request.id);
+        }
+        (ids[0], ids[1])
+    }
+
+    /// Whether the request on `node` closed as deleted, and none on it is open.
+    fn closed_as_deleted(&self, node: &crate::domain::profile_read::StoredFact) -> bool {
+        use crate::domain::review_queue::{ReviewOutcome, ReviewStatus};
+        let requests = self.reviews.requests.lock().unwrap();
+        let on_node: Vec<_> = requests
+            .iter()
+            .filter(|(request, _)| request.fact_id == node.node_key)
+            .collect();
+        !on_node.is_empty()
+            && on_node.iter().all(|(request, _)| {
+                matches!(&request.status, ReviewStatus::Closed(done) if done.outcome == ReviewOutcome::Deleted)
+            })
+    }
+}
+
+#[tokio::test]
+async fn a_forget_closes_the_review_request_of_every_node_it_removes() {
+    let learned = learned_project_with_a_commitment().await;
+    learned.flags_both().await;
+    let owner = crate::test_support::context_of(learned.subject, learned.tenant);
+
+    learned
+        .pipeline
         .subject_control
-        .delete(&owner, subject, &project.node_key)
+        .delete(&owner, learned.subject, &learned.project.node_key)
         .await
         .expect("the subject forgets the project");
 
-    // The commitment went with the project: its request is closed, and the flagged value is no longer kept.
-    let open: Vec<_> = reviews
-        .requests
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|(request, _)| request.fact_id == promise.node_key && request.is_open())
-        .map(|(request, _)| request.status.clone())
-        .collect();
     assert!(
-        open.is_empty(),
-        "a removed node's review request is still open with its flagged value: {open:?}"
+        learned.closed_as_deleted(&learned.promise),
+        "the owned node"
+    );
+    assert!(
+        learned.closed_as_deleted(&learned.project),
+        "the named node"
+    );
+}
+
+#[tokio::test]
+async fn an_administrators_delete_closes_the_requests_of_the_owner_and_of_what_it_owns() {
+    let learned = learned_project_with_a_commitment().await;
+    learned.flags_both().await;
+    let administrator = crate::test_support::context_of(Uuid::new_v4(), learned.tenant);
+
+    learned
+        .pipeline
+        .admin_facts
+        .delete(&administrator, learned.subject, &learned.project.node_key)
+        .await
+        .expect("the administrator deletes the project");
+
+    assert!(
+        learned.closed_as_deleted(&learned.promise),
+        "the owned node"
+    );
+    assert!(
+        learned.closed_as_deleted(&learned.project),
+        "the named node"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_deleting_the_owner_closes_the_requests_of_what_it_owns() {
+    use crate::domain::review_queue::Resolution;
+    let learned = learned_project_with_a_commitment().await;
+    let (_, project_request) = learned.flags_both().await;
+    let reviewer = crate::test_support::context_of(Uuid::new_v4(), learned.tenant);
+
+    learned
+        .pipeline
+        .review_queue
+        .resolve(
+            &reviewer,
+            project_request,
+            Resolution::Deleted { reason: None },
+        )
+        .await
+        .expect("the reviewer deletes the project");
+
+    assert!(
+        learned.closed_as_deleted(&learned.promise),
+        "the owned node"
+    );
+    assert!(
+        learned.closed_as_deleted(&learned.project),
+        "the named node"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_whose_close_failed_is_finished_by_its_repeat_for_the_owned_nodes_too() {
+    use std::sync::atomic::Ordering;
+    let learned = learned_project_with_a_commitment().await;
+    learned.flags_both().await;
+    let owner = crate::test_support::context_of(learned.subject, learned.tenant);
+    learned
+        .reviews
+        .close_open_fails
+        .store(true, Ordering::SeqCst);
+
+    let first = learned
+        .pipeline
+        .subject_control
+        .delete(&owner, learned.subject, &learned.project.node_key)
+        .await;
+    assert!(
+        matches!(
+            first,
+            Err(crate::domain::error::DomainError::Unavailable(_))
+        ),
+        "{first:?}"
+    );
+    assert!(!learned.closed_as_deleted(&learned.promise));
+    learned
+        .reviews
+        .close_open_fails
+        .store(false, Ordering::SeqCst);
+
+    learned
+        .pipeline
+        .subject_control
+        .delete(&owner, learned.subject, &learned.project.node_key)
+        .await
+        .expect("the repeat finishes the delete");
+
+    assert!(
+        learned.closed_as_deleted(&learned.promise),
+        "the owned node"
+    );
+    assert!(
+        learned.closed_as_deleted(&learned.project),
+        "the named node"
     );
 }

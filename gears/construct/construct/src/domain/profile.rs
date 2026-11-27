@@ -136,13 +136,26 @@ impl Mark {
     }
 }
 
-/// The ownership of `facts`: each owned node's key with its owner's, for [`owned_by`]. Copies keys only.
+/// Each owned node's key with its owner's, for [`owned_by`], from nodes given as a key and the owner's key. Copies keys
+/// only.
+#[must_use]
+pub fn owners<'a>(
+    nodes: impl IntoIterator<Item = (&'a NodeKey, Option<&'a NodeKey>)>,
+) -> Vec<(NodeKey, NodeKey)> {
+    nodes
+        .into_iter()
+        .filter_map(|(node, owner)| Some((node.clone(), owner?.clone())))
+        .collect()
+}
+
+/// The ownership of `facts`, for [`owned_by`].
 #[must_use]
 pub fn ownership(facts: &[Fact]) -> Vec<(NodeKey, NodeKey)> {
-    facts
-        .iter()
-        .filter_map(|fact| Some((fact.node_key.clone(), fact.owner.clone()?)))
-        .collect()
+    owners(
+        facts
+            .iter()
+            .map(|fact| (&fact.node_key, fact.owner.as_ref())),
+    )
 }
 
 /// The keys of the nodes `node` owns, however deep, in `ownership` (from [`ownership`]). The planner's walk of "a

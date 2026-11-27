@@ -310,7 +310,7 @@ impl AdminFactsService {
                     let new = self.edited(key, by, fact_id, new);
                     settled.closed.map(|_| new)
                 }
-                Wrote::Nothing | Wrote::Removed => {
+                Wrote::Nothing | Wrote::Removed(_) => {
                     let closed = settled.closed?;
                     match &closed.status {
                         // This edit found the fact gone, and closed the
@@ -427,8 +427,11 @@ impl AdminFactsService {
                 .await?;
             return match settled.wrote {
                 // Removed, and recorded even when the request did not close.
-                Wrote::Removed => {
+                Wrote::Removed(owned) => {
                     self.deleted(key, by, fact_id, request.category);
+                    for fact in &owned {
+                        self.deleted(key, by, &fact.node_key, fact.category);
+                    }
                     settled.closed.map(|_| ())
                 }
                 Wrote::Nothing | Wrote::Corrected(_) => {

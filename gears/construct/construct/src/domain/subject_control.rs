@@ -20,7 +20,8 @@ use super::profile::Category;
 use super::profile_read::{StoredFact, settings_scope};
 use super::profile_writes::{ProfileWrites, Removed, WriteError};
 use super::review_queue::{
-    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_change,
+    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests,
+    close_on_change, close_orphaned,
 };
 use super::subject_access::{authorize, own};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
@@ -457,16 +458,12 @@ impl FactDelete<'_> {
             })?;
         // A removal takes the nodes the fact owns with it, however deep, so each of them is deleted too: it gets its
         // delete event, and its open review request closes as deleted.
-        let owned: &[StoredFact] = match &removed {
-            Removed::Removed(fact, owned) => {
+        if let Removed::Removed(fact, owned) = &removed {
+            deleted(fact);
+            for fact in owned {
                 deleted(fact);
-                for fact in owned {
-                    deleted(fact);
-                }
-                owned
             }
-            Removed::Gone => &[],
-        };
+        }
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
         // A fact already gone may still have an open request left by an
         // earlier delete whose close failed; this closes it.
@@ -496,32 +493,28 @@ impl FactDelete<'_> {
             }
             other => other,
         })?;
-        for fact in owned {
-            close_on_change(
-                self.requests,
-                self.events,
-                self.writes,
-                self.scope,
-                self.key,
-                &fact.node_key,
-                OutsideChange {
-                    by: self.by,
-                    outcome: ReviewOutcome::Deleted,
-                    changed: true,
-                },
-            )
-            .await
-            .map_err(|err| match err {
-                DomainError::Unavailable(_) | DomainError::Database(_) => {
-                    DomainError::Unavailable(format!(
-                        "fact {} is deleted, but the review request of the node {} it owned was \
-                         not closed: {err}",
-                        fact_id.0, fact.node_key.0
-                    ))
-                }
-                other => other,
-            })?;
-        }
+        // The nodes the fact owned went with it: their requests close as deleted too, and so does one an earlier
+        // delete left open when its close failed.
+        close_orphaned(
+            self.requests,
+            self.events,
+            self.writes,
+            self.scope,
+            self.key,
+            self.by,
+            None,
+        )
+        .await
+        .map_err(|err| match err {
+            DomainError::Unavailable(_) | DomainError::Database(_) => {
+                DomainError::Unavailable(format!(
+                    "fact {} is deleted, but the review request of a node it owned was not closed; \
+                     send the delete again: {err}",
+                    fact_id.0
+                ))
+            }
+            other => other,
+        })?;
         match removed {
             Removed::Removed(..) => Ok(()),
             Removed::Gone if closed => Ok(()),

@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::error::DomainError;
 use super::plan::{Change, NodeKey, Origin, Plan, Step};
 use super::planner::processing::{PlanWriter, ProcessingContexts, Written};
-use super::profile::owned_by;
+use super::profile::{owned_by, owners};
 use super::profile_read::{StoredFact, read_failure};
 use super::subject_settings::SubjectKey;
 
@@ -249,12 +249,13 @@ impl ProfileWrites {
         self.with_reruns(deadline, "delete", move || async move {
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
             let current = Self::before_write(deadline, "delete", self.read(construct, key)).await?;
-            let owners: Vec<(NodeKey, NodeKey)> = current
-                .facts
-                .iter()
-                .filter_map(|fact| Some((fact.node_key.clone(), fact.owner.clone()?)))
-                .collect();
-            let owned: Vec<StoredFact> = owned_by(&owners, fact_id)
+            let ownership = owners(
+                current
+                    .facts
+                    .iter()
+                    .map(|fact| (&fact.node_key, fact.owner.as_ref())),
+            );
+            let owned: Vec<StoredFact> = owned_by(&ownership, fact_id)
                 .iter()
                 .filter_map(|key| current.facts.iter().find(|fact| &fact.node_key == key))
                 .cloned()

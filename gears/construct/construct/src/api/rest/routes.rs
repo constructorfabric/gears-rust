@@ -495,7 +495,7 @@ pub fn register_review_queue_routes(
             "Close an open review request of the caller's tenant as `rejected` (with a \
              `reason`), `deleted`, or `corrected` (with `property`, the fact's own property, \
              and its new `value`). A correction passes the sensitive-data checks and Admission \
-             and gives the fact a new id; when they refuse it, 422 and the request stays \
+             and replaces the fact in place; when they refuse it, 422 and the request stays \
              open. A correction of a fact that is gone closes the request as deleted. Needs \
              the permission to resolve review requests; without it, 403. An unknown \
              request answers 404, a closed one 409.",
@@ -614,10 +614,10 @@ pub fn register_admin_facts_routes(
         .summary("Edit a subject's fact")
         .description(
             "Stores a new value for the fact's own property in place of the fact, with the \
-             administrator as origin; the fact gets a new id. An open review request on the \
+             administrator as origin; the fact keeps its id. An open review request on the \
              fact closes as corrected; while a reviewer resolves it, 409. When the edit was \
              stored but the request did not close, 409 with reason `WRITTEN_NOT_CLOSED`: the \
-             fact has its new id already, so the edit is not sent again. The value passes \
+             fact has its new value already, so the edit is not sent again. The value passes \
              the sensitive-data checks and Admission; when they refuse it, 422 names the \
              reason, nothing is stored and a review request stays open. A fact the subject \
              does not have answers 404. Needs the permission to administer a subject's \
@@ -633,7 +633,7 @@ pub fn register_admin_facts_routes(
         .json_response_with_schema::<dto::StoredFactDto>(
             openapi,
             StatusCode::OK,
-            "The fact as stored, under its new id",
+            "The fact as stored, under its own id",
         )
         .standard_errors(openapi)
         .error_422(openapi)
