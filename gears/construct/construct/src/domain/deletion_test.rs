@@ -50,8 +50,13 @@ impl Fixture {
         };
         let now = OffsetDateTime::now_utc().unix_timestamp();
         let profile = MemoryProfile::with(vec![
-            stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
-            stored_fact(Category::Role, "roles", json!({ "title": "Engineer" }), now),
+            stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+            stored_fact(
+                Category::PRODUCT,
+                "roles",
+                json!({ "title": "Engineer" }),
+                now,
+            ),
         ]);
         let writer = MemoryWriter::new(Arc::clone(&profile), 0);
         Self {
@@ -688,7 +693,7 @@ async fn retention_records_the_rows_it_removed_and_nothing_when_there_were_none(
 #[tokio::test]
 async fn a_request_left_open_on_a_fact_an_earlier_run_removed_is_closed_by_the_next() {
     let fx = Fixture::new();
-    let gone = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    let gone = stored_fact(Category::PROJECT, "project", json!({ "name": "Go" }), 10);
     fx.reviews.open_on(fx.key, &gone);
 
     fx.deletion(listing(vec![fx.key.subject_id]))
@@ -783,7 +788,7 @@ async fn a_fact_retention_removes_closes_its_request_as_construct_though_a_resol
 #[tokio::test]
 async fn a_fact_an_earlier_run_removed_closes_its_request_as_the_resolution_recorded() {
     let fx = Fixture::new();
-    let gone = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    let gone = stored_fact(Category::PROJECT, "project", json!({ "name": "Go" }), 10);
     let reviewer = deleted_by_reviewer(&fx, &gone);
 
     fx.deletion(listing(vec![fx.key.subject_id]))
@@ -804,7 +809,7 @@ async fn a_fact_an_earlier_run_removed_closes_its_request_as_the_resolution_reco
 async fn every_close_is_tried_when_one_fails_and_the_tenant_reports_the_request_left_open() {
     let fx = Fixture::new();
     for name in ["Go", "C"] {
-        let gone = stored_fact(Category::Skill, "skills", json!({ "name": name }), 10);
+        let gone = stored_fact(Category::PROJECT, "project", json!({ "name": name }), 10);
         fx.reviews.open_on(fx.key, &gone);
     }
     fx.reviews.close_open_fails.store(true, Ordering::SeqCst);
@@ -869,7 +874,7 @@ async fn a_write_that_lands_during_the_wait_is_removed_before_the_erasure_finish
     );
 
     // A plan that passed Admission before the mark lands now.
-    let late = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    let late = stored_fact(Category::PROJECT, "project", json!({ "name": "Go" }), 10);
     fx.profile.facts.lock().unwrap().push(late);
     *fx.profile.version.lock().unwrap() = Some(9);
 
@@ -903,7 +908,7 @@ async fn a_run_whose_erasure_another_run_finished_leaves_the_new_profile() {
             .await
             .unwrap()
     );
-    let new = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    let new = stored_fact(Category::PROJECT, "project", json!({ "name": "Go" }), 10);
     fx.profile.facts.lock().unwrap().push(new.clone());
 
     assert_eq!(running.await.unwrap().unwrap(), Erasure::NotUnderWay);
@@ -973,7 +978,7 @@ async fn a_run_paused_after_its_check_leaves_the_new_profile_another_run_started
     assert!(fx.profile.live().is_empty(), "the first removal ran");
 
     // The subject's new profile, in the next generation.
-    let new = stored_fact(Category::Skill, "skills", json!({ "name": "Go" }), 10);
+    let new = stored_fact(Category::PROJECT, "project", json!({ "name": "Go" }), 10);
     fx.profile.facts.lock().unwrap().push(new.clone());
     fx.profile.generation.store(1, Ordering::SeqCst);
     *fx.profile.version.lock().unwrap() = Some((1 << 32) | 1);

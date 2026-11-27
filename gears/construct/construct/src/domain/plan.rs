@@ -125,9 +125,10 @@ impl Property {
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    /// A new entity with its properties.
+    /// A new entity with its properties, owned by the node `owner` when its kind is an entry kind.
     AddEntity {
         key: NodeKey,
+        owner: Option<NodeKey>,
         properties: Vec<Property>,
     },
     /// A new property on an existing entity.
@@ -136,16 +137,31 @@ pub enum Change {
     /// step.
     ReplaceProperty { entity: NodeKey, property: Property },
     /// A new entity in place of an old one; the old entity goes in the same
-    /// step.
+    /// step. When `key` is `old`, the entity is changed where it stands: its
+    /// links and the nodes it owns stay.
     ReplaceEntity {
         old: NodeKey,
         key: NodeKey,
+        owner: Option<NodeKey>,
         properties: Vec<Property>,
     },
     /// Remove an entity.
     RemoveEntity { entity: NodeKey },
     /// Remove one property of an entity.
     RemoveProperty { entity: NodeKey, name: String },
+    /// A new link of kind `kind` from one entity to another, whose one property holds its fields.
+    AddLink {
+        kind: String,
+        from: NodeKey,
+        to: NodeKey,
+        properties: Vec<Property>,
+    },
+    /// Remove the link of kind `kind` from one entity to another.
+    RemoveLink {
+        kind: String,
+        from: NodeKey,
+        to: NodeKey,
+    },
 }
 
 impl Change {
@@ -153,21 +169,23 @@ impl Change {
     #[must_use]
     pub fn properties(&self) -> &[Property] {
         match self {
-            Self::AddEntity { properties, .. } | Self::ReplaceEntity { properties, .. } => {
-                properties
-            }
+            Self::AddEntity { properties, .. }
+            | Self::ReplaceEntity { properties, .. }
+            | Self::AddLink { properties, .. } => properties,
             Self::AddProperty { property, .. } | Self::ReplaceProperty { property, .. } => {
                 std::slice::from_ref(property)
             }
-            Self::RemoveEntity { .. } | Self::RemoveProperty { .. } => &[],
+            Self::RemoveEntity { .. } | Self::RemoveProperty { .. } | Self::RemoveLink { .. } => {
+                &[]
+            }
         }
     }
 
     pub(crate) fn properties_mut(&mut self) -> Option<&mut Vec<Property>> {
         match self {
-            Self::AddEntity { properties, .. } | Self::ReplaceEntity { properties, .. } => {
-                Some(properties)
-            }
+            Self::AddEntity { properties, .. }
+            | Self::ReplaceEntity { properties, .. }
+            | Self::AddLink { properties, .. } => Some(properties),
             _ => None,
         }
     }
@@ -175,22 +193,24 @@ impl Change {
     /// The value of the `index`th property the change would store.
     pub(crate) fn value_mut(&mut self, index: usize) -> Option<&mut Value> {
         match self {
-            Self::AddEntity { properties, .. } | Self::ReplaceEntity { properties, .. } => {
-                properties.get_mut(index).map(|p| &mut p.value)
-            }
+            Self::AddEntity { properties, .. }
+            | Self::ReplaceEntity { properties, .. }
+            | Self::AddLink { properties, .. } => properties.get_mut(index).map(|p| &mut p.value),
             Self::AddProperty { property, .. } | Self::ReplaceProperty { property, .. } => {
                 (index == 0).then_some(&mut property.value)
             }
-            Self::RemoveEntity { .. } | Self::RemoveProperty { .. } => None,
+            Self::RemoveEntity { .. } | Self::RemoveProperty { .. } | Self::RemoveLink { .. } => {
+                None
+            }
         }
     }
 
     /// The stored entity the change touches: the one it replaces, removes or
-    /// adds a property to. None for a new entity.
+    /// adds a property to. None for a new entity and for a link.
     #[must_use]
     pub fn touches(&self) -> Option<&NodeKey> {
         match self {
-            Self::AddEntity { .. } => None,
+            Self::AddEntity { .. } | Self::AddLink { .. } | Self::RemoveLink { .. } => None,
             Self::AddProperty { entity, .. }
             | Self::ReplaceProperty { entity, .. }
             | Self::RemoveEntity { entity }
@@ -204,7 +224,7 @@ impl Change {
     pub fn stores_values(&self) -> bool {
         !matches!(
             self,
-            Self::RemoveEntity { .. } | Self::RemoveProperty { .. }
+            Self::RemoveEntity { .. } | Self::RemoveProperty { .. } | Self::RemoveLink { .. }
         )
     }
 
@@ -223,7 +243,7 @@ impl Change {
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Step {
-    /// The entity kind of the entity the step touches.
+    /// The entity kind of the entity the step touches, or the link kind of the link it adds or removes.
     pub entity_kind: String,
     pub change: Change,
     /// The confidence the model gives the step, from 0 to 1. A plan a person

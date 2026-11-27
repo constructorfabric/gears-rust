@@ -124,7 +124,7 @@ mod tests {
             by: admin,
             fact_id: NodeKey("construct:t:old".to_owned()),
             new_fact_id: NodeKey("construct:t:new".to_owned()),
-            category: Category::Skill,
+            category: Category::PROJECT,
         });
 
         assert!(logs_contain("construct::audit"));
@@ -134,7 +134,7 @@ mod tests {
         assert!(logs_contain(&format!("caller={admin}")));
         assert!(logs_contain("fact_id=construct:t:old"));
         assert!(logs_contain("new_fact_id=construct:t:new"));
-        assert!(logs_contain("category=\"skill\""));
+        assert!(logs_contain("category=\"project\""));
     }
 
     #[tracing_test::traced_test]
@@ -146,13 +146,13 @@ mod tests {
             tenant_id: tenant,
             subject_id: subject,
             by: admin,
-            categories: BTreeSet::from([Category::Role, Category::Skill]),
+            categories: BTreeSet::from([Category::PRODUCT, Category::PROJECT]),
         });
 
         assert!(logs_contain("event=\"admin_facts_read\""));
         assert!(logs_contain(&format!("caller={admin}")));
-        assert!(logs_contain("\"role\""));
-        assert!(logs_contain("\"skill\""));
+        assert!(logs_contain("\"product\""));
+        assert!(logs_contain("\"project\""));
     }
 
     #[tracing_test::traced_test]
@@ -165,14 +165,14 @@ mod tests {
             subject_id: subject,
             by: admin,
             fact_id: NodeKey("construct:t:added".to_owned()),
-            category: Category::Skill,
+            category: Category::PROJECT,
         });
         LogAdminFactsEvents.record(AdminFactsEvent::Deleted {
             tenant_id: tenant,
             subject_id: subject,
             by: admin,
             fact_id: NodeKey("construct:t:deleted".to_owned()),
-            category: Category::Role,
+            category: Category::PRODUCT,
         });
         LogAdminFactsEvents.record(AdminFactsEvent::Refused {
             tenant_id: tenant,

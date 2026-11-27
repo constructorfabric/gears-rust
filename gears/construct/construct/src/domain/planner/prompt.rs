@@ -1,15 +1,15 @@
 use construct_sdk::gts::record_type_schema;
-use construct_sdk::person_types::Cardinality;
+use construct_sdk::linked_schema::Owner;
 use serde_json::Value;
 use toolkit_macros::domain_model;
 
 use super::agent::AgentMessage;
-use super::catalog::PropertyCatalog;
-use crate::domain::profile::Category;
+use super::catalog::Catalog;
 use crate::domain::record_intake::ReceivedRecord;
 
 const INSTRUCTIONS: &str = include_str!("instructions.md");
-const PROPERTIES_PLACEHOLDER: &str = "{properties}";
+const KINDS_PLACEHOLDER: &str = "{kinds}";
+const LINKS_PLACEHOLDER: &str = "{links}";
 const NOT_BLANK: &str = "\\S";
 
 /// Why a record cannot be shown to the model.
@@ -36,32 +36,54 @@ impl UnusableRecord {
     }
 }
 
-/// The planner's instructions, with every property of the person types and its value form.
+/// The planner's instructions, with every node kind and link kind of the profile schema and the form of its values.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-prompt:p1
 #[must_use]
-pub fn instructions(catalog: &PropertyCatalog) -> String {
-    let properties = Category::ALL
-        .iter()
-        .flat_map(|category| {
-            catalog.names().filter_map(move |property| {
-                let spec = catalog.get(property)?;
-                (spec.category == *category).then(|| {
-                    let cardinality = match spec.cardinality {
-                        Cardinality::One => "one",
-                        Cardinality::Many => "many",
-                    };
-                    format!(
-                        "{}: {property} ({cardinality}): {}",
-                        category.name(),
-                        form(spec.schema())
-                    )
-                })
-            })
+pub fn instructions(catalog: &Catalog) -> String {
+    let kinds = catalog
+        .kind_names()
+        .filter_map(|name| catalog.kind(name))
+        .map(|spec| {
+            let kind = spec.kind();
+            let owner = match &kind.owner {
+                Owner::Root => "owned by the person".to_owned(),
+                Owner::Kinds(owners) => format!("owned by a node of: {}", owners.join(", ")),
+            };
+            let one = if kind.single { ", only one" } else { "" };
+            format!(
+                "- {} ({owner}{one}): {} Value: {} Two with the same `{}` are the same.",
+                kind.name,
+                kind.description,
+                form(spec.schema()),
+                kind.key
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
-    INSTRUCTIONS.replace(PROPERTIES_PLACEHOLDER, &properties)
+    let links = catalog
+        .link_names()
+        .filter_map(|name| catalog.link(name))
+        .map(|spec| {
+            let kind = spec.kind();
+            let fields = if kind.fields.is_empty() {
+                String::new()
+            } else {
+                format!(" Fields: {}", form(spec.schema()))
+            };
+            format!(
+                "- {}: from {} to {}. {}{fields}",
+                kind.name,
+                kind.from.join(" | "),
+                kind.to.join(" | "),
+                kind.description
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    INSTRUCTIONS
+        .replace(KINDS_PLACEHOLDER, &kinds)
+        .replace(LINKS_PLACEHOLDER, &links)
 }
 
 /// The record and the numbered profile as the model gets them, marked as data, with no field named `id` or `*_id`.

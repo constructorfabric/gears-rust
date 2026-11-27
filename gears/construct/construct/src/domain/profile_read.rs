@@ -19,7 +19,7 @@ use super::deletion::{RetentionPeriods, period_start};
 use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
-use super::profile::Category;
+use super::profile::{Category, Link};
 use super::review_queue::FactsUnderReview;
 use super::subject_reach::reach;
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
@@ -68,6 +68,14 @@ impl OriginKind {
     }
 }
 
+/// Where a node or a link was learned: the tool and, when there is one, the message or record.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedFrom {
+    pub tool: String,
+    pub message: Option<String>,
+}
+
 /// One stored fact as a reader sees it: its key, category, property and value,
 /// who it came from, when it was stored, and when its source asserted it.
 #[domain_model]
@@ -77,6 +85,10 @@ pub struct StoredFact {
     pub category: Category,
     pub property: String,
     pub value: Value,
+    /// The node that owns this one, for a node of an entry kind.
+    pub owner: Option<NodeKey>,
+    /// The tools and messages the node was learned from, the newest last.
+    pub learned: Vec<LearnedFrom>,
     pub origin: OriginKind,
     pub stored_at: OffsetDateTime,
     pub produced_at: Option<OffsetDateTime>,
@@ -111,6 +123,85 @@ pub trait StoredProfiles: Send + Sync {
         ctx: &SecurityContext,
         key: SubjectKey,
     ) -> Result<Vec<StoredFact>, DomainError>;
+
+    /// The links between a subject's stored facts, with where each was learned. A reader that holds no links
+    /// answers none.
+    ///
+    /// # Errors
+    ///
+    /// When the profile cannot be read.
+    async fn links(
+        &self,
+        _ctx: &SecurityContext,
+        _key: SubjectKey,
+    ) -> Result<Vec<StoredLinkFact>, DomainError> {
+        Ok(Vec::new())
+    }
+}
+
+/// A link as a reader sees it: its kind, ends and fields, and where it was learned.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredLinkFact {
+    pub link: Link,
+    pub learned: Vec<LearnedFrom>,
+}
+
+/// The node a read of one node gives: the node, the nodes it owns, the nodes one link away grouped by link kind, and
+/// the tools it was learned from, with a count each.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeDetails {
+    pub node: StoredFact,
+    pub owned: Vec<StoredFact>,
+    pub neighbours: Vec<NeighbourGroup>,
+    pub learned_from: Vec<ToolCount>,
+}
+
+/// The neighbours of a node by one link kind.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct NeighbourGroup {
+    pub link: String,
+    pub neighbours: Vec<Neighbour>,
+}
+
+/// Which way a link goes, from the node a read is about.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkDirection {
+    /// The link starts at the node.
+    Out,
+    /// The link ends at the node.
+    In,
+}
+
+impl LinkDirection {
+    /// The direction's name on the wire.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Out => "out",
+            Self::In => "in",
+        }
+    }
+}
+
+/// A node one link away, with the link's direction and fields.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Neighbour {
+    pub direction: LinkDirection,
+    pub fields: Value,
+    pub node: StoredFact,
+}
+
+/// How many times a tool taught the profile what a node holds.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCount {
+    pub tool: String,
+    pub count: usize,
 }
 
 /// A content-free event for one profile read: who read which subject's
@@ -239,7 +330,7 @@ fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<Grant> {
             unnamed: false,
         },
         None => Grant {
-            categories: Category::ALL.into_iter().collect(),
+            categories: Category::all().into_iter().collect(),
             unnamed: true,
         },
     })
@@ -432,6 +523,168 @@ impl ProfileReadService {
         tenant: Option<Uuid>,
         subject_id: Uuid,
     ) -> Result<ProfileView, DomainError> {
+        let Access {
+            key,
+            construct,
+            construct_scope,
+            readable,
+            served,
+        } = self.access(ctx, tenant, subject_id).await?;
+        let categories = if readable.is_empty() {
+            Vec::new()
+        } else {
+            self.facts(&construct, &construct_scope, key, &readable)
+                .await?
+        };
+
+        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-event
+        self.ports.events.read(ProfileReadEvent {
+            tenant_id: key.tenant_id,
+            subject_id,
+            caller: ctx.subject_id(),
+            categories: categories.iter().map(|group| group.category).collect(),
+            granted: Category::all()
+                .into_iter()
+                .filter(|category| readable.contains(category))
+                .collect(),
+            served,
+        });
+        Ok(ProfileView {
+            subject_id,
+            categories,
+        })
+        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-event
+    }
+
+    /// One node of the profile of `subject_id` with the nodes it owns, the nodes one link away grouped by link
+    /// kind, and the tools it was learned from, in one call. Every node it gives is of a category the caller may
+    /// read: a project the caller may not read is not a neighbour either.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`], and [`DomainError::NoSuchFact`] when the subject has no such node, the caller may not
+    /// read its category, or nothing is served (personalization off, an erasure under way): the three look the
+    /// same.
+    ///
+    /// Cancel-safe: the read only reads.
+    #[tracing::instrument(skip_all, fields(%subject_id, caller = %ctx.subject_id()))]
+    pub async fn read_node(
+        &self,
+        ctx: &SecurityContext,
+        tenant: Option<Uuid>,
+        subject_id: Uuid,
+        node: &NodeKey,
+    ) -> Result<NodeDetails, DomainError> {
+        let Access {
+            key,
+            construct,
+            construct_scope,
+            readable,
+            ..
+        } = self.access(ctx, tenant, subject_id).await?;
+        let gone = || DomainError::NoSuchFact(node.0.clone());
+        if readable.is_empty() {
+            return Err(gone());
+        }
+        let stored = self.visible(&construct, &construct_scope, key).await?;
+        let links = self
+            .ports
+            .profiles
+            .links(&construct, key)
+            .await
+            .map_err(read_failure)?;
+        let held = stored
+            .iter()
+            .find(|fact| &fact.node_key == node && readable.contains(&fact.category))
+            .ok_or_else(gone)?;
+        let readable_fact = |key: &NodeKey| {
+            stored
+                .iter()
+                .find(|fact| &fact.node_key == key && readable.contains(&fact.category))
+        };
+        let owned: Vec<StoredFact> = stored
+            .iter()
+            .filter(|fact| fact.owner.as_ref() == Some(node) && readable.contains(&fact.category))
+            .cloned()
+            .collect();
+        let mut groups: Vec<NeighbourGroup> = Vec::new();
+        let mut learned: Vec<&LearnedFrom> = held.learned.iter().collect();
+        for stored_link in &links {
+            let link = &stored_link.link;
+            let (direction, other) = if &link.from == node {
+                (LinkDirection::Out, &link.to)
+            } else if &link.to == node {
+                (LinkDirection::In, &link.from)
+            } else {
+                continue;
+            };
+            // A link to a node the caller may not read is not shown, nor counted.
+            let Some(other) = readable_fact(other) else {
+                continue;
+            };
+            learned.extend(stored_link.learned.iter());
+            let neighbour = Neighbour {
+                direction,
+                fields: link.fields.clone(),
+                node: other.clone(),
+            };
+            match groups.iter_mut().find(|group| group.link == link.kind) {
+                Some(group) => group.neighbours.push(neighbour),
+                None => groups.push(NeighbourGroup {
+                    link: link.kind.clone(),
+                    neighbours: vec![neighbour],
+                }),
+            }
+        }
+        groups.sort_by(|a, b| a.link.cmp(&b.link));
+        let mut counts: Vec<ToolCount> = Vec::new();
+        for place in learned {
+            match counts.iter_mut().find(|count| count.tool == place.tool) {
+                Some(count) => count.count += 1,
+                None => counts.push(ToolCount {
+                    tool: place.tool.clone(),
+                    count: 1,
+                }),
+            }
+        }
+        counts.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.tool.cmp(&b.tool)));
+        let mut categories: Vec<Category> = std::iter::once(held.category)
+            .chain(owned.iter().map(|fact| fact.category))
+            .chain(
+                groups
+                    .iter()
+                    .flat_map(|group| group.neighbours.iter().map(|n| n.node.category)),
+            )
+            .collect();
+        categories.sort();
+        categories.dedup();
+        self.ports.events.read(ProfileReadEvent {
+            tenant_id: key.tenant_id,
+            subject_id,
+            caller: ctx.subject_id(),
+            categories,
+            granted: Category::all()
+                .into_iter()
+                .filter(|category| readable.contains(category))
+                .collect(),
+            served: true,
+        });
+        Ok(NodeDetails {
+            node: held.clone(),
+            owned,
+            neighbours: groups,
+            learned_from: counts,
+        })
+    }
+
+    /// The caller's access to the profile of `subject_id`: the policy checks, the settings, and the categories
+    /// the caller may read.
+    async fn access(
+        &self,
+        ctx: &SecurityContext,
+        tenant: Option<Uuid>,
+        subject_id: Uuid,
+    ) -> Result<Access, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-authorize
         let key = SubjectKey {
             tenant_id: Self::tenant_of(ctx, tenant),
@@ -481,31 +734,13 @@ impl ProfileReadService {
             (true, CategoryCheck::PerCategory) => self.readable_one_by_one(ctx, key).await?,
         };
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
-
-        let categories = if readable.is_empty() {
-            Vec::new()
-        } else {
-            self.facts(&construct, &construct_scope, key, &readable)
-                .await?
-        };
-
-        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-event
-        self.ports.events.read(ProfileReadEvent {
-            tenant_id: key.tenant_id,
-            subject_id,
-            caller: ctx.subject_id(),
-            categories: categories.iter().map(|group| group.category).collect(),
-            granted: Category::ALL
-                .into_iter()
-                .filter(|category| readable.contains(category))
-                .collect(),
+        Ok(Access {
+            key,
+            construct,
+            construct_scope,
+            readable,
             served,
-        });
-        Ok(ProfileView {
-            subject_id,
-            categories,
         })
-        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-event
     }
 
     /// The categories one policy call each allows. The calls run at the same
@@ -517,7 +752,7 @@ impl ProfileReadService {
         ctx: &SecurityContext,
         key: SubjectKey,
     ) -> Result<HashSet<Category>, DomainError> {
-        let decisions = join_all(Category::ALL.into_iter().map(|category| async move {
+        let decisions = join_all(Category::all().into_iter().map(|category| async move {
             let request = profile_request(key, Some(category));
             let decided = self
                 .policy_enforcer
@@ -570,6 +805,37 @@ impl ProfileReadService {
         key: SubjectKey,
         readable: &HashSet<Category>,
     ) -> Result<Vec<CategoryFacts>, DomainError> {
+        let stored = self.visible(construct, construct_scope, key).await?;
+        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
+        let mut groups: Vec<CategoryFacts> = Category::all()
+            .into_iter()
+            .filter(|category| readable.contains(category))
+            .map(|category| CategoryFacts {
+                category,
+                facts: Vec::new(),
+            })
+            .collect();
+        for fact in stored {
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.category == fact.category)
+            {
+                group.facts.push(fact);
+            }
+        }
+        groups.retain(|group| !group.facts.is_empty());
+        Ok(groups)
+        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
+    }
+
+    /// Every stored fact the profile serves: not one under an open review request, not one stored before the
+    /// tenant's retention period began.
+    async fn visible(
+        &self,
+        construct: &SecurityContext,
+        construct_scope: &AccessScope,
+        key: SubjectKey,
+    ) -> Result<Vec<StoredFact>, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
         let stored = self
             .ports
@@ -591,29 +857,21 @@ impl ProfileReadService {
         // @cpt-begin:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
         let period = self.ports.retention.period(key.tenant_id).await?;
         let kept_since = period.and_then(|period| period_start(OffsetDateTime::now_utc(), period));
-        let stored = stored.filter(|fact| kept_since.is_none_or(|since| fact.stored_at >= since));
+        Ok(stored
+            .filter(|fact| kept_since.is_none_or(|since| fact.stored_at >= since))
+            .collect())
         // @cpt-end:cpt-cf-construct-algo-retention-hide:p2:inst-hide-expired
-        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
-        let mut groups: Vec<CategoryFacts> = Category::ALL
-            .into_iter()
-            .filter(|category| readable.contains(category))
-            .map(|category| CategoryFacts {
-                category,
-                facts: Vec::new(),
-            })
-            .collect();
-        for fact in stored {
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|group| group.category == fact.category)
-            {
-                group.facts.push(fact);
-            }
-        }
-        groups.retain(|group| !group.facts.is_empty());
-        Ok(groups)
-        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
     }
+}
+
+/// What a caller may do with a subject's profile: the processing context graph storage is read with, and the
+/// categories the caller may read.
+struct Access {
+    key: SubjectKey,
+    construct: SecurityContext,
+    construct_scope: AccessScope,
+    readable: HashSet<Category>,
+    served: bool,
 }
 
 #[cfg(test)]
@@ -646,11 +904,15 @@ mod tests {
 
         let unnamed = granted(&AccessScope::for_tenant(key.tenant_id), key).unwrap();
         assert!(unnamed.unnamed);
-        let named = granted(&AccessScope::single(path_to(key, &[Category::Skill])), key).unwrap();
+        let named = granted(
+            &AccessScope::single(path_to(key, &[Category::PROJECT])),
+            key,
+        )
+        .unwrap();
         assert!(!named.unnamed);
         let both = granted(
             &AccessScope::from_constraints(vec![
-                path_to(key, &[Category::Skill]),
+                path_to(key, &[Category::PROJECT]),
                 ScopeConstraint::new(vec![ScopeFilter::eq(
                     pep_properties::OWNER_TENANT_ID,
                     key.tenant_id,
@@ -671,7 +933,7 @@ mod tests {
         // Alone it reaches nothing: the profile is not visible, never an empty grant.
         assert_eq!(granted(&AccessScope::single(dead.clone()), key), None);
         // Beside a live path it adds nothing and takes nothing away.
-        let live = path_to(key, &[Category::Skill]);
+        let live = path_to(key, &[Category::PROJECT]);
         assert_eq!(
             granted(
                 &AccessScope::from_constraints(vec![dead, live.clone()]),
@@ -688,7 +950,7 @@ mod tests {
 
         assert_eq!(
             categories(&tenant, key),
-            Some(Category::ALL.into_iter().collect())
+            Some(Category::all().into_iter().collect())
         );
         let elsewhere = SubjectKey {
             tenant_id: Uuid::new_v4(),
@@ -700,11 +962,11 @@ mod tests {
     #[test]
     fn a_resource_id_filter_narrows_the_grant_to_the_subjects_it_names() {
         let key = key();
-        let scope = AccessScope::single(path_to(key, &[Category::Skill]));
+        let scope = AccessScope::single(path_to(key, &[Category::PROJECT]));
 
         assert_eq!(
             categories(&scope, key),
-            Some([Category::Skill].into_iter().collect())
+            Some([Category::PROJECT].into_iter().collect())
         );
         let other = SubjectKey {
             subject_id: Uuid::new_v4(),
@@ -748,13 +1010,13 @@ mod tests {
     fn several_paths_to_the_profile_grant_the_union_of_their_categories() {
         let key = key();
         let scope = AccessScope::from_constraints(vec![
-            path_to(key, &[Category::Skill]),
-            path_to(key, &[Category::Role]),
+            path_to(key, &[Category::PROJECT]),
+            path_to(key, &[Category::PRODUCT]),
         ]);
 
         assert_eq!(
             categories(&scope, key),
-            Some([Category::Skill, Category::Role].into_iter().collect())
+            Some([Category::PROJECT, Category::PRODUCT].into_iter().collect())
         );
     }
 
@@ -762,7 +1024,7 @@ mod tests {
     fn the_settings_scope_keeps_only_the_tenant_filters() {
         let key = key();
 
-        let narrowed = settings_scope(&AccessScope::single(path_to(key, &[Category::Skill])));
+        let narrowed = settings_scope(&AccessScope::single(path_to(key, &[Category::PROJECT])));
         let [constraint] = narrowed.constraints() else {
             panic!("one constraint: {narrowed:?}");
         };

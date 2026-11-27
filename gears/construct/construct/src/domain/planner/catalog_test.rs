@@ -1,49 +1,71 @@
-use construct_sdk::person_types::PROPERTIES;
+use construct_sdk::linked_schema::Schema;
 use serde_json::json;
 
-use super::test_data::{catalog, schema_in_person_type};
+use super::test_data::catalog;
+use crate::domain::profile::profile_schema;
 
 #[test]
-fn every_property_of_the_person_types_has_its_category_and_cardinality() {
+fn every_kind_and_link_kind_of_the_schema_is_in_the_catalog() {
     let catalog = catalog();
 
-    for property in PROPERTIES {
-        let spec = catalog.get(property.name).expect("a listed property");
-        assert_eq!(
-            spec.category.type_id(),
-            property.type_id,
-            "{}",
-            property.name
-        );
-        assert_eq!(spec.cardinality, property.cardinality, "{}", property.name);
+    for kind in &profile_schema().nodes {
+        let spec = catalog.kind(kind.name).expect("a listed kind");
+        assert_eq!(spec.category.name(), kind.name);
+        assert_eq!(spec.schema(), &Schema::fields_schema(kind), "{}", kind.name);
     }
-    assert_eq!(catalog.names().count(), PROPERTIES.len());
+    for kind in &profile_schema().links {
+        let spec = catalog.link(kind.name).expect("a listed link kind");
+        assert_eq!(
+            spec.schema(),
+            &Schema::link_fields_schema(kind),
+            "{}",
+            kind.name
+        );
+    }
+    assert_eq!(catalog.kind_names().count(), profile_schema().nodes.len());
+    assert_eq!(catalog.link_names().count(), profile_schema().links.len());
 }
 
 #[test]
-fn each_property_checks_a_value_against_its_own_schema() {
+fn each_kind_checks_a_value_against_its_own_schema() {
     let catalog = catalog();
 
-    for property in catalog.names() {
-        let spec = catalog.get(property).expect("a listed property");
+    for name in catalog.kind_names() {
+        let spec = catalog.kind(name).expect("a listed kind");
         let refusal = spec
             .check(&json!({ "no_such_field": true }))
-            .expect_err("an object with an unknown field fits no property");
+            .expect_err("an object with an unknown field fits no kind");
         assert!(
-            refusal.ends_with(&format!("it takes {}", schema_in_person_type(property))),
-            "{property}: {refusal}"
+            refusal.ends_with(&format!("it takes {}", spec.schema())),
+            "{name}: {refusal}"
         );
     }
 }
 
 #[test]
-fn an_orcid_must_have_the_orcid_form() {
+fn a_commitment_takes_one_of_three_kinds_and_a_date_as_a_date() {
     let catalog = catalog();
-    let orcid = catalog.get("orcid_id").expect("orcid_id");
+    let commitment = catalog.kind("commitment").expect("commitment");
 
-    assert_eq!(orcid.check(&json!("0000-0002-1825-0097")), Ok(()));
-    assert!(orcid.check(&json!(42)).is_err());
-    assert!(orcid.check(&json!("orcid of Jane")).is_err());
+    assert_eq!(
+        commitment
+            .check(&json!({ "kind": "promise", "text": "send the script", "due": "2026-11-27" })),
+        Ok(())
+    );
+    assert!(
+        commitment
+            .check(&json!({ "kind": "wish", "text": "x" }))
+            .is_err()
+    );
+    assert!(
+        commitment
+            .check(&json!({ "kind": "promise", "text": "x", "due": "Friday" }))
+            .is_err()
+    );
+    assert!(
+        commitment.check(&json!({ "kind": "promise" })).is_err(),
+        "the text is required"
+    );
 }
 
 #[test]
@@ -51,26 +73,28 @@ fn a_refusal_names_the_broken_rule_and_where_but_not_the_value() {
     let catalog = catalog();
     let long = "7".repeat(10_000);
 
-    let orcid = catalog
-        .get("orcid_id")
-        .expect("orcid_id")
-        .check(&json!(long))
-        .expect_err("not an orcid");
-    let skill = catalog
-        .get("skills")
-        .expect("skills")
+    let refusal = catalog
+        .kind("project")
+        .expect("project")
         .check(&json!({ "name": format!("{long}{long}") }))
         .expect_err("a name over its limit");
 
     assert!(
-        orcid.starts_with("the value breaks `pattern`; it takes "),
-        "{orcid}"
+        refusal.starts_with("`/name` breaks `maxLength`; it takes "),
+        "{refusal}"
     );
-    assert!(
-        skill.starts_with("`/name` breaks `maxLength`; it takes "),
-        "{skill}"
+    assert!(!refusal.contains("7777"), "{refusal}");
+}
+
+#[test]
+fn a_link_checks_its_fields() {
+    let catalog = catalog();
+    let works_on = catalog.link("works_on").expect("works_on");
+
+    assert_eq!(works_on.check(&json!({})), Ok(()));
+    assert_eq!(
+        works_on.check(&json!({ "role": "lead", "since": "2026-01-05" })),
+        Ok(())
     );
-    for refusal in [orcid, skill] {
-        assert!(!refusal.contains("7777"), "{refusal}");
-    }
+    assert!(works_on.check(&json!({ "colour": "red" })).is_err());
 }

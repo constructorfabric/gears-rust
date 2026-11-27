@@ -1,3 +1,4 @@
+use construct_sdk::linked_schema::{LEARNED, LEARNED_MAX, OWNER, SchemaPrefix};
 use graph_storage_sdk::models::{NodeSpec, NodeView};
 use serde_json::{Map, Number, Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -6,7 +7,7 @@ use time::{OffsetDateTime, UtcOffset};
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use crate::domain::profile::{Category, Fact};
-use crate::domain::profile_read::{OriginKind, StoredFact};
+use crate::domain::profile_read::{LearnedFrom, OriginKind, StoredFact};
 
 /// What each source puts in a fact's origin: who produced it, how, and the
 /// model when an agent did.
@@ -17,7 +18,7 @@ const METHOD_ADMIN: &str = "admin.edit";
 /// The members of a fact's payload besides its one fact property.
 const ORIGIN: &str = "origin";
 const RECORD: &str = "record";
-const ENVELOPE: [&str; 2] = [ORIGIN, RECORD];
+const ENVELOPE: [&str; 4] = [ORIGIN, RECORD, OWNER, LEARNED];
 
 /// The category whose plain name the plan's step carries.
 fn category(entity_kind: &str) -> Result<Category, DomainError> {
@@ -101,11 +102,69 @@ fn single(properties: &[Property]) -> Result<&Property, DomainError> {
     }
 }
 
+/// A message as a node remembers it: at most the 500 characters its schema takes.
+fn clipped(message: &str) -> String {
+    message.chars().take(500).collect()
+}
+
+/// Where a plan's origin says a write was learned: the tool, and the message or record when there is one.
+fn learned_from(plan: &Plan) -> LearnedFrom {
+    match &plan.origin {
+        Origin::Connector {
+            connector,
+            provenance,
+            ..
+        } => LearnedFrom {
+            tool: connector.clone(),
+            message: Some(clipped(provenance)),
+        },
+        Origin::Agent { .. } => LearnedFrom {
+            tool: METHOD_MCP.to_owned(),
+            message: None,
+        },
+        Origin::Reviewer { .. } => LearnedFrom {
+            tool: METHOD_REVIEW.to_owned(),
+            message: None,
+        },
+        Origin::Administrator { .. } => LearnedFrom {
+            tool: METHOD_ADMIN.to_owned(),
+            message: None,
+        },
+        Origin::Subject { .. } | Origin::Retention => LearnedFrom {
+            tool: "construct".to_owned(),
+            message: None,
+        },
+    }
+}
+
+/// The places a node was learned from, as its payload lists them.
+pub(super) fn learned_of(payload: &Map<String, Value>) -> Vec<LearnedFrom> {
+    payload
+        .get(LEARNED)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(LearnedFrom {
+                        tool: item.get("tool")?.as_str()?.to_owned(),
+                        message: item
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The node of the fact a step stores, none for a removal. The node is its
-/// category's person type, with a payload of the one property, its origin
-/// and, for a record's fact, the record. It claims its new key with
-/// `expected_version = Some(0)`, so a key in use is a conflict, never an
-/// overwrite.
+/// category's type for the person, with a payload of the one property, its
+/// origin, where it was learned and, for a record's fact, the record. It
+/// claims its new key with `expected_version = Some(0)`, so a key in use is a
+/// conflict, never an overwrite. A node replaced in place keeps its key and
+/// the places it was learned from, and adds this write's.
 ///
 /// # Errors
 ///
@@ -117,20 +176,32 @@ pub fn fact_node(
     plan: &Plan,
     step: &Step,
     now: OffsetDateTime,
+    prefix: &SchemaPrefix,
+    stored: Option<&NodeView>,
 ) -> Result<Option<NodeSpec>, DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-fact
-    let (key, properties): (&NodeKey, &[Property]) = match &step.change {
-        Change::AddEntity { key, properties }
-        | Change::ReplaceEntity {
-            key, properties, ..
-        } => (key, properties),
-        Change::RemoveEntity { .. } => return Ok(None),
-        // One node holds one fact, so a property is never changed on its own:
-        // the planner replaces the fact's node.
-        Change::AddProperty { .. } => return Err(property_change("add-property")),
-        Change::ReplaceProperty { .. } => return Err(property_change("replace-property")),
-        Change::RemoveProperty { .. } => return Err(property_change("remove-property")),
-    };
+    let (key, owner, properties, in_place): (&NodeKey, Option<&NodeKey>, &[Property], bool) =
+        match &step.change {
+            Change::AddEntity {
+                key,
+                owner,
+                properties,
+            } => (key, owner.as_ref(), properties, false),
+            Change::ReplaceEntity {
+                old,
+                key,
+                owner,
+                properties,
+            } => (key, owner.as_ref(), properties, old == key),
+            Change::RemoveEntity { .. } | Change::AddLink { .. } | Change::RemoveLink { .. } => {
+                return Ok(None);
+            }
+            // One node holds one fact, so a property is never changed on its own:
+            // the planner replaces the fact's node.
+            Change::AddProperty { .. } => return Err(property_change("add-property")),
+            Change::ReplaceProperty { .. } => return Err(property_change("replace-property")),
+            Change::RemoveProperty { .. } => return Err(property_change("remove-property")),
+        };
     let property = single(properties)?;
     // The envelope would overwrite it, and the node would hold no fact.
     if ENVELOPE.contains(&property.name.as_str()) {
@@ -142,6 +213,48 @@ pub fn fact_node(
     let mut payload = Map::new();
     payload.insert(property.name.clone(), property.value.clone());
     payload.insert(ORIGIN.to_owned(), origin(plan, step, now)?);
+    if let Some(owner) = owner {
+        payload.insert(OWNER.to_owned(), json!(owner.0));
+    }
+    let mut learned = in_place
+        .then(|| stored.and_then(|node| node.payload.as_ref()?.as_object().map(learned_of)))
+        .flatten()
+        .unwrap_or_default();
+    learned.push(learned_from(plan));
+    let skip = learned.len().saturating_sub(LEARNED_MAX);
+    payload.insert(
+        LEARNED.to_owned(),
+        Value::Array(
+            learned
+                .iter()
+                .skip(skip)
+                .map(|place| {
+                    let mut item = Map::new();
+                    item.insert("tool".to_owned(), json!(place.tool));
+                    if let Some(message) = &place.message {
+                        item.insert("message".to_owned(), json!(message));
+                    }
+                    Value::Object(item)
+                })
+                .collect(),
+        ),
+    );
+    if let Some(record) = record_of(plan) {
+        payload.insert(RECORD.to_owned(), record);
+    }
+    Ok(Some(NodeSpec {
+        node_key: key.0.clone(),
+        type_id: category(&step.entity_kind)?.type_id(prefix),
+        name: None,
+        payload: Some(Value::Object(payload)),
+        expected_version: if in_place { None } else { Some(0) },
+    }))
+    // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-fact
+}
+
+/// The record a plan came from, as a node or link payload holds it.
+#[must_use]
+pub fn record_of(plan: &Plan) -> Option<Value> {
     if let Origin::Connector {
         connector,
         provenance,
@@ -149,19 +262,32 @@ pub fn fact_node(
         ..
     } = &plan.origin
     {
-        payload.insert(
-            RECORD.to_owned(),
+        return Some(
             json!({ "connector": connector, "provenance": provenance, "version": version }),
         );
     }
-    Ok(Some(NodeSpec {
-        node_key: key.0.clone(),
-        type_id: category(&step.entity_kind)?.type_id().to_owned(),
-        name: None,
-        payload: Some(Value::Object(payload)),
-        expected_version: Some(0),
-    }))
-    // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-fact
+    None
+}
+
+/// The payload of the edge a link step stores: its fields, its origin and the record.
+///
+/// # Errors
+///
+/// When the step's time has no RFC 3339 form, or the step has no fields.
+pub fn link_payload(plan: &Plan, step: &Step, now: OffsetDateTime) -> Result<Value, DomainError> {
+    let fields = step
+        .change
+        .properties()
+        .first()
+        .map(|property| property.value.clone())
+        .ok_or_else(|| DomainError::internal("a link step holds no fields"))?;
+    let mut payload = Map::new();
+    payload.insert(construct_sdk::linked_schema::FIELDS.to_owned(), fields);
+    payload.insert(ORIGIN.to_owned(), origin(plan, step, now)?);
+    if let Some(record) = record_of(plan) {
+        payload.insert(RECORD.to_owned(), record);
+    }
+    Ok(Value::Object(payload))
 }
 
 fn property_change(kind: &str) -> DomainError {
@@ -181,7 +307,7 @@ fn property_change(kind: &str) -> DomainError {
 pub fn fact_of(node: &NodeView) -> Result<Fact, DomainError> {
     let defect = |what: &str| DomainError::internal(format!("fact {} {what}", node.node_key));
     let category =
-        Category::from_type_id(&node.type_id).ok_or_else(|| defect("is of no person type"))?;
+        Category::from_type_id(&node.type_id).ok_or_else(|| defect("is of no node kind"))?;
     let payload = node
         .payload
         .as_ref()
@@ -198,6 +324,10 @@ pub fn fact_of(node: &NodeView) -> Result<Fact, DomainError> {
         category,
         property: property.clone(),
         value: value.clone(),
+        owner: payload
+            .get(OWNER)
+            .and_then(Value::as_str)
+            .map(|owner| NodeKey(owner.to_owned())),
     })
 }
 
@@ -234,6 +364,7 @@ pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
         category,
         property,
         value,
+        owner,
     } = fact_of(node)?;
     let payload = node
         .payload
@@ -255,6 +386,8 @@ pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
         category,
         property,
         value,
+        owner,
+        learned: learned_of(payload),
         origin,
         stored_at: node.envelope.created_at,
         produced_at,

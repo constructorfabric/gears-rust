@@ -49,8 +49,13 @@ impl Fixture {
     /// and a writer that conflicts `conflicts` times.
     fn new(conflicts: u32) -> Self {
         let profile = MemoryProfile::with(vec![
-            stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
-            stored_fact(Category::Role, "roles", json!({ "title": "Engineer" }), 20),
+            stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+            stored_fact(
+                Category::PRODUCT,
+                "roles",
+                json!({ "title": "Engineer" }),
+                20,
+            ),
         ]);
         let writer = MemoryWriter::new(Arc::clone(&profile), conflicts);
         Self {
@@ -178,7 +183,7 @@ async fn the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_
         .iter()
         .map(|item| item.fact.category)
         .collect();
-    assert_eq!(categories, [Category::Role, Category::Skill]);
+    assert_eq!(categories, [Category::PRODUCT, Category::PROJECT]);
     assert_eq!(view.version, Some(1));
     assert_eq!(
         fixture.reads(),
@@ -191,7 +196,7 @@ async fn the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
             caller: fixture.subject,
-            categories: BTreeSet::from([Category::Skill, Category::Role]),
+            categories: BTreeSet::from([Category::PROJECT, Category::PRODUCT]),
         }]
     );
 }
@@ -205,7 +210,7 @@ async fn a_view_is_recorded_with_the_categories_served_and_not_at_all_for_a_bad_
         .view(
             &fixture.owner(),
             fixture.subject,
-            &filter("entity_kind eq 'skill'"),
+            &filter("entity_kind eq 'project'"),
         )
         .await
         .unwrap();
@@ -224,7 +229,7 @@ async fn a_view_is_recorded_with_the_categories_served_and_not_at_all_for_a_bad_
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
             caller: fixture.subject,
-            categories: BTreeSet::from([Category::Skill]),
+            categories: BTreeSet::from([Category::PROJECT]),
         }],
         "only the served page is recorded, with only what it served"
     );
@@ -235,7 +240,7 @@ async fn another_subject_is_refused_before_the_policy_service_is_asked_or_anythi
     let fixture = Fixture::new(0);
     let resolver = Arc::new(RecordingResolver::default());
     let service = fixture.service(Arc::clone(&resolver) as _);
-    let fact_id = fixture.fact_id(Category::Skill);
+    let fact_id = fixture.fact_id(Category::PROJECT);
     let colleague = context_of(Uuid::new_v4(), fixture.tenant);
 
     let view = service
@@ -294,7 +299,7 @@ async fn each_operation_asks_for_its_own_action_on_the_subject_facts() {
     let fixture = Fixture::new(0);
     let resolver = Arc::new(RecordingResolver::default());
     let service = fixture.service(Arc::clone(&resolver) as _);
-    let fact_id = fixture.fact_id(Category::Skill);
+    let fact_id = fixture.fact_id(Category::PROJECT);
 
     service
         .view(&fixture.owner(), fixture.subject, &ODataQuery::new())
@@ -357,7 +362,7 @@ async fn one_fact_is_served_and_a_fact_the_subject_does_not_have_is_no_such_fact
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
             caller: fixture.subject,
-            categories: BTreeSet::from([Category::Skill]),
+            categories: BTreeSet::from([Category::PROJECT]),
         }],
         "only the read that served a fact is an event"
     );
@@ -367,7 +372,7 @@ async fn one_fact_is_served_and_a_fact_the_subject_does_not_have_is_no_such_fact
 async fn a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_fact_is_gone() {
     let fixture = Fixture::new(0);
     let service = fixture.service(Arc::new(AllowResolver));
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
 
     service
         .delete(&fixture.owner(), fixture.subject, &skill)
@@ -391,7 +396,7 @@ async fn a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_
     );
     assert_eq!(plan.profile_version, Some(1));
     assert_eq!(plan.steps.len(), 1);
-    assert_eq!(plan.steps[0].entity_kind, "skill");
+    assert_eq!(plan.steps[0].entity_kind, "project");
     assert_eq!(
         plan.steps[0].change,
         Change::RemoveEntity {
@@ -416,7 +421,7 @@ async fn a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_
             subject_id: fixture.subject,
             caller: fixture.subject,
             fact_id: skill,
-            category: Category::Skill,
+            category: Category::PROJECT,
         }
     );
 }
@@ -430,7 +435,7 @@ async fn a_delete_reads_and_writes_again_on_a_conflict() {
         .delete(
             &fixture.owner(),
             fixture.subject,
-            &fixture.fact_id(Category::Skill),
+            &fixture.fact_id(Category::PROJECT),
         )
         .await
         .unwrap();
@@ -459,7 +464,7 @@ async fn a_delete_gives_up_as_unavailable_once_the_reruns_are_spent() {
         .delete(
             &fixture.owner(),
             fixture.subject,
-            &fixture.fact_id(Category::Skill),
+            &fixture.fact_id(Category::PROJECT),
         )
         .await;
 
@@ -493,7 +498,7 @@ async fn a_delete_gives_up_as_unavailable_once_its_budget_is_spent() {
         .delete(
             &fixture.owner(),
             fixture.subject,
-            &fixture.fact_id(Category::Skill),
+            &fixture.fact_id(Category::PROJECT),
         )
         .await;
 
@@ -521,7 +526,7 @@ async fn a_read_past_the_budget_is_cut_off_and_nothing_is_written() {
         .delete(
             &fixture.owner(),
             fixture.subject,
-            &fixture.fact_id(Category::Skill),
+            &fixture.fact_id(Category::PROJECT),
         )
         .await;
 
@@ -550,7 +555,7 @@ async fn a_policy_service_that_outlasts_the_budget_is_cut_off_and_nothing_is_rea
         .delete(
             &fixture.owner(),
             fixture.subject,
-            &fixture.fact_id(Category::Skill),
+            &fixture.fact_id(Category::PROJECT),
         )
         .await;
 
@@ -583,7 +588,7 @@ async fn a_rerun_whose_read_outlasts_the_budget_writes_nothing_more() {
         .delete(
             &fixture.owner(),
             fixture.subject,
-            &fixture.fact_id(Category::Skill),
+            &fixture.fact_id(Category::PROJECT),
         )
         .await;
 
@@ -601,7 +606,7 @@ async fn a_fact_another_write_removed_before_the_rerun_is_no_such_fact() {
     let mut fixture = Fixture::new(0);
     fixture.writer = MemoryWriter::racing(Arc::clone(&fixture.profile));
     let service = fixture.service(Arc::new(AllowResolver));
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
 
     let deleted = service
         .delete(&fixture.owner(), fixture.subject, &skill)
@@ -691,7 +696,7 @@ async fn the_export_needs_its_permission_not_the_owner_and_holds_the_settings_an
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
             caller: officer.subject_id(),
-            categories: BTreeSet::from([Category::Skill, Category::Role]),
+            categories: BTreeSet::from([Category::PROJECT, Category::PRODUCT]),
         }]
     );
     assert!(
@@ -743,7 +748,7 @@ async fn without_a_processing_identity_every_operation_is_not_configured() {
         Arc::clone(&fixture.events),
         None,
     );
-    let fact_id = fixture.fact_id(Category::Skill);
+    let fact_id = fixture.fact_id(Category::PROJECT);
 
     let view = service
         .view(&fixture.owner(), fixture.subject, &ODataQuery::new())
@@ -770,7 +775,7 @@ async fn a_profile_too_large_to_read_is_the_gears_own_failure_for_the_view_the_e
         .too_large
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let service = fixture.service(Arc::new(AllowResolver));
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
 
     let view = service
         .view(&fixture.owner(), fixture.subject, &ODataQuery::default())
@@ -839,7 +844,7 @@ async fn each_fact_carries_its_latest_review_request_and_the_export_holds_them_a
 #[tokio::test]
 async fn the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted() {
     let fixture = Fixture::new(0);
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
     let stored = fixture.profile.live();
     fixture.reviews.open_on(
         fixture.key(),
@@ -870,7 +875,7 @@ async fn the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted() {
 #[tokio::test]
 async fn a_delete_whose_request_cannot_be_closed_is_unavailable_and_its_repeat_closes_it() {
     let fixture = Fixture::new(0);
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
     let stored = fixture.profile.live();
     fixture.reviews.open_on(
         fixture.key(),
@@ -971,7 +976,7 @@ impl Fixture {
 #[tokio::test(start_paused = true)]
 async fn a_write_that_started_runs_past_the_budget_to_its_end() {
     let fixture = Fixture::new(0);
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
 
     fixture
         .service_over_odd_writer(Duration::from_millis(100), false)
@@ -993,7 +998,7 @@ async fn a_writer_past_its_limit_is_a_delete_to_send_again_with_the_request_open
     use crate::domain::profile_writes::WRITER_LIMIT;
 
     let fixture = Fixture::new(0);
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
     let fact = fixture
         .profile
         .live()
@@ -1020,7 +1025,7 @@ async fn a_writer_past_its_limit_is_a_delete_to_send_again_with_the_request_open
 #[tokio::test]
 async fn a_delete_whose_writer_failed_after_it_landed_is_done() {
     let fixture = Fixture::new(0);
-    let skill = fixture.fact_id(Category::Skill);
+    let skill = fixture.fact_id(Category::PROJECT);
     let fact = fixture
         .profile
         .live()

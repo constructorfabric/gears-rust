@@ -17,6 +17,7 @@ const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
 const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
 const SUBJECT_FACTS_TAG: &str = "Subject facts";
 const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
+const PROFILE_NODE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile/nodes/{fact_id}";
 const SUBJECT_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts";
 const SUBJECT_FACT_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/{fact_id}";
 const SUBJECT_EXPORT_PATH: &str = "/construct/v1/subjects/{subject_id}/export";
@@ -169,6 +170,43 @@ pub fn register_routes(
         )
         .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
+
+    subject = OperationBuilder::get(PROFILE_NODE_PATH)
+        .operation_id("construct.get_profile_node")
+        .summary("Read one node of a subject's profile")
+        .description(
+            "Read one node of the profile, for a caller the platform lets act for the subject: \
+             the node, the nodes it owns, the nodes one link away grouped by link kind with the \
+             fields of each link, and where it was learned from: the tools, with a count each. \
+             Every node in the answer is of a kind the caller may read: a reader without the \
+             permission for a kind sees no node of it, also not as a neighbour. A node the \
+             caller may not read, or the subject does not have, is answered with 404.",
+        )
+        .tag("Profiles")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject whose profile is read")
+        .path_param("fact_id", "The node's id, as the profile read gives it")
+        .query_param_typed(
+            "tenant",
+            false,
+            "Tenant of the subject, when not the caller's own",
+            "string",
+        )
+        .handler(handlers::get_profile_node)
+        .json_response_with_schema::<dto::ProfileNodeDto>(
+            openapi,
+            StatusCode::OK,
+            "The node with what it owns, what it links to and where it was learned",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide the profile read",
+        )
+        .register(subject, openapi);
 
     router
         .merge(not_stored(records))

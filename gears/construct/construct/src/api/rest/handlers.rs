@@ -23,9 +23,9 @@ use crate::domain::review_queue::{Resolution, ReviewText};
 
 use super::dto::{
     AdminFactRequest, FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto,
-    PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest, ResolutionRequest,
-    ReviewRequestDto, ReviewRequestsPageDto, StoredFactDto, SubjectExportDto, SubjectFactDto,
-    SubjectFactsPageDto, SubjectSettingsDto, TenantQuery,
+    ProfileNodeDto, PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest,
+    ResolutionRequest, ReviewRequestDto, ReviewRequestsPageDto, StoredFactDto, SubjectExportDto,
+    SubjectFactDto, SubjectFactsPageDto, SubjectSettingsDto, TenantQuery,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -168,6 +168,31 @@ pub async fn get_profile(
     // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
     Ok(Json(ProfileDto::from(profile)))
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
+}
+
+/// One node of the subject's profile, with what it owns, what it links to and where it was learned.
+pub async fn get_profile_node(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteProfile>>,
+    Path((subject_id, fact_id)): Path<(Uuid, String)>,
+    Query(query): Query<TenantQuery>,
+) -> ApiResult<impl IntoResponse> {
+    let node = fact_key(subject_id, fact_id)?;
+    let tenant = ConcreteProfile::tenant_of(&ctx, query.tenant);
+    let span = tracing::info_span!(
+        "profile_node_read",
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %tenant
+    );
+    let details = async {
+        svc.read_node(&ctx, query.tenant, subject_id, &node)
+            .await
+            .map_err(CanonicalError::from)
+    }
+    .instrument(span)
+    .await?;
+    Ok(Json(ProfileNodeDto::from(details)))
 }
 
 /// The longest fact id the routes take; a graph node key is far shorter.

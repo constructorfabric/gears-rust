@@ -216,14 +216,14 @@ async fn a_plan_a_stage_drops_is_not_written_and_dropped_once() {
 
 #[tokio::test]
 async fn a_fact_candidate_never_removes_or_replaces_a_value() {
-    let remove = ("remove", json!({ "number": 2, "confidence": 0.8 }));
+    let remove = ("remove", json!({ "number": 3, "confidence": 0.8 }));
     let replace = (
         "replace",
-        json!({ "number": 1, "value": "professor", "confidence": 0.8 }),
+        json!({ "number": 1, "value": { "name": "Jane Doe", "profession": "professor" }, "confidence": 0.8 }),
     );
     let add = (
         "add",
-        json!({ "property": "skills", "value": { "name": "Rust" }, "confidence": 0.8 }),
+        json!({ "kind": "project", "value": { "name": "Orion" }, "confidence": 0.8 }),
     );
     let only_taking_away = Chain::new(
         vec![
@@ -257,12 +257,12 @@ async fn a_fact_candidate_never_removes_or_replaces_a_value() {
 /// The skill, fact 2, under an open review request.
 fn skill_under_review(chain: &Chain) {
     let mut skill = crate::test_support::stored_fact(
-        crate::domain::profile::Category::Skill,
-        "skills",
-        json!({ "name": "Python" }),
+        crate::domain::profile::Category::PROJECT,
+        "project",
+        json!({ "name": "Atlas" }),
         1,
     );
-    skill.node_key = node_key(2);
+    skill.node_key = node_key(3);
     chain.reviews.open_on(
         crate::domain::subject_settings::SubjectKey {
             tenant_id: TENANT,
@@ -274,10 +274,10 @@ fn skill_under_review(chain: &Chain) {
 
 #[tokio::test]
 async fn a_step_on_a_fact_under_review_is_dropped_and_the_rest_written() {
-    let remove_skill = ("remove", json!({ "number": 2, "confidence": 0.9 }));
+    let remove_skill = ("remove", json!({ "number": 3, "confidence": 0.9 }));
     let replace_role = (
         "replace",
-        json!({ "number": 1, "value": "professor", "confidence": 0.9 }),
+        json!({ "number": 1, "value": { "name": "Jane Doe", "profession": "professor" }, "confidence": 0.9 }),
     );
     let chain = Chain::new(
         vec![
@@ -309,7 +309,7 @@ async fn a_call_whose_only_step_is_on_a_fact_under_review_stores_nothing() {
     let chain = Chain::new(
         vec![
             Ok(tool_calls(
-                &[("remove", json!({ "number": 2, "confidence": 0.9 }))],
+                &[("remove", json!({ "number": 3, "confidence": 0.9 }))],
                 900,
             )),
             Ok(done(950)),
@@ -363,7 +363,7 @@ async fn a_manage_call_reads_the_facts_under_review_as_construct_not_as_the_agen
     let chain = Chain::new(
         vec![
             Ok(tool_calls(
-                &[("remove", json!({ "number": 2, "confidence": 0.9 }))],
+                &[("remove", json!({ "number": 3, "confidence": 0.9 }))],
                 900,
             )),
             Ok(done(950)),
@@ -387,10 +387,10 @@ async fn a_manage_call_reads_the_facts_under_review_as_construct_not_as_the_agen
 
 #[tokio::test]
 async fn a_manage_call_drops_only_the_steps_on_a_fact_under_review() {
-    let remove_skill = ("remove", json!({ "number": 2, "confidence": 0.9 }));
+    let remove_skill = ("remove", json!({ "number": 3, "confidence": 0.9 }));
     let replace_role = (
         "replace",
-        json!({ "number": 1, "value": "professor", "confidence": 0.9 }),
+        json!({ "number": 1, "value": { "name": "Jane Doe", "profession": "professor" }, "confidence": 0.9 }),
     );
     let chain = Chain::new(
         vec![

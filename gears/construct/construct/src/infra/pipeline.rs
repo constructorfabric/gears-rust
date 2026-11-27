@@ -25,7 +25,7 @@ use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::planner::agent::{Planner, PlannerCaps};
-use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::manage::{ManageBudget, ManageFacts};
 use crate::domain::planner::processing::{
     PlanWriter, Processing, ProcessingContexts, ProcessingPorts,
@@ -325,7 +325,7 @@ pub fn assemble(
     // A correction stores a value, so it runs only where record processing
     // may: with an identity and the opt-in to store values unchecked. A
     // rejection and a delete need neither.
-    let catalog = Arc::new(PropertyCatalog::load().context("the person types' property catalog")?);
+    let catalog = Arc::new(Catalog::load().context("the person types' property catalog")?);
     let stores_unchecked = identity.is_some() && configured.unchecked.present();
     if stores_unchecked {
         warn_unchecked(cfg);

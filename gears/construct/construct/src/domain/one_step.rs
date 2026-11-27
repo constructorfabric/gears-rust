@@ -13,14 +13,14 @@ use toolkit_macros::domain_model;
 use super::admission::{Admission, AdmissionOutcome};
 use super::error::DomainError;
 use super::plan::{Change, NodeKey, Origin, Plan, Property, Step};
-use super::planner::catalog::{PropertyCatalog, PropertySpec};
+use super::planner::catalog::{Catalog, KindSpec};
 use super::planner::processing::Written;
 use super::profile::Category;
 use super::profile_writes::{Attempt, ProfileWrites, SubjectFacts, WriteError};
 use super::record_intake::DropReason;
 use super::sensitive_data::{Checked, SensitiveDataChecks};
 use super::subject_settings::SubjectKey;
-use construct_sdk::person_types::Cardinality;
+use construct_sdk::linked_schema::Owner;
 
 /// Why a value set by hand stored nothing.
 #[domain_model]
@@ -51,7 +51,7 @@ impl NotStored {
 pub struct OneStepPath {
     pub checks: SensitiveDataChecks,
     pub admission: Admission,
-    pub catalog: Arc<PropertyCatalog>,
+    pub catalog: Arc<Catalog>,
 }
 
 /// A fact the one-step path stored: its new key, its category and its
@@ -102,25 +102,28 @@ enum Prepared<E> {
 }
 
 impl OneStepPath {
-    /// The schema of `property`, when a person type has it.
+    /// The schema of the kind `property` names, when the schema has it and its nodes belong to the person.
     ///
     /// # Errors
     ///
-    /// [`DomainError::InvalidValue`] for a property no person type has, or
-    /// a value its schema does not take. The message never repeats the
+    /// [`DomainError::InvalidValue`] for a property that is no kind of the schema, a kind owned by another node (the
+    /// planner adds those, with their owner), or a value its schema does not take. The message never repeats the
     /// caller's property or value.
-    pub(crate) fn check(
-        &self,
-        property: &str,
-        value: &Value,
-    ) -> Result<&PropertySpec, DomainError> {
+    pub(crate) fn check(&self, property: &str, value: &Value) -> Result<&KindSpec, DomainError> {
         let spec = self
             .catalog
-            .get(property)
+            .kind(property)
             .ok_or_else(|| DomainError::InvalidValue {
                 field: "property",
-                rule: "no person type has this property".to_owned(),
+                rule: "the profile schema has no such kind".to_owned(),
             })?;
+        if !matches!(spec.kind().owner, Owner::Root) {
+            return Err(DomainError::InvalidValue {
+                field: "property",
+                rule: "a node of this kind is owned by another node, and only the planner adds it"
+                    .to_owned(),
+            });
+        }
         spec.check(value)
             .map_err(|rule| DomainError::InvalidValue {
                 field: "value",
@@ -155,9 +158,15 @@ impl OneStepPath {
             "add",
             deadline,
             |current, new_key| {
+                let named = value.get(spec.kind().key);
                 let held = current.facts.iter().find(|fact| {
-                    fact.property == property
-                        && (spec.cardinality == Cardinality::One || &fact.value == value)
+                    fact.category == spec.category
+                        && (spec.kind().single
+                            || named.is_some_and(|named| {
+                                fact.value
+                                    .get(spec.kind().key)
+                                    .is_some_and(|held| same_name(held, named))
+                            }))
                 });
                 Ok(match held {
                     Some(held) => Built::Skipped(Held(held.node_key.clone())),
@@ -165,6 +174,7 @@ impl OneStepPath {
                         spec.category,
                         Change::AddEntity {
                             key: new_key.clone(),
+                            owner: None,
                             properties: vec![Property::new(property, value.clone())],
                         },
                     ),
@@ -210,9 +220,9 @@ impl OneStepPath {
         P: Fn(&NodeKey) -> PF,
         PF: Future<Output = Result<(), DomainError>>,
     {
-        let spec = self.catalog.get(property).ok_or_else(|| {
+        let spec = self.catalog.kind(property).ok_or_else(|| {
             DomainError::internal(format!(
-                "stored fact {} has property `{property}`, which no person type has",
+                "stored fact {} has property `{property}`, which is no kind of the schema",
                 fact.0
             ))
         })?;
@@ -227,15 +237,17 @@ impl OneStepPath {
             origin,
             what,
             deadline,
-            |current, new_key| {
+            |current, _new_key| {
                 let Some(old) = current.facts.into_iter().find(|old| &old.node_key == fact) else {
                     return Ok(Built::Skipped(Gone));
                 };
                 Ok(Built::Step(
                     old.category,
                     Change::ReplaceEntity {
-                        old: old.node_key,
-                        key: new_key.clone(),
+                        // In place: the node keeps its links and the nodes it owns.
+                        old: old.node_key.clone(),
+                        key: old.node_key,
+                        owner: old.owner,
                         properties: vec![Property::new(old.property, value.clone())],
                     },
                 ))
@@ -326,10 +338,20 @@ impl OneStepPath {
                         return not_stored(NotStored::Blocked);
                     };
                     // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-admit
+                    let node_key = admitted
+                        .steps
+                        .first()
+                        .and_then(|step| match &step.change {
+                            Change::AddEntity { key, .. } | Change::ReplaceEntity { key, .. } => {
+                                Some(key.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(new_key);
                     Ok(Prepared::Write(
                         Box::new(admitted),
                         NewFact {
-                            node_key: new_key,
+                            node_key,
                             category,
                             property,
                         },
@@ -344,9 +366,9 @@ impl OneStepPath {
                 pend(&fact.node_key).await?;
                 let written = writes
                     .write(construct, &admitted, |now| {
-                        now.facts
-                            .iter()
-                            .any(|stored| stored.node_key == fact.node_key)
+                        now.facts.iter().any(|stored| {
+                            stored.node_key == fact.node_key && stored.value == fact.property.value
+                        })
                     })
                     .await?;
                 Ok(match written {
@@ -356,5 +378,21 @@ impl OneStepPath {
                 // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-write
             })
             .await
+    }
+}
+
+/// Whether two values name the same thing: text compared without case and spacing.
+fn same_name(held: &Value, named: &Value) -> bool {
+    match (held, named) {
+        (Value::String(held), Value::String(named)) => {
+            let comparable = |text: &str| {
+                text.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase()
+            };
+            comparable(held) == comparable(named)
+        }
+        _ => held == named,
     }
 }

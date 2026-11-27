@@ -5,7 +5,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::catalog::PropertyCatalog;
+use super::catalog::Catalog;
 use super::draft::PlanDraft;
 use super::prompt::{UnusableRecord, instructions, message_input, record_input};
 use crate::domain::model_client::{
@@ -44,7 +44,7 @@ pub struct AgentMessage {
 #[domain_model]
 pub struct Planner {
     model: Arc<dyn ModelClient>,
-    catalog: Arc<PropertyCatalog>,
+    catalog: Arc<Catalog>,
     events: Arc<dyn IntakeEvents>,
     caps: PlannerCaps,
     instructions: String,
@@ -103,7 +103,7 @@ impl Planner {
     #[must_use]
     pub fn new(
         model: Arc<dyn ModelClient>,
-        catalog: Arc<PropertyCatalog>,
+        catalog: Arc<Catalog>,
         events: Arc<dyn IntakeEvents>,
         caps: PlannerCaps,
     ) -> Self {
@@ -187,7 +187,8 @@ impl Planner {
         profile: Profile,
     ) -> Result<Plan, Failure> {
         let subject_id = record.envelope.subject_id.ok_or(Failure::NoSubject)?;
-        let draft = PlanDraft::new(&self.catalog, profile);
+        let draft = PlanDraft::new(&self.catalog, profile)
+            .for_message(&record.connector, &record.envelope.provenance);
         let input = record_input(record, &draft.numbered_profile()).map_err(Failure::Unusable)?;
         let mut plan = self.converse(ctx, subject_id, draft, input).await?.finish(
             record.tenant_id,

@@ -1,11 +1,10 @@
 //! The two graph types that tie a subject's facts together: the profile's root
 //! node and the edge from the root to each fact. Both are registered with
-//! graph storage beside the person types. The schemas are embedded from the
+//! graph storage beside the node and link kinds of each person. The schemas are embedded from the
 //! crate's `schemas/`, so the registration and the published files cannot
 //! drift apart.
 
 use crate::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
-use crate::person_types::{PERSON_TYPES, PersonType};
 
 /// One graph type Construct registers with graph storage: its type id and its
 /// JSON schema. A person type, the profile root or the has-fact edge.
@@ -13,15 +12,6 @@ use crate::person_types::{PERSON_TYPES, PersonType};
 pub struct GraphType {
     pub type_id: &'static str,
     pub schema: &'static str,
-}
-
-impl From<PersonType> for GraphType {
-    fn from(person_type: PersonType) -> Self {
-        Self {
-            type_id: person_type.type_id,
-            schema: person_type.schema,
-        }
-    }
 }
 
 /// The profile's root node type. It derives from graph storage's owned node:
@@ -43,13 +33,11 @@ pub const HAS_FACT: GraphType = GraphType {
     ),
 };
 
-/// Every graph type Construct writes, in registration order: the root, the
-/// edge, then the person types.
+/// The graph types every tenant's profiles share, in registration order: the root and the edge. A person's node
+/// and link kinds come after them: [`crate::linked_schema::Schema::graph_types`].
 #[must_use]
 pub fn graph_types() -> Vec<GraphType> {
-    let mut types = vec![PROFILE_ROOT, HAS_FACT];
-    types.extend(PERSON_TYPES.into_iter().map(GraphType::from));
-    types
+    vec![PROFILE_ROOT, HAS_FACT]
 }
 
 #[cfg(test)]

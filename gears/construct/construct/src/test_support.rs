@@ -705,6 +705,7 @@ pub fn add_entity(kind: &str, properties: &[(&str, &str)]) -> Step {
         entity_kind: kind.to_owned(),
         change: Change::AddEntity {
             key: NodeKey(Uuid::new_v4().to_string()),
+            owner: None,
             properties: properties
                 .iter()
                 .map(|(name, value)| Property::new(*name, *value))
@@ -721,6 +722,7 @@ pub fn add_value(kind: &str, name: &str, value: serde_json::Value) -> Step {
         entity_kind: kind.to_owned(),
         change: Change::AddEntity {
             key: NodeKey(Uuid::new_v4().to_string()),
+            owner: None,
             properties: vec![Property::new(name, value)],
         },
         confidence: Some(0.9),
@@ -925,13 +927,23 @@ pub fn processing_context(tenant_id: Uuid) -> (SecurityContext, AccessScope) {
 /// subject of the context it was called with, and the tenant and subject read.
 pub struct FixedFacts {
     facts: Vec<crate::domain::profile_read::StoredFact>,
+    links: Vec<crate::domain::profile_read::StoredLinkFact>,
     pub calls: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
 }
 
 impl FixedFacts {
     pub fn new(facts: Vec<crate::domain::profile_read::StoredFact>) -> Self {
+        Self::with_links(facts, Vec::new())
+    }
+
+    /// Stored facts and the links between them.
+    pub fn with_links(
+        facts: Vec<crate::domain::profile_read::StoredFact>,
+        links: Vec<crate::domain::profile_read::StoredLinkFact>,
+    ) -> Self {
         Self {
             facts,
+            links,
             calls: std::sync::Mutex::default(),
         }
     }
@@ -946,6 +958,14 @@ impl crate::domain::profile_read::StoredProfiles for FixedFacts {
     ) -> Result<Vec<crate::domain::profile_read::StoredFact>, DomainError> {
         self.calls.lock().unwrap().push((ctx.subject_id(), key));
         Ok(self.facts.clone())
+    }
+
+    async fn links(
+        &self,
+        _ctx: &SecurityContext,
+        _key: SubjectKey,
+    ) -> Result<Vec<crate::domain::profile_read::StoredLinkFact>, DomainError> {
+        Ok(self.links.clone())
     }
 }
 
@@ -1245,6 +1265,8 @@ pub fn stored_fact(
         category,
         property: property.to_owned(),
         value,
+        owner: None,
+        learned: Vec::new(),
         origin: crate::domain::profile_read::OriginKind::Connector,
         stored_at: time::OffsetDateTime::from_unix_timestamp(stored_at).unwrap(),
         produced_at: None,
@@ -1372,7 +1394,7 @@ impl MemoryWriter {
     /// Apply the plan's removals, its entity replaces as a correction or an
     /// edit makes them, and its added entities, with the plan's origin. A
     /// subject's plan stores no fact, as the writer refuses one.
-    fn remove(&self, plan: &Plan) {
+    fn remove(&self, plan: &Plan, store: bool) {
         use crate::domain::profile_read::OriginKind;
         let origin = match plan.origin {
             crate::domain::plan::Origin::Administrator { .. } => Some(OriginKind::Administrator),
@@ -1401,6 +1423,7 @@ impl MemoryWriter {
                     old,
                     key,
                     properties,
+                    ..
                 } => {
                     let category = facts.iter().find(|fact| &fact.node_key == old)?.category;
                     let property = properties.first()?;
@@ -1409,18 +1432,24 @@ impl MemoryWriter {
                         category,
                         property: property.name.clone(),
                         value: property.value.clone(),
+                        owner: None,
+                        learned: Vec::new(),
                         origin: origin?,
                         stored_at: time::OffsetDateTime::now_utc(),
                         produced_at: None,
                     })
                 }
-                Change::AddEntity { key, properties } => {
+                Change::AddEntity {
+                    key, properties, ..
+                } => {
                     let property = properties.first()?;
                     Some(crate::domain::profile_read::StoredFact {
                         node_key: key.clone(),
                         category: crate::domain::profile::Category::from_name(&step.entity_kind)?,
                         property: property.name.clone(),
                         value: property.value.clone(),
+                        owner: None,
+                        learned: Vec::new(),
                         origin: origin?,
                         stored_at: time::OffsetDateTime::now_utc(),
                         produced_at: None,
@@ -1430,7 +1459,9 @@ impl MemoryWriter {
             })
             .collect();
         facts.retain(|fact| !removed.contains(&&fact.node_key));
-        facts.extend(replaced);
+        if store {
+            facts.extend(replaced);
+        }
     }
 
     pub fn plans(&self) -> Vec<Plan> {
@@ -1465,11 +1496,11 @@ impl crate::domain::planner::processing::PlanWriter for MemoryWriter {
         if *conflicts > 0 {
             *conflicts -= 1;
             if self.racing {
-                self.remove(plan);
+                self.remove(plan, false);
             }
             return Ok(Written::Conflict);
         }
-        self.remove(plan);
+        self.remove(plan, true);
         Ok(Written::Stored)
     }
 }

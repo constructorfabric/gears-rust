@@ -17,7 +17,14 @@ const MAX_PAGES: usize = 50;
 fn skills_at(seconds: &[i64]) -> Vec<StoredFact> {
     seconds
         .iter()
-        .map(|second| stored_fact(Category::Skill, "skills", json!({ "at": second }), *second))
+        .map(|second| {
+            stored_fact(
+                Category::PROJECT,
+                "project",
+                json!({ "at": second }),
+                *second,
+            )
+        })
         .collect()
 }
 
@@ -151,7 +158,7 @@ fn ties_are_broken_by_the_fact_id() {
 #[test]
 fn a_filter_keeps_the_facts_it_matches() {
     let mut facts = skills(3);
-    facts.push(stored_fact(Category::Role, "roles", json!({}), 4));
+    facts.push(stored_fact(Category::PRODUCT, "roles", json!({}), 4));
     let keep = |raw: &str| {
         seconds(
             &page(facts.clone(), &filtered(raw), &SUBJECT_FACTS_LISTING)
@@ -160,12 +167,12 @@ fn a_filter_keeps_the_facts_it_matches() {
         )
     };
 
-    assert_eq!(keep("entity_kind eq 'role'"), [4]);
+    assert_eq!(keep("entity_kind eq 'product'"), [4]);
     assert_eq!(
         keep("stored_at gt 1970-01-01T00:00:02Z and origin eq 'connector'"),
         [4, 3]
     );
-    assert_eq!(keep("not (entity_kind in ('skill', 'preference'))"), [4]);
+    assert_eq!(keep("not (entity_kind in ('project', 'team'))"), [4]);
     assert_eq!(
         keep("stored_at lt 2300-01-01T00:00:00Z"),
         [4, 3, 2, 1],
@@ -218,7 +225,7 @@ fn a_select_is_refused_rather_than_dropped() {
 fn a_cursor_continued_under_another_filter_is_refused() {
     let first = page(
         skills(4),
-        &filtered("entity_kind eq 'skill'").with_limit(1),
+        &filtered("entity_kind eq 'project'").with_limit(1),
         &SUBJECT_FACTS_LISTING,
     )
     .unwrap();

@@ -56,9 +56,9 @@ the reference evaluation set that scores the planner.
 ### 1.2 Purpose
 
 Construct keeps one consistent profile per subject and avoids contradicting facts (`cpt-cf-construct-fr-fact-decisions`).
-The model works on numbered values and plain property names, never on IDs
+The model works on numbered lines and plain kind names, never on IDs
 (`cpt-cf-construct-principle-model-never-sees-ids`). The tools refuse a call that breaks a rule and tell the model
-why, so the plan holds only steps that fit the person types.
+why, so the plan holds only steps that fit the profile schema.
 
 **Out of scope**: skipping a fact under an open review request (Review Queue); the graph storage implementations of the
 profile read and the write (Profile Writer); the context processing runs under for a tenant; wiring the queue into the
@@ -104,7 +104,9 @@ deployment configuration.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-numbered-profile`
 
-1. [ ] - `p1` - Each fact is one line: `n. property (category): value`, numbered from 1 in the order of the read -
+1. [ ] - `p1` - Each node is one line: `n. kind: {fields}`, or `n. kind (owned by m): {fields}` for an entry owned by
+   node `m`; each link is one line after the nodes: `n. link kind from a to b: {fields}`. Lines are numbered from 1 in
+   the order of the read, nodes first. A node this plan adds takes the next number when the tool answers -
    `inst-number-lines`
 2. [ ] - `p1` - Every value is shown as compact JSON, a text value as a JSON string, so a line break in a value cannot
    start a line that looks like another value - `inst-number-values`
@@ -114,22 +116,27 @@ deployment configuration.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-tools`
 
-1. [ ] - `p1` - Three tools: `add(property, value, confidence)`, `replace(number, value, confidence)` and
-   `remove(number, confidence)`. They only add steps to the plan in memory - `inst-tools-set`
-2. [ ] - `p1` - `add` offers every property of the person types by name. The property decides the category -
-   `inst-tools-properties`
+1. [ ] - `p1` - Four tools: `add(kind, value, owner, confidence)`, `link(kind, from, to, fields, confidence)`,
+   `replace(number, value, confidence)` and `remove(number, confidence)`. They only add steps to the plan in memory -
+   `inst-tools-set`
+2. [ ] - `p1` - `add` offers every node kind of the schema by name, `link` every link kind. The kind decides the
+   category. A kind owned by a node needs `owner`, the number of a node of a kind that may own it, and a kind the root
+   owns takes none - `inst-tools-properties`
 3. [ ] - `p1` - A value is checked against its property's schema in the person type. A refusal names the broken rule
    and where it is broken, and the schema the property takes. It does not repeat the value. A refusal repeats at most
    80 characters of a tool or property name or of a parse error - `inst-tools-value`
 4. [ ] - `p1` - A number must name a value of the profile, and only one step may use it - `inst-tools-number`
-5. [ ] - `p1` - A property that holds one value takes no second one: an `add` is refused while the profile holds an
-   untouched value of it, with "use replace n", or while the plan already adds or replaces one. After a `remove` of
-   the old value, an `add` is allowed - `inst-tools-cardinality`
-6. [ ] - `p1` - A value already held is refused: an `add` or a `replace` to a value another fact of the profile holds
-   under the same property, or that the plan already writes there, and a `replace` with exactly the value the fact
-   already has. Text, also each text field of an entry, is compared without case and spacing, so a `replace` that only
-   fixes case or spacing is taken - `inst-tools-duplicate`
-7. [ ] - `p1` - `replace` takes the complete new value: fields left out of an object are gone - `inst-tools-replace`
+5. [ ] - `p1` - The profile holds one `me`: a second is refused with the number of the one held, to replace -
+   `inst-tools-cardinality`
+6. [ ] - `p1` - A node already held is refused with its number: an `add` or a `replace` to a name (the kind's key
+   property: `name`, `text`, `label` or `id`) another node of the same kind and owner holds, or that the plan already
+   adds, and a `replace` with exactly the value the node already has. Text is compared without case and spacing. The
+   model links to the number it is given. A node the person forgot from the message being planned is refused too -
+   `inst-tools-duplicate`
+7. [ ] - `p1` - `replace` takes the complete new value: fields left out of an object are gone. The node keeps its key,
+   its links and what it owns. `remove` of a node takes the nodes it owns with it, and its links go with them; `remove`
+   of a link number removes the link. A link is refused for a link kind the two kinds do not fit, for a node a step
+   removes, and for a link the profile or the plan already holds - `inst-tools-replace`
 8. [ ] - `p1` - Confidence is a number from 0 to 1 - `inst-tools-confidence`
 9. [ ] - `p1` - A refused call adds no step; the model gets the refusal's text as the tool result - `inst-tools-refusal`
 
@@ -138,11 +145,12 @@ deployment configuration.
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-build`
 
 1. [ ] - `p1` - Each number maps back to its node key - `inst-build-keys`
-2. [ ] - `p1` - Each new value gets a new node key, `construct:{tenant id}:{random UUID}`, also a value that returns
-   after a delete, because a soft-deleted key cannot be reused - `inst-build-new-keys`
-3. [ ] - `p1` - Each value is one entity of its category with one property, and the step's entity kind is the
-   category's plain name. An add is a new entity, a remove removes the entity, and a replace is one step with a new
-   entity in place of the old one, so the old value goes in the same write - `inst-build-replace`
+2. [ ] - `p1` - Each added node gets a new node key, `construct:{tenant id}:{random UUID}`, also a node that returns
+   after a delete, because a soft-deleted key cannot be reused. A replaced node keeps its key - `inst-build-new-keys`
+3. [ ] - `p1` - Each node is one entity of its category with one property, and the step's entity kind is the
+   category's plain name. An add is a new entity with its owner, a remove removes the entity, and a replace is one
+   step that changes the entity where it stands. A link is a step of its link kind between two keys, one of which may be
+   a node this plan adds - `inst-build-replace`
 4. [ ] - `p1` - A value is stored as JSON, as the node stores it: a text value as a JSON string, an object of fields as that object - `inst-build-values`
 5. [ ] - `p1` - The plan holds the tenant and the subject, the profile version it was built on, none for a subject
    without a profile yet, and its origin - `inst-build-origin`
@@ -314,7 +322,7 @@ The system **MUST** show the profile as numbered values of plain properties, and
 **Touches**:
 - Code: `domain::planner::draft::PlanDraft`
 
-**Verified by**: `the_profile_is_shown_as_numbered_values_of_plain_properties_in_json`,
+**Verified by**: `the_profile_is_shown_as_numbered_nodes_and_links`,
 `a_line_break_in_a_value_cannot_forge_a_profile_line` and `the_model_input_holds_no_id`.
 
 ### Plan Tools
@@ -328,7 +336,7 @@ adding a step.
 - `cpt-cf-construct-algo-planner-tools`
 
 **Touches**:
-- Code: `domain::planner::draft::PlanDraft::apply`, `domain::planner::tools`, `domain::planner::catalog::PropertyCatalog`
+- Code: `domain::planner::draft::PlanDraft::apply`, `domain::planner::tools`, `domain::planner::catalog::Catalog`
 
 **Verified by**: one test per refusal in `domain::planner::draft_test`, each checking that the draft did not change,
 and the catalog tests.
@@ -346,9 +354,9 @@ and profile version.
 **Touches**:
 - Code: `domain::planner::build`, `domain::plan`
 
-**Verified by**: `a_replace_is_one_entity_in_place_of_the_old_one`,
-`an_add_and_a_remove_keep_their_confidence_in_a_plan_on_the_profile_version` and
-`every_new_value_gets_its_own_new_key_also_when_it_returns`.
+**Verified by**: `a_replace_changes_the_node_where_it_stands`,
+`an_added_node_gets_a_new_key_and_the_number_after_the_profile` and
+`an_entry_can_be_owned_by_a_node_this_plan_adds`.
 
 ### Agent Loop
 
@@ -378,7 +386,7 @@ record input with the payload, its schema and the numbered profile, without an I
 **Touches**:
 - Code: `domain::planner::prompt`, `domain/planner/instructions.md`
 
-**Verified by**: `the_instructions_list_every_property_with_its_cardinality_and_form`,
+**Verified by**: `the_instructions_list_every_kind_and_link_kind_with_its_owner_and_form`,
 `each_record_type_reaches_the_model_with_its_payload_and_schema`, `an_empty_profile_is_said_to_be_empty`,
 `a_record_cannot_close_its_block_or_forge_a_profile`, `a_record_the_model_cannot_be_shown_is_refused`,
 `an_id_nested_in_a_list_of_objects_is_not_shown`, `each_example_in_the_instructions_gets_the_answer_it_shows`,
@@ -512,7 +520,7 @@ contradicting pairs against the PRD G2 target.
 **Touches**:
 - Code: `tests/planner_eval.rs`, `tests/eval/`
 
-**Verified by**: `every_case_fits_the_person_types_and_its_record_type`. The score itself comes from
+**Verified by**: `every_case_fits_the_profile_schema_and_its_record_type`. The score itself comes from
 `the_planner_meets_the_decision_target`, run with
 `cargo test -p cf-gears-construct --test planner_eval -- --ignored --nocapture`.
 

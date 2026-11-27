@@ -109,9 +109,8 @@ fn a_root_takes_as_many_removals_and_as_long_a_key_as_its_bounds_allow() {
 }
 
 #[test]
-fn the_root_and_the_edge_register_before_the_person_types() {
+fn the_shared_types_are_the_root_and_the_edge() {
     let types: Vec<&str> = graph_types().iter().map(|t| t.type_id).collect();
 
-    assert_eq!(types[..2], [PROFILE_ROOT.type_id, HAS_FACT.type_id]);
-    assert_eq!(types.len(), 2 + PERSON_TYPES.len());
+    assert_eq!(types, [PROFILE_ROOT.type_id, HAS_FACT.type_id]);
 }

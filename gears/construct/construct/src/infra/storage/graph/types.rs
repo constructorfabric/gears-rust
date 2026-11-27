@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use construct_sdk::linked_schema::SchemaPrefix;
 use construct_sdk::profile_types::graph_types;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
@@ -15,6 +16,7 @@ use toolkit_canonical_errors::CanonicalError;
 
 use super::{CAS_CONFLICT, DEFAULT_CALL_TIMEOUT, bounded, graph_error, unanswered};
 use crate::domain::error::DomainError;
+use crate::domain::profile::profile_schema;
 
 /// Registers Construct's graph types in a tenant before the first write there.
 /// Graph storage keeps types per tenant. Registering the same schemas again
@@ -33,7 +35,7 @@ use crate::domain::error::DomainError;
 pub struct GraphTypes {
     client: Arc<dyn GraphStorageClientV1>,
     timeout: Duration,
-    registered: Mutex<HashSet<Uuid>>,
+    registered: Mutex<HashSet<(Uuid, Uuid)>>,
 }
 
 /// A changed schema of a registered type is admitted when graph storage proves
@@ -74,38 +76,48 @@ impl GraphTypes {
         self
     }
 
-    fn done(&self, tenant_id: Uuid) -> bool {
-        self.registered.lock().contains(&tenant_id)
+    fn done(&self, tenant_id: Uuid, subject_id: Uuid) -> bool {
+        self.registered.lock().contains(&(tenant_id, subject_id))
     }
 
-    /// Make sure the types exist in the context's tenant.
+    /// Make sure the types exist in the context's tenant: the root and the has-fact edge every profile shares, and the
+    /// node and link kinds of the person `subject_id`, whose type ids carry the person's prefix, so two people's
+    /// kinds never collide in the tenant.
     ///
     /// # Errors
     ///
     /// When graph storage refuses or cannot take the registration, or does not
     /// answer in time.
-    pub async fn ensure(&self, ctx: &SecurityContext) -> Result<(), DomainError> {
+    pub async fn ensure(&self, ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-register
         let tenant_id = ctx.subject_tenant_id();
-        if self.done(tenant_id) {
+        if self.done(tenant_id, subject_id) {
             return Ok(());
         }
-        let batch = graph_types()
+        let prefix = SchemaPrefix::of(subject_id);
+        let shared = graph_types().into_iter().map(|graph_type| {
+            serde_json::from_str(graph_type.schema)
+                .map(|schema| TypeRegistration {
+                    type_id: graph_type.type_id.to_owned(),
+                    schema,
+                })
+                .map_err(|err| {
+                    DomainError::internal(format!(
+                        "graph type {} has no valid schema: {err}",
+                        graph_type.type_id
+                    ))
+                })
+        });
+        let own = profile_schema()
+            .graph_types(&prefix)
             .into_iter()
             .map(|graph_type| {
-                serde_json::from_str(graph_type.schema)
-                    .map(|schema| TypeRegistration {
-                        type_id: graph_type.type_id.to_owned(),
-                        schema,
-                    })
-                    .map_err(|err| {
-                        DomainError::internal(format!(
-                            "graph type {} has no valid schema: {err}",
-                            graph_type.type_id
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                Ok(TypeRegistration {
+                    type_id: graph_type.type_id,
+                    schema: graph_type.schema,
+                })
+            });
+        let batch = shared.chain(own).collect::<Result<Vec<_>, DomainError>>()?;
         let first = tokio::time::timeout(
             self.timeout,
             self.client
@@ -132,7 +144,7 @@ impl GraphTypes {
             Ok(Err(err)) => return Err(graph_error("type registration", &err)),
             Err(_) => return Err(unanswered("type registration", self.timeout)),
         }
-        self.registered.lock().insert(tenant_id);
+        self.registered.lock().insert((tenant_id, subject_id));
         Ok(())
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-register
     }

@@ -250,7 +250,7 @@ Graph storage only soft-deletes in its v1. A soft delete leaves a tombstone: a m
 
 **Core Entities**:
 
-The profile is a tree. The subject node is its root, and the subject's entities hang from it. Each entity has an entity kind, such as a person's identity, roles, skills or preferences, and carries properties. Each kind of subject has its own entity kinds. An entity linked to the subject is what the PRD calls a fact, and its entity kind is the PRD's category. This document says "entity" for the graph and "fact" where it follows the PRD.
+The profile is a graph. The subject node is its root, and the subject's entities hang from it. Each entity has an entity kind, such as a project, a person or a commitment, and carries properties. An entry such as a commitment is owned by the entity it hangs on, and entities are linked to each other by links of their own kinds (`works_on`, `owner`). The kinds and links are the profile schema, which has a default for a person. An entity linked to the subject is what the PRD calls a fact, and its entity kind is the PRD's category. This document says "entity" for the graph and "fact" where it follows the PRD.
 
 The PRD's "guardrails" are the sensitive-data checks. This document never says a bare "kind". An "entity kind" is the PRD's category. A "sensitive-data kind" is the PRD's special category.
 

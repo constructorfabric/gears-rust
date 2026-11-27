@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
+use construct_sdk::linked_schema::{FIELDS, SchemaPrefix};
 use graph_storage_sdk::GraphStorageClientV1;
+use graph_storage_sdk::gts::STATIC_EDGE_TYPE;
 use graph_storage_sdk::models::{NodeView, TraverseRequest, TruncationReason};
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
@@ -18,8 +20,8 @@ use crate::domain::deletion::{ProfileGenerations, RetentionPeriods, period_start
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
-use crate::domain::profile::{FactCount, FullProfile, Profile};
-use crate::domain::profile_read::{StoredFact, StoredProfiles};
+use crate::domain::profile::{FactCount, FullProfile, Link, Profile, profile_schema};
+use crate::domain::profile_read::{LearnedFrom, StoredFact, StoredLinkFact, StoredProfiles};
 use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::subject_settings::SubjectKey;
 
@@ -48,6 +50,15 @@ pub(crate) struct Stored {
     pub version: Option<u64>,
     pub root: Root,
     pub facts: Vec<NodeView>,
+    /// The links between the facts, with the key of the edge that holds each.
+    pub links: Vec<StoredLink>,
+}
+
+/// A link as graph storage holds it: its kind, ends and fields, and the key of its edge.
+pub(crate) struct StoredLink {
+    pub link: Link,
+    pub edge_key: String,
+    pub payload: Option<serde_json::Value>,
 }
 
 /// A failed profile read. Out of range is graph storage refusing the read's
@@ -105,14 +116,15 @@ pub(crate) async fn read_generation(
     let NodeKey(key) = generation_root(subject, generation);
     let request = TraverseRequest {
         seeds: vec![key.clone()],
-        depth: 1,
-        edge_type_patterns: vec![HAS_FACT_TYPE.to_owned()],
+        depth: 2,
+        // The facts are one has-fact edge from the root, and the links between them one more hop.
+        edge_type_patterns: vec![STATIC_EDGE_TYPE.to_owned()],
         node_type_patterns: Vec::new(),
         max_nodes: Some(MAX_PROFILE_NODES),
         // Both directions and every relation, as before these existed.
         direction: None,
         edge_discriminators: Vec::new(),
-        include_edge_payload: false,
+        include_edge_payload: true,
     };
     // Without a snapshot, the root and the facts may come from different
     // graph states: a fresh version with stale facts would pass the write's
@@ -148,6 +160,7 @@ pub(crate) async fn read_generation(
             version: None,
             root: Root::default(),
             facts: Vec::new(),
+            links: Vec::new(),
         });
     };
     // A cut profile would let the planner add what is already stored. Only a
@@ -195,10 +208,35 @@ pub(crate) async fn read_generation(
         .filter(|edge| edge.src == key && edge.edge_type_id == HAS_FACT_TYPE)
         .map(|edge| edge.dst.as_str())
         .collect();
+    let prefix = SchemaPrefix::of(subject.subject_id);
+    let links = response
+        .edges
+        .iter()
+        .filter(|edge| pointed.contains(edge.src.as_str()) && pointed.contains(edge.dst.as_str()))
+        .filter_map(|edge| {
+            let kind = profile_schema().link_of_type_id(&prefix, &edge.edge_type_id)?;
+            Some(StoredLink {
+                link: Link {
+                    kind: kind.name.to_owned(),
+                    from: NodeKey(edge.src.clone()),
+                    to: NodeKey(edge.dst.clone()),
+                    fields: edge
+                        .payload
+                        .as_ref()
+                        .and_then(|payload| payload.get(FIELDS))
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                },
+                edge_key: edge.edge_key.clone(),
+                payload: edge.payload.clone(),
+            })
+        })
+        .collect();
     let facts = response
         .nodes
-        .into_iter()
+        .iter()
         .filter(|node| pointed.contains(node.node_key.as_str()))
+        .cloned()
         .collect();
     Ok(Stored {
         key: NodeKey(key),
@@ -206,6 +244,7 @@ pub(crate) async fn read_generation(
         version: Some(version),
         root,
         facts,
+        links,
     })
 }
 
@@ -303,18 +342,84 @@ impl ProfileSource for GraphProfileSource {
             .filter(|node| !listed.contains(node.node_key.as_str()))
             .filter(|node| kept_since.is_none_or(|since| node.envelope.created_at >= since))
             .map(fact_of)
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
+        let held: BTreeSet<&NodeKey> = facts.iter().map(|fact| &fact.node_key).collect();
+        let links = stored
+            .links
+            .iter()
+            .map(|stored| stored.link.clone())
+            .filter(|link| held.contains(&link.from) && held.contains(&link.to))
+            .collect();
         Ok(Profile {
             version: stored.version,
             facts,
+            links,
+            marks: stored.root.marks.clone(),
         })
         // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-facts
     }
 }
 
+/// Where a link was learned, from its payload: the connector and the record it names, or else the method.
+fn link_learned(payload: Option<&serde_json::Value>) -> Vec<LearnedFrom> {
+    let Some(payload) = payload else {
+        return Vec::new();
+    };
+    if let Some(record) = payload.get("record") {
+        let text = |field: &str| record.get(field).and_then(serde_json::Value::as_str);
+        if let Some(tool) = text("connector") {
+            return vec![LearnedFrom {
+                tool: tool.to_owned(),
+                message: text("provenance").map(str::to_owned),
+            }];
+        }
+    }
+    payload
+        .get("origin")
+        .and_then(|origin| origin.get("method"))
+        .and_then(serde_json::Value::as_str)
+        .map(|method| {
+            vec![LearnedFrom {
+                tool: method.to_owned(),
+                message: None,
+            }]
+        })
+        .unwrap_or_default()
+}
+
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-stored:p1
 #[async_trait]
 impl StoredProfiles for GraphProfileSource {
+    async fn links(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<Vec<StoredLinkFact>, DomainError> {
+        let subject = subject_in_context(ctx, key)?;
+        let stored = read_stored(
+            self.client.as_ref(),
+            self.version.as_ref(),
+            self.generations.as_ref(),
+            self.timeout,
+            ctx,
+            &subject,
+        )
+        .await?;
+        let listed = &stored.root.removals;
+        Ok(stored
+            .links
+            .iter()
+            .filter(|held| {
+                !listed.contains(held.link.from.0.as_str())
+                    && !listed.contains(held.link.to.0.as_str())
+            })
+            .map(|held| StoredLinkFact {
+                link: held.link.clone(),
+                learned: link_learned(held.payload.as_ref()),
+            })
+            .collect())
+    }
+
     #[tracing::instrument(skip_all, fields(tenant_id = %key.tenant_id, subject_id = %key.subject_id))]
     async fn stored(
         &self,

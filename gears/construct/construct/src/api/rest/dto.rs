@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::domain::one_step::NewFact;
 use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::profile::Category;
-use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
+use crate::domain::profile_read::{NodeDetails, OriginKind, ProfileView, StoredFact};
 use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::review_queue::{
     Resolution, ReviewOutcome, ReviewRequest, ReviewStatus, ReviewText,
@@ -217,24 +217,17 @@ pub struct FactOriginDto {
     pub kind: OriginKindDto,
 }
 
-/// A category of a person's profile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A category of a person's profile: a node kind of the profile's schema, by its registered name, such as `project`
+/// or `commitment`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[toolkit_macros::api_dto(response)]
-pub enum ProfileEntityKindDto {
-    Identity,
-    Role,
-    Skill,
-    Preference,
-}
+#[serde(transparent)]
+#[schema(value_type = String)]
+pub struct ProfileEntityKindDto(pub String);
 
 impl From<Category> for ProfileEntityKindDto {
     fn from(category: Category) -> Self {
-        match category {
-            Category::Identity => Self::Identity,
-            Category::Role => Self::Role,
-            Category::Skill => Self::Skill,
-            Category::Preference => Self::Preference,
-        }
+        Self(category.name().to_owned())
     }
 }
 
@@ -245,12 +238,14 @@ impl From<Category> for ProfileEntityKindDto {
 pub struct ProfileFactDto {
     /// The fact's id, the graph node key.
     pub fact_id: String,
-    /// The fact's property, by its plain key, such as `skills`. A category
-    /// has several properties, so this names which one the fact holds.
+    /// The fact's property: the name of its kind, such as `project`.
     pub property: String,
-    /// The property's value: a string, or an object for a property with
-    /// fields, such as `{"name": "Rust"}` for a skill.
+    /// The node's value: the object of its fields, such as
+    /// `{"name": "Atlas", "status": "active"}` for a project.
     pub value: serde_json::Value,
+    /// The id of the node that owns this one, for a node of an entry kind such as a commitment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub origin: FactOriginDto,
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
@@ -287,11 +282,103 @@ impl From<StoredFact> for ProfileFactDto {
             fact_id: fact.node_key.0,
             property: fact.property,
             value: fact.value,
+            owner: fact.owner.map(|owner| owner.0),
             origin: FactOriginDto {
                 kind: fact.origin.into(),
             },
             stored_at: fact.stored_at,
             produced_at: fact.produced_at,
+        }
+    }
+}
+
+/// A node of the profile with its kind.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProfileNodeFactDto {
+    /// The node's kind, by its registered name.
+    pub entity_kind: ProfileEntityKindDto,
+    #[serde(flatten)]
+    pub fact: ProfileFactDto,
+}
+
+impl From<StoredFact> for ProfileNodeFactDto {
+    fn from(fact: StoredFact) -> Self {
+        Self {
+            entity_kind: fact.category.into(),
+            fact: fact.into(),
+        }
+    }
+}
+
+/// A node one link away: which way the link goes, its fields, and the node.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct NeighbourDto {
+    /// `out` when the link starts at the node read, `in` when it ends there.
+    pub direction: String,
+    /// The link's fields, as its link kind defines them.
+    pub fields: serde_json::Value,
+    pub node: ProfileNodeFactDto,
+}
+
+/// The neighbours of a node by one link kind.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct NeighbourGroupDto {
+    /// The link kind, by its registered name, such as `works_on`.
+    pub link: String,
+    pub neighbours: Vec<NeighbourDto>,
+}
+
+/// A tool and how many times it taught the profile what a node holds.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ToolCountDto {
+    pub tool: String,
+    pub count: usize,
+}
+
+/// One node of the profile: the node, the nodes it owns, the nodes one link away grouped by link kind, and where it
+/// was learned from.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ProfileNodeDto {
+    pub node: ProfileNodeFactDto,
+    pub owned: Vec<ProfileNodeFactDto>,
+    pub neighbours: Vec<NeighbourGroupDto>,
+    pub learned_from: Vec<ToolCountDto>,
+}
+
+impl From<NodeDetails> for ProfileNodeDto {
+    fn from(details: NodeDetails) -> Self {
+        Self {
+            node: details.node.into(),
+            owned: details.owned.into_iter().map(Into::into).collect(),
+            neighbours: details
+                .neighbours
+                .into_iter()
+                .map(|group| NeighbourGroupDto {
+                    link: group.link,
+                    neighbours: group
+                        .neighbours
+                        .into_iter()
+                        .map(|neighbour| NeighbourDto {
+                            direction: neighbour.direction.name().to_owned(),
+                            fields: neighbour.fields,
+                            node: neighbour.node.into(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            learned_from: details
+                .learned_from
+                .into_iter()
+                .map(|count| ToolCountDto {
+                    tool: count.tool,
+                    count: count.count,
+                })
+                .collect(),
         }
     }
 }

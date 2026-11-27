@@ -17,10 +17,13 @@ use uuid::Uuid;
 use crate::api::rest::routes::register_routes;
 use crate::domain::plan::NodeKey;
 use crate::domain::profile::Category;
-use crate::domain::profile_read::{CategoryCheck, OriginKind, StoredFact};
+use crate::domain::profile::Link;
+use crate::domain::profile_read::{
+    CategoryCheck, LearnedFrom, OriginKind, StoredFact, StoredLinkFact,
+};
 use crate::test_support::{
-    AllowResolver, DenyResolver, IntakeFixture, RecordingProfileEvents, RecordingResolver,
-    context_of, inmem_db, profile_service, settings_service,
+    AllowResolver, DenyResolver, FixedFacts, IntakeFixture, RecordingProfileEvents,
+    RecordingResolver, context_of, inmem_db, profile_service_over, settings_service,
 };
 
 fn at(text: &str) -> OffsetDateTime {
@@ -30,9 +33,11 @@ fn at(text: &str) -> OffsetDateTime {
 fn rust_skill() -> StoredFact {
     StoredFact {
         node_key: NodeKey("construct:t:fact-1".to_owned()),
-        category: Category::Skill,
-        property: "skills".to_owned(),
-        value: json!({ "name": "Rust", "level": "expert" }),
+        category: Category::PROJECT,
+        property: "project".to_owned(),
+        value: json!({ "name": "Rust" }),
+        owner: None,
+        learned: Vec::new(),
         origin: OriginKind::Agent,
         stored_at: at("2026-10-21T10:00:00Z"),
         produced_at: Some(at("2026-10-21T09:59:00Z")),
@@ -55,13 +60,26 @@ async fn get_as(
     caller: Uuid,
     tenant: Uuid,
 ) -> (StatusCode, Option<String>, Value) {
+    get_linked(resolver, facts, Vec::new(), uri, caller, tenant).await
+}
+
+/// [`get_as`] over facts with the links between them.
+async fn get_linked(
+    resolver: Arc<dyn AuthZResolverApi>,
+    facts: Vec<StoredFact>,
+    links: Vec<StoredLinkFact>,
+    uri: &str,
+    caller: Uuid,
+    tenant: Uuid,
+) -> (StatusCode, Option<String>, Value) {
     let db = inmem_db().await;
     let intake = Arc::new(IntakeFixture::default().build(&db));
     let settings = Arc::new(settings_service(&db, Arc::clone(&resolver), true));
-    let profile = Arc::new(profile_service(
+    let profile = Arc::new(profile_service_over(
         &db,
         resolver,
-        facts,
+        Arc::new(FixedFacts::with_links(facts, links)),
+        Uuid::new_v4(),
         Arc::new(RecordingProfileEvents::default()),
         CategoryCheck::OneCall,
     ));
@@ -108,11 +126,11 @@ async fn a_profile_reads_as_its_categories_with_each_facts_property_origin_and_t
         json!({
             "subject_id": subject.to_string(),
             "categories": [{
-                "entity_kind": "skill",
+                "entity_kind": "project",
                 "facts": [{
                     "fact_id": "construct:t:fact-1",
-                    "property": "skills",
-                    "value": { "name": "Rust", "level": "expert" },
+                    "property": "project",
+                    "value": { "name": "Rust" },
                     "origin": { "kind": "agent" },
                     "stored_at": "2026-10-21T10:00:00Z",
                     "produced_at": "2026-10-21T09:59:00Z",
@@ -247,4 +265,104 @@ async fn a_refused_read_is_logged_with_the_caller_the_subject_and_the_tenant() {
         logs_contain(&format!("tenant_id={named}")),
         "the tenant the read named"
     );
+}
+
+fn node(kind: Category, key: &str, value: Value, owner: Option<&str>) -> StoredFact {
+    StoredFact {
+        node_key: NodeKey(key.to_owned()),
+        category: kind,
+        property: kind.name().to_owned(),
+        value,
+        owner: owner.map(|owner| NodeKey(owner.to_owned())),
+        learned: vec![LearnedFrom {
+            tool: "chat".to_owned(),
+            message: Some("m1".to_owned()),
+        }],
+        origin: OriginKind::Connector,
+        stored_at: at("2026-10-21T10:00:00Z"),
+        produced_at: None,
+    }
+}
+
+#[tokio::test]
+async fn a_node_reads_with_what_it_owns_what_it_links_to_and_where_it_was_learned() {
+    let subject = Uuid::new_v4();
+    let facts = vec![
+        node(
+            Category::PERSON,
+            "construct:t:priya",
+            json!({ "name": "Priya Shah" }),
+            None,
+        ),
+        node(
+            Category::PROJECT,
+            "construct:t:project",
+            json!({ "name": "Atlas" }),
+            None,
+        ),
+        node(
+            Category::COMMITMENT,
+            "construct:t:promise",
+            json!({ "kind": "promise", "text": "send the script" }),
+            Some("construct:t:project"),
+        ),
+    ];
+    let links = vec![StoredLinkFact {
+        link: Link {
+            kind: "works_on".to_owned(),
+            from: NodeKey("construct:t:priya".to_owned()),
+            to: NodeKey("construct:t:project".to_owned()),
+            fields: json!({ "role": "lead" }),
+        },
+        learned: vec![LearnedFrom {
+            tool: "mail".to_owned(),
+            message: None,
+        }],
+    }];
+
+    let (status, cache, body) = get_linked(
+        Arc::new(AllowResolver),
+        facts,
+        links,
+        &format!("/construct/v1/subjects/{subject}/profile/nodes/construct:t:project"),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(cache.as_deref(), Some("no-store"));
+    assert_eq!(body["node"]["entity_kind"], "project");
+    assert_eq!(body["node"]["fact_id"], "construct:t:project");
+    assert_eq!(body["node"]["value"], json!({ "name": "Atlas" }));
+    assert_eq!(body["owned"][0]["entity_kind"], "commitment");
+    assert_eq!(body["owned"][0]["owner"], "construct:t:project");
+    assert_eq!(body["neighbours"][0]["link"], "works_on");
+    let neighbour = &body["neighbours"][0]["neighbours"][0];
+    assert_eq!(neighbour["direction"], "in");
+    assert_eq!(neighbour["fields"], json!({ "role": "lead" }));
+    assert_eq!(neighbour["node"]["entity_kind"], "person");
+    assert_eq!(
+        body["learned_from"],
+        json!([{ "tool": "chat", "count": 1 }, { "tool": "mail", "count": 1 }])
+    );
+}
+
+#[tokio::test]
+async fn a_node_the_subject_does_not_have_or_a_malformed_id_is_404() {
+    let subject = Uuid::new_v4();
+
+    for id in ["construct:t:nothing", "a%20b"] {
+        let (status, _, _) = get_linked(
+            Arc::new(AllowResolver),
+            vec![rust_skill()],
+            Vec::new(),
+            &format!("/construct/v1/subjects/{subject}/profile/nodes/{id}"),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{id}");
+    }
 }

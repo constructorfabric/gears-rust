@@ -66,7 +66,7 @@ fn adds_a_skill() -> Arc<Scripted> {
         answer(ModelOutput::ToolCalls(vec![ToolCall {
             id: "call_0".to_owned(),
             name: "add".to_owned(),
-            arguments: json!({ "property": "skills", "value": { "name": "Rust" }, "confidence": 0.9 }),
+            arguments: json!({ "kind": "project", "value": { "name": "Rust" }, "confidence": 0.9 }),
         }])),
         answer(ModelOutput::Text("The plan is complete.".to_owned())),
     ]))))
@@ -176,11 +176,11 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
     let [skills] = view.categories.as_slice() else {
         panic!("one category, got {view:?}");
     };
-    assert_eq!(skills.category, Category::Skill);
+    assert_eq!(skills.category, Category::PROJECT);
     let [fact] = skills.facts.as_slice() else {
         panic!("one fact, got {:?}", skills.facts);
     };
-    assert_eq!(fact.property, "skills");
+    assert_eq!(fact.property, "project");
     assert_eq!(fact.value, json!({ "name": "Rust" }));
     assert_eq!(fact.origin, OriginKind::Connector);
     assert_eq!(
@@ -425,7 +425,7 @@ impl AuthZResolverApi for CategoriesAsked {
 async fn the_configured_category_check_reaches_the_profile_read() {
     for (check, per_category) in [
         (CategoryCheckConfig::OneCall, 0),
-        (CategoryCheckConfig::PerCategory, Category::ALL.len()),
+        (CategoryCheckConfig::PerCategory, Category::all().len()),
     ] {
         let db = inmem_db().await;
         let asked = Arc::new(CategoriesAsked::default());
@@ -562,8 +562,8 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         .await
         .unwrap();
     let mut plan = crate::test_support::connector_plan(vec![crate::test_support::add_value(
-        "skill",
-        "skills",
+        "project",
+        "project",
         json!({ "name": "Rust" }),
     )]);
     plan.tenant_id = tenant;
@@ -636,8 +636,8 @@ async fn a_correction_needs_the_opt_in_to_store_values_unchecked() {
             let request = reviews.open_on_at(
                 key,
                 &crate::test_support::stored_fact(
-                    Category::Skill,
-                    "skills",
+                    Category::PROJECT,
+                    "project",
                     json!({ "name": "Rust" }),
                     10,
                 ),
@@ -660,7 +660,7 @@ async fn a_correction_needs_the_opt_in_to_store_values_unchecked() {
                     &crate::test_support::context_of(Uuid::new_v4(), key.tenant_id),
                     request.id,
                     Resolution::Corrected {
-                        property: "skills".to_owned(),
+                        property: "project".to_owned(),
                         value: json!({ "name": "Go" }),
                         reason: None,
                     },
@@ -717,7 +717,7 @@ async fn an_administrators_add_needs_the_opt_in_to_store_values_unchecked() {
                 .add(
                     &crate::test_support::context_of(Uuid::new_v4(), Uuid::new_v4()),
                     Uuid::new_v4(),
-                    "skills",
+                    "project",
                     &json!({ "name": "Go" }),
                 )
                 .await
@@ -996,4 +996,179 @@ async fn a_tenant_the_platform_deleted_leaves_construct_and_graph_storage_throug
         "the tenant is no longer kept"
     );
     assert!(kept.contains(&staying.tenant_id));
+}
+
+/// A model that learns the story's message: Priya works on the project and promised to send a script.
+fn learns_priya() -> Arc<Scripted> {
+    let call = |id: &str, name: &str, arguments: serde_json::Value| ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments,
+    };
+    Arc::new(Scripted(Mutex::new(VecDeque::from([
+        answer(ModelOutput::ToolCalls(vec![
+            call(
+                "c1",
+                "add",
+                json!({ "kind": "person", "value": { "name": "Priya Shah", "space": "work" }, "confidence": 1.0 }),
+            ),
+            call(
+                "c2",
+                "add",
+                json!({ "kind": "project", "value": { "name": "Construct Browser onboarding" }, "confidence": 1.0 }),
+            ),
+            call(
+                "c3",
+                "link",
+                json!({ "kind": "works_on", "from": 1, "to": 2, "confidence": 1.0 }),
+            ),
+            call(
+                "c4",
+                "add",
+                json!({
+                    "kind": "commitment",
+                    "value": { "kind": "promise", "text": "send the interview script" },
+                    "owner": 2,
+                    "confidence": 1.0
+                }),
+            ),
+            call(
+                "c5",
+                "link",
+                json!({ "kind": "owner", "from": 3, "to": 1, "confidence": 1.0 }),
+            ),
+        ])),
+        answer(ModelOutput::Text(
+            "Added Priya, the project and the promise.".to_owned(),
+        )),
+    ]))))
+}
+
+#[tokio::test]
+async fn a_message_is_learned_as_linked_nodes_shown_in_one_call_and_forgotten_with_what_the_node_owns()
+ {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+    let pipeline = assemble(
+        &cfg,
+        Some(learns_priya()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
+        crate::test_support::deletion_tables(&db),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+        Arc::new(crate::test_support::NoTenantResolver),
+    )
+    .expect("the pipeline assembles");
+    let worker = pipeline.worker.expect("processing is wired");
+    let intake = IntakeFixture {
+        hand_off_to: Some(Arc::clone(&pipeline.hand_off)),
+        ..IntakeFixture::default()
+    }
+    .build(&db);
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let cancel = CancellationToken::new();
+    let running = tokio::spawn(worker.run(cancel.clone()));
+    intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            tenant,
+            chat_record(subject, "chat/t/1", "v1"),
+        )
+        .await
+        .expect("intake answers");
+
+    let reader = in_tenant(tenant);
+    let read_back = async {
+        loop {
+            let view = pipeline.profile.read(&reader, None, subject).await.unwrap();
+            if view
+                .categories
+                .iter()
+                .map(|group| group.facts.len())
+                .sum::<usize>()
+                == 3
+            {
+                return view;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let view = tokio::time::timeout(Duration::from_secs(30), read_back)
+        .await
+        .expect("the record is processed");
+    cancel.cancel();
+    running.await.unwrap();
+
+    // The profile shows a person, a project and a commitment.
+    let kinds: Vec<&str> = view
+        .categories
+        .iter()
+        .map(|group| group.category.name())
+        .collect();
+    assert_eq!(kinds, ["person", "project", "commitment"]);
+    let node = |kind: &str| {
+        view.categories
+            .iter()
+            .find(|group| group.category.name() == kind)
+            .and_then(|group| group.facts.first())
+            .cloned()
+            .unwrap()
+    };
+    let (priya, project, promise) = (node("person"), node("project"), node("commitment"));
+    assert_eq!(promise.owner.as_ref(), Some(&project.node_key));
+    // The tool is the connector that sent the message; the message is the record.
+    assert_eq!(project.learned[0].message.as_deref(), Some("chat/t/1"));
+
+    // One call gives the project, its commitment, the person who works on it and where it was learned from.
+    let details = pipeline
+        .profile
+        .read_node(&reader, None, subject, &project.node_key)
+        .await
+        .unwrap();
+    assert_eq!(
+        details.node.value,
+        json!({ "name": "Construct Browser onboarding" })
+    );
+    assert_eq!(details.owned.len(), 1);
+    assert_eq!(details.owned[0].node_key, promise.node_key);
+    let works_on = details
+        .neighbours
+        .iter()
+        .find(|group| group.link == "works_on")
+        .expect("the person who works on it");
+    assert_eq!(works_on.neighbours[0].node.node_key, priya.node_key);
+    assert_eq!(details.learned_from[0].tool, project.learned[0].tool);
+    assert!(details.learned_from[0].count >= 1);
+
+    // The subject forgets the project: it goes with its commitment and its links, and Priya stays.
+    let owner = crate::test_support::context_of(subject, tenant);
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &project.node_key)
+        .await
+        .expect("the subject forgets the project");
+    let after = pipeline.profile.read(&reader, None, subject).await.unwrap();
+    let left: Vec<&str> = after
+        .categories
+        .iter()
+        .map(|group| group.category.name())
+        .collect();
+    assert_eq!(left, ["person"], "Priya stays: {after:?}");
+    let priya_after = pipeline
+        .profile
+        .read_node(&reader, None, subject, &priya.node_key)
+        .await
+        .unwrap();
+    assert!(
+        priya_after.neighbours.is_empty(),
+        "no link of the project is left: {priya_after:?}"
+    );
 }

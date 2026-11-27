@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::api::rest::routes::register_review_queue_routes;
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::one_step::OneStepPath;
-use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::catalog::Catalog;
 use crate::domain::profile::Category;
 use crate::domain::review_queue::{CLAIM_HOLD, ReviewQueueService};
 use crate::domain::sensitive_data::SensitiveDataChecks;
@@ -44,8 +44,8 @@ impl Tenant {
             id: Uuid::new_v4(),
             subject: Uuid::new_v4(),
             profile: MemoryProfile::with(vec![stored_fact(
-                Category::Skill,
-                "skills",
+                Category::PROJECT,
+                "project",
                 json!({ "name": "Rust" }),
                 10,
             )]),
@@ -75,7 +75,7 @@ impl Tenant {
                 events: Arc::new(RecordingAdmissionEvents::default()),
                 drops,
             }),
-            catalog: Arc::new(PropertyCatalog::load().unwrap()),
+            catalog: Arc::new(Catalog::load().unwrap()),
         });
         let service = ReviewQueueService::new(
             Arc::new(writes),
@@ -170,7 +170,7 @@ async fn the_subject_flags_a_fact_and_sees_its_request() {
     assert_eq!(flagged.status, StatusCode::CREATED, "{}", flagged.body);
     assert_eq!(flagged.body["fact_id"], json!(skill));
     assert_eq!(flagged.body["state"], json!("open"));
-    assert_eq!(flagged.body["entity_kind"], json!("skill"));
+    assert_eq!(flagged.body["entity_kind"], json!("project"));
     assert_eq!(flagged.body["value"], json!({ "name": "Rust" }));
     assert_eq!(flagged.body["comment"], json!("wrong"));
     assert!(flagged.body["created_at"].is_string());
@@ -289,7 +289,7 @@ async fn a_correction_answers_the_closed_request_with_the_new_facts_id() {
         tenant.reviewer(),
         Method::POST,
         &resolution(&id),
-        Some(json!({ "outcome": "corrected", "property": "skills", "value": { "name": "Go" } })),
+        Some(json!({ "outcome": "corrected", "property": "project", "value": { "name": "Go" } })),
     )
     .await;
 
@@ -320,7 +320,7 @@ async fn a_correction_admission_refuses_is_422_and_the_request_stays_open() {
         tenant.routes(Arc::new(AllowResolver), Uuid::new_v4(), off),
         Method::POST,
         &resolution(&id),
-        Some(json!({ "outcome": "corrected", "property": "skills", "value": { "name": "Go" } })),
+        Some(json!({ "outcome": "corrected", "property": "project", "value": { "name": "Go" } })),
     )
     .await;
 
@@ -351,11 +351,11 @@ async fn a_body_that_does_not_fit_its_outcome_is_400_naming_the_field() {
         (json!({ "outcome": "rejected", "reason": "  " }), "reason"),
         (json!({ "outcome": "corrected" }), "property"),
         (
-            json!({ "outcome": "corrected", "property": "skills" }),
+            json!({ "outcome": "corrected", "property": "project" }),
             "value",
         ),
         (
-            json!({ "outcome": "deleted", "property": "skills", "value": { "name": "Go" } }),
+            json!({ "outcome": "deleted", "property": "project", "value": { "name": "Go" } }),
             "property",
         ),
         (
@@ -363,7 +363,7 @@ async fn a_body_that_does_not_fit_its_outcome_is_400_naming_the_field() {
             "value",
         ),
         (
-            json!({ "outcome": "corrected", "property": "skills", "value": { "name": "" } }),
+            json!({ "outcome": "corrected", "property": "project", "value": { "name": "" } }),
             "value",
         ),
         (
@@ -427,7 +427,7 @@ async fn a_held_or_unclosed_request_is_409_with_a_reason_a_client_tells_apart() 
     let id = tenant.flagged().await;
     let reject = || Some(json!({ "outcome": "rejected", "reason": "it is right" }));
     let correct =
-        Some(json!({ "outcome": "corrected", "property": "skills", "value": { "name": "Go" } }));
+        Some(json!({ "outcome": "corrected", "property": "project", "value": { "name": "Go" } }));
 
     tenant.reviews.hold_first(time::OffsetDateTime::now_utc());
     let held = send(tenant.reviewer(), Method::POST, &resolution(&id), reject()).await;

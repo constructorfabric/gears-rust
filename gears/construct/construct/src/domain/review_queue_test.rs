@@ -16,7 +16,7 @@ use crate::domain::error::DomainError;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::plan::Plan;
 use crate::domain::plan::{Change, NodeKey, Origin};
-use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_writes::ProfileWrites;
@@ -56,8 +56,13 @@ impl Fixture {
     /// `conflicts` times.
     fn new(conflicts: u32) -> Self {
         let profile = MemoryProfile::with(vec![
-            stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
-            stored_fact(Category::Role, "roles", json!({ "title": "Engineer" }), 20),
+            stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+            stored_fact(
+                Category::PRODUCT,
+                "roles",
+                json!({ "title": "Engineer" }),
+                20,
+            ),
         ]);
         let writer = MemoryWriter::new(Arc::clone(&profile), conflicts);
         Self {
@@ -99,7 +104,7 @@ impl Fixture {
                     events: Arc::new(RecordingAdmissionEvents::default()),
                     drops,
                 }),
-                catalog: Arc::new(PropertyCatalog::load().unwrap()),
+                catalog: Arc::new(Catalog::load().unwrap()),
             })
         });
         ReviewQueueService::new(
@@ -140,7 +145,7 @@ impl Fixture {
         self.profile
             .live()
             .into_iter()
-            .find(|fact| fact.category == Category::Skill)
+            .find(|fact| fact.category == Category::PROJECT)
             .unwrap()
             .node_key
     }
@@ -160,7 +165,7 @@ impl Fixture {
 
     fn corrected(name: &str) -> Resolution {
         Resolution::Corrected {
-            property: "skills".to_owned(),
+            property: "project".to_owned(),
             value: json!({ "name": name }),
             reason: None,
         }
@@ -195,7 +200,7 @@ async fn a_flag_opens_a_request_with_the_flagged_value_and_records_it() {
     let request = fixture.flagged().await;
 
     assert_eq!(request.fact_id, skill);
-    assert_eq!(request.property, "skills");
+    assert_eq!(request.property, "project");
     assert_eq!(
         request.status,
         ReviewStatus::Open {
@@ -214,7 +219,7 @@ async fn a_flag_opens_a_request_with_the_flagged_value_and_records_it() {
             subject_id: fixture.subject,
             request_id: request.id,
             fact_id: skill,
-            category: Category::Skill,
+            category: Category::PROJECT,
         }]
     );
 }
@@ -577,7 +582,7 @@ async fn a_delete_of_a_fact_already_gone_closes_the_request_as_deleted() {
 }
 
 #[tokio::test]
-async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
+async fn a_correction_replaces_the_fact_in_place_as_the_reviewer() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
 
@@ -590,9 +595,9 @@ async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
     let ReviewOutcome::Corrected(new_key) = outcome_of(&closed).clone() else {
         panic!("corrected: {closed:?}");
     };
-    assert_ne!(
+    assert_eq!(
         new_key, request.fact_id,
-        "a replace gives the fact a new id"
+        "a correction changes the fact where it stands, so its links and owned nodes stay"
     );
     let [plan] = fixture.writer.plans().try_into().unwrap();
     assert_eq!(
@@ -606,14 +611,16 @@ async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
         &plan.steps[..],
         [step] if step.confidence.is_none() && matches!(
             &step.change,
-            Change::ReplaceEntity { old, key, properties }
+            Change::ReplaceEntity { old, key, properties, .. }
                 if *old == request.fact_id && *key == new_key
                     && properties[0].value == json!({ "name": "Go" })
         )
     ));
     let live = fixture.profile.live();
-    assert!(live.iter().all(|fact| fact.node_key != request.fact_id));
-    assert!(live.iter().any(|fact| fact.node_key == new_key));
+    assert!(
+        live.iter()
+            .any(|fact| fact.node_key == new_key && fact.value == json!({ "name": "Go" }))
+    );
     assert!(matches!(
         fixture.events.taken().last(),
         Some(ReviewQueueEvent::Resolved {
@@ -746,7 +753,7 @@ async fn a_correction_takes_only_the_facts_property_with_a_value_its_schema_take
     };
 
     let other_property = resolve("roles", json!({ "title": "Lead" })).await;
-    let bad_value = resolve("skills", json!({ "name": "" })).await;
+    let bad_value = resolve("project", json!({ "name": "" })).await;
 
     assert!(
         matches!(
@@ -786,7 +793,7 @@ async fn a_corrections_value_is_checked_before_its_fact_is_read() {
             &fixture.reviewer(),
             request.id,
             Resolution::Corrected {
-                property: "skills".to_owned(),
+                property: "project".to_owned(),
                 value: json!({ "name": "" }),
                 reason: None,
             },
@@ -809,7 +816,7 @@ async fn a_corrections_value_is_checked_before_its_fact_is_read() {
 #[tokio::test]
 async fn a_correction_of_a_stored_property_no_person_type_has_is_internal() {
     let fixture = Fixture::new(0);
-    let odd = stored_fact(Category::Skill, "retired_property", json!("x"), 30);
+    let odd = stored_fact(Category::PROJECT, "retired_property", json!("x"), 30);
     fixture.profile.facts.lock().unwrap().push(odd.clone());
     let request = fixture
         .service()

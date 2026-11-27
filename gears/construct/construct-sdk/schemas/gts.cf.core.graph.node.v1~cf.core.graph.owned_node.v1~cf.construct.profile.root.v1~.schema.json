@@ -29,6 +29,22 @@
               "uniqueItems": true,
               "maxItems": 1000,
               "items": { "type": "string", "minLength": 1, "maxLength": 2048 }
+            },
+            "marks": {
+              "description": "Nodes the person forgot, each with the tool and the message it was learned from, so the same message does not create it again. The newest 200.",
+              "type": "array",
+              "maxItems": 200,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "key", "tool", "message"],
+                "properties": {
+                  "kind": { "type": "string", "minLength": 1, "maxLength": 100 },
+                  "key": { "type": "string", "minLength": 1, "maxLength": 1000 },
+                  "tool": { "type": "string", "minLength": 1, "maxLength": 500 },
+                  "message": { "type": "string", "minLength": 1, "maxLength": 500 }
+                }
+              }
             }
           }
         }

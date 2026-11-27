@@ -84,7 +84,7 @@ pub(crate) enum Attempt<T> {
 /// What a removal of one fact did.
 #[domain_model]
 pub(crate) enum Removed {
-    Removed(StoredFact),
+    Removed(Box<StoredFact>),
     /// No live fact had the id, at the first read or after a conflict.
     Gone,
 }
@@ -264,7 +264,7 @@ impl ProfileWrites {
                 .await?;
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-write
             Ok(match written {
-                Written::Stored => Attempt::Done(Removed::Removed(fact)),
+                Written::Stored => Attempt::Done(Removed::Removed(Box::new(fact))),
                 Written::Conflict => Attempt::Conflict,
             })
         })

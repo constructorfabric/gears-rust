@@ -115,12 +115,12 @@ mod tests {
             tenant_id: ids.tenant,
             subject_id: ids.subject,
             caller,
-            categories: BTreeSet::from([Category::Skill, Category::Role]),
+            categories: BTreeSet::from([Category::PROJECT, Category::PRODUCT]),
         });
 
         assert!(logs_contain("event=\"subject_facts_viewed\""));
         ids.assert_logged_with_caller(caller, logs_contain);
-        assert!(logs_contain("categories=role,skill"));
+        assert!(logs_contain("categories=product,project"));
     }
 
     #[tracing_test::traced_test]
@@ -135,13 +135,13 @@ mod tests {
             subject_id: ids.subject,
             caller,
             fact_id: NodeKey("construct:t:fact-1".to_owned()),
-            category: Category::Skill,
+            category: Category::PROJECT,
         });
 
         assert!(logs_contain("event=\"subject_fact_deleted\""));
         ids.assert_logged_with_caller(caller, logs_contain);
         assert!(logs_contain("fact_id=construct:t:fact-1"));
-        assert!(logs_contain("category=\"skill\""));
+        assert!(logs_contain("category=\"project\""));
     }
 
     #[tracing_test::traced_test]
@@ -154,11 +154,11 @@ mod tests {
             tenant_id: ids.tenant,
             subject_id: ids.subject,
             caller: officer,
-            categories: BTreeSet::from([Category::Preference]),
+            categories: BTreeSet::from([Category::TEAM]),
         });
 
         assert!(logs_contain("event=\"subject_data_exported\""));
         ids.assert_logged_with_caller(officer, logs_contain);
-        assert!(logs_contain("categories=preference"));
+        assert!(logs_contain("categories=team"));
     }
 }

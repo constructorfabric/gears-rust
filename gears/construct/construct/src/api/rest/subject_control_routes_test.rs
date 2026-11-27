@@ -37,8 +37,13 @@ impl Subject {
             tenant: Uuid::new_v4(),
             id: Uuid::new_v4(),
             profile: MemoryProfile::with(vec![
-                stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
-                stored_fact(Category::Role, "roles", json!({ "title": "Engineer" }), 20),
+                stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+                stored_fact(
+                    Category::PRODUCT,
+                    "roles",
+                    json!({ "title": "Engineer" }),
+                    20,
+                ),
             ]),
             reviews: Arc::default(),
         }
@@ -147,13 +152,13 @@ async fn the_owner_lists_its_facts_newest_first_with_kind_origin_and_version() {
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
     let items = answer.body["items"].as_array().unwrap();
     assert_eq!(items.len(), 2);
-    assert_eq!(items[0]["entity_kind"], "role");
-    assert_eq!(items[0]["fact_id"], subject.fact_id(Category::Role));
+    assert_eq!(items[0]["entity_kind"], "product");
+    assert_eq!(items[0]["fact_id"], subject.fact_id(Category::PRODUCT));
     assert_eq!(items[0]["property"], "roles");
     assert_eq!(items[0]["value"], json!({ "title": "Engineer" }));
     assert_eq!(items[0]["origin"], json!({ "kind": "connector" }));
     assert_eq!(items[0]["stored_at"], "1970-01-01T00:00:20Z");
-    assert_eq!(items[1]["entity_kind"], "skill");
+    assert_eq!(items[1]["entity_kind"], "project");
     assert_eq!(answer.body["version"], 1);
     assert_eq!(answer.body["page_info"]["limit"], 50);
     assert!(answer.body["page_info"]["next_cursor"].is_null());
@@ -167,7 +172,7 @@ async fn the_list_filters_orders_and_pages() {
         subject.own(),
         Method::GET,
         &encoded(&format!(
-            "{}?$filter=entity_kind eq 'skill'",
+            "{}?$filter=entity_kind eq 'project'",
             subject.facts()
         )),
     )
@@ -190,8 +195,8 @@ async fn the_list_filters_orders_and_pages() {
 
     assert_eq!(skills.status, StatusCode::OK, "{}", skills.body);
     assert_eq!(skills.body["items"].as_array().unwrap().len(), 1);
-    assert_eq!(skills.body["items"][0]["entity_kind"], "skill");
-    assert_eq!(oldest.body["items"][0]["entity_kind"], "skill");
+    assert_eq!(skills.body["items"][0]["entity_kind"], "project");
+    assert_eq!(oldest.body["items"][0]["entity_kind"], "project");
     assert!(oldest.body["page_info"]["next_cursor"].is_string());
     assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
 }
@@ -199,7 +204,7 @@ async fn the_list_filters_orders_and_pages() {
 #[tokio::test]
 async fn another_subject_or_a_refused_owner_gets_404_on_the_facts_resource() {
     let subject = Subject::new();
-    let skill = subject.fact_id(Category::Skill);
+    let skill = subject.fact_id(Category::PROJECT);
 
     for (who, router) in [
         (
@@ -231,7 +236,7 @@ async fn another_subject_or_a_refused_owner_gets_404_on_the_facts_resource() {
 #[tokio::test]
 async fn the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found() {
     let subject = Subject::new();
-    let skill = subject.fact_id(Category::Skill);
+    let skill = subject.fact_id(Category::PROJECT);
 
     let read = send(subject.own(), Method::GET, &subject.fact(&skill)).await;
     let deleted = send(subject.own(), Method::DELETE, &subject.fact(&skill)).await;
@@ -240,7 +245,7 @@ async fn the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found() {
 
     assert_eq!(read.status, StatusCode::OK, "{}", read.body);
     assert_eq!(read.body["fact_id"], skill);
-    assert_eq!(read.body["entity_kind"], "skill");
+    assert_eq!(read.body["entity_kind"], "project");
     assert_eq!(deleted.status, StatusCode::NO_CONTENT);
     assert_eq!(again.status, StatusCode::NOT_FOUND);
     assert_eq!(deleted_again.status, StatusCode::NOT_FOUND);
@@ -255,7 +260,7 @@ async fn the_export_is_a_json_attachment_and_403_without_its_permission() {
         .profile
         .live()
         .into_iter()
-        .find(|fact| fact.category == Category::Skill)
+        .find(|fact| fact.category == Category::PROJECT)
         .unwrap();
     let request = subject.reviews.open_on_at(
         crate::domain::subject_settings::SubjectKey {
@@ -294,8 +299,8 @@ async fn the_export_is_a_json_attachment_and_403_without_its_permission() {
             "id": request.id,
             "subject_id": subject.id,
             "fact_id": skill.node_key.0,
-            "entity_kind": "skill",
-            "property": "skills",
+            "entity_kind": "project",
+            "property": "project",
             "value": { "name": "Rust" },
             "state": "open",
             "created_at": "1970-01-01T00:16:40Z",
@@ -313,7 +318,7 @@ async fn the_export_is_a_json_attachment_and_403_without_its_permission() {
 #[tokio::test]
 async fn every_answer_is_no_store_with_the_security_headers() {
     let subject = Subject::new();
-    let skill = subject.fact_id(Category::Skill);
+    let skill = subject.fact_id(Category::PROJECT);
 
     for (router, method, uri) in [
         (subject.own(), Method::GET, subject.facts()),
@@ -371,8 +376,8 @@ async fn following_the_cursor_over_http_serves_the_rest_once_under_the_same_filt
 
     assert_eq!(first.status, StatusCode::OK, "{}", first.body);
     assert_eq!(second.status, StatusCode::OK, "{}", second.body);
-    assert_eq!(first.body["items"][0]["entity_kind"], "role");
-    assert_eq!(second.body["items"][0]["entity_kind"], "skill");
+    assert_eq!(first.body["items"][0]["entity_kind"], "product");
+    assert_eq!(second.body["items"][0]["entity_kind"], "project");
     assert!(second.body["page_info"]["next_cursor"].is_null());
     assert_eq!(
         unfiltered.status,

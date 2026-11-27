@@ -39,19 +39,30 @@ pub enum FactOrigin {
     Administrator,
 }
 
-/// A category of a person's profile: one person type.
+/// A category of a person's profile: a node kind of the profile's schema, named by its registered name, such as
+/// `project` or `commitment`.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum FactCategory {
-    /// The identity person type, [`crate::gts::IDENTITY_TYPE`].
-    Identity,
-    /// The role person type, [`crate::gts::ROLE_TYPE`].
-    Role,
-    /// The skill person type, [`crate::gts::SKILL_TYPE`].
-    Skill,
-    /// The preference person type, [`crate::gts::PREFERENCE_TYPE`].
-    Preference,
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FactCategory(String);
+
+impl FactCategory {
+    /// The category of the node kind registered as `name`.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// The kind's registered name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FactCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// A fact's id: its graph node key. A type of its own, so it cannot be

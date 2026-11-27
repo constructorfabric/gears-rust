@@ -183,15 +183,19 @@ impl Changes {
         plan.steps
             .iter()
             .fold(Self::default(), |changes, step| match step.change {
-                Change::AddEntity { .. } | Change::AddProperty { .. } => Self {
-                    added: changes.added + 1,
-                    ..changes
-                },
+                Change::AddEntity { .. } | Change::AddProperty { .. } | Change::AddLink { .. } => {
+                    Self {
+                        added: changes.added + 1,
+                        ..changes
+                    }
+                }
                 Change::ReplaceEntity { .. } | Change::ReplaceProperty { .. } => Self {
                     replaced: changes.replaced + 1,
                     ..changes
                 },
-                Change::RemoveEntity { .. } | Change::RemoveProperty { .. } => Self {
+                Change::RemoveEntity { .. }
+                | Change::RemoveProperty { .. }
+                | Change::RemoveLink { .. } => Self {
                     removed: changes.removed + 1,
                     ..changes
                 },

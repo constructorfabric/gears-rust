@@ -127,7 +127,11 @@ impl Graph {
             tenant_id: key.tenant_id,
             subject_id: key.subject_id,
             profile_version: version,
-            ..connector_plan(vec![add_value("skill", "skills", json!({ "name": name }))])
+            ..connector_plan(vec![add_value(
+                "project",
+                "project",
+                json!({ "name": name }),
+            )])
         };
         assert_eq!(
             self.writer.write(ctx, &plan).await.unwrap(),
@@ -234,7 +238,11 @@ async fn the_root_goes_once_its_facts_are_gone_and_the_next_generation_starts_a_
         tenant_id: graph.key.tenant_id,
         subject_id: graph.key.subject_id,
         profile_version: Some(1),
-        ..connector_plan(vec![add_value("skill", "skills", json!({ "name": "C" }))])
+        ..connector_plan(vec![add_value(
+            "project",
+            "project",
+            json!({ "name": "C" }),
+        )])
     };
     assert_eq!(
         graph.writer.write(&graph.ctx, &stale).await.unwrap(),
