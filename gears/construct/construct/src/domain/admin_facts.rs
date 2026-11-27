@@ -387,7 +387,9 @@ impl AdminFactsService {
     /// # Errors
     ///
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact and
-    /// no open request on it; [`DomainError::ReviewConflict`] while a
+    /// the delete closes no open request (it answers done when it closes a
+    /// request an earlier delete left open, whichever fact it names);
+    /// [`DomainError::ReviewConflict`] while a
     /// reviewer resolves the fact's request, when an earlier resolution
     /// closed it meanwhile, or when the delete was stored but the request did
     /// not close; unavailable when the profile kept changing, when the

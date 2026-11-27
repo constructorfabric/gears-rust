@@ -188,7 +188,7 @@ The PRD requires that a tenant administrator can read all facts of any subject i
 2. [x] - `p2` - API: the extractors take the security context, the service and the ids; a fact id not shaped like a node key answers 404 - `inst-delete-parse`
 3. [x] - `p2` - Start the budget. Run `cpt-cf-construct-algo-admin-facts-admin-only` - `inst-delete-authorize`
 4. [x] - `p2` - **IF** the fact has an open review request, resolve it as the administrator as `cpt-cf-construct-flow-review-queue-resolve` does from its claim on, within this delete's budget, as deleted: **IF** this delete removed the fact, record a deleted event and **RETURN** 204, or the conflict when the request did not close; **IF** it found the fact gone and closed the request, **RETURN** 204; else conflict - `inst-delete-review`
-5. [x] - `p2` - Otherwise delete the fact as `cpt-cf-construct-algo-subject-control-delete` does, with the administrator as origin, and record a deleted event. Close a request flagged on the fact meanwhile, or left by an earlier delete, as deleted; **IF** that close fails, unavailable. **IF** the fact was gone and no request closed, no such fact. **RETURN** 204 - `inst-delete-write`
+5. [x] - `p2` - Otherwise delete the fact as `cpt-cf-construct-algo-subject-control-delete` does, with the administrator as origin, and record a deleted event. Close a request flagged on the fact meanwhile, or left by an earlier delete, and the requests of the nodes it owned, as deleted, trying every close; **IF** a close fails and the sweep did not close it, unavailable. **IF** the fact was gone and no request closed, no such fact. **RETURN** 204 - `inst-delete-write`
 
 ## 3. Processes / Business Logic (CDSL)
 

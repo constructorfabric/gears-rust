@@ -292,12 +292,14 @@ pub fn register_subject_control_routes(
         .operation_id("construct.delete_subject_fact")
         .summary("Delete one of the subject's own facts")
         .description(
-            "Soft-deletes one live fact of the caller; it is not served from the next read, \
-             and an open review request on it closes as deleted. Owner only. Another subject, \
-             or a fact the subject does not have, answers 404. 503 when the profile kept \
-             changing while the delete was written, or when the fact was deleted but its \
-             review request could not be closed; sending the delete again then closes the \
-             request and answers 204.",
+            "Soft-deletes one live fact of the caller; it is not served from the next read. \
+             The nodes the fact owns go with it, and the open review requests of the fact and \
+             of those nodes close as deleted. Owner only. Another subject, or a fact the \
+             subject does not have, answers 404, unless the delete closes a review request \
+             an earlier delete left open: then it answers 204, whichever fact it names. 503 \
+             when the profile kept changing while the delete was written, or when a review \
+             request could not be closed; sending the delete again then closes it and \
+             answers 204.",
         )
         .tag(SUBJECT_FACTS_TAG)
         .authenticated()
@@ -652,11 +654,13 @@ pub fn register_admin_facts_routes(
         .summary("Delete a subject's fact")
         .description(
             "Soft-deletes one live fact as the subject's delete does, with the administrator \
-             as origin; an open review request on it closes as deleted, and while a reviewer \
-             resolves it, 409. A fact the subject does not have answers 404. 503 when the \
-             profile kept changing, or when the fact was deleted but its review request \
-             could not be closed; sending the delete again then closes it. Works while \
-             personalization is off. Needs the permission to administer a subject's facts; \
+             as origin; the nodes the fact owns go with it, and the open review requests of \
+             the fact and of those nodes close as deleted, and while a reviewer resolves the \
+             fact's request, 409. A fact the subject does not have answers 404, unless the \
+             delete closes a review request an earlier delete left open: then it answers \
+             204, whichever fact it names. 503 when the profile kept changing, or when a \
+             review request could not be closed; sending the delete again then closes it. \
+             Works while personalization is off. Needs the permission to administer a subject's facts; \
              without it, 403.",
         )
         .tag(ADMIN_FACTS_TAG)

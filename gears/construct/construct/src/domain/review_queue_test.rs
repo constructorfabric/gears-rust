@@ -24,7 +24,8 @@ use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
     CLAIM_HOLD, NotStored, OutsideChange, Resolution, ReviewConflict, ReviewOutcome,
-    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_change,
+    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, Sweep,
+    close_on_change, close_orphaned,
 };
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
@@ -1134,6 +1135,64 @@ async fn the_subjects_delete_after_a_landed_correction_closes_the_request_as_the
         (done.outcome, done.by),
         (ReviewOutcome::Corrected(new_key), fixture.reviewer),
         "closed as the reviewer's correction, not as the subject's delete"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_closes_a_left_over_request_as_the_recorded_delete_of_the_reviewer() {
+    // A reviewer's delete landed and its close failed: the fact is gone, and the claim recorded the delete.
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.reviews.close_fails.store(true, Ordering::SeqCst);
+    let unclosed = fixture
+        .service()
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Deleted { reason: None },
+        )
+        .await;
+    assert!(
+        matches!(
+            unclosed,
+            Err(DomainError::ReviewConflict(ReviewConflict::NotClosed {
+                outcome: ReviewOutcome::Deleted,
+                ..
+            }))
+        ),
+        "{unclosed:?}"
+    );
+    fixture.reviews.close_fails.store(false, Ordering::SeqCst);
+    let writes = ProfileWrites::new(
+        Arc::clone(&fixture.profile) as _,
+        Arc::clone(&fixture.writer) as _,
+        Arc::new(ServiceIdentity::new(Uuid::new_v4())),
+        2,
+    );
+    // Not removed by the delete that sweeps: it closes as the reviewer's recorded delete.
+    let swept = close_orphaned(
+        fixture.reviews.as_ref(),
+        fixture.events.as_ref(),
+        &writes,
+        &AccessScope::allow_all(),
+        request.subject(),
+        Sweep {
+            by: fixture.subject,
+            except: None,
+            removed_now: &[],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(swept, 1);
+    let ReviewStatus::Closed(done) = fixture.status() else {
+        panic!("closed");
+    };
+    assert_eq!(
+        (done.outcome, done.by),
+        (ReviewOutcome::Deleted, fixture.reviewer),
+        "the reviewer's delete, not the subject's"
     );
 }
 

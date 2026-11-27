@@ -676,10 +676,22 @@ pub(crate) async fn close_on_change(
     Ok(true)
 }
 
-/// Closes as deleted, by `by`, every open request of the subject whose fact is no longer live, except the one on
+/// What a [`close_orphaned`] sweep closes as: who closes, which request it leaves to its caller, and which nodes
+/// this delete removed.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sweep<'a> {
+    pub by: Uuid,
+    pub except: Option<&'a NodeKey>,
+    pub removed_now: &'a [NodeKey],
+}
+
+/// Closes as deleted, by `sweep.by`, every open request of the subject whose fact is no longer live, except the one on
 /// `except`: a delete takes the nodes its fact owns with it, and an earlier delete may have left such a request
-/// open when its close failed. Every close is tried; the first failure is returned after the rest. How many
-/// requests it closed.
+/// open when its close failed. `removed_now` are the nodes this delete removed: a request on one of them closes as
+/// this delete's, and any other as an outside change that did not change the fact, so that a resolution its claim
+/// recorded and the profile holds closes as that one. Every close is tried; the first failure is returned after the
+/// rest. How many requests it closed.
 ///
 /// # Errors
 ///
@@ -690,8 +702,7 @@ pub(crate) async fn close_orphaned(
     writes: &ProfileWrites,
     scope: &AccessScope,
     key: SubjectKey,
-    by: Uuid,
-    except: Option<&NodeKey>,
+    sweep: Sweep<'_>,
 ) -> Result<usize, DomainError> {
     let read_failed = |err: DomainError| {
         tracing::warn!(error = %err, "construct: the requests on removed nodes could not be read");
@@ -708,13 +719,13 @@ pub(crate) async fn close_orphaned(
     let (mut closed, mut failed) = (0, None);
     for fact_id in open
         .iter()
-        .filter(|fact_id| Some(*fact_id) != except)
+        .filter(|fact_id| Some(*fact_id) != sweep.except)
         .filter(|fact_id| !live.iter().any(|fact| &fact.node_key == *fact_id))
     {
         let change = OutsideChange {
-            by,
+            by: sweep.by,
             outcome: ReviewOutcome::Deleted,
-            changed: true,
+            changed: sweep.removed_now.contains(fact_id),
         };
         match close_on_change(requests, events, writes, scope, key, fact_id, change).await {
             Ok(true) => closed += 1,
@@ -1409,8 +1420,14 @@ impl ReviewQueueService {
                     &self.writes,
                     hold.scope,
                     key,
-                    hold.resolver.by(),
-                    Some(&request.fact_id),
+                    Sweep {
+                        by: hold.resolver.by(),
+                        except: Some(&request.fact_id),
+                        removed_now: &owned
+                            .iter()
+                            .map(|fact| fact.node_key.clone())
+                            .collect::<Vec<_>>(),
+                    },
                 )
                 .await
                 {

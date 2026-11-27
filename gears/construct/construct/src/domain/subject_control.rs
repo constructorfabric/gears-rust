@@ -20,7 +20,7 @@ use super::profile::Category;
 use super::profile_read::{StoredFact, settings_scope};
 use super::profile_writes::{ProfileWrites, Removed, WriteError};
 use super::review_queue::{
-    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests,
+    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, Sweep,
     close_on_change, close_orphaned,
 };
 use super::subject_access::{authorize, own};
@@ -429,7 +429,7 @@ impl FactDelete<'_> {
     /// # Errors
     ///
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact
-    /// and no open request on it, also when a concurrent write removed it
+    /// and the delete closes no open request, also when a concurrent write removed it
     /// before a rerun; unavailable when the profile kept changing past the
     /// reruns or the budget, when the writer failed and the fact is not seen
     /// gone after it, or when a review request of the fact or of a node it
@@ -490,14 +490,23 @@ impl FactDelete<'_> {
         // The nodes the fact owned went with it: their requests close as deleted too, and so does one an earlier
         // delete left open when its close failed. This runs also when the close above failed, so that one failure
         // does not leave the others open.
+        let removed_now: Vec<NodeKey> = match &removed {
+            Removed::Removed(fact, owned) => std::iter::once(fact.node_key.clone())
+                .chain(owned.iter().map(|fact| fact.node_key.clone()))
+                .collect(),
+            Removed::Gone => Vec::new(),
+        };
         let swept = close_orphaned(
             self.requests,
             self.events,
             self.writes,
             self.scope,
             self.key,
-            self.by,
-            None,
+            Sweep {
+                by: self.by,
+                except: None,
+                removed_now: &removed_now,
+            },
         )
         .await;
         // A store that did not answer: a repeat finds the fact gone and closes what is left.
@@ -515,7 +524,14 @@ impl FactDelete<'_> {
         // of the close above is behind it.
         let (closed, swept) = match (named, swept) {
             (Ok(closed), Ok(swept)) => (closed, swept),
-            (Err(_), Ok(swept)) => (swept > 0, swept),
+            (Err(err), Ok(swept)) => {
+                tracing::warn!(
+                    error = %err,
+                    fact_id = %fact_id.0,
+                    "construct: the close of the request on a deleted fact failed; the sweep closed what was open"
+                );
+                (false, swept)
+            }
             (_, Err(err)) => return Err(not_closed(err)),
         };
         match removed {
