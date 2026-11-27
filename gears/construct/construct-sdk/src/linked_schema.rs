@@ -16,6 +16,7 @@
 use std::fmt;
 
 use serde_json::{Map, Value, json};
+use toolkit_gts::gts_id;
 use uuid::Uuid;
 
 /// Who owns the nodes of a kind.
@@ -121,8 +122,8 @@ pub const LEARNED_MAX: usize = 50;
 /// The member of a link's payload that holds its fields.
 pub const FIELDS: &str = "fields";
 
-const NODE_BASE: &str = "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~";
-const EDGE_BASE: &str = "gts.cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~";
+const NODE_BASE: &str = gts_id!("cf.core.graph.node.v1~cf.core.graph.owned_node.v1~");
+const EDGE_BASE: &str = gts_id!("cf.core.graph.edge.v1~cf.core.graph.static_edge.v1~");
 
 impl Schema {
     /// The node kind named `name`.
