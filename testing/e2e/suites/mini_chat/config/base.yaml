@@ -333,9 +333,7 @@ gears:
         - id: "gpt-5-mini"
           provider_model_id: "gpt-5-mini"
           display_name: "GPT-5 Mini"
-          # Lowercase on purpose: DESIGN lets `standard` / `premium` load beside
-          # `Standard` / `Premium`, and this entry checks it.
-          tier: standard
+          tier: Standard
           enabled: true
           system_prompt: "You are a helpful assistant. IMPORTANT RULE: When the user says exactly 'PING', you MUST respond with exactly 'PONG' and nothing else."
           thread_summary_prompt: ""
