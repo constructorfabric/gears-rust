@@ -600,9 +600,8 @@ impl From<toolkit_odata::Page<ReviewRequest>> for ReviewRequestsPageDto {
 pub struct FlagFactRequest {
     /// The fact's id, as the facts list gives it.
     pub fact_id: String,
-    /// What is wrong with it, at most 1 000 characters.
+    /// What is wrong with it, at most 1 000 characters after trimming.
     #[serde(default)]
-    #[schema(max_length = 1000)]
     pub comment: Option<String>,
 }
 
@@ -614,14 +613,13 @@ pub struct FlagFactRequest {
 #[serde(deny_unknown_fields)]
 pub struct ResolutionRequest {
     pub outcome: ReviewOutcomeDto,
-    /// Why, at most 1 000 characters.
+    /// Why, at most 1 000 characters after trimming.
     #[serde(default)]
-    #[schema(max_length = 1000)]
     pub reason: Option<String>,
-    /// The fact's property, such as `skills`.
+    /// The fact's property: its node's kind, such as `project`.
     #[serde(default)]
     pub property: Option<String>,
-    /// The new value: a string, or an object for a property with fields.
+    /// The new value: the object of the node's fields.
     #[serde(default)]
     pub value: Option<serde_json::Value>,
 }
@@ -676,10 +674,11 @@ impl TryFrom<ResolutionRequest> for Resolution {
 #[toolkit_macros::api_dto(request)]
 #[serde(deny_unknown_fields)]
 pub struct AdminFactRequest {
-    /// The fact's property, such as `skills`.
+    /// The fact's property: its node's kind, such as `project`.
+    #[schema(min_length = 1, max_length = 64, pattern = "^[a-z0-9_]+$")]
     pub property: String,
-    /// The value: a string, or an object for a property with fields, such
-    /// as `{"name": "Rust"}` for a skill.
+    /// The value: the object of the node's fields, such as `{"name": "Atlas"}`
+    /// for a `project`. A node that needs an owner is not added here.
     pub value: serde_json::Value,
 }
 
@@ -720,7 +719,7 @@ pub struct StoredFactDto {
     /// The fact's id, the graph node key.
     pub fact_id: String,
     pub entity_kind: ProfileEntityKindDto,
-    /// The fact's property, such as `skills`.
+    /// The fact's property: its node's kind, such as `project`.
     pub property: String,
     /// The value as Admission let it through.
     pub value: serde_json::Value,

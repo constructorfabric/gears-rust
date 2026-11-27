@@ -322,7 +322,7 @@ pub fn register_subject_control_routes(
         .summary("Export a subject's data")
         .description(
             "All of a subject's data in the caller's tenant, as a JSON file: the settings, \
-             every live fact with its origin, and every review request, open and closed. For the data protection officer, under \
+             every live fact with its origin, and every review request, open and closed. The links between facts are not part of it yet. For the data protection officer, under \
              the permission to export a subject's data; without it, 403. A subject \
              without data in the tenant exports empty, like one with no profile.",
         )
