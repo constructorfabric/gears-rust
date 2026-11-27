@@ -168,7 +168,6 @@ class TestErrorMapping:
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"]) == ("error", "rate_limited"), turn
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_stream_without_terminal_event_is_provider_error(self, chat, mock_provider):
         """The provider stream ends (the connection closes) after a delta and
@@ -224,7 +223,6 @@ class TestErrorMapping:
         turn = poll_turn(chat["id"], rid)
         assert (turn["state"], turn["error_code"]) == ("error", "provider_error"), turn
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_completed_without_usage_is_provider_error(self, chat, mock_provider):
         """A `response.completed` without `usage` (the real API always sends

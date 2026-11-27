@@ -297,7 +297,6 @@ class TestProviderCleanupOpenAI:
         the cleanup is retried `max_attempts` times and ends in `failed`."""
         check_attachment_cleanup_403_ends_failed(mock_provider, STANDARD_MODEL)
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_vector_store_delete_500_is_dead_lettered(self, mock_provider):
         """19-18: every vector store delete of a deleted chat answers 500:
@@ -331,7 +330,6 @@ class TestProviderCleanupAzure:
         the cleanup is retried `max_attempts` times and ends in `failed`."""
         check_attachment_cleanup_403_ends_failed(mock_provider, DEFAULT_MODEL)
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_vector_store_delete_500_is_dead_lettered(self, mock_provider):
         """19-18 (azure): every vector store delete of a deleted chat answers 500:
@@ -441,7 +439,6 @@ class TestCleanupWorkerDB:
         assert [(r["cleanup_status"], r["cleanup_attempts"]) for r in rows] == [("done", 0)], rows
         _assert_file_deleted_once(request, mock_provider, file_id)
 
-    @pytest.mark.usefixtures("outbox_capture")
     def test_chat_deletion_enqueues_chat_cleanup_event(self, server):
         """DELETE chat → one chat cleanup outbox payload with the chat's
         tenant, deletion time and a system request id."""
@@ -456,7 +453,6 @@ class TestCleanupWorkerDB:
             assert key in payloads[0], payloads[0]
         assert wait_cleanup_terminal([att_id]) == {att_id: "done"}
 
-    @pytest.mark.usefixtures("outbox_capture")
     def test_attachment_deletion_enqueues_cleanup_event(self, request, server, mock_provider):
         """DELETE attachment → one per-attachment cleanup outbox payload with
         the provider file id; the cleanup deletes that file."""
@@ -497,7 +493,6 @@ class TestCleanupWorkerDB:
         for file_id in file_ids:
             _assert_file_deleted_once(request, mock_provider, file_id)
 
-    @pytest.mark.usefixtures("outbox_capture")
     def test_second_delete_chat_404_single_cleanup_event(self, server):
         """A second DELETE of a chat is 404 and enqueues no second cleanup event."""
         chat_id = create_chat()["id"]
@@ -508,7 +503,6 @@ class TestCleanupWorkerDB:
         assert len(chat_cleanup_payloads(chat_id)) == 1
         assert wait_cleanup_terminal([att_id]) == {att_id: "done"}
 
-    @pytest.mark.usefixtures("outbox_capture")
     def test_chat_without_attachments_still_enqueues(self, server):
         """DELETE of an empty chat still enqueues one chat cleanup event
         (reason `chat_soft_delete`)."""

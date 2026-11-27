@@ -382,9 +382,8 @@ def provider_file_id(attachment_id: str) -> str:
 # terminal), its absence from the capture means it was not enqueued.
 #
 # The `server` fixture installs the trigger once the server is up, before any
-# test runs. A test that reads the outbox requests the `outbox_capture`
-# fixture. Without the outbox schema only those tests fail, at setup, and
-# the rest of the suite runs.
+# test runs. Without the outbox schema a test fails, with the reason, when it
+# reads the outbox; the rest of the suite runs.
 
 E2E_OUTBOX_CAPTURE = "e2e_outbox_capture"
 
@@ -409,10 +408,7 @@ _OUTBOX_UNAVAILABLE: str | None = "the server fixture has not installed the capt
 
 def _require_outbox() -> None:
     if _OUTBOX_UNAVAILABLE is not None:
-        raise RuntimeError(
-            f"outbox capture unavailable: {_OUTBOX_UNAVAILABLE} "
-            "(a test that reads the outbox requests the `outbox_capture` fixture)"
-        )
+        pytest.fail(f"outbox capture unavailable: {_OUTBOX_UNAVAILABLE}", pytrace=False)
 
 
 def outbox_table(suffix: str) -> str:
@@ -1166,14 +1162,6 @@ def server(test_env):
     # DB summary on teardown, once no turn is still running.
     _wait_no_running_turns()
     _db_summary_text = _print_db_summary()
-
-
-@pytest.fixture(scope="session")
-def outbox_capture(server):
-    """The outbox capture (see "Outbox capture"), for a test that reads the outbox.
-    Without the outbox schema the test fails at setup with the reason."""
-    if _OUTBOX_UNAVAILABLE is not None:
-        pytest.fail(f"outbox capture unavailable: {_OUTBOX_UNAVAILABLE}", pytrace=False)
 
 
 def _wait_no_running_turns(timeout: float = 5.0) -> None:

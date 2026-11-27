@@ -138,7 +138,6 @@ def _wait_for_summary(chat_id: str, timeout: float = 30.0) -> dict:
 class TestThreadSummary:
     """16-05, 19-09, 19-10."""
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_summary_replaces_summarized_messages(self, request, chat_with_model, mock_provider):
         """The turn that reaches the threshold schedules a summary of the
@@ -226,7 +225,6 @@ class TestThreadSummary:
             ("user", "Third question."),
         ]
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_retry_after_summary_does_not_resend_replaced_answer(
         self, request, chat_with_model, mock_provider,
@@ -259,7 +257,6 @@ class TestThreadSummary:
         assert replaced_answer not in str(captured[0]), "replaced answer resent"
         assert _summary_rows(chat_id) == [summary], "a summary that does not cover the turn is kept"
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     @pytest.mark.parametrize("mutation", ["retry", "edit", "delete"])
     def test_mutation_of_summarized_turn_drops_summary(
@@ -316,7 +313,6 @@ class TestThreadSummary:
         assert summary["summary_text"] not in str(captured[0]), "stale summary sent"
 
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(90)
     def test_retry_of_summarized_turn_restores_earlier_history(
         self, request, chat_with_model, mock_provider,
@@ -374,7 +370,6 @@ SUMMARY_MAX_ATTEMPTS = 3
 class TestThreadSummaryFailures:
     """The summary request fails at the provider."""
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_failed_summary_request_is_retried(self, request, chat_with_model, mock_provider):
         """A provider 500 on the summary request: the task is retried and the
@@ -389,7 +384,6 @@ class TestThreadSummaryFailures:
         assert summary["summary_text"] == "MOCK-SUMMARY 1 user and 1 assistant messages"
         assert len(_summary_requests(mock_provider, chat_id)) == 2
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_context_length_exceeded_drops_oldest_messages(
         self, request, chat_with_model, mock_provider,
@@ -427,7 +421,6 @@ class TestThreadSummaryFailures:
         messages = list_messages(chat_id)
         assert uuid_from_db(summary["summarized_up_to_message_id"]) == messages[5]["id"]
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(60)
     def test_summary_failing_every_attempt_changes_nothing(
         self, request, chat_with_model, mock_provider,

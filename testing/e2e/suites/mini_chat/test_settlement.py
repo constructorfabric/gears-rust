@@ -93,7 +93,6 @@ def _require_offline(request):
 class TestSettlement:
     """Quota settlement after various turn outcomes."""
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.multi_provider
     @pytest.mark.timeout(30)
     def test_completed_turn_releases_reserve(self, provider, provider_chat, mock_provider):
@@ -193,7 +192,6 @@ class TestSettlement:
         assert plain == {"reserve_tokens": 8747, "reserved_credits_micro": 124_545}, plain
         assert ws == {"reserve_tokens": 9247, "reserved_credits_micro": 126_045}, ws
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_cancelled_with_content(self, request, chat, mock_provider):
         """Disconnect after some deltas (the provider reported no usage): the
@@ -211,7 +209,6 @@ class TestSettlement:
         assert poll_turn(chat["id"], rid)["state"] == "cancelled"
         assert_estimated_settlement(rid, used_before, "aborted", "Write a long essay.")
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_cancelled_without_content(self, request, chat, mock_provider):
         """Disconnect before any delta: the turn is cancelled, the reserve
@@ -229,7 +226,6 @@ class TestSettlement:
         assert poll_turn(chat["id"], rid)["state"] == "cancelled"
         assert_estimated_settlement(rid, used_before, "aborted", "Write slowly.")
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_provider_http_error_releases_reserve(self, request, chat, mock_provider):
         """A provider HTTP 500 ends the stream with `error` and fails the turn;
@@ -255,7 +251,7 @@ class TestSettlement:
         assert poll_turn(chat["id"], rid)["state"] == "error"
         assert_estimated_settlement(rid, used_before, "failed", "This should fail.")
 
-    @pytest.mark.usefixtures("offline_only", "outbox_capture")
+    @pytest.mark.usefixtures("offline_only")
     @pytest.mark.timeout(30)
     @pytest.mark.parametrize("with_usage", [True, False], ids=["with_usage", "usage_null"])
     def test_response_failed_settles_on_reported_usage(self, chat, mock_provider, with_usage):
@@ -296,7 +292,6 @@ class TestSettlement:
         assert event["actual_credits_micro"] == 700 * 3 + 40 * 15, event
         assert total_daily_used() - used_before == 700 * 3 + 40 * 15
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_incomplete_response_is_done_and_settled_on_actual_usage(
         self, request, chat, mock_provider,
@@ -332,7 +327,7 @@ class TestSettlement:
         assert event["actual_credits_micro"] == cost, event
         assert total_daily_used() - used_before == cost
 
-    @pytest.mark.usefixtures("offline_only", "outbox_capture")
+    @pytest.mark.usefixtures("offline_only")
     @pytest.mark.timeout(30)
     def test_cached_and_reasoning_tokens_recorded_not_billed(self, chat, mock_provider):
         """The provider reports 300 cached of 400 input tokens and 40
@@ -381,7 +376,6 @@ class TestSettlement:
         assert event["actual_credits_micro"] == 2100, event
         assert total_daily_used() - used_before == 2100
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(30)
     def test_one_usage_outbox_event_per_turn(self, chat):
         """A completed turn enqueues exactly one usage event, even after a

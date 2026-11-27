@@ -155,7 +155,6 @@ class TestCodeInterpreterUsageAccounting:
         # The CODEINTERP scenario emits exactly one completed code_interpreter call.
         assert _query_ci_calls() == ci_before + 1
 
-    @pytest.mark.usefixtures("outbox_capture")
     @pytest.mark.timeout(20)
     def test_non_ci_turn_has_zero_ci_calls(self, provider, server, mock_provider):
         """In a chat without an XLSX the same `CODEINTERP:` prompt does not

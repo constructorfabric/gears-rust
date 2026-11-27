@@ -406,7 +406,7 @@ class TestWebSearchDailyQuota:
         assert mock_provider.get_captured_requests() == []
         assert_no_reserves(user3.user_id)
 
-    @pytest.mark.usefixtures("offline_only", "outbox_capture")
+    @pytest.mark.usefixtures("offline_only")
     def test_model_without_web_search_skips_tool_and_quota(self, user3, mock_provider):
         """Web search requested in a chat whose model has
         `tool_support.web_search: false` (gpt-5-nano): the turn runs without
@@ -474,7 +474,7 @@ class TestWebSearchDailyQuota:
         expect_done(parse_sse(resp.text))
         assert_no_reserves(user3.user_id)
 
-    @pytest.mark.usefixtures("offline_only", "outbox_capture")
+    @pytest.mark.usefixtures("offline_only")
     def test_web_search_below_quota_allowed(self, user3, mock_provider):
         """One call below the daily web_search quota: the turn runs with the
         `web_search` tool, and its one search is counted, which brings the
