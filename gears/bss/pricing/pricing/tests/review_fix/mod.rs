@@ -39,6 +39,15 @@ impl authz_resolver_sdk::AuthZResolverApi for PriceGrant {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, toolkit_canonical_errors::CanonicalError>
+    {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 fn scoped(f: &AcceptanceFixture) -> Arc<CommercialTermsService> {
     Arc::new(CommercialTermsService::new(

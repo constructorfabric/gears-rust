@@ -2246,6 +2246,14 @@ mod pdp_dedup_tests {
                 // closed as `CompileFailed`.
                 Ok(permit_scoped_to_request_tenant(&request))
             }
+
+            async fn evaluate_batch(
+                &self,
+                ctx: PlatformSecurityContext,
+                req: authz_resolver_sdk::EvaluationBatchRequest,
+            ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+                authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+            }
         }
 
         let plugin = HappyPathPlugin::new();
@@ -4128,6 +4136,14 @@ mod aggregate_op_kind_enforcement_tests {
                         ..Default::default()
                     },
                 })
+            }
+
+            async fn evaluate_batch(
+                &self,
+                ctx: PlatformSecurityContext,
+                req: authz_resolver_sdk::EvaluationBatchRequest,
+            ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+                authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
             }
         }
 

@@ -235,7 +235,18 @@ impl AuthZResolverApi for TrAuthz {
         _ctx: PlatformSecurityContext,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
-        Ok(self.0.evaluate(&request).await)
+        self.0
+            .evaluate(&request)
+            .await
+            .map_err(|e| CanonicalError::internal(e.to_string()).create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -250,6 +261,14 @@ impl AuthZResolverApi for StaticAuthz {
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(self.0.evaluate(&request))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

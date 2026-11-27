@@ -2,8 +2,8 @@
 //! Service implementation for the static `AuthZ` resolver plugin.
 
 use authz_resolver_sdk::{
-    Capability, Constraint, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
-    InPredicate, InTenantSubtreePredicate, Predicate,
+    Capability, Constraint, DenyReason, EvaluationRequest, EvaluationResponse,
+    EvaluationResponseContext, InPredicate, InTenantSubtreePredicate, Predicate,
 };
 use toolkit_macros::domain_model;
 use toolkit_security::pep_properties;
@@ -66,18 +66,12 @@ impl Service {
 
         let Some(tid) = tenant_id else {
             // No tenant resolvable from context or subject - deny access.
-            return EvaluationResponse {
-                decision: false,
-                context: EvaluationResponseContext::default(),
-            };
+            return Self::deny(DenyReason::INVALID_REQUEST);
         };
 
         if tid == Uuid::default() {
             // Nil UUID tenant - deny rather than grant unrestricted access.
-            return EvaluationResponse {
-                decision: false,
-                context: EvaluationResponseContext::default(),
-            };
+            return Self::deny(DenyReason::INVALID_REQUEST);
         }
 
         // This static PDP has no RG client and therefore cannot resolve group
@@ -89,10 +83,7 @@ impl Service {
                 .properties
                 .contains_key("ancestor_group_ids")
         {
-            return EvaluationResponse {
-                decision: false,
-                context: EvaluationResponseContext::default(),
-            };
+            return Self::deny(DenyReason::INVALID_REQUEST);
         }
 
         // Baseline OWNER_TENANT_ID clamp -- the universal shape a PEP binds when its
@@ -171,6 +162,11 @@ impl Service {
                 ..Default::default()
             },
         }
+    }
+
+    /// A denial carrying `error_code` (a batch denial must carry one).
+    fn deny(error_code: &str) -> EvaluationResponse {
+        EvaluationResponse::deny(DenyReason::new(error_code))
     }
 }
 

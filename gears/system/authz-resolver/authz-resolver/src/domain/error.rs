@@ -1,6 +1,8 @@
 //! Domain errors for the `AuthZ` resolver.
 
-use authz_resolver_sdk::AuthZResolverError;
+use std::time::Duration;
+
+use authz_resolver_sdk::{AuthZResolverError, BatchRequestError, BatchResultsError};
 use toolkit_macros::domain_model;
 
 /// Internal domain errors.
@@ -21,6 +23,17 @@ pub enum DomainError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// The batch request is invalid (empty, too many items, an unresolvable
+    /// key): the caller's error.
+    #[error("invalid batch request: {0}")]
+    InvalidBatch(#[source] BatchRequestError),
+
+    #[error("batch evaluation did not finish within {0:?}")]
+    BatchDeadlineExceeded(Duration),
+
+    #[error("plugin returned malformed batch results: {0}")]
+    MalformedBatchResults(#[source] BatchResultsError),
 }
 
 // TODO(DE1302): `DomainError::Internal` only carries a String, so these From

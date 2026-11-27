@@ -47,6 +47,15 @@ impl authz_resolver_sdk::AuthZResolverApi for Narrow {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, toolkit_canonical_errors::CanonicalError>
+    {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 async fn put_quorum(f: &Fixture, kind: &str, quorum: u32) {

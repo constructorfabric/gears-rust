@@ -1115,3 +1115,20 @@ fn a_filter_only_field_is_left_out_of_the_orderby_contract() {
             .contains_key("region")
     );
 }
+
+#[test]
+fn rest_route_options_name_body_limits_by_operation_and_report_unknown_ones() {
+    let options = RestRouteOptions::default()
+        .body_limit("evaluate_batch", 1024)
+        .body_limit("evaluate_bacth", 2048);
+    assert_eq!(options.body_limit_for("evaluate_batch"), Some(1024));
+    assert_eq!(options.body_limit_for("evaluate"), None);
+    assert_eq!(
+        options.check_operations(&["evaluate", "evaluate_batch"]),
+        Err(UnknownOperations(vec!["evaluate_bacth".to_owned()]))
+    );
+    RestRouteOptions::default()
+        .body_limit("evaluate_batch", 1024)
+        .check_operations(&["evaluate", "evaluate_batch"])
+        .unwrap();
+}

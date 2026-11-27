@@ -7,6 +7,7 @@ AuthZ resolver plugin that resolves tenant hierarchy via `TenantResolverClient`.
 1. **Tenant resolution** — `subject.properties["tenant_id"]` is always required (missing or nil → deny). `TenantContext.root_id` is a separate, optional target tenant: together with `resource.id` and `TenantContext.mode` it selects one of the rules R1–R8.
 2. **Hierarchy query** — calls `TenantResolverClient::is_ancestor` and `get_descendants`, with the barrier mode taken from the request's `TenantContext.barrier_mode` and `get_descendants` filtered by its `tenant_status`.
 3. **Predicate generation** — returns an `In` predicate on `owner_tenant_id` for tenant scoping (a single-value `In` for one tenant), plus `InGroup` when the resource has `group_ids` and the PEP advertises `GroupMembership`, and `InGroupSubtree` for `ancestor_group_ids` with `GroupMembership` and `GroupHierarchy`. A missing capability, an empty array or a malformed array is a deny
+4. **Denials and failures** — every denial carries `deny_reason.error_code`: `INVALID_REQUEST` for missing or malformed input (subject tenant, tenant status, `owner_tenant_id`, group properties), `INSUFFICIENT_PERMISSIONS` when a rule refuses access or a tenant is not found. Any other Tenant Resolver failure is not a decision: the evaluation fails with `ServiceUnavailable` (503) when the Tenant Resolver is unavailable and `Internal` (500) otherwise, on `/evaluate` and for the whole batch alike.
 
 ## Configuration
 

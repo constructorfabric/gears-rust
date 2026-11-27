@@ -5,6 +5,7 @@
 //! - [`AuthZResolverApi`] - Public API contract for consumers
 //! - [`AuthZResolverPluginClient`] - Plugin API trait for implementations
 //! - [`EvaluationRequest`], [`EvaluationResponse`] - Evaluation models
+//! - [`EvaluationBatchRequest`], [`EvaluationBatchResponse`] - Batch evaluation ([`batch`])
 //! - [`Constraint`], [`Predicate`] - Constraint types
 //! - [`AuthZResolverError`] - Error types
 //! - [`AuthZResolverPluginSpecV1`] - GTS schema for plugin discovery
@@ -48,6 +49,7 @@
 toolkit_gts::declare_gts_inventory!();
 
 pub mod api;
+pub mod batch;
 pub mod constraints;
 pub mod error;
 pub mod gts;
@@ -65,6 +67,11 @@ pub mod rest;
 // carries the `Api` suffix per the contract-kind convention.
 pub use api::{AuthZResolverApi, auth_z_resolver_api_ir};
 
+pub use batch::{
+    BatchRequestError, BatchResultsError, EvaluationBatchItem, EvaluationBatchOptions,
+    EvaluationBatchRequest, EvaluationBatchResponse, EvaluationsSemantic, MAX_BATCH_ITEMS,
+    check_batch_results, evaluate_batch_concurrently, evaluate_batch_sequentially,
+};
 pub use constraints::{
     Constraint, EqPredicate, InGroupPredicate, InGroupSubtreePredicate, InPredicate,
     InTenantSubtreePredicate, Predicate,
@@ -76,9 +83,13 @@ pub use models::{
     EvaluationResponse, EvaluationResponseContext, Resource, Subject, TenantContext, TenantMode,
 };
 pub use pep::{
-    AccessDenial, AccessRequest, EnforcerError, IntoPropertyValue, PolicyEnforcer, ResourceType,
+    AccessCheck, AccessCheckError, AccessDenial, AccessRequest, EnforcerError, IntoPropertyValue,
+    PolicyEnforcer, ResourceType,
 };
 pub use plugin_api::AuthZResolverPluginClient;
+/// The semaphore type of [`AuthZResolverPluginClient::evaluate_batch`], so
+/// plugins need no direct `tokio` dependency to implement it.
+pub use tokio::sync::Semaphore;
 // REST projection: base projection trait + HTTP binding builder (always), plus
 // the generated clients when `rest-client` is enabled.
 pub use rest::{AuthZResolverApiRest, auth_z_resolver_api_rest_http_binding};

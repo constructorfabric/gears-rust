@@ -57,6 +57,14 @@ impl AuthZResolverApi for ScriptedPdp {
         self.requests.lock().push(request);
         response.ok_or_else(|| CanonicalError::service_unavailable().create())
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// One grant of [`FakePdp`]: `subject` may take `actions` on whatever one of `paths` admits.
@@ -164,6 +172,14 @@ impl AuthZResolverApi for FakePdp {
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(self.decide(&request))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use authz_resolver_sdk::{
-    Action, Constraint, EvaluationRequest, EvaluationRequestContext, EvaluationResponse, Predicate,
-    Resource, Subject,
+    Action, Constraint, DenyReason, EvaluationRequest, EvaluationRequestContext,
+    EvaluationResponse, Predicate, Resource, Subject,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -168,10 +168,11 @@ fn shape(response: &EvaluationResponse) -> Vec<Vec<PredicateShape>> {
         .collect()
 }
 
+/// A denial with no delegation reason: it carries the generic
+/// `insufficient_permissions` code (every denial carries an error code, as
+/// batch evaluation requires).
 fn assert_plain_deny(response: &EvaluationResponse) {
-    assert!(!response.decision);
-    assert!(response.context.constraints.is_empty());
-    assert!(response.context.deny_reason.is_none());
+    assert_deny_reason(response, DenyReason::INSUFFICIENT_PERMISSIONS);
 }
 
 fn assert_deny_reason(response: &EvaluationResponse, code: &str) {

@@ -668,6 +668,14 @@ impl AuthZResolverApi for NarrowingPdp {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

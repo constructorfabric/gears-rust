@@ -101,6 +101,14 @@ impl AuthZResolverApi for ActsIn {
             Answer::Elsewhere(other) => allow(vec![*other]),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// The service identity: a subject of the platform root, never of the
@@ -572,7 +580,18 @@ mod hierarchy {
             _ctx: PlatformSecurityContext,
             request: EvaluationRequest,
         ) -> Result<EvaluationResponse, CanonicalError> {
-            Ok(self.0.evaluate(&request).await)
+            self.0
+                .evaluate(&request)
+                .await
+                .map_err(|e| CanonicalError::internal(e.to_string()).create())
+        }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
         }
     }
 
@@ -953,6 +972,14 @@ mod purge {
                 });
             }
             support::AllowInOwnTenant.evaluate(ctx, request).await
+        }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
         }
     }
 

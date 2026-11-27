@@ -9390,6 +9390,17 @@ mod management_permissions {
                 },
             })
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationBatchResponse,
+            toolkit_canonical_errors::CanonicalError,
+        > {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
 
     fn checks(client: &CapturingAuthZResolverClient) -> Vec<(String, String, Option<Uuid>)> {
@@ -9763,6 +9774,17 @@ mod management_permissions {
                         deny_reason: None,
                     },
                 })
+            }
+
+            async fn evaluate_batch(
+                &self,
+                ctx: toolkit_security::PlatformSecurityContext,
+                req: authz_resolver_sdk::EvaluationBatchRequest,
+            ) -> Result<
+                authz_resolver_sdk::EvaluationBatchResponse,
+                toolkit_canonical_errors::CanonicalError,
+            > {
+                authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
             }
         }
 
@@ -10168,6 +10190,17 @@ mod management_permissions {
                     deny_reason: None,
                 },
             })
+        }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationBatchResponse,
+            toolkit_canonical_errors::CanonicalError,
+        > {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
         }
     }
 
@@ -10739,6 +10772,17 @@ async fn empty_scope_denies_each_ancestor_permission() {
                     deny_reason: None,
                 },
             })
+        }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationBatchResponse,
+            toolkit::api::canonical_prelude::CanonicalError,
+        > {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
         }
     }
     let auth = AuthConfig {

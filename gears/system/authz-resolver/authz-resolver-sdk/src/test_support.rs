@@ -46,4 +46,13 @@ impl crate::AuthZResolverApi for EmptyScopePdp {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, toolkit::api::canonical_prelude::CanonicalError>
+    {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }

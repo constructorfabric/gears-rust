@@ -3198,6 +3198,14 @@ pub(crate) mod tests {
                     },
                 })
             }
+
+            async fn evaluate_batch(
+                &self,
+                ctx: PlatformSecurityContext,
+                req: authz_resolver_sdk::EvaluationBatchRequest,
+            ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+                authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+            }
         }
 
         let policy_enforcer = PolicyEnforcer::new(Arc::new(FixedAuthZ(allow)));
@@ -4961,6 +4969,17 @@ pub(crate) mod tests {
                 _: EvaluationRequest,
             ) -> Result<EvaluationResponse, toolkit_canonical_errors::CanonicalError> {
                 std::future::pending().await
+            }
+
+            async fn evaluate_batch(
+                &self,
+                ctx: toolkit_security::PlatformSecurityContext,
+                req: authz_resolver_sdk::EvaluationBatchRequest,
+            ) -> Result<
+                authz_resolver_sdk::EvaluationBatchResponse,
+                toolkit_canonical_errors::CanonicalError,
+            > {
+                authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
             }
         }
         let metrics = Arc::new(RequestRecorder::default());

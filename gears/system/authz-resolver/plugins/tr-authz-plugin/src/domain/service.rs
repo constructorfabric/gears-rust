@@ -20,9 +20,9 @@
 use std::sync::Arc;
 
 use authz_resolver_sdk::{
-    BarrierMode as AuthzBarrierMode, Capability, Constraint, EvaluationRequest, EvaluationResponse,
-    EvaluationResponseContext, InGroupPredicate, InGroupSubtreePredicate, InPredicate, Predicate,
-    TenantMode,
+    AuthZResolverError, BarrierMode as AuthzBarrierMode, Capability, Constraint, DenyReason,
+    EvaluationRequest, EvaluationResponse, EvaluationResponseContext, InGroupPredicate,
+    InGroupSubtreePredicate, InPredicate, Predicate, TenantMode,
 };
 use tenant_resolver_sdk::{
     BarrierMode, GetDescendantsOptions, IsAncestorOptions, TenantId, TenantResolverClient,
@@ -49,10 +49,19 @@ impl Service {
     ///
     /// Branches the request into one of 8 rules (R1–R8) by
     /// `resource.id.is_some()` × `tenant_context.root_id.is_some()` × `mode`.
-    /// On any failed access check, resolver call failure, or missing required
-    /// field — returns `deny` (fail-closed).
+    /// On any failed access check, unknown tenant, or missing or malformed
+    /// field — returns a coded `deny` (fail-closed).
+    ///
+    /// # Errors
+    ///
+    /// A Tenant Resolver failure other than an unknown tenant
+    /// (`ServiceUnavailable` when transient, `Internal` otherwise): a technical
+    /// failure is never returned as a denial.
     #[allow(clippy::cognitive_complexity)]
-    pub async fn evaluate(&self, request: &EvaluationRequest) -> EvaluationResponse {
+    pub async fn evaluate(
+        &self,
+        request: &EvaluationRequest,
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
         info!(
             action = %request.action.name,
             resource_type = %request.resource.resource_type,
@@ -63,11 +72,11 @@ impl Service {
         // R1/R2/R5/R6 use it inside `is_in_subtree`).
         let Some(subject_tid) = Self::read_uuid(&request.subject.properties, "tenant_id") else {
             warn!("tr-authz: subject tenant_id missing or unparseable -- deny");
-            return Self::deny();
+            return Ok(Self::deny(DenyReason::INVALID_REQUEST));
         };
         if subject_tid == Uuid::nil() {
             warn!("tr-authz: subject tenant_id is nil -- deny");
-            return Self::deny();
+            return Ok(Self::deny(DenyReason::INVALID_REQUEST));
         }
 
         let tc = request.context.tenant_context.as_ref();
@@ -85,7 +94,7 @@ impl Service {
                 Ok(v) => v,
                 Err(bad) => {
                     warn!(%bad, "tr-authz: unknown tenant_status value -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INVALID_REQUEST));
                 }
             },
         };
@@ -115,10 +124,10 @@ impl Service {
                 warn!(
                     "tr-authz: single-resource request missing owner_tenant_id in properties -- deny"
                 );
-                return Self::deny();
+                return Ok(Self::deny(DenyReason::INVALID_REQUEST));
             };
             self.evaluate_single(&ctx, subject_tid, owner_tid, root_id, &mode, barrier_mode)
-                .await
+                .await?
         } else {
             self.evaluate_list(
                 &ctx,
@@ -128,7 +137,7 @@ impl Service {
                 barrier_mode,
                 &tenant_statuses,
             )
-            .await
+            .await?
         };
 
         // Group predicates are orthogonal to tenant scoping — append only on
@@ -144,7 +153,7 @@ impl Service {
             .is_err()
         {
             warn!("tr-authz: malformed group scoping properties -- deny");
-            return Self::deny();
+            return Ok(Self::deny(DenyReason::INVALID_REQUEST));
         }
 
         // A decision-only CREATE (`require_constraints = false`, per the request
@@ -168,7 +177,7 @@ impl Service {
             response.context.constraints.clear();
         }
 
-        response
+        Ok(response)
     }
 
     // ── Single-resource branches (R1–R4) ──────────────────────────────────
@@ -182,51 +191,54 @@ impl Service {
         root_id: Option<Uuid>,
         mode: &TenantMode,
         barrier_mode: BarrierMode,
-    ) -> EvaluationResponse {
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
         match (root_id, mode) {
             (Some(root), TenantMode::RootOnly) => {
                 // R1: GET /tasks/{id}?tenant=t2&tenant_mode=root_only
                 if owner != root {
                     warn!(%owner, %root, "R1: owner_tenant_id != root_id -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
-                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await {
+                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await? {
                     warn!(%subject, %root, "R1: subject is not an ancestor of root_id -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
                 debug!(rule = "R1", %owner, "tr-authz: allow");
-                Self::allow_eq(owner)
+                Ok(Self::allow_eq(owner))
             }
             (Some(root), TenantMode::Subtree) => {
                 // R2: GET /tasks/{id}?tenant=t2
-                if !self.is_in_subtree(ctx, root, owner, barrier_mode).await {
+                if !self.is_in_subtree(ctx, root, owner, barrier_mode).await? {
                     warn!(%owner, %root, "R2: owner is not in root_id subtree -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
-                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await {
+                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await? {
                     warn!(%subject, %root, "R2: subject is not an ancestor of root_id -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
                 debug!(rule = "R2", %owner, "tr-authz: allow");
-                Self::allow_eq(owner)
+                Ok(Self::allow_eq(owner))
             }
             (None, TenantMode::RootOnly) => {
                 // R3: GET /tasks/{id}?tenant_mode=root_only
                 if owner != subject {
                     warn!(%owner, %subject, "R3: owner_tenant_id != subject tenant -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
                 debug!(rule = "R3", %owner, "tr-authz: allow");
-                Self::allow_eq(owner)
+                Ok(Self::allow_eq(owner))
             }
             (None, TenantMode::Subtree) => {
                 // R4: GET /tasks/{id}
-                if !self.is_in_subtree(ctx, subject, owner, barrier_mode).await {
+                if !self
+                    .is_in_subtree(ctx, subject, owner, barrier_mode)
+                    .await?
+                {
                     warn!(%owner, %subject, "R4: owner is not in subject subtree -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
                 debug!(rule = "R4", %owner, "tr-authz: allow");
-                Self::allow_eq(owner)
+                Ok(Self::allow_eq(owner))
             }
         }
     }
@@ -242,65 +254,57 @@ impl Service {
         mode: &TenantMode,
         barrier_mode: BarrierMode,
         tenant_statuses: &[TenantStatus],
-    ) -> EvaluationResponse {
+    ) -> Result<EvaluationResponse, AuthZResolverError> {
         match (root_id, mode) {
             (Some(root), TenantMode::RootOnly) => {
                 // R5: GET /tasks?tenant=t2&tenant_mode=root_only
                 // Subject must be (reflexive) ancestor of root_id.
-                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await {
+                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await? {
                     warn!(%subject, %root, "R5: subject is not an ancestor of root_id -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
                 debug!(rule = "R5", %root, "tr-authz: allow");
-                Self::allow_eq(root)
+                Ok(Self::allow_eq(root))
             }
             (Some(root), TenantMode::Subtree) => {
                 // R6: GET /tasks?tenant=t2
                 // Subject must be (reflexive) ancestor of root_id.
-                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await {
+                if !self.is_in_subtree(ctx, subject, root, barrier_mode).await? {
                     warn!(%subject, %root, "R6: subject is not an ancestor of root_id -- deny");
-                    return Self::deny();
+                    return Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS));
                 }
                 match self
                     .resolve_subtree(ctx, root, barrier_mode, tenant_statuses)
-                    .await
+                    .await?
                 {
-                    Ok(ids) if !ids.is_empty() => {
+                    Some(ids) if !ids.is_empty() => {
                         debug!(rule = "R6", %root, visible = ids.len(), "tr-authz: allow");
-                        Self::allow_in(ids)
+                        Ok(Self::allow_in(ids))
                     }
-                    Ok(_) => {
-                        warn!(%root, "R6: empty descendants -- deny");
-                        Self::deny()
-                    }
-                    Err(e) => {
-                        warn!(error = %e, %root, "R6: TR failure -- deny");
-                        Self::deny()
+                    _ => {
+                        warn!(%root, "R6: tenant not found or no visible tenants -- deny");
+                        Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS))
                     }
                 }
             }
             (None, TenantMode::RootOnly) => {
                 // R7: GET /tasks?tenant_mode=root_only
                 debug!(rule = "R7", %subject, "tr-authz: allow");
-                Self::allow_eq(subject)
+                Ok(Self::allow_eq(subject))
             }
             (None, TenantMode::Subtree) => {
                 // R8: GET /tasks
                 match self
                     .resolve_subtree(ctx, subject, barrier_mode, tenant_statuses)
-                    .await
+                    .await?
                 {
-                    Ok(ids) if !ids.is_empty() => {
+                    Some(ids) if !ids.is_empty() => {
                         debug!(rule = "R8", %subject, visible = ids.len(), "tr-authz: allow");
-                        Self::allow_in(ids)
+                        Ok(Self::allow_in(ids))
                     }
-                    Ok(_) => {
-                        warn!(%subject, "R8: empty descendants -- deny");
-                        Self::deny()
-                    }
-                    Err(e) => {
-                        warn!(error = %e, %subject, "R8: TR failure -- deny");
-                        Self::deny()
+                    _ => {
+                        warn!(%subject, "R8: tenant not found or no visible tenants -- deny");
+                        Ok(Self::deny(DenyReason::INSUFFICIENT_PERMISSIONS))
                     }
                 }
             }
@@ -310,16 +314,17 @@ impl Service {
     // ── TR helpers ────────────────────────────────────────────────────────
 
     /// Reflexive "candidate is in the closed subtree rooted at `anchor`".
-    /// Returns `false` on any TR error (fail-closed).
+    /// An unknown tenant is `false` (a policy answer); any other TR failure is
+    /// an error, never a denial: a technical failure is not a decision.
     async fn is_in_subtree(
         &self,
         ctx: &SecurityContext,
         anchor: Uuid,
         candidate: Uuid,
         barrier_mode: BarrierMode,
-    ) -> bool {
+    ) -> Result<bool, AuthZResolverError> {
         if anchor == candidate {
-            return true;
+            return Ok(true);
         }
         match self
             .tr
@@ -331,11 +336,9 @@ impl Service {
             )
             .await
         {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, %anchor, %candidate, "is_ancestor failed -- treat as false");
-                false
-            }
+            Ok(v) => Ok(v),
+            Err(TenantResolverError::TenantNotFound { .. }) => Ok(false),
+            Err(e) => Err(tr_failure("is_ancestor", &e)),
         }
     }
 
@@ -343,15 +346,16 @@ impl Service {
     ///
     /// `tenant_statuses` filters descendants by status (empty = all). Per the
     /// TR SDK contract (`GetDescendantsOptions::status`), the filter does not
-    /// apply to the starting tenant itself.
+    /// apply to the starting tenant itself. `None` when the tenant is unknown
+    /// (a policy answer); any other TR failure is an error.
     async fn resolve_subtree(
         &self,
         ctx: &SecurityContext,
         tenant_id: Uuid,
         barrier_mode: BarrierMode,
         tenant_statuses: &[TenantStatus],
-    ) -> Result<Vec<Uuid>, String> {
-        let response = self
+    ) -> Result<Option<Vec<Uuid>>, AuthZResolverError> {
+        let result = self
             .tr
             .get_descendants(
                 ctx,
@@ -362,18 +366,17 @@ impl Service {
                     max_depth: None,
                 },
             )
-            .await
-            .map_err(|e| match e {
-                TenantResolverError::TenantNotFound { .. } => {
-                    format!("Tenant {tenant_id} not found")
-                }
-                other => format!("TR error: {other}"),
-            })?;
+            .await;
+        let response = match result {
+            Ok(response) => response,
+            Err(TenantResolverError::TenantNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(tr_failure("get_descendants", &e)),
+        };
 
         let mut visible = Vec::with_capacity(response.descendants.len() + 1);
         visible.push(response.tenant.id.0);
         visible.extend(response.descendants.iter().map(|t| t.id.0));
-        Ok(visible)
+        Ok(Some(visible))
     }
 
     // ── Response builders ────────────────────────────────────────────────
@@ -402,11 +405,11 @@ impl Service {
         }
     }
 
-    fn deny() -> EvaluationResponse {
-        EvaluationResponse {
-            decision: false,
-            context: EvaluationResponseContext::default(),
-        }
+    /// A denial carrying `error_code`: malformed or missing request input is
+    /// [`DenyReason::INVALID_REQUEST`], a policy refusal
+    /// [`DenyReason::INSUFFICIENT_PERMISSIONS`]. A batch denial must carry one.
+    fn deny(error_code: &str) -> EvaluationResponse {
+        EvaluationResponse::deny(DenyReason::new(error_code))
     }
 
     // ── Group predicates (orthogonal to tenant) ──────────────────────────
@@ -495,6 +498,19 @@ impl Service {
             AuthzBarrierMode::Respect => BarrierMode::Respect,
             AuthzBarrierMode::Ignore => BarrierMode::Ignore,
         }
+    }
+}
+
+/// A Tenant Resolver failure other than an unknown tenant: unavailable or
+/// broken infrastructure, never a policy answer. Transient conditions are
+/// retryable `ServiceUnavailable`; the rest are `Internal`.
+fn tr_failure(call: &str, e: &TenantResolverError) -> AuthZResolverError {
+    warn!(error = %e, call, "tr-authz: tenant resolver failure -- evaluation fails");
+    match e {
+        TenantResolverError::ServiceUnavailable(_) | TenantResolverError::NoPluginAvailable => {
+            AuthZResolverError::ServiceUnavailable(format!("tenant resolver {call}: {e}"))
+        }
+        _ => AuthZResolverError::Internal(format!("tenant resolver {call}: {e}")),
     }
 }
 

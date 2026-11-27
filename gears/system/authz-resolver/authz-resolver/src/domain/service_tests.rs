@@ -4,6 +4,7 @@
 //! plugin the service selected.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use async_trait::async_trait;
 use authz_resolver_sdk::models::{Action, EvaluationRequestContext, Resource, Subject};
 use authz_resolver_sdk::{
     AuthZResolverError, AuthZResolverPluginClient, AuthZResolverPluginSpecV1, EvaluationRequest,
-    EvaluationResponse,
+    EvaluationResponse, EvaluationsSemantic,
 };
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
@@ -34,6 +35,16 @@ impl AuthZResolverPluginClient for Named {
         &self,
         _request: EvaluationRequest,
     ) -> Result<EvaluationResponse, AuthZResolverError> {
+        Err(AuthZResolverError::Internal(self.0.to_owned()))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        _requests: Vec<EvaluationRequest>,
+        _semantic: EvaluationsSemantic,
+        _max_concurrency: NonZeroUsize,
+        _in_flight: &authz_resolver_sdk::Semaphore,
+    ) -> Result<Vec<EvaluationResponse>, AuthZResolverError> {
         Err(AuthZResolverError::Internal(self.0.to_owned()))
     }
 }
@@ -288,6 +299,23 @@ mod pep {
         ) -> Result<EvaluationResponse, AuthZResolverError> {
             *self.seen.lock().expect("request lock poisoned") = Some(request);
             Ok(self.response.clone())
+        }
+
+        async fn evaluate_batch(
+            &self,
+            requests: Vec<EvaluationRequest>,
+            semantic: EvaluationsSemantic,
+            max_concurrency: NonZeroUsize,
+            in_flight: &authz_resolver_sdk::Semaphore,
+        ) -> Result<Vec<EvaluationResponse>, AuthZResolverError> {
+            authz_resolver_sdk::evaluate_batch_concurrently(
+                requests,
+                semantic,
+                max_concurrency,
+                in_flight,
+                |request| self.evaluate(request),
+            )
+            .await
         }
     }
 

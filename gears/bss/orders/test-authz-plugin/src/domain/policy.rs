@@ -181,14 +181,12 @@ impl Policy {
             return permit(Vec::new());
         }
 
-        let deny_reason = failure.map(|f| DenyReason {
-            error_code: match f {
-                DelegationFailure::Required => DELEGATION_PROOF_REQUIRED,
-                DelegationFailure::Invalid => DELEGATION_PROOF_INVALID,
-            }
-            .to_owned(),
-            details: None,
-        });
+        // Every denial carries an error code (required for batch evaluation).
+        let deny_reason = Some(DenyReason::new(match failure {
+            Some(DelegationFailure::Required) => DELEGATION_PROOF_REQUIRED,
+            Some(DelegationFailure::Invalid) => DELEGATION_PROOF_INVALID,
+            None => DenyReason::INSUFFICIENT_PERMISSIONS,
+        }));
         EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {

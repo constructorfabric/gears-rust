@@ -848,6 +848,17 @@ async fn bundled_static_provider_fails_closed_for_every_orders_resource() {
         {
             Ok(static_authz_plugin::domain::Service::new().evaluate(&request))
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationBatchResponse,
+            toolkit_canonical_errors::CanonicalError,
+        > {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
     let pep = pep(std::sync::Arc::new(BundledStatic));
     let a = arrangement(10, 20, 30);

@@ -1455,10 +1455,10 @@ fn capture_body_param(method: &RestMethodModel) -> Option<syn::Ident> {
 }
 
 fn generate_server_registration(model: &RestContractModel) -> TokenStream {
-    let fn_name = format_ident!(
-        "register_{}_routes",
-        to_snake_case(&model.trait_ident.to_string())
-    );
+    let snake = to_snake_case(&model.trait_ident.to_string());
+    let fn_name = format_ident!("register_{snake}_routes");
+    let fn_name_with = format_ident!("register_{snake}_routes_with");
+    let fn_name_inner = format_ident!("__register_{snake}_routes");
     let base_trait = &model.base_trait;
     let doc = format!(
         "Register the macro-generated REST routes for [`{}`] on the given router.\n\n\
@@ -1468,22 +1468,63 @@ fn generate_server_registration(model: &RestContractModel) -> TokenStream {
          `OperationBuilder::verb(..).register(router, openapi)` calls.",
         model.trait_ident
     );
+    let doc_with = format!(
+        "Like [`{fn_name}`], with runtime [`RestRouteOptions`](::toolkit::api::RestRouteOptions) \
+         (for example a per-operation request body limit from gear configuration). \
+         Operations are named by their contract method."
+    );
 
     // Methods marked `#[server_manual]` are excluded from generation so the
     // author can register them by hand. They remain in the client + IR.
-    let method_routes = model
+    let generated: Vec<&RestMethodModel> = model
         .methods
         .iter()
         .filter(|method| !method.server_manual)
+        .collect();
+    let method_routes = generated
+        .iter()
         .map(|method| generate_method_route(method, model));
+    let known_operations: Vec<String> = generated
+        .iter()
+        .map(|method| method.ident.to_string())
+        .collect();
 
     quote! {
         #[cfg(feature = "rest-server")]
         #[doc = #doc]
         pub fn #fn_name(
+            router: ::axum::Router,
+            openapi: &dyn ::toolkit::api::OpenApiRegistry,
+            svc: ::std::sync::Arc<dyn #base_trait>,
+        ) -> ::axum::Router {
+            #fn_name_inner(router, openapi, svc, &::toolkit::api::RestRouteOptions::default())
+        }
+
+        #[cfg(feature = "rest-server")]
+        #[doc = #doc_with]
+        ///
+        /// # Errors
+        ///
+        /// [`UnknownOperations`](::toolkit::api::UnknownOperations) when
+        /// `options` name an operation this contract does not register, in
+        /// every build profile: a misspelled operation would otherwise leave
+        /// its route without the configured limit.
+        pub fn #fn_name_with(
+            router: ::axum::Router,
+            openapi: &dyn ::toolkit::api::OpenApiRegistry,
+            svc: ::std::sync::Arc<dyn #base_trait>,
+            options: &::toolkit::api::RestRouteOptions,
+        ) -> ::std::result::Result<::axum::Router, ::toolkit::api::UnknownOperations> {
+            options.check_operations(&[#(#known_operations),*])?;
+            ::std::result::Result::Ok(#fn_name_inner(router, openapi, svc, options))
+        }
+
+        #[cfg(feature = "rest-server")]
+        fn #fn_name_inner(
             mut router: ::axum::Router,
             openapi: &dyn ::toolkit::api::OpenApiRegistry,
             svc: ::std::sync::Arc<dyn #base_trait>,
+            options: &::toolkit::api::RestRouteOptions,
         ) -> ::axum::Router {
             #(#method_routes)*
             router
@@ -1624,18 +1665,26 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
         quote! {}
     };
 
+    let method_name_str = method_name.to_string();
+
     quote! {
-        router = ::toolkit::api::OperationBuilder::#http_verb_method(#full_path)
-            .operation_id(#operation_id)
-            #auth_registration
-            #exposed_registration
-            #(#path_param_registrations)*
-            #query_param_registration
-            #request_registration
-            .handler(#handler)
-            #response_registration
-            .standard_errors(openapi)
-            .register(router, openapi);
+        router = {
+            let operation = ::toolkit::api::OperationBuilder::#http_verb_method(#full_path)
+                .operation_id(#operation_id)
+                #auth_registration
+                #exposed_registration
+                #(#path_param_registrations)*
+                #query_param_registration
+                #request_registration
+                .handler(#handler)
+                #response_registration
+                .standard_errors(openapi);
+            let operation = match options.body_limit_for(#method_name_str) {
+                ::std::option::Option::Some(bytes) => operation.body_limit(bytes, openapi),
+                ::std::option::Option::None => operation,
+            };
+            operation.register(router, openapi)
+        };
     }
 }
 

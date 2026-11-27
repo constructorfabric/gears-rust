@@ -126,6 +126,14 @@ impl AuthZResolverApi for TargetTenantAllowAuthZ {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Permits, but the sole constraint is `InTenantSubtree` rooted at a
@@ -159,6 +167,14 @@ impl AuthZResolverApi for InTenantSubtreeOnlyAuthZ {
                 deny_reason: None,
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -525,6 +541,14 @@ async fn empty_scope_never_authorizes_group_creation() {
                     deny_reason: None,
                 },
             })
+        }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
         }
     }
     let db = common::test_db().await;

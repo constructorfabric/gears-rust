@@ -69,6 +69,15 @@ impl authz_resolver_sdk::AuthZResolverApi for Resolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, toolkit_canonical_errors::CanonicalError>
+    {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 /// Authoring state over any database, with the scripted registry in its hub.
 pub async fn state_on(

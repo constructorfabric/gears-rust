@@ -122,6 +122,14 @@ impl AuthZResolverApi for Revocable {
             self.granted.evaluate(ctx, request).await
         }
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// The frozen basis over the platform default (no date required), on today's UTC date, so the

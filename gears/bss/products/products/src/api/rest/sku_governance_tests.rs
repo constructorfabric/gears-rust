@@ -1283,6 +1283,17 @@ impl authz_resolver_sdk::AuthZResolverApi for ActionResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 /// The action each served operation's door asks the PDP, by `operationId`. The release of a
 /// reference is `submit` for a caller that owns no reference (the operator route).

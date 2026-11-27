@@ -20,6 +20,7 @@ workspace = true
 [dependencies]
 # Serialization / core
 async-trait = { workspace = true }
+futures = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }
@@ -28,7 +29,7 @@ secrecy = { workspace = true }
 schemars = { workspace = true }
 utoipa = { workspace = true, features = ["uuid"] }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 # GTS types
 gts = { workspace = true }
@@ -65,3 +66,4 @@ otel = ["rest-client", "toolkit-contract/otel"]
 # (available to integration tests). Only the runtime is test-only.
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"] }
+proptest = { workspace = true }
