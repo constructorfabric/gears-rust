@@ -52,6 +52,8 @@
 //!   when a tenant is hard-deleted.
 //! * [`for_principal_lifecycle_tenant_hook`] — delivery of the tenant
 //!   hard-delete event to other gears' principal-lifecycle hooks.
+//! * [`for_ownership_probe`] — the built-in soft-delete ownership probe
+//!   against Resource Group's un-gated read surface.
 //!
 //! `delete_user`'s RG membership cleanup used to mint a `for_user_cleanup`
 //! system actor here; VHP-190 moved it to run under the caller's context
@@ -137,19 +139,14 @@ pub(crate) fn for_retention_sweep(tenant_id: Uuid) -> SecurityContext {
 }
 
 /// User-groups cascade-cleanup hook — fired when a tenant is
-/// hard-deleted and AM must walk its user-group memberships in RG.
-/// `tenant_id` is the tenant being deleted; it rides the audit log
-/// line only.
+/// hard-deleted and AM must remove its user groups in RG. `tenant_id`
+/// is the tenant being deleted; it rides the audit log line only.
 ///
-/// Platform-scoped, NOT scoped to `tenant_id`: the subject
-/// tenant here is by definition a `Deleted` row mid-purge, and the
-/// `AuthZ` resolver's system-actor grant would root a tenant-subtree
-/// scope at it — deleted roots are clamped out of scope
-/// materialization, the subtree resolves to zero tenants, and every
-/// RG cascade call fails closed. The reaper then defers the whole
-/// backlog forever. Platform scope (nil tenant → Global grant) is
-/// honest for this flow: the cascade addresses explicit group ids of
-/// a tenant that is being erased, not a live tenant's data.
+/// Platform-scoped, NOT scoped to `tenant_id`: the subject tenant here is
+/// by definition a `Deleted` row mid-purge. The cascade goes through RG's
+/// un-gated tenant-cleanup surface, which ignores the context, so the
+/// identity serves audit correlation; a tenant-bound identity would
+/// misleadingly suggest a grant rooted at a tenant that no longer exists.
 #[must_use]
 pub(crate) fn for_user_groups_cascade(tenant_id: Uuid) -> SecurityContext {
     tracing::info!(
@@ -175,6 +172,24 @@ pub(crate) fn for_principal_lifecycle_tenant_hook(tenant_id: Uuid) -> SecurityCo
     tracing::info!(
         target: "am.system_actor",
         site = "principal_lifecycle_tenant_hook",
+        tenant_id = %tenant_id,
+        "am system actor constructed",
+    );
+    build_inner(None)
+}
+
+/// Soft-delete ownership probe — the built-in resource-group check that
+/// `delete_tenant` runs before soft-deleting `tenant_id`. `tenant_id`
+/// rides the audit log line only.
+///
+/// Platform-scoped: the probe goes through Resource Group's un-gated read
+/// surface, which ignores the context, so the identity here exists for
+/// audit correlation and must not suggest a tenant-bound grant.
+#[must_use]
+pub(crate) fn for_ownership_probe(tenant_id: Uuid) -> SecurityContext {
+    tracing::info!(
+        target: "am.system_actor",
+        site = "ownership_probe",
         tenant_id = %tenant_id,
         "am system actor constructed",
     );
@@ -243,6 +258,14 @@ mod tests {
     #[test]
     fn principal_lifecycle_tenant_hook_is_platform_scoped() {
         let ctx = for_principal_lifecycle_tenant_hook(Uuid::from_u128(0xDEAD_BEEF_FACE_CAFE));
+        assert_eq!(ctx.subject_id(), AM_SYSTEM_ACTOR_UUID);
+        assert_eq!(ctx.subject_type(), Some(AM_SYSTEM_SUBJECT_TYPE));
+        assert_eq!(ctx.subject_tenant_id(), Uuid::nil());
+    }
+
+    #[test]
+    fn ownership_probe_is_platform_scoped() {
+        let ctx = for_ownership_probe(Uuid::from_u128(0xFEED));
         assert_eq!(ctx.subject_id(), AM_SYSTEM_ACTOR_UUID);
         assert_eq!(ctx.subject_type(), Some(AM_SYSTEM_SUBJECT_TYPE));
         assert_eq!(ctx.subject_tenant_id(), Uuid::nil());

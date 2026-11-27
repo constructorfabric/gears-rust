@@ -2062,16 +2062,16 @@ impl<R: TenantRepo> TenantService<R> {
         if child_count > 0 {
             return Err(DomainError::TenantHasChildren);
         }
-        // 2. Resource-ownership rejection. Caller's `ctx` is propagated
-        // so RG-side AuthZ + SecureORM resolve the parent's
-        // `AccessScope`; the checker narrows further to `tenant_id` via
-        // an OData filter so the answer reflects this child specifically
-        // rather than the whole reachable subtree.
-        let rg_links = self
+        // 2. Resource-ownership rejection. Like the child count above it
+        // is a structural guard, so it runs without the caller's `ctx`:
+        // the answer must be the same whoever deletes the tenant, or a
+        // caller who cannot see the tenant's resources could delete it
+        // from under them (see `ResourceOwnershipChecker`).
+        let owned = self
             .resource_checker
-            .count_ownership_links(ctx, tenant_id)
+            .count_ownership_links(tenant_id)
             .await?;
-        if rg_links > 0 {
+        if owned > 0 {
             return Err(DomainError::TenantHasResources);
         }
         // Read before the write, as in `update_tenant`.

@@ -65,6 +65,34 @@ pub struct AccountManagementConfig {
 
     /// In-process Tenant Resolver plugin registration knobs.
     pub tr_plugin: TrPluginConfig,
+
+    /// Tenant-ownership plugin selection: who answers "does this tenant
+    /// still own anything?" before soft-delete and cleans up after
+    /// hard-delete.
+    pub tenant_ownership: TenantOwnershipConfig,
+}
+
+/// Selection of the tenant-ownership plugin
+/// ([`account_management_sdk::TenantOwnershipPluginClient`]).
+///
+/// With no vendor configured (the default) AM answers the soft-delete
+/// ownership precondition itself, from the tenant's resource groups in
+/// Resource Group, and runs no extra hard-delete cleanup. With a vendor
+/// configured AM asks the plugin instance of that vendor instead and
+/// registers its cleanup as a hard-delete hook. A configured vendor whose
+/// plugin cannot be resolved fails the soft-delete with a retryable
+/// `service_unavailable` and defers the hard-delete; AM never silently falls
+/// back to the built-in check, because that would change what "owns
+/// something" means behind the operator's back.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TenantOwnershipConfig {
+    /// Vendor of the `PluginV1<TenantOwnershipPluginSpecV1>` instance to
+    /// select (lower `priority` wins among several of the same vendor, as
+    /// for the `IdP` and tenant-resolver plugins). `None` keeps the
+    /// built-in resource-group check. An empty string is rejected by
+    /// [`AccountManagementConfig::validate`].
+    pub vendor: Option<String>,
 }
 
 /// Pagination knobs for collection endpoints.
@@ -620,6 +648,16 @@ impl AccountManagementConfig {
         if self.tr_plugin.vendor.is_empty() {
             bad.push(
                 "tr_plugin.vendor (must be non-empty; an empty string would register an instance the TR gateway can never select)",
+            );
+        }
+        if self
+            .tenant_ownership
+            .vendor
+            .as_deref()
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            bad.push(
+                "tenant_ownership.vendor (must be non-empty when set; omit it to keep the built-in resource-group check)",
             );
         }
         // Conversion sub-section: validate eagerly so a bad

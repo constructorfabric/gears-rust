@@ -1187,18 +1187,18 @@ fn static_rule_passes_group_service_uses_retry() {
         "negative control violated: group_service.rs should not bypass \
          transaction_with_retry for its writes"
     );
-    // Exact count, not a floor: the four call sites are create_group,
-    // update_group (via attempt_update_group), move_group and delete_group --
-    // two of them pass a level chosen from the request, which is why the
-    // needle above matches the call and not the level. A floor would pass
-    // just as well if another transaction were added without retry, or if a
-    // refactor quietly dropped the wrapper from one; only exact equality
-    // catches both directions.
+    // Exact count, not a floor: the five call sites are create_group,
+    // update_group (via attempt_update_group), move_group, delete_group and
+    // delete_tenant_groups_unscoped -- two of them pass a level chosen from
+    // the request, which is why the needle above matches the call and not the
+    // level. A floor would pass just as well if another transaction were added
+    // without retry, or if a refactor quietly dropped the wrapper from one;
+    // only exact equality catches both directions.
     assert_eq!(
-        retried, 4,
-        "expected exactly 4 transaction_with_retry call sites in \
+        retried, 5,
+        "expected exactly 5 transaction_with_retry call sites in \
          group_service.rs -- create_group, update_group, move_group, \
-         delete_group -- found {retried}"
+         delete_group, delete_tenant_groups_unscoped -- found {retried}"
     );
 }
 

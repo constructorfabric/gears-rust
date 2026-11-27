@@ -180,8 +180,10 @@ paths:
         `deleted_at` to arm the retention sweep; the row is hard-deleted
         by the background reaper once the retention window elapses.
         Preconditions: the tenant has no non-deleted children
-        (`tenant_has_children`), no resources owned in resource-group
-        (`tenant_has_resources`), and is not the platform root
+        (`tenant_has_children`), owns nothing that blocks deletion
+        (`tenant_has_resources`; answered by the configured
+        tenant-ownership plugin, or by default by the tenant's resource
+        groups), and is not the platform root
         (`root_tenant_cannot_delete`). Returns 204 No Content on success;
         the post-delete projection (status=`deleted`,
         `deleted_at` set) can be re-read via

@@ -1,17 +1,26 @@
 //! Cascade cleanup hook for tenant hard-delete.
 //!
 //! Implements `cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger`.
+//!
+//! AM only triggers the cleanup; Resource Group owns its mechanics. The
+//! hook makes a single [`ResourceGroupTenantCleanup::delete_tenant_groups`]
+//! call naming the tenant and AM's user-group type, and RG removes every
+//! such group with its subtree, memberships and closure rows. Only AM's
+//! own group type is addressed, so groups other gears created for the
+//! tenant are left to their owners.
+//!
+//! The call goes through RG's un-gated tenant-cleanup surface rather than
+//! the PEP-gated `ResourceGroupClient`: the tenant is `Deleted` by the time
+//! the hook runs, and no PDP grant can address a deleted tenant's rows
+//! (see the trait's docs for why both a tenant-bound and a platform-scoped
+//! grant fail closed).
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::FutureExt;
-use resource_group_sdk::{ResourceGroupClient, ResourceGroupError};
-use toolkit_odata::ast::{CompareOperator, Expr, Value};
-use toolkit_odata::{CursorV1, ODataQuery};
-use toolkit_security::SecurityContext;
-use tracing::{debug, info};
+use resource_group_sdk::ResourceGroupTenantCleanup;
+use tracing::info;
 use uuid::Uuid;
 
 use super::USER_GROUP_TYPE_CODE;
@@ -19,18 +28,10 @@ use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
 use crate::domain::system_actor::for_user_groups_cascade;
 use crate::domain::tenant::hooks::{HookError, TenantHardDeleteHook};
 
-/// Default timeout for a single RG round-trip.
-const CASCADE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Maximum groups to fetch per page during cascade.
-const CASCADE_PAGE_SIZE: u64 = 100;
-
-/// Overall budget per cascade invocation. Caps the worst-case time the
-/// retention pipeline can spend on a single tenant before returning
-/// [`HookError::Retryable`] so the next tick resumes. Without this an
-/// O(N^2) parent/child retry loop combined with the 10s per-call
-/// `CASCADE_TIMEOUT` could keep one tenant blocking the pipeline for
-/// hours.
+/// Overall budget per cascade invocation. Caps the time the retention
+/// pipeline can spend on a single tenant before returning
+/// [`HookError::Retryable`] so the next tick resumes, keeping one slow RG
+/// call from monopolising the pipeline.
 #[allow(
     clippy::duration_suboptimal_units,
     reason = "from_mins is unstable on workspace MSRV; keep from_secs"
@@ -38,46 +39,44 @@ const CASCADE_PAGE_SIZE: u64 = 100;
 const CASCADE_BUDGET: Duration = Duration::from_secs(120);
 
 // @cpt-begin:cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger:p1:inst-flow-cascade-hook
-/// Build the cascade cleanup hook that deletes a tenant's user-group
-/// subtree via `ResourceGroupClient` during hard-delete.
+/// Build the cascade cleanup hook that deletes a tenant's user groups via
+/// RG during hard-delete.
 ///
-/// The hook:
-/// 1. Lists all groups of type `USER_GROUP_TYPE_CODE` scoped to
-///    `tenant_id`.
-/// 2. For each listed group without a listed parent, invokes
-///    [`ResourceGroupClient::delete_group_cascade`] (RG's `force=true`
-///    variant), which atomically tears down the group + its subtree +
-///    every membership row + every closure-table row anchored at it,
-///    in a single SERIALIZABLE transaction on the RG side.
-/// 3. Per-call `NotFound` is treated as idempotent success (a parent's
-///    cascade may already have eaten the descendant, or a peer cleanup
-///    tick may have raced this run).
-///
-/// If RG is unreachable, the hook returns [`HookError::Retryable`] so
-/// the pipeline defers the tenant to the next retention tick. The
-/// entire body is wrapped in a single [`tokio::time::timeout`]
-/// (`CASCADE_BUDGET`) so a single misbehaving tenant cannot monopolise
-/// the retention pipeline indefinitely.
+/// A tenant with no user groups is a successful no-op. Any RG failure, and
+/// exceeding [`CASCADE_BUDGET`], returns [`HookError::Retryable`] so the
+/// pipeline defers the tenant to the next retention tick; the call is
+/// idempotent, so a retry after a partial run finishes the job.
 pub fn build_cascade_cleanup_hook(
-    client: Arc<dyn ResourceGroupClient + Send + Sync>,
+    client: Arc<dyn ResourceGroupTenantCleanup + Send + Sync>,
 ) -> TenantHardDeleteHook {
     Arc::new(move |tenant_id: Uuid| {
         let client = Arc::clone(&client);
         async move {
-            // Overall budget — hit means we yield to the next retention
-            // tick instead of monopolising the pipeline.
-            match tokio::time::timeout(CASCADE_BUDGET, cascade_inner(&client, tenant_id)).await {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    emit_metric(
-                        AM_DEPENDENCY_HEALTH,
-                        MetricKind::Counter,
-                        &[
-                            ("target", "resource_group"),
-                            ("op", "cascade_cleanup"),
-                            ("outcome", "budget_exceeded"),
-                        ],
+            let start = Instant::now();
+            let ctx = for_user_groups_cascade(tenant_id);
+            let outcome = tokio::time::timeout(
+                CASCADE_BUDGET,
+                client.delete_tenant_groups(&ctx, tenant_id, USER_GROUP_TYPE_CODE),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(groups_deleted)) => {
+                    record("success");
+                    info!(
+                        target: "am.user_groups",
+                        tenant_id = %tenant_id,
+                        groups_deleted,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "cascade cleanup completed for tenant user groups"
                     );
+                    Ok(())
+                }
+                Ok(Err(e)) => {
+                    record("error");
+                    Err(retryable(format!("resource-group: {e}")))
+                }
+                Err(_elapsed) => {
+                    record("budget_exceeded");
                     Err(retryable(format!(
                         "cascade cleanup for tenant {tenant_id} exceeded overall budget of \
                          {}s; retrying on next retention tick",
@@ -91,247 +90,17 @@ pub fn build_cascade_cleanup_hook(
 }
 // @cpt-end:cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger:p1:inst-flow-cascade-hook
 
-/// Inner cascade body, separated so the overall budget timeout in the
-/// hook closure can wrap it as one future.
-///
-/// Each tenant-bound user-group is handed off to RG's
-/// [`ResourceGroupClient::delete_group_cascade`] (the SDK's
-/// `force=true` variant), which atomically tears down the group + its
-/// subtree + every membership row + every closure row in a single
-/// SERIALIZABLE transaction on the RG side.
-///
-/// `NotFound` per call is treated as idempotent success: a parent's
-/// cascade may have already removed a descendant before we reach it,
-/// or a peer cleanup tick may have raced this run. The order in
-/// which `fetch_tenant_groups` returns rows is irrelevant for the
-/// same reason -- cascading from a parent eats its descendants.
-async fn cascade_inner(
-    client: &Arc<dyn ResourceGroupClient + Send + Sync>,
-    tenant_id: Uuid,
-) -> Result<(), HookError> {
-    let start = Instant::now();
-    // System-actor context bound to the tenant being deleted. A future
-    // RG-side authz tightening that rejects `SecurityContext::anonymous`
-    // would not regress this hook because the subject is a stable
-    // platform-root UUID.
-    let ctx = for_user_groups_cascade(tenant_id);
-
-    let groups = fetch_tenant_groups(client, &ctx, tenant_id).await?;
-
-    if groups.is_empty() {
-        // Emit success on the empty-tenant path too so the metric fires on both
-        // terminal branches — operators charting cleanup-success rate see a
-        // unified signal.
-        emit_metric(
-            AM_DEPENDENCY_HEALTH,
-            MetricKind::Counter,
-            &[
-                ("target", "resource_group"),
-                ("op", "cascade_cleanup"),
-                ("outcome", "success"),
-            ],
-        );
-        info!(
-            target: "am.user_groups",
-            tenant_id = %tenant_id,
-            groups_deleted = 0,
-            elapsed_ms = start.elapsed().as_millis(),
-            "cascade cleanup completed (no groups)"
-        );
-        return Ok(());
-    }
-
-    let total_groups = groups.len();
-    let mut deleted: usize = 0;
-    let mut already_deleted: usize = 0;
-
-    for group_id in &groups {
-        if cascade_one(client, &ctx, tenant_id, *group_id).await? {
-            already_deleted += 1;
-        } else {
-            deleted += 1;
-        }
-    }
-
+/// Emit the cascade outcome on the shared dependency-health counter.
+fn record(outcome: &'static str) {
     emit_metric(
         AM_DEPENDENCY_HEALTH,
         MetricKind::Counter,
         &[
             ("target", "resource_group"),
             ("op", "cascade_cleanup"),
-            ("outcome", "success"),
+            ("outcome", outcome),
         ],
     );
-    info!(
-        target: "am.user_groups",
-        tenant_id = %tenant_id,
-        groups_listed = total_groups,
-        groups_deleted = deleted,
-        already_deleted,
-        elapsed_ms = start.elapsed().as_millis(),
-        "cascade cleanup completed for tenant user groups"
-    );
-
-    Ok(())
-}
-
-/// Issue a single `delete_group_cascade` call.
-///
-/// Returns `Ok(true)` when RG reports `NotFound` (idempotent skip),
-/// `Ok(false)` on a successful delete. Any other RG error or a
-/// per-call timeout becomes [`HookError::Retryable`] so the
-/// retention pipeline resumes on the next tick.
-async fn cascade_one(
-    client: &Arc<dyn ResourceGroupClient + Send + Sync>,
-    ctx: &SecurityContext,
-    tenant_id: Uuid,
-    group_id: Uuid,
-) -> Result<bool, HookError> {
-    // The trait boundary is `CanonicalError` (ADR 0005); project the
-    // inner result into the typed SDK view so the `NotFound` idempotent
-    // arm below dispatches as before.
-    let outcome = tokio::time::timeout(CASCADE_TIMEOUT, client.delete_group_cascade(ctx, group_id))
-        .await
-        .map(|r| r.map_err(ResourceGroupError::from));
-    match outcome {
-        Err(_elapsed) => {
-            emit_metric(
-                AM_DEPENDENCY_HEALTH,
-                MetricKind::Counter,
-                &[
-                    ("target", "resource_group"),
-                    ("op", "cascade_delete_group"),
-                    ("outcome", "timeout"),
-                ],
-            );
-            Err(retryable("timeout deleting group"))
-        }
-        Ok(Err(ResourceGroupError::NotFound { .. })) => {
-            // Already removed by a previous cascade step (parent ate
-            // the descendant) or a peer cleanup tick. Idempotent
-            // skip, observable so a future RG-side authz tightening
-            // that mis-classifies as `NotFound` does not silently
-            // leave orphaned closure / membership rows.
-            emit_metric(
-                AM_DEPENDENCY_HEALTH,
-                MetricKind::Counter,
-                &[
-                    ("target", "resource_group"),
-                    ("op", "cascade_delete_group"),
-                    ("outcome", "already_deleted"),
-                ],
-            );
-            debug!(
-                target: "am.user_groups",
-                tenant_id = %tenant_id,
-                group_id = %group_id,
-                "cascade-delete returned NotFound; treating as already-deleted"
-            );
-            Ok(true)
-        }
-        Ok(Err(e)) => {
-            emit_metric(
-                AM_DEPENDENCY_HEALTH,
-                MetricKind::Counter,
-                &[
-                    ("target", "resource_group"),
-                    ("op", "cascade_delete_group"),
-                    ("outcome", "error"),
-                ],
-            );
-            Err(retryable(format!(
-                "failed to cascade-delete group {group_id}: {e}"
-            )))
-        }
-        Ok(Ok(())) => Ok(false),
-    }
-}
-
-/// Fetch the tenant's AM user groups that need their own cascade.
-///
-/// Drain all pages of the exact-type listing before pruning groups covered by
-/// a listed parent's cascade.
-async fn fetch_tenant_groups(
-    client: &Arc<dyn ResourceGroupClient + Send + Sync>,
-    ctx: &SecurityContext,
-    tenant_id: Uuid,
-) -> Result<Vec<Uuid>, HookError> {
-    let filter = Expr::And(
-        Box::new(Expr::Compare(
-            Box::new(Expr::Identifier("tenant_id".to_owned())),
-            CompareOperator::Eq,
-            Box::new(Expr::Value(Value::Uuid(tenant_id))),
-        )),
-        Box::new(Expr::Compare(
-            Box::new(Expr::Identifier("type".to_owned())),
-            CompareOperator::Eq,
-            Box::new(Expr::Value(Value::String(USER_GROUP_TYPE_CODE.to_owned()))),
-        )),
-    );
-
-    let mut groups = Vec::new();
-    let mut cursor: Option<CursorV1> = None;
-
-    loop {
-        let mut query = ODataQuery::default()
-            .with_limit(CASCADE_PAGE_SIZE)
-            .with_filter(filter.clone());
-        if let Some(c) = cursor.take() {
-            query = query.with_cursor(c);
-        }
-
-        let page =
-            match tokio::time::timeout(CASCADE_TIMEOUT, client.list_groups(ctx, &query)).await {
-                Err(_elapsed) => {
-                    emit_metric(
-                        AM_DEPENDENCY_HEALTH,
-                        MetricKind::Counter,
-                        &[
-                            ("target", "resource_group"),
-                            ("op", "cascade_list_groups"),
-                            ("outcome", "timeout"),
-                        ],
-                    );
-                    return Err(retryable("resource-group: timeout listing user groups"));
-                }
-                Ok(Err(e)) => {
-                    emit_metric(
-                        AM_DEPENDENCY_HEALTH,
-                        MetricKind::Counter,
-                        &[
-                            ("target", "resource_group"),
-                            ("op", "cascade_list_groups"),
-                            ("outcome", "error"),
-                        ],
-                    );
-                    return Err(retryable(format!("resource-group: {e}")));
-                }
-                Ok(Ok(p)) => p,
-            };
-
-        groups.extend(
-            page.items
-                .into_iter()
-                .map(|group| (group.id, group.hierarchy.parent_id)),
-        );
-
-        match page.page_info.next_cursor {
-            Some(token) => {
-                cursor = Some(
-                    CursorV1::decode(&token)
-                        .map_err(|e| retryable(format!("invalid cursor from RG: {e}")))?,
-                );
-            }
-            None => break,
-        }
-    }
-
-    let listed_ids: HashSet<_> = groups.iter().map(|(id, _)| *id).collect();
-    Ok(groups
-        .into_iter()
-        .filter(|(_, parent_id)| parent_id.is_none_or(|id| !listed_ids.contains(&id)))
-        .map(|(id, _)| id)
-        .collect())
 }
 
 fn retryable(detail: impl Into<String>) -> HookError {

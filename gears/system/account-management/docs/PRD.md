@@ -429,9 +429,9 @@ The system **MUST** allow an administrator to change a tenant's status between `
 
 **Actors**: `cpt-cf-account-management-actor-tenant-admin`, `cpt-cf-account-management-actor-platform-admin`
 
-The system **MUST** allow deletion of a **non-root** tenant only when it has no non-deleted child tenants and no remaining tenant-owned resource associations in the Resource Group ownership graph, transitioning the tenant to `deleted` status (soft delete). Attempts to delete the root tenant **MUST** be rejected as `InvalidArgument` (HTTP 400) with `reason=ROOT_TENANT_CANNOT_DELETE`. If non-deleted children exist, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_CHILDREN`. If resource associations remain under the tenant's ownership scope, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_RESOURCES`. Hard deletion **MUST** occur after a configurable retention period (default: 90 days). The hard-deletion process **MUST NOT** leave orphaned child tenant records. When a parent and child tenant share the same retention window, the hard-deletion background job **MUST** process leaf tenants before their parents (leaf-first ordering).
+The system **MUST** allow deletion of a **non-root** tenant only when it has no non-deleted child tenants and owns nothing that blocks deletion, transitioning the tenant to `deleted` status (soft delete). What a tenant owns is answered by the deployment's tenant-ownership plugin when one is configured (for example a product that knows which of its resources are still live), and otherwise by whether any resource group in Resource Group names the tenant as owner. The answer **MUST NOT** depend on which caller requests the deletion. Attempts to delete the root tenant **MUST** be rejected as `InvalidArgument` (HTTP 400) with `reason=ROOT_TENANT_CANNOT_DELETE`. If non-deleted children exist, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_CHILDREN`. If the tenant still owns something, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_RESOURCES`; if ownership cannot be determined, deletion **MUST** be refused with a retryable `service_unavailable` rather than assumed empty. Hard deletion **MUST** occur after a configurable retention period (default: 90 days). The hard-deletion process **MUST NOT** leave orphaned child tenant records, and **MUST** let the configured tenant-ownership plugin clean up the tenant's leftovers before the tenant row is removed. When a parent and child tenant share the same retention window, the hard-deletion background job **MUST** process leaf tenants before their parents (leaf-first ordering).
 
-- **Rationale**: Preventing deletion of tenants with active children or remaining resource ownership links protects organizational integrity and prevents orphaned ownership mappings. The root tenant is undeletable so the deployment always retains exactly one hierarchy root. Soft delete with retention enables recovery and compliance. Ensuring no orphaned child records prevents referential integrity violations during retention cleanup.
+- **Rationale**: Preventing deletion of tenants with active children or remaining owned resources protects organizational integrity and prevents orphaned resources. Asking the component that owns the resources, rather than inferring ownership from bookkeeping such as resource groups that may outlive every resource in them, keeps tenants that own nothing deletable; answering independently of the caller keeps a caller who cannot see a tenant's resources from deleting it. The root tenant is undeletable so the deployment always retains exactly one hierarchy root. Soft delete with retention enables recovery and compliance. Ensuring no orphaned child records prevents referential integrity violations during retention cleanup.
 
 #### Children Query with Pagination
 
@@ -1392,11 +1392,11 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 
 **Preconditions**:
 - Tenant `T5` has no children
-- Tenant `T5` has no remaining resource ownership associations in Resource Group
+- Tenant `T5` owns nothing that blocks deletion (per the configured tenant-ownership plugin, or the built-in resource-group check)
 
 **Main Flow**:
 1. Administrator submits a delete request for `T5`.
-2. System validates that `T5` has no children and no remaining resource ownership associations.
+2. System validates that `T5` has no children and owns nothing that blocks deletion.
 3. System transitions `T5` to `deleted` status as a soft delete.
 4. System schedules hard deletion after the configured retention period, by default 90 days.
 
@@ -2016,7 +2016,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 |------------|-------------|-------------|
 | IdP Provider (via IdP integration contract) | User authentication, token issuance, user-tenant binding. IdP must be available before AM bootstrap completes. | p1 |
 | GTS Types Registry | Provides runtime-extensible tenant type definitions and parent-child constraint validation at tenant creation time. | p1 |
-| [Resource Group](../../resource-group/docs/PRD.md) | User group hierarchy, membership storage, cycle detection, tenant-scoped isolation, and the ownership-graph data AM reads to verify that no tenant-owned resource associations remain before soft deletion. | p1 |
+| [Resource Group](../../resource-group/docs/PRD.md) | User group hierarchy, membership storage, cycle detection, tenant-scoped isolation, the ownership data AM reads (through its un-gated read surface) for the built-in soft-delete ownership check, and the un-gated tenant cleanup AM uses for user groups at hard deletion. | p1 |
 
 **Depend on AM (consumers):**
 
@@ -2035,7 +2035,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - Parent-child tenant creation is governed by GTS type constraints (allowed-parents rules); extensible by registering new GTS type schemas without code changes.
 - The v1 tenant-mode contract is binary: `managed` and `self-managed`. Richer barrier taxonomies are explicitly out of scope for this review baseline.
 - RBAC Engine handles role definitions, role assignments, and group-to-role binding; Resource Group provides group structure and membership data, while AM provides tenant hierarchy, barrier context, and IdP-backed user lookup when needed.
-- Resource ownership is represented in the Resource Group ownership graph; tenant deletion validation relies on the absence of resource associations under the tenant's ownership scope.
+- Without a tenant-ownership plugin, resource ownership is represented in the Resource Group ownership graph and tenant deletion validation relies on the absence of resource groups owned by the tenant; a deployment whose resources live elsewhere supplies a tenant-ownership plugin instead.
 - Authorization enforcement (AuthZ Resolver) and barrier-aware traversal (Tenant Resolver Plugin) are downstream consumers of AM data. The Tenant Resolver Plugin is a stateless query facade over the same database that AM owns, consuming `tenants` and `tenant_closure` directly through a read-only database role; the Plugin holds no derived state of its own, so consistency with AM follows from transactional co-maintenance of those tables inside AM.
 
 ## 12. Risks

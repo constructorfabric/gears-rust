@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod read_service;
 pub mod repo;
 pub mod rg_service;
+pub mod tenant_cleanup_service;
 pub mod type_catalog;
 
 /// Type alias for the database provider used by domain services.

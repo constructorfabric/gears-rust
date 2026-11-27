@@ -1,12 +1,9 @@
 //! Test helpers shared across crate-internal integration tests for the
-//! Resource Group SDK adapter. Promoted to `pub(crate)` (compiled
-//! under `#[cfg(test)]` only) so service-level tests in
+//! Resource Group SDK adapter. Promoted to `pub(crate)` (compiled under
+//! `#[cfg(test)]` only) so service-level tests in
 //! `domain/tenant/service/service_tests.rs` can wire the production
-//! [`super::RgResourceOwnershipChecker`] against a slow / empty fake
-//! without re-stubbing the full ~15-method `ResourceGroupClient`
-//! trait at every call site. The in-file fakes inside
-//! `super::checker::tests` exercise the checker in isolation; this
-//! gear exists for the cross-gear integration use case.
+//! [`super::RgResourceOwnershipChecker`] against a slow fake. The in-file
+//! fakes inside `super::checker::tests` exercise the checker in isolation.
 
 #![cfg(test)]
 
@@ -14,20 +11,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use resource_group_sdk::{
-    CreateGroupRequest, ResourceGroup, ResourceGroupClient, ResourceGroupMembership,
-    ResourceGroupWithDepth, UpdateGroupRequest,
+    ResourceGroup, ResourceGroupMembership, ResourceGroupReadHierarchy, ResourceGroupWithDepth,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-/// Minimal `ResourceGroupClient` fake whose `list_groups` sleeps for
-/// `delay` before returning an empty page. Any other trait method is
-/// `unreachable!()` — service-level integration tests exercise only
-/// the soft-delete probe path. Use with
-/// `#[tokio::test(start_paused = true)]` to verify the production
-/// timeout boundary fires deterministically.
+/// Minimal `ResourceGroupReadHierarchy` fake whose `list_groups` sleeps
+/// for `delay` before returning an empty page. Any other trait method is
+/// `unreachable!()` — service-level integration tests exercise only the
+/// soft-delete probe path. Use with `#[tokio::test(start_paused = true)]`
+/// to verify the production timeout boundary fires deterministically.
 pub struct SlowRgClient {
     pub delay: Duration,
 }
@@ -39,40 +34,7 @@ impl SlowRgClient {
 }
 
 #[async_trait]
-impl ResourceGroupClient for SlowRgClient {
-    async fn create_group(
-        &self,
-        _ctx: &SecurityContext,
-        _request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<ResourceGroup, CanonicalError> {
-        unreachable!()
-    }
-    async fn list_groups(
-        &self,
-        _ctx: &SecurityContext,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, CanonicalError> {
-        tokio::time::sleep(self.delay).await;
-        Ok(Page::empty(1))
-    }
-    async fn update_group(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-        _request: UpdateGroupRequest,
-    ) -> Result<ResourceGroup, CanonicalError> {
-        unreachable!()
-    }
-    async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
-        unreachable!()
-    }
+impl ResourceGroupReadHierarchy for SlowRgClient {
     async fn get_group_descendants(
         &self,
         _ctx: &SecurityContext,
@@ -89,22 +51,19 @@ impl ResourceGroupClient for SlowRgClient {
     ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
         unreachable!()
     }
-    async fn add_membership(
+    async fn list_groups(
         &self,
         _ctx: &SecurityContext,
-        _group_id: Uuid,
-        _resource_type: &str,
-        _resource_id: &str,
-    ) -> Result<ResourceGroupMembership, CanonicalError> {
-        unreachable!()
+        _query: &ODataQuery,
+    ) -> Result<Page<ResourceGroup>, CanonicalError> {
+        tokio::time::sleep(self.delay).await;
+        Ok(Page::empty(1))
     }
-    async fn remove_membership(
+    async fn get_group(
         &self,
         _ctx: &SecurityContext,
-        _group_id: Uuid,
-        _resource_type: &str,
-        _resource_id: &str,
-    ) -> Result<(), CanonicalError> {
+        _id: Uuid,
+    ) -> Result<ResourceGroup, CanonicalError> {
         unreachable!()
     }
     async fn list_memberships(

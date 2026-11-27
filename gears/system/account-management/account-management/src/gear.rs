@@ -67,6 +67,7 @@ use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo_impl::{
     AmDbProvider, ConversionRepoImpl, MetadataRepoImpl, TenantHierarchyReadAdapter, TenantRepoImpl,
 };
+use crate::infra::tenant_ownership::LazyTenantOwnershipChecker;
 use crate::infra::types_registry::root_type::desired_root_schema;
 use crate::infra::types_registry::{GtsMetadataSchemaRegistry, GtsTenantTypeChecker};
 use crate::tr_plugin::PluginImpl as TrPluginImpl;
@@ -765,23 +766,55 @@ impl Gear for AccountManagementGear {
         );
         // @cpt-end:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-resolve-plugin
 
-        // FEATURE 2.3 follow-up — hard-resolve the Resource Group
-        // client for the soft-delete `tenant_has_resources` probe.
+        // The PEP-gated RG client backs user-membership cleanup on
+        // `delete_user`, which runs under the caller's context.
         // resource-group is declared in `deps` so the runtime guarantees
-        // init ordering, and the probe is load-bearing for soft-delete
-        // safety (DESIGN §3.5): a missing client would silently admit
-        // soft-delete on tenants that still own RG rows, which is
-        // contract-broken rather than degraded — so we fail closed at
-        // init instead of binding an inert fallback in production.
-        // (Tests construct the service directly with
-        // `InertResourceOwnershipChecker` and bypass this init path.)
+        // init ordering; a missing client is fatal.
         let rg_client: Arc<dyn resource_group_sdk::ResourceGroupClient + Send + Sync> = ctx
             .client_hub()
             .get::<dyn resource_group_sdk::ResourceGroupClient>()
             .map_err(|e| anyhow::anyhow!("failed to get ResourceGroupClient: {e}"))?;
-        info!("resource-group client resolved from client hub; enabling RG ownership checker");
-        let resource_checker: Arc<dyn ResourceOwnershipChecker> =
-            Arc::new(RgResourceOwnershipChecker::new(Arc::clone(&rg_client)));
+
+        // Soft-delete ownership precondition (DESIGN §3.5). The answer
+        // must not depend on the deleting caller, so neither option
+        // carries the caller's context:
+        //   * `tenant_ownership.vendor` unset → the built-in check over the
+        //     tenant's RG groups, through RG's un-gated read surface;
+        //   * vendor set → the product's tenant-ownership plugin, resolved
+        //     lazily (its gear may init after AM); its cleanup joins the
+        //     hard-delete hooks below. An unresolvable plugin fails closed
+        //     (503 / deferred cleanup), never back to the built-in check.
+        // A missing RG read client would silently admit soft-delete of
+        // tenants that still own groups, so it is fatal at init rather
+        // than replaced by an inert fallback. (Tests construct the service
+        // directly with `InertResourceOwnershipChecker`.)
+        let mut ownership_cleanup_hook: Option<TenantHardDeleteHook> = None;
+        let resource_checker: Arc<dyn ResourceOwnershipChecker> = if let Some(vendor) =
+            cfg.tenant_ownership.vendor.clone()
+        {
+            let lazy = Arc::new(LazyTenantOwnershipChecker::new(
+                ctx.client_hub(),
+                Arc::clone(&platform_registry),
+                vendor.clone(),
+            ));
+            ownership_cleanup_hook = Some(lazy.cleanup_hook());
+            info!(
+                configured_vendor = %vendor,
+                "tenant ownership answered by the tenant-ownership plugin; resolution deferred to first call"
+            );
+            lazy
+        } else {
+            let rg_read: Arc<dyn resource_group_sdk::ResourceGroupReadHierarchy + Send + Sync> =
+                ctx.client_hub()
+                    .get::<dyn resource_group_sdk::ResourceGroupReadHierarchy>()
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to get ResourceGroupReadHierarchy: {e}")
+                    })?;
+            info!(
+                "tenant ownership answered by the built-in resource-group check (no tenant_ownership.vendor configured)"
+            );
+            Arc::new(RgResourceOwnershipChecker::new(rg_read))
+        };
 
         // PEP boundary (DESIGN §4.2). Hard-fail when no `AuthZResolverApi`
         // is registered: DESIGN §4.3 mandates fail-closed for protected
@@ -811,10 +844,22 @@ impl Gear for AccountManagementGear {
         // tenant hard-delete removes the tenant's user-group subtree
         // via RG before the `tenants` row is deleted.
         // @cpt-begin:cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger:p1:inst-flow-cascade-entry
+        let rg_tenant_cleanup: Arc<
+            dyn resource_group_sdk::ResourceGroupTenantCleanup + Send + Sync,
+        > = ctx
+            .client_hub()
+            .get::<dyn resource_group_sdk::ResourceGroupTenantCleanup>()
+            .map_err(|e| anyhow::anyhow!("failed to get ResourceGroupTenantCleanup: {e}"))?;
         self.register_hard_delete_hook(crate::domain::user_groups::build_cascade_cleanup_hook(
-            Arc::clone(&rg_client),
+            rg_tenant_cleanup,
         ));
         // @cpt-end:cpt-cf-account-management-flow-user-groups-cascade-cleanup-trigger:p1:inst-flow-cascade-entry
+
+        // The tenant-ownership plugin's cleanup runs after AM's own
+        // user-group cleanup, before the IdP deprovision and row delete.
+        if let Some(hook) = ownership_cleanup_hook {
+            self.register_hard_delete_hook(hook);
+        }
 
         // Principal-lifecycle hooks: other gears register a hook to hear
         // about user and tenant deletions. One dispatcher serves both the `delete_user` path

@@ -1,87 +1,84 @@
-//! `RgResourceOwnershipChecker` — production
-//! [`crate::domain::tenant::resource_checker::ResourceOwnershipChecker`]
-//! wired against `resource_group_sdk::ResourceGroupClient` resolved
-//! from `ClientHub`.
+//! `RgResourceOwnershipChecker` — the built-in
+//! [`crate::domain::tenant::resource_checker::ResourceOwnershipChecker`],
+//! answering from the tenant's resource groups in `resource-group`.
 //!
-//! Production binding for the soft-delete ownership probe (DESIGN §3.5):
-//! `resource-group` is a hard `deps` of AM, so this checker is always
-//! the one wired in production. The placeholder
+//! The gear wires it when no tenant-ownership plugin vendor is configured
+//! (`tenant_ownership.vendor` unset); with a vendor configured the
+//! plugin answers instead. The placeholder
 //! [`crate::domain::tenant::resource_checker::InertResourceOwnershipChecker`]
 //! is reserved for unit tests.
 //!
 //! ## Probe shape
 //!
-//! `delete_tenant` only needs a boolean ("does the child tenant own at
-//! least one RG row?") to drive the [`DomainError::TenantHasResources`]
-//! rejection. The implementation issues:
+//! `delete_tenant` only needs a boolean ("does the tenant own at least one
+//! RG group?") to drive the [`DomainError::TenantHasResources`] rejection.
+//! The implementation issues:
 //!
 //! ```text
-//! list_groups(ctx, $top=1, $filter=tenant_id eq <child>)
+//! list_groups($top=1, $filter=tenant_id eq <tenant>)
 //! ```
 //!
-//! and reports `1` when the page has any items, `0` otherwise. The
-//! caller's [`SecurityContext`] is propagated so RG-side `AuthZ` +
-//! `SecureORM` apply the parent's `AccessScope` (which already covers
-//! descendants per RG PRD §4); the `OData` filter narrows the answer to
-//! the *specific* child tenant rather than the whole reachable subtree
-//! — without that filter an unfiltered `list_groups($top=1)` would
-//! return non-empty whenever any sibling owns RG rows, over-blocking
-//! soft-delete.
+//! and reports `1` when the page has any items, `0` otherwise.
 //!
-//! ## Coordination
+//! ## Caller-independent read
 //!
-//! The `tenant_id` filter field was added to RG's `GroupFilterField`
-//! whitelist in constructorfabric/gears-rust#1626 (closed). RG ships
-//! the field as the un-nested identifier `tenant_id` (not
-//! `hierarchy/tenant_id`); this checker matches that wire shape.
+//! The probe goes through [`ResourceGroupReadHierarchy`], RG's in-process
+//! read surface that bypasses the `PolicyEnforcer`, not through the
+//! PEP-gated `ResourceGroupClient`. Through the gated client the answer
+//! depended on the deleting caller's PDP scope: a group the caller could
+//! not see read as "no groups", so a tenant still owning groups (and the
+//! resources inside them) was deleted, while the same tenant was refused
+//! for a caller who could see them. The `tenant_id` filter alone selects
+//! the tenant; the answer is a single boolean, and the tenant-level
+//! `DELETE` authorization has already run, so nothing is disclosed. The
+//! `SecurityContext` passed to RG is AM's system actor and serves audit
+//! correlation only — RG ignores it on this surface.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use resource_group_sdk::ResourceGroupClient;
+use resource_group_sdk::ResourceGroupReadHierarchy;
 use toolkit_odata::ODataQuery;
 use toolkit_odata::ast::{CompareOperator, Expr, Value};
-use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::metrics::{AM_DEPENDENCY_HEALTH, MetricKind, emit_metric};
+use crate::domain::system_actor::for_ownership_probe;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
 
 /// `OData` identifier for the tenant-scope column on `ResourceGroup`.
 ///
-/// Matches `GroupFilterField::TenantId` as exposed by RG SDK; RG
-/// shipped the field with the un-nested name `tenant_id` per the
-/// `#1626` whitelist work. The literal here keeps AM independent of
-/// the SDK's enum re-exports.
+/// Matches `GroupFilterField::TenantId` as exposed by RG SDK (the
+/// un-nested identifier `tenant_id`, not `hierarchy/tenant_id`). The
+/// literal here keeps AM independent of the SDK's enum re-exports.
 const TENANT_ID_FIELD: &str = "tenant_id";
 
-/// Default RG probe timeout (ms). Picked to be tight enough that a
-/// hung RG never stalls a tenant soft-delete saga past the 503
-/// fail-something boundary, and loose enough that healthy RG round
-/// trips never spuriously time out. Mirrors the donor-branch default.
+/// Default RG probe timeout (ms). Tight enough that a hung RG never
+/// stalls a tenant soft-delete past the 503 boundary, loose enough that
+/// healthy RG round trips never spuriously time out.
 const DEFAULT_PROBE_TIMEOUT_MS: u64 = 2_000;
 
-/// Production resource-ownership checker backed by the Resource Group
-/// SDK.
+/// Built-in resource-ownership checker backed by RG's un-gated read
+/// surface.
 pub struct RgResourceOwnershipChecker {
-    client: Arc<dyn ResourceGroupClient + Send + Sync>,
+    client: Arc<dyn ResourceGroupReadHierarchy + Send + Sync>,
     probe_timeout: Duration,
 }
 
 impl RgResourceOwnershipChecker {
-    /// Construct a new checker around an RG client resolved from
-    /// `ClientHub`, using the backward-compatible default timeout.
+    /// Construct a new checker around RG's read client resolved from
+    /// `ClientHub`, using the default timeout.
     #[must_use]
-    pub fn new(client: Arc<dyn ResourceGroupClient + Send + Sync>) -> Self {
+    pub fn new(client: Arc<dyn ResourceGroupReadHierarchy + Send + Sync>) -> Self {
         Self::with_timeout(client, DEFAULT_PROBE_TIMEOUT_MS)
     }
 
-    /// Construct a checker with the configured probe timeout.
+    /// Construct a checker with an explicit probe timeout.
     #[must_use]
     pub fn with_timeout(
-        client: Arc<dyn ResourceGroupClient + Send + Sync>,
+        client: Arc<dyn ResourceGroupReadHierarchy + Send + Sync>,
         probe_timeout_ms: u64,
     ) -> Self {
         Self {
@@ -94,11 +91,7 @@ impl RgResourceOwnershipChecker {
 #[async_trait]
 impl ResourceOwnershipChecker for RgResourceOwnershipChecker {
     // @cpt-begin:cpt-cf-account-management-algo-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-algo-sdelpc-rg-probe
-    async fn count_ownership_links(
-        &self,
-        ctx: &SecurityContext,
-        tenant_id: Uuid,
-    ) -> Result<u64, DomainError> {
+    async fn count_ownership_links(&self, tenant_id: Uuid) -> Result<u64, DomainError> {
         // `$top=1` — we only need a boolean answer; the actual count is
         // never read by `delete_tenant`, which compares against zero.
         let query = ODataQuery::default()
@@ -112,7 +105,10 @@ impl ResourceOwnershipChecker for RgResourceOwnershipChecker {
         // (`target` / `op` / `outcome`) so an RG outage shows up on
         // the unified dependency-health dashboard alongside IdP and
         // GTS, not only as a tracing line.
-        match tokio::time::timeout(self.probe_timeout, self.client.list_groups(ctx, &query)).await {
+        // Audit-correlation identity only; the read surface ignores it.
+        let ctx = for_ownership_probe(tenant_id);
+        match tokio::time::timeout(self.probe_timeout, self.client.list_groups(&ctx, &query)).await
+        {
             Err(_elapsed) => {
                 emit_metric(
                     AM_DEPENDENCY_HEALTH,

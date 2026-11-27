@@ -277,6 +277,34 @@ pub struct IdpPluginSpecV1;
 pub struct PrincipalLifecycleHookSpecV1;
 
 // ---------------------------------------------------------------------------
+// Tenant-ownership plugin spec
+// ---------------------------------------------------------------------------
+
+/// GTS type definition for tenant-ownership plugin instances.
+///
+/// A product that knows what a tenant owns registers an instance of this
+/// type with its vendor and binds a
+/// [`crate::TenantOwnershipPluginClient`] under the instance's scope. AM
+/// selects the instance whose vendor matches its configured
+/// `tenant_ownership.vendor`; see [`crate::tenant_ownership`] for the
+/// contract and why it carries no caller identity.
+///
+/// # Instance ID Format
+///
+/// ```text
+/// gts.cf.toolkit.plugins.plugin.v1~cf.core.tenant_ownership.plugin.v1~<vendor>.<package>.tenant_ownership.plugin.v1
+/// ```
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = PluginV1,
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.tenant_ownership.plugin.v1~"),
+    description = "Tenant-ownership plugin specification",
+    properties = "",
+)]
+pub struct TenantOwnershipPluginSpecV1;
+
+// ---------------------------------------------------------------------------
 // PEP resource-type registrations (RBAC target_type authorizability)
 // ---------------------------------------------------------------------------
 

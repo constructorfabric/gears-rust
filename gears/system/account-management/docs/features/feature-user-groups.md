@@ -102,8 +102,8 @@ user-group subtree.
 
 **Success Scenarios**:
 
-- During tenant hard-deletion (invoked by the retention job owned by `feature-tenant-hierarchy-management`), AM calls `ResourceGroupClient` to delete the tenant's user-group subtree before the `tenants` row is removed. Resource Group is the authoritative owner of the cleanup mechanics — AM only triggers and awaits completion. On success, the hard-delete flow proceeds to the `tenants` row delete.
-- Tenant has no user groups — `ResourceGroupClient` cleanup call is a successful no-op; hard-delete proceeds.
+- During tenant hard-deletion (invoked by the retention job owned by `feature-tenant-hierarchy-management`), AM calls `ResourceGroupTenantCleanup::delete_tenant_groups` (RG's un-gated tenant-cleanup surface — the tenant is already `Deleted`, so no PDP grant can address its rows) to delete the tenant's user groups with their subtrees before the `tenants` row is removed. Resource Group is the authoritative owner of the cleanup mechanics — AM only triggers and awaits completion. On success, the hard-delete flow proceeds to the `tenants` row delete.
+- Tenant has no user groups — the RG cleanup call is a successful no-op; hard-delete proceeds.
 
 **Error Scenarios**:
 
@@ -113,7 +113,7 @@ user-group subtree.
 **Steps**:
 
 1. [ ] - `p1` - Called by the hard-delete flow in `feature-tenant-hierarchy-management` with `{tenant_id}` just before the `tenants` row delete - `inst-flow-cascade-entry`
-2. [ ] - `p1` - Invoke `ResourceGroupClient` to delete the tenant's user-group subtree (groups of type `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` scoped to `{tenant_id}`) - `inst-flow-cascade-invoke-rg`
+2. [ ] - `p1` - Invoke `ResourceGroupTenantCleanup::delete_tenant_groups` to delete the tenant's user groups with their subtrees (groups of type `gts.cf.core.rg.group.v1~cf.core.am.user_group.v1~` scoped to `{tenant_id}`) - `inst-flow-cascade-invoke-rg`
 3. [ ] - `p1` - **IF** RG call failed transport-level (unreachable or timeout) - `inst-flow-cascade-unavailable-branch`
    1. [ ] - `p1` - **RETURN** `(reject, code=service_unavailable)` via the `feature-errors-observability` envelope; hard-delete flow aborts and `tenants` row is NOT removed - `inst-flow-cascade-unavailable-return`
 4. [ ] - `p1` - **IF** RG call returned a provider-level error - `inst-flow-cascade-provider-error-branch`
@@ -185,7 +185,7 @@ type catalogue.
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-user-groups-cascade-cleanup-trigger`
 
-The system **MUST** trigger `ResourceGroupClient` cleanup of the tenant's user-group subtree during tenant hard-deletion before the `tenants` row is removed. If the RG cleanup call fails transport-level, the hard-delete flow **MUST** abort with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row **MUST NOT** be removed — the retention job retries on its next tick. If RG returns a provider-level error, the hard-delete flow **MUST** abort and surface the mapped error; the `tenants` row remains for retry. AM **MUST NOT** perform RG-side cleanup work itself — the trigger is a pass-through call and the actual work is owned by Resource Group.
+The system **MUST** trigger Resource Group cleanup (`ResourceGroupTenantCleanup`) of the tenant's user-group subtree during tenant hard-deletion before the `tenants` row is removed. If the RG cleanup call fails transport-level, the hard-delete flow **MUST** abort with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row **MUST NOT** be removed — the retention job retries on its next tick. If RG returns a provider-level error, the hard-delete flow **MUST** abort and surface the mapped error; the `tenants` row remains for retry. AM **MUST NOT** perform RG-side cleanup work itself — the trigger is a pass-through call and the actual work is owned by Resource Group.
 
 **Implements**:
 
@@ -194,7 +194,7 @@ The system **MUST** trigger `ResourceGroupClient` cleanup of the tenant's user-g
 **Touches**:
 
 - Entities: `UserGroup` (delegated view), `UserGroupMembership` (delegated adapter)
-- Sibling integration: `ResourceGroupClient`; `feature-tenant-hierarchy-management` hard-delete flow (caller)
+- Sibling integration: `ResourceGroupTenantCleanup`; `feature-tenant-hierarchy-management` hard-delete flow (caller)
 - Error taxonomy: delegated to `feature-errors-observability` (catalog owner); `service_unavailable` code referenced by name only.
 
 ### Delegation Boundary
@@ -233,7 +233,7 @@ Membership-write callers **MUST** combine AM's `GET /tenants/{tenant_id}/users` 
 - [ ] On startup with no AM user-group definitions in Types Registry, AM's manifest publishes the declarations from §3 and awaits their admission before application `init`. RG accepts root groups and groups nested under the exact AM user-group type. It accepts AM-user memberships and rejects unknown metadata fields. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] On an identical restart, publication succeeds without changing either type's revision. A differing document follows the registry's revision and admission rules. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
 - [ ] If publication is rejected, cancelled or cannot complete within its startup budget, application `init` does not run; diagnostics identify the publisher, affected identifiers and underlying cause. No RG type-management API or RG-local type table is used. Fingerprints `dod-user-groups-rg-type-schema-idempotent-registration`.
-- [ ] During tenant hard-deletion invoked by the retention job in `feature-tenant-hierarchy-management`, AM calls `ResourceGroupClient` to delete the tenant's user-group subtree before the `tenants` row is removed; if the RG cleanup call fails transport-level, the hard-delete flow aborts with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row is NOT removed. On the next retry, the hard-delete flow re-attempts cleanup. Fingerprints `dod-user-groups-cascade-cleanup-trigger`.
+- [ ] During tenant hard-deletion invoked by the retention job in `feature-tenant-hierarchy-management`, AM calls `ResourceGroupTenantCleanup` to delete the tenant's user-group subtree before the `tenants` row is removed; if the RG cleanup call fails transport-level, the hard-delete flow aborts with `code=service_unavailable` via the `feature-errors-observability` envelope and the `tenants` row is NOT removed. On the next retry, the hard-delete flow re-attempts cleanup. Fingerprints `dod-user-groups-cascade-cleanup-trigger`.
 - [ ] The AM OpenAPI spec contains NO `/user-groups` family of endpoints and NO `/memberships` family — user-group CRUD, membership add/remove, and nested-group operations are not part of AM's REST surface. The AM gear contains no `user_group_*` or `user_group_membership_*` tables, no adapter tables, and no in-memory group-hierarchy cache; RG is the single storage owner. Fingerprints `dod-user-groups-delegation-boundary`.
 - [ ] A membership-write consumer checks `GET /tenants/{tenant_id}/users?user_id=<id>` before adding the AM user via `ResourceGroupClient`. RG validates the member's type against the bound membership schema. Fingerprints `dod-user-groups-membership-user-existence-pattern`, `dod-user-groups-delegation-boundary`.
 - [ ] Resource Group forest invariants reject nested user-group cycles at the `ResourceGroupClient` boundary, including cycles between groups of the same AM user-group type. Fingerprints `dod-user-groups-delegation-boundary`.

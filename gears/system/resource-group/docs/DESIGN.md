@@ -52,11 +52,15 @@ read under the caller's context.
 | RG's PolicyEnforcer / SecureORM | Enforcement of those constraints on RG operations and database access |
 | Tenant resolver | Interpretation of tenant hierarchy and barrier metadata |
 
-RG exposes two Rust SDK traits through ClientHub:
+RG exposes these Rust SDK traits through ClientHub:
 
 - `ResourceGroupClient`: authorized group, hierarchy and membership operations.
 - `ResourceGroupReadHierarchy`: in-process reads for trusted AuthZ and tenant
-  resolver consumers. The consumer owns scoping on this interface.
+  resolver consumers, and for account-management's tenant soft-delete
+  ownership probe, whose answer must not depend on the deleting caller. The
+  consumer owns scoping on this interface.
+- `ResourceGroupTenantCleanup`: in-process, un-gated removal of a hard-deleted
+  tenant's groups of one type, for tenant-lifecycle cleanup paths.
 
 HTTP routes expose group and membership operations under `/resource-group/v1`.
 The host supplies any outer route prefix, such as `/cf`. Type publication and
@@ -354,6 +358,16 @@ has no `tenant_id` column.
 Its reads bypass PolicyEnforcer to avoid recursing into a PDP that is itself
 requesting RG data. Consumers must supply the appropriate filters and validate
 tenant ownership. This interface has no separate unscoped HTTP route.
+
+#### Tenant cleanup
+
+`RgTenantCleanupService` implements `ResourceGroupTenantCleanup`. It deletes
+every group of one type owned by a tenant, each root of that set with the same
+force cascade as `delete_group(force = true)`, without PolicyEnforcer: its
+callers clean up after a tenant that is already soft-deleted, and no PEP-gated
+actor can be admitted for a deleted tenant. The type is matched through the
+local `gts_type` dictionary, so cleanup works without the registry and a type no
+group ever used matches nothing. It has no HTTP route.
 
 #### Type catalog adapter and repositories
 
