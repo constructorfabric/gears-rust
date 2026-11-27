@@ -223,7 +223,7 @@ impl<'a> PlanDraft<'a> {
         if self.forgotten(category, &value) {
             return Err(ToolRefusal::Forgotten { kind });
         }
-        if category.kind().single {
+        if self.catalog.node(category).single {
             if let Some(number) = self.held_single(category) {
                 return Err(ToolRefusal::SecondNode { kind, number });
             }
@@ -249,7 +249,7 @@ impl<'a> PlanDraft<'a> {
         category: Category,
         owner: Option<usize>,
     ) -> Result<Option<NodeRef>, ToolRefusal> {
-        let kind = category.kind();
+        let kind = self.catalog.node(category);
         match (&kind.owner, owner) {
             (Owner::Root, None) => Ok(None),
             (Owner::Root, Some(_)) => Err(ToolRefusal::OwnerNotAllowed {
@@ -528,7 +528,7 @@ impl<'a> PlanDraft<'a> {
         owner: Option<&NodeRef>,
         besides: Option<usize>,
     ) -> Option<usize> {
-        let key = category.kind().key;
+        let key = self.catalog.node(category).key;
         let named = value.get(key)?;
         self.untouched()
             .find(|(number, fact)| {
@@ -545,8 +545,10 @@ impl<'a> PlanDraft<'a> {
 
     /// Whether the person forgot a node of this kind and name that this plan's message taught.
     fn forgotten(&self, category: Category, value: &Value) -> bool {
-        let (Some((tool, message)), Some(key)) = (&self.source, Mark::identity(category, value))
-        else {
+        let (Some((tool, message)), Some(key)) = (
+            &self.source,
+            Mark::identity(self.catalog.node(category).key, value),
+        ) else {
             return false;
         };
         self.marks.iter().any(|mark| {
@@ -564,7 +566,7 @@ impl<'a> PlanDraft<'a> {
         value: &Value,
         owner: Option<&NodeRef>,
     ) -> Option<usize> {
-        let key = category.kind().key;
+        let key = self.catalog.node(category).key;
         let named = value.get(key)?;
         let same = |held: &Value| held.get(key).is_some_and(|held| same_value(held, named));
         let mut added = 0;

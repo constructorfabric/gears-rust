@@ -1,4 +1,4 @@
-use construct_sdk::linked_schema::{LEARNED, LEARNED_MAX, OWNER, SchemaPrefix};
+use construct_sdk::linked_schema::{LEARNED, LEARNED_MAX, OWNER, Schema, SchemaPrefix};
 use graph_storage_sdk::models::{NodeSpec, NodeView};
 use serde_json::{Map, Number, Value, json};
 use time::format_description::well_known::Rfc3339;
@@ -21,8 +21,8 @@ const RECORD: &str = "record";
 const ENVELOPE: [&str; 4] = [ORIGIN, RECORD, OWNER, LEARNED];
 
 /// The category whose plain name the plan's step carries.
-fn category(entity_kind: &str) -> Result<Category, DomainError> {
-    Category::from_name(entity_kind)
+fn category(schema: &Schema, entity_kind: &str) -> Result<Category, DomainError> {
+    Category::from_name(schema, entity_kind)
         .ok_or_else(|| DomainError::internal(format!("unknown entity kind `{entity_kind}`")))
 }
 
@@ -176,6 +176,7 @@ pub fn fact_node(
     plan: &Plan,
     step: &Step,
     now: OffsetDateTime,
+    schema: &Schema,
     prefix: &SchemaPrefix,
     stored: Option<&NodeView>,
 ) -> Result<Option<NodeSpec>, DomainError> {
@@ -244,7 +245,7 @@ pub fn fact_node(
     }
     Ok(Some(NodeSpec {
         node_key: key.0.clone(),
-        type_id: category(&step.entity_kind)?.type_id(prefix),
+        type_id: category(schema, &step.entity_kind)?.type_id(prefix),
         name: None,
         payload: Some(Value::Object(payload)),
         expected_version: if in_place { None } else { Some(0) },
@@ -308,10 +309,10 @@ fn property_change(kind: &str) -> DomainError {
 /// exactly one fact property besides its origin and record. Graph storage's
 /// validation does not rule out the last, so it is a defect of the stored
 /// node, reported with its key and never with a value.
-pub fn fact_of(node: &NodeView) -> Result<Fact, DomainError> {
+pub fn fact_of(schema: &Schema, node: &NodeView) -> Result<Fact, DomainError> {
     let defect = |what: &str| DomainError::internal(format!("fact {} {what}", node.node_key));
-    let category =
-        Category::from_type_id(&node.type_id).ok_or_else(|| defect("is of no node kind"))?;
+    let category = Category::from_type_id(schema, &node.type_id)
+        .ok_or_else(|| defect("is of no node kind"))?;
     let payload = node
         .payload
         .as_ref()
@@ -362,14 +363,14 @@ fn origin_kind(payload: &Map<String, Value>) -> Option<OriginKind> {
 ///
 /// Every defect [`fact_of`] reports, and an origin that names no known
 /// source; each names the node's key and never a value.
-pub fn stored_fact_of(node: &NodeView) -> Result<StoredFact, DomainError> {
+pub fn stored_fact_of(schema: &Schema, node: &NodeView) -> Result<StoredFact, DomainError> {
     let Fact {
         node_key,
         category,
         property,
         value,
         owner,
-    } = fact_of(node)?;
+    } = fact_of(schema, node)?;
     let payload = node
         .payload
         .as_ref()
@@ -410,4 +411,11 @@ fn produced_at(node_key: &str, at: &Value) -> Option<OffsetDateTime> {
             tracing::warn!(%node_key, %error, "a stored fact's produced_at is not RFC 3339; it is served without it");
         })
         .ok()
+}
+
+/// Whether `node` is of a person's kind that `schema` does not have: a node of a kind the host removed, which stays in
+/// graph storage, hidden, until it is forgotten. It is not a fact of the profile, and not a defect either.
+#[must_use]
+pub fn of_removed_kind(schema: &Schema, node: &NodeView) -> bool {
+    Schema::node_kind_name(&node.type_id).is_some_and(|name| schema.node(name).is_none())
 }

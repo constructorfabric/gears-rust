@@ -1,19 +1,10 @@
-use std::fmt;
-use std::sync::OnceLock;
-
-use construct_sdk::linked_schema::{NodeKind, Schema, SchemaPrefix, default_schema};
+use construct_sdk::linked_schema::{NodeKind, Schema, SchemaPrefix};
 use serde_json::Value;
+use std::fmt;
 use toolkit_macros::domain_model;
 
 use super::plan::NodeKey;
 use super::subject_settings::SubjectKey;
-
-/// The schema every profile has: the linked default schema.
-#[must_use]
-pub fn profile_schema() -> &'static Schema {
-    static SCHEMA: OnceLock<Schema> = OnceLock::new();
-    SCHEMA.get_or_init(default_schema)
-}
 
 /// A category of a person's profile: one node kind of the profile's schema, such as a project or a commitment. The
 /// name of the kind is its registered name, which the model, the REST API and the permission policy use.
@@ -22,27 +13,31 @@ pub fn profile_schema() -> &'static Schema {
 pub struct Category(&'static str);
 
 impl Category {
-    /// Every category of the schema, in the order the planner lists them.
+    /// Every category of `schema`, in the order the planner lists them.
     #[must_use]
-    pub fn all() -> Vec<Self> {
-        profile_schema()
-            .nodes
-            .iter()
-            .map(|kind| Self(kind.name))
-            .collect()
+    pub fn all(schema: &Schema) -> Vec<Self> {
+        schema.nodes.iter().map(|kind| Self(kind.name)).collect()
     }
 
-    /// The category whose graph node type is `type_id`, in the types of any person, or `None` for any other type.
+    /// The category a stored record names, such as a review request for a fact: whichever kind the person's schema
+    /// holds now. A request for a kind removed since stays readable under its name.
     #[must_use]
-    pub fn from_type_id(type_id: &str) -> Option<Self> {
-        Self::from_name(Schema::node_kind_name(type_id)?)
+    pub fn of_stored(name: &str) -> Self {
+        Self(construct_sdk::schema_doc::intern(name))
     }
 
-    /// The category whose plain name, the entity kind a plan step carries, is `name`, or `None` for any other
-    /// name.
+    /// The category whose graph node type is `type_id`, in the types of any person, or `None` for any other type
+    /// or a kind `schema` does not have.
     #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        profile_schema()
+    pub fn from_type_id(schema: &Schema, type_id: &str) -> Option<Self> {
+        Self::from_name(schema, Schema::node_kind_name(type_id)?)
+    }
+
+    /// The category of `schema` whose plain name, the entity kind a plan step carries, is `name`, or `None` for
+    /// any other name.
+    #[must_use]
+    pub fn from_name(schema: &Schema, name: &str) -> Option<Self> {
+        schema
             .nodes
             .iter()
             .find(|kind| kind.name == name)
@@ -61,20 +56,10 @@ impl Category {
         self.0
     }
 
-    /// The category's node kind in the schema.
-    ///
-    /// # Panics
-    ///
-    /// Never: a category is made from a kind of the schema.
+    /// The category's node kind in `schema`, or `None` when `schema` has no such kind.
     #[must_use]
-    #[allow(
-        clippy::expect_used,
-        reason = "a category is only ever made from a kind of the schema"
-    )]
-    pub fn kind(self) -> &'static NodeKind {
-        profile_schema()
-            .node(self.0)
-            .expect("a category is a kind of the schema")
+    pub fn kind(self, schema: &Schema) -> Option<&NodeKind> {
+        schema.node(self.0)
     }
 }
 
@@ -120,11 +105,11 @@ pub struct Mark {
 }
 
 impl Mark {
-    /// What names a node of `category` with `value`, compared without case and spacing, or none when the value
-    /// does not hold the property that names the kind.
+    /// What names a node of a kind whose naming property is `key`, with `value`, compared without case and spacing,
+    /// or none when the value does not hold that property.
     #[must_use]
-    pub fn identity(category: Category, value: &Value) -> Option<String> {
-        let named = value.get(category.kind().key)?;
+    pub fn identity(key: &str, value: &Value) -> Option<String> {
+        let named = value.get(key)?;
         Some(match named {
             Value::String(text) => text
                 .split_whitespace()
@@ -235,4 +220,12 @@ impl fmt::Display for FullProfile {
             self.subject.subject_id, self.subject.tenant_id, self.facts, self.limit
         )
     }
+}
+
+/// The default schema, for the tests whose person has not changed it.
+#[cfg(test)]
+#[must_use]
+pub fn profile_schema() -> &'static Schema {
+    static SCHEMA: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(construct_sdk::linked_schema::default_schema)
 }

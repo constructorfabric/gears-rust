@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use crate::api::rest::error::{
     bad_fact_body, bad_resolution, bad_text, for_admin_facts, for_export, for_facts, for_rest,
-    for_reviews, for_settings, no_such_fact, too_long,
+    for_reviews, for_schema, for_settings, no_such_fact, too_long,
 };
 use crate::api::rest::types::{
     ConcreteAdminFacts, ConcreteErasure, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue,
-    ConcreteSettings, ConcreteSubjectControl,
+    ConcreteSchema, ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::manage::ManageFacts;
@@ -22,10 +22,11 @@ use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::review_queue::{Resolution, ReviewText};
 
 use super::dto::{
-    AdminFactRequest, FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto,
-    ProfileNodeDto, PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest,
-    ResolutionRequest, ReviewRequestDto, ReviewRequestsPageDto, StoredFactDto, SubjectExportDto,
-    SubjectFactDto, SubjectFactsPageDto, SubjectSettingsDto, TenantQuery,
+    AdminFactRequest, FlagFactRequest, ManageFactsRequest, ManageFactsResponse,
+    PatchSubjectSchemaRequest, ProfileDto, ProfileNodeDto, PutSubjectSettingsRequest,
+    RecordOutcomeDto, RecordQuery, RecordRequest, ResolutionRequest, ReviewRequestDto,
+    ReviewRequestsPageDto, StoredFactDto, SubjectExportDto, SubjectFactDto, SubjectFactsPageDto,
+    SubjectSchemaDto, SubjectSettingsDto, TenantQuery,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -80,6 +81,29 @@ pub async fn get_subject_settings(
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-return
     Ok(Json(SubjectSettingsDto::new(subject_id, settings)))
     // @cpt-end:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-return
+}
+
+/// Reads a person's profile schema. Owner only.
+pub async fn get_subject_schema(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteSchema>>,
+    Path(subject_id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let view = svc.schema(&ctx, subject_id).await.map_err(for_schema)?;
+    Ok(Json(SubjectSchemaDto::new(subject_id, view)))
+}
+
+pub async fn patch_subject_schema(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteSchema>>,
+    Path(subject_id): Path<Uuid>,
+    Json(req): Json<PatchSubjectSchemaRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let view = svc
+        .change(&ctx, subject_id, &req.changes)
+        .await
+        .map_err(for_schema)?;
+    Ok(Json(SubjectSchemaDto::new(subject_id, view)))
 }
 
 pub async fn put_subject_settings(

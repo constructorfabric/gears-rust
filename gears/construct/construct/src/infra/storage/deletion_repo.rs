@@ -21,6 +21,7 @@ use crate::domain::tenant_exit::{TenantRows, TenantTables};
 use super::record_ids_entity::{self as record_ids, Entity as RecordIdEntity};
 use super::review_requests_entity::{self as review_requests, Entity as ReviewRequestEntity};
 use super::scope_error::map_scope_error;
+use super::subject_schema_entity::{self as schemas, Entity as SubjectSchemaEntity};
 use super::subject_settings_entity::{self as settings, Entity as SubjectSettingsEntity};
 use super::subject_settings_repo::coverage;
 use super::tenants_entity::{self as tenants, Entity as TenantEntity};
@@ -268,6 +269,10 @@ impl DeletionStore for DeletionTables {
         marked_at: OffsetDateTime,
     ) -> Result<bool, DomainError> {
         let scope = scope.clone();
+        let default_schema =
+            crate::domain::profile_schema::doc_json(&construct_sdk::schema_doc::SchemaDoc::of(
+                &construct_sdk::linked_schema::default_schema(),
+            ))?;
         // The erasure this run started: a mark kept without its time reads
         // as the epoch, so that one matches a missing time too.
         let same_mark = if marked_at == OffsetDateTime::UNIX_EPOCH {
@@ -326,6 +331,25 @@ impl DeletionStore for DeletionTables {
                             Condition::all()
                                 .add(record_ids::Column::TenantId.eq(key.tenant_id))
                                 .add(record_ids::Column::SubjectId.eq(key.subject_id)),
+                        )
+                        .exec(tx)
+                        .await
+                        .map_err(map_scope_error)?;
+                    // The schema the host set holds the person's own kind names and descriptions: an erased person
+                    // starts anew with the default schema. The row stays, with its count of the names the process
+                    // keeps for the person, so erasing does not give the person a new budget for them.
+                    SubjectSchemaEntity::update_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .filter(
+                            Condition::all()
+                                .add(schemas::Column::TenantId.eq(key.tenant_id))
+                                .add(schemas::Column::SubjectId.eq(key.subject_id)),
+                        )
+                        .col_expr(schemas::Column::SchemaJson, Expr::value(default_schema))
+                        .col_expr(
+                            schemas::Column::Version,
+                            Expr::col(schemas::Column::Version).add(1),
                         )
                         .exec(tx)
                         .await
@@ -463,6 +487,18 @@ impl DeletionStore for DeletionTables {
             })
             .await
             .map_err(map_scope_error)?;
+        let schema_rows: Vec<TenantRow> = SubjectSchemaEntity::find()
+            .secure()
+            .scope_with(&everyone)
+            .project_all(&conn, |query| {
+                query
+                    .select_only()
+                    .column(schemas::Column::TenantId)
+                    .distinct()
+                    .into_model()
+            })
+            .await
+            .map_err(map_scope_error)?;
         let requests: Vec<TenantRow> = ReviewRequestEntity::find()
             .secure()
             .scope_with(&everyone)
@@ -491,6 +527,7 @@ impl DeletionStore for DeletionTables {
             settings
                 .into_iter()
                 .chain(identities)
+                .chain(schema_rows)
                 .chain(requests)
                 .map(|row| row.tenant_id),
         );
@@ -525,6 +562,14 @@ impl TenantTables for DeletionTables {
             .await
             .map_err(map_scope_error)?
             .rows_affected;
+        let subject_schemas = SubjectSchemaEntity::delete_many()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(schemas::Column::TenantId.eq(tenant_id)))
+            .exec(&conn)
+            .await
+            .map_err(map_scope_error)?
+            .rows_affected;
         // Open requests too: the tenant's profiles go with its graph, so no
         // fact is left for a request to close on.
         let review_requests = ReviewRequestEntity::delete_many()
@@ -538,6 +583,7 @@ impl TenantTables for DeletionTables {
         let record_ids = remove_record_ids(&conn, scope, tenant_id, Condition::all()).await?;
         Ok(TenantRows {
             subject_settings,
+            subject_schemas,
             review_requests,
             record_ids,
         })

@@ -97,8 +97,7 @@ fn request_of(row: entity::Model) -> Result<ReviewRequest, DomainError> {
         ReviewText::optional(text)
             .map_err(|rule| defect(format!("a {what} that {}", rule.description())))
     };
-    let category = Category::from_name(&row.entity_kind)
-        .ok_or_else(|| defect(format!("an unknown entity kind `{}`", row.entity_kind)))?;
+    let category = Category::of_stored(&row.entity_kind);
     let comment = text("comment", row.comment)?;
     let status = match row.state.as_str() {
         OPEN => {

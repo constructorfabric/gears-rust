@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use time::OffsetDateTime;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_retry::strategy::jitter;
 use toolkit_macros::domain_model;
@@ -56,7 +57,19 @@ const LANDED_CHECK: Duration = Duration::from_secs(5);
 pub struct SubjectFacts {
     pub version: Option<u64>,
     pub facts: Vec<StoredFact>,
+    /// The nodes of a kind the subject's schema does not have: nodes of a kind the host removed, which no read
+    /// shows and which an erasure, a retention sweep and the host's next schema change remove.
+    pub orphans: Vec<Orphan>,
     pub generation: u64,
+}
+
+/// A node of a kind the subject's schema no longer has.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Orphan {
+    pub node_key: NodeKey,
+    /// When the node was stored.
+    pub stored_at: OffsetDateTime,
 }
 
 /// Reads a subject's live facts with its profile's version, as Construct.
@@ -284,6 +297,58 @@ impl ProfileWrites {
         .await
     }
 
+    /// Forgets every node of the subject's that is of a kind the schema no longer has, with the nodes they own,
+    /// in one write as the subject's own delete. Run after a schema without the kinds is stored: such nodes are
+    /// hidden from every read, and only this removes them. Read and written again after a conflict. Safe to
+    /// repeat.
+    ///
+    /// # Errors
+    ///
+    /// When the profile cannot be read or the write fails or runs out of `deadline`.
+    pub(crate) async fn forget_orphans(
+        &self,
+        construct: &SecurityContext,
+        key: SubjectKey,
+        deadline: Instant,
+    ) -> Result<usize, WriteError> {
+        let origin = Origin::Subject {
+            subject: key.subject_id,
+        };
+        self.with_reruns(
+            deadline,
+            "removal of the nodes of removed kinds",
+            move || {
+                let origin = origin.clone();
+                async move {
+                    let current = Self::before_write(
+                        deadline,
+                        "removal of orphans",
+                        self.read(construct, key),
+                    )
+                    .await?;
+                    if current.orphans.is_empty() {
+                        return Ok(Attempt::Done(0));
+                    }
+                    let mut plan = removals(key, current.version, &[], origin);
+                    add_orphan_removals(&mut plan, &current.orphans);
+                    let gone: Vec<&NodeKey> = current.orphans.iter().map(|o| &o.node_key).collect();
+                    let written = self
+                        .write(construct, &plan, |now| {
+                            // Gone from the orphans, and not live again as nodes of a re-added kind.
+                            !now.orphans.iter().any(|o| gone.contains(&&o.node_key))
+                                && !now.facts.iter().any(|fact| gone.contains(&&fact.node_key))
+                        })
+                        .await?;
+                    Ok(match written {
+                        Written::Stored => Attempt::Done(current.orphans.len()),
+                        Written::Conflict => Attempt::Conflict,
+                    })
+                }
+            },
+        )
+        .await
+    }
+
     /// Run `attempt` until it is done: after a conflict, pause briefly and
     /// run it again, at most `max_reruns` times and while `deadline` lasts.
     /// The attempt bounds its own reads with [`Self::before_write`], and
@@ -368,6 +433,17 @@ pub(crate) fn removals(
             })
             .collect(),
     }
+}
+
+/// Adds a removal of each of `orphans` to `plan`. The step names no kind: the schema has none for the node.
+pub(crate) fn add_orphan_removals(plan: &mut Plan, orphans: &[Orphan]) {
+    plan.steps.extend(orphans.iter().map(|orphan| Step {
+        entity_kind: String::new(),
+        change: Change::RemoveEntity {
+            entity: orphan.node_key.clone(),
+        },
+        confidence: None,
+    }));
 }
 
 /// The pause before rerun `attempt + 1`: growing, with jitter, so a delete

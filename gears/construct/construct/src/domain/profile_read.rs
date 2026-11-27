@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use authz_resolver_sdk::models::TenantMode;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use authz_resolver_sdk::{AccessDenial, EnforcerError, PolicyEnforcer};
+use construct_sdk::linked_schema::Schema;
 use futures::future::join_all;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -20,6 +21,7 @@ use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
 use super::profile::{Category, Link};
+use super::profile_schema::{DefaultSchemas, ProfileSchemas};
 use super::review_queue::FactsUnderReview;
 use super::subject_reach::reach;
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
@@ -262,6 +264,8 @@ pub struct ProfileReadService {
     ports: ProfileReadPorts,
     policy_enforcer: PolicyEnforcer,
     check: CategoryCheck,
+    /// Where each person's schema comes from: the categories the read lists and checks.
+    schemas: Arc<dyn ProfileSchemas>,
 }
 
 /// The request for the profile of the subject at `key`, with the category
@@ -282,12 +286,15 @@ fn profile_request(key: SubjectKey, category: Option<Category>) -> AccessRequest
 
 /// The categories a category filter names; a value that names no category
 /// names nothing.
-fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> HashSet<Category> {
+fn named_categories<'a>(
+    values: impl IntoIterator<Item = &'a ScopeValue>,
+    schema: &Schema,
+) -> HashSet<Category> {
     values
         .into_iter()
         .filter_map(|value| {
             let category = match value {
-                ScopeValue::String(name) => Category::from_name(name),
+                ScopeValue::String(name) => Category::from_name(schema, name),
                 _ => None,
             };
             if category.is_none() {
@@ -312,13 +319,13 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 /// the applications and agents that act for the tenant's subjects: a
 /// constraint that reaches the tenant lets the caller read every subject in
 /// it. A policy may narrow that to named subjects with a resource id filter.
-fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<Grant> {
+fn granted_by(constraint: &ScopeConstraint, key: SubjectKey, schema: &Schema) -> Option<Grant> {
     let mut named: Option<HashSet<Category>> = None;
     for filter in reach(constraint, key)? {
         if filter.property() != CATEGORY_PROPERTY {
             return None;
         }
-        let these = named_categories(filter.values());
+        let these = named_categories(filter.values(), schema);
         named = Some(match named {
             Some(before) => before.intersection(&these).copied().collect(),
             None => these,
@@ -330,7 +337,7 @@ fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<Grant> {
             unnamed: false,
         },
         None => Grant {
-            categories: Category::all().into_iter().collect(),
+            categories: Category::all(schema).into_iter().collect(),
             unnamed: true,
         },
     })
@@ -355,14 +362,14 @@ pub(crate) struct Grant {
 /// The read asks with constraints required, so the enforcer never answers
 /// with an unconstrained scope. One that does grants nothing: an allow
 /// without constraints is a refusal, never a grant of every profile.
-pub(crate) fn granted(scope: &AccessScope, key: SubjectKey) -> Option<Grant> {
+pub(crate) fn granted(scope: &AccessScope, key: SubjectKey, schema: &Schema) -> Option<Grant> {
     if scope.is_unconstrained() {
         return None;
     }
     scope
         .constraints()
         .iter()
-        .filter_map(|constraint| granted_by(constraint, key))
+        .filter_map(|constraint| granted_by(constraint, key, schema))
         .reduce(|mut all, these| {
             all.categories.extend(these.categories);
             all.unnamed |= these.unnamed;
@@ -485,7 +492,15 @@ impl ProfileReadService {
             ports,
             policy_enforcer,
             check,
+            schemas: Arc::new(DefaultSchemas::new()),
         }
+    }
+
+    /// The same read over each person's own schema, from `schemas`, rather than the default schema for everyone.
+    #[must_use]
+    pub fn with_schemas(mut self, schemas: Arc<dyn ProfileSchemas>) -> Self {
+        self.schemas = schemas;
+        self
     }
 
     /// The same read with other retention periods.
@@ -529,11 +544,12 @@ impl ProfileReadService {
             construct_scope,
             readable,
             served,
+            schema,
         } = self.access(ctx, tenant, subject_id).await?;
         let categories = if readable.is_empty() {
             Vec::new()
         } else {
-            self.facts(&construct, &construct_scope, key, &readable)
+            self.facts(&construct, &construct_scope, key, &schema, &readable)
                 .await?
         };
 
@@ -543,7 +559,7 @@ impl ProfileReadService {
             subject_id,
             caller: ctx.subject_id(),
             categories: categories.iter().map(|group| group.category).collect(),
-            granted: Category::all()
+            granted: Category::all(&schema)
                 .into_iter()
                 .filter(|category| readable.contains(category))
                 .collect(),
@@ -581,6 +597,7 @@ impl ProfileReadService {
             construct_scope,
             readable,
             served,
+            schema,
         } = self.access(ctx, tenant, subject_id).await?;
         // A read the caller may not make is audited too, as the profile read audits its refusals.
         let refused = |served: bool| {
@@ -589,7 +606,7 @@ impl ProfileReadService {
                 subject_id,
                 caller: ctx.subject_id(),
                 categories: Vec::new(),
-                granted: Category::all()
+                granted: Category::all(&schema)
                     .into_iter()
                     .filter(|category| readable.contains(category))
                     .collect(),
@@ -677,7 +694,7 @@ impl ProfileReadService {
             subject_id,
             caller: ctx.subject_id(),
             categories,
-            granted: Category::all()
+            granted: Category::all(&schema)
                 .into_iter()
                 .filter(|category| readable.contains(category))
                 .collect(),
@@ -715,7 +732,8 @@ impl ProfileReadService {
             )
             .await
             .map_err(not_visible)?;
-        let Some(granted) = granted(&scope, key) else {
+        let schema = self.schemas.schema(key).await?;
+        let Some(granted) = granted(&scope, key, &schema) else {
             return Err(DomainError::NotVisible(
                 "the policy scope does not reach the subject".to_owned(),
             ));
@@ -745,10 +763,13 @@ impl ProfileReadService {
                 }
                 granted.categories
             }
-            (true, CategoryCheck::PerCategory) => self.readable_one_by_one(ctx, key).await?,
+            (true, CategoryCheck::PerCategory) => {
+                self.readable_one_by_one(ctx, key, &schema).await?
+            }
         };
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
         Ok(Access {
+            schema,
             key,
             construct,
             construct_scope,
@@ -765,27 +786,32 @@ impl ProfileReadService {
         &self,
         ctx: &SecurityContext,
         key: SubjectKey,
+        schema: &Schema,
     ) -> Result<HashSet<Category>, DomainError> {
-        let decisions = join_all(Category::all().into_iter().map(|category| async move {
-            let request = profile_request(key, Some(category));
-            let decided = self
-                .policy_enforcer
-                .access_scope_with(
-                    ctx,
-                    &PROFILE_RESOURCE,
-                    actions::READ,
-                    Some(key.subject_id),
-                    &request,
-                )
-                .await;
-            (category, decided)
-        }))
+        let decisions = join_all(
+            Category::all(schema)
+                .into_iter()
+                .map(|category| async move {
+                    let request = profile_request(key, Some(category));
+                    let decided = self
+                        .policy_enforcer
+                        .access_scope_with(
+                            ctx,
+                            &PROFILE_RESOURCE,
+                            actions::READ,
+                            Some(key.subject_id),
+                            &request,
+                        )
+                        .await;
+                    (category, decided)
+                }),
+        )
         .await;
         let mut readable = HashSet::new();
         for (category, decided) in decisions {
             match decided {
                 Ok(scope) => {
-                    if granted(&scope, key)
+                    if granted(&scope, key, schema)
                         .is_some_and(|grant| grant.categories.contains(&category))
                     {
                         readable.insert(category);
@@ -817,11 +843,12 @@ impl ProfileReadService {
         construct: &SecurityContext,
         construct_scope: &AccessScope,
         key: SubjectKey,
+        schema: &Schema,
         readable: &HashSet<Category>,
     ) -> Result<Vec<CategoryFacts>, DomainError> {
         let stored = self.visible(construct, construct_scope, key).await?;
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
-        let mut groups: Vec<CategoryFacts> = Category::all()
+        let mut groups: Vec<CategoryFacts> = Category::all(schema)
             .into_iter()
             .filter(|category| readable.contains(category))
             .map(|category| CategoryFacts {
@@ -881,6 +908,8 @@ impl ProfileReadService {
 /// What a caller may do with a subject's profile: the processing context graph storage is read with, and the
 /// categories the caller may read.
 struct Access {
+    /// The schema the read started with.
+    schema: Arc<Schema>,
     key: SubjectKey,
     construct: SecurityContext,
     construct_scope: AccessScope,
@@ -900,6 +929,11 @@ mod tests {
             tenant_id: Uuid::new_v4(),
             subject_id: Uuid::new_v4(),
         }
+    }
+
+    /// What `scope` grants on the profile at `key`, over the default schema.
+    fn granted(scope: &AccessScope, key: SubjectKey) -> Option<Grant> {
+        super::granted(scope, key, crate::domain::profile::profile_schema())
     }
 
     /// The categories `scope` grants on the profile at `key`.
@@ -964,7 +998,11 @@ mod tests {
 
         assert_eq!(
             categories(&tenant, key),
-            Some(Category::all().into_iter().collect())
+            Some(
+                Category::all(crate::domain::profile::profile_schema())
+                    .into_iter()
+                    .collect()
+            )
         );
         let elsewhere = SubjectKey {
             tenant_id: Uuid::new_v4(),

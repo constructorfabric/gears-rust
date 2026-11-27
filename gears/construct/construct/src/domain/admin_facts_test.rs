@@ -18,7 +18,6 @@ use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
 use crate::domain::one_step::{NotStored, OneStepPath};
 use crate::domain::plan::{Change, NodeKey, Origin, Plan};
-use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::OriginKind;
@@ -66,7 +65,9 @@ fn one_step_path(
             events: Arc::new(RecordingAdmissionEvents::default()),
             drops,
         }),
-        catalog: Arc::new(Catalog::load().unwrap()),
+        catalogs: Arc::new(crate::domain::planner::catalog::Catalogs::new(Arc::new(
+            crate::domain::profile_schema::DefaultSchemas::new(),
+        ))),
     })
 }
 

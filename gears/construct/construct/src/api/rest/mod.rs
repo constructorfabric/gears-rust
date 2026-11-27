@@ -24,6 +24,8 @@ mod routes_test;
 mod review_queue_routes_test;
 
 #[cfg(test)]
+mod schema_routes_test;
+#[cfg(test)]
 mod settings_routes_test;
 
 #[cfg(test)]

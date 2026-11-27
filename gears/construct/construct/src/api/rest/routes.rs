@@ -1,6 +1,6 @@
 use crate::api::rest::types::{
     ConcreteAdminFacts, ConcreteErasure, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue,
-    ConcreteSettings, ConcreteSubjectControl,
+    ConcreteSchema, ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
@@ -14,6 +14,8 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 const SUBJECT_SETTINGS_PATH: &str = "/construct/v1/subjects/{subject_id}/settings";
 const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
+const SUBJECT_SCHEMA_PATH: &str = "/construct/v1/subjects/{subject_id}/schema";
+const SUBJECT_SCHEMA_TAG: &str = "Profile schema";
 const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
 const SUBJECT_FACTS_TAG: &str = "Subject facts";
 const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
@@ -349,6 +351,74 @@ pub fn register_subject_control_routes(
     // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-send
 
     router.merge(not_stored(subject)).layer(Extension(svc))
+}
+
+/// The routes of a person's profile schema: read it and change it while the gear runs. Owner only; every answer is
+/// marked `no-store`.
+pub fn register_schema_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    svc: Arc<ConcreteSchema>,
+) -> Router {
+    let mut schema = OperationBuilder::get(SUBJECT_SCHEMA_PATH)
+        .operation_id("construct.get_subject_schema")
+        .summary("Read a person's profile schema")
+        .description(
+            "The node kinds and link kinds the person's profile holds. A person whose host \
+             changed nothing has the default schema (`version` 0); `version` counts the \
+             changes made. Owner only: another \
+             person's schema is refused with 403.",
+        )
+        .tag(SUBJECT_SCHEMA_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The person: the caller's own subject id")
+        .handler(handlers::get_subject_schema)
+        .json_response_with_schema::<dto::SubjectSchemaDto>(
+            openapi,
+            StatusCode::OK,
+            "The person's schema",
+        )
+        .standard_errors(openapi)
+        .register(Router::new(), openapi);
+
+    schema = OperationBuilder::patch(SUBJECT_SCHEMA_PATH)
+        .operation_id("construct.patch_subject_schema")
+        .summary("Change a person's profile schema")
+        .description(
+            "Add or remove node kinds, link kinds and their properties while the gear runs. \
+             The changes are applied in order to a copy and checked as a whole: one that \
+             breaks a rule (an invalid JSON schema, a name already in use, a link to a kind \
+             that does not exist, a kind graph storage refuses) refuses the request with 422 \
+             and the schema does not change (any failure after the names it brought in were \
+             charged, such as a refusal by graph storage or a lost race, leaves them charged to \
+             the person). A change applies from the next message; a message being \
+             planned finishes its plan with the schema it started with, and its write reads \
+             the schema again. The types of an added kind are registered in graph storage in \
+             this call. Removing a node kind forgets all its nodes after the new schema is \
+             stored; they are hidden from every read from then on. When that removal fails \
+             the answer is 503 and the schema is already changed: send an empty change \
+             (`{\"changes\": []}`) or any other change to finish it; sending the same \
+             removal again is refused, as the kind is gone. Owner only: another person's \
+             schema is refused with 403.",
+        )
+        .tag(SUBJECT_SCHEMA_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The person: the caller's own subject id")
+        .json_request::<dto::PatchSubjectSchemaRequest>(openapi, "The changes")
+        .handler(handlers::patch_subject_schema)
+        .json_response_with_schema::<dto::SubjectSchemaDto>(
+            openapi,
+            StatusCode::OK,
+            "The schema as stored",
+        )
+        .standard_errors(openapi)
+        .error_422(openapi)
+        .error_503(openapi)
+        .register(schema, openapi);
+
+    router.merge(not_stored(schema)).layer(Extension(svc))
 }
 
 /// The erasure route: the subject erases everything Construct holds about

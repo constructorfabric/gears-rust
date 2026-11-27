@@ -463,7 +463,8 @@ fn payload_schema(type_id: &str) -> Value {
 
 #[test]
 fn every_case_fits_the_profile_schema_and_its_record_type() {
-    let catalog = Catalog::load().expect("the catalog");
+    let catalog =
+        Catalog::load(&construct_sdk::linked_schema::default_schema()).expect("the catalog");
     let cases = cases();
     let mut names = BTreeSet::new();
     for case in &cases {
@@ -524,9 +525,12 @@ fn every_case_fits_the_profile_schema_and_its_record_type() {
 #[tokio::test]
 #[ignore = "calls a model: set CONSTRUCT_EVAL_URL, CONSTRUCT_EVAL_MODEL and CONSTRUCT_EVAL_API_KEY"]
 async fn the_planner_meets_the_decision_target() {
-    let catalog = Catalog::load().expect("the catalog");
+    let catalog =
+        Catalog::load(&construct_sdk::linked_schema::default_schema()).expect("the catalog");
     let cases = cases();
-    let planner = planner(Catalog::load().expect("the catalog"));
+    let planner = planner(
+        Catalog::load(&construct_sdk::linked_schema::default_schema()).expect("the catalog"),
+    );
     let ctx = context();
     let mut report = String::new();
     let mut right = 0_usize;

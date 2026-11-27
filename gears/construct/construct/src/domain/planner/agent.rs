@@ -5,7 +5,7 @@ use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::catalog::Catalog;
+use super::catalog::{Catalog, Catalogs};
 use super::draft::PlanDraft;
 use super::prompt::{UnusableRecord, instructions, message_input, record_input};
 use crate::domain::model_client::{
@@ -16,6 +16,7 @@ use crate::domain::profile::Profile;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
+use crate::domain::subject_settings::SubjectKey;
 
 /// Text runs to about this many bytes a token. A record whose input is longer than this many bytes for each token of
 /// the cap cannot be read within the cap, and is dropped before any model call.
@@ -45,9 +46,10 @@ pub struct AgentMessage {
 pub struct Planner {
     model: Arc<dyn ModelClient>,
     catalog: Arc<Catalog>,
+    /// Each person's own catalog; without it every person has `catalog`.
+    catalogs: Option<Arc<Catalogs>>,
     events: Arc<dyn IntakeEvents>,
     caps: PlannerCaps,
-    instructions: String,
 }
 
 impl std::fmt::Debug for Planner {
@@ -62,6 +64,8 @@ impl std::fmt::Debug for Planner {
 #[derive(Clone, Copy)]
 enum Failure {
     NoSubject,
+    /// The person's schema could not be read.
+    Schema,
     Unusable(UnusableRecord),
     Model(&'static str),
     RoundCap,
@@ -71,7 +75,7 @@ enum Failure {
 impl Failure {
     fn reason(self) -> DropReason {
         match self {
-            Self::NoSubject | Self::Unusable(_) => DropReason::ProcessingFailed,
+            Self::NoSubject | Self::Schema | Self::Unusable(_) => DropReason::ProcessingFailed,
             Self::Model(_) => DropReason::ModelFailed,
             Self::RoundCap => DropReason::RoundCap,
             Self::TokenCap => DropReason::TokenCap,
@@ -81,6 +85,7 @@ impl Failure {
     fn kind(self) -> &'static str {
         match self {
             Self::NoSubject => "no_subject",
+            Self::Schema => "schema_unavailable",
             Self::Unusable(unusable) => unusable.kind(),
             Self::Model(kind) => kind,
             Self::RoundCap | Self::TokenCap => self.reason().name(),
@@ -107,13 +112,31 @@ impl Planner {
         events: Arc<dyn IntakeEvents>,
         caps: PlannerCaps,
     ) -> Self {
-        let instructions = instructions(&catalog);
         Self {
             model,
             catalog,
+            catalogs: None,
             events,
             caps,
-            instructions,
+        }
+    }
+
+    /// The same planner over each person's own schema, from `catalogs`, instead of one catalog for everyone.
+    #[must_use]
+    pub fn with_catalogs(mut self, catalogs: Arc<Catalogs>) -> Self {
+        self.catalogs = Some(catalogs);
+        self
+    }
+
+    /// The catalog of the person `key`: the schema they have now, which the whole of one record or message is then
+    /// planned over, even when the host changes it meanwhile.
+    async fn catalog_of(&self, key: SubjectKey) -> Result<Arc<Catalog>, Failure> {
+        match &self.catalogs {
+            Some(catalogs) => catalogs.of(key).await.map_err(|error| {
+                tracing::warn!(%error, "the person's schema could not be read");
+                Failure::Schema
+            }),
+            None => Ok(Arc::clone(&self.catalog)),
         }
     }
 
@@ -158,9 +181,22 @@ impl Planner {
         message: &AgentMessage,
         profile: Profile,
     ) -> Result<Plan, DropReason> {
-        let draft = PlanDraft::new(&self.catalog, profile);
+        let catalog = match self
+            .catalog_of(SubjectKey {
+                tenant_id: message.tenant_id,
+                subject_id: message.subject_id,
+            })
+            .await
+        {
+            Ok(catalog) => catalog,
+            Err(failure) => return Err(failure.reason()),
+        };
+        let draft = PlanDraft::new(&catalog, profile);
         let input = message_input(message, &draft.numbered_profile());
-        match self.converse(ctx, message.subject_id, draft, input).await {
+        match self
+            .converse(ctx, message.subject_id, &catalog, draft, input)
+            .await
+        {
             Ok(draft) => Ok(draft.finish(
                 message.tenant_id,
                 message.subject_id,
@@ -187,14 +223,19 @@ impl Planner {
         profile: Profile,
     ) -> Result<Plan, Failure> {
         let subject_id = record.envelope.subject_id.ok_or(Failure::NoSubject)?;
-        let draft = PlanDraft::new(&self.catalog, profile)
+        let catalog = self
+            .catalog_of(SubjectKey {
+                tenant_id: record.tenant_id,
+                subject_id,
+            })
+            .await?;
+        let draft = PlanDraft::new(&catalog, profile)
             .for_message(&record.connector, &record.envelope.provenance);
         let input = record_input(record, &draft.numbered_profile()).map_err(Failure::Unusable)?;
-        let mut plan = self.converse(ctx, subject_id, draft, input).await?.finish(
-            record.tenant_id,
-            subject_id,
-            origin(record),
-        );
+        let mut plan = self
+            .converse(ctx, subject_id, &catalog, draft, input)
+            .await?
+            .finish(record.tenant_id, subject_id, origin(record));
         if let Some(cap) = confidence_cap(record) {
             for step in &mut plan.steps {
                 step.confidence = step.confidence.map(|confidence| confidence.min(cap));
@@ -209,6 +250,7 @@ impl Planner {
         &self,
         ctx: &SecurityContext,
         subject_id: Uuid,
+        catalog: &Catalog,
         mut draft: PlanDraft<'a>,
         input: String,
     ) -> Result<PlanDraft<'a>, Failure> {
@@ -217,10 +259,7 @@ impl Planner {
             return Err(Failure::TokenCap);
         }
         let mut request = ModelRequest {
-            messages: vec![
-                Message::System(self.instructions.clone()),
-                Message::User(input),
-            ],
+            messages: vec![Message::System(instructions(catalog)), Message::User(input)],
             tools: draft.tools(),
             answer: AnswerKind::Text,
             max_output_tokens: None,

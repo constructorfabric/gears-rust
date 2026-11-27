@@ -274,6 +274,20 @@ async fn router_of(
             .is_ok()
     );
     assert!(gear.settings.set(settings).is_ok());
+    assert!(
+        gear.schema
+            .set(Arc::new(crate::domain::schema_service::SchemaService::new(
+                Arc::new(toolkit_db::DBProvider::new(db)),
+                Arc::new(
+                    crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository::new(
+                    )
+                ),
+                Arc::clone(&pipeline.schema_effects),
+                Arc::new(crate::test_support::RecordingSchemaEvents::default()),
+                PolicyEnforcer::new(Arc::new(AllowResolver)),
+            )))
+            .is_ok()
+    );
     assert!(gear.profile.set(pipeline.profile).is_ok());
     assert!(gear.subject_control.set(pipeline.subject_control).is_ok());
     assert!(gear.review_queue.set(pipeline.review_queue).is_ok());

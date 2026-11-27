@@ -21,12 +21,13 @@ use graph_storage_sdk::GraphStorageClientV1;
 use crate::api::rest::routes;
 use crate::api::rest::types::{
     ConcreteAdminFacts, ConcreteErasure, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue,
-    ConcreteSettings, ConcreteSubjectControl,
+    ConcreteSchema, ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::{IntakePorts, RecordIntakeService};
+use crate::domain::schema_service::{SchemaService, StoredSchemas};
 use crate::domain::subject_settings::SubjectSettingsService;
 use crate::infra::connector_switch::ConfigConnectorSwitch;
 use crate::infra::deletion_job::{ClusterLeadership, DeletionJob, Leadership};
@@ -36,6 +37,7 @@ use crate::infra::record_types::RegistryRecordTypes;
 use crate::infra::storage::deletion_repo::DeletionTables;
 use crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository;
 use crate::infra::storage::review_requests_repo::ReviewRequestStore;
+use crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository;
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::infra::tenant_defaults::SettingsServiceDefaults;
 
@@ -52,6 +54,7 @@ use crate::infra::tenant_defaults::SettingsServiceDefaults;
 pub struct ConstructGear {
     intake: OnceLock<Arc<ConcreteIntake>>,
     settings: OnceLock<Arc<ConcreteSettings>>,
+    schema: OnceLock<Arc<ConcreteSchema>>,
     profile: OnceLock<Arc<ConcreteProfile>>,
     subject_control: OnceLock<Arc<ConcreteSubjectControl>>,
     review_queue: OnceLock<Arc<ConcreteReviewQueue>>,
@@ -91,6 +94,7 @@ impl Default for ConstructGear {
         Self {
             intake: OnceLock::new(),
             settings: OnceLock::new(),
+            schema: OnceLock::new(),
             profile: OnceLock::new(),
             subject_control: OnceLock::new(),
             review_queue: OnceLock::new(),
@@ -159,6 +163,7 @@ impl Gear for ConstructGear {
         let graph = hub
             .get::<dyn GraphStorageClientV1>()
             .context("failed to get graph storage")?;
+        let schema_repo = Arc::new(SeaOrmSubjectSchemaRepository::new());
         let pipeline = pipeline::build(
             &cfg,
             &hub,
@@ -167,8 +172,22 @@ impl Gear for ConstructGear {
             Arc::new(ReviewRequestStore::new(Arc::clone(&db))),
             Arc::new(DeletionTables::new(Arc::clone(&db))),
             policy_enforcer.clone(),
+            Arc::new(StoredSchemas::new(
+                Arc::clone(&db),
+                Arc::clone(&schema_repo),
+            )),
         )
         .context("record processing")?;
+        let schema = Arc::new(SchemaService::new(
+            Arc::clone(&db),
+            schema_repo,
+            Arc::clone(&pipeline.schema_effects),
+            Arc::new(crate::infra::schema_events::LogSchemaEvents),
+            policy_enforcer.clone(),
+        ));
+        self.schema
+            .set(schema)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         // Nothing below can fail but a second init.
         self.settings
             .set(Arc::clone(&settings))
@@ -292,6 +311,12 @@ impl ConstructGear {
             .ok_or_else(|| anyhow::anyhow!("Manage-facts not initialized"))?;
 
         let router = routes::register_routes(router, openapi, intake, settings, profile);
+        let schema = self
+            .schema
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Profile schema not initialized"))?;
+        let router = routes::register_schema_routes(router, openapi, schema);
         let router = routes::register_subject_control_routes(router, openapi, subject_control);
         let router = routes::register_review_queue_routes(router, openapi, review_queue);
         let erasure = self

@@ -232,7 +232,8 @@ fn example_fact(number: usize, line: &str) -> Fact {
     };
     Fact {
         node_key: NodeKey(format!("example:{number}")),
-        category: Category::from_name(kind).expect("a kind"),
+        category: Category::from_name(crate::domain::profile::profile_schema(), kind)
+            .expect("a kind"),
         property: kind.to_owned(),
         value: serde_json::from_str(value).expect("a JSON value"),
         owner,

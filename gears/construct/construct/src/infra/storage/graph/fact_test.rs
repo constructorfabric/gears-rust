@@ -36,6 +36,7 @@ fn node_of(plan: &Plan) -> NodeSpec {
         plan,
         &plan.steps[0],
         now(),
+        crate::domain::profile::profile_schema(),
         &SchemaPrefix::of(plan.subject_id),
         None,
     )
@@ -109,6 +110,7 @@ fn a_confidence_that_is_no_finite_number_is_a_defect() {
             &plan,
             &plan.steps[0],
             now(),
+            crate::domain::profile::profile_schema(),
             &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
             None,
         ));
@@ -179,6 +181,7 @@ fn a_removal_stores_no_node() {
             &plan,
             &plan.steps[0],
             now(),
+            crate::domain::profile::profile_schema(),
             &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
             None
         )
@@ -195,6 +198,7 @@ fn a_step_of_no_known_category_is_a_defect() {
         &plan,
         &plan.steps[0],
         now(),
+        crate::domain::profile::profile_schema(),
         &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
         None,
     ));
@@ -220,6 +224,7 @@ fn a_fact_must_hold_exactly_one_property() {
             &plan,
             &plan.steps[0],
             now(),
+            crate::domain::profile::profile_schema(),
             &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
             None,
         ));
@@ -235,6 +240,7 @@ fn a_fact_property_named_as_the_envelope_is_a_defect() {
             &plan,
             &plan.steps[0],
             now(),
+            crate::domain::profile::profile_schema(),
             &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
             None,
         ));
@@ -281,6 +287,7 @@ fn a_property_change_is_refused_without_its_value_in_the_message() {
             &plan,
             &plan.steps[0],
             now(),
+            crate::domain::profile::profile_schema(),
             &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
             None,
         ));
@@ -328,10 +335,13 @@ pub(super) fn view(type_id: &str, payload: Option<Value>) -> NodeView {
 
 #[test]
 fn a_stored_fact_reads_back_as_its_property_and_value() {
-    let fact = fact_of(&view(
-        &project_type(),
-        Some(json!({ "project": skills(), "origin": {}, "record": {} })),
-    ))
+    let fact = fact_of(
+        crate::domain::profile::profile_schema(),
+        &view(
+            &project_type(),
+            Some(json!({ "project": skills(), "origin": {}, "record": {} })),
+        ),
+    )
     .expect("a fact");
 
     assert_eq!(fact.category, Category::PROJECT);
@@ -360,7 +370,10 @@ fn a_fact_node_that_holds_no_single_fact_is_a_defect_named_by_its_key() {
             "no node kind",
         ),
     ] {
-        match fact_of(&view(type_id, payload)) {
+        match fact_of(
+            crate::domain::profile::profile_schema(),
+            &view(type_id, payload),
+        ) {
             Err(DomainError::Internal(message)) => {
                 assert!(message.contains("construct:t:fact"), "{message}");
                 assert!(message.contains(what), "{message}");
@@ -406,7 +419,7 @@ proptest! {
     /// same category, property and value.
     #[test]
     fn a_stored_fact_reads_back_as_written(
-        category in prop::sample::select(Category::all()),
+        category in prop::sample::select(Category::all(crate::domain::profile::profile_schema())),
         property in "[a-z_]{1,16}".prop_filter("no envelope member", |name| {
             name != "origin" && name != "record"
         }),
@@ -428,7 +441,7 @@ proptest! {
         };
         let node = node_of(&plan);
 
-        let fact = fact_of(&view(&node.type_id, node.payload)).expect("a fact");
+        let fact = fact_of(crate::domain::profile::profile_schema(), &view(&node.type_id, node.payload)).expect("a fact");
 
         prop_assert_eq!(fact.category, category);
         prop_assert_eq!(fact.property, property);
@@ -464,7 +477,7 @@ fn a_stored_node_that_breaks_the_fact_shape_is_reported_with_its_key() {
             skill(json!({ "project": skills(), "origin": { "method": "somewhere.else" } })),
         ),
     ] {
-        let result = stored_fact_of(&node);
+        let result = stored_fact_of(crate::domain::profile::profile_schema(), &node);
 
         let Err(DomainError::Internal(message)) = result else {
             panic!("{what}: an internal error, got {result:?}");
@@ -485,7 +498,8 @@ fn a_produced_at_that_does_not_parse_is_served_as_absent_and_logged() {
         })),
     );
 
-    let fact = stored_fact_of(&node).expect("the fact is still served");
+    let fact = stored_fact_of(crate::domain::profile::profile_schema(), &node)
+        .expect("the fact is still served");
 
     assert_eq!(fact.origin, OriginKind::Administrator);
     assert_eq!(fact.produced_at, None);
@@ -505,7 +519,8 @@ fn a_produced_at_that_is_not_a_string_is_served_as_absent_and_logged() {
         })),
     );
 
-    let fact = stored_fact_of(&node).expect("the fact is still served");
+    let fact = stored_fact_of(crate::domain::profile::profile_schema(), &node)
+        .expect("the fact is still served");
 
     assert_eq!(fact.produced_at, None);
     assert!(logs_contain("not a string"));

@@ -833,16 +833,13 @@ async fn a_row_construct_cannot_read_is_an_internal_error() {
         row.resolved_at = Set(Some(at(10)));
         row.outcome = Set(Some("rejected".to_owned()));
     };
-    let defects: [(&str, Tweak); 6] = [
+    let defects: [(&str, Tweak); 5] = [
         ("an unknown state", |row| {
             row.state = Set("waiting".to_owned());
         }),
         ("an open row without a value", |row| row.value = Set(None)),
         ("a value that is not JSON", |row| {
             row.value = Set(Some("{".to_owned()));
-        }),
-        ("an unknown entity kind", |row| {
-            row.entity_kind = Set("hobby".to_owned());
         }),
         ("a correction without its new fact", |row| {
             row.state = Set("closed".to_owned());
@@ -891,4 +888,22 @@ async fn a_row_construct_cannot_read_is_an_internal_error() {
         )
         .await;
     assert!(matches!(fine, Ok(Some(_))), "{fine:?}");
+
+    // A request for a kind the host removed since is still read, under the kind's name: the schema of the person
+    // may no longer have it, and the request is not a defect.
+    let removed = row(|row| row.entity_kind = Set("removed_kind".to_owned()));
+    let removed_id = removed.id.clone().unwrap();
+    stored_row(&db, removed).await;
+    let found = store
+        .find(
+            &tenant(key),
+            RequestKey {
+                tenant_id: key.tenant_id,
+                id: removed_id,
+            },
+        )
+        .await
+        .expect("a request of a removed kind is read")
+        .expect("it is there");
+    assert_eq!(found.category.name(), "removed_kind");
 }

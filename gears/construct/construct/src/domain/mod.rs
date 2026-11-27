@@ -22,10 +22,12 @@ pub mod plan;
 pub mod planner;
 pub mod profile;
 pub mod profile_read;
+pub mod profile_schema;
 pub mod profile_writes;
 pub mod record_intake;
 pub mod refusal;
 pub mod review_queue;
+pub mod schema_service;
 pub mod sensitive_data;
 pub mod settings_scope;
 pub mod subject_access;
@@ -51,11 +53,17 @@ mod plan_test;
 #[cfg(test)]
 mod profile_read_test;
 #[cfg(test)]
+mod profile_schema_test;
+#[cfg(test)]
 mod profile_test;
+#[cfg(test)]
+mod profile_writes_test;
 #[cfg(test)]
 mod record_intake_test;
 #[cfg(test)]
 mod review_queue_test;
+#[cfg(test)]
+mod schema_service_test;
 #[cfg(test)]
 mod sensitive_data_test;
 #[cfg(test)]

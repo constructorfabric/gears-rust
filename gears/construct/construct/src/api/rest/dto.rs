@@ -6,12 +6,15 @@ use crate::domain::one_step::NewFact;
 use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::{NodeDetails, OriginKind, ProfileView, StoredFact};
+use crate::domain::profile_schema::SchemaChange;
 use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::review_queue::{
     Resolution, ReviewOutcome, ReviewRequest, ReviewStatus, ReviewText,
 };
+use crate::domain::schema_service::SchemaView;
 use crate::domain::subject_control::{SubjectExport, SubjectFact, SubjectFactsPage};
 use crate::domain::subject_settings::SubjectSettings;
+use construct_sdk::schema_doc::SchemaDoc;
 
 /// One connector record, as JSON. Intake checks it against its GTS type, so
 /// the body is taken as it is and not shaped by this DTO.
@@ -91,6 +94,44 @@ impl SubjectSettingsDto {
 pub struct PutSubjectSettingsRequest {
     /// Turn personalization on or off. Applies from the next request.
     pub personalization_enabled: bool,
+}
+
+/// A person's profile schema as the API returns it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectSchemaDto {
+    /// The person the schema belongs to: the caller.
+    #[schema(value_type = String)]
+    pub subject_id: Uuid,
+    /// The schema: `nodes`, the node kinds with their properties, and `links`, the link kinds with the kinds at their
+    /// ends and their fields. Each property is a name and its JSON schema (draft 7).
+    #[schema(value_type = Object)]
+    pub schema: SchemaDoc,
+    /// How many times the schema was changed; 0 for the default schema nobody changed.
+    pub version: i64,
+}
+
+impl SubjectSchemaDto {
+    #[must_use]
+    pub fn new(subject_id: Uuid, view: SchemaView) -> Self {
+        Self {
+            subject_id,
+            schema: view.schema,
+            version: view.version,
+        }
+    }
+}
+
+/// What the host sends to change a person's schema: changes applied in order to a copy, so that all hold or none is
+/// made. A change is `add_node_kind`, `remove_node_kind`, `add_link_kind`, `remove_link_kind`, `add_property`,
+/// `remove_property`, `add_link_field` or `remove_link_field`, with its `op` and the kind, name or definition it
+/// takes. Removing a node kind forgets all its nodes.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct PatchSubjectSchemaRequest {
+    #[schema(value_type = Vec<Object>)]
+    pub changes: Vec<SchemaChange>,
 }
 
 /// The longest `message` a manage-facts call takes, in characters.

@@ -68,7 +68,7 @@ impl SubjectSettings {
 /// can have a row in more than one tenant, so a row is never looked up by the
 /// subject alone. Named fields keep the two ids from being swapped.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubjectKey {
     pub tenant_id: Uuid,
     pub subject_id: Uuid,
@@ -127,7 +127,7 @@ pub trait SubjectSettingsRepository: Send + Sync {
 
 /// Owner only: a subject reads and changes only its own settings. Another
 /// subject, in this tenant or another, is refused.
-fn ensure_owner(ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainError> {
+pub(crate) fn ensure_owner(ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-compare
     if ctx.subject_id() == subject_id {
         return Ok(());

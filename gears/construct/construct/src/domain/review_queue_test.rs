@@ -16,7 +16,6 @@ use crate::domain::error::DomainError;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::plan::Plan;
 use crate::domain::plan::{Change, NodeKey, Origin};
-use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_writes::ProfileWrites;
@@ -105,7 +104,9 @@ impl Fixture {
                     events: Arc::new(RecordingAdmissionEvents::default()),
                     drops,
                 }),
-                catalog: Arc::new(Catalog::load().unwrap()),
+                catalogs: Arc::new(crate::domain::planner::catalog::Catalogs::new(Arc::new(
+                    crate::domain::profile_schema::DefaultSchemas::new(),
+                ))),
             })
         });
         ReviewQueueService::new(
@@ -1508,6 +1509,7 @@ async fn a_correction_in_place_has_landed_only_when_the_fact_holds_another_value
         crate::domain::profile_writes::SubjectFacts {
             version: Some(1),
             facts: vec![fact],
+            orphans: Vec::new(),
             generation: 0,
         }
     };

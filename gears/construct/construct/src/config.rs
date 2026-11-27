@@ -5,6 +5,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use uuid::Uuid;
 
+use construct_sdk::linked_schema::default_schema;
+
 use crate::domain::profile::Category;
 
 /// Default for [`ConstructConfig::personalization_default`]: on, so a host
@@ -348,7 +350,7 @@ impl ConstructConfig {
             .entity_kinds
             .iter()
             .flatten()
-            .find(|kind| Category::from_name(kind).is_none())
+            .find(|kind| Category::from_name(&default_schema(), kind).is_none())
         {
             return Err(InvalidConfig(format!(
                 "admission.entity_kinds names {unknown:?}, which is not an entity kind"

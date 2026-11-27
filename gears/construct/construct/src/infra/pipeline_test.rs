@@ -21,44 +21,15 @@ use uuid::Uuid;
 use super::pipeline::{MANAGE_BUDGET, assemble};
 use crate::config::{CategoryCheckConfig, ConstructConfig};
 use crate::domain::model_client::{
-    ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
+    ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall,
 };
 use crate::domain::profile::Category;
 use crate::domain::profile_read::OriginKind;
 use crate::domain::record_intake::IntakeOutcome;
 use crate::test_support::{
-    AllowResolver, IntakeFixture, chat_record, fake_graph_storage, inmem_db, settings_service,
-    unchecked_processing,
+    AllowResolver, IntakeFixture, Scripted, answer, chat_record, fake_graph_storage, inmem_db,
+    settings_service, unchecked_processing,
 };
-
-/// A model that answers with the given answers in turn, then the last again.
-struct Scripted(Mutex<VecDeque<ModelResponse>>);
-
-#[async_trait]
-impl ModelClient for Scripted {
-    async fn complete(
-        &self,
-        _ctx: &SecurityContext,
-        _request: &ModelRequest,
-    ) -> Result<ModelResponse, ModelError> {
-        let mut answers = self.0.lock().unwrap();
-        Ok(if answers.len() > 1 {
-            answers.pop_front().unwrap()
-        } else {
-            answers.front().cloned().unwrap()
-        })
-    }
-}
-
-fn answer(output: ModelOutput) -> ModelResponse {
-    ModelResponse {
-        output,
-        usage: Some(Usage {
-            input_tokens: 100,
-            output_tokens: 20,
-        }),
-    }
-}
 
 /// The model adds one skill, then says the plan is complete.
 fn adds_a_skill() -> Arc<Scripted> {
@@ -425,7 +396,10 @@ impl AuthZResolverApi for CategoriesAsked {
 async fn the_configured_category_check_reaches_the_profile_read() {
     for (check, per_category) in [
         (CategoryCheckConfig::OneCall, 0),
-        (CategoryCheckConfig::PerCategory, Category::all().len()),
+        (
+            CategoryCheckConfig::PerCategory,
+            Category::all(crate::domain::profile::profile_schema()).len(),
+        ),
     ] {
         let db = inmem_db().await;
         let asked = Arc::new(CategoriesAsked::default());

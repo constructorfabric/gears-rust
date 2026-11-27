@@ -25,12 +25,13 @@ use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::planner::agent::{Planner, PlannerCaps};
-use crate::domain::planner::catalog::Catalog;
+use crate::domain::planner::catalog::{Catalog, Catalogs};
 use crate::domain::planner::manage::{ManageBudget, ManageFacts};
 use crate::domain::planner::processing::{
     PlanWriter, Processing, ProcessingContexts, ProcessingPorts,
 };
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
+use crate::domain::profile_schema::{DefaultSchemas, ProfileSchemas, SchemaEffects};
 use crate::domain::profile_writes::{ProfileWrites, WRITE_BUDGET};
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
@@ -55,6 +56,7 @@ use crate::infra::profile_events::LogProfileEvents;
 use crate::infra::record_queue::{RecordQueue, record_queue, serve};
 use crate::infra::retention_periods::ConfigRetentionPeriods;
 use crate::infra::review_queue_events::LogReviewQueueEvents;
+use crate::infra::schema_effects::GraphSchemaEffects;
 use crate::infra::storage::deletion_repo::DeletionTables;
 use crate::infra::storage::graph::directory::GraphProfileDirectory;
 use crate::infra::storage::graph::offboarding::GraphTenantOffboarding;
@@ -64,6 +66,7 @@ use crate::infra::storage::graph::types::GraphTypes;
 use crate::infra::storage::graph::writer::{GraphPlanWriter, SoftDelete, WriterPorts};
 use crate::infra::subject_control_events::LogSubjectControlEvents;
 use crate::infra::tenant_statuses::HubTenantStatuses;
+use construct_sdk::linked_schema::default_schema;
 
 /// [`ProcessingContexts`] for a deployment without a processing identity:
 /// Construct has no identity to read or write the profiles as.
@@ -175,6 +178,8 @@ pub struct Pipeline {
     pub retention: Arc<dyn RetentionPeriods>,
     /// The subjects' profile generations, which a record intake takes carries.
     pub generations: Arc<dyn ProfileGenerations>,
+    /// What a change of a person's schema does in graph storage: registers the types, forgets removed kinds.
+    pub schema_effects: Arc<dyn SchemaEffects>,
 }
 
 /// How long manage-facts may take: [`WRITE_BUDGET`] for the steps before the write, as the other write paths have,
@@ -197,6 +202,10 @@ pub(crate) const MANAGE_BUDGET: ManageBudget = ManageBudget {
 /// the config or the gear.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-wiring:p1
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the gear's collaborators, each given once"
+)]
 pub fn build(
     cfg: &ValidConfig,
     hub: &Arc<ClientHub>,
@@ -205,6 +214,7 @@ pub fn build(
     reviews: Arc<dyn ReviewRequests>,
     deletion: Arc<DeletionTables>,
     policy_enforcer: PolicyEnforcer,
+    schemas: Arc<dyn ProfileSchemas>,
 ) -> anyhow::Result<Pipeline> {
     let model: Option<Arc<dyn ModelClient>> = match &cfg.config().model {
         Some(model) => Some(Arc::new(ChatCompletionsModel::new(
@@ -217,7 +227,7 @@ pub fn build(
         )?)),
         None => None,
     };
-    assemble(
+    assemble_with(
         cfg,
         model,
         graph,
@@ -226,6 +236,7 @@ pub fn build(
         deletion,
         policy_enforcer,
         Arc::new(HubTenantStatuses::new(Arc::clone(hub))),
+        schemas,
     )
 }
 
@@ -248,6 +259,44 @@ pub fn assemble(
     policy_enforcer: PolicyEnforcer,
     statuses: Arc<dyn TenantStatuses>,
 ) -> anyhow::Result<Pipeline> {
+    assemble_with(
+        cfg,
+        model,
+        graph,
+        settings,
+        reviews,
+        deletion,
+        policy_enforcer,
+        statuses,
+        Arc::new(DefaultSchemas::new()),
+    )
+}
+
+/// [`assemble`] with where each person's profile schema comes from: the default schema for everyone, or the
+/// schemas the hosts set.
+///
+/// # Errors
+///
+/// As [`assemble`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the gear's collaborators, each given once; a test replaces any of them"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the gear's wiring, one block after another"
+)]
+pub fn assemble_with(
+    cfg: &ValidConfig,
+    model: Option<Arc<dyn ModelClient>>,
+    graph: Arc<dyn GraphStorageClientV1>,
+    settings: Arc<dyn SubjectSettingsReader>,
+    reviews: Arc<dyn ReviewRequests>,
+    deletion: Arc<DeletionTables>,
+    policy_enforcer: PolicyEnforcer,
+    statuses: Arc<dyn TenantStatuses>,
+    schemas: Arc<dyn ProfileSchemas>,
+) -> anyhow::Result<Pipeline> {
     let configured = Configured::of(cfg, model.as_ref());
     let identity = cfg
         .identity()
@@ -265,43 +314,53 @@ pub fn assemble(
     // The reader and the writer find a profile's root in the generation the
     // settings table keeps, which an erasure moves on. The planner reads no
     // fact past the tenant's retention period.
-    let reader = Arc::new(GraphProfileSource::new(
-        Arc::clone(&graph),
-        Arc::new(PayloadCounter),
-        Arc::clone(&deletion) as _,
-        Arc::clone(&periods) as _,
-    ));
+    let reader = Arc::new(
+        GraphProfileSource::new(
+            Arc::clone(&graph),
+            Arc::new(PayloadCounter),
+            Arc::clone(&deletion) as _,
+            Arc::clone(&periods) as _,
+        )
+        .with_schemas(Arc::clone(&schemas)),
+    );
     // @cpt-end:cpt-cf-construct-algo-erasure-wire:p1:inst-wire-generations
-    let profile = Arc::new(ProfileReadService::new(
-        ProfileReadPorts {
-            settings: Arc::clone(&settings),
-            profiles: Arc::clone(&reader) as _,
-            contexts: Arc::clone(&contexts),
-            events: Arc::new(LogProfileEvents),
-            reviews: Arc::clone(&reviews) as _,
-            retention: Arc::clone(&periods) as _,
-        },
-        policy_enforcer.clone(),
-        // Without an identity the read answers not configured before it
-        // checks a category, so the check it would take does not matter.
-        match cfg.identity().map(|identity| identity.category_check) {
-            Some(CategoryCheckConfig::OneCall) => CategoryCheck::OneCall,
-            Some(CategoryCheckConfig::PerCategory) | None => CategoryCheck::PerCategory,
-        },
-    ));
+    let profile = Arc::new(
+        ProfileReadService::new(
+            ProfileReadPorts {
+                settings: Arc::clone(&settings),
+                profiles: Arc::clone(&reader) as _,
+                contexts: Arc::clone(&contexts),
+                events: Arc::new(LogProfileEvents),
+                reviews: Arc::clone(&reviews) as _,
+                retention: Arc::clone(&periods) as _,
+            },
+            policy_enforcer.clone(),
+            // Without an identity the read answers not configured before it
+            // checks a category, so the check it would take does not matter.
+            match cfg.identity().map(|identity| identity.category_check) {
+                Some(CategoryCheckConfig::OneCall) => CategoryCheck::OneCall,
+                Some(CategoryCheckConfig::PerCategory) | None => CategoryCheck::PerCategory,
+            },
+        )
+        .with_schemas(Arc::clone(&schemas)),
+    );
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
 
     // @cpt-begin:cpt-cf-construct-algo-subject-control-wire:p1:inst-wire-subject-control
     // The writer stores processing's plans and the subject's deletes, so a
     // subject deletes its facts also where no model is configured.
-    let graph_writer = Arc::new(GraphPlanWriter::new(WriterPorts {
-        client: Arc::clone(&graph),
-        types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
-        version: Arc::new(PayloadCounter),
-        removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
-        generations: Arc::clone(&deletion) as _,
-        tenants: Arc::clone(&deletion) as _,
-    }));
+    let types = Arc::new(GraphTypes::new(Arc::clone(&graph)));
+    let graph_writer = Arc::new(
+        GraphPlanWriter::new(WriterPorts {
+            client: Arc::clone(&graph),
+            types: Arc::clone(&types),
+            version: Arc::new(PayloadCounter),
+            removal: Arc::new(SoftDelete::new(Arc::clone(&graph))),
+            generations: Arc::clone(&deletion) as _,
+            tenants: Arc::clone(&deletion) as _,
+        })
+        .with_schemas(Arc::clone(&schemas)),
+    );
     let writer: Arc<dyn PlanWriter> = Arc::clone(&graph_writer) as _;
     let profile_writes = Arc::new(ProfileWrites::new(
         Arc::clone(&reader) as _,
@@ -309,6 +368,8 @@ pub fn assemble(
         Arc::clone(&contexts),
         cfg.config().processing.max_reruns,
     ));
+    let schema_effects: Arc<dyn SchemaEffects> =
+        Arc::new(GraphSchemaEffects::new(types, Arc::clone(&profile_writes)));
     let subject_control = Arc::new(SubjectControlService::new(
         SubjectControlPorts {
             writes: Arc::clone(&profile_writes),
@@ -325,7 +386,7 @@ pub fn assemble(
     // A correction stores a value, so it runs only where record processing
     // may: with an identity and the opt-in to store values unchecked. A
     // rejection and a delete need neither.
-    let catalog = Arc::new(Catalog::load().context("the person types' property catalog")?);
+    let catalogs = Arc::new(Catalogs::new(schemas));
     let stores_unchecked = identity.is_some() && configured.unchecked.present();
     if stores_unchecked {
         warn_unchecked(cfg);
@@ -336,7 +397,7 @@ pub fn assemble(
         Arc::new(OneStepPath {
             checks,
             admission,
-            catalog: Arc::clone(&catalog),
+            catalogs: Arc::clone(&catalogs),
         })
     });
     let review_queue = Arc::new(ReviewQueueService::new(
@@ -423,6 +484,7 @@ pub fn assemble(
             deletion_job,
             retention: periods,
             generations: deletion,
+            schema_effects,
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -438,13 +500,14 @@ pub fn assemble(
     ));
     let planner = Planner::new(
         model,
-        catalog,
+        Arc::new(Catalog::load(&default_schema()).context("the person types' property catalog")?),
         Arc::clone(&events) as _,
         PlannerCaps {
             max_rounds: cfg.config().processing.max_rounds,
             max_tokens: cfg.config().processing.max_tokens,
         },
-    );
+    )
+    .with_catalogs(Arc::clone(&catalogs));
     let (checks, admission) = value_stages(cfg, settings, Arc::clone(&events) as _);
     let processing = Arc::new(Processing::new(
         planner,
@@ -487,6 +550,7 @@ pub fn assemble(
         deletion_job,
         retention: periods,
         generations: deletion,
+        schema_effects,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }

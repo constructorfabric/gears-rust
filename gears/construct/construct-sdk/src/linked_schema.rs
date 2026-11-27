@@ -45,7 +45,7 @@ pub struct NodeKind {
     /// The kind's registered name, which the REST API, the SDK and the model use: lower case, one word.
     pub name: &'static str,
     /// What the kind is, for the model and the published schema.
-    pub description: &'static str,
+    pub description: String,
     pub owner: Owner,
     /// A reference node points at where something came from, rather than being a thing the person works with.
     pub reference: bool,
@@ -61,7 +61,7 @@ pub struct NodeKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkKind {
     pub name: &'static str,
-    pub description: &'static str,
+    pub description: String,
     /// The kinds a link of this kind may start at.
     pub from: Vec<&'static str>,
     /// The kinds a link of this kind may end at.
@@ -277,6 +277,10 @@ fn node_schema(prefix: &SchemaPrefix, kind: &NodeKind) -> Value {
             "{} One node is one {}: its payload holds one property, named like the kind, whose value is the object of the node's fields, and the origin of the node. It also holds record, the record the node came from, exactly when it came from a record.",
             kind.description, kind.name
         ),
+        // Declares the key property of the kind, the one that names a node, as a path a filter or a sort may use: graph storage builds the index in the
+        // background once the type is registered, and admits a filter on the path only after it is built. The gear
+        // does not filter or sort in graph storage yet; the declaration is there for the readers that will.
+        "x-gts-traits": { "index": [format!("/payload/{}/{}", kind.name, kind.key)] },
         "type": "object",
         "allOf": [
             { "$ref": format!("gts://{NODE_BASE}") },
@@ -438,7 +442,7 @@ const THINGS: [&str; 9] = [
 fn thing(kind: &'static str, description: &'static str, properties: Vec<PropertyDef>) -> NodeKind {
     NodeKind {
         name: kind,
-        description,
+        description: description.to_owned(),
         owner: Owner::Root,
         reference: false,
         single: false,
@@ -455,7 +459,7 @@ fn entry(
 ) -> NodeKind {
     NodeKind {
         name: kind,
-        description,
+        description: description.to_owned(),
         owner: Owner::Kinds(THINGS.to_vec()),
         reference: false,
         single: false,
@@ -472,7 +476,7 @@ fn reference(
 ) -> NodeKind {
     NodeKind {
         name: kind,
-        description,
+        description: description.to_owned(),
         owner: Owner::Root,
         reference: true,
         single: false,
@@ -490,7 +494,7 @@ fn link(
 ) -> LinkKind {
     LinkKind {
         name,
-        description,
+        description: description.to_owned(),
         from: from.to_vec(),
         to: to.to_vec(),
         fields,
@@ -521,7 +525,8 @@ fn default_things() -> Vec<NodeKind> {
     vec![
         NodeKind {
             name: "me",
-            description: "The person the profile is of: the direct properties of the profile root. There is one.",
+            description: "The person the profile is of: the direct properties of the profile root. There is one."
+                .to_owned(),
             owner: Owner::Root,
             reference: false,
             single: true,

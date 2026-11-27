@@ -31,8 +31,9 @@ use crate::domain::deletion::{KnownTenants, ProfileGenerations, ProfileRoots, Ro
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin, Plan};
 use crate::domain::planner::processing::{PlanWriter, Written};
+use crate::domain::profile::Mark;
 use crate::domain::profile::{FactCount, FullProfile};
-use crate::domain::profile::{Mark, profile_schema};
+use crate::domain::profile_schema::{DefaultSchemas, ProfileSchemas};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The reason graph storage gives a write that lost a serialization race; it
@@ -136,6 +137,8 @@ pub struct GraphPlanWriter {
     attempts: NonZeroU32,
     timeout: Duration,
     max_facts: usize,
+    /// Where each person's schema comes from.
+    schemas: Arc<dyn ProfileSchemas>,
 }
 
 impl GraphPlanWriter {
@@ -146,7 +149,15 @@ impl GraphPlanWriter {
             attempts: DEFAULT_ATTEMPTS,
             timeout: DEFAULT_CALL_TIMEOUT,
             max_facts: MAX_FACTS,
+            schemas: Arc::new(DefaultSchemas::new()),
         }
+    }
+
+    /// Read each person's schema from `schemas` rather than using the default schema for everyone.
+    #[must_use]
+    pub fn with_schemas(mut self, schemas: Arc<dyn ProfileSchemas>) -> Self {
+        self.schemas = schemas;
+        self
     }
 
     /// Replace [`DEFAULT_ATTEMPTS`].
@@ -460,6 +471,7 @@ fn changes(
     plan: &Plan,
     stored: &Stored,
     now: OffsetDateTime,
+    schema: &Schema,
     prefix: &SchemaPrefix,
 ) -> Result<Changes, DomainError> {
     let root = &stored.key;
@@ -470,7 +482,7 @@ fn changes(
             Change::ReplaceEntity { old, .. } => old_node(old),
             _ => None,
         };
-        if let Some(node) = fact_node(plan, step, now, prefix, previous)? {
+        if let Some(node) = fact_node(plan, step, now, schema, prefix, previous)? {
             let in_place =
                 matches!(&step.change, Change::ReplaceEntity { old, key, .. } if old == key);
             if !in_place {
@@ -495,7 +507,7 @@ fn changes(
                 changes.removals.extend(with_owned(stored, old));
             }
             Change::AddLink { kind, from, to, .. } => {
-                if profile_schema().link(kind).is_none() {
+                if schema.link(kind).is_none() {
                     return Err(DomainError::internal(format!("unknown link kind `{kind}`")));
                 }
                 changes.edges.push(EdgeSpec {
@@ -578,7 +590,7 @@ fn with_owned(stored: &Stored, node: &NodeKey) -> Vec<NodeKey> {
 /// The marks the root holds after `plan`: what it held, and, for a person's own forget, a mark for each node it
 /// removes and each message the node was learned from, so the same message does not create the node again. The
 /// newest [`MAX_MARKS`].
-fn marks_after(stored: &Stored, plan: &Plan) -> Vec<Mark> {
+fn marks_after(schema: &Schema, stored: &Stored, plan: &Plan) -> Vec<Mark> {
     let mut marks = stored.root.marks.clone();
     if matches!(plan.origin, Origin::Subject { .. }) {
         for step in &plan.steps {
@@ -588,7 +600,7 @@ fn marks_after(stored: &Stored, plan: &Plan) -> Vec<Mark> {
             // The nodes it owns go with it, and so do their messages.
             for removed in with_owned(stored, entity) {
                 if let Some(node) = stored.facts.iter().find(|node| node.node_key == removed.0) {
-                    marks_of(node, &mut marks);
+                    marks_of(schema, node, &mut marks);
                 }
             }
         }
@@ -598,11 +610,14 @@ fn marks_after(stored: &Stored, plan: &Plan) -> Vec<Mark> {
 }
 
 /// Add to `marks` one for each message the removed stored `node` was learned from.
-fn marks_of(node: &NodeView, marks: &mut Vec<Mark>) {
-    let Ok(fact) = fact_of(node) else {
+fn marks_of(schema: &Schema, node: &NodeView, marks: &mut Vec<Mark>) {
+    let Ok(fact) = fact_of(schema, node) else {
         return;
     };
-    let Some(key) = Mark::identity(fact.category, &fact.value) else {
+    let Some(kind) = fact.category.kind(schema) else {
+        return;
+    };
+    let Some(key) = Mark::identity(kind.key, &fact.value) else {
         return;
     };
     let learned = node
@@ -669,6 +684,7 @@ fn batch(
     versions: &dyn ProfileVersion,
     max_facts: usize,
     now: OffsetDateTime,
+    schema: &Schema,
 ) -> Result<Batch, DomainError> {
     let live: BTreeSet<&str> = stored
         .facts
@@ -689,7 +705,7 @@ fn batch(
         edges,
         removals,
         unlinks,
-    } = changes(plan, stored, now, &prefix)?;
+    } = changes(plan, stored, now, schema, &prefix)?;
     if let Some(key) = removals.iter().find(|key| !live.contains(key.0.as_str())) {
         return Err(DomainError::internal(format!(
             "the plan removes {}, which is not a fact of the profile it was built on",
@@ -709,7 +725,7 @@ fn batch(
     listed.extend(removals);
     let root_now = Root {
         removals: listed,
-        marks: marks_after(stored, plan),
+        marks: marks_after(schema, stored, plan),
     };
     let payload = root_now.payload(subject.subject_id, versions, versions.next(stored.version)?)?;
     nodes.push(NodeSpec {
@@ -739,6 +755,7 @@ impl GraphPlanWriter {
         &self,
         ctx: &SecurityContext,
         subject: &ContextSubject,
+        schema: &Schema,
     ) -> Result<Stored, DomainError> {
         read_stored(
             self.ports.client.as_ref(),
@@ -747,6 +764,7 @@ impl GraphPlanWriter {
             self.timeout,
             ctx,
             subject,
+            schema,
         )
         .await
     }
@@ -761,9 +779,10 @@ impl GraphPlanWriter {
         &self,
         ctx: &SecurityContext,
         subject: &ContextSubject,
+        schema: &Schema,
         expected: Option<u64>,
     ) -> Result<Written, DomainError> {
-        let now = self.read(ctx, subject).await?;
+        let now = self.read(ctx, subject, schema).await?;
         if now.version == expected {
             return Err(DomainError::internal(format!(
                 "graph storage refused the write of profile root {} while its counter \
@@ -803,10 +822,15 @@ impl PlanWriter for GraphPlanWriter {
                 subject_id: plan.subject_id,
             },
         )?;
-        by(deadline, self.ports.types.ensure(ctx, plan.subject_id)).await?;
+        let schema = by(deadline, self.schemas.schema(*subject.key())).await?;
+        by(
+            deadline,
+            self.ports.types.ensure(ctx, plan.subject_id, &schema),
+        )
+        .await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
-        let stored = by(deadline, self.read(ctx, &subject)).await?;
+        let stored = by(deadline, self.read(ctx, &subject, &schema)).await?;
         let expected = stored.version;
         if expected != plan.profile_version {
             tracing::debug!(
@@ -832,6 +856,7 @@ impl PlanWriter for GraphPlanWriter {
                 self.ports.version.as_ref(),
                 self.max_facts,
                 OffsetDateTime::now_utc(),
+                &schema,
             )
         };
         let Batch {
@@ -849,7 +874,7 @@ impl PlanWriter for GraphPlanWriter {
                     return Err(DomainError::ProfileFull(full));
                 }
                 self.remove(ctx, &waiting, deadline).await;
-                let stored = by(deadline, self.read(ctx, &subject)).await?;
+                let stored = by(deadline, self.read(ctx, &subject, &schema)).await?;
                 if stored.version != expected {
                     return Ok(Written::Conflict);
                 }
@@ -868,7 +893,7 @@ impl PlanWriter for GraphPlanWriter {
                 // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
                 Ok(Written::Stored)
             }
-            Written::Conflict => by(deadline, self.refused(ctx, &subject, expected)).await,
+            Written::Conflict => by(deadline, self.refused(ctx, &subject, &schema, expected)).await,
         }
     }
 }
@@ -888,6 +913,7 @@ impl ProfileRoots for GraphPlanWriter {
         // The root of the generation asked for, not the current one: once
         // another run finished the erasure, the current root is a new
         // profile's.
+        let schema = self.schemas.schema(key).await?;
         let stored = read_generation(
             self.ports.client.as_ref(),
             self.ports.version.as_ref(),
@@ -895,6 +921,7 @@ impl ProfileRoots for GraphPlanWriter {
             self.timeout,
             ctx,
             &subject,
+            &schema,
         )
         .await?;
         if stored.version.is_none() {

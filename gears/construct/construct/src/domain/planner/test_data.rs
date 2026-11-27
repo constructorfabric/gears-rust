@@ -34,7 +34,7 @@ pub(super) const TENANT: Uuid = Uuid::from_u128(0x6b1f_0c2a_93d4_4e8f_a1b2_c3d4_
 pub(super) const SUBJECT: Uuid = Uuid::from_u128(0x2c9e_7a41_5b3f_4d6e_8f90_1a2b_3c4d_5e6f);
 
 pub(super) fn catalog() -> Catalog {
-    Catalog::load().expect("the catalog")
+    Catalog::load(crate::domain::profile::profile_schema()).expect("the catalog")
 }
 
 pub(super) fn origin() -> Origin {

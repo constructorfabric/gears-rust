@@ -366,7 +366,7 @@ async fn a_forgotten_project_is_marked_with_its_message_and_that_message_does_no
             "chat_engine/thread-42/msg-7"
         )
     );
-    let catalog = Catalog::load().unwrap();
+    let catalog = Catalog::load(crate::domain::profile::profile_schema()).unwrap();
     let add = crate::domain::model_client::ToolCall {
         id: "c".to_owned(),
         name: "add".to_owned(),

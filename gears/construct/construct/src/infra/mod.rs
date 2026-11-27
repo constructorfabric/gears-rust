@@ -26,6 +26,10 @@ pub mod record_types;
 mod record_types_test;
 pub mod retention_periods;
 pub mod review_queue_events;
+#[cfg(test)]
+mod runtime_schema_test;
+pub mod schema_effects;
+pub mod schema_events;
 pub mod storage;
 pub mod subject_control_events;
 pub mod tenant_defaults;

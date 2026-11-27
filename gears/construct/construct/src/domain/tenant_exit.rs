@@ -80,6 +80,8 @@ pub trait GraphOffboarding: Send + Sync {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TenantRows {
     pub subject_settings: u64,
+    /// The schemas the hosts set for the tenant's subjects.
+    pub subject_schemas: u64,
     pub review_requests: u64,
     pub record_ids: u64,
 }
@@ -233,6 +235,7 @@ impl TenantExit {
             self.ports.events.record(DeletionEvent::TenantRowsRemoved {
                 tenant_id,
                 subject_settings: rows.subject_settings,
+                subject_schemas: rows.subject_schemas,
                 review_requests: rows.review_requests,
                 record_ids: rows.record_ids,
             });
