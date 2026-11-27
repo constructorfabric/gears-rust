@@ -5,9 +5,9 @@
 
 use chrono::{DateTime, Utc};
 use model_registry_sdk::{
-    ApprovalV1, ModelEntryV1, ModelInfoV1, ModelV1, ProviderEntryV1, ProviderV1,
+    ApprovalV1, ModelCostV1, ModelEntryV1, ModelInfoV1, ModelV1, ProviderEntryV1, ProviderV1,
 };
-use serde_json::Value as JsonValue;
+use serde_json::Value;
 use toolkit_macros::api_dto;
 use uuid::Uuid;
 
@@ -44,7 +44,7 @@ pub struct ProviderEntryDto {
     pub sharing_mode: String,
     pub managed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<JsonValue>,
+    pub metadata: Option<Value>,
     /// Row version; the `ETag` of single-entry responses.
     pub version: i64,
     pub created_at: DateTime<Utc>,
@@ -111,7 +111,7 @@ pub struct CreateProviderRequestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<JsonValue>,
+    pub metadata: Option<Value>,
 }
 
 /// `UpdateProviderRequestV1` on the wire. The precondition comes from the
@@ -122,16 +122,21 @@ pub struct CreateProviderRequestDto {
 #[allow(clippy::option_option)]
 pub struct UpdateProviderRequestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub name: Option<String>,
     /// A value different from the stored one is a type migration of the
     /// provider and all its models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub gts_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sharing_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub managed: Option<bool>,
     /// `null` clears the metadata.
     #[serde(
@@ -139,7 +144,7 @@ pub struct UpdateProviderRequestDto {
         deserialize_with = "nullable_opt::deserialize",
         skip_serializing_if = "Option::is_none"
     )]
-    pub metadata: Option<Option<JsonValue>>,
+    pub metadata: Option<Option<Value>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +165,42 @@ impl From<ApprovalV1> for ModelApprovalDto {
             state: a.state.as_str().to_owned(),
             decided_by: a.decided_by,
             decided_at: a.decided_at,
+        }
+    }
+}
+
+/// `ModelCostV1` on the wire: rates in micro-credits; an absent rate means
+/// the model does not price that kind of usage.
+#[allow(clippy::struct_field_names)]
+#[api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
+pub struct ModelCostDto {
+    /// Per 1,000,000 input tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_per_1m_micro: Option<u64>,
+    /// Per 1,000,000 output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_per_1m_micro: Option<u64>,
+    /// Per 1,000,000 input tokens read from the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_per_1m_micro: Option<u64>,
+    /// Per 1,000,000 input tokens written to the provider's prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_1m_micro: Option<u64>,
+    /// Per 1,000 web search calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_per_1k_calls_micro: Option<u64>,
+}
+
+impl From<ModelCostV1> for ModelCostDto {
+    fn from(c: ModelCostV1) -> Self {
+        Self {
+            input_per_1m_micro: c.input_per_1m_micro,
+            output_per_1m_micro: c.output_per_1m_micro,
+            cache_read_per_1m_micro: c.cache_read_per_1m_micro,
+            cache_write_per_1m_micro: c.cache_write_per_1m_micro,
+            web_search_per_1k_calls_micro: c.web_search_per_1k_calls_micro,
         }
     }
 }
@@ -205,21 +246,28 @@ pub struct ModelInfoDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multiplier_display: Option<String>,
     /// Cost in micro-credits; absent rates are omitted.
-    pub cost: JsonValue,
-    pub performance: JsonValue,
-    pub additional_info: JsonValue,
+    pub cost: ModelCostDto,
+    #[schema(value_type = Object)]
+    pub performance: Value,
+    #[schema(value_type = Object)]
+    pub additional_info: Value,
     pub supported_api: Vec<String>,
-    pub capabilities: JsonValue,
-    pub disabled_capabilities: JsonValue,
-    pub context_window: JsonValue,
-    pub default_parameters: JsonValue,
+    #[schema(value_type = Object)]
+    pub capabilities: Value,
+    #[schema(value_type = Object)]
+    pub disabled_capabilities: Value,
+    #[schema(value_type = Object)]
+    pub context_window: Value,
+    #[schema(value_type = Object)]
+    pub default_parameters: Value,
     pub allow_parameter_override: bool,
     pub allow_extra_params: Vec<String>,
-    pub provider_settings: JsonValue,
+    #[schema(value_type = Object)]
+    pub provider_settings: Value,
 }
 
-fn to_json<T: serde::Serialize>(value: &T) -> JsonValue {
-    serde_json::to_value(value).unwrap_or(JsonValue::Null)
+fn to_json<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
 impl From<ModelInfoV1> for ModelInfoDto {
@@ -251,7 +299,7 @@ impl From<ModelInfoV1> for ModelInfoDto {
             sort_order: i.sort_order,
             icon: i.icon,
             multiplier_display: i.multiplier_display,
-            cost: to_json(&i.cost),
+            cost: i.cost.into(),
             performance: to_json(&i.performance),
             additional_info: to_json(&i.additional_info),
             supported_api,
@@ -407,26 +455,34 @@ pub struct CreateModelRequestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multiplier_display: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost: Option<JsonValue>,
+    #[schema(value_type = Option<ModelCostDto>)]
+    pub cost: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub performance: Option<JsonValue>,
+    #[schema(value_type = Option<Object>)]
+    pub performance: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_info: Option<JsonValue>,
+    #[schema(value_type = Option<Object>)]
+    pub additional_info: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supported_api: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<JsonValue>,
+    #[schema(value_type = Option<Object>)]
+    pub capabilities: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disabled_capabilities: Option<JsonValue>,
-    pub context_window: JsonValue,
+    #[schema(value_type = Option<Object>)]
+    pub disabled_capabilities: Option<Value>,
+    #[schema(value_type = Object)]
+    pub context_window: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_parameters: Option<JsonValue>,
+    #[schema(value_type = Option<Object>)]
+    pub default_parameters: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_parameter_override: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_extra_params: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_settings: Option<JsonValue>,
+    #[schema(value_type = Option<Object>)]
+    pub provider_settings: Option<Value>,
 }
 
 /// `UpdateModelRequestV1` on the wire. Nullable fields accept `null` to
@@ -437,10 +493,13 @@ pub struct CreateModelRequestDto {
 #[allow(clippy::option_option)]
 pub struct UpdateModelRequestDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sharing_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub approval_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub provider_model_id: Option<String>,
     #[serde(
         default,
@@ -455,6 +514,7 @@ pub struct UpdateModelRequestDto {
     )]
     pub secret_ref: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub display_name: Option<String>,
     #[serde(
         default,
@@ -475,6 +535,7 @@ pub struct UpdateModelRequestDto {
     )]
     pub vendor: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub managed: Option<bool>,
     #[serde(
         default,
@@ -525,6 +586,7 @@ pub struct UpdateModelRequestDto {
     )]
     pub model_version: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub sort_order: Option<i32>,
     #[serde(
         default,
@@ -539,27 +601,38 @@ pub struct UpdateModelRequestDto {
     )]
     pub multiplier_display: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost: Option<JsonValue>,
+    #[schema(value_type = ModelCostDto)]
+    pub cost: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub performance: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub performance: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub additional_info: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub additional_info: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub supported_api: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub capabilities: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub disabled_capabilities: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub disabled_capabilities: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub context_window: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default_parameters: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub default_parameters: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub allow_parameter_override: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
     pub allow_extra_params: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_settings: Option<JsonValue>,
+    #[schema(value_type = Object)]
+    pub provider_settings: Option<Value>,
 }
 
 #[cfg(test)]
