@@ -367,19 +367,23 @@ def provider_file_id(attachment_id: str) -> str:
 
 # ── Outbox capture ───────────────────────────────────────────────────────
 #
-# The toolkit-db outbox deletes a message's `toolkit_outbox_body` row about
+# The toolkit-db outbox deletes a message's `<prefix>_body` row about
 # a second after its handler succeeded (vacuum worker,
 # libs/toolkit-db/src/outbox/workers/vacuum.rs; its tuning is not part of
 # the mini-chat config), so the body table cannot tell "never enqueued" from
 # "already handled". The handlers keep nothing either: usage events go to
 # the static model policy plugin, audit events to the static audit plugin.
 #
-# Instead a SQLite trigger on `toolkit_outbox_incoming` copies each message
+# Instead a SQLite trigger on `<prefix>_incoming` copies each message
 # (queue and payload) into E2E_OUTBOX_CAPTURE when it is enqueued. The
 # trigger runs inside the enqueuing transaction, so a message is captured
 # exactly when it commits, and the copy is never vacuumed. Once the
 # transaction that would enqueue a message has committed (e.g. the turn is
 # terminal), its absence from the capture means it was not enqueued.
+#
+# The `server` fixture installs the trigger once the server is up, before any
+# test runs. Without the outbox schema a test fails, with the reason, when it
+# reads the outbox; the rest of the suite runs.
 
 E2E_OUTBOX_CAPTURE = "e2e_outbox_capture"
 
@@ -390,22 +394,69 @@ ATTACHMENT_CLEANUP_QUEUE = "mini-chat.attachment_cleanup"
 CHAT_CLEANUP_QUEUE = "mini-chat.chat_cleanup"
 THREAD_SUMMARY_QUEUE = "mini-chat.thread_summary"
 
-_OUTBOX_TABLES = ("toolkit_outbox_body", "toolkit_outbox_incoming", "toolkit_outbox_partitions")
+# The outbox table prefix is configurable (toolkit-db `.table_prefix(P)`, default
+# `toolkit_outbox`). The fixture finds the prefix in the schema: it is the one P for
+# which each `P_<suffix>` below exists.
+_OUTBOX_SUFFIXES = ("body", "incoming", "partitions", "dead_letters", "processor")
+
+#: The detected outbox table prefix. `_install_outbox_capture` sets it.
+_OUTBOX_PREFIX: str | None = None
+
+#: Why the capture is not installed, or None once it is. `_install_outbox_capture` sets it.
+_OUTBOX_UNAVAILABLE: str | None = "the server fixture has not installed the capture yet"
+
+
+def _require_outbox() -> None:
+    if _OUTBOX_UNAVAILABLE is not None:
+        pytest.fail(f"outbox capture unavailable: {_OUTBOX_UNAVAILABLE}", pytrace=False)
+
+
+def outbox_table(suffix: str) -> str:
+    """The name of the outbox table `<prefix>_<suffix>` for the detected prefix."""
+    _require_outbox()
+    return f"{_OUTBOX_PREFIX}_{suffix}"
+
+
+def _outbox_prefixes(names: set[str]) -> list[str]:
+    """Every prefix P for which all `P_<suffix>` tables exist in `names`."""
+    tail = f"_{_OUTBOX_SUFFIXES[0]}"
+    candidates = {n[: -len(tail)] for n in names if n.endswith(tail) and len(n) > len(tail)}
+    return sorted(
+        p for p in candidates if all(f"{p}_{s}" in names for s in _OUTBOX_SUFFIXES)
+    )
 
 
 def _install_outbox_capture(timeout: float = 60.0) -> None:
-    """Create the capture table and trigger once the outbox schema exists."""
+    """Create the capture table and trigger once the outbox schema exists. Without
+    exactly one outbox schema within `timeout`, record why in `_OUTBOX_UNAVAILABLE`."""
+    global _OUTBOX_PREFIX, _OUTBOX_UNAVAILABLE
     deadline = time.monotonic() + timeout
     while True:
+        prefixes: list[str] = []
         if os.path.exists(DB_PATH):
             names = {
                 r["name"] for r in query_db("SELECT name FROM sqlite_master WHERE type = 'table'")
             }
-            if all(t in names for t in _OUTBOX_TABLES):
+            prefixes = _outbox_prefixes(names)
+            if len(prefixes) == 1:
+                _OUTBOX_PREFIX = prefixes[0]
                 break
+            # DESIGN requires one shared outbox pipeline. A second complete table set
+            # does not go away, so the fixture stops waiting at once.
+            if len(prefixes) > 1:
+                _OUTBOX_UNAVAILABLE = (
+                    f"outbox tables P_{{{','.join(_OUTBOX_SUFFIXES)}}}: expected exactly one "
+                    f"prefix P, found {len(prefixes)}: {prefixes}"
+                )
+                return
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"outbox tables {_OUTBOX_TABLES} not created within {timeout}s")
+            _OUTBOX_UNAVAILABLE = (
+                f"outbox tables P_{{{','.join(_OUTBOX_SUFFIXES)}}}: expected exactly one "
+                f"prefix P within {timeout}s, found {len(prefixes)}: {prefixes}"
+            )
+            return
         time.sleep(0.2)
+    _OUTBOX_UNAVAILABLE = None
     conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
         conn.executescript(f"""
@@ -416,11 +467,11 @@ def _install_outbox_capture(timeout: float = 60.0) -> None:
                 payload BLOB    NOT NULL
             );
             CREATE TRIGGER IF NOT EXISTS {E2E_OUTBOX_CAPTURE}_on_enqueue
-            AFTER INSERT ON toolkit_outbox_incoming
+            AFTER INSERT ON {outbox_table('incoming')}
             BEGIN
                 INSERT INTO {E2E_OUTBOX_CAPTURE} (body_id, queue, payload)
                 SELECT b.id, p.queue, b.payload
-                FROM toolkit_outbox_body b, toolkit_outbox_partitions p
+                FROM {outbox_table('body')} b, {outbox_table('partitions')} p
                 WHERE b.id = NEW.body_id AND p.id = NEW.partition_id;
             END;
         """)
@@ -431,6 +482,7 @@ def _install_outbox_capture(timeout: float = 60.0) -> None:
 def outbox_payloads(needle: str, queue: str | None = None) -> list[dict]:
     """JSON payloads of the outbox messages enqueued so far (see "Outbox
     capture") that contain `needle`, oldest first; only `queue` if given."""
+    _require_outbox()
     # `payload` is a BLOB. The CAST is required: SQLite built with
     # SQLITE_LIKE_DOESNT_MATCH_BLOBS (Debian/Ubuntu system libsqlite3, used by
     # the CI Python) never matches LIKE against a BLOB.
@@ -1113,12 +1165,16 @@ def server(test_env):
 
 
 def _wait_no_running_turns(timeout: float = 5.0) -> None:
-    """Best effort: wait until no turn is `running` (the summary would show it)."""
+    """Best effort: wait until no turn is `running` (the summary would show it). A gear
+    without the `chat_turns` table gives no wait."""
     if not os.path.exists(DB_PATH):
         return
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        running = query_db("SELECT COUNT(*) AS n FROM chat_turns WHERE state = 'running'")
+        try:
+            running = query_db("SELECT COUNT(*) AS n FROM chat_turns WHERE state = 'running'")
+        except sqlite3.Error:
+            return
         if running[0]["n"] == 0:
             return
         time.sleep(0.1)

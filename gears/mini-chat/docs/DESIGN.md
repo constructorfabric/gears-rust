@@ -794,12 +794,13 @@ Upload is synchronous: within the request the file is uploaded to the RAG provid
 | The chat's model is no longer in the catalog (checked before the body is read) | 400 | `invalid_argument`, `field_violations[model].reason = INVALID_MODEL` |
 | No boundary in `Content-Type`, unreadable multipart body, no `file` field, `file` part without a content type | 400 | `invalid_argument`, `field_violations[].reason`: `BOUNDARY_REQUIRED` (`content_type`), `MULTIPART_ERROR` (`multipart`), `MISSING_FILE` (`file`), `MISSING_CONTENT_TYPE` (`content_type`) |
 | File larger than `min(rag.uploaded_file_max_size_kb, model max_file_size_mb)` / `min(rag.uploaded_image_max_size_kb, model max_file_size_mb)` | 400 | `out_of_range`, `field_violations[content_length].reason = FILE_TOO_LARGE` |
-| Unsupported MIME type | 400 | `invalid_argument`, `UNSUPPORTED_CONTENT_TYPE` |
+| Unsupported MIME type | 400 | `invalid_argument`, `field_violations[content_type].reason = UNSUPPORTED_CONTENT_TYPE` |
 | Code-interpreter-only file (XLSX) while code interpreter is unavailable | 400 | `invalid_argument` |
 | Image upload while `disable_images` is on | 400 | `failed_precondition`, `violations[{subject: images, type: FEATURE_DISABLED}]` |
 | The chat's vector store was created for another provider backend | 409 | `already_exists`, `resource_name = provider_mismatch` |
 | Per-chat document count or total size limit | 429 | `resource_exhausted`, `document_limit` / `storage_limit` |
 | Provider or storage failure (including a failed add to the vector store or vector store indexing that fails within 25 s after the upload started; the row gets `error_code = indexing_failed`), upload concurrency limit | 503 + `Retry-After` (10 s; 5 s for the concurrency limit) | `service_unavailable` |
+| The chat's vector store cannot be created (first document of the chat) | 503 + `Retry-After` (10 s) | `service_unavailable`; the row gets `error_code = vector_store_failed`, no vector store is recorded for the chat, and the uploaded provider file is deleted |
 | Model-policy plugin failure while resolving the chat's model | 500 | `internal` |
 | Body larger than api-gateway `defaults.body_limit_bytes` | 413 | returned by api-gateway, not by mini-chat |
 
@@ -1220,11 +1221,11 @@ The REST error mapping:
 | Malformed JSON body | `invalid_argument` | 400 | `field_violations[body].reason = json_syntax_error` (platform JSON extractor) |
 | JSON body without a JSON `Content-Type` (`POST /chats`, `PATCH /chats/{id}`, `messages:stream`, turn edit, reaction `PUT`) | `invalid_argument` | 415 | `field_violations[body].reason = missing_json_content_type` (platform JSON extractor). Not declared in the OpenAPI document |
 | Path parameter that is not a UUID (chat, message, turn `request_id`, attachment id) | `invalid_argument` | 400 | `field_violations[].reason = invalid_path_params` (platform path extractor) |
-| Unsupported upload MIME type | `invalid_argument` | 400 | `UNSUPPORTED_CONTENT_TYPE` (was 415) |
+| Unsupported upload MIME type | `invalid_argument` | 400 | `field_violations[content_type].reason = UNSUPPORTED_CONTENT_TYPE` (was 415) |
 | Code-interpreter-only upload (XLSX) while code interpreter is unavailable (kill switch, or the chat's model lacks `tool_support.code_interpreter`) | `invalid_argument` | 400 | `field_violations[file].reason = CODE_INTERPRETER_UNAVAILABLE`; `context.resource_type` is the attachment type |
 | Upload request is not valid multipart: no boundary in `Content-Type`, unreadable multipart body, no `file` field, `file` part without a content type | `invalid_argument` | 400 | `field_violations[].reason`: `BOUNDARY_REQUIRED` (`content_type`), `MULTIPART_ERROR` (`multipart`), `MISSING_FILE` (`file`), `MISSING_CONTENT_TYPE` (`content_type`) |
 | `DELETE /chats/{id}`: the chat-cleanup outbox payload exceeds the outbox size limit | `invalid_argument` | 400 | `detail`; the same message is also in `context.format`. The same failure on attachment `DELETE` and on turn retry, edit and delete is returned as 500 `internal` |
-| Image on a model without vision | `invalid_argument` | 400 | `VISION_NOT_SUPPORTED` (was 415) |
+| Image on a model without vision (send, retry, edit) | `invalid_argument` | 400 | `field_violations[content_type].reason = VISION_NOT_SUPPORTED` (was 415); `context.resource_type` is the attachment type |
 | Invalid, duplicate, foreign or not-ready `attachment_ids`, or more than `rag.max_documents_per_chat + rag.max_images_per_message` of them | `invalid_argument` | 400 | `field_violations[attachment].reason = invalid_attachment` |
 | Upload larger than the limit | `out_of_range` | 400 | `field_violations[content_length].reason = FILE_TOO_LARGE` (was 413). A body above api-gateway `defaults.body_limit_bytes` (default 16 MiB) gets 413 from the gateway before it reaches mini-chat |
 | Too many images in one message | `out_of_range` | 400 | `field_violations[image_count].reason = TOO_MANY_IMAGES` |
@@ -1232,7 +1233,7 @@ The REST error mapping:
 | Mandatory context does not fit the budget | `out_of_range` | 400 | `CONTEXT_BUDGET_EXCEEDED` |
 | Kill switch (web search, images) | `failed_precondition` | 400 | `violations[{subject: web_search\|images, type: FEATURE_DISABLED}]` |
 | Retry/edit/delete of a non-terminal turn | `failed_precondition` | 400 | `violations[{subject: turn_state, type: STATE}]` |
-| Reaction (`PUT` or `DELETE`) on a non-assistant message | `failed_precondition` | 400 | `violations[{subject: reaction_target, type: STATE}]` |
+| Reaction (`PUT` or `DELETE`) on a non-assistant message | `failed_precondition` | 400 | `violations[{subject: reaction_target, type: STATE}]`; `context.resource_type` is the message type and `context.resource_name` the message id |
 | Missing, invalid or expired bearer token | `unauthenticated` | 401 | `context.reason`: `MISSING_BEARER` / `AUTHN_FAILED` (api-gateway) |
 | AuthZ denied (fail-closed) | `permission_denied` | 403 | `AUTHZ_DENIED` |
 | The PDP could not evaluate the request (unreachable, timeout, evaluation error); access is still refused (fail-closed) | `service_unavailable` | 503 + `Retry-After` | `Retry-After: 5` (`context.retry_after_seconds = 5`); generic detail, the cause is only logged |
@@ -1566,9 +1567,11 @@ sequenceDiagram
     Note over CS: Handler: resolve MIME from field headers (before body read)
     Note over CS: Handler: authz + model resolve -> upload limits, code-interpreter status<br/>(model gone from catalog -> 400 INVALID_MODEL, before body read)
     Note over CS: Service: reject images when disable_images; resolve purposes from MIME, apply kill switch / capability filtering
-    Note over CS: Handler: stream chunks with byte counter; abort with 400 FILE_TOO_LARGE if limit exceeded
+    Note over CS: Handler: Content-Length minus 64 KiB of multipart overhead above the limit -> 400 FILE_TOO_LARGE (field content_length), no row, before body read
+    Note over CS: Handler: take an upload concurrency permit; none free -> 503 + Retry-After 5 s, no row
 
-    CS->>DB: Insert attachment metadata (status: pending, for_file_search, for_code_interpreter); enforce per-chat document/storage limits (429)
+    CS->>DB: Insert attachment metadata (status: pending, for_file_search, for_code_interpreter) before the body is read; enforce per-chat document/storage limits (429)
+    Note over CS: Service: stream the body with a byte counter; over the limit -> row status: failed, error_code = file_too_large, 400 FILE_TOO_LARGE
     CS->>OG: POST {alias}/v1/files or /openai/files (streaming multipart via OAGW SDK)
     OG->>OAI: Files API upload
     OAI-->>OG: provider_file_id
@@ -2827,7 +2830,7 @@ A turn is a user-message + assistant-response pair identified by `request_id` in
 6. **New request_id invariant (normative)**: Both retry and edit create a new turn with a **new `request_id`** generated by the **server** (UUID v4). The client does not provide the new `request_id` — the retry endpoint has no request body, and the edit endpoint body contains only `content`. The server-generated `request_id` is returned to the client via the SSE `event: stream_started` event (same contract as `sendMessage`). The old turn's `replaced_by_request_id` is set to the new `request_id` for audit traceability. The old `request_id` is no longer valid for idempotent replay — the soft-deleted turn is excluded from the replay path (replay requires `deleted_at IS NULL`). Audit events include both `original_request_id` and `new_request_id` (see audit event payloads for `turn_retry` and `turn_edit`).
 7. **Atomicity invariant (normative)**: The "latest turn" identity check (rule 1), the terminal state check (rule 3), the soft-delete of the old turn, and the INSERT of the new `running` turn MUST all execute within a single DB transaction using `SELECT FOR UPDATE` or equivalent serializable isolation. Without this, two concurrent retry/edit requests for the same turn can both pass the validation checks simultaneously, both soft-delete the old turn (the second soft-delete is a no-op since `deleted_at` is already set), and both attempt to INSERT a new running turn — which violates the `UNIQUE(chat_id) WHERE state = 'running' AND deleted_at IS NULL` index. If the new running turn INSERT fails due to this unique constraint (concurrent race condition), the mutation returns HTTP 409 `aborted` with `context.reason = GENERATION_IN_PROGRESS` (not HTTP 500).
 
-8. **Preflight-before-mutation order (normative)**: retry and edit validate the mutation read-only and run the quota preflight **before** the mutation commits. A preflight rejection (quota 429, kill switch 400, image guard 400, ...) returns a JSON error and leaves the previous turn and the chat unchanged. After the mutation commits, context assembly, provider resolution and the quota reserve run; any failure there marks the new turn `failed` (`error_code = context_length_exceeded` or `turn_setup_failed`) and returns a JSON error, so the chat does not stay blocked by a `running` turn.
+8. **Preflight-before-mutation order (normative)**: retry and edit validate the mutation read-only and run the quota preflight **before** the mutation commits. A preflight rejection (quota 429, kill switch 400, image guard 400, `INPUT_TOO_LONG` 400 for the new or replayed user message, ...) returns a JSON error and leaves the previous turn and the chat unchanged. After the mutation commits, context assembly, provider resolution and the quota reserve run; any failure there marks the new turn `failed` (`error_code = context_length_exceeded` or `turn_setup_failed`) and returns a JSON error, so the chat does not stay blocked by a `running` turn.
 9. **Deleted turns**: `GET /v1/chats/{id}/turns/{request_id}` returns 404 for a soft-deleted turn; retry, edit or delete of a soft-deleted turn returns 409 `NOT_LATEST_TURN`. Resending a soft-deleted turn's `request_id` to `messages:stream` returns 409 `request_id_conflict`.
 
 #### Turn Mutation API Contracts
@@ -3441,7 +3444,7 @@ Each entry specifies the model identifier, provider, tier, capability flags, lim
 | `display_name`, `description`, `icon`, `multiplier_display` | string | UI metadata. |
 | `provider_id` | string | Key of the `providers.<id>` entry that serves the model ([ADR-0005](./ADR/0005-cpt-cf-mini-chat-adr-multi-provider-adapters.md)). |
 | `provider_display_name` | string | Provider name for UI. Not returned by the Models API and not read by the gear. |
-| `tier` | `premium` \| `standard` | Rate-limit tier and downgrade cascade order. |
+| `tier` | `Premium` \| `Standard` (the lowercase `premium` / `standard` also load) | Rate-limit tier and downgrade cascade order. |
 | `enabled` | boolean | Disabled models are not visible in the Models API and are rejected by `POST /v1/chats`; an existing chat on a disabled model is downgraded (`model_disabled`). |
 | `multimodal_capabilities` | array of strings | e.g. `VISION_INPUT`. Image input requires `VISION_INPUT`. |
 | `context_window` | integer | Maximum context tokens. The input budget is `min(max_input_tokens, context_window - max_output_tokens_applied)` (context assembly and the thread-summary threshold). |
@@ -3451,10 +3454,10 @@ Each entry specifies the model identifier, provider, tier, capability flags, lim
 | `estimation_budgets` | object | Per-model token estimation budgets (same fields as the `estimation_budgets` config section). Used for all token estimation of turns on this model (section 5.2.1); `minimal_generation_floor` is ignored here and taken from the gear configuration. |
 | `max_num_results` | integer | Top-k chunks per `file_search` call. |
 | `web_search_context_size` | `low` \| `medium` \| `high` | Search context size hint for web search. |
-| `max_tool_calls` | integer | Maximum built-in tool calls the provider may make per request (default 2). Sent only by the OpenAI Responses adapter. |
+| `max_tool_calls` | integer | Maximum built-in tool calls the provider may make per request (default 2). Sent only by the OpenAI Responses adapter, on every request, also when no tool is enabled. |
 | `general_config` | object | `api_params` (optional `temperature`, `top_p`, `frequency_penalty`, `presence_penalty` — each sent only when set; leave them unset for reasoning models such as gpt-5-mini, which reject them with 400 "Unsupported parameter" — plus `stop`, `extra_body`, `reasoning_effort`; `extra_body` keys are merged into the top level of the request body by the OpenAI Responses, OpenAI Chat and vLLM adapters (the Anthropic adapter does not send it), except keys the request controls, which are ignored with a warning: `model`, `input`, `messages`, `instructions`, `system`, `stream`, `stream_options`, `max_output_tokens`, `max_completion_tokens`, `max_tokens`, `max_tool_calls`, `tools`, `tool_choice`, `include`, `store`, `previous_response_id`, `user`, `metadata`), `features`, `tool_support` (`web_search`, `file_search`, `image_generation`, `code_interpreter`, `mcp` — the `mcp` flag is unused, [ADR-0006](./ADR/0006-cpt-cf-mini-chat-adr-mcp-deferred.md)), `supported_endpoints`, `max_file_size_mb` (per-model upload cap). |
 | `preference` | object (optional) | `is_default`, `sort_order`. |
-| `system_prompt` | string | Sent as system instructions on every request for this model. |
+| `system_prompt` | string | Sent as system instructions on every request for this model. An empty prompt with no tool guard sends no `instructions`. |
 | `thread_summary_prompt` | string | System prompt of the thread-summary call; read from the entry of the summary model (`thread_summary_worker.summary_model_id`). Empty falls back to `thread_summary_worker.summary_system_prompt`. |
 
 **Rules**:
@@ -4296,7 +4299,7 @@ Contents (logically):
 Every token estimate uses the `estimation_budgets` of a model catalog entry (`ModelCatalogEntry.estimation_budgets`; defaults apply when the entry omits the object):
 
 - The quota availability check in preflight uses the entry of each cascade candidate model, the model that tier would use.
-- The booked reserve and everything after preflight — the `INPUT_TOO_LONG` check and the context-assembly token budget — use the entry of the **effective** model (after the downgrade cascade).
+- The booked reserve, the `INPUT_TOO_LONG` check (part of preflight, also for retry and edit) and, after preflight, the context-assembly token budget use the entry of the **effective** model (after the downgrade cascade).
 
 `minimal_generation_floor` is the exception: it comes from the gear configuration `estimation_budgets.minimal_generation_floor` (default 50), is validated at startup to be `> 0` and `<= streaming.max_output_tokens`, and the floor applied to a turn is `min(minimal_generation_floor, max_output_tokens_applied)`, persisted as `chat_turns.minimal_generation_floor_applied`.
 

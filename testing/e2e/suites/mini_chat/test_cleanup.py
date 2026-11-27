@@ -34,6 +34,7 @@ from .conftest import (
     get_quota_status,
     open_stream,
     outbox_payloads,
+    outbox_table,
     provider_file_id,
     provider_usage,
     query_db,
@@ -193,7 +194,7 @@ CLEANUP_MAX_ATTEMPTS = 5
 def _dead_letters(chat_id: str) -> list[dict]:
     """Dead-lettered outbox messages whose payload mentions `chat_id`."""
     return query_db(
-        "SELECT partition_id, seq, payload, last_error FROM toolkit_outbox_dead_letters "
+        f"SELECT partition_id, seq, payload, last_error FROM {outbox_table('dead_letters')} "
         # CAST: see outbox_payloads in conftest.py (LIKE never matches a
         # BLOB on SQLite built with SQLITE_LIKE_DOESNT_MATCH_BLOBS).
         "WHERE CAST(payload AS TEXT) LIKE ?",
@@ -205,7 +206,7 @@ def _processed_seq(partition_id: int) -> int:
     """The outbox processor's committed offset of a partition: messages with
     `seq` up to it are never delivered again."""
     (row,) = query_db(
-        "SELECT processed_seq FROM toolkit_outbox_processor WHERE partition_id = ?",
+        f"SELECT processed_seq FROM {outbox_table('processor')} WHERE partition_id = ?",
         (partition_id,),
     )
     return row["processed_seq"]
