@@ -48,15 +48,23 @@ impl Fixture {
     /// A subject with a skill stored at second 10 and a role at second 20,
     /// and a writer that conflicts `conflicts` times.
     fn new(conflicts: u32) -> Self {
-        let profile = MemoryProfile::with(vec![
-            stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
-            stored_fact(
-                Category::PRODUCT,
-                "roles",
-                json!({ "title": "Engineer" }),
-                20,
-            ),
-        ]);
+        Self::with_facts(
+            vec![
+                stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+                stored_fact(
+                    Category::PRODUCT,
+                    "roles",
+                    json!({ "title": "Engineer" }),
+                    20,
+                ),
+            ],
+            conflicts,
+        )
+    }
+
+    /// A subject with the facts `facts`, and a writer that conflicts `conflicts` times.
+    fn with_facts(facts: Vec<crate::domain::profile_read::StoredFact>, conflicts: u32) -> Self {
+        let profile = MemoryProfile::with(facts);
         let writer = MemoryWriter::new(Arc::clone(&profile), conflicts);
         Self {
             tenant: Uuid::new_v4(),
@@ -1044,4 +1052,61 @@ async fn a_delete_whose_writer_failed_after_it_landed_is_done() {
         fixture.events.taken().as_slice(),
         [SubjectControlEvent::Deleted { .. }]
     ));
+}
+
+#[tokio::test]
+async fn a_delete_records_the_event_of_each_node_it_takes_with_it_however_deep() {
+    let project = stored_fact(Category::PROJECT, "project", json!({ "name": "Atlas" }), 10);
+    let mut commitment = stored_fact(
+        Category::COMMITMENT,
+        "commitment",
+        json!({ "kind": "promise", "text": "ship" }),
+        11,
+    );
+    commitment.owner = Some(project.node_key.clone());
+    let mut decision = stored_fact(
+        Category::PRODUCT,
+        "product",
+        json!({ "text": "ship in March" }),
+        12,
+    );
+    decision.owner = Some(commitment.node_key.clone());
+    let other = stored_fact(Category::PROJECT, "project", json!({ "name": "Other" }), 13);
+    let fixture = Fixture::with_facts(
+        vec![project.clone(), commitment.clone(), decision.clone(), other],
+        0,
+    );
+    let service = fixture.service(Arc::new(AllowResolver));
+
+    service
+        .delete(&fixture.owner(), fixture.subject, &project.node_key)
+        .await
+        .unwrap();
+
+    let deleted: Vec<(NodeKey, Category)> = fixture
+        .events
+        .taken()
+        .into_iter()
+        .map(|event| match event {
+            SubjectControlEvent::Deleted {
+                fact_id, category, ..
+            } => (fact_id, category),
+            other => panic!("only deletes are recorded: {other:?}"),
+        })
+        .collect();
+    assert_eq!(deleted.len(), 3, "{deleted:?}");
+    for (fact, category) in [
+        (&project, Category::PROJECT),
+        (&commitment, Category::COMMITMENT),
+        (&decision, Category::PRODUCT),
+    ] {
+        assert_eq!(
+            deleted
+                .iter()
+                .filter(|event| **event == (fact.node_key.clone(), category))
+                .count(),
+            1,
+            "{category:?} once: {deleted:?}"
+        );
+    }
 }

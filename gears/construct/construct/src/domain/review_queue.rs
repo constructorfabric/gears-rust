@@ -713,6 +713,7 @@ pub(crate) async fn close_orphaned(
             Ok(true) => closed += 1,
             Ok(false) => {}
             Err(err) => {
+                tracing::warn!(error = %err, fact_id = %fact_id.0, "construct: a request on a removed node was not closed");
                 failed.get_or_insert(err);
             }
         }

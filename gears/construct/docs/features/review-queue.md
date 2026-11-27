@@ -242,7 +242,7 @@ A delete and a correction are written against the profile's version, and read an
 
 **Steps**:
 1. [x] - `p1` - Start the budget, build Construct's context, and read the subject's facts. **IF** the fact is gone, **RETURN** done - `inst-remove-read`
-2. [x] - `p1` - Write a plan with one removal, with the resolver as origin, against the version just read; on a conflict, read and write again as in `cpt-cf-construct-algo-subject-control-delete` - `inst-remove-write`
+2. [x] - `p1` - Write a plan with one removal, with the resolver as origin, against the version just read; on a conflict, read and write again as in `cpt-cf-construct-algo-subject-control-delete`. The removal takes the nodes the fact owns with it: the open requests of the subject whose node is gone close as deleted, by the resolver. A close that fails is logged and left, and the next delete of the subject closes it - `inst-remove-write`
 
 ### Close a Request
 

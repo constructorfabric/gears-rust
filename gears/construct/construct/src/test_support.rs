@@ -1632,6 +1632,8 @@ pub struct MemoryReviews {
     /// Fail the close of an open request on a fact as unavailable, and
     /// nothing else.
     pub close_open_fails: std::sync::atomic::AtomicBool,
+    /// Fail the close of an open request on this fact as unavailable, and of no other.
+    pub close_open_fails_on: std::sync::Mutex<Option<crate::domain::plan::NodeKey>>,
     /// Answer each claim this long after taking it, as a slow database
     /// that committed would.
     pub claim_delay: std::sync::Mutex<std::time::Duration>,
@@ -1975,6 +1977,16 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         if self
             .close_open_fails
             .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
+        if let Some(failing) = self.close_open_fails_on.lock().unwrap().as_ref()
+            && self
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(request, _)| request.id == key.id && &request.fact_id == failing)
         {
             return Err(DomainError::Unavailable("the database is down".to_owned()));
         }

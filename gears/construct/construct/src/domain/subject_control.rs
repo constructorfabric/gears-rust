@@ -414,8 +414,10 @@ impl FactDelete<'_> {
     /// Soft-delete the fact `fact_id`: a plan with one removal, written
     /// against the profile's version, and read and written again after a
     /// short pause on a conflict, within the rerun limit and the budget.
-    /// `deleted` records the fact a delete removed; then the fact's open
-    /// review request closes as deleted.
+    /// `deleted` records the fact a delete removed and each node it owned; then
+    /// the open review requests of the fact and of every node it took with it
+    /// close as deleted, and so do those an earlier delete left open on a node
+    /// that is gone (its close failed).
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
     /// fact deleted without its event, and its review request open until the
@@ -427,8 +429,9 @@ impl FactDelete<'_> {
     /// and no open request on it, also when a concurrent write removed it
     /// before a rerun; unavailable when the profile kept changing past the
     /// reruns or the budget, when the writer failed and the fact is not seen
-    /// gone after it, or when the fact's review request could not be closed,
-    /// the last two of which a repeat of the delete finishes; not configured
+    /// gone after it, or when a review request of the fact or of a node it
+    /// owned could not be closed, the last two of which a repeat of the delete
+    /// finishes (it answers as done when it closes one); not configured
     /// without a processing identity.
     pub(crate) async fn run(
         &self,
@@ -467,7 +470,7 @@ impl FactDelete<'_> {
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
         // A fact already gone may still have an open request left by an
         // earlier delete whose close failed; this closes it.
-        let closed = close_on_change(
+        let named = close_on_change(
             self.requests,
             self.events,
             self.writes,
@@ -480,22 +483,11 @@ impl FactDelete<'_> {
                 changed: matches!(removed, Removed::Removed(..)),
             },
         )
-        .await
-        .map_err(|err| match err {
-            // A store that did not answer: a repeat finds the fact gone and
-            // closes the request.
-            DomainError::Unavailable(_) | DomainError::Database(_) => {
-                DomainError::Unavailable(format!(
-                    "fact {} is deleted, but its review request was not closed; send the \
-                     delete again: {err}",
-                    fact_id.0
-                ))
-            }
-            other => other,
-        })?;
+        .await;
         // The nodes the fact owned went with it: their requests close as deleted too, and so does one an earlier
-        // delete left open when its close failed.
-        close_orphaned(
+        // delete left open when its close failed. This runs also when the close above failed, so that one failure
+        // does not leave the others open.
+        let swept = close_orphaned(
             self.requests,
             self.events,
             self.writes,
@@ -504,20 +496,24 @@ impl FactDelete<'_> {
             self.by,
             None,
         )
-        .await
-        .map_err(|err| match err {
+        .await;
+        // A store that did not answer: a repeat finds the fact gone and closes what is left.
+        let not_closed = |err: DomainError| match err {
             DomainError::Unavailable(_) | DomainError::Database(_) => {
                 DomainError::Unavailable(format!(
-                    "fact {} is deleted, but the review request of a node it owned was not closed; \
-                     send the delete again: {err}",
+                    "fact {} is deleted, but a review request on it or on a node it owned was not \
+                     closed; send the delete again: {err}",
                     fact_id.0
                 ))
             }
             other => other,
-        })?;
+        };
+        let closed = named.map_err(not_closed)?;
+        let swept = swept.map_err(not_closed)?;
         match removed {
             Removed::Removed(..) => Ok(()),
-            Removed::Gone if closed => Ok(()),
+            // A repeat that closed a request has finished the delete.
+            Removed::Gone if closed || swept > 0 => Ok(()),
             Removed::Gone => Err(no_such_fact(fact_id)),
         }
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
