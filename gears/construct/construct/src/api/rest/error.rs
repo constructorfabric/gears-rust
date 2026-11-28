@@ -65,13 +65,59 @@ fn log_out_of_scope(refused: &SettingsOutOfScope) {
         tenant_id = %refused.tenant_id,
         subject_id = %refused.subject_id,
         refusal = ?refused.refusal,
-        "construct subject settings out of the policy scope"
+        "construct subject settings or schema out of the policy scope"
     );
 }
 
 /// Errors about a subject's profile.
 #[resource_error(gts_id!("cf.construct.subject.profile.v1~"))]
 pub struct ProfileError;
+
+/// Errors about a person's profile schema.
+#[resource_error(gts_id!("cf.construct.subject.schema.v1~"))]
+pub struct SubjectSchemaError;
+
+/// The REST answer for a domain error on the schema routes: another person's schema is refused with 403, a change
+/// the rules refuse is an invalid argument that names the reason, and the rest as everywhere else.
+#[must_use]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+)]
+pub fn for_schema(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct schema access forbidden");
+            SubjectSchemaError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::OutOfScope(refused) => {
+            log_out_of_scope(&refused);
+            SubjectSchemaError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::InvalidValue { field, rule } => {
+            tracing::info!(field, rule = %rule, "construct schema change refused");
+            SubjectSchemaError::invalid_argument()
+                .with_field_violation(field, rule, "invalid_schema")
+                .with_override(Http::status_code(422))
+                .create()
+        }
+        // The two answers the schema service words for the owner: what heals them is in the text.
+        DomainError::Unavailable(message)
+            if message == crate::domain::schema_service::SWEEP_PENDING
+                || message == crate::domain::schema_service::CONFLICT =>
+        {
+            tracing::warn!(%message, "construct schema change not finished");
+            CanonicalError::service_unavailable()
+                .with_detail(message)
+                .create()
+        }
+        other => other.into(),
+    }
+}
 
 /// Errors about a subject's settings.
 #[resource_error(gts_id!("cf.construct.subject.settings.v1~"))]

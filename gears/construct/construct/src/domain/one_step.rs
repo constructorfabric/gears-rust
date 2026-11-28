@@ -13,7 +13,7 @@ use toolkit_macros::domain_model;
 use super::admission::{Admission, AdmissionOutcome};
 use super::error::DomainError;
 use super::plan::{Change, NodeKey, Origin, Plan, Property, Step};
-use super::planner::catalog::{Catalog, KindSpec};
+use super::planner::catalog::{Catalog, Catalogs, KindSpec};
 use super::planner::processing::Written;
 use super::profile::Category;
 use super::profile_writes::{Attempt, ProfileWrites, SubjectFacts, WriteError};
@@ -51,7 +51,8 @@ impl NotStored {
 pub struct OneStepPath {
     pub checks: SensitiveDataChecks,
     pub admission: Admission,
-    pub catalog: Arc<Catalog>,
+    /// Each person's catalog: the kinds a value may be stored under are those of the person's own schema.
+    pub catalogs: Arc<Catalogs>,
 }
 
 /// A fact the one-step path stored: its new key, its category and its
@@ -109,9 +110,12 @@ impl OneStepPath {
     /// [`DomainError::InvalidValue`] for a property that is no kind of the schema, a kind owned by another node (the
     /// planner adds those, with their owner), or a value its schema does not take. The message never repeats the
     /// caller's property or value.
-    pub(crate) fn check(&self, property: &str, value: &Value) -> Result<&KindSpec, DomainError> {
-        let spec = self
-            .catalog
+    pub(crate) fn check<'c>(
+        catalog: &'c Catalog,
+        property: &str,
+        value: &Value,
+    ) -> Result<&'c KindSpec, DomainError> {
+        let spec = catalog
             .kind(property)
             .ok_or_else(|| DomainError::InvalidValue {
                 field: "property",
@@ -150,7 +154,8 @@ impl OneStepPath {
         value: &Value,
         deadline: Instant,
     ) -> Result<OneStepDone<Held>, WriteError> {
-        let spec = self.check(property, value)?;
+        let catalog = self.catalogs.of(key).await?;
+        let spec = Self::check(&catalog, property, value)?;
         self.write(
             writes,
             key,
@@ -196,8 +201,7 @@ impl OneStepPath {
     ///
     /// # Errors
     ///
-    /// Internal when no person type has `property`, a stored fact's own
-    /// property; [`DomainError::InvalidValue`] for a value its schema does
+    /// [`DomainError::InvalidValue`] for a value its schema does
     /// not take; `pend`'s error; unavailable when the profile kept changing;
     /// may have been written when the writer failed.
     #[allow(
@@ -220,12 +224,12 @@ impl OneStepPath {
         P: Fn(&NodeKey) -> PF,
         PF: Future<Output = Result<(), DomainError>>,
     {
-        let spec = self.catalog.kind(property).ok_or_else(|| {
-            DomainError::internal(format!(
-                "stored fact {} has property `{property}`, which is no kind of the schema",
-                fact.0
-            ))
-        })?;
+        let catalog = self.catalogs.of(key).await?;
+        // A kind the schema no longer has: the person's host removed it after the fact was read, and the fact is
+        // hidden from every read now, so the correction finds it gone as the reread would.
+        let Some(spec) = catalog.kind(property) else {
+            return Ok(OneStepDone::Skipped(Gone));
+        };
         spec.check(value)
             .map_err(|rule| DomainError::InvalidValue {
                 field: "value",

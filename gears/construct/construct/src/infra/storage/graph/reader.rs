@@ -13,17 +13,19 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::fact::{fact_of, stored_fact_of};
+use super::fact::{fact_of, of_removed_kind, stored_fact_of};
 use super::root::{ProfileVersion, Root, generation_root};
 use super::{ContextSubject, DEFAULT_CALL_TIMEOUT, graph_error, subject_in_context, unanswered};
 use crate::domain::deletion::{ProfileGenerations, RetentionPeriods, period_start};
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
-use crate::domain::profile::{FactCount, FullProfile, Link, Profile, profile_schema};
+use crate::domain::profile::{FactCount, FullProfile, Link, Profile};
 use crate::domain::profile_read::{LearnedFrom, StoredFact, StoredLinkFact, StoredProfiles};
-use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
+use crate::domain::profile_schema::{DefaultSchemas, ProfileSchemas};
+use crate::domain::profile_writes::{Orphan, SubjectFacts, SubjectProfiles};
 use crate::domain::subject_settings::SubjectKey;
+use construct_sdk::linked_schema::Schema;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
 /// storage's ceiling for a traversal, `traversal_max_nodes`, is 1000 by
@@ -90,11 +92,12 @@ pub(crate) async fn read_stored(
     timeout: Duration,
     ctx: &SecurityContext,
     subject: &ContextSubject,
+    schema: &Schema,
 ) -> Result<Stored, DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
     let generation = generations.generation(*subject.key()).await?;
     // @cpt-end:cpt-cf-construct-algo-erasure-root-key:p1:inst-root-read
-    read_generation(client, versions, generation, timeout, ctx, subject).await
+    read_generation(client, versions, generation, timeout, ctx, subject, schema).await
 }
 
 /// [`read_stored`] of the profile root in `generation`, whatever the
@@ -110,6 +113,7 @@ pub(crate) async fn read_generation(
     timeout: Duration,
     ctx: &SecurityContext,
     subject: &ContextSubject,
+    schema: &Schema,
 ) -> Result<Stored, DomainError> {
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
     let subject = subject.key();
@@ -214,7 +218,7 @@ pub(crate) async fn read_generation(
         .iter()
         .filter(|edge| pointed.contains(edge.src.as_str()) && pointed.contains(edge.dst.as_str()))
         .filter_map(|edge| {
-            let kind = profile_schema().link_of_type_id(&prefix, &edge.edge_type_id)?;
+            let kind = schema.link_of_type_id(&prefix, &edge.edge_type_id)?;
             Some(StoredLink {
                 link: Link {
                     kind: kind.name.to_owned(),
@@ -258,6 +262,8 @@ pub struct GraphProfileSource {
     version: Arc<dyn ProfileVersion>,
     generations: Arc<dyn ProfileGenerations>,
     retention: Arc<dyn RetentionPeriods>,
+    /// Where each person's schema comes from.
+    schemas: Arc<dyn ProfileSchemas>,
     /// The time the retention period is counted back from.
     clock: fn() -> OffsetDateTime,
     timeout: Duration,
@@ -282,9 +288,17 @@ impl GraphProfileSource {
             version,
             generations,
             retention,
+            schemas: Arc::new(DefaultSchemas::new()),
             clock: OffsetDateTime::now_utc,
             timeout: DEFAULT_CALL_TIMEOUT,
         }
+    }
+
+    /// Read each person's schema from `schemas` rather than using the default schema for everyone.
+    #[must_use]
+    pub fn with_schemas(mut self, schemas: Arc<dyn ProfileSchemas>) -> Self {
+        self.schemas = schemas;
+        self
     }
 
     /// Count the retention period back from `clock` rather than the wall
@@ -320,6 +334,7 @@ impl ProfileSource for GraphProfileSource {
                 subject_id,
             },
         )?;
+        let schema = self.schemas.schema(*subject.key()).await?;
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
@@ -327,6 +342,7 @@ impl ProfileSource for GraphProfileSource {
             self.timeout,
             ctx,
             &subject,
+            &schema,
         )
         .await?;
 
@@ -340,8 +356,9 @@ impl ProfileSource for GraphProfileSource {
             .facts
             .iter()
             .filter(|node| !listed.contains(node.node_key.as_str()))
+            .filter(|node| !of_removed_kind(&schema, node))
             .filter(|node| kept_since.is_none_or(|since| node.envelope.created_at >= since))
-            .map(fact_of)
+            .map(|node| fact_of(&schema, node))
             .collect::<Result<Vec<_>, _>>()?;
         let held: BTreeSet<&NodeKey> = facts.iter().map(|fact| &fact.node_key).collect();
         let links = stored
@@ -396,6 +413,7 @@ impl StoredProfiles for GraphProfileSource {
         key: SubjectKey,
     ) -> Result<Vec<StoredLinkFact>, DomainError> {
         let subject = subject_in_context(ctx, key)?;
+        let schema = self.schemas.schema(key).await?;
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
@@ -403,6 +421,7 @@ impl StoredProfiles for GraphProfileSource {
             self.timeout,
             ctx,
             &subject,
+            &schema,
         )
         .await?;
         let listed = &stored.root.removals;
@@ -428,6 +447,7 @@ impl StoredProfiles for GraphProfileSource {
     ) -> Result<Vec<StoredFact>, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-stored
         let subject = subject_in_context(ctx, key)?;
+        let schema = self.schemas.schema(key).await?;
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
@@ -435,9 +455,10 @@ impl StoredProfiles for GraphProfileSource {
             self.timeout,
             ctx,
             &subject,
+            &schema,
         )
         .await?;
-        Ok(served(&stored))
+        Ok(served(&schema, &stored))
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-stored
     }
 }
@@ -446,14 +467,15 @@ impl StoredProfiles for GraphProfileSource {
 /// removal. A malformed fact is left out here, while the planner's read fails
 /// on it: a reader is better served by the rest of the profile, whereas a
 /// plan built on a partial profile could add what is stored.
-fn served(stored: &Stored) -> Vec<StoredFact> {
+fn served(schema: &Schema, stored: &Stored) -> Vec<StoredFact> {
     let listed = &stored.root.removals;
     stored
         .facts
         .iter()
         .filter(|node| !listed.contains(node.node_key.as_str()))
+        .filter(|node| !of_removed_kind(schema, node))
         .filter_map(|node| {
-            stored_fact_of(node)
+            stored_fact_of(schema, node)
                 .inspect_err(|defect| {
                     // Only Construct writes these nodes, so this is a
                     // defect, not a state a reader should see in silence.
@@ -475,6 +497,8 @@ impl SubjectProfiles for GraphProfileSource {
     ) -> Result<SubjectFacts, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-subject-control-read-facts:p1:inst-facts-read
         let subject = subject_in_context(ctx, key)?;
+        let schema = self.schemas.schema(key).await?;
+        let schema = &*schema;
         let stored = read_stored(
             self.client.as_ref(),
             self.version.as_ref(),
@@ -482,6 +506,7 @@ impl SubjectProfiles for GraphProfileSource {
             self.timeout,
             ctx,
             &subject,
+            schema,
         )
         .await?;
         // Unlike the profile read, a fact that cannot be read fails the read:
@@ -491,11 +516,23 @@ impl SubjectProfiles for GraphProfileSource {
             .facts
             .iter()
             .filter(|node| !listed.contains(node.node_key.as_str()))
-            .map(stored_fact_of)
+            .filter(|node| !of_removed_kind(schema, node))
+            .map(|node| stored_fact_of(schema, node))
             .collect::<Result<Vec<_>, _>>()?;
+        let orphans = stored
+            .facts
+            .iter()
+            .filter(|node| !listed.contains(node.node_key.as_str()))
+            .filter(|node| of_removed_kind(schema, node))
+            .map(|node| Orphan {
+                node_key: NodeKey(node.node_key.clone()),
+                stored_at: node.envelope.created_at,
+            })
+            .collect();
         Ok(SubjectFacts {
             version: stored.version,
             facts,
+            orphans,
             generation: stored.generation,
         })
         // @cpt-end:cpt-cf-construct-algo-subject-control-read-facts:p1:inst-facts-read

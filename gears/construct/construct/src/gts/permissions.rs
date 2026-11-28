@@ -25,6 +25,7 @@ use crate::domain::planner::manage::{self, SUBJECT_FACTS_RESOURCE};
 use crate::domain::profile_read::{self, PROFILE_RESOURCE};
 use crate::domain::record_intake::{self, RECORD_RESOURCE};
 use crate::domain::review_queue::{self, REVIEW_REQUEST_RESOURCE};
+use crate::domain::schema_service::{self, SUBJECT_SCHEMA_RESOURCE};
 use crate::domain::subject_control;
 use crate::domain::subject_settings::{self, SUBJECT_SETTINGS_RESOURCE};
 
@@ -70,6 +71,24 @@ gts_instance! {
         resource_type: SUBJECT_SETTINGS_RESOURCE.name().to_owned(),
         action: subject_settings::actions::UPDATE.to_owned(),
         display_name: "Change own personalization settings".to_owned(),
+    }
+}
+
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.construct._.subject_schema_get.v1"),
+        resource_type: SUBJECT_SCHEMA_RESOURCE.name().to_owned(),
+        action: schema_service::actions::GET.to_owned(),
+        display_name: "Read own profile schema".to_owned(),
+    }
+}
+
+gts_instance! {
+    AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.construct._.subject_schema_update.v1"),
+        resource_type: SUBJECT_SCHEMA_RESOURCE.name().to_owned(),
+        action: schema_service::actions::UPDATE.to_owned(),
+        display_name: "Change own profile schema".to_owned(),
     }
 }
 

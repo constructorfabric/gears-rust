@@ -18,7 +18,9 @@ use super::error::DomainError;
 use super::plan::{NodeKey, Origin};
 use super::planner::processing::Written;
 use super::profile_read::StoredFact;
-use super::profile_writes::{Attempt, ProfileWrites, WRITE_LANDED, WriteError, removals};
+use super::profile_writes::{
+    Attempt, Orphan, ProfileWrites, WRITE_LANDED, WriteError, add_orphan_removals, removals,
+};
 use super::record_intake::RECEIVE_WINDOW;
 use super::review_queue::{
     OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequests, close_on_change,
@@ -209,6 +211,12 @@ pub enum DeletionEvent {
         subject_id: Uuid,
         facts: usize,
     },
+    /// An erasure or retention removed this many of the subject's nodes of a kind its schema no longer has.
+    OrphansRemoved {
+        tenant_id: Uuid,
+        subject_id: Uuid,
+        nodes: usize,
+    },
     /// Retention removed this many rows of the tenant's from Construct's
     /// tables.
     RowsExpired {
@@ -221,6 +229,7 @@ pub enum DeletionEvent {
     TenantRowsRemoved {
         tenant_id: Uuid,
         subject_settings: u64,
+        subject_schemas: u64,
         review_requests: u64,
         record_ids: u64,
     },
@@ -616,7 +625,7 @@ impl Deletion {
                 &Origin::Retention,
                 "retention",
                 None,
-                |fact| fact.stored_at < before,
+                |stored_at| stored_at < before,
             )
             .await?
             .unwrap_or_default();
@@ -683,7 +692,7 @@ impl Deletion {
         origin: &Origin,
         what: &str,
         generation: Option<u64>,
-        chosen: impl Fn(&StoredFact) -> bool,
+        chosen: impl Fn(OffsetDateTime) -> bool,
     ) -> Result<Option<Removal>, DomainError> {
         let writes = &self.ports.writes;
         let deadline = writes.deadline();
@@ -696,22 +705,47 @@ impl Deletion {
                 if generation.is_some_and(|generation| generation != current.generation) {
                     return Ok(Attempt::Done(None));
                 }
-                let (gone, kept): (Vec<StoredFact>, Vec<StoredFact>) =
-                    current.facts.into_iter().partition(|fact| chosen(fact));
+                let (gone, kept): (Vec<StoredFact>, Vec<StoredFact>) = current
+                    .facts
+                    .into_iter()
+                    .partition(|fact| chosen(fact.stored_at));
                 let kept: BTreeSet<NodeKey> = kept.into_iter().map(|fact| fact.node_key).collect();
-                if gone.is_empty() {
+                // Nodes of a kind the host removed are in no read, so they go here too: an erasure and the
+                // retention period reach everything the subject has.
+                let orphans: Vec<Orphan> = current
+                    .orphans
+                    .into_iter()
+                    .filter(|orphan| chosen(orphan.stored_at))
+                    .collect();
+                if gone.is_empty() && orphans.is_empty() {
                     return Ok(Attempt::Done(Some(Removal {
                         removed: BTreeSet::new(),
                         kept,
                     })));
                 }
-                let ids: BTreeSet<&NodeKey> = gone.iter().map(|fact| &fact.node_key).collect();
-                let plan = removals(key, current.version, &gone, origin.clone());
+                let ids: BTreeSet<&NodeKey> = gone
+                    .iter()
+                    .map(|fact| &fact.node_key)
+                    .chain(orphans.iter().map(|orphan| &orphan.node_key))
+                    .collect();
+                let mut plan = removals(key, current.version, &gone, origin.clone());
+                add_orphan_removals(&mut plan, &orphans);
                 let written = writes
                     .write(construct, &plan, |now| {
                         !now.facts.iter().any(|fact| ids.contains(&fact.node_key))
+                            && !now
+                                .orphans
+                                .iter()
+                                .any(|orphan| ids.contains(&orphan.node_key))
                     })
                     .await?;
+                if matches!(written, Written::Stored) && !orphans.is_empty() {
+                    self.ports.events.record(DeletionEvent::OrphansRemoved {
+                        tenant_id: key.tenant_id,
+                        subject_id: key.subject_id,
+                        nodes: orphans.len(),
+                    });
+                }
                 Ok(match written {
                     Written::Stored => Attempt::Done(Some(Removal {
                         removed: gone.into_iter().map(|fact| fact.node_key).collect(),

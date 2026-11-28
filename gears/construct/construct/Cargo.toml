@@ -59,6 +59,7 @@ jsonschema = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+lru = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }

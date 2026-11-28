@@ -10,7 +10,7 @@ pub struct LogDeletionEvents;
 impl DeletionEvents for LogDeletionEvents {
     #[expect(
         clippy::cognitive_complexity,
-        reason = "six log lines; the tracing macros count toward the complexity"
+        reason = "seven log lines; the tracing macros count toward the complexity"
     )]
     fn record(&self, event: DeletionEvent) {
         // @cpt-begin:cpt-cf-construct-algo-erasure-log:p1:inst-log-event
@@ -48,6 +48,18 @@ impl DeletionEvents for LogDeletionEvents {
                 facts,
                 "facts past the retention period removed"
             ),
+            DeletionEvent::OrphansRemoved {
+                tenant_id,
+                subject_id,
+                nodes,
+            } => tracing::info!(
+                target: "construct::audit",
+                event = "orphan_nodes_removed",
+                %tenant_id,
+                %subject_id,
+                nodes,
+                "nodes of a kind the subject's schema no longer has removed"
+            ),
             DeletionEvent::RowsExpired {
                 tenant_id,
                 review_requests,
@@ -64,6 +76,7 @@ impl DeletionEvents for LogDeletionEvents {
             DeletionEvent::TenantRowsRemoved {
                 tenant_id,
                 subject_settings,
+                subject_schemas,
                 review_requests,
                 record_ids,
             } => tracing::info!(
@@ -71,6 +84,7 @@ impl DeletionEvents for LogDeletionEvents {
                 event = "tenant_rows_removed",
                 %tenant_id,
                 subject_settings,
+                subject_schemas,
                 review_requests,
                 record_ids,
                 "a deleted tenant's rows removed from Construct's tables"
@@ -139,6 +153,7 @@ mod tests {
         events.record(DeletionEvent::TenantRowsRemoved {
             tenant_id,
             subject_settings: 4,
+            subject_schemas: 7,
             review_requests: 5,
             record_ids: 6,
         });
@@ -179,6 +194,7 @@ mod tests {
                 &[
                     tenant.clone(),
                     "subject_settings=4".to_owned(),
+                    "subject_schemas=7".to_owned(),
                     "review_requests=5".to_owned(),
                     "record_ids=6".to_owned(),
                 ],

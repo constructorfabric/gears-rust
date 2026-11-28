@@ -32,6 +32,7 @@ fn deleted_tenant() -> Fixture {
     store.keep([tenant]);
     *store.tenant_rows.lock().unwrap() = TenantRows {
         subject_settings: 2,
+        subject_schemas: 1,
         review_requests: 3,
         record_ids: 4,
     };
@@ -167,6 +168,7 @@ async fn an_exit_offboards_the_graph_removes_the_rows_in_the_tenants_scope_and_f
             DeletionEvent::TenantRowsRemoved {
                 tenant_id: f.tenant,
                 subject_settings: 2,
+                subject_schemas: 1,
                 review_requests: 3,
                 record_ids: 4,
             },

@@ -5,8 +5,6 @@ use std::time::Duration;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::domain::profile::Category;
-
 /// Default for [`ConstructConfig::personalization_default`]: on, so a host
 /// without the settings service takes records for new subjects. A deployment
 /// that wants new subjects to start with personalization off sets it to false.
@@ -183,7 +181,7 @@ pub struct AdmissionConfig {
     pub trusted_connectors: Option<Vec<Uuid>>,
     /// The lowest confidence, from 0 to 1, a model's step may carry.
     pub confidence_floor: f32,
-    /// The entity kinds a plan may store.
+    /// The entity kinds a plan may store, by name: the default schema's, or one a person's host adds at run time.
     pub entity_kinds: Option<Vec<String>>,
     /// The most steps one plan may hold.
     pub max_steps: usize,
@@ -348,10 +346,14 @@ impl ConstructConfig {
             .entity_kinds
             .iter()
             .flatten()
-            .find(|kind| Category::from_name(kind).is_none())
+            .find(|kind| !crate::domain::profile_schema::name_ok(kind))
         {
+            // A person's host may add kinds to that person's schema at run time, so the names are checked for
+            // their spelling here; a name that no schema has matches no step, so it admits nothing.
             return Err(InvalidConfig(format!(
-                "admission.entity_kinds names {unknown:?}, which is not an entity kind"
+                "admission.entity_kinds names {unknown:?}, which is not spelled as an entity kind: lower-case \
+                 letters, digits and `_`, starting with a letter, at most {} characters",
+                crate::domain::profile_schema::MAX_NAME
             )));
         }
         let floor = admission.confidence_floor;
@@ -541,9 +543,19 @@ mod tests {
 
     #[test]
     fn an_entity_kind_that_is_not_one_is_refused() {
-        assert!(valid(serde_json::json!({ "admission": { "entity_kinds": ["skills"] } })).is_err());
+        assert!(
+            valid(serde_json::json!({ "admission": { "entity_kinds": ["Not A Kind"] } })).is_err()
+        );
         assert!(
             valid(serde_json::json!({ "admission": { "entity_kinds": ["project", "product"] } }))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_entity_kind_a_person_may_add_at_run_time_is_allowed_by_name() {
+        assert!(
+            valid(serde_json::json!({ "admission": { "entity_kinds": ["project", "pets"] } }))
                 .is_ok()
         );
     }

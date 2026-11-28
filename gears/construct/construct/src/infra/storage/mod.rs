@@ -15,6 +15,10 @@ mod review_requests_repo_test;
 pub mod scope_error;
 #[cfg(test)]
 mod scope_error_test;
+pub mod subject_schema_entity;
+pub mod subject_schema_repo;
+#[cfg(test)]
+mod subject_schema_repo_test;
 pub mod subject_settings_entity;
 pub mod subject_settings_repo;
 #[cfg(test)]

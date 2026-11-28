@@ -41,6 +41,38 @@ async fn finish_marked(t: &Tables, key: SubjectKey) -> bool {
         .unwrap()
 }
 
+/// Stores the default schema as the schema the host set for `key`.
+async fn set_schema(t: &Tables, key: SubjectKey) {
+    use crate::domain::profile_schema::SubjectSchemaRepository as _;
+    let conn = t.db.conn().expect("connection");
+    crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository::new()
+        .store(
+            &conn,
+            &toolkit_security::AccessScope::allow_all(),
+            key,
+            None,
+            &construct_sdk::schema_doc::SchemaDoc::of(
+                &construct_sdk::linked_schema::default_schema(),
+            ),
+            0,
+        )
+        .await
+        .unwrap();
+}
+
+/// Whether the host has set a schema for `key`.
+async fn has_schema(t: &Tables, key: SubjectKey) -> bool {
+    use crate::domain::profile_schema::{SchemaLookup, SubjectSchemaRepository as _};
+    let conn = t.db.conn().expect("connection");
+    matches!(
+        crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository::new()
+            .find(&conn, &toolkit_security::AccessScope::allow_all(), key)
+            .await
+            .unwrap(),
+        SchemaLookup::Stored(_)
+    )
+}
+
 async fn tables() -> Tables {
     let db = inmem_db().await;
     let provider = Arc::new(DBProvider::new(db.clone()));
@@ -642,6 +674,7 @@ async fn a_tenants_exit_removes_every_row_of_it_in_every_table_and_no_other() {
             .unwrap();
         t.add_request(subject, now).await;
         t.add_identity(subject).await;
+        set_schema(&t, subject).await;
     }
     t.add_closed_request(key, now).await;
 
@@ -655,6 +688,7 @@ async fn a_tenants_exit_removes_every_row_of_it_in_every_table_and_no_other() {
         removed,
         TenantRows {
             subject_settings: 2,
+            subject_schemas: 2,
             review_requests: 3,
             record_ids: 2,
         },
@@ -670,6 +704,13 @@ async fn a_tenants_exit_removes_every_row_of_it_in_every_table_and_no_other() {
         t.identities().await,
         1,
         "another tenant keeps its identities"
+    );
+    for gone in [key, same_tenant] {
+        assert!(!has_schema(&t, gone).await, "the tenant's schemas go");
+    }
+    assert!(
+        has_schema(&t, neighbour).await,
+        "another tenant keeps its schemas"
     );
 
     let again = t
@@ -773,4 +814,100 @@ async fn forgetting_a_tenant_under_a_scope_that_leaves_it_out_keeps_it() {
             .unwrap(),
         "in its own scope it is forgotten, and says so"
     );
+}
+
+#[tokio::test]
+async fn an_erasure_resets_the_schema_to_the_default_and_keeps_the_count_of_names() {
+    use crate::domain::profile_schema::{SchemaLookup, SubjectSchemaRepository as _};
+    use construct_sdk::linked_schema::default_schema;
+    use construct_sdk::schema_doc::SchemaDoc;
+
+    let t = tables().await;
+    let (key, other) = (subject(), subject());
+    let now = OffsetDateTime::now_utc();
+    let mut changed = SchemaDoc::of(&default_schema());
+    changed.links.clear();
+    let conn = t.db.conn().expect("connection");
+    let repo = crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository::new();
+    let scope = toolkit_security::AccessScope::allow_all();
+    for subject in [key, other] {
+        t.store
+            .mark(&tenant_scope(subject), subject, now)
+            .await
+            .unwrap();
+        repo.store(&conn, &scope, subject, None, &changed, 7)
+            .await
+            .unwrap();
+    }
+
+    assert!(finish_marked(&t, key).await);
+
+    let SchemaLookup::Stored(erased) = repo.find(&conn, &scope, key).await.unwrap() else {
+        panic!("the row stays");
+    };
+    assert_eq!(
+        erased.doc,
+        SchemaDoc::of(&default_schema()),
+        "an erased person starts from the default schema"
+    );
+    assert_eq!(erased.version, 2, "the reset moves the version on");
+    assert_eq!(
+        erased.names_charged, 7,
+        "erasing gives no new budget for the names kept"
+    );
+    let SchemaLookup::Stored(untouched) = repo.find(&conn, &scope, other).await.unwrap() else {
+        panic!("the other row stays");
+    };
+    assert_eq!(untouched.doc, changed);
+}
+
+#[tokio::test]
+async fn a_schema_change_that_read_no_row_conflicts_with_an_erasure_that_finished_first() {
+    use crate::domain::profile_schema::{SchemaLookup, SchemaStore, SubjectSchemaRepository as _};
+    use construct_sdk::linked_schema::default_schema;
+    use construct_sdk::schema_doc::SchemaDoc;
+
+    let t = tables().await;
+    let key = subject();
+    let conn = t.db.conn().expect("connection");
+    let repo = crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository::new();
+    let scope = toolkit_security::AccessScope::allow_all();
+    t.store
+        .mark(&tenant_scope(key), key, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    // The change reads the person's schema: no row.
+    assert!(matches!(
+        repo.find(&conn, &scope, key).await.unwrap(),
+        SchemaLookup::Absent
+    ));
+
+    assert!(finish_marked(&t, key).await);
+
+    let mut changed = SchemaDoc::of(&default_schema());
+    changed.links.clear();
+    assert!(
+        matches!(
+            repo.reserve_names(&conn, &scope, key, None, &changed, 0, 3)
+                .await
+                .unwrap(),
+            SchemaStore::Conflict
+        ),
+        "its charge finds the erasure's row"
+    );
+    assert!(
+        matches!(
+            repo.store(&conn, &scope, key, None, &changed, 3)
+                .await
+                .unwrap(),
+            SchemaStore::Conflict
+        ),
+        "so does its store"
+    );
+    let SchemaLookup::Stored(row) = repo.find(&conn, &scope, key).await.unwrap() else {
+        panic!("the erasure left a row");
+    };
+    assert_eq!(row.doc, SchemaDoc::of(&default_schema()));
+    assert_eq!(row.names_charged, 0);
+    assert!(row.version >= 1);
 }

@@ -28,6 +28,7 @@ pub mod linked_schema;
 pub mod models;
 pub mod profile_types;
 pub mod reason;
+pub mod schema_doc;
 
 #[cfg(test)]
 mod graph_schemas_tests;

@@ -1288,6 +1288,8 @@ pub struct MemoryProfile {
     pub delay: std::sync::Mutex<std::time::Duration>,
     pub too_large: std::sync::atomic::AtomicBool,
     pub owner: Option<SubjectKey>,
+    /// Nodes of a kind the schema lost, which no read shows.
+    pub orphans: std::sync::Mutex<Vec<crate::domain::profile_writes::Orphan>>,
 }
 
 impl MemoryProfile {
@@ -1346,12 +1348,14 @@ impl crate::domain::profile_writes::SubjectProfiles for MemoryProfile {
             return Ok(crate::domain::profile_writes::SubjectFacts {
                 version: None,
                 facts: Vec::new(),
+                orphans: Vec::new(),
                 generation,
             });
         }
         Ok(crate::domain::profile_writes::SubjectFacts {
             version: *self.version.lock().unwrap(),
             facts: self.live(),
+            orphans: self.orphans.lock().unwrap().clone(),
             generation,
         })
     }
@@ -1414,6 +1418,11 @@ impl MemoryWriter {
                 _ => None,
             })
             .collect();
+        self.profile
+            .orphans
+            .lock()
+            .unwrap()
+            .retain(|orphan| !removed.contains(&&orphan.node_key));
         let mut facts = self.profile.facts.lock().unwrap();
         let replaced: Vec<crate::domain::profile_read::StoredFact> = plan
             .steps
@@ -1445,7 +1454,10 @@ impl MemoryWriter {
                     let property = properties.first()?;
                     Some(crate::domain::profile_read::StoredFact {
                         node_key: key.clone(),
-                        category: crate::domain::profile::Category::from_name(&step.entity_kind)?,
+                        category: crate::domain::profile::Category::from_name(
+                            crate::domain::profile::profile_schema(),
+                            &step.entity_kind,
+                        )?,
                         property: property.name.clone(),
                         value: property.value.clone(),
                         owner: None,
@@ -1540,9 +1552,9 @@ impl crate::domain::subject_control::SubjectControlEvents for RecordingSubjectCo
 
 /// The profile writes over `profile` and `writer`, read and written as the
 /// processing identity `identity`, with at most two reruns.
-pub fn profile_writes(
+pub fn profile_writes<W: crate::domain::planner::processing::PlanWriter + 'static>(
     profile: Arc<MemoryProfile>,
-    writer: Arc<MemoryWriter>,
+    writer: Arc<W>,
     identity: Option<Uuid>,
 ) -> crate::domain::profile_writes::ProfileWrites {
     let contexts: Arc<dyn crate::domain::planner::processing::ProcessingContexts> = match identity {
@@ -2714,4 +2726,158 @@ pub fn no_retention() -> Arc<dyn crate::domain::deletion::RetentionPeriods> {
             crate::config::RetentionConfig::default(),
         ),
     )
+}
+
+/// The node kind "pets" the schema tests add: owned by the person, named by `name`, with a species beside it.
+pub fn pets_kind() -> construct_sdk::schema_doc::NodeKindDoc {
+    use construct_sdk::schema_doc::{NodeKindDoc, OwnerDoc, PropertyDoc};
+    let text = |name: &str| PropertyDoc {
+        name: name.to_owned(),
+        required: name == "name",
+        schema: serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 100 }),
+    };
+    NodeKindDoc {
+        name: "pets".to_owned(),
+        description: "An animal the person keeps.".to_owned(),
+        owner: OwnerDoc::Root,
+        reference: false,
+        single: false,
+        key: "name".to_owned(),
+        properties: vec![text("name"), text("species")],
+    }
+}
+
+/// The change that adds [`pets_kind`].
+pub fn add_pets() -> crate::domain::profile_schema::SchemaChange {
+    crate::domain::profile_schema::SchemaChange::AddNodeKind { kind: pets_kind() }
+}
+
+/// Records the changes of schemas.
+#[derive(Default)]
+pub struct RecordingSchemaEvents {
+    pub changed: std::sync::Mutex<Vec<crate::domain::schema_service::SchemaChanged>>,
+    pub forgotten: std::sync::Mutex<Vec<crate::domain::schema_service::NodesForgotten>>,
+}
+
+impl crate::domain::schema_service::SchemaEvents for RecordingSchemaEvents {
+    fn changed(&self, event: crate::domain::schema_service::SchemaChanged) {
+        self.changed.lock().unwrap().push(event);
+    }
+
+    fn nodes_forgotten(&self, event: crate::domain::schema_service::NodesForgotten) {
+        self.forgotten.lock().unwrap().push(event);
+    }
+}
+
+/// A model that answers with the given answers in turn, then the last again.
+pub struct Scripted(
+    pub std::sync::Mutex<std::collections::VecDeque<crate::domain::model_client::ModelResponse>>,
+);
+
+#[async_trait]
+impl crate::domain::model_client::ModelClient for Scripted {
+    async fn complete(
+        &self,
+        _ctx: &SecurityContext,
+        _request: &crate::domain::model_client::ModelRequest,
+    ) -> Result<crate::domain::model_client::ModelResponse, crate::domain::model_client::ModelError>
+    {
+        let mut answers = self.0.lock().unwrap();
+        Ok(if answers.len() > 1 {
+            answers.pop_front().unwrap()
+        } else {
+            answers.front().cloned().unwrap()
+        })
+    }
+}
+
+/// A model answer with the usage the caps count.
+pub fn answer(
+    output: crate::domain::model_client::ModelOutput,
+) -> crate::domain::model_client::ModelResponse {
+    crate::domain::model_client::ModelResponse {
+        output,
+        usage: Some(crate::domain::model_client::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+        }),
+    }
+}
+
+/// Graph storage as a schema test sees it: what was registered and forgotten, an answer that refuses the
+/// registration, and one that fails the removal.
+#[derive(Default)]
+pub struct RecordingEffects {
+    pub registered:
+        std::sync::Mutex<Vec<(crate::domain::subject_settings::SubjectKey, Vec<String>)>>,
+    /// The people whose orphaned nodes were forgotten, one entry per call.
+    pub forgotten: std::sync::Mutex<Vec<crate::domain::subject_settings::SubjectKey>>,
+    pub refuse: std::sync::Mutex<Option<String>>,
+    pub fail_forget: std::sync::atomic::AtomicBool,
+    /// How many nodes a forget reports it removed.
+    pub forgotten_nodes: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl crate::domain::profile_schema::SchemaEffects for RecordingEffects {
+    async fn register(
+        &self,
+        key: crate::domain::subject_settings::SubjectKey,
+        schema: &construct_sdk::linked_schema::Schema,
+    ) -> Result<(), DomainError> {
+        if let Some(reason) = self.refuse.lock().unwrap().clone() {
+            return Err(DomainError::InvalidValue {
+                field: "schema",
+                rule: reason,
+            });
+        }
+        self.registered.lock().unwrap().push((
+            key,
+            schema
+                .nodes
+                .iter()
+                .map(|kind| kind.name.to_owned())
+                .collect(),
+        ));
+        Ok(())
+    }
+
+    async fn forget(
+        &self,
+        key: crate::domain::subject_settings::SubjectKey,
+    ) -> Result<usize, DomainError> {
+        if self.fail_forget.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::Unavailable("graph storage is down".to_owned()));
+        }
+        self.forgotten.lock().unwrap().push(key);
+        Ok(self
+            .forgotten_nodes
+            .load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// A change that adds a node kind whose name and property names no other test uses, so that the process does not keep
+/// them yet: what a charge for names is measured on.
+pub fn add_fresh_kind() -> crate::domain::profile_schema::SchemaChange {
+    use construct_sdk::schema_doc::{NodeKindDoc, OwnerDoc, PropertyDoc};
+    let unique = Uuid::new_v4().simple().to_string();
+    let property = |name: String| PropertyDoc {
+        name,
+        required: false,
+        schema: serde_json::json!({ "type": "string", "maxLength": 100 }),
+    };
+    crate::domain::profile_schema::SchemaChange::AddNodeKind {
+        kind: NodeKindDoc {
+            name: format!("k{unique}"),
+            description: String::new(),
+            owner: OwnerDoc::Root,
+            reference: false,
+            single: false,
+            key: format!("n{unique}"),
+            properties: vec![
+                property(format!("n{unique}")),
+                property(format!("s{unique}")),
+            ],
+        },
+    }
 }

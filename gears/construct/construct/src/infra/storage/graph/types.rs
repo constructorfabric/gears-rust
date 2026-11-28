@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
-use construct_sdk::linked_schema::SchemaPrefix;
+use construct_sdk::linked_schema::{Schema, SchemaPrefix};
 use construct_sdk::profile_types::graph_types;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
@@ -16,7 +17,6 @@ use toolkit_canonical_errors::CanonicalError;
 
 use super::{CAS_CONFLICT, DEFAULT_CALL_TIMEOUT, bounded, graph_error, unanswered};
 use crate::domain::error::DomainError;
-use crate::domain::profile::profile_schema;
 
 /// Registers Construct's graph types in a tenant before the first write there.
 /// Graph storage keeps types per tenant. Registering the same schemas again
@@ -35,7 +35,7 @@ use crate::domain::profile::profile_schema;
 pub struct GraphTypes {
     client: Arc<dyn GraphStorageClientV1>,
     timeout: Duration,
-    registered: Mutex<HashSet<(Uuid, Uuid)>>,
+    registered: Mutex<HashMap<(Uuid, Uuid), u64>>,
 }
 
 /// A changed schema of a registered type is admitted when graph storage proves
@@ -76,8 +76,8 @@ impl GraphTypes {
         self
     }
 
-    fn done(&self, tenant_id: Uuid, subject_id: Uuid) -> bool {
-        self.registered.lock().contains(&(tenant_id, subject_id))
+    fn done(&self, tenant_id: Uuid, subject_id: Uuid, fingerprint: u64) -> bool {
+        self.registered.lock().get(&(tenant_id, subject_id)) == Some(&fingerprint)
     }
 
     /// Make sure the types exist in the context's tenant: the root and the has-fact edge every profile shares, and the
@@ -88,13 +88,27 @@ impl GraphTypes {
     ///
     /// When graph storage refuses or cannot take the registration, or does not
     /// answer in time.
-    pub async fn ensure(&self, ctx: &SecurityContext, subject_id: Uuid) -> Result<(), DomainError> {
+    pub async fn ensure(
+        &self,
+        ctx: &SecurityContext,
+        subject_id: Uuid,
+        schema: &Schema,
+    ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-register
         let tenant_id = ctx.subject_tenant_id();
-        if self.done(tenant_id, subject_id) {
+        let prefix = SchemaPrefix::of(subject_id);
+        let own_types = schema.graph_types(&prefix);
+        let fingerprint = {
+            let mut hasher = DefaultHasher::new();
+            for graph_type in &own_types {
+                graph_type.type_id.hash(&mut hasher);
+                graph_type.schema.to_string().hash(&mut hasher);
+            }
+            hasher.finish()
+        };
+        if self.done(tenant_id, subject_id, fingerprint) {
             return Ok(());
         }
-        let prefix = SchemaPrefix::of(subject_id);
         let shared = graph_types().into_iter().map(|graph_type| {
             serde_json::from_str(graph_type.schema)
                 .map(|schema| TypeRegistration {
@@ -108,15 +122,12 @@ impl GraphTypes {
                     ))
                 })
         });
-        let own = profile_schema()
-            .graph_types(&prefix)
-            .into_iter()
-            .map(|graph_type| {
-                Ok(TypeRegistration {
-                    type_id: graph_type.type_id,
-                    schema: graph_type.schema,
-                })
-            });
+        let own = own_types.into_iter().map(|graph_type| {
+            Ok(TypeRegistration {
+                type_id: graph_type.type_id,
+                schema: graph_type.schema,
+            })
+        });
         let batch = shared.chain(own).collect::<Result<Vec<_>, DomainError>>()?;
         let first = tokio::time::timeout(
             self.timeout,
@@ -144,7 +155,9 @@ impl GraphTypes {
             Ok(Err(err)) => return Err(graph_error("type registration", &err)),
             Err(_) => return Err(unanswered("type registration", self.timeout)),
         }
-        self.registered.lock().insert((tenant_id, subject_id));
+        self.registered
+            .lock()
+            .insert((tenant_id, subject_id), fingerprint);
         Ok(())
         // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-register
     }

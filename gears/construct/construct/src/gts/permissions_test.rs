@@ -85,6 +85,16 @@ fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
             "export",
         ),
         (
+            "cf.construct._.subject_schema_get.v1",
+            "gts.cf.construct.subject.schema.v1~",
+            "get",
+        ),
+        (
+            "cf.construct._.subject_schema_update.v1",
+            "gts.cf.construct.subject.schema.v1~",
+            "update",
+        ),
+        (
             "cf.construct._.subject_settings_get.v1",
             "gts.cf.construct.subject.settings.v1~",
             "get",

@@ -67,7 +67,12 @@ pub(crate) async fn authorize(
             &AccessRequest::new().resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id),
         )
         .await?;
-    if granted(&scope, key).is_none() {
+    // Only whether the scope reaches the subject matters here, not which categories it names.
+    let reach_only = construct_sdk::linked_schema::Schema {
+        nodes: Vec::new(),
+        links: Vec::new(),
+    };
+    if granted(&scope, key, &reach_only).is_none() {
         return Err(DomainError::forbidden(format!(
             "the policy scope for {action} does not reach subject {} in tenant {}",
             key.subject_id, key.tenant_id

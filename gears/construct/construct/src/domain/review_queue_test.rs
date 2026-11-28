@@ -16,7 +16,6 @@ use crate::domain::error::DomainError;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::plan::Plan;
 use crate::domain::plan::{Change, NodeKey, Origin};
-use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_writes::ProfileWrites;
@@ -105,7 +104,9 @@ impl Fixture {
                     events: Arc::new(RecordingAdmissionEvents::default()),
                     drops,
                 }),
-                catalog: Arc::new(Catalog::load().unwrap()),
+                catalogs: Arc::new(crate::domain::planner::catalog::Catalogs::new(Arc::new(
+                    crate::domain::profile_schema::DefaultSchemas::new(),
+                ))),
             })
         });
         ReviewQueueService::new(
@@ -815,7 +816,8 @@ async fn a_corrections_value_is_checked_before_its_fact_is_read() {
 }
 
 #[tokio::test]
-async fn a_correction_of_a_stored_property_no_person_type_has_is_internal() {
+async fn a_correction_of_a_stored_property_its_schema_no_longer_has_closes_the_request_as_deleted()
+{
     let fixture = Fixture::new(0);
     let odd = stored_fact(Category::PROJECT, "retired_property", json!("x"), 30);
     fixture.profile.facts.lock().unwrap().push(odd.clone());
@@ -838,10 +840,8 @@ async fn a_correction_of_a_stored_property_no_person_type_has_is_internal() {
         )
         .await;
 
-    assert!(
-        matches!(&corrected, Err(DomainError::Internal(why)) if why.contains(&odd.node_key.0)),
-        "{corrected:?}"
-    );
+    // The kind was removed from the schema, so the fact is hidden from every read: it is gone.
+    assert_eq!(outcome_of(&corrected.unwrap()), &ReviewOutcome::Deleted);
     assert!(fixture.writer.plans().is_empty());
 }
 
@@ -1508,6 +1508,7 @@ async fn a_correction_in_place_has_landed_only_when_the_fact_holds_another_value
         crate::domain::profile_writes::SubjectFacts {
             version: Some(1),
             facts: vec![fact],
+            orphans: Vec::new(),
             generation: 0,
         }
     };

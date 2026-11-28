@@ -27,6 +27,7 @@
   - [One Write per Plan](#one-write-per-plan)
   - [Profile Read](#profile-read)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
+  - [Schema at Run Time](#schema-at-run-time)
 - [7. Non-Functional Considerations](#7-non-functional-considerations)
 
 <!-- /toc -->
@@ -383,6 +384,53 @@ The profile read **MUST** return the root's version and every fact one has-fact 
       (`a_write_whose_answer_was_lost_is_sent_again_with_its_key_and_lands_once`).
 - [ ] Only a live fact of the subject's root is ever deleted (`a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted`).
 - [ ] A profile never grows past what one read takes (`a_full_profile_takes_no_new_fact_but_takes_a_removal`).
+
+### Schema at Run Time
+
+A person's schema is read and changed while the gear runs, through `GET` and `PATCH /construct/v1/subjects/{subject_id}/schema`
+(REST only: the host calls the gear over HTTP; no SDK method). Both are authorized actions on the subject's schema,
+owner only by default, as the subject's settings are. A change is a list of `add_node_kind`, `remove_node_kind`,
+`add_link_kind`, `remove_link_kind`, `add_property`, `remove_property`, `add_link_field` and `remove_link_field`,
+applied in order to a copy and checked as a whole, so all hold or none is made.
+
+- **Storage**: the gear keeps the schema a host set as one row per tenant and subject in `construct__subject_schemas`,
+  with a version that a change compares and moves, so two changes at once cannot both land. A person without a row, or whose row holds the default schema, has the default schema; the row
+  also holds the count of names the person has made the process keep (below). A change is logged as
+  `profile_schema_changed`.
+- **Rules**: names are lower case letters, digits and `_` and at most 40 characters; `origin`, `record`, `learned` and
+  `owner` are reserved; a name may not repeat; a kind's key is one of its properties; an owner or a link end names a
+  kind of the schema; every property is a JSON schema (draft 7) with no `$ref` into the document (`#`, `#/..`), as graph storage places a property in the node's own type, where such a reference would resolve against the node. A schema holds at most 64 node kinds, 64 link kinds
+  and 32 properties a kind. A refusal answers 422 with the reason and the schema does not change. Any failure after the names were charged (a refusal or an outage of graph storage, a change that loses a race, a database error) leaves them charged to the person; a refusal by the rules, or by the budget, charges nothing.
+- **From the next message**: the planner, the profile read and the writer read the person's schema when they start.
+  A message being planned finishes with the catalog it started with; the write then reads the schema again, so a
+  change that lands between the two can refuse that message's write. The writer also reads the schema once more just before it stores, and answers a conflict when it differs from the one the write was built on; the message is planned again, up to the re-run limit, and dropped only then. A change landing after that check leaves a node of a removed kind hidden from every read, until the next change, an erasure or the retention period sweeps it, unless a change adds the kind back before then: the node then shows again as a live fact, under the kind's new property schema.
+- **Graph storage**: a change registers the types of the schema for the person, under the per-person prefix, before it
+  is stored; graph storage's refusal, such as a removed kind added again with a schema it holds as incompatible, is the
+  answer and the schema does not change. Graph storage has no call to remove a type, so a removed kind stays registered, unused.
+- **Removing a node kind**: the new schema is stored first, then the nodes of the kinds it lacks, with the nodes they
+  own, are forgotten in one write. From the moment the schema is stored those nodes are in no read: the profile
+  read, the planner and the subject's own view skip a node of a kind the schema does not have. If the removal fails or
+  the process stops before it, the nodes stay in graph storage, hidden, and the call answers 503 and says so. Sending an
+  empty change (`{"changes": []}`) or any other change that does not add the kind back finishes the removal; sending the same removal again is refused,
+  as the kind is gone, and a change that adds the kind back does not finish it: the nodes show again with the kind. An erasure and the retention
+  period remove such nodes too, and the removal is logged on the audit target with the node count. A message planned just before the change can still write a node of the removed kind;
+  it is hidden and swept the same way. The kind also leaves the owners and link ends that name it; a link kind left
+  with no kind at an end goes with it, and a kind left with no owner is refused, naming it.
+- **Names kept in memory**: a kind, property or field name is kept for the life of the process, once. Free text (the
+  descriptions) is not. The names a change brings in that the process does not keep yet are charged to the person
+  before any is kept, by a compare-and-set on the schema's version and count, so a change that is then refused or loses a race
+  has paid for what it leaked, and of two changes on one version only one goes on. A person may make the process keep
+  at most 8 192 names over the life of their schema, removals not refunded and an erasure not resetting the count
+  (a person's schema holds at most 4 224 names at a time); a change that brings in no new name is never refused for
+  it. An erasure resets the schema to the default and keeps the count. A schema is also capped at 60 000 bytes as JSON.
+- **Per-kind permission**: the profile read asks the policy for each kind of the person's schema, so an added kind is
+  never readable without its own grant.
+- **Index**: every node type declares an index on the key property of its kind, the one that names a node
+  (`/payload/<kind>/<key>`, `name` for most kinds). Graph storage builds the index in the background after the type is
+  registered, and a filter or sort on it is admitted only once it is built; its activation lifecycle is not shipped
+  yet (graph storage ADR-0003), so it reports no time, and a kind added at run time may not be filtered or sorted on
+  its name for a while. The gear itself filters and sorts
+  nothing in graph storage, so no write or read of the gear waits for it.
 
 ## 7. Non-Functional Considerations
 

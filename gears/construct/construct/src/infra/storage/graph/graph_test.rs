@@ -812,6 +812,7 @@ async fn a_new_fact_whose_key_is_held_is_a_defect_and_stores_nothing() {
         &plan,
         &plan.steps[0],
         time::OffsetDateTime::now_utc(),
+        crate::domain::profile::profile_schema(),
         &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
         None,
     )
@@ -844,7 +845,11 @@ async fn a_root_key_held_by_another_type_is_a_defect() {
     let profiles = Profiles::new();
     // The subject's types are registered in the tenant, by their prefix.
     GraphTypes::new(Arc::clone(&profiles.client) as Arc<dyn GraphStorageClientV1>)
-        .ensure(&profiles.ctx, profiles.subject)
+        .ensure(
+            &profiles.ctx,
+            profiles.subject,
+            crate::domain::profile::profile_schema(),
+        )
         .await
         .unwrap();
     // A fact node under the subject's root key.
@@ -853,6 +858,7 @@ async fn a_root_key_held_by_another_type_is_a_defect() {
         &plan,
         &plan.steps[0],
         time::OffsetDateTime::now_utc(),
+        crate::domain::profile::profile_schema(),
         &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
         None,
     )
@@ -1527,6 +1533,7 @@ async fn a_profile_past_what_one_read_takes_is_full() {
         &plan,
         &plan.steps[0],
         time::OffsetDateTime::now_utc(),
+        crate::domain::profile::profile_schema(),
         &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
         None,
     )
@@ -2224,14 +2231,48 @@ async fn registration_is_remembered_per_tenant_and_a_failed_one_is_not() {
         construct_in(Uuid::new_v4()),
     );
 
-    types.ensure(&first, first.subject_id()).await.unwrap();
-    types.ensure(&first, first.subject_id()).await.unwrap();
-    types.ensure(&second, second.subject_id()).await.unwrap();
+    types
+        .ensure(
+            &first,
+            first.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await
+        .unwrap();
+    types
+        .ensure(
+            &first,
+            first.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await
+        .unwrap();
+    types
+        .ensure(
+            &second,
+            second.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await
+        .unwrap();
     scripted
         .fail_next_registration
         .store(true, Ordering::SeqCst);
-    let failed = types.ensure(&third, third.subject_id()).await;
-    types.ensure(&third, third.subject_id()).await.unwrap();
+    let failed = types
+        .ensure(
+            &third,
+            third.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await;
+    types
+        .ensure(
+            &third,
+            third.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await
+        .unwrap();
 
     assert!(
         matches!(failed, Err(DomainError::Unavailable(_))),
@@ -2321,7 +2362,11 @@ async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
     );
 
     GraphTypes::new(Arc::clone(&client))
-        .ensure(&ctx, ctx.subject_id())
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
         .await
         .unwrap();
 
@@ -2337,12 +2382,20 @@ async fn registering_unchanged_schemas_logs_no_upgrade() {
     let ctx = construct_in(Uuid::new_v4());
     // The tenant already holds the current schemas, as after a restart.
     GraphTypes::new(Arc::clone(&client))
-        .ensure(&ctx, ctx.subject_id())
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
         .await
         .unwrap();
 
     GraphTypes::new(client)
-        .ensure(&ctx, ctx.subject_id())
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
         .await
         .unwrap();
 
@@ -2363,7 +2416,11 @@ async fn a_registration_sent_again_after_a_lost_race_still_upgrades() {
         .store(true, Ordering::SeqCst);
 
     GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>)
-        .ensure(&ctx, ctx.subject_id())
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
         .await
         .unwrap();
 
@@ -2396,8 +2453,20 @@ async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_reme
     let scripted = Scripted::over(Arc::clone(&client));
     let types = GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>);
 
-    let first = types.ensure(&ctx, ctx.subject_id()).await;
-    let second = types.ensure(&ctx, ctx.subject_id()).await;
+    let first = types
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await;
+    let second = types
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await;
 
     assert!(matches!(first, Err(DomainError::Internal(_))), "{first:?}");
     assert!(
@@ -2442,7 +2511,14 @@ async fn a_registration_that_loses_a_race_is_sent_once_more() {
         .store(true, Ordering::SeqCst);
 
     let ctx = construct_in(Uuid::new_v4());
-    types.ensure(&ctx, ctx.subject_id()).await.unwrap();
+    types
+        .ensure(
+            &ctx,
+            ctx.subject_id(),
+            crate::domain::profile::profile_schema(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 2);
 }
@@ -2752,4 +2828,44 @@ async fn the_directory_hands_on_graph_storages_cursor_and_leaves_out_a_root_it_c
     );
     assert!(logs_contain("has no payload"));
     assert!(logs_contain("is not the root of subject"));
+}
+
+/// Answers the default schema once, then a schema without links: the person's host changed it during a write.
+struct ChangesAfterFirstRead(AtomicU32);
+
+#[async_trait]
+impl crate::domain::profile_schema::ProfileSchemas for ChangesAfterFirstRead {
+    async fn schema(
+        &self,
+        _key: crate::domain::subject_settings::SubjectKey,
+    ) -> Result<Arc<construct_sdk::linked_schema::Schema>, DomainError> {
+        let mut doc = construct_sdk::schema_doc::SchemaDoc::of(
+            &construct_sdk::linked_schema::default_schema(),
+        );
+        if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+            doc.links.clear();
+        }
+        Ok(Arc::new(doc.build()))
+    }
+}
+
+#[tokio::test]
+async fn a_write_whose_schema_changed_while_it_was_built_stores_nothing_and_conflicts() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let writer = profiles
+        .writer()
+        .with_schemas(Arc::new(ChangesAfterFirstRead(AtomicU32::new(0))));
+
+    let written = writer
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await
+        .expect("the write answers");
+
+    assert!(matches!(written, Written::Conflict), "{written:?}");
+    let profile = profiles.read().await;
+    assert_eq!(profile.version, Some(1), "nothing was stored");
 }

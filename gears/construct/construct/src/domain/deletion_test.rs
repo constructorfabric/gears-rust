@@ -992,3 +992,55 @@ async fn a_run_paused_after_its_check_leaves_the_new_profile_another_run_started
         "no root is removed"
     );
 }
+
+fn orphan(stored_at: OffsetDateTime) -> crate::domain::profile_writes::Orphan {
+    crate::domain::profile_writes::Orphan {
+        node_key: crate::domain::plan::NodeKey::new_in(Uuid::new_v4()),
+        stored_at,
+    }
+}
+
+#[tokio::test]
+async fn an_erasure_removes_the_nodes_of_a_kind_the_schema_lost_with_the_facts_and_says_so() {
+    let fx = Fixture::new();
+    fx.marked_long_ago();
+    *fx.profile.orphans.lock().unwrap() = vec![
+        orphan(OffsetDateTime::now_utc()),
+        orphan(OffsetDateTime::now_utc()),
+    ];
+
+    let done = fx
+        .deletion(FixedDirectory::default())
+        .erase(fx.key)
+        .await
+        .unwrap();
+
+    assert_eq!(done, Erasure::Done);
+    assert!(fx.profile.live().is_empty());
+    assert!(
+        fx.profile.orphans.lock().unwrap().is_empty(),
+        "an erasure reaches the nodes no read shows"
+    );
+    assert!(fx.events.taken().contains(&DeletionEvent::OrphansRemoved {
+        tenant_id: fx.key.tenant_id,
+        subject_id: fx.key.subject_id,
+        nodes: 2,
+    }));
+}
+
+#[tokio::test]
+async fn retention_removes_the_nodes_of_a_lost_kind_past_the_period_and_keeps_the_newer() {
+    let fx = Fixture::new();
+    let (old, new) = (
+        orphan(OffsetDateTime::UNIX_EPOCH),
+        orphan(OffsetDateTime::now_utc()),
+    );
+    *fx.profile.orphans.lock().unwrap() = vec![old, new.clone()];
+
+    fx.deletion(listing(vec![fx.key.subject_id]))
+        .expire(fx.key.tenant_id, Duration::from_hours(24))
+        .await
+        .unwrap();
+
+    assert_eq!(*fx.profile.orphans.lock().unwrap(), [new]);
+}

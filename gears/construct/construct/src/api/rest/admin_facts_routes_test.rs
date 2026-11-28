@@ -17,7 +17,6 @@ use crate::api::rest::routes::register_admin_facts_routes;
 use crate::domain::admin_facts::{AdminFactsPorts, AdminFactsService};
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::one_step::OneStepPath;
-use crate::domain::planner::catalog::Catalog;
 use crate::domain::profile::Category;
 use crate::domain::review_queue::{CLAIM_HOLD, ReviewQueueService, ReviewText};
 use crate::domain::sensitive_data::SensitiveDataChecks;
@@ -86,7 +85,9 @@ impl Tenant {
                 events: Arc::new(RecordingAdmissionEvents::default()),
                 drops,
             }),
-            catalog: Arc::new(Catalog::load().unwrap()),
+            catalogs: Arc::new(crate::domain::planner::catalog::Catalogs::new(Arc::new(
+                crate::domain::profile_schema::DefaultSchemas::new(),
+            ))),
         });
         let enforcer = PolicyEnforcer::new(resolver);
         let review_queue = Arc::new(ReviewQueueService::new(

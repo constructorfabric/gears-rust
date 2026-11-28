@@ -189,7 +189,7 @@ async fn a_caller_the_platform_lets_act_for_the_subject_reads_its_facts_by_categ
     assert_eq!(event.categories, [Category::ME, Category::PROJECT]);
     assert_eq!(
         event.granted,
-        Category::all(),
+        Category::all(crate::domain::profile::profile_schema()),
         "the grant, also the categories without facts"
     );
     assert!(event.served);
@@ -1431,7 +1431,10 @@ async fn a_node_read_is_audited_with_the_categories_it_served() {
 
     assert!(read.is_ok(), "{read:?}");
     assert!(event.served);
-    assert_eq!(event.granted, Category::all());
+    assert_eq!(
+        event.granted,
+        Category::all(crate::domain::profile::profile_schema())
+    );
     // The person, and what it is linked to: the projects it works on, and their commitments. Not the unlinked team.
     assert_eq!(
         event.categories,
@@ -1445,7 +1448,10 @@ async fn a_node_the_subject_does_not_hold_is_audited_as_served_and_refused() {
 
     assert!(matches!(read, Err(DomainError::NoSuchFact(_))), "{read:?}");
     assert!(event.served);
-    assert_eq!(event.granted, Category::all());
+    assert_eq!(
+        event.granted,
+        Category::all(crate::domain::profile::profile_schema())
+    );
     assert!(event.categories.is_empty());
 }
 
