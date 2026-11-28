@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use strum::IntoEnumIterator;
 
@@ -64,6 +64,8 @@ impl ForceMode {
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RateLimitQuota {
+    /// The first 12 hex digits of the token's SHA-256; `None` without a token.
+    pub token: Option<String>,
     /// `core`, `graphql`, `search`, and whatever else GitHub lists.
     pub resource: String,
     pub limit: u64,
@@ -91,9 +93,44 @@ pub struct FetchOptions {
     pub cancel: CancellationToken,
     pub telemetry: Arc<SessionTelemetry>,
     pub public_repo: Arc<OnceLock<bool>>,
+    /// Which pool tokens this run saw the repository shown to or hidden from.
+    pub token_access: Arc<RepoTokenAccess>,
     /// Tasks in flight inside this run, when the caller narrows the gear's
     /// `max_concurrent_tasks` for it.
     pub max_concurrent_tasks: Option<std::num::NonZeroUsize>,
+}
+
+/// What one run learned about which pool tokens can see its repository, by
+/// token label. It starts empty for every run, since access changes between
+/// runs: a token can be given or refused a private repository at any time.
+#[domain_model]
+#[derive(Debug, Default)]
+pub struct RepoTokenAccess {
+    seen: Mutex<HashMap<String, bool>>,
+}
+
+impl RepoTokenAccess {
+    /// `Some(true)` once GitHub showed the repository to `token`,
+    /// `Some(false)` once it answered `404` for it, `None` before either.
+    #[must_use]
+    pub fn sees(&self, token: &str) -> Option<bool> {
+        self.lock().get(token).copied()
+    }
+
+    pub fn shown(&self, token: &str) {
+        if self.sees(token) != Some(true) {
+            self.lock().insert(token.to_owned(), true);
+        }
+    }
+
+    /// `true` the first time, so the caller logs the token once.
+    pub fn hidden(&self, token: &str) -> bool {
+        self.lock().insert(token.to_owned(), false) != Some(false)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, bool>> {
+        self.seen.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// A top-level listing the sync can reconcile deletions for.
@@ -505,8 +542,8 @@ pub trait GithubPort: Send + Sync {
         fetched_before: DateTime<Utc>,
     ) -> Result<u64, DomainError>;
 
-    /// Bytes the cache holds for one `owner/name` repository, matched exactly
-    /// as `clear_cache` matches, so `status` can show what a clear would free.
+    /// Bytes the cache holds for one `owner/name` repository, matched as
+    /// `clear_cache` matches, in the caller's partition plus the shared one.
     ///
     /// # Errors
     /// Storage failures.
@@ -525,4 +562,27 @@ pub trait GithubPort: Send + Sync {
     /// # Errors
     /// `Internal` when GitHub cannot be reached or answers something else.
     async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError>;
+
+    async fn rate_limit_for_tenant(
+        &self,
+        _tenant_id: uuid::Uuid,
+        _scope: &AccessScope,
+    ) -> Result<Vec<RateLimitQuota>, DomainError> {
+        self.rate_limit().await
+    }
+
+    fn reload_tokens(&self, _tenant_id: uuid::Uuid) {}
+
+    /// Whether GitHub answers `401 Unauthorized` to `token`. A token GitHub
+    /// cannot be asked about, because it is down or answers anything else,
+    /// counts as not rejected.
+    ///
+    /// # Errors
+    /// `Internal` when the GitHub API base URL would send the token in cleartext.
+    async fn rejects_token(
+        &self,
+        _token: &toolkit_utils::SecretString,
+    ) -> Result<bool, DomainError> {
+        Ok(false)
+    }
 }

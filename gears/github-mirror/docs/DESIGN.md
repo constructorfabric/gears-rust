@@ -79,9 +79,10 @@ A sync is designed to be stopped and started again. The task queue lives in memo
 | `cpt-cf-github-mirror-fr-log-redaction` | `p1` | Tokens and credential-shaped text are redacted before logging; GraphQL error bodies are logged, not stored on the session |
 | `cpt-cf-github-mirror-fr-sync-summary` | `p2` | A completed session stores a `SyncSummary` with one counter per table and any accepted drift |
 | `cpt-cf-github-mirror-fr-progress` | `p2` | `progress_percent` is weighted by phase, never goes down, and is written by the heartbeat |
-| `cpt-cf-github-mirror-fr-env-independence` | `p1` | All settings come from the gear config; the GitHub token comes from the credential store |
+| `cpt-cf-github-mirror-fr-env-independence` | `p1` | All settings come from the gear config; GitHub tokens come from the credential store |
+| `cpt-cf-github-mirror-fr-token-pool` | `p2` | Each tenant's tokens are listed in `gm_token_secrets` and kept in the credential store; each request uses the token with the most calls left, and a token GitHub answers `401` leaves the pool |
 
-Not covered by this design yet: Python bindings (`cpt-cf-github-mirror-fr-python-bindings`), write-back (`cpt-cf-github-mirror-fr-write-back`), the token pool (`cpt-cf-github-mirror-fr-token-pool`) and security-alert collection (`cpt-cf-github-mirror-fr-security-sync`, refused by scope validation today).
+Not covered by this design yet: Python bindings (`cpt-cf-github-mirror-fr-python-bindings`), write-back (`cpt-cf-github-mirror-fr-write-back`) and security-alert collection (`cpt-cf-github-mirror-fr-security-sync`, refused by scope validation today).
 
 #### NFR Allocation
 
@@ -158,7 +159,7 @@ The gear is started and stopped by the framework. `stop()` cancels the pool and 
 
 - [x] `p1` - **ID**: `cpt-cf-github-mirror-constraint-one-token`
 
-The gear is configured with one token: `github_token_secret` names its secret in the credential store, read on the gear's first request to GitHub and kept until a restart. All tenants' syncs share its rate limit, so a backoff pauses every request made with it. A token per tenant is future work. Unknown keys in the gear's config are refused at start-up, so the `github_token` key of earlier builds fails loudly instead of leaving the gear unauthenticated.
+Token pool membership is stored in `gm_token_secrets` and scoped to one tenant; the DB is the source of truth. Token values live in credstore, and only secret references, full SHA-256 fingerprints, and optional scope notes are stored in the database. For each outbound GitHub request, the gear checks the tenant's current reference set in the DB. It caches the resolved token pool and reads values from credstore only when that set changes. A successful add, replace, or remove invalidates the local tenant pool immediately; other instances observe the DB reference change on their next request. Requests use the token with the most calls left above its reserve that is not backing off; when none is ready, the client waits for the one ready soonest ([#5367](https://github.com/constructorfabric/gears-rust/issues/5367)). A token GitHub answers `401 Unauthorized` leaves the active pool until it is rebuilt, and the request is retried with another token; when every token has been refused, the sync fails as access lost. A `404` from a token not yet shown a private repository is checked against `GET /repos/{owner}/{name}` with that token; if GitHub hides the repository from it, that token is skipped for the rest of the run and the request is retried with another one. Per-token scope notes are managed alongside each tenant's references. The `TokenPoolEntry` of the source design is split in two: the stored `gm_token_secrets` row holds the fingerprint, secret name and scope note, and the in-memory `PooledToken` holds the rate-limit state, the `401` health flag and the scopes from `X-OAuth-Scopes`; those last three start fresh after a restart.
 
 #### Tenant Isolation in Storage
 
@@ -276,6 +277,10 @@ Response store with compression and a content hash, in `gm_http_cache` or, with 
 | `POST /sync/resume` | Re-queue repositories still `in_progress` (optionally one, `?repo=owner/name`) |
 | `GET /sessions`, `GET /sessions/{id}` | Session list and one session: status, progress, error, summary |
 | `GET /sync-status` | Per-repository run status; filter `status=in_progress\|complete` |
+| `GET /tokens` | The caller's tenant's tokens, `{"tokens": [{"fingerprint": "<64 hex>", "scope_note": "repo, read:org"}]}`; token values are never returned |
+| `POST /tokens`, `PUT /tokens` | Body `{"tokens": [{"token": "ghp_…", "scope_note": "…"}]}`, up to 100 tokens. Each token value is saved in the credential store as `github-mirror-<fingerprint>` and listed in `gm_token_secrets`. `POST` adds them; adding a token already there keeps one copy and keeps its note when none is sent. `PUT` makes the pool exactly this list, and an empty list clears it. Each token is first checked with `GET /rate_limit`: one GitHub answers `401` is refused with `400` and nothing is saved, and one GitHub cannot check (down, `5xx`) is added unchecked with a warning. Both return the pool as `GET` does, and the pool is read again on the tenant's next request |
+| `DELETE /tokens/{fingerprint}` | Take one token out of the pool and delete its credential-store secret; `404` when the tenant has no such token |
+| `GET /rate-limit` | Each pool token's GitHub quota (REST, GraphQL and the other resources), named by the first 12 hex digits of the token's SHA-256 |
 | `DELETE /cache` | Clear the caller's cached responses for `?owner=` or `?repo=owner/name`; shared public-repository entries stay, and a sync with `force=true` re-fetches them |
 | `GET /repos` | Mirrored repositories |
 | `GET /repos/{owner}/{name}/commits/{sha}/files`, `GET /repos/{owner}/{name}/pulls/{number}/threads` | Data GitHub's REST paths do not serve in this shape |
@@ -576,7 +581,6 @@ Configuration (`config` of the gear):
 | Setting | Default |
 |---|---|
 | `api_base_url` | `https://api.github.com` |
-| `github_token_secret` | none (`tenant_id` and `key` of the token's secret in the credential store) |
 | `scope` | every family except security; actions and reactions `open`, timeline `none` |
 | `cache_compression` | `gzip` |
 | `max_concurrent_syncs` | 4 |
@@ -587,6 +591,7 @@ Configuration (`config` of the gear):
 | `cache_max_age_days` | none; cached responses are kept until cleared |
 | `cache_dir` | none; cached responses go to `gm_http_cache` |
 | `tenants.<tenant_id>.cache_max_age_days` | `cache_max_age_days` |
+| Token pool | managed per tenant through the token API or CLI; membership is stored in the DB and values in credstore |
 
 At the start of each sync the gear deletes the syncing tenant's `gm_http_cache` rows whose `fetched_at` is older than that tenant's `cache_max_age_days`, and the shared public-repository rows older than the gear-wide `cache_max_age_days`. A `304` does not rewrite a row, so `fetched_at` is the time of the last `200`. A delete that fails is logged and the sync goes on.
 
@@ -608,7 +613,7 @@ The database pool should allow at least `max_concurrent_syncs` × `max_concurren
 | `check-rate-limit` | `Service::rate_limit`: the token's quotas on every GitHub pool from `GET /rate_limit`, which costs nothing; `core` and `graphql` first |
 | `clear-cache <ORG/REPO>` | `Service::delete_repository`: every mirrored row of the repository, its watermarks, fingerprints, sessions, run status and cached responses, then the repository row, in one transaction; refused with `409` while a sync of it is in flight. This is the per-repository deletion `cpt-cf-github-mirror-nfr-data-governance` asks for; the REST `DELETE /cache` keeps dropping cached responses only |
 
-Configuration is one TOML file (`--config`, default `./github-mirror.toml`) merged over the built-in template that `--print-config` prints; its tables are the runtime's own settings, plus `[cli] tenant_id` and `[cli] database_placement`. Three flags override parts of it, with repotap's meaning: `--storage-dir <DIR>` (or `GITHUB_MIRROR_STORAGE_DIR`) sets `server.home_dir`, the root under which the toolkit keeps every gear's files (`<DIR>/github-mirror/`, `<DIR>/credstore/`); `--database-url <URL>` (or `GITHUB_MIRROR_DATABASE_URL`) replaces `gears.github-mirror.database` with that one `dsn`, `sqlite://`, `postgres://` or `mysql://`, after which placement is moot; `--database-placement <MODE>` (flag over TOML, default `per_repo`) picks the SQLite file when the gear's database is a `file`: `per_repo` is `<DIR>/github-mirror/cache/<owner>_<name>/github_mirror.db`, `per_org` is `<DIR>/github-mirror/cache/<owner>/github_mirror.db`, `shared` is `<DIR>/github-mirror/github_mirror.db`. `check-rate-limit` names no repository and opens the shared file. A per-repository or per-owner file holds that scope alone, HTTP cache included, so the shared public-repository partition only helps within one file. The GitHub token comes from `--token`, `GITHUB_TOKEN` or `~/.github-mirror/gh_token.txt` and reaches the gear through an in-memory static credstore secret. The platform token comes from `--platform-token`, `CF_PLATFORM_TOKEN` or `~/.github-mirror/platform_token.txt`; the AuthN resolver turns it into the `SecurityContext`, and when `cli.tenant_id` is set it must match the token's tenant. The `static-authn` feature (default) accepts any non-empty platform token as the plugin's configured identity, for local use; `oidc-authn` checks it against the platform's login server.
+Configuration is one TOML file (`--config`, default `./github-mirror.toml`) merged over the built-in template that `--print-config` prints; its tables are the runtime's own settings, plus `[cli] tenant_id` and `[cli] database_placement`. Three flags override parts of it, with repotap's meaning: `--storage-dir <DIR>` (or `GITHUB_MIRROR_STORAGE_DIR`) sets `server.home_dir`, the root under which the toolkit keeps every gear's files (`<DIR>/github-mirror/`, `<DIR>/credstore/`); `--database-url <URL>` (or `GITHUB_MIRROR_DATABASE_URL`) replaces `gears.github-mirror.database` with that one `dsn`, `sqlite://`, `postgres://` or `mysql://`, after which placement is moot; `--database-placement <MODE>` (flag over TOML, default `per_repo`) picks the SQLite file when the gear's database is a `file`: `per_repo` is `<DIR>/github-mirror/cache/<owner>_<name>/github_mirror.db`, `per_org` is `<DIR>/github-mirror/cache/<owner>/github_mirror.db`, `shared` is `<DIR>/github-mirror/github_mirror.db`. `check-rate-limit` names no repository and opens the shared file. A per-repository or per-owner file holds that scope alone, HTTP cache included, so the shared public-repository partition only helps within one file. The GitHub tokens come from `--token` (repeated for several), `GITHUB_TOKEN` (comma-separated) or `~/.github-mirror/gh_token.txt` (one per line) and reach the gear as in-memory static credstore secrets (`github-token`, `github-token-2`, ...). The platform token comes from `--platform-token`, `CF_PLATFORM_TOKEN` or `~/.github-mirror/platform_token.txt`; the AuthN resolver turns it into the `SecurityContext`, and when `cli.tenant_id` is set it must match the token's tenant. The `static-authn` feature (default) accepts any non-empty platform token as the plugin's configured identity, for local use; `oidc-authn` checks it against the platform's login server.
 
 ### Future Work
 

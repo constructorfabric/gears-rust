@@ -273,6 +273,30 @@ impl RateLimitController {
             .filter(|wait| !wait.is_zero())
     }
 
+    /// How soon this token can send, for choosing between the pool's tokens.
+    /// A GraphQL request also waits out the token's GraphQL hold.
+    pub async fn readiness(&self, graphql: bool) -> Readiness {
+        let graphql_until = if graphql {
+            self.inner.lock().await.graphql_until
+        } else {
+            None
+        };
+        let gate = self.gate_snapshot().await;
+        let now = Utc::now();
+        if let Some(until) = [gate.backoff_until, graphql_until]
+            .into_iter()
+            .flatten()
+            .filter(|until| *until > now)
+            .max()
+        {
+            return Readiness::Later(Some(until));
+        }
+        if gate.remaining <= gate.reserve {
+            return Readiness::Later(gate.reset_at);
+        }
+        Readiness::Now(gate.remaining - gate.reserve)
+    }
+
     pub async fn backing_off(&self) -> bool {
         self.inner
             .lock()
@@ -564,6 +588,15 @@ impl RateLimitController {
             reset_at: g.reset_at,
         }
     }
+}
+
+/// How soon a token can send its next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// It can send now, with this many calls left above its reserve.
+    Now(u32),
+    /// It is backing off or down to its reserve until this time; `None` when no reset is known.
+    Later(Option<DateTime<Utc>>),
 }
 
 /// Read-only snapshot of controller state (for diagnostics / tests).

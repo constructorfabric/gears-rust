@@ -35,6 +35,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::repo::{TokenSecretRecord, TokenSecretRepository};
 use crate::domain::repo::{
     ActiveSyncRecord, ActiveSyncRepository, EntityFingerprintRecord, EntityFingerprintRepository,
     RepoRunStatus, RepoSyncStatusRecord, RepoSyncStatusRepository, SessionStatus,
@@ -100,6 +101,7 @@ use super::entity::reviews::{self, Entity as ReviewEntity};
 use super::entity::sync_sessions::{self, Entity as SyncSessionEntity};
 use super::entity::sync_watermarks::{self, Entity as SyncWatermarkEntity};
 use super::entity::tags::{self, Entity as TagEntity};
+use super::entity::token_secrets::{self, Entity as TokenSecretEntity};
 use super::entity::workflow_jobs::{self, Entity as WorkflowJobEntity};
 use super::entity::workflow_runs::{self, Entity as WorkflowRunEntity};
 use super::entity::workflows::{self, Entity as WorkflowEntity};
@@ -6266,6 +6268,153 @@ impl SyncSessionRepository for SeaOrmSyncSessionRepository {
             .map(|m| Ok((m.tenant_id, m.try_into()?)))
             .collect()
     }
+}
+
+pub struct SeaOrmTokenSecretRepository {
+    db: Arc<DbProvider>,
+}
+
+impl SeaOrmTokenSecretRepository {
+    #[must_use]
+    pub fn new(db: Arc<DbProvider>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait]
+impl TokenSecretRepository for SeaOrmTokenSecretRepository {
+    async fn list(&self, scope: &AccessScope) -> Result<Vec<TokenSecretRecord>, DomainError> {
+        let conn = self.db.conn()?;
+        let rows = TokenSecretEntity::find()
+            .secure()
+            .scope_with(scope)
+            .order_by(token_secrets::Column::Fingerprint, Order::Asc)
+            .all(&conn)
+            .await
+            .map_err(map_scope_error)?;
+        Ok(rows.into_iter().map(token_secret_record).collect())
+    }
+
+    async fn add_many(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        records: &[TokenSecretRecord],
+    ) -> Result<(), DomainError> {
+        let records = records.to_vec();
+        let scope = scope.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    for record in records {
+                        upsert_token_secret(tx, &scope, tenant_id, &record).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+    }
+
+    async fn replace(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        records: &[TokenSecretRecord],
+    ) -> Result<Vec<TokenSecretRecord>, DomainError> {
+        let records = records.to_vec();
+        let scope = scope.clone();
+        self.db
+            .db()
+            .transaction_ref_mapped(move |tx| {
+                Box::pin(async move {
+                    let previous: Vec<TokenSecretRecord> = TokenSecretEntity::find()
+                        .secure()
+                        .scope_with(&scope)
+                        .all(tx)
+                        .await
+                        .map_err(map_scope_error)?
+                        .into_iter()
+                        .map(token_secret_record)
+                        .collect();
+                    TokenSecretEntity::delete_many()
+                        .secure()
+                        .scope_with(&scope)
+                        .exec(tx)
+                        .await
+                        .map_err(map_scope_error)?;
+                    for record in records {
+                        upsert_token_secret(tx, &scope, tenant_id, &record).await?;
+                    }
+                    Ok(previous)
+                })
+            })
+            .await
+    }
+
+    async fn remove(
+        &self,
+        scope: &AccessScope,
+        fingerprint: &str,
+    ) -> Result<Option<TokenSecretRecord>, DomainError> {
+        let conn = self.db.conn()?;
+        let existing = TokenSecretEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(token_secrets::Column::Fingerprint.eq(fingerprint)))
+            .one(&conn)
+            .await
+            .map_err(map_scope_error)?;
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+        TokenSecretEntity::delete_many()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(token_secrets::Column::Fingerprint.eq(fingerprint)))
+            .exec(&conn)
+            .await
+            .map_err(map_scope_error)?;
+        Ok(Some(token_secret_record(existing)))
+    }
+}
+
+fn token_secret_record(row: token_secrets::Model) -> TokenSecretRecord {
+    TokenSecretRecord {
+        fingerprint: row.fingerprint,
+        secret_key: row.secret_key,
+        scope_note: row.scope_note,
+    }
+}
+
+async fn upsert_token_secret(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant_id: Uuid,
+    record: &TokenSecretRecord,
+) -> Result<(), DomainError> {
+    let model = token_secrets::ActiveModel {
+        tenant_id: ActiveValue::Set(tenant_id),
+        fingerprint: ActiveValue::Set(record.fingerprint.clone()),
+        secret_key: ActiveValue::Set(record.secret_key.clone()),
+        scope_note: ActiveValue::Set(record.scope_note.clone()),
+    };
+    let mut on_conflict = SecureOnConflict::<TokenSecretEntity>::columns([
+        token_secrets::Column::TenantId,
+        token_secrets::Column::Fingerprint,
+    ]);
+    on_conflict
+        .inner_mut()
+        .update_columns([token_secrets::Column::ScopeNote]);
+    TokenSecretEntity::insert(model.clone())
+        .secure()
+        .scope_with_model(scope, &model)
+        .map_err(map_scope_error)?
+        .on_conflict(on_conflict)
+        .exec(runner)
+        .await
+        .map_err(map_scope_error)?;
+    Ok(())
 }
 
 pub struct SeaOrmActiveSyncRepository {

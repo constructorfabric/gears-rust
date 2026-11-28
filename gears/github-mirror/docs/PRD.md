@@ -264,10 +264,21 @@ so the unchecked boxes below read as "not yet", not "abandoned".
   one workflow by id or file name (`/actions/workflows/{workflow_id}/runs`), and
   artifacts (`/actions/artifacts`)
 
+**Delivered by the token pool increment**
+([gears-rust#5367](https://github.com/constructorfabric/gears-rust/issues/5367)):
+
+- A GitHub token pool per tenant (`cpt-cf-github-mirror-fr-token-pool`): token values
+  in the credential store, their references in `gm_token_secrets` (migration
+  `m0003_token_secrets`); each request uses the token with the most calls left, a
+  token GitHub answers `401` leaves the pool, and private-repository requests go only
+  to tokens that can read the repository
+- Token management through `GET`/`POST`/`PUT /github-mirror/v1/tokens` and
+  `DELETE /github-mirror/v1/tokens/{fingerprint}`, and through the CLI flags
+  `--token`, `--token-only` and `--token-scope-note`; `GET /github-mirror/v1/rate-limit`
+  and `check-rate-limit` show each token's quota
+
 **Deferred to tracked follow-ups**:
 
-- A GitHub token per tenant and token pools (`cpt-cf-github-mirror-fr-token-pool`):
-  not yet scheduled
 - Write-back operations, Python bindings, state-change events: later
   increments of this PRD, not yet scheduled
 - Annotated-tag metadata: tags are mirrored as list-tags returns them (`name` plus
@@ -1214,6 +1225,10 @@ The mirror is a replica of personal data: every contributor row is a person, and
 ## 13. Open Questions
 
 - What is the maximum supported number of tokens in a token pool, and how is token rotation prioritized?
+  **Answered** ([gears-rust#5367](https://github.com/constructorfabric/gears-rust/issues/5367)):
+  each request uses the token with the most calls left that is above its reserve and not
+  backing off, and waits for the one ready soonest when none is; one add or replace call
+  takes up to 100 tokens, and a tenant's pool has no total limit.
 - How are write-back operation conflicts resolved when the same entity is modified both locally and on GitHub between synchronization cycles?
 - What is the retention policy for write-back operation history (completed/failed operations)?
 - How is the GitHub-compatible API versioned when GitHub changes their API schema and the mirror's response format must be updated?

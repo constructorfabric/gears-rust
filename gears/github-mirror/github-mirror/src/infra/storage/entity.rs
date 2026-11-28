@@ -1491,3 +1491,30 @@ pub mod logical_conversations {
 
     impl ActiveModelBehavior for ActiveModel {}
 }
+
+pub mod token_secrets {
+    use super::{DeriveEntityModel, DerivePrimaryKey, DeriveRelation, EnumIter, Scopable, Uuid};
+    use sea_orm::entity::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
+    #[sea_orm(table_name = "gm_token_secrets")]
+    #[secure(
+        tenant_col = "tenant_id",
+        resource_col = "fingerprint",
+        no_owner,
+        no_type
+    )]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub tenant_id: Uuid,
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub fingerprint: String,
+        pub secret_key: String,
+        pub scope_note: Option<String>,
+    }
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+
+    impl ActiveModelBehavior for ActiveModel {}
+}

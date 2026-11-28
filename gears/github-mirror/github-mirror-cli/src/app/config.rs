@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use figment::Figment;
 use figment::providers::Serialized;
-use github_mirror::config::GithubTokenSecret;
 use github_mirror::domain::validate::validate_repo_path;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -20,8 +19,6 @@ pub struct CliConfig {
     pub app: AppConfig,
     /// The tenant the platform token must belong to, when set.
     pub tenant_id: Option<Uuid>,
-    /// The credential-store secret the GitHub token is saved in, when a token is given.
-    pub github_token_secret: Option<GithubTokenSecret>,
 }
 
 /// Where the SQLite database file lives.
@@ -59,7 +56,10 @@ struct CliTable {
 }
 
 /// Merge the configuration file and the flags over the built-in template.
-pub fn load(path: &Path, has_github_token: bool, storage: StorageFlags<'_>) -> Result<CliConfig> {
+pub fn load(
+    path: &Path,
+    storage: StorageFlags<'_>,
+) -> Result<CliConfig> {
     let mut merged: Value =
         toml::from_str(DEFAULT_TEMPLATE).context("the built-in configuration does not parse")?;
     if path.is_file() {
@@ -83,12 +83,6 @@ pub fn load(path: &Path, has_github_token: bool, storage: StorageFlags<'_>) -> R
             .unwrap_or(DatabasePlacement::PerRepo),
         storage.repo,
     )?;
-    let github_token_secret = if has_github_token {
-        Some(github_token_secret(&merged)?)
-    } else {
-        drop_github_token(&mut merged);
-        None
-    };
     expand_home_dir(&mut merged)?;
 
     let app: AppConfig = Figment::new()
@@ -99,7 +93,6 @@ pub fn load(path: &Path, has_github_token: bool, storage: StorageFlags<'_>) -> R
     Ok(CliConfig {
         app,
         tenant_id: cli.tenant_id,
-        github_token_secret,
     })
 }
 
@@ -201,24 +194,6 @@ fn place_database(
     Ok(())
 }
 
-fn github_token_secret(config: &Value) -> Result<GithubTokenSecret> {
-    let secret = config
-        .pointer("/gears/github-mirror/config/github_token_secret")
-        .cloned()
-        .ok_or_else(|| anyhow!("gears.github-mirror.config.github_token_secret is missing"))?;
-    serde_json::from_value(secret)
-        .context("gears.github-mirror.config.github_token_secret is not valid")
-}
-
-fn drop_github_token(config: &mut Value) {
-    if let Some(gear) = config
-        .pointer_mut("/gears/github-mirror/config")
-        .and_then(Value::as_object_mut)
-    {
-        gear.remove("github_token_secret");
-    }
-}
-
 fn expand_home_dir(config: &mut Value) -> Result<()> {
     let Some(home_dir) = config.pointer_mut("/server/home_dir") else {
         return Ok(());
@@ -278,7 +253,6 @@ mod tests {
     ) -> Option<PathBuf> {
         let loaded = load(
             Path::new("does-not-exist.toml"),
-            false,
             flags(dir, placement, repo),
         )
         .unwrap();
@@ -329,7 +303,6 @@ mod tests {
         let dir = scratch_dir();
         let postgres = load(
             Path::new("does-not-exist.toml"),
-            false,
             StorageFlags {
                 storage_dir: Some(dir.clone()),
                 database_url: Some("postgres://u:p@db.local/mirror".to_owned()),
@@ -343,7 +316,6 @@ mod tests {
         let by_url = dir.join("by-url.db");
         let sqlite = load(
             Path::new("does-not-exist.toml"),
-            false,
             StorageFlags {
                 storage_dir: Some(dir.clone()),
                 database_url: Some(format!("sqlite://{}?mode=rwc", by_url.display())),
@@ -363,14 +335,13 @@ mod tests {
         let toml = dir.join("github-mirror.toml");
         std::fs::write(&toml, "[cli]\ndatabase_placement = \"shared\"\n").unwrap();
 
-        let from_toml = load(&toml, false, flags(&dir, None, Some("dtolnay/itoa"))).unwrap();
+        let from_toml = load(&toml, flags(&dir, None, Some("dtolnay/itoa"))).unwrap();
         assert_eq!(
             sqlite_file(&from_toml.app),
             Some(dir.join("github-mirror").join("github_mirror.db"))
         );
         let from_flag = load(
             &toml,
-            false,
             flags(&dir, Some(DatabasePlacement::PerRepo), Some("dtolnay/itoa")),
         )
         .unwrap();
@@ -387,7 +358,6 @@ mod tests {
         assert!(
             load(
                 Path::new("does-not-exist.toml"),
-                false,
                 flags(&dir, None, Some("../x"))
             )
             .is_err()

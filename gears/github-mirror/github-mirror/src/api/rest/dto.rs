@@ -14,6 +14,7 @@ use github_mirror_sdk::{
 };
 use github_mirror_sdk::{CountDrift, MirrorStatus, SyncSummary};
 
+use crate::domain::ports::github::RateLimitQuota;
 use crate::domain::repo::{RepoRunStatus, RepoSyncStatusRecord, SessionStatus, SyncSessionRecord};
 use crate::domain::sync::TelemetrySnapshot;
 
@@ -1168,6 +1169,75 @@ pub struct CacheClearedDto {
     pub scope: String,
     /// How many cached responses went.
     pub entries_removed: u64,
+}
+
+/// One GitHub rate-limit pool of one token, as `GET /rate_limit` reports it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorRateLimitQuotaDto)]
+pub struct RateLimitQuotaDto {
+    /// The first 12 hex digits of the token's SHA-256; absent without a token.
+    pub token: Option<String>,
+    /// `core`, `graphql`, `search`, and whatever else GitHub lists.
+    pub resource: String,
+    pub limit: u64,
+    pub remaining: u64,
+    pub used: u64,
+    #[schema(format = DateTime)]
+    pub reset_at: Option<String>,
+}
+
+impl From<RateLimitQuota> for RateLimitQuotaDto {
+    fn from(quota: RateLimitQuota) -> Self {
+        Self {
+            token: quota.token,
+            resource: quota.resource,
+            limit: quota.limit,
+            remaining: quota.remaining,
+            used: quota.used,
+            reset_at: quota.reset_at.map(|at| at.to_rfc3339()),
+        }
+    }
+}
+
+/// The quotas of every token in the pool, as served by `/github-mirror/v1/rate-limit`.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorRateLimitDto)]
+pub struct RateLimitDto {
+    /// One entry per token and GitHub resource, `core` and `graphql` first.
+    pub quotas: Vec<RateLimitQuotaDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[schema(as = GithubMirrorTokenInputDto)]
+pub struct TokenInputDto {
+    #[schema(value_type = String)]
+    pub token: toolkit_utils::SecretString,
+    pub scope_note: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[schema(as = GithubMirrorTokenBatchDto)]
+pub struct TokenBatchDto {
+    pub tokens: Vec<TokenInputDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorTokenDto)]
+pub struct TokenDto {
+    pub fingerprint: String,
+    pub scope_note: Option<String>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorTokensDto)]
+pub struct TokensDto {
+    pub tokens: Vec<TokenDto>,
 }
 
 /// Sessions queued by one resume call.

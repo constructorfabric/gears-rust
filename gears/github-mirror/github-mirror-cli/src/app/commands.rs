@@ -420,6 +420,7 @@ pub async fn check_rate_limit(service: &Service, ctx: &SecurityContext) -> Resul
         .iter()
         .map(|quota| {
             json!({
+                "token": quota.token,
                 "resource": quota.resource,
                 "limit": quota.limit,
                 "used": quota.used,

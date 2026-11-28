@@ -19,6 +19,7 @@ use tokio_util::task::TaskTracker;
 use toolkit_macros::domain_model;
 use toolkit_odata::{CursorV1, ODataQuery, Page, PageInfo, SortDir};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
+use toolkit_utils::SecretString;
 use uuid::Uuid;
 
 use super::error::DomainError;
@@ -26,6 +27,8 @@ use super::ports::github::{
     FetchOptions, ForceMode, GithubPort, RateLimitQuota, SHARED_CACHE_PARTITION,
 };
 use super::ports::telemetry_sink::TelemetrySink;
+use super::ports::token_vault::{NoTokenVault, TokenVault, vault_secret_name};
+use super::repo::TokenSecretRepository;
 use super::repo::{
     ActiveSyncRecord, ActiveSyncRepository, ArtifactRepository, BranchRecord, BranchRepository,
     CheckRunRecord, CheckRunRepository, CommentRecord, CommentRepository, CommitCommentRecord,
@@ -701,6 +704,8 @@ pub struct Service {
     sync_tx: mpsc::Sender<SyncJob>,
     sync_rx: Arc<Mutex<Option<mpsc::Receiver<SyncJob>>>>,
     active_syncs: Arc<dyn ActiveSyncRepository>,
+    token_secrets: Arc<dyn TokenSecretRepository>,
+    token_vault: Arc<dyn TokenVault>,
     instance_id: Uuid,
     in_process_syncs: TaskTracker,
     in_process_slots: Arc<tokio::sync::Semaphore>,
@@ -913,11 +918,63 @@ impl Clone for Service {
             sync_tx: self.sync_tx.clone(),
             sync_rx: Arc::clone(&self.sync_rx),
             active_syncs: Arc::clone(&self.active_syncs),
+            token_secrets: Arc::clone(&self.token_secrets),
+            token_vault: Arc::clone(&self.token_vault),
             instance_id: self.instance_id,
             in_process_syncs: self.in_process_syncs.clone(),
             in_process_slots: Arc::clone(&self.in_process_slots),
             claim_gates: self.claim_gates.clone(),
             shutdown: Arc::clone(&self.shutdown),
+        }
+    }
+}
+
+fn normalized_token(token: &SecretString) -> Result<SecretString, DomainError> {
+    let token = SecretString::new(token.expose().trim());
+    if token.expose().is_empty() {
+        return Err(DomainError::Validation {
+            field: "token".to_owned(),
+            message: "must not be empty".to_owned(),
+        });
+    }
+    Ok(token)
+}
+
+fn normalized_scope_note(scope_note: Option<&str>) -> Result<Option<String>, DomainError> {
+    let note = scope_note.map(str::trim).filter(|note| !note.is_empty());
+    if note.is_some_and(|note| note.chars().count() > 500) {
+        return Err(DomainError::Validation {
+            field: "scope_note".to_owned(),
+            message: "must be no longer than 500 characters".to_owned(),
+        });
+    }
+    Ok(note.map(str::to_owned))
+}
+
+async fn cleanup_new_tokens(
+    vault: &dyn TokenVault,
+    ctx: &SecurityContext,
+    fingerprints: &HashSet<String>,
+    existing: &HashSet<String>,
+) {
+    for fingerprint in fingerprints.difference(existing) {
+        if let Err(error) = vault.delete(ctx, fingerprint).await {
+            tracing::warn!(%fingerprint, %error, "new token credential cleanup failed");
+        }
+    }
+}
+
+async fn delete_dropped_tokens(
+    vault: &dyn TokenVault,
+    ctx: &SecurityContext,
+    removed: Vec<super::repo::TokenSecretRecord>,
+    kept: &HashSet<String>,
+) {
+    for record in removed {
+        if !kept.contains(&record.fingerprint)
+            && let Err(error) = vault.delete(ctx, &record.fingerprint).await
+        {
+            tracing::warn!(fingerprint = %record.fingerprint, %error, "removed token credential cleanup failed");
         }
     }
 }
@@ -963,6 +1020,7 @@ impl Service {
         sync_sessions: Arc<dyn SyncSessionRepository>,
         repo_sync_status: Arc<dyn RepoSyncStatusRepository>,
         active_syncs: Arc<dyn ActiveSyncRepository>,
+        token_secrets: Arc<dyn TokenSecretRepository>,
         sync_writer: Arc<dyn SyncWriter>,
         fingerprints: Arc<dyn EntityFingerprintRepository>,
         watermark_store: Arc<dyn SyncWatermarkRepository>,
@@ -1018,6 +1076,8 @@ impl Service {
             sync_tx,
             sync_rx: Arc::new(Mutex::new(Some(sync_rx))),
             active_syncs,
+            token_secrets,
+            token_vault: Arc::new(NoTokenVault),
             instance_id: Uuid::new_v4(),
             in_process_syncs: TaskTracker::new(),
             in_process_slots,
@@ -3767,8 +3827,8 @@ impl Service {
             .await?)
     }
 
-    /// Bytes the HTTP cache holds for one repository, for `status`. Guarded
-    /// like `clear_cache`, since it reads exactly what a clear would drop.
+    /// Bytes the HTTP cache holds for one repository, for `status`, shared
+    /// partition included. Guarded like `clear_cache`.
     ///
     /// # Errors
     /// `Validation` when `owner/name` is not a usable path; `Forbidden`/
@@ -3799,8 +3859,225 @@ impl Service {
         &self,
         ctx: &SecurityContext,
     ) -> Result<Vec<RateLimitQuota>, DomainError> {
-        self.sync_access_scope(ctx).await?;
-        self.github.rate_limit().await
+        let scope = self.sync_access_scope(ctx).await?;
+        self.github
+            .rate_limit_for_tenant(ctx.subject_tenant_id(), &scope)
+            .await
+    }
+
+    /// The caller's tenant's tokens: fingerprints, secret names and scope notes,
+    /// never the token values.
+    ///
+    /// # Errors
+    /// `Forbidden` when the caller may not sync; storage failures.
+    pub async fn list_tokens(
+        &self,
+        ctx: &SecurityContext,
+    ) -> Result<Vec<super::repo::TokenSecretRecord>, DomainError> {
+        let scope = self.sync_access_scope(ctx).await?;
+        self.token_secrets.list(&scope).await
+    }
+
+    async fn ensure_github_accepts(
+        &self,
+        tokens: &[(SecretString, Option<String>)],
+    ) -> Result<(), DomainError> {
+        for (index, (token, _)) in tokens.iter().enumerate() {
+            if self.github.rejects_token(token).await? {
+                return Err(DomainError::Validation {
+                    field: "tokens".to_owned(),
+                    message: format!("GitHub answers 401 Unauthorized to token {}", index + 1),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Save `tokens` in the credential store and add them to the caller's
+    /// tenant's pool; a token already there keeps one copy.
+    ///
+    /// # Errors
+    /// `Validation` for an empty list, more than 100 tokens, an empty token, a
+    /// note over 500 characters or a token GitHub answers `401` to;
+    /// `Forbidden` when the caller may not sync; credential-store and storage
+    /// failures.
+    pub async fn add_tokens(
+        &self,
+        ctx: &SecurityContext,
+        tokens: &[(SecretString, Option<String>)],
+    ) -> Result<Vec<super::repo::TokenSecretRecord>, DomainError> {
+        let scope = self.sync_access_scope(ctx).await?;
+        if tokens.is_empty() || tokens.len() > 100 {
+            return Err(DomainError::Validation {
+                field: "tokens".to_owned(),
+                message: "must contain between 1 and 100 tokens".to_owned(),
+            });
+        }
+        let normalized = tokens
+            .iter()
+            .map(|(token, note)| {
+                Ok((
+                    normalized_token(token)?,
+                    normalized_scope_note(note.as_deref())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        self.ensure_github_accepts(&normalized).await?;
+        let existing = self.token_secrets.list(&scope).await?;
+        let existing_fingerprints: HashSet<String> = existing
+            .iter()
+            .map(|record| record.fingerprint.clone())
+            .collect();
+        let mut saved = HashSet::new();
+        let mut records: Vec<super::repo::TokenSecretRecord> = Vec::new();
+        for (token, note) in &normalized {
+            let fingerprint = match self.token_vault.save(ctx, token).await {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    cleanup_new_tokens(
+                        self.token_vault.as_ref(),
+                        ctx,
+                        &saved,
+                        &existing_fingerprints,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if !saved.insert(fingerprint.clone()) {
+                if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.fingerprint == fingerprint)
+                    && note.is_some()
+                {
+                    record.scope_note.clone_from(note);
+                }
+                continue;
+            }
+            let scope_note = note.clone().or_else(|| {
+                existing
+                    .iter()
+                    .find(|record| record.fingerprint == fingerprint)
+                    .and_then(|record| record.scope_note.clone())
+            });
+            records.push(super::repo::TokenSecretRecord {
+                fingerprint: fingerprint.clone(),
+                secret_key: vault_secret_name(&fingerprint),
+                scope_note,
+            });
+        }
+        if let Err(error) = self
+            .token_secrets
+            .add_many(&scope, ctx.subject_tenant_id(), &records)
+            .await
+        {
+            cleanup_new_tokens(self.token_vault.as_ref(), ctx, &saved, &existing_fingerprints)
+                .await;
+            return Err(error);
+        }
+        self.github.reload_tokens(ctx.subject_tenant_id());
+        self.list_tokens(ctx).await
+    }
+
+    /// Make the caller's tenant's pool exactly `tokens`; an empty list clears it.
+    ///
+    /// # Errors
+    /// `Validation` for more than 100 tokens, an empty token, a note over 500
+    /// characters or a token GitHub answers `401` to; `Forbidden` when the
+    /// caller may not sync; credential-store and storage failures.
+    pub async fn replace_tokens(
+        &self,
+        ctx: &SecurityContext,
+        tokens: &[(SecretString, Option<String>)],
+    ) -> Result<Vec<super::repo::TokenSecretRecord>, DomainError> {
+        if tokens.len() > 100 {
+            return Err(DomainError::Validation {
+                field: "tokens".to_owned(),
+                message: "must contain no more than 100 tokens".to_owned(),
+            });
+        }
+        let scope = self.sync_access_scope(ctx).await?;
+        let normalized = tokens
+            .iter()
+            .map(|(token, note)| {
+                Ok((
+                    normalized_token(token)?,
+                    normalized_scope_note(note.as_deref())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        self.ensure_github_accepts(&normalized).await?;
+        let existing = self.token_secrets.list(&scope).await?;
+        let existing_fingerprints: HashSet<String> = existing
+            .iter()
+            .map(|record| record.fingerprint.clone())
+            .collect();
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        for (token, note) in &normalized {
+            let fingerprint = match self.token_vault.save(ctx, token).await {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    cleanup_new_tokens(
+                        self.token_vault.as_ref(),
+                        ctx,
+                        &seen,
+                        &existing_fingerprints,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if !seen.insert(fingerprint.clone()) {
+                continue;
+            }
+            let record = super::repo::TokenSecretRecord {
+                fingerprint: fingerprint.clone(),
+                secret_key: vault_secret_name(&fingerprint),
+                scope_note: note.clone(),
+            };
+            records.push(record);
+        }
+        let removed = match self
+            .token_secrets
+            .replace(&scope, ctx.subject_tenant_id(), &records)
+            .await
+        {
+            Ok(removed) => removed,
+            Err(error) => {
+                cleanup_new_tokens(self.token_vault.as_ref(), ctx, &seen, &existing_fingerprints)
+                    .await;
+                return Err(error);
+            }
+        };
+        self.github.reload_tokens(ctx.subject_tenant_id());
+        delete_dropped_tokens(self.token_vault.as_ref(), ctx, removed, &seen).await;
+        self.list_tokens(ctx).await
+    }
+
+    /// Take the token with `fingerprint` out of the caller's tenant's pool and
+    /// delete it from the credential store.
+    ///
+    /// # Errors
+    /// `NotFound` when the tenant has no such token; `Forbidden` when the
+    /// caller may not sync; credential-store and storage failures.
+    pub async fn remove_token(
+        &self,
+        ctx: &SecurityContext,
+        fingerprint: &str,
+    ) -> Result<(), DomainError> {
+        let scope = self.sync_access_scope(ctx).await?;
+        let Some(record) = self.token_secrets.remove(&scope, fingerprint).await? else {
+            return Err(DomainError::NotFound);
+        };
+        self.github.reload_tokens(ctx.subject_tenant_id());
+        self.token_vault.delete(ctx, &record.fingerprint).await
+    }
+
+    #[must_use]
+    pub fn with_token_vault(mut self, vault: Arc<dyn TokenVault>) -> Self {
+        self.token_vault = vault;
+        self
     }
 
     /// Hand the service the token the gear cancels on shutdown. Called once,
@@ -4908,6 +5185,7 @@ impl Service {
             cancel: cancel.clone(),
             telemetry: Arc::clone(telemetry),
             public_repo: Arc::default(),
+            token_access: Arc::default(),
             max_concurrent_tasks: job.max_concurrent_tasks,
         };
         let stop_beating = CancellationToken::new();
@@ -5239,6 +5517,7 @@ impl Service {
             FetchOptions {
                 cancel: cancel.clone(),
                 public_repo: Arc::default(),
+                token_access: Arc::default(),
                 ..options.clone()
             },
         ));

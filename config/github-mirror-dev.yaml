@@ -248,9 +248,6 @@ gears:
         max_conns: 20
     config:
       api_base_url: "https://api.github.com"
-      github_token_secret:
-        tenant_id: "00000000-df51-5b42-9538-d2b56b7ee953"
-        key: "github-token"
       # Repositories synced at once, and the ceiling on GitHub requests in
       # flight across all of them (GitHub's secondary rate limit reacts to
       # concurrency, so raise the second one only with a token pool).

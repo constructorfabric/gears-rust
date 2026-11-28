@@ -13,11 +13,13 @@
 
 pub mod controller;
 pub mod headers;
+pub mod pool;
 pub mod probe;
 pub mod registry;
 
 pub use controller::{ControllerSnapshot, RateLimitController};
 pub use headers::RateLimitHeaders;
+pub use pool::{PooledToken, TokenPool};
 pub use probe::{AuthoritativeQuota, QuotaProbe};
 pub use registry::{ControllerRegistry, TokenFingerprint};
 

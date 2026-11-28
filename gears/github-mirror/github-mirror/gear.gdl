@@ -29,6 +29,5 @@ gear(
         path = "../github-mirror-sdk",
     ),
 
-    # `github_token_secret` names a CredStore secret and is never offered as a control.
     config_schema = config(exposes = ["api_base_url"]),
 )

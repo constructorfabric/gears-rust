@@ -1799,6 +1799,39 @@ pub struct ActiveSyncRecord {
     pub updated_at: String,
 }
 
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenSecretRecord {
+    pub fingerprint: String,
+    pub secret_key: String,
+    pub scope_note: Option<String>,
+}
+
+#[async_trait]
+pub trait TokenSecretRepository: Send + Sync {
+    async fn list(&self, scope: &AccessScope) -> Result<Vec<TokenSecretRecord>, DomainError>;
+
+    async fn add_many(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        records: &[TokenSecretRecord],
+    ) -> Result<(), DomainError>;
+
+    async fn replace(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        records: &[TokenSecretRecord],
+    ) -> Result<Vec<TokenSecretRecord>, DomainError>;
+
+    async fn remove(
+        &self,
+        scope: &AccessScope,
+        fingerprint: &str,
+    ) -> Result<Option<TokenSecretRecord>, DomainError>;
+}
+
 #[async_trait]
 pub trait ActiveSyncRepository: Send + Sync {
     async fn find(

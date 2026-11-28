@@ -464,6 +464,7 @@ fn opts(scope: ScopeConfig) -> FetchOptions {
         cancel: tokio_util::sync::CancellationToken::new(),
         telemetry: std::sync::Arc::default(),
         public_repo: std::sync::Arc::default(),
+        token_access: std::sync::Arc::default(),
         max_concurrent_tasks: None,
     }
 }
@@ -1704,6 +1705,7 @@ async fn a_stored_etag_turns_the_next_sync_into_a_free_304() {
         cancel: tokio_util::sync::CancellationToken::new(),
         telemetry: std::sync::Arc::default(),
         public_repo: std::sync::Arc::default(),
+        token_access: std::sync::Arc::default(),
         max_concurrent_tasks: None,
     };
 

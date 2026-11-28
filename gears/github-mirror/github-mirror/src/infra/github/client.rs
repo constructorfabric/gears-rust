@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 use std::collections::hash_map::Entry;
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use toolkit_security::AccessScope;
@@ -33,13 +33,14 @@ use crate::infra::github::compression::MAX_BODY_BYTES;
 use crate::infra::github::metrics::{GithubRequestMetrics, Outcome};
 use crate::infra::github::pagination::parse_link_next;
 use crate::infra::github::rate_limit::{
-    AuthoritativeQuota, QuotaProbe, RateLimitController, RateLimitHeaders,
+    AuthoritativeQuota, ControllerRegistry, PooledToken, QuotaProbe, RateLimitHeaders, TokenPool,
 };
 use crate::redact::redacted_word;
 
 /// Items asked for per request. GitHub's maximum, so a listing of a given
 /// size costs the fewest requests.
 const FIRST_PAGE_SIZE: u32 = 100;
+const WORKFLOW_JOBS_PAGE_SIZE: u32 = 30;
 const ACCEPT_JSON: &str = "application/vnd.github+json";
 
 fn within_since(state: &str, updated_at: &str, since: Option<DateTime<Utc>>) -> bool {
@@ -270,13 +271,13 @@ fn fallback_delay(attempt: u32) -> std::time::Duration {
 
 /// Releases the token's in-flight slot when dropped, so an admitted request
 /// counts against its controller exactly as long as it is in flight.
-struct Admission<'a> {
-    controller: &'a RateLimitController,
+struct Admission {
+    pooled: Arc<PooledToken>,
 }
 
-impl Drop for Admission<'_> {
+impl Drop for Admission {
     fn drop(&mut self) {
-        self.controller.release();
+        self.pooled.controller.release();
     }
 }
 
@@ -285,7 +286,7 @@ impl Drop for Admission<'_> {
 struct RateLimitProbe {
     http: reqwest::Client,
     url: String,
-    token: Arc<Token>,
+    token: Option<SecretString>,
 }
 
 impl std::fmt::Debug for RateLimitProbe {
@@ -304,7 +305,7 @@ impl QuotaProbe for RateLimitProbe {
             .get(&self.url)
             .header("Accept", ACCEPT_JSON)
             .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
-        if let Some(token) = self.token.get().await.ok()? {
+        if let Some(token) = &self.token {
             request = request.bearer_auth(token.expose());
         }
         let body: serde_json::Value = request
@@ -391,30 +392,40 @@ fn cache_partition(options: &FetchOptions) -> (AccessScope, uuid::Uuid) {
     }
 }
 
-/// Where the client gets its GitHub token the first time it needs one.
+/// Where the client gets its GitHub tokens the first time it needs them.
 #[async_trait]
 pub(crate) trait TokenSource: Send + Sync {
-    async fn token(&self) -> Result<Option<SecretString>, DomainError>;
+    async fn references(&self, scope: &AccessScope) -> Result<Vec<String>, DomainError>;
+
+    async fn tokens(
+        &self,
+        tenant_id: uuid::Uuid,
+        references: &[String],
+    ) -> Result<Vec<SecretString>, DomainError>;
 }
 
-struct Token {
-    value: tokio::sync::OnceCell<Option<SecretString>>,
-    source: OnceLock<Arc<dyn TokenSource>>,
+struct BuiltPool {
+    references: Option<Vec<String>>,
+    pool: Arc<TokenPool>,
 }
 
-impl Token {
-    async fn get(&self) -> Result<Option<&SecretString>, DomainError> {
-        let value = self
-            .value
-            .get_or_try_init(|| async {
-                match self.source.get() {
-                    Some(source) => source.token().await,
-                    None => Ok(None),
-                }
-            })
-            .await?;
-        Ok(value.as_ref())
+type TenantPools = HashMap<Option<uuid::Uuid>, BuiltPool>;
+
+fn token_pool(
+    http: &reqwest::Client,
+    api_base_url: &str,
+    registry: &ControllerRegistry,
+    tokens: Vec<SecretString>,
+) -> TokenPool {
+    let pool = TokenPool::new(tokens, registry);
+    for pooled in pool.iter() {
+        pooled.controller.set_quota_probe(Arc::new(RateLimitProbe {
+            http: http.clone(),
+            url: format!("{}/rate_limit", api_base_url.trim_end_matches('/')),
+            token: pooled.token.clone(),
+        }));
     }
+    pool
 }
 
 fn refuse_cleartext(api_base_url: &str, parsed: &url::Url) -> Result<(), DomainError> {
@@ -437,16 +448,15 @@ pub struct GithubClient {
     http: reqwest::Client,
     api_base_url: String,
     api_origin: url::Origin,
-    token: Arc<Token>,
+    tokens: Vec<SecretString>,
+    pools: Mutex<TenantPools>,
+    registry: ControllerRegistry,
+    token_source: OnceLock<Arc<dyn TokenSource>>,
     cache: Arc<dyn HttpCache>,
     /// Ceiling on requests in flight, shared by every sync using this client.
     /// GitHub's secondary rate limit reacts to concurrency, so the ceiling is
     /// global rather than per sync.
     permits: Semaphore,
-    /// The token's admission controller: every request is admitted here
-    /// before it takes a shared permit, so a token that is backing off or out
-    /// of budget never occupies capacity another token could use.
-    controller: Arc<RateLimitController>,
     /// Ceiling the controller's adaptive soft cap may grow to.
     max_cap: u32,
     metrics: GithubRequestMetrics,
@@ -462,16 +472,27 @@ impl GithubClient {
         Self::with_cache(api_base_url, token, Arc::new(NoCache))
     }
 
+    /// # Errors
+    /// Whatever [`Self::with_tokens`] returns: this is that call with at most
+    /// one token.
+    pub fn with_cache(
+        api_base_url: String,
+        token: Option<SecretString>,
+        cache: Arc<dyn HttpCache>,
+    ) -> Result<Self, DomainError> {
+        Self::with_tokens(api_base_url, token.into_iter().collect(), cache)
+    }
+
     /// A client that revalidates against `cache` instead of re-fetching.
     ///
     /// # Errors
     /// Returns `DomainError::Internal` when the underlying HTTP client cannot
     /// be constructed, when `api_base_url` does not parse, when it would carry
-    /// the token over plain `http` to another machine, or when it has no host
+    /// a token over plain `http` to another machine, or when it has no host
     /// for a `next` link to be compared against.
-    pub fn with_cache(
+    pub fn with_tokens(
         api_base_url: String,
-        token: Option<SecretString>,
+        tokens: Vec<SecretString>,
         cache: Arc<dyn HttpCache>,
     ) -> Result<Self, DomainError> {
         let parsed = url::Url::parse(&api_base_url)
@@ -492,7 +513,7 @@ impl GithubClient {
             }))
             .build()
             .map_err(|e| DomainError::internal(format!("failed to build HTTP client: {e}")))?;
-        if token.is_some() {
+        if !tokens.is_empty() {
             refuse_cleartext(&api_base_url, &parsed)?;
         }
         let api_origin = parsed.origin();
@@ -502,24 +523,16 @@ impl GithubClient {
                 redacted_word(&api_base_url)
             )));
         }
-        let token = Arc::new(Token {
-            value: tokio::sync::OnceCell::new_with(token.map(Some)),
-            source: OnceLock::new(),
-        });
-        let controller = Arc::new(RateLimitController::new());
-        controller.set_quota_probe(Arc::new(RateLimitProbe {
-            http: http.clone(),
-            url: format!("{}/rate_limit", api_base_url.trim_end_matches('/')),
-            token: Arc::clone(&token),
-        }));
         Ok(Self {
             http,
             api_base_url,
             api_origin,
-            token,
+            tokens,
+            pools: Mutex::default(),
+            registry: ControllerRegistry::new(),
+            token_source: OnceLock::new(),
             cache,
             permits: Semaphore::new(DEFAULT_MAX_CONCURRENT_REQUESTS),
-            controller,
             max_cap: u32::try_from(DEFAULT_MAX_CONCURRENT_REQUESTS).unwrap_or(u32::MAX),
             metrics: GithubRequestMetrics::from_global(),
             upstream_backoff: UPSTREAM_BACKOFF,
@@ -527,15 +540,128 @@ impl GithubClient {
         })
     }
 
-    /// Read the token from `source` on the first GitHub request instead of a fixed one.
+    /// Read the tokens from `source` on the first GitHub request instead of fixed ones.
     pub(crate) fn set_token_source(&self, source: Arc<dyn TokenSource>) -> Result<(), DomainError> {
-        let parsed = url::Url::parse(&self.api_base_url)
-            .map_err(|e| DomainError::internal(format!("invalid GitHub API base URL: {e}")))?;
-        refuse_cleartext(&self.api_base_url, &parsed)?;
-        self.token
-            .source
+        self.token_source
             .set(source)
             .map_err(|_| DomainError::internal("the GitHub client already has a token source"))
+    }
+
+    /// `pooled`'s quotas, or `None` when the token is out of the pool or GitHub
+    /// answers `401` to it, which drops it.
+    async fn token_rate_limit(
+        &self,
+        pooled: &PooledToken,
+    ) -> Result<Option<Vec<RateLimitQuota>>, DomainError> {
+        if pooled.is_dropped() {
+            return Ok(None);
+        }
+        let url = format!("{}/rate_limit", self.api_base_url.trim_end_matches('/'));
+        let mut request = self
+            .http
+            .get(&url)
+            .header("Accept", ACCEPT_JSON)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
+        if let Some(token) = &pooled.token {
+            request = request.bearer_auth(token.expose());
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| DomainError::internal(format!("GET /rate_limit failed: {e}")))?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && pooled.drop_from_pool() {
+            return Ok(None);
+        }
+        let body: serde_json::Value = response
+            .error_for_status()
+            .map_err(|e| DomainError::internal(format!("GET /rate_limit failed: {e}")))?
+            .json()
+            .await
+            .map_err(|e| DomainError::internal(format!("GET /rate_limit decode failed: {e}")))?;
+        let resources = body
+            .get("resources")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| DomainError::internal("GET /rate_limit answered without resources"))?;
+        let mut quotas: Vec<RateLimitQuota> = resources
+            .iter()
+            .map(|(resource, pool)| RateLimitQuota {
+                token: pooled.label().map(str::to_owned),
+                resource: resource.clone(),
+                limit: pool
+                    .get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                remaining: pool
+                    .get("remaining")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                used: pool
+                    .get("used")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                reset_at: pool
+                    .get("reset")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|secs| Utc.timestamp_opt(secs, 0).single()),
+            })
+            .collect();
+        quotas.sort_by_key(|quota| match quota.resource.as_str() {
+            "core" => (0, String::new()),
+            "graphql" => (1, String::new()),
+            other => (2, other.to_owned()),
+        });
+        Ok(Some(quotas))
+    }
+
+    async fn build_or_get_pool(
+        &self,
+        tenant_id: Option<uuid::Uuid>,
+        scope: &AccessScope,
+    ) -> Result<Arc<TokenPool>, DomainError> {
+        let source = self.token_source.get();
+        let tenant_references = match (source, tenant_id) {
+            (Some(source), Some(_)) => Some(source.references(scope).await?),
+            (Some(_), None) => Some(Vec::new()),
+            (None, _) => None,
+        };
+        {
+            let pools = self.pools.lock().unwrap_or_else(PoisonError::into_inner);
+            // Reuse the tenant's pool while its secret names are unchanged.
+            if let Some(built) = pools.get(&tenant_id)
+                && built.references == tenant_references
+            {
+                return Ok(Arc::clone(&built.pool));
+            }
+        }
+        let tokens = match (source, tenant_id, tenant_references.as_deref()) {
+            (Some(source), Some(tenant_id), Some(references)) => {
+                source.tokens(tenant_id, references).await?
+            }
+            (Some(_), _, _) => Vec::new(),
+            (None, _, _) => self.tokens.clone(),
+        };
+        if !tokens.is_empty() {
+            let parsed = url::Url::parse(&self.api_base_url)
+                .map_err(|e| DomainError::internal(format!("invalid GitHub API base URL: {e}")))?;
+            refuse_cleartext(&self.api_base_url, &parsed)?;
+        }
+        let pool = Arc::new(token_pool(
+            &self.http,
+            &self.api_base_url,
+            &self.registry,
+            tokens,
+        ));
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                tenant_id,
+                BuiltPool {
+                    references: tenant_references,
+                    pool: Arc::clone(&pool),
+                },
+            );
+        Ok(pool)
     }
 
     #[must_use]
@@ -565,13 +691,33 @@ impl GithubClient {
     /// cancelled run gives up the wait instead of holding the shutdown.
     async fn admit(
         &self,
-        telemetry: &SessionTelemetry,
-        cancel: &CancellationToken,
-    ) -> Result<(Admission<'_>, SemaphorePermit<'_>), DomainError> {
+        api: GithubApi,
+        options: &FetchOptions,
+    ) -> Result<(Admission, SemaphorePermit<'_>), DomainError> {
+        let telemetry = &options.telemetry;
+        let cancel = &options.cancel;
+        let pool = self
+            .build_or_get_pool(Some(options.tenant_id), &options.access_scope)
+            .await?;
         loop {
+            let picked = pool
+                .pick(
+                    api == GithubApi::Graphql,
+                    options.public_repo.get().copied(),
+                    &options.token_access,
+                )
+                .await;
+            let Some(pooled) = picked else {
+                if pool.iter().any(|pooled| !pooled.is_dropped()) {
+                    return Err(DomainError::NotFound);
+                }
+                return Err(DomainError::AccessLost(
+                    "GitHub answered 401 Unauthorized to every token in the pool".to_owned(),
+                ));
+            };
             let asked = Instant::now();
             tokio::select! {
-                admitted = self.controller.admit() => {
+                admitted = pooled.controller.admit() => {
                     let parked = admitted
                         .map_err(|e| DomainError::internal(format!("GitHub rate limit: {e}")))?;
                     if parked {
@@ -581,14 +727,14 @@ impl GithubClient {
                 () = cancel.cancelled() => return Err(DomainError::Cancelled),
             }
             let admission = Admission {
-                controller: &self.controller,
+                pooled: Arc::clone(&pooled),
             };
             let permit = tokio::select! {
                 permit = self.permits.acquire() => permit
                     .map_err(|e| DomainError::internal(format!("request semaphore closed: {e}")))?,
                 () = cancel.cancelled() => return Err(DomainError::Cancelled),
             };
-            if !self.controller.backing_off().await {
+            if !pooled.controller.backing_off().await {
                 return Ok((admission, permit));
             }
         }
@@ -660,19 +806,110 @@ impl GithubClient {
     /// Feed a response's rate-limit headers to the token's controller.
     async fn observe(
         &self,
+        pooled: &PooledToken,
         headers: &reqwest::header::HeaderMap,
         status: reqwest::StatusCode,
     ) -> RateLimitHeaders {
+        pooled.note_scopes(
+            headers
+                .get("x-oauth-scopes")
+                .and_then(|value| value.to_str().ok()),
+        );
         let mut seen = RateLimitHeaders::parse(
             headers
                 .iter()
                 .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str(), v))),
         );
         seen.is_secondary_rate_limit = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
-        self.controller
+        pooled
+            .controller
             .observe(&seen, status.as_u16(), self.max_cap)
             .await;
         seen
+    }
+
+    /// After a `404` on `url`: whether GitHub hides the repository from
+    /// `pooled` and another token is left to retry with. A `404` on a public
+    /// repository, or from a token already shown it, is a real one. For a URL
+    /// below the repository, the token is asked for the repository itself,
+    /// so a deleted issue does not count a token out.
+    async fn should_retry_not_found(
+        &self,
+        url: &str,
+        pooled: &PooledToken,
+        options: &FetchOptions,
+    ) -> bool {
+        let Some(label) = pooled.label() else {
+            return false;
+        };
+        let access = &options.token_access;
+        if options.public_repo.get() == Some(&true) || access.sees(label) == Some(true) {
+            return false;
+        }
+        let Some(repo_url) = self.repo_url(url) else {
+            return false;
+        };
+        if repo_url != url.split('?').next().unwrap_or(url).trim_end_matches('/') {
+            match self.repo_visible_to_token(&repo_url, pooled).await {
+                Some(true) => {
+                    access.shown(label);
+                    return false;
+                }
+                Some(false) => {}
+                None => return false,
+            }
+        }
+        if access.hidden(label) {
+            tracing::warn!(
+                token = label,
+                "GitHub answered 404 to a pool token for a repository it may not see; \
+                 this run leaves the token out for that repository"
+            );
+        }
+        self.build_or_get_pool(Some(options.tenant_id), &options.access_scope)
+            .await
+            .is_ok_and(|pool| {
+            pool.iter().any(|other| {
+                !other.is_dropped()
+                    && other
+                        .label()
+                        .is_some_and(|other| access.sees(other) != Some(false))
+            })
+        })
+    }
+
+    /// `{api}/repos/{owner}/{name}` for a URL on that repository.
+    fn repo_url(&self, url: &str) -> Option<String> {
+        let parsed = url::Url::parse(url).ok()?;
+        let mut segments = parsed.path_segments()?;
+        segments.by_ref().find(|segment| *segment == "repos")?;
+        let owner = segments.next()?;
+        let name = segments.next()?;
+        Some(format!(
+            "{}/repos/{owner}/{name}",
+            self.api_base_url.trim_end_matches('/')
+        ))
+    }
+
+    /// Whether GitHub shows the repository at `repo_url` to `pooled`; `None`
+    /// when it gives no clear answer.
+    async fn repo_visible_to_token(&self, repo_url: &str, pooled: &PooledToken) -> Option<bool> {
+        let mut request = self
+            .http
+            .get(repo_url)
+            .header("Accept", ACCEPT_JSON)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
+        if let Some(token) = &pooled.token {
+            request = request.bearer_auth(token.expose());
+        }
+        let status = request.send().await.ok()?.status();
+        if status.is_success() {
+            Some(true)
+        } else if status == reqwest::StatusCode::NOT_FOUND {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// Sleep before retrying a limit that gave the controller nothing to park
@@ -818,7 +1055,6 @@ impl GithubClient {
         self.check_origin(url)?;
         let key = CacheKey::compute("GET", url, ACCEPT_JSON);
         let cached = self.cached_entry(options, url, &key).await;
-        let token = self.token.get().await?;
         let sent = Sent {
             api: GithubApi::Rest,
             url,
@@ -832,10 +1068,10 @@ impl GithubClient {
         // A retry gives them up first: a request asleep on a backoff is not
         // in flight.
         let (body, etag, last_modified, next_page, _admission, _permit, mut line) = loop {
-            let (admission, permit) = self.admit(&options.telemetry, &options.cancel).await?;
+            let (admission, permit) = self.admit(GithubApi::Rest, options).await?;
             let (outcome, took) = self
                 .send(
-                    self.conditional_request(url, cached.as_ref(), token),
+                    self.conditional_request(url, cached.as_ref(), admission.pooled.token.as_ref()),
                     &sent,
                     &options.telemetry,
                     &options.cancel,
@@ -857,7 +1093,44 @@ impl GithubClient {
             };
 
             let status = response.status();
-            let seen = self.observe(response.headers(), status).await;
+            let seen = self
+                .observe(&admission.pooled, response.headers(), status)
+                .await;
+            if status == reqwest::StatusCode::UNAUTHORIZED && admission.pooled.drop_from_pool() {
+                self.count(
+                    &options.telemetry,
+                    &sent,
+                    status.as_u16(),
+                    Outcome::Failed,
+                    took,
+                    &seen,
+                );
+                drop(permit);
+                drop(admission);
+                continue;
+            }
+            if status == reqwest::StatusCode::NOT_FOUND
+                && self
+                    .should_retry_not_found(url, &admission.pooled, options)
+                    .await
+            {
+                self.count(
+                    &options.telemetry,
+                    &sent,
+                    status.as_u16(),
+                    Outcome::Failed,
+                    took,
+                    &seen,
+                );
+                drop(permit);
+                drop(admission);
+                continue;
+            }
+            if (status.is_success() || status == reqwest::StatusCode::NOT_MODIFIED)
+                && let Some(label) = admission.pooled.label()
+            {
+                options.token_access.shown(label);
+            }
             if status.is_server_error() && upstream_attempt < UPSTREAM_RETRIES {
                 self.count(
                     &options.telemetry,
@@ -1158,23 +1431,24 @@ impl GithubClient {
             url: &url,
             etag_used: false,
         };
-        let token = self.token.get().await?;
 
         let mut attempt: u32 = 0;
         let mut upstream_attempt: u32 = 0;
         // GraphQL shares the REST ceilings: both spend the same token's
         // budget, though the controller only reads the core budget headers.
         let (body, _admission, _permit, mut line) = loop {
-            if let Some(wait) = self.controller.graphql_wait().await {
+            let (admission, permit) = self.admit(GithubApi::Graphql, options).await?;
+            if let Some(wait) = admission.pooled.controller.graphql_wait().await {
+                drop(permit);
+                drop(admission);
                 self.pause(wait, telemetry, cancel).await?;
                 continue;
             }
-            let (admission, permit) = self.admit(telemetry, cancel).await?;
             let mut request = self
                 .http
                 .post(&url)
                 .json(&serde_json::json!({ "query": query, "variables": variables }));
-            if let Some(token) = token {
+            if let Some(token) = &admission.pooled.token {
                 request = request.bearer_auth(token.expose());
             }
             let (outcome, took) = self.send(request, &sent, telemetry, cancel).await?;
@@ -1196,7 +1470,22 @@ impl GithubClient {
             };
 
             let status = response.status();
-            let seen = self.observe(response.headers(), status).await;
+            let seen = self
+                .observe(&admission.pooled, response.headers(), status)
+                .await;
+            if status == reqwest::StatusCode::UNAUTHORIZED && admission.pooled.drop_from_pool() {
+                self.count(
+                    telemetry,
+                    &sent,
+                    status.as_u16(),
+                    Outcome::Failed,
+                    took,
+                    &seen,
+                );
+                drop(permit);
+                drop(admission);
+                continue;
+            }
             if status.is_server_error() && upstream_attempt < UPSTREAM_RETRIES {
                 self.count(
                     telemetry,
@@ -1258,9 +1547,10 @@ impl GithubClient {
                 GraphqlRead::Unread(e) => return Err(ReadFailure::Transport(e).into_error()),
                 GraphqlRead::RateLimited { delay, .. } if attempt < RATE_LIMIT_RETRIES => {
                     report_graphql_budget(attempt, delay);
+                    let pooled = Arc::clone(&admission.pooled);
                     drop(permit);
                     drop(admission);
-                    self.controller.hold_graphql(delay).await;
+                    pooled.controller.hold_graphql(delay).await;
                     attempt += 1;
                 }
                 GraphqlRead::RateLimited { body, bytes, .. }
@@ -3568,7 +3858,7 @@ impl GithubPort for GithubClient {
         let jobs = self
             .get_json_all_wrapped(
                 &format!(
-                    "/repos/{owner}/{name}/actions/runs/{run_id}/jobs?per_page={FIRST_PAGE_SIZE}"
+                    "/repos/{owner}/{name}/actions/runs/{run_id}/jobs?per_page={WORKFLOW_JOBS_PAGE_SIZE}"
                 ),
                 options,
                 |page: GhWorkflowJobsPage| page.jobs,
@@ -3603,7 +3893,19 @@ impl GithubPort for GithubClient {
     ) -> Result<u64, DomainError> {
         let prefixes = self.cache_prefixes(owner, Some(name), repo_ids);
         let prefixes: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-        self.cache.size(scope, tenant_id, &prefixes).await
+        let own = self.cache.size(scope, tenant_id, &prefixes).await?;
+        if tenant_id == SHARED_CACHE_PARTITION {
+            return Ok(own);
+        }
+        let shared = self
+            .cache
+            .size(
+                &AccessScope::for_tenant(SHARED_CACHE_PARTITION),
+                SHARED_CACHE_PARTITION,
+                &prefixes,
+            )
+            .await?;
+        Ok(own + shared)
     }
 
     async fn expire_cache(
@@ -3615,55 +3917,79 @@ impl GithubPort for GithubClient {
         self.cache.expire(scope, tenant_id, fetched_before).await
     }
 
-    async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError> {
+    fn reload_tokens(&self, tenant_id: uuid::Uuid) {
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&Some(tenant_id));
+    }
+
+    async fn rejects_token(&self, token: &SecretString) -> Result<bool, DomainError> {
+        let parsed = url::Url::parse(&self.api_base_url)
+            .map_err(|e| DomainError::internal(format!("invalid GitHub API base URL: {e}")))?;
+        refuse_cleartext(&self.api_base_url, &parsed)?;
         let url = format!("{}/rate_limit", self.api_base_url.trim_end_matches('/'));
-        let mut request = self
+        let answer = self
             .http
             .get(&url)
             .header("Accept", ACCEPT_JSON)
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION);
-        if let Some(token) = self.token.get().await? {
-            request = request.bearer_auth(token.expose());
-        }
-        let body: serde_json::Value = request
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .bearer_auth(token.expose())
             .send()
+            .await;
+        match answer {
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => Ok(true),
+            Ok(response) if response.status().is_success() => Ok(false),
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    "GitHub could not check a new token; it is added unchecked"
+                );
+                Ok(false)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "GitHub could not check a new token; it is added unchecked"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    async fn rate_limit(&self) -> Result<Vec<RateLimitQuota>, DomainError> {
+        self.rate_limit_pool(self.build_or_get_pool(None, &AccessScope::allow_all()).await?)
             .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| DomainError::internal(format!("GET /rate_limit failed: {e}")))?
-            .json()
+    }
+
+    async fn rate_limit_for_tenant(
+        &self,
+        tenant_id: uuid::Uuid,
+        scope: &AccessScope,
+    ) -> Result<Vec<RateLimitQuota>, DomainError> {
+        self.rate_limit_pool(self.build_or_get_pool(Some(tenant_id), scope).await?)
             .await
-            .map_err(|e| DomainError::internal(format!("GET /rate_limit decode failed: {e}")))?;
-        let resources = body
-            .get("resources")
-            .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| DomainError::internal("GET /rate_limit answered without resources"))?;
-        let mut quotas: Vec<RateLimitQuota> = resources
-            .iter()
-            .map(|(resource, pool)| RateLimitQuota {
-                resource: resource.clone(),
-                limit: pool
-                    .get("limit")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                remaining: pool
-                    .get("remaining")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                used: pool
-                    .get("used")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0),
-                reset_at: pool
-                    .get("reset")
-                    .and_then(serde_json::Value::as_i64)
-                    .and_then(|secs| Utc.timestamp_opt(secs, 0).single()),
-            })
-            .collect();
-        quotas.sort_by_key(|quota| match quota.resource.as_str() {
-            "core" => (0, String::new()),
-            "graphql" => (1, String::new()),
-            other => (2, other.to_owned()),
-        });
+    }
+}
+
+impl GithubClient {
+    async fn rate_limit_pool(
+        &self,
+        pool: Arc<TokenPool>,
+    ) -> Result<Vec<RateLimitQuota>, DomainError> {
+        let mut quotas = Vec::new();
+        let mut answered = false;
+        for pooled in pool.iter() {
+            if let Some(token_quotas) = self.token_rate_limit(pooled).await? {
+                answered = true;
+                quotas.extend(token_quotas);
+            }
+        }
+        if !answered {
+            return Err(DomainError::AccessLost(
+                "GitHub answered 401 Unauthorized to every token in the pool".to_owned(),
+            ));
+        }
         Ok(quotas)
     }
 }

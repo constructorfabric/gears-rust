@@ -13,11 +13,6 @@ use crate::infra::github::compression::Compression;
 pub struct GithubMirrorConfig {
     #[serde(default = "default_api_base_url")]
     pub api_base_url: String,
-    /// Where the GitHub token lives in the credential store; it is read once
-    /// at init. Without it the gear syncs unauthenticated, which works for
-    /// public repositories at a much lower rate limit.
-    #[serde(default)]
-    pub github_token_secret: Option<GithubTokenSecret>,
     /// What a sync collects when the request does not say (PRD §5.4): the
     /// type's default, which leaves timeline events off until a deployment or
     /// a request turns them on (PRD §5.2).
@@ -99,13 +94,6 @@ fn default_sync_deadline_minutes() -> NonZeroU64 {
     NonZeroU64::new(360).unwrap_or(NonZeroU64::MIN)
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GithubTokenSecret {
-    pub tenant_id: Uuid,
-    pub key: String,
-}
-
 impl GithubMirrorConfig {
     /// The configured GitHub API base URL, validated.
     ///
@@ -153,31 +141,7 @@ impl GithubMirrorConfig {
         }
         // A token would travel in cleartext over plain `http`. Loopback is
         // allowed so a local mock server still works without TLS.
-        if parsed.scheme() == "http" && self.github_token_secret.is_some() && !is_loopback(&parsed)
-        {
-            return Err(crate::domain::error::DomainError::Validation {
-                field: "api_base_url".to_owned(),
-                message: format!(
-                    concat!(
-                        "`{}` uses http, which would send the GitHub token in cleartext; ",
-                        "use https (or a loopback host for local testing)"
-                    ),
-                    crate::redact::redacted_word(&self.api_base_url)
-                ),
-            });
-        }
         Ok(self.api_base_url.clone())
-    }
-}
-
-/// Whether the URL points at this machine, where plain `http` carries no
-/// token over a network.
-fn is_loopback(url: &url::Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(host)) => host == "localhost" || host.ends_with(".localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
     }
 }
 
@@ -185,7 +149,6 @@ impl Default for GithubMirrorConfig {
     fn default() -> Self {
         Self {
             api_base_url: default_api_base_url(),
-            github_token_secret: None,
             scope: ScopeConfig::default(),
             cache_compression: Compression::default(),
             max_concurrent_syncs: default_max_concurrent_syncs(),

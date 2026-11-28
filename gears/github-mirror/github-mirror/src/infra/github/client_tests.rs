@@ -2,9 +2,12 @@ use std::time::{Duration, Instant};
 
 use tokio_util::sync::CancellationToken;
 
-use super::{GithubClient, MAX_BODY_BYTES, RateLimitHeaders, graphql_url, read_capped};
+use super::{GithubApi, GithubClient, MAX_BODY_BYTES, RateLimitHeaders, graphql_url, read_capped};
 use crate::domain::error::DomainError;
+use crate::domain::ports::github::{FetchOptions, ForceMode};
+use crate::domain::scope::ScopeConfig;
 use crate::domain::sync::SessionTelemetry;
+use toolkit_security::AccessScope;
 
 #[test]
 fn github_com_serves_graphql_beside_its_rest_root() {
@@ -64,11 +67,22 @@ async fn a_backoff_set_while_a_request_waits_for_its_permit_holds_that_request_b
     let client = GithubClient::new("https://api.github.com".to_owned(), None)
         .unwrap()
         .with_max_concurrent_requests(std::num::NonZeroUsize::MIN);
-    let telemetry = SessionTelemetry::default();
-    let cancel = CancellationToken::new();
+    let tenant_id = uuid::Uuid::new_v4();
+    let options = FetchOptions {
+        tenant_id,
+        access_scope: AccessScope::for_tenant(tenant_id),
+        scope: ScopeConfig::default(),
+        force: ForceMode::None,
+        since: None,
+        cancel: CancellationToken::new(),
+        telemetry: std::sync::Arc::new(SessionTelemetry::default()),
+        public_repo: std::sync::Arc::default(),
+        token_access: std::sync::Arc::default(),
+        max_concurrent_tasks: None,
+    };
     let held = client.permits.acquire().await.unwrap();
 
-    let admitted = client.admit(&telemetry, &cancel);
+    let admitted = client.admit(GithubApi::Rest, &options);
     tokio::pin!(admitted);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), &mut admitted)
@@ -81,7 +95,14 @@ async fn a_backoff_set_while_a_request_waits_for_its_permit_holds_that_request_b
         retry_after_secs: Some(1),
         ..RateLimitHeaders::default()
     };
-    client.controller.observe(&limited, 429, 1).await;
+    client
+        .build_or_get_pool(Some(options.tenant_id), &options.access_scope)
+        .await
+        .expect("the pool exists once admit has run")
+        .first()
+        .controller
+        .observe(&limited, 429, 1)
+        .await;
     let released = Instant::now();
     drop(held);
 

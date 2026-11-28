@@ -27,14 +27,14 @@ use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
 use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 
 use super::dto::{
-    ArtifactDto, ArtifactsPageDto, AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto,
-    CheckRunsPageDto, CommentDto, CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto,
-    CommitStatusDto, ContributorDto, DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto,
-    IssueReactionDto, IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto,
-    PullRequestFileDto, ReleaseDto, RepoDto, RepoSyncStatusDto, ResumeAcceptedDto,
-    ResumeFailureDto, ReviewCommentDto, ReviewDto, ReviewThreadDto, SyncAcceptedDto,
-    SyncSessionDto, TagDto, WorkflowDto, WorkflowJobDto, WorkflowJobsPageDto, WorkflowRunDto,
-    WorkflowRunsPageDto, WorkflowsPageDto,
+    ArtifactDto, ArtifactsPageDto, AuthenticatedUserDto, BranchDto, CacheClearedDto,
+    CheckRunDto, CheckRunsPageDto, CommentDto, CommitCommentDto, CommitDto, CommitFileDto,
+    CommitStatsDto, CommitStatusDto, ContributorDto, DeploymentDto, GithubMirrorHealthDto,
+    IssueDto, IssueEventDto, IssueReactionDto, IssueTimelineEventDto, LabelDto, MilestoneDto,
+    PullRequestDto, PullRequestFileDto, RateLimitDto, RateLimitQuotaDto, ReleaseDto, RepoDto,
+    RepoSyncStatusDto, ResumeAcceptedDto, ResumeFailureDto, ReviewCommentDto, ReviewDto,
+    ReviewThreadDto, SyncAcceptedDto, SyncSessionDto, TagDto, TokenBatchDto, TokenDto, TokensDto, WorkflowDto,
+    WorkflowJobDto, WorkflowJobsPageDto, WorkflowRunDto, WorkflowRunsPageDto, WorkflowsPageDto,
 };
 
 const DEFAULT_PER_PAGE: u64 = 30;
@@ -1127,6 +1127,86 @@ pub async fn get_sync_session(
 ) -> ApiResult<JsonBody<SyncSessionDto>> {
     let session = svc.get_session(&ctx, id).await?;
     Ok(Json(SyncSessionDto::from(session)))
+}
+
+/// The quota of every token in the pool, per GitHub rate-limit resource.
+pub async fn get_rate_limit(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+) -> ApiResult<JsonBody<RateLimitDto>> {
+    let quotas = svc.rate_limit(&ctx).await?;
+    Ok(Json(RateLimitDto {
+        quotas: quotas.into_iter().map(RateLimitQuotaDto::from).collect(),
+    }))
+}
+
+pub async fn list_tokens(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+) -> ApiResult<JsonBody<TokensDto>> {
+    let tokens = svc
+        .list_tokens(&ctx)
+        .await?
+        .into_iter()
+        .map(|record| TokenDto {
+            fingerprint: record.fingerprint,
+            scope_note: record.scope_note,
+        })
+        .collect();
+    Ok(Json(TokensDto { tokens }))
+}
+
+pub async fn add_tokens(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Json(body): Json<TokenBatchDto>,
+) -> ApiResult<JsonBody<TokensDto>> {
+    let tokens: Vec<_> = body
+        .tokens
+        .into_iter()
+        .map(|token| (token.token, token.scope_note))
+        .collect();
+    let tokens = svc
+        .add_tokens(&ctx, &tokens)
+        .await?
+        .into_iter()
+        .map(|record| TokenDto {
+            fingerprint: record.fingerprint,
+            scope_note: record.scope_note,
+        })
+        .collect();
+    Ok(Json(TokensDto { tokens }))
+}
+
+pub async fn replace_tokens(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Json(body): Json<TokenBatchDto>,
+) -> ApiResult<JsonBody<TokensDto>> {
+    let tokens: Vec<_> = body
+        .tokens
+        .into_iter()
+        .map(|token| (token.token, token.scope_note))
+        .collect();
+    let tokens = svc
+        .replace_tokens(&ctx, &tokens)
+        .await?
+        .into_iter()
+        .map(|record| TokenDto {
+            fingerprint: record.fingerprint,
+            scope_note: record.scope_note,
+        })
+        .collect();
+    Ok(Json(TokensDto { tokens }))
+}
+
+pub async fn remove_token(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path(fingerprint): Path<String>,
+) -> ApiResult<StatusCode> {
+    svc.remove_token(&ctx, &fingerprint).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// List the caller's sync sessions, with `OData` filtering and paging.
