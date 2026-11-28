@@ -18,6 +18,7 @@ const HARD_READS: &[(&str, &str)] = &[
     ("get", "/bss-pricing/v1/plan-revisions/checks"),
     ("get", "/bss-pricing/v1/plan-revisions/{id}/checks"),
     ("post", "/bss-pricing/v1/plan-revisions/{id}/items"),
+    ("put", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
     ("post", "/bss-pricing/v1/plan-revisions/{id}/submit"),
     ("post", "/bss-pricing/v1/approval-units/{id}/approve"),
     ("post", "/bss-pricing/v1/price-books/{id}/entries"),
@@ -74,7 +75,7 @@ async fn an_op_that_is_not_served_has_no_text_to_read() {
 async fn every_op_declares_its_503() {
     let api = served().await;
     let all = ops(&api);
-    assert_eq!(all.len(), 61, "the route census holds 61 ops");
+    assert_eq!(all.len(), 63, "the route census holds 63 ops");
     let missing: Vec<_> = all
         .iter()
         .filter(|(_, _, op)| {
@@ -484,4 +485,89 @@ fn required_of(schema: &Value) -> Vec<String> {
         take(part);
     }
     out
+}
+
+/// D-542 to D-545: `QUOTA_CATALOG_UNAVAILABLE` is named on exactly the ops that validate quota
+/// rules through Products (the PUT, both checks reads, the plan submit and the approve whose vote
+/// applies), and the texts name what the quota endpoints and the item delete refuse, and that the
+/// submit and the approve answer a Products refusal of the quota rules as Products gave it.
+#[tokio::test]
+async fn the_quota_texts_name_their_outage_and_refusals() {
+    let api = served().await;
+    let named: BTreeSet<(String, String)> = ops(&api)
+        .into_iter()
+        .filter(|(_, _, op)| {
+            op["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("QUOTA_CATALOG_UNAVAILABLE"))
+        })
+        .map(|(m, p, _)| (m, p))
+        .collect();
+    assert_eq!(
+        named,
+        set(&[
+            ("put", "/bss-pricing/v1/plan-revisions/{id}/quota-rules"),
+            ("get", "/bss-pricing/v1/plan-revisions/checks"),
+            ("get", "/bss-pricing/v1/plan-revisions/{id}/checks"),
+            ("post", "/bss-pricing/v1/plan-revisions/{id}/submit"),
+            ("post", "/bss-pricing/v1/approval-units/{id}/approve"),
+        ])
+    );
+    let put = description(
+        &api,
+        "put",
+        "/bss-pricing/v1/plan-revisions/{id}/quota-rules",
+    );
+    for said in [
+        "If-Match",
+        "Idempotency-Key",
+        "IDEMPOTENCY_CONFLICT",
+        "IDEMPOTENCY_KEY_IN_FLIGHT",
+        "REVISION_NOT_DRAFT",
+        "NOT_DRAFT_AUTHOR",
+        "STALE_REVISION",
+        "UNIT_CONTENDED",
+        "QUOTA_RULE_INVALID",
+        "QUOTA_DEFINITION_CHANGED",
+        "QUOTA_AMOUNT_INVALID",
+        "QUOTA_UNIT_INEXACT",
+        "QUOTA_SCOPE_UNSUPPORTED",
+        "QUOTA_RULE_DUPLICATE",
+        "QUOTA_SET_INCOMPATIBLE",
+        "REGISTRY_UNAVAILABLE",
+    ] {
+        assert!(put.contains(said), "the PUT names {said}: {put}");
+    }
+    let read = description(
+        &api,
+        "get",
+        "/bss-pricing/v1/plan-revisions/{id}/quota-rules",
+    );
+    assert!(
+        read.contains("ETag") && read.contains("asks Products nothing"),
+        "{read}"
+    );
+    for path in [
+        "/bss-pricing/v1/plan-revisions/checks",
+        "/bss-pricing/v1/plan-revisions/{id}/checks",
+    ] {
+        let text = description(&api, "get", path);
+        for said in ["revision_version", "quota_rules_digest", "quota_rule_id"] {
+            assert!(text.contains(said), "{path} names {said}: {text}");
+        }
+    }
+    let delete = description(&api, "delete", "/bss-pricing/v1/plan-items/{id}");
+    assert!(delete.contains("ITEM_HAS_QUOTA_RULES"), "{delete}");
+    let read = description(&api, "get", "/bss-pricing/v1/plan-revisions/{id}");
+    assert!(read.contains("quota_rules_digest"), "{read}");
+    for (method, path) in [
+        ("post", "/bss-pricing/v1/plan-revisions/{id}/submit"),
+        ("post", "/bss-pricing/v1/approval-units/{id}/approve"),
+    ] {
+        let text = description(&api, method, path);
+        assert!(
+            text.contains("as Products gave it") && text.contains("quota_definition"),
+            "{path} names a Products refusal of the quota rules: {text}"
+        );
+    }
 }

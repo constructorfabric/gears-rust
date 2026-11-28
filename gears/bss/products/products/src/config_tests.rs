@@ -233,3 +233,56 @@ fn a_zero_fence_ttl_is_refused_at_boot() {
         .expect_err("a zero fence TTL must be refused at boot");
     assert!(message.contains("fence_ttl_minutes"), "{message}");
 }
+
+/// The quota discovery's settings (P-D-268): 5000 ms per page, 50 records asked per page, at most
+/// 10 000 records per snapshot and 25 s for a whole read and the judging of its records by
+/// default, as the settings the intake reads. A zero timeout, a page size outside 1 to 200, a
+/// zero record bound or a zero deadline admits no discovery at all, so each is refused at boot,
+/// naming its field.
+#[test]
+fn the_quota_settings_default_and_refuse_out_of_range() {
+    let cfg = ProductsConfig::default();
+    assert_eq!(
+        (
+            cfg.quota_discovery_timeout_ms,
+            cfg.quota_discovery_page_size,
+            cfg.quota_discovery_max_items,
+            cfg.quota_discovery_deadline_ms
+        ),
+        (5_000, 50, 10_000, 25_000)
+    );
+    let settings = cfg.quota_settings();
+    assert_eq!(settings.timeout, std::time::Duration::from_millis(5_000));
+    assert_eq!(settings.deadline, std::time::Duration::from_secs(25));
+    assert_eq!((settings.page_size, settings.max_items), (50, 10_000));
+    assert!(cfg.validate().is_ok());
+    for (json, field) in [
+        (
+            r#"{"quota_discovery_timeout_ms": 0}"#,
+            "quota_discovery_timeout_ms",
+        ),
+        (
+            r#"{"quota_discovery_page_size": 0}"#,
+            "quota_discovery_page_size",
+        ),
+        (
+            r#"{"quota_discovery_page_size": 201}"#,
+            "quota_discovery_page_size",
+        ),
+        (
+            r#"{"quota_discovery_max_items": 0}"#,
+            "quota_discovery_max_items",
+        ),
+        (
+            r#"{"quota_discovery_deadline_ms": 0}"#,
+            "quota_discovery_deadline_ms",
+        ),
+    ] {
+        let cfg: ProductsConfig = serde_json::from_str(json).expect("a well-typed configuration");
+        let refusal = cfg.validate().expect_err("refused at boot");
+        assert!(refusal.contains(field), "{json}: {refusal}");
+    }
+    let cfg: ProductsConfig = serde_json::from_str(r#"{"quota_discovery_page_size": 200}"#)
+        .expect("a well-typed configuration");
+    assert!(cfg.validate().is_ok());
+}

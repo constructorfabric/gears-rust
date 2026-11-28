@@ -130,6 +130,29 @@ COLUMN bss.pricing_plan_item tenant_id uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_item treatment text NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_item updated_at timestamp with time zone NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_item version bigint NOT NULL DEFAULT 1
+COLUMN bss.pricing_plan_quota_rule amount text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule availability_json text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule basis text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule created_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule definition_digest text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule definition_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule definition_version text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule dimension_value text NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule evidence_json text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule item_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule logical_binding_key text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule revision_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule rule_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule scope_selection_json text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule subject_selector text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_rule unit_ref text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_set quota_rules_digest text NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_set revision_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_set rule_count integer NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_set tenant_id uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_set updated_at timestamp with time zone NOT NULL DEFAULT -
+COLUMN bss.pricing_plan_quota_set updated_by uuid NOT NULL DEFAULT -
 COLUMN bss.pricing_plan_revision approved_by_unit_id uuid NULL DEFAULT -
 COLUMN bss.pricing_plan_revision available_from date NULL DEFAULT -
 COLUMN bss.pricing_plan_revision book_id uuid NOT NULL DEFAULT -
@@ -343,6 +366,19 @@ CONSTRAINT bss.pricing_plan_item pricing_plan_item_pkey PRIMARY KEY (id)
 CONSTRAINT bss.pricing_plan_item pricing_plan_item_price_book_entry_id_fkey FOREIGN KEY (price_book_entry_id) REFERENCES bss.pricing_price_book_entry(id)
 CONSTRAINT bss.pricing_plan_item pricing_plan_item_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES bss.pricing_plan_revision(id)
 CONSTRAINT bss.pricing_plan_item pricing_plan_item_sku UNIQUE (revision_id, sku_id)
+CONSTRAINT bss.pricing_plan_quota_rule chk_pricing_plan_quota_rule_amount CHECK (((length(amount) >= 1) AND (length(amount) <= 39)))
+CONSTRAINT bss.pricing_plan_quota_rule chk_pricing_plan_quota_rule_basis CHECK ((basis = ANY (ARRAY['fixed'::text, 'per_plan_unit'::text])))
+CONSTRAINT bss.pricing_plan_quota_rule chk_pricing_plan_quota_rule_digest CHECK ((length(definition_digest) = 64))
+CONSTRAINT bss.pricing_plan_quota_rule chk_pricing_plan_quota_rule_key CHECK (((length(logical_binding_key) >= 1) AND (length(logical_binding_key) <= 64)))
+CONSTRAINT bss.pricing_plan_quota_rule chk_pricing_plan_quota_rule_subject CHECK ((subject_selector = 'resource_owner'::text))
+CONSTRAINT bss.pricing_plan_quota_rule chk_pricing_plan_quota_rule_version CHECK (((length(definition_version) >= 1) AND (length(definition_version) <= 20)))
+CONSTRAINT bss.pricing_plan_quota_rule pricing_plan_quota_rule_item_id_fkey FOREIGN KEY (item_id) REFERENCES bss.pricing_plan_item(id)
+CONSTRAINT bss.pricing_plan_quota_rule pricing_plan_quota_rule_pkey PRIMARY KEY (revision_id, rule_id)
+CONSTRAINT bss.pricing_plan_quota_rule pricing_plan_quota_rule_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES bss.pricing_plan_revision(id)
+CONSTRAINT bss.pricing_plan_quota_set chk_pricing_plan_quota_set_count CHECK (((rule_count >= 1) AND (rule_count <= 200)))
+CONSTRAINT bss.pricing_plan_quota_set chk_pricing_plan_quota_set_digest CHECK ((length(quota_rules_digest) = 64))
+CONSTRAINT bss.pricing_plan_quota_set pricing_plan_quota_set_pkey PRIMARY KEY (revision_id)
+CONSTRAINT bss.pricing_plan_quota_set pricing_plan_quota_set_revision_id_fkey FOREIGN KEY (revision_id) REFERENCES bss.pricing_plan_revision(id)
 CONSTRAINT bss.pricing_plan_revision chk_pricing_plan_revision_state CHECK ((state = ANY (ARRAY['draft'::text, 'pending'::text, 'scheduled'::text, 'published'::text, 'superseded'::text])))
 CONSTRAINT bss.pricing_plan_revision pricing_plan_revision_approved_by_unit_id_fkey FOREIGN KEY (approved_by_unit_id) REFERENCES bss.pricing_approval_unit(id)
 CONSTRAINT bss.pricing_plan_revision pricing_plan_revision_book_id_fkey FOREIGN KEY (book_id) REFERENCES bss.pricing_price_book(id)
@@ -437,6 +473,9 @@ INDEX bss pricing_plan_code CREATE UNIQUE INDEX pricing_plan_code ON bss.pricing
 INDEX bss pricing_plan_item_pkey CREATE UNIQUE INDEX pricing_plan_item_pkey ON bss.pricing_plan_item USING btree (id)
 INDEX bss pricing_plan_item_sku CREATE UNIQUE INDEX pricing_plan_item_sku ON bss.pricing_plan_item USING btree (revision_id, sku_id)
 INDEX bss pricing_plan_pkey CREATE UNIQUE INDEX pricing_plan_pkey ON bss.pricing_plan USING btree (id)
+INDEX bss pricing_plan_quota_rule_item CREATE INDEX pricing_plan_quota_rule_item ON bss.pricing_plan_quota_rule USING btree (item_id)
+INDEX bss pricing_plan_quota_rule_pkey CREATE UNIQUE INDEX pricing_plan_quota_rule_pkey ON bss.pricing_plan_quota_rule USING btree (revision_id, rule_id)
+INDEX bss pricing_plan_quota_set_pkey CREATE UNIQUE INDEX pricing_plan_quota_set_pkey ON bss.pricing_plan_quota_set USING btree (revision_id)
 INDEX bss pricing_plan_revision_no CREATE UNIQUE INDEX pricing_plan_revision_no ON bss.pricing_plan_revision USING btree (plan_id, rev_no)
 INDEX bss pricing_plan_revision_open CREATE UNIQUE INDEX pricing_plan_revision_open ON bss.pricing_plan_revision USING btree (plan_id) WHERE (state = ANY (ARRAY['draft'::text, 'pending'::text]))
 INDEX bss pricing_plan_revision_pkey CREATE UNIQUE INDEX pricing_plan_revision_pkey ON bss.pricing_plan_revision USING btree (id)

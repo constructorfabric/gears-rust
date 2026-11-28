@@ -73,6 +73,9 @@ and a reference barrier that cannot race SKU retirement (spec §1, §2 decisions
 | Eligibility | all reprices renewals; new stops a renewal walking the chain. |
 | Reservation | Products-owned reference receipt protecting SKU lifecycle and type. |
 | Migration | Approved request to change subscription structure or pins, executed by Subscriptions. |
+| Quota rule | An allocation limit on a plan revision: one exact Products quota definition version, an amount in an allowed unit, a basis (`fixed` or `per_plan_unit`) and a logical binding, for one item of the revision; never a price (D-540, D-541). |
+| Logical binding | A stable service or resource slot within a plan (`logical_binding_key`). The rules of one binding target one eventual assignment scope, and at most one rule per binding and metric applies to a sale (D-542). |
+| Quota digest | `quota_rules_digest` covers a revision's whole rule set; `selected_quota_digest` the rules a sale selects, with their evidence; `quota_snapshot_digest` also each selected rule's final limit and availability revision, the original quantity and the purchase (D-541, D-547, D-548). |
 
 ## 2. Actors
 
@@ -141,6 +144,8 @@ prices approval, reference reservations, export, settings and core events. Phase
 the owner defers promotions (D-409), migration requests and retirement (D-410), and the sold-as bundle and grants
 (D-411). Phase 4: resolve, durable price reads and golden
 consumer contracts; quote is not built (D-415).
+The quotas programme adds allocation quota rules on plan revisions (D-540): their authoring, checks and governance,
+and their terms in the preview and in the accepted receipt.
 
 ### 4.2 Out of Scope
 
@@ -389,6 +394,23 @@ Persist PricesPublished and ApprovalUnitDecided with state and audit in the tool
 
 A plan has immutable published revisions; each revision binds one book and contains items, availability, minimal Grants and optional sold-as bundle SKU; an item is a SKU and its entry in the plan's book, with no treatment, included quantity or minimum quantity (D-467). Enforce an entry for every item (ITEM_ENTRY_MISSING), one recurring frequency (FREQUENCY_MIXED), no duplicate usage meter (METER_DUPLICATE), no bundle item, no deprecated SKU newly added, while one carried over from the same plan's published revision stays, and one that revision carries may be added again (ITEM_SKU_DEPRECATED, D-408, D-465), and entries only from its book (ITEM_BOOK_FOREIGN). Sale-date coverage is per dimension value with an open tail or default (ITEM_UNCOVERED); book validity is PLAN_BOOK_VALIDITY. Checks compute blocked_by pending price units, and each check row names the items that turn it red and the pending prices behind blocked_by (D-466). A new plan's code, on create and on clone, is 1 to 32 characters of A-Z, 0-9, - and _, starting with a letter or a digit, judged as sent with no trim or case folding (PLAN_CODE_INVALID); a code stored before the rule keeps reading and is never judged again (D-468). Clone produces a draft; retirement requires migration. An approved revision whose sale date is after the day of its approval is scheduled: it takes effect on that date, and until then the plan keeps selling its published revision (D-446, D-449, D-450). Grants and the sold-as bundle SKU are deferred (D-411), and so is retirement (D-410).
 
+#### `fr-plan-quota-rules`
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-pricing-fr-plan-quota-rules`
+
+**Phase:** quotas programme. **Source:** quotas package feature 2 (`cpt-cf-bss-quotas-feature-plan-rules`,
+`cpt-cf-bss-quotas-fr-plan-rules`, `-fr-plan-amount`, `-fr-plan-absence`, `-fr-plan-revision`,
+`-fr-charging-separation`, `-fr-plan-edit`, `-fr-plan-edit-conflict`, `-fr-plan-governance`,
+`-fr-qualification-recheck`); D-540 … D-548.
+
+A draft revision carries allocation quota rules that select exact Products definition versions, separate from its
+prices. The author replaces the complete collection at once under the revision's ETag and an idempotency key,
+through the REST endpoints or the SDK's `PricingQuotaAuthoringClientV1`, which answer the same request identically;
+an invalid set changes nothing and names every failing rule and field. Products validates the set outside the
+transaction. Checks, submit, approval, copy and clone carry and recheck the rules. The preview carries the selected
+quota terms with a digest; an acceptance freezes them with the price terms, and a quota-bearing plan cannot be
+bought without the expected digest.
+
 #### `fr-promotions`
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-pricing-fr-promotions`
@@ -436,7 +458,7 @@ the dated unit, entry and requested dimension, policy projection and complete in
 
 **Phase:** 4, not built (D-415). **Source:** spec §2.2, §5–§7, §12–§13; phase 2 plan for delivery details.
 
-Not built (D-415): the owner dropped quote and the Studio wiring; consumers read resolve and GET /bss-pricing/v1/prices/{id}, and Rating owns the minimum-fee floor arithmetic. GET /pricing/v1/quote is the Studio preview with quantities, returning totals (since D-467 no plan item is optional or carries an included quantity). Apply price selection, half-open tiers, per-price prorated min_fee and promotions in that order. Recurring slices prorate by calendar days; usage readings use their timestamps and counters restart per slice. Quote is separate from the consumer resolve contract.
+Not built (D-415): the owner dropped quote and the Studio wiring; consumers read resolve and GET /bss-pricing/v1/prices/{id}, and Rating owns the minimum-fee floor arithmetic. GET /pricing/v1/quote is the Studio preview with quantities, returning totals (since D-467 no plan item is optional or carries an included quantity). Apply price selection, half-open tiers, per-price prorated min_fee and promotions in that order. Recurring slices prorate by covered UTC seconds over the billing period's UTC seconds, and Rating computes that proration (D-388, D-415); usage readings use their timestamps and counters restart per slice. Quote is separate from the consumer resolve contract.
 
 ## 6. Non-Functional Requirements
 
@@ -505,6 +527,14 @@ the entry's next price beside its price in force (D-472), and a book's entries l
 (D-473).
 Every price decimal is exact text within published limits, and each price, binding and receipt carries its
 currency spec (D-527 to D-533).
+The quotas programme adds the plan quota rules (D-540 to D-548): `GET` and `PUT /plan-revisions/{id}/quota-rules`
+under the revision's ETag, the PUT with `If-Match` and `Idempotency-Key`; the revision read's `quota_rules` and
+`quota_rules_digest`; the checks' `revision_version` and `quota_rules_digest`, nine quota rows and each subject's
+`quota_rule_id` and `field`; and 409 `ITEM_HAS_QUOTA_RULES` on an item delete. The SDK adds
+`PricingQuotaAuthoringClientV1` (`get_quota_rules`, `replace_quota_rules` and `check_plan_revision`, answering as the
+GET, the PUT and the revision checks do, D-540), and `ResolvedBindings.quota_terms`,
+`NewSaleQuery.expected_quota_digest` and `AcceptanceReceipt.quota`, each `None` for a plan without rules (D-547,
+D-548).
 The frozen consumer contract is named `/pricing/v1/resolve` and `/pricing/v1/prices/{id}` in spec §7.1;
 phase 4 must explicitly wire that public surface. Wire fields and query parameters are snake_case.
 Doors use headers + Bytes and preconditions::parse_body with correlation::establish on mutations. Errors expose
@@ -647,6 +677,10 @@ earlier pins retain the original GL. Pricing creates no refreeze prices or appro
 | AC #23 | `cpt-cf-bss-pricing-nfr-tenant-isolation` | Given two tenants with the same book code or replay key, when they act then each remains independent; using the other tenant's price or unit id cannot read or mutate it. |
 | AC #24 | `cpt-cf-bss-pricing-nfr-two-backends` | Given two writers approving intersecting chains on either backend, when they race then approved windows stay nonoverlapping; a losing conditional unit write is UNIT_CONTENDED rather than a second apply. |
 | AC #25 | `cpt-cf-bss-pricing-nfr-idempotency-concurrency` | Given a successful keyed POST, when the same body repeats then the saved response returns without a second object/unit; a changed payload conflicts, stale If-Match preserves state, and concurrent claims cannot both mutate. |
+| AC #26 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a draft with two items, when its author puts a complete set of rules then the set, its digest and a new ETag are saved together; a second put with the old ETag is STALE_REVISION, the same key and body replay the first answer, the same key with another body is IDEMPOTENCY_CONFLICT, an empty array clears the set, and a set with a foreign item, a fractional amount or two rules for one binding and metric changes nothing and names each rule and field. |
+| AC #27 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a revision with rules, when its checks run then each failing rule is a red quota row naming the rule and field, and each sellable cell that no rule of a metric covers is a red `QUOTA_RULE_MISSING` line naming its item, with the evaluated revision version and digest; submit refuses red quota rows, and an apply refuses a definition withdrawn after submit; deleting an item with rules is ITEM_HAS_QUOTA_RULES. |
+| AC #28 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a published revision with rules, when it is copied or its plan cloned then the draft's rules keep their definitions and point at the copied items; the published revision keeps reading its rules after its definition is withdrawn. |
+| AC #29 | `cpt-cf-bss-pricing-fr-plan-quota-rules` | Given a published revision with 10 vCPU per plan unit, when a buyer accepts two units with the preview's quota digest then the receipt freezes the rule, its evidence, quantity 2 and both digests; a stale or missing digest is RESOLUTION_CHANGED even when no price changed. |
 
 ## 10. Dependencies
 
@@ -678,6 +712,10 @@ remain later decisions, not implicit requirements of this rewrite.
 Content authority: spec §2 decisions 4–7, 13–17, §2.2, §3 A–C, §5–§8 and §12–§13.
 [DESIGN](DESIGN.md) supplies the drivers and transactions; ADRs record four structural decisions;
 [DECISIONS](DECISIONS.md) records D-384 onward. Slices and FEATUREs carry phase-specific implementation obligations.
+
+The quotas programme's requirement `cpt-cf-bss-pricing-fr-plan-quota-rules` traces to the quotas package's feature 2
+(`cpt-cf-bss-quotas-feature-plan-rules`) and to D-540 … D-548; AC #26 … AC #29 verify it, slice 08 designs it, and
+the plan quota rules feature implements it.
 
 D-509 supplies reusable executable Pricing provider fixtures for F07/F22/F31 and the Pricing-input
 portions of F02/F23/F24 in `pricing/tests/seam_fixtures`. Each schema-1 envelope has explicit given and

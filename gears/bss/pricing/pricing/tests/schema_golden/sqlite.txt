@@ -58,6 +58,9 @@ INDEX pricing_hold_acceptance
 INDEX pricing_plan_code
   ON pricing_plan
   DDL CREATE UNIQUE INDEX pricing_plan_code ON pricing_plan (tenant_id, code)
+INDEX pricing_plan_quota_rule_item
+  ON pricing_plan_quota_rule
+  DDL CREATE INDEX pricing_plan_quota_rule_item ON pricing_plan_quota_rule (item_id)
 INDEX pricing_plan_revision_open
   ON pricing_plan_revision
   DDL CREATE UNIQUE INDEX pricing_plan_revision_open ON pricing_plan_revision (plan_id) WHERE state IN ('draft','pending')
@@ -335,6 +338,42 @@ TABLE pricing_plan_item
   CONSTRAINT chk_pricing_plan_item_treatment CHECK (treatment IN ('paid','optional','included'))
   CONSTRAINT pricing_plan_item_sku UNIQUE (revision_id, sku_id)
   FK price_book_entry_id -> pricing_price_book_entry.id
+  FK revision_id -> pricing_plan_revision.id
+TABLE pricing_plan_quota_rule
+  COLUMN amount TEXT NOT NULL DEFAULT - PK 0
+  COLUMN availability_json TEXT NOT NULL DEFAULT - PK 0
+  COLUMN basis TEXT NOT NULL DEFAULT - PK 0
+  COLUMN created_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN definition_digest TEXT NOT NULL DEFAULT - PK 0
+  COLUMN definition_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN definition_version TEXT NOT NULL DEFAULT - PK 0
+  COLUMN dimension_value TEXT NULL DEFAULT - PK 0
+  COLUMN evidence_json TEXT NOT NULL DEFAULT - PK 0
+  COLUMN item_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN logical_binding_key TEXT NOT NULL DEFAULT - PK 0
+  COLUMN revision_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN rule_id TEXT NOT NULL DEFAULT - PK 2
+  COLUMN scope_selection_json TEXT NOT NULL DEFAULT - PK 0
+  COLUMN subject_selector TEXT NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN unit_ref TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_plan_quota_rule_amount CHECK (length(amount) BETWEEN 1 AND 39)
+  CONSTRAINT chk_pricing_plan_quota_rule_basis CHECK (basis IN ('fixed','per_plan_unit'))
+  CONSTRAINT chk_pricing_plan_quota_rule_digest CHECK (length(definition_digest) = 64)
+  CONSTRAINT chk_pricing_plan_quota_rule_key CHECK (length(logical_binding_key) BETWEEN 1 AND 64)
+  CONSTRAINT chk_pricing_plan_quota_rule_subject CHECK (subject_selector = 'resource_owner')
+  CONSTRAINT chk_pricing_plan_quota_rule_version CHECK (length(definition_version) BETWEEN 1 AND 20)
+  FK item_id -> pricing_plan_item.id
+  FK revision_id -> pricing_plan_revision.id
+TABLE pricing_plan_quota_set
+  COLUMN quota_rules_digest TEXT NOT NULL DEFAULT - PK 0
+  COLUMN revision_id TEXT NOT NULL DEFAULT - PK 1
+  COLUMN rule_count INTEGER NOT NULL DEFAULT - PK 0
+  COLUMN tenant_id TEXT NOT NULL DEFAULT - PK 0
+  COLUMN updated_at TEXT NOT NULL DEFAULT - PK 0
+  COLUMN updated_by TEXT NOT NULL DEFAULT - PK 0
+  CONSTRAINT chk_pricing_plan_quota_set_count CHECK (rule_count BETWEEN 1 AND 200)
+  CONSTRAINT chk_pricing_plan_quota_set_digest CHECK (length(quota_rules_digest) = 64)
   FK revision_id -> pricing_plan_revision.id
 TABLE pricing_plan_revision
   COLUMN approved_by_unit_id TEXT NULL DEFAULT - PK 0

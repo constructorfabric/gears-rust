@@ -11,6 +11,10 @@ struct CategoryResource;
 struct ApprovalUnitResource;
 #[resource_error(gts_id!("cf.bss.products.derived_usage_type.v1~"))]
 struct DerivedUsageTypeResource;
+#[resource_error(gts_id!("cf.bss.products.quota_definition.v1~"))]
+struct QuotaDefinitionResource;
+#[resource_error(gts_id!("cf.bss.products.quota_adapter_target.v1~"))]
+struct QuotaAdapterTargetResource;
 
 /// The resource a refusal names (RS-25): one of the gear's registered authz labels
 /// (`crate::authz::labels`), picked from what the refusal carries. Every refusal used to name
@@ -21,6 +25,8 @@ enum Refused {
     Category,
     ApprovalUnit,
     DerivedUsageType,
+    QuotaDefinition,
+    QuotaAdapterTarget,
 }
 
 /// Build `$method($args)` on the resource `$resource` names; every arm has one builder type.
@@ -31,6 +37,8 @@ macro_rules! on {
             Refused::Category => CategoryResource::$method($($arg),*),
             Refused::ApprovalUnit => ApprovalUnitResource::$method($($arg),*),
             Refused::DerivedUsageType => DerivedUsageTypeResource::$method($($arg),*),
+            Refused::QuotaDefinition => QuotaDefinitionResource::$method($($arg),*),
+            Refused::QuotaAdapterTarget => QuotaAdapterTargetResource::$method($($arg),*),
         }
     };
 }
@@ -39,9 +47,14 @@ impl Refused {
     /// A missing row names its kind (`what`); a reference is a SKU's. An approval refusal and a
     /// stale unit refuse the unit, a `CATEGORY_` code the category, and a `DERIVED_` code of the
     /// derived doors the derived usage type (P-D-231). The binding's `DERIVED_` codes refuse a
-    /// SKU's write, so they name the SKU (P-D-232). Every other refusal is a write or a read of a
-    /// SKU, the registry's own resource.
+    /// SKU's write, so they name the SKU (P-D-232). A quota row's miss names its quota resource
+    /// ([`Self::of_quota`], P-D-273); every other quota refusal is answered by its endpoint
+    /// ([`quota_refusal`]). Every other refusal is a write or a read of a SKU, the registry's own
+    /// resource.
     fn of(err: &DomainError) -> Self {
+        if let Some(quota) = Self::of_quota(err) {
+            return quota;
+        }
         match err {
             DomainError::NotFound {
                 what: "derived_usage_type",
@@ -75,6 +88,25 @@ impl Refused {
                 Self::Category
             }
             _ => Self::Sku,
+        }
+    }
+}
+
+impl Refused {
+    /// The quota row a miss names (P-D-273): a target's the adapter target, a candidate's or a
+    /// definition's the quota definition; `None` for every other refusal. A quota code names no
+    /// resource here: the quota endpoint that refuses it decides ([`quota_refusal`]).
+    fn of_quota(err: &DomainError) -> Option<Self> {
+        match err {
+            DomainError::NotFound {
+                what: "quota_adapter_target",
+                ..
+            } => Some(Self::QuotaAdapterTarget),
+            DomainError::NotFound {
+                what: "quota_candidate" | "quota_definition",
+                ..
+            } => Some(Self::QuotaDefinition),
+            _ => None,
         }
     }
 }
@@ -118,6 +150,10 @@ pub(crate) fn permission_denied(label: &str, reason: String) -> CanonicalError {
         Refused::ApprovalUnit
     } else if label == labels::DERIVED_USAGE_TYPE {
         Refused::DerivedUsageType
+    } else if label == labels::QUOTA_DEFINITION {
+        Refused::QuotaDefinition
+    } else if label == labels::QUOTA_ADAPTER_TARGET {
+        Refused::QuotaAdapterTarget
     } else {
         Refused::Sku
     };
@@ -191,77 +227,122 @@ fn validation(resource: Refused, report: &ValidationReport) -> CanonicalError {
     builder.create()
 }
 
+/// The quota resource a quota endpoint answers its refusals on (P-D-273).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuotaResource {
+    /// The adapter target endpoints and the discovery.
+    AdapterTarget,
+    /// The candidate, review and definition endpoints.
+    Definition,
+}
+
+impl From<QuotaResource> for Refused {
+    fn from(resource: QuotaResource) -> Self {
+        match resource {
+            QuotaResource::AdapterTarget => Self::QuotaAdapterTarget,
+            QuotaResource::Definition => Self::QuotaDefinition,
+        }
+    }
+}
+
+/// `err` as a quota endpoint answers it (P-D-273): the endpoint decides the resource, not the
+/// code, so a generic refusal (`VALIDATION`, `FIELD_TOO_LONG`, `CONTENDED`, a key's refusal, a
+/// stale revision) names the endpoint's quota resource and never the SKU. A miss names the quota
+/// row that is missing.
+pub(crate) fn quota_refusal(err: DomainError, resource: QuotaResource) -> CanonicalError {
+    let named = match &err {
+        DomainError::NotFound { .. } => Refused::of_quota(&err).unwrap_or(resource.into()),
+        _ => resource.into(),
+    };
+    canonical(err, named)
+}
+
+/// A stored quota row that does not read (P-D-274): a data-loss 500 on the endpoint's quota
+/// resource, whose wire detail is the fixed `detail`.
+pub(crate) fn quota_data_loss(resource: QuotaResource, detail: &str) -> CanonicalError {
+    on!(Refused::from(resource), data_loss(detail))
+        .with_resource("quota catalog")
+        .create()
+}
+
 impl From<DomainError> for CanonicalError {
     fn from(err: DomainError) -> Self {
-        use DomainError as D;
         let resource = Refused::of(&err);
-        match err {
-            D::Conflict { code, detail } => aborted(resource, detail, code),
-            D::Forbidden { code, .. } => denied(resource, code),
-            D::NotFound { what, id } => on!(resource, not_found(format!("{what} {id}")))
-                .with_resource(id.to_string())
-                .create(),
-            D::StaleUnit { generation } => precondition(
-                resource,
-                "unit",
-                &format!("the unit was refreshed; review generation {generation}"),
-                "UNIT_STALE",
-            ),
-            // InvalidSubmit and ApplyRefused enter through Validation/Conflict
-            // so their static subject-specific codes and fields survive intact.
-            // Database errors are mapped only after the transaction retry loop.
-            D::Approval(r) => match r.code {
-                "SOD_VIOLATION" | "NOT_SUBMITTER" => denied(resource, r.code),
-                "NOTE_REQUIRED" => {
-                    precondition(resource, "note", "a reject needs a note", "NOTE_REQUIRED")
-                }
-                "NOTE_TOO_LONG" => precondition(resource, "note", &r.detail, "NOTE_TOO_LONG"),
-                "VALIDATION" => precondition(resource, "items", &r.detail, "VALIDATION"),
-                "GENERATION_MISMATCH" => {
-                    precondition(resource, "generation", &r.detail, "GENERATION_MISMATCH")
-                }
-                // The cause stays in the log, never on the wire (RS-01): an outbox enqueue, a
-                // repository failure the store wrapped, a unit row that does not read.
-                "DB" | "STORE" => {
-                    tracing::error!(
-                        code = r.code,
-                        detail = %r.detail,
-                        "bss-products: approval store failure"
-                    );
-                    CanonicalError::internal(format!("products: approval store: {}", r.detail))
-                        .create()
-                }
-                other => aborted(resource, r.detail, other),
-            },
-            D::Validation(report) => validation(resource, &report),
-            D::StaleRevision { expected, found } => aborted(
-                resource,
-                format!("expected {expected}, found {found}"),
-                "STALE_REVISION",
-            ),
-            D::IdempotencyConflict(detail) => aborted(resource, detail, "IDEMPOTENCY_CONFLICT"),
-            D::IdempotencyKeyInFlight(detail) => {
-                aborted(resource, detail, "IDEMPOTENCY_KEY_IN_FLIGHT")
+        canonical(err, resource)
+    }
+}
+
+/// `err` on the resource it refuses.
+fn canonical(err: DomainError, resource: Refused) -> CanonicalError {
+    use DomainError as D;
+    match err {
+        D::Conflict { code, detail } => aborted(resource, detail, code),
+        D::Forbidden { code, .. } => denied(resource, code),
+        D::NotFound { what, id } => on!(resource, not_found(format!("{what} {id}")))
+            .with_resource(id.to_string())
+            .create(),
+        D::StaleUnit { generation } => precondition(
+            resource,
+            "unit",
+            &format!("the unit was refreshed; review generation {generation}"),
+            "UNIT_STALE",
+        ),
+        // InvalidSubmit and ApplyRefused enter through Validation/Conflict
+        // so their static subject-specific codes and fields survive intact.
+        // Database errors are mapped only after the transaction retry loop.
+        D::Approval(r) => match r.code {
+            "SOD_VIOLATION" | "NOT_SUBMITTER" => denied(resource, r.code),
+            "NOTE_REQUIRED" => {
+                precondition(resource, "note", "a reject needs a note", "NOTE_REQUIRED")
             }
-            D::AuditUnavailable(detail) => unavailable("audit_log", &detail, None),
-            D::UsageTypeUnresolved(detail) => {
-                precondition(resource, "usage_type_ref", &detail, "USAGE_TYPE_UNRESOLVED")
+            "NOTE_TOO_LONG" => precondition(resource, "note", &r.detail, "NOTE_TOO_LONG"),
+            "VALIDATION" => precondition(resource, "items", &r.detail, "VALIDATION"),
+            "GENERATION_MISMATCH" => {
+                precondition(resource, "generation", &r.detail, "GENERATION_MISMATCH")
             }
-            D::UsageTypeUnavailable(detail) => unavailable(
-                "usage_type_catalog",
-                &detail,
-                Some("USAGE_TYPE_UNAVAILABLE"),
-            ),
-            D::UsageTypeForbidden(detail) => catalog_denied(&detail),
-            D::UsageUnavailable(detail) => {
-                unavailable("sku_usage_port", &detail, Some("USAGE_UNAVAILABLE"))
+            // The cause stays in the log, never on the wire (RS-01): an outbox enqueue, a
+            // repository failure the store wrapped, a unit row that does not read.
+            "DB" | "STORE" => {
+                tracing::error!(
+                    code = r.code,
+                    detail = %r.detail,
+                    "bss-products: approval store failure"
+                );
+                CanonicalError::internal(format!("products: approval store: {}", r.detail)).create()
             }
-            D::UnrecognizedUnit(detail) => {
-                precondition(resource, "meter", &detail, "UNRECOGNIZED_UNIT")
-            }
-            D::MeterDeclarationIncomplete(detail) => {
-                precondition(resource, "meter", &detail, "METER_DECLARATION_INCOMPLETE")
-            }
+            other => aborted(resource, r.detail, other),
+        },
+        D::Validation(report) => validation(resource, &report),
+        D::StaleRevision { expected, found } => aborted(
+            resource,
+            format!("expected {expected}, found {found}"),
+            "STALE_REVISION",
+        ),
+        D::IdempotencyConflict(detail) => aborted(resource, detail, "IDEMPOTENCY_CONFLICT"),
+        D::IdempotencyKeyInFlight(detail) => aborted(resource, detail, "IDEMPOTENCY_KEY_IN_FLIGHT"),
+        D::AuditUnavailable(detail) => unavailable("audit_log", &detail, None),
+        D::UsageTypeUnresolved(detail) => {
+            precondition(resource, "usage_type_ref", &detail, "USAGE_TYPE_UNRESOLVED")
+        }
+        D::UsageTypeUnavailable(detail) => unavailable(
+            "usage_type_catalog",
+            &detail,
+            Some("USAGE_TYPE_UNAVAILABLE"),
+        ),
+        D::UsageTypeForbidden(detail) => catalog_denied(&detail),
+        D::UsageUnavailable(detail) => {
+            unavailable("sku_usage_port", &detail, Some("USAGE_UNAVAILABLE"))
+        }
+        D::UnrecognizedUnit(detail) => {
+            precondition(resource, "meter", &detail, "UNRECOGNIZED_UNIT")
+        }
+        D::MeterDeclarationIncomplete(detail) => {
+            precondition(resource, "meter", &detail, "METER_DECLARATION_INCOMPLETE")
+        }
+        D::QuotaUnavailable { code, detail } => unavailable("quota", &detail, Some(code)),
+        // No adapter is built for the plugin instance: the capability is absent, not down.
+        D::QuotaClosed { code, detail } => {
+            on!(resource, unimplemented(format!("{code}: {detail}"))).create()
         }
     }
 }

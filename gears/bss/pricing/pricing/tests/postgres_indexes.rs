@@ -65,6 +65,8 @@ const DESIGN_INDEXES: &[(&str, &str)] = &[
         "(plan_id) WHERE (state = 'scheduled'::text)",
     ),
     ("pricing_plan_item_sku", "(revision_id, sku_id)"),
+    // D-546 (m20261121_000024): the item delete's check reads the rules of one item.
+    ("pricing_plan_quota_rule_item", "(item_id)"),
 ];
 /// The unique keys DESIGN §3.7 declares, inline or as a partial unique index, by the columns (and
 /// the predicate) they cover.

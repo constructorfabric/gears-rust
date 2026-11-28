@@ -276,6 +276,35 @@ pub async fn update_draft(
     matched(result.rows_affected, "STALE_REVISION")?;
     super::plan_summary::refresh(runner, scope, m.tenant_id, m.plan_id).await
 }
+/// Move an unlocked draft to its next version at the version the caller read (a quota rule write,
+/// D-543); answers the new version. The revision's `updated_at` moves with it, so the plan's
+/// summary is refreshed: its last activity reads the revisions' `updated_at` (D-484).
+/// # Errors
+/// `STALE_REVISION` for a lost version, a locked or a non-draft revision.
+pub async fn bump_draft(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    tenant: Uuid,
+    id: Uuid,
+    version: i64,
+    now: time::OffsetDateTime,
+) -> Result<i64, RepoError> {
+    let next = version.checked_add(1).ok_or(RepoError::Conflict {
+        code: "STALE_REVISION",
+    })?;
+    let result = e::Entity::update_many()
+        .secure()
+        .scope_with(scope)
+        .col_expr(e::Column::UpdatedAt, Expr::value(now))
+        .col_expr(e::Column::Version, Expr::col(e::Column::Version).add(1_i64))
+        .filter(unlocked_draft(tenant, id, version))
+        .exec(runner)
+        .await
+        .map_err(|e| driver_failure("bump draft plan revision".into(), e))?;
+    matched(result.rows_affected, "STALE_REVISION")?;
+    super::plan_summary::refresh_revision(runner, scope, tenant, id).await?;
+    Ok(next)
+}
 /// Acquire pending ownership only on an unlocked draft at the observed version.
 /// # Errors
 /// `UNIT_NOT_FOUND` or typed database failures. A lost race returns false.

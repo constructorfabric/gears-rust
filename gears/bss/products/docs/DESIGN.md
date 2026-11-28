@@ -40,6 +40,12 @@ that reference in Products, then confirms after its own commit. Products answers
 its own registry and fences against that registry in one local transaction (spec §2.2, §4, §6, §7.3,
 §13; [DECISIONS](DECISIONS.md), P-D-185, P-D-189–194).
 
+Products also keeps the commercial quota catalog of the quotas package (P-D-266): adapter targets, discovery
+intake and manual records staged as candidates, their review, immutable definition versions with their sale
+availability, and the reads plan authors and Pricing use. The package's
+[DESIGN §3.3.1](../../docs/quotas/DESIGN.md#331-catalog-onboarding-and-plan-publication) is the contract;
+§3.1, §3.2, §3.3, §3.4, §3.5 and §3.7 below carry the Products half.
+
 The requirements are [PRD](PRD.md). The content authority is
 `docs/superpowers/specs/2026-09-24-pricebook-model-design.md` in the main checkout, referenced below as
 “spec”. The amendments in §2.2 and decision 17 supersede earlier remote-count, row-lock and
@@ -57,6 +63,8 @@ Every PRD FR and NFR appears once in this allocation. Section references identif
 | `cpt-cf-bss-products-fr-sku-descriptors` | Governed, dated billing descriptors | §3.1 SkuVersion; §3.6 GL change |
 | `cpt-cf-bss-products-fr-sku-metering` | Usage metering resolves at submit and apply | §3.1 type rules and the derived pin; §3.5 usage-type catalog and its derived sibling |
 | `cpt-cf-bss-products-fr-derived-usage-type` | A derived meter is data with one evaluator, stored append-only, pinned by a usage SKU at its first publish | §3.1 derived usage declaration, type and pin; §3.3 derived usage type doors and the SKU doors' derived codes; §3.4 products-sdk; §3.5 the derived sibling and pricing's meter semantics; §3.7 derived usage tables |
+| `cpt-cf-bss-products-fr-quota-catalog` | Reviewed, versioned quota definitions from authorized evidence | §3.1 quota catalog; §3.2 Quota catalog; §3.3 quota endpoints; §3.4 products-sdk and types-registry; §3.5 discovery plugin; §3.7 quota tables |
+| `cpt-cf-bss-products-fr-quota-set-validation` | One complete set of plan quota rules judged against the catalog, as facts for Pricing | §3.2 Quota catalog; §3.3 the quota-set validation; §3.4 products-sdk |
 | `cpt-cf-bss-products-fr-sku-bundle` | Bundle identity supports sold-as only | §3.1 bundle rules; §3.5 Pricing; §3.6 reserve/write/confirm |
 | `cpt-cf-bss-products-fr-sku-lifecycle` | One approval shape governs lifecycle | §3.1 lifecycle; §3.2 Approvals; §3.6 fenced retirement |
 | `cpt-cf-bss-products-fr-sku-versions` | Durable history determines dated truth | §3.3 dated read; §3.7 version table and ordering |
@@ -77,7 +85,9 @@ Every PRD FR and NFR appears once in this allocation. Section references identif
 ### 1.3 Architecture Layers
 
 `products-sdk` remains the public contract crate for typed clients, DTOs, errors and event payloads. It also holds
-the derived usage declaration and its one pure evaluator (§3.1, P-D-230).
+the derived usage declaration and its one pure evaluator (§3.1, P-D-230), and the quota contract: the GTS
+schemas and the discovery plugin specification, the two quota traits, exact units and the canonical digests
+(P-D-267).
 Within `products`, `contract` declares REST/OpenAPI, `api` implements authenticated doors, `domain`
 owns SKU rules and the three approval subjects, and `infra` supplies repositories, migrations, outbox
 and port adapters. Domain rules depend on ports; infrastructure implements them. `bss-approval` is a
@@ -300,6 +310,88 @@ classDiagram
     ApprovalUnit "1" *-- "0..*" Decision : decisions
 ```
 
+#### Quota catalog
+
+The quota catalog (P-D-266) turns adapter evidence and manual records into reviewed definitions a plan author can
+select. Products owns the GTS schemas and the discovery plugin specification, and no instance of them: the adapter
+owner registers the metric, unit and policy instances of its service in its own namespace, and Products judges every
+reference against types-registry (P-D-267). Every type below is stored tenant-keyed and append-only, except a
+candidate's review columns (§3.7, P-D-274).
+
+| Type | Fields and invariants |
+| --- | --- |
+| `QuotaTarget` (adapter target) | Tenant, id, `plugin_instance_id` (an instance types-registry holds under `gts.cf.toolkit.plugins.plugin.v1~cf.bss.products.quota_discovery.v1~`), `target_key` (opaque, 1 to 255 printable ASCII bytes), `name` (1 to 200 characters), creator and time. One per tenant, plugin instance and target key. Never changed (P-D-268). |
+| `QuotaSnapshot` | Tenant, id, target, the adapter's `snapshot_id`, `source_revision` (a canonical decimal of at most 39 digits, compared as a number), `observed_at`, `item_count`, `content_digest`; `snapshot_json` (the verified snapshot, records sorted by id), `evidence_json` (its candidates' registry evidence), `review_json` (`rejected`, `drift` and `retired` notes); creator and time. One per tenant, target and revision (P-D-268). |
+| `QuotaCandidate` | Content, never changed: tenant, id, target, `origin` (`discovery` with its snapshot, or `manual` without one), `record_id`, `capability_key`, `record_json`, `record_digest`, `evidence_json`, creator and time. Review columns: `state` (`staged → submitted → approved` or `rejected`, the feature's `cpt-cf-bss-products-state-quota-candidate`), `version` (the `If-Match` tag), `proposal_json` (the SKU and SKU version, the named definition, the plan units with their converted bounds, the bases and the conditions) and `proposal_evidence_json` (the registry entities the submit pinned, each with its evidence and content: the metric, the record's unit and its canonical unit, both policies and each plan unit), the submitter, the decider, their times and notes, and the approved definition's id and version. A decided candidate is frozen. Never deleted (P-D-269). |
+| `QuotaMappingVersion` | Tenant, `mapping_id`, version; the lineage `(target, capability_key)`; plugin instance, target key and `mapping_key`; `mapping_json` (the target, its plugin instance and key, the capability and mapping keys, the metric and unit references, the limits, the operations, the record digest and the intake evidence) and its digest; the profile's `profile_id`, `profile_version`, `profile_json` and `profile_digest`; creator and time (P-D-270). |
+| `QuotaDefinitionVersion` | Tenant, `definition_id`, version; the candidate it was approved from; `sku_id` and `sku_version` (it applies to that SKU version and every later one; every version of one definition is of one SKU and one metric); the metric and the subject type as their deterministic UUIDs (`GtsId::to_uuid`) and the profile id, for the reads; its mapping version; `content_json` and its digest; creator and time. Each resource type is a child row, by its deterministic UUID (P-D-270). |
+| `QuotaAvailability` | Tenant, definition and version, revision, `state` (`enabled`, `disabled` or `withdrawn`), `reason_code` (null exactly when enabled), an optional qualification reference `{id, version, digest}`, the observation time and the decider. The current one is the highest revision. Approval writes revision 1, `disabled`, `qualification_pending`, with no qualification; nothing else writes one yet (P-D-271). |
+
+**Judging a record** (P-D-268). Discovery and manual input pass the same checks below, through types-registry's
+`TypesRegistryApi` as the caller, outside any transaction, with one answer per entity kept for a whole intake:
+- *shape*: the record parses into the closed v1 capability: a UUID `id`, `type_id`, keys of at most 255 characters,
+  references, `limits` as canonical decimals with a positive `step` (the capability schema itself refuses a zero
+  one) and `min` not above `max`, all six `operations` present, explicit `change_support` and an object
+  `properties`; at most 200 unique resource types; else `QUOTA_RECORD_INVALID` on the field;
+- *identity*: no segment of `type_id` or of a metric, unit or policy reference carries a minor version, the
+  adapter's segments included, and every `cf.bss.products.quota_*` segment is exactly `v1`; else
+  `QUOTA_VERSION_UNSUPPORTED`. `type_id` is the capability schema `gts.cf.bss.products.quota_capability.v1~` or a
+  schema derived from it, and it and each of its ancestors are registered, non-deleted schemas, `type_id` a concrete
+  one. The metric, the unit and both policies resolve as instances whose type chain starts with their family and
+  whose content parses with the reference as its `id`; the subject and resource types resolve as concrete types. An
+  unknown reference is `QUOTA_REFERENCE_UNKNOWN`; a `type_id` of another family, an abstract `type_id`, a reference
+  of a wrong family or an abstract type `QUOTA_REFERENCE_FAMILY`; a metric whose `quota_kind` is not `allocation`
+  `QUOTA_CAPABILITY_UNSUPPORTED`. The metric's `display_name` and `description` need non-empty English text
+  (`QUOTA_DISPLAY_TEXT_MISSING`), valid locale tags (`VALIDATION`) and at most 32 locales of 2000 characters
+  (`FIELD_TOO_LONG`). Last within identity, the record validates against `type_id`'s live schema: a record the
+  schema refuses is `QUOTA_RECORD_INVALID` on `properties`, and a schema that does not compile `QUOTA_RECORD_INVALID`
+  on `type_id`, a verdict and not an outage;
+- *units*: the record's unit and the metric share one canonical unit, which references itself with factor 1/1;
+  every other unit references it directly with a positive, reduced factor. A unit factor that is not positive and
+  reduced is `QUOTA_UNIT_INVALID` on `unit_ref`; a canonical unit that is not a registered unit, does not name itself
+  or is not canonical is `QUOTA_UNIT_INVALID` on `metric_ref`, and a canonical reference that does not parse or
+  carries a minor version is refused on `metric_ref.canonical_unit_ref`; a record's unit of another canonical unit
+  is `QUOTA_UNIT_MISMATCH`;
+- *policies*: allocated capacity summed, with English text; the resource owner in one verified scope with unique
+  required dimensions among `region` and `resource_pool`. A policy whose content does not read as that, or whose
+  text fails, is `QUOTA_POLICY_INVALID`;
+- *evidence*: every resolved schema and instance is kept as `{gts_id: {uuid, resource_version, digest}}`, the digest
+  taken over its registry content, with the record's own digest.
+
+In a discovery, a capability key that two records of the snapshot name, valid or rejected, rejects every record that
+names it: a valid one is `QUOTA_RECORD_INVALID` on `capability_key`, a rejected one keeps its own code.
+
+A registry outage at any step aborts the whole intake (503 `QUOTA_REGISTRY_UNAVAILABLE`); it is never a refusal, and
+types-registry's own text is logged, never answered. Locale tags match `^[a-z]{2,3}(-[A-Za-z0-9]{1,8})*$`, at most
+32 per map, each text at most 2000 characters; a read serves the requested locale or English and names the tag
+served.
+
+**Digests** (P-D-267). The SDK renders a JSON value one way: keys sorted at every depth, no whitespace, strings and
+integers as written. A digest is the lowercase hex SHA-256 of a domain line and that rendering. The domains are
+`cf.bss.products.quota_capability_snapshot.v1` (snapshot id, revision, observation time, count and the records
+sorted by id; no cursor and no digest), `cf.bss.products.quota_capability.v1` (a record),
+`cf.bss.products.quota_definition.v1`, `cf.bss.products.quota_mapping.v1` and `cf.bss.products.quota_profile.v1`;
+registry evidence hashes the rendering alone. The snapshot's `observed_at` is hashed as RFC 3339 text in UTC: `Z`
+as the offset, whole seconds always written, and a fraction of a second only when it is not zero, without trailing
+zeros. Each digest is taken once, at its write; no read computes one again.
+
+**Approval** (P-D-269, P-D-270, P-D-271). A submit pins, as the caller, the registry entities the definition carries
+(the metric, the record's unit and its canonical unit, both policies and each plan unit) at the content intake
+judged; an entity revised since is 409 `QUOTA_SOURCE_CONFLICT`, one types-registry no longer holds 400
+`QUOTA_REFERENCE_UNKNOWN` on the record's field. The owner ruled on 2026-11-19 that such a discovered candidate waits
+for a new snapshot revision of its target, or is replaced by a manual record under a new record id; there is no
+re-pin path. An approval builds the definition, mapping and profile versions from the stored candidate, its proposal
+and its pins alone, with no registry or plugin call. The profile is `bounded_allocation`: the scope policy's
+aggregation, the accounting basis, all six operations required and the record's change support. The mapping lineage
+`(target, capability_key)` reuses its latest version when both its mapping digest and its profile digest are equal,
+else writes the next version. A definition's evidence is the intake evidence plus each plan unit's. The owner ruled on
+2026-11-19 that a named definition's next version must be for the same SKU, from any adapter target, and of the same
+metric: the submit and the approval's transaction both check it (400 `QUOTA_RECORD_INVALID` on `definition_id`). A
+lost race for a definition's or a mapping's next version is 409 `CONTENDED` at once, without a server retry; a lineage
+holds one mapping row per version, so two first approvals of one capability key race the same way and never fork it.
+Indexed GTS references are stored as `GtsId::to_uuid`. Units convert exactly on `u128` with checked multiplication,
+never through a float.
+
 ### 3.2 Component Model
 
 | Component | Responsibility | Collaborators |
@@ -310,6 +402,7 @@ classDiagram
 | References — `cpt-cf-bss-products-component-references` | Local reservation registry, reciprocal fence checks, confirm/release and force-release | Registry, Pricing owner, Events |
 | Read model — `cpt-cf-bss-products-component-read-model` | Scoped list/search, SKU card, local reference summary, dated reads and retained browse transport | Registry, Versions, References |
 | Events — `cpt-cf-bss-products-component-events` | Audit and outbox writes in state transactions; outbound domain and approval events | All mutating components, toolkit-db outbox |
+| Quota catalog — `cpt-cf-bss-products-component-quota-catalog` | Targets, discovery intake, candidates, review, definition versions, availability, catalog reads, quota-set validation for Pricing | types-registry, discovery plugins, Registry (SKU versions), Events (audit only), Pricing (the validation's caller) |
 
 Component definition sites:
 
@@ -319,6 +412,7 @@ Component definition sites:
 - [ ] `p1` - **ID**: `cpt-cf-bss-products-component-references`
 - [ ] `p1` - **ID**: `cpt-cf-bss-products-component-read-model`
 - [ ] `p1` - **ID**: `cpt-cf-bss-products-component-events`
+- [ ] `p1` - **ID**: `cpt-cf-bss-products-component-quota-catalog`
 
 The approval subject implements `collect`, `validate_submit`, `lock`, `snapshot`, `apply` and `unlock`.
 Submit validates, records snapshot/items/quorum and conditionally acquires pending ownership, all in
@@ -391,7 +485,7 @@ idempotency column; reserve also deduplicates live logical references independen
 Permissions deny by default: `products:read` covers scoped reads, `products:author` draft/category and
 reference mutations, the draft delete, the usage-type picker and orphan recovery, `products:submit` lifecycle proposals and withdrawal,
 `products:approve` decisions, and `products:settings` approval-policy writes and reads. A derived usage type is the
-resource `derived_usage_type` with one permission, `author`, for its two writes; its reads take `sku:read` (P-D-231, O-3). Reference operations also
+resource `derived_usage_type` with one permission, `author`, for its two writes; its reads take `sku:read` (P-D-231, O-3). The quota catalog has two resources: `quota_adapter_target` with `read` and `author`, and `quota_definition` with `read`, `author`, `submit` and `approve` (P-D-273). Reference operations also
 check the authenticated owner gear; operator force-release requires explicit operator authorization and
 reason. SoD and submitter checks apply in the domain regardless of grants (spec §6, §7.3).
 
@@ -405,14 +499,14 @@ reason. SoD and submitter checks apply in the domain regardless of grants (spec 
 | `DERIVED_USAGE_TYPE_REQUIRED` | 400 on `usage_type_ref` before any catalog is asked. A usage SKU's ref is not a derived usage type; names the SKU (P-D-259) |
 | `METERING_IMMUTABLE` | 400 at a change's submit, 409 at its apply; the change moves a published usage SKU's ref or unit, or changes its type away from usage, other than a raw meter onto the identity wrapper of that meter in the same unit; on `usage_type_ref` or `unit`; names the SKU (P-D-258, P-D-251). Replaces `DERIVED_PIN_IMMUTABLE`. |
 | `NOTE_TOO_LONG` | 400; a submitter's note over 2000 characters on submit, changes or retire, or a vote's note on approve or reject; nothing is written (P-D-219, P-D-225) |
-| `FIELD_TOO_LONG` | 400 on the field; a text over its cap on a SKU create, draft PATCH or change, a category create or rename, or a forced release's reason; nothing is written (P-D-225) |
+| `FIELD_TOO_LONG` | 400 on the field; a text over its cap on a SKU create, draft PATCH or change, a category create or rename, a forced release's reason, or a quota target, record, proposal or note; nothing is written (P-D-225) |
 | `SKU_TYPE_FROZEN`, `SKU_REFERENCED`, `SKU_FENCED`, `REFERENCE_RELEASED` | 409; live reference, fence or terminal reservation conflict |
 | `ROW_LOCKED_PENDING`, `STALE_REVISION`, `VERSION_ORDER`, `CATEGORY_IN_USE` | 409; pending ownership, concurrency, timeline or category reference conflict (a SKU that is not retired names the category, P-D-208) |
 | `SKU_NOT_DRAFT`, `CATEGORY_RETIRED` | 409; a delete of a SKU that was ever published (P-D-206); a retirement of a retired category, an assignment to one, or `is_default: true` on one (P-D-196, P-D-208, P-D-220) |
 | `UNIT_CONTENDED`, `UNIT_ALREADY_DECIDED`, `DUPLICATE_VOTE` | 409; conditional unit write, terminal state or duplicate generation vote |
-| `CONTENDED` | 409; a transaction still contended after its bounded retries (an approval-unit door answers `UNIT_CONTENDED`) |
+| `CONTENDED` | 409; a transaction still contended after its bounded retries (an approval-unit endpoint answers `UNIT_CONTENDED`). A quota approval that lost the race for a definition's or a mapping's next version (a lineage's first included) answers it at once, without a server retry; the client sends the approval again (P-D-270). A discovery that lost the race for its revision and finds no stored snapshot answers it on the adapter target (P-D-268) |
 | `GENERATION_MISMATCH`, `UNIT_STALE` | 400 with current/new generation; mismatch refuses vote, stale refresh commits |
-| `SOD_VIOLATION`, `NOT_SUBMITTER`, `NOT_DRAFT_AUTHOR` | 403; author/submitter approval, unauthorized withdrawal, or a SKU draft edited or deleted by anyone but its author |
+| `SOD_VIOLATION`, `NOT_SUBMITTER`, `NOT_DRAFT_AUTHOR` | 403; author/submitter approval, unauthorized withdrawal, or a SKU draft edited or deleted by anyone but its author; a quota candidate approved or rejected by its submitter or by the author of its manual record (P-D-269) |
 | `USAGE_TYPE_FORBIDDEN` | 403; the usage-type catalog, read as the caller, refused the caller at submit or approve (P-D-207) |
 | `SYSTEM_ACTOR_RESERVED` | 403 at every door, before the PDP; the caller's context carries pricing's system actor (the subject type `bss-pricing.system` or the id `PRICING_SYSTEM_ACTOR`), which acts in-process only (P-D-222) |
 | `USAGE_NEEDS_METER`, `USAGE_TYPE_UNRESOLVED`, `BUNDLE_HAS_NO_METER` | Validation refusal; submit's failed subject checks are 400 with no unit created. Draft unresolved catalog reference is 400 per P-D-184. |
@@ -420,10 +514,100 @@ reason. SoD and submitter checks apply in the domain regardless of grants (spec 
 | `NO_VERSION_IN_FORCE` | 404; date precedes first version |
 | `SKU_RETIRING`, `SKU_DEPRECATED`, `ITEM_SKU_DEPRECATED` | Pricing-side adoption guards: a new price book entry refuses a retiring (`SKU_RETIRING`) or deprecated (`SKU_DEPRECATED`) SKU; in phase 3 a new plan revision refuses a deprecated SKU (`ITEM_SKU_DEPRECATED`) |
 | `REGISTRY_UNAVAILABLE` | 503 from Pricing when reserve cannot succeed; Pricing writes nothing |
+| `QUOTA_RECORD_INVALID`, `QUOTA_REFERENCE_UNKNOWN`, `QUOTA_REFERENCE_FAMILY`, `QUOTA_VERSION_UNSUPPORTED`, `QUOTA_CAPABILITY_UNSUPPORTED`, `QUOTA_UNIT_INVALID`, `QUOTA_UNIT_MISMATCH`, `QUOTA_POLICY_INVALID`, `QUOTA_DISPLAY_TEXT_MISSING` | 400 on the field; a capability record the quota catalog refuses (§3.1). In a discovery the record is a `rejected` note instead, and the intake goes on (P-D-268). A quota submit also answers `QUOTA_RECORD_INVALID` on `definition_id` (a named definition of another SKU or metric; a quota approval checks it again in its transaction, P-D-270), `QUOTA_VERSION_UNSUPPORTED`, `QUOTA_REFERENCE_UNKNOWN`, `QUOTA_REFERENCE_FAMILY` and `QUOTA_UNIT_MISMATCH` on `allowed_unit_refs[i]`, `QUOTA_REFERENCE_UNKNOWN` on the record's field for a pinned entity types-registry no longer holds, and `QUOTA_DISPLAY_TEXT_MISSING` on `profile_conditions` (P-D-269) |
+| `QUOTA_UNIT_INEXACT`, `QUOTA_PROFILE_UNSUPPORTED`, `QUOTA_SKU_VERSION_UNKNOWN` | 400 on the field; a quota proposal whose bounds do not convert exactly into a plan unit, whose capability lacks an operation or initial installation, or whose SKU version the tenant does not hold (P-D-269) |
+| `QUOTA_TARGET_PLUGIN_UNKNOWN`, `QUOTA_FILTER_INVALID`, `NOTE_REQUIRED` | 400; a target's plugin instance types-registry does not hold under the quota discovery specification (P-D-268); a quota definition `$filter` that names a term twice, lacks a required term or goes outside its `eq` terms (P-D-272); a quota reject without a note (P-D-269) |
+| `QUOTA_TARGET_TAKEN`, `QUOTA_SOURCE_CONFLICT`, `QUOTA_SOURCE_STALE`, `QUOTA_CANDIDATE_STATE` | 409; the tenant already binds that plugin instance and key; other content at a stored revision or record id; a revision below the target's highest (P-D-268); at a quota submit, an entity types-registry revised since intake (P-D-269); a review of a candidate in another state (P-D-269) |
+| `QUOTA_DISCOVERY_CLOSED` | 501; no discovery adapter is registered for the target's plugin instance, answered before any read or write. The canonical 501 carries no reason field, so its `detail` leads with the code (`QUOTA_DISCOVERY_CLOSED: …`) (P-D-268) |
+| `QUOTA_REGISTRY_UNAVAILABLE`, `QUOTA_DISCOVERY_INCOMPLETE`, `QUOTA_DISCOVERY_UNAVAILABLE` | 503; types-registry does not answer, a snapshot is not complete, or not read whole and judged within the discovery deadline, or the adapter fails or answers a page late; nothing is stored. The canonical 503 carries no reason field, so its `detail` leads with the code (P-D-268) |
 
 An unreachable configured usage-type catalog is 503 during publication validation; a catalog that refuses the
 caller is 403 `USAGE_TYPE_FORBIDDEN` (P-D-207). The usage catalog's
 authoring behavior is defined in §3.5; these codes do not turn a catalog non-answer into a draft-save outage.
+
+**The quota catalog** (P-D-266 … P-D-273). The operations below are under `/bss-products/v1`. Each authorizes
+before it reads the body, asks the PDP for the caller's tenant only (P-D-265), reads with that tenant as the SQL
+filter and writes to it; a denial is 403 and a PDP that cannot answer is 503 on every operation. Candidate rows, the
+review writes and an approval's writes take `tenant_only()` of the `quota_definition` grant; the definition reads, and
+the submit's and the approval's read of the definition a proposal names, keep the whole grant with its row constraints
+(P-D-273). Every quota POST accepts optional `Idempotency-Key`
+(P-D-198). Registry, plugin and PDP calls happen before a write's transaction, which re-checks stored rows only. Each
+write records one audit row in its transaction; no outbox event is written (P-D-268). Texts keep the caps of P-D-225:
+a target name 200 characters, keys 255, each localized text and note 2000, at most 32 locales per map; a discovered
+record takes at most 64 KiB as JSON, and a snapshot at most `quota_discovery_max_items` records (P-D-268). No quota
+row holds U+0000: a body that holds it is 400 `VALIDATION` on its path, and a discovered record that holds it makes the
+snapshot incomplete (P-D-268, P-D-273), since Postgres refuses the character where SQLite stores it. Every refusal
+names the operation's quota resource, never the SKU: `quota_adapter_target` for the target operations and the
+discovery, `quota_definition` for the others; a miss names the quota row that is missing, and the list-protocol
+refusals (an unknown or repeated query parameter, a refused cursor, a `$filter` the OData binding refuses) name
+`cf.core.odata.query.v1~`, as on every Products list. A stored row that does not read is a data-loss 500 whose detail is `a stored quota row does not read`
+(P-D-273, P-D-274). Every list cursor binds the caller's tenant.
+
+| Operation | Grant | Contract and refusals |
+| --- | --- | --- |
+| `POST /quota-adapter-targets` | `author` on `quota_adapter_target` | Body `{plugin_instance_id, target_key, name}`; 201 with the target. 400 `VALIDATION`, `FIELD_TOO_LONG`, `QUOTA_TARGET_PLUGIN_UNKNOWN` on `plugin_instance_id`; 409 `QUOTA_TARGET_TAKEN`; 503 `QUOTA_REGISTRY_UNAVAILABLE` (P-D-268). |
+| `GET /quota-adapter-targets` | `read` on `quota_adapter_target` | `Page` of targets by `name`, then `id`; `limit`/`$top` 50, at most 200; `cursor`/`$skiptoken`; the cursor binds the caller's tenant. |
+| `GET /quota-adapter-targets/{id}` | `read` on `quota_adapter_target` | One target; 404 for an unknown or foreign one. |
+| `POST /quota-adapter-targets/{id}/discoveries` | `author` on `quota_adapter_target` | Operation `bss_products.run_quota_discovery`. No body. 201 `{snapshot, candidates, rejected, drift, retired}`, 200 for a replay of a stored revision; each candidate's `snapshot_row_id` is the answer's `snapshot.id`. The stored revision answers before any record is judged: a replay, a conflict or a stale revision asks types-registry nothing. 404; 409 `QUOTA_SOURCE_CONFLICT`, `QUOTA_SOURCE_STALE`, `CONTENDED`; 501 `QUOTA_DISCOVERY_CLOSED`; 503 `QUOTA_DISCOVERY_INCOMPLETE` (also when the read and the judging pass `quota_discovery_deadline_ms`, 25 s by default; the operation declares that deadline plus 15 s for the staging as its request timeout, so the 503 comes before the API gateway cuts the request), `QUOTA_DISCOVERY_UNAVAILABLE`, `QUOTA_REGISTRY_UNAVAILABLE` (P-D-268). |
+| `POST /quota-candidates` | `author` on `quota_definition` | Body `{target_id, record}`; 201 with the candidate and its `ETag`, 200 with the stored one for the same record again. 400 with the record's code (§3.1) on `record.<field>`; 404 for the target; 409 `QUOTA_SOURCE_CONFLICT`; 503 `QUOTA_REGISTRY_UNAVAILABLE` (P-D-268). |
+| `GET /quota-candidates` | `read` on `quota_definition` | `target_id` and `state` (`staged`, `submitted`, `approved` or `rejected`, else 400 `VALIDATION`); newest first, then `id`; `limit`/`$top`, `cursor`/`$skiptoken`; the cursor binds the caller's tenant, `target_id` and `state`. |
+| `GET /quota-candidates/{id}` | `read` on `quota_definition` | One candidate with the `ETag` of its version; 404 for an unknown or foreign one. |
+| `POST /quota-candidates/{id}/submit` | `submit` on `quota_definition` | `If-Match`; body `{sku_id, sku_version, definition_id, allowed_unit_refs, supported_bases, profile_conditions, note}`, `definition_id` and `note` optional, the bases `fixed` and/or `per_plan_unit`; pins the registry entities the definition carries (§3.1); 200 with the candidate and its new `ETag`. 400 `VALIDATION` (a missing `If-Match` included), `VALIDATION` on `supported_bases[i]` for another basis, `FIELD_TOO_LONG`, `QUOTA_SKU_VERSION_UNKNOWN` on `sku_version`, `QUOTA_RECORD_INVALID` on `definition_id` (a named definition of another SKU or metric), `QUOTA_VERSION_UNSUPPORTED`, `QUOTA_REFERENCE_UNKNOWN`, `QUOTA_REFERENCE_FAMILY`, `QUOTA_UNIT_MISMATCH` or `QUOTA_UNIT_INEXACT` on `allowed_unit_refs[i]`, `QUOTA_REFERENCE_UNKNOWN` on the record's field (`metric_ref`, `unit_ref`, `metric_ref.canonical_unit_ref`, `accounting_policy_ref` or `scope_policy_ref`) for an entity types-registry no longer holds, `QUOTA_DISPLAY_TEXT_MISSING` on `profile_conditions`, `QUOTA_PROFILE_UNSUPPORTED`; 404, also for a named definition the `submit` grant does not reach (P-D-273); 409 `QUOTA_CANDIDATE_STATE`, `STALE_REVISION`, `QUOTA_SOURCE_CONFLICT` for an entity types-registry revised since intake (a new snapshot revision of the target, or a manual record under a new record id, judges it again); 503 `QUOTA_REGISTRY_UNAVAILABLE` (P-D-269). |
+| `POST /quota-candidates/{id}/approve` | `approve` on `quota_definition` | `If-Match`; a JSON body, `{}` at least, with an optional `note`; 200 `{candidate, definition}`, the definition as its version read answers it in English, and no `ETag` (an approved candidate never moves again). 400 `VALIDATION` (a missing `If-Match` or body included), `FIELD_TOO_LONG` on `note`, `QUOTA_SKU_VERSION_UNKNOWN`, `QUOTA_RECORD_INVALID` on `definition_id` when the named definition is of another SKU or metric; 403 `SOD_VIOLATION`; 404, also for a named definition the `approve` grant does not reach (P-D-273); 409 `QUOTA_CANDIDATE_STATE`, `STALE_REVISION`, `CONTENDED` when a concurrent approval took the definition's next version or the mapping lineage's, without a retry (P-D-269, P-D-270). |
+| `POST /quota-candidates/{id}/reject` | `approve` on `quota_definition` | `If-Match`; a JSON body with the required `note`; 200 with the candidate and its new `ETag`. 400 `VALIDATION` (a missing `If-Match` or body included), `NOTE_REQUIRED`, `FIELD_TOO_LONG` on `note`; 403 `SOD_VIOLATION`; 404; 409 `QUOTA_CANDIDATE_STATE`, `STALE_REVISION` (P-D-269). |
+| `GET /quota-definitions` | `read` on `quota_definition` | The list query below; `Page<ProductsQuotaDefinition>`. 400: first the shared OData refusals on `$filter` (`INVALID_FILTER`, `FILTER_TOO_LONG`, `FILTER_TOO_COMPLEX`), then `QUOTA_FILTER_INVALID`, `VALIDATION` on `availability`, or a cursor from another tenant or under other filters (P-D-272). |
+| `GET /quota-definitions/{id}/versions/{version}` | `read` on `quota_definition` | One version with its current availability; optional `locale`; 400 `VALIDATION` for a `version` that is not a canonical decimal from 1; 404 for an unknown or foreign version, or one the caller's grant does not name (P-D-272). |
+
+The list query of `GET /quota-definitions` (P-D-272): `$filter` is required by the operation, although the OpenAPI
+document cannot mark it required, and the operation publishes its vocabulary (`x-odata-filter`). It is a conjunction
+(`and`) of `eq` terms, each at most once, on `sku_id` (a UUID) and `sku_version` (a string), both required, and
+optionally `subject_type_ref` and `resource_type_ref` (GTS ids) and `profile_id` (a UUID). A term named twice, any
+other field, operator or shape, or a missing required term is 400 `QUOTA_FILTER_INVALID` naming the term. The terms are
+read from the shared OData binding's one parse, within its budget: a `$filter` that does not parse, or one over 8 KiB
+or 2000 nodes, is the binding's 400 on `$filter` (`INVALID_FILTER`, `FILTER_TOO_LONG`, `FILTER_TOO_COMPLEX`), before
+any term is read. Plain parameters: `availability` (`enabled` by default, or `all`; anything
+else is 400 `VALIDATION`), `locale`, `limit` or `$top` (50 by default, at most 200) and `cursor` or `$skiptoken`; both
+spellings of one parameter are 400. The list answers the versions of that SKU approved at a SKU version up to
+`sku_version` (P-D-270) that the caller's grant names; `enabled` keeps those whose current availability is enabled,
+and `all` adds the others with their reason. The order is `definition_id`, then `version`. The cursor binds the
+authorized scope, which is the caller's tenant (P-D-265), and `sku_id`, `sku_version`, `subject_type_ref`,
+`resource_type_ref`, `profile_id` and `availability`; a cursor reused by another tenant or under other filters is
+400. A row's GTS refs are matched through their UUIDs, never by string prefix. `locale` in a row names the tag its
+display name was served in; the description and the conditions fall back to English on their own. No read asks
+types-registry or a plugin.
+
+The SDK methods are `ProductsQuotaCatalogClientV1::list_quota_definitions(ctx, request)` → `{items, next_cursor}` and
+`get_quota_definition(ctx, definition_id, version, locale)`, over the same code as the two reads (P-D-272), and the
+adapters' `ProductsQuotaDiscoveryPluginClientV1::list_capabilities(ctx, request)` (P-D-267). A definition answers the
+fields of the quotas package's §3.3.1.1: identity and digest, SKU and SKU version, metric, text and locale, units
+with exact bounds, subject and resource types, mapping, profile and qualification references (the last null until
+qualification), both policies, change support, conditions, bases (`fixed` and `per_plan_unit` on REST, `Fixed` and
+`PerPlanUnit` in the SDK, as the quotas package spells them), and availability.
+
+**The quota-set validation** (P-D-275, P-D-276). `ProductsQuotaCatalogClientV1::validate_quota_set(ctx, request)`
+validates one complete set of plan quota rules for Pricing, in the same process and as the caller; it has no REST
+projection. It asks `read` on `quota_definition` for the caller's tenant before it reads anything, and it reads the
+definitions under the whole grant, so a definition the grant does not reach is unknown to the set. The request,
+`bss_products_sdk::quota::validation::QuotaSetRequest`, carries the purpose (`Authoring` or `Acceptance`), the
+change kind (`InitialSet`, `Increase` or `Unchanged`), the plan quantity, the prior limits and at most 200 rules,
+each with its definition reference `{id, version, digest}`, its SKU and SKU version, its logical binding, its
+dimension value, its subject selector and scope selection, its amount, unit and basis. The answer,
+`QuotaSetValidation`, is one verdict per rule (the resolved definition, and with a quantity the final limit) and
+every check found; Pricing decides what each boundary refuses. A malformed request, or one over Products' bounds
+(P-D-275), is 400 `VALIDATION` on its field; the PDP's 403 and 503 and a corrupt row's 500 are the only
+other errors. Three statements read a set whatever it holds: the versions, their current availability, and their
+mappings' adapter targets with their profile content. No registry or plugin is called. The checks, judged by a pure
+function that reports every failure:
+
+| Code | Field | When |
+| --- | --- | --- |
+| `QUOTA_RULE_INVALID` | `definition_ref`, `basis`, `unit_ref` | A version unknown to the caller's scope; another SKU, or a SKU version before the definition's; a basis or a unit the definition does not allow |
+| `QUOTA_DEFINITION_CHANGED` | `definition_ref.digest` | The rule's digest is not the stored one |
+| `QUOTA_AMOUNT_INVALID` | `amount`, `quantity` | An amount that is not a canonical integer, off the unit's grid (`min + n × step`) or above `max`; a final limit at the quantity off the grid or above `max`; an amount or a final limit whose arithmetic overflows 128 bits |
+| `QUOTA_UNIT_INEXACT` | `amount` | The amount does not convert exactly into the canonical unit |
+| `QUOTA_SCOPE_UNSUPPORTED` | `subject_selector`, `scope_selection.<key>` | Another subject selector; a required dimension missing, an extra key, an empty value, or a value over 255 bytes or not printable ASCII. Only the form of a value is checked: no alias is resolved and no wildcard is known (the scope authority refuses both, the quotas package's feature 3) |
+| `QUOTA_SET_INCOMPATIBLE` | `logical_binding_key`, `scope_selection`, `change_kind`, `prior` | Rules of one binding with other profile content or on another adapter target; rules of one binding, whatever their dimension value, with another subject or scope; a rule without a prior limit, a prior limit whose unit is neither the metric's canonical unit nor an allowed unit or that does not convert exactly (each naming the rule), or a prior limit that no rule keeps (naming no rule; not when a rule of its binding did not resolve); a decrease, no increase, a definition without increase support, or an unchanged set with other limits |
+| `QUOTA_QUALIFICATION_UNAVAILABLE` | `definition_ref` | The version is not `enabled`; the reason names the state and the reason code |
 
 ### 3.4 Internal Dependencies
 
@@ -433,7 +617,8 @@ authoring behavior is defined in §3.5; these codes do not turn a catalog non-an
 | toolkit-db / SecureORM | SecureConn and scoped transactions; PolicyEnforcer-derived AccessScope on all reads/writes, including audit, replay and child records. Conditional writes, no raw unscoped connection. |
 | toolkit-db outbox | State, audit and outbox records share the same transaction; dispatch happens after commit, and the outbox's sequencer is woken only after it (P-D-221). No success event escapes a rollback. |
 | toolkit REST / PolicyEnforcer | OperationBuilder, authenticated operations, RFC-9457 errors and deny-by-default resource/action checks. |
-| products-sdk / ClientHub | Public SKU/version/catalog contracts, usage-type port, and the derived usage declaration with its pure evaluator (P-D-230); consumers resolve typed clients without importing gear internals. |
+| products-sdk / ClientHub | Public SKU/version/catalog contracts, usage-type port, the derived usage declaration with its pure evaluator (P-D-230), and `DerivedUsageTypeReadV1`, the read of one stored declaration in a named catalog tenant (P-D-277); consumers resolve typed clients without importing gear internals. Its `quota` module holds the five quota GTS schemas and the discovery plugin specification, which the toolkit inventory seeds into types-registry, the exact units, the canonical digests, `ProductsQuotaDiscoveryPluginClientV1` and `ProductsQuotaCatalogClientV1` (P-D-267), and the quota-set validation contract in `quota::validation` (P-D-275). |
+| types-registry / `TypesRegistryApi` | The quota intake resolves schemas, instances and ancestry and validates records through `TypesRegistryApi`, resolved from the ClientHub on every call (a remote registry is wired after init) and read as the caller. Not found or deleted is unknown; any other error, or no registry in the hub, is an outage (P-D-268). |
 
 Outbound events are `SkuPublished`, `SkuChanged`, `SkuRetired`, `ApprovalUnitDecided` and
 `ReferenceForceReleased`. Broker events follow this gear's camelCase convention. `SkuChanged` carries
@@ -479,6 +664,14 @@ canonical or disagrees with `@<n>` is 400 `METER_POLICY_MISMATCH`; an unknown co
 provider does (`UNCONFIGURED_DEPENDENCY`). The raw-meter provider (E1a) is not built: when it exists, it registers under a
 `products-sdk` trait that this dispatcher calls for every non-derived id.
 
+Products also registers at its init the ClientHub's one `dyn DerivedUsageTypeReadV1` (P-D-277), over the same runtime. It
+answers one stored version of a derived usage type, named by its meter id, in a catalog tenant the caller names: the stored
+declaration, the stored digest, the output unit as `canonical_unit` and `derived-v1:<digest>`. It is the REST version
+read in process, with the same 404, 403, 503 and 500 rules. It asks `sku:read` in the named tenant, `RootOnly` with that
+tenant as the context's root, and the compiled scope must hold it; this is the one read that may name a tenant other than
+the subject's own (amending P-D-265). It is a general read: a consumer such as Rating needs `sku:read` in each seller
+tenant it reads, granted by the platform.
+
 `SkuUsageV1` is the second port in `products-sdk`, and pricing fills it (P-D-197; pricing D-428). Pricing
 registers it in `ClientHub` at its init; Products resolves it at each `GET /skus` and `GET /skus/{id}`, calls
 it once per list page on a task of its own and outside any transaction, and shows `usage: null` when it is
@@ -500,6 +693,14 @@ platform's error layer, so the grant, the replay endpoint and the answer's bytes
 `sku_retire` unit's impact is pricing's `SkuUsage` of its SKU, from ONE `SkuUsageV1::usage` call per page, null when
 the port refuses, cannot answer or is absent; never `usage_sets`. A kind products does not record, and any `book_id`,
 are an empty page and zero counts, after `state` has been accepted (P-D-252). An unknown state is the list door's 400.
+
+The quota catalog has two external dependencies (P-D-267, P-D-268). A discovery adapter implements
+`ProductsQuotaDiscoveryPluginClientV1` and registers a scoped client in the ClientHub under its plugin instance id;
+its owner registers that instance under `gts.cf.toolkit.plugins.plugin.v1~cf.bss.products.quota_discovery.v1~`.
+Products resolves the target's client on every discovery; with none registered, the discovery is 501
+`QUOTA_DISCOVERY_CLOSED` before any read or write. No adapter exists in this version, so production discovery is
+closed. Types-registry answers every record judgement; when it does not, the intake is 503
+`QUOTA_REGISTRY_UNAVAILABLE` and stores nothing. The catalog reads ask neither.
 
 ### 3.6 Interactions & Sequences
 
@@ -1008,6 +1209,183 @@ CREATE TABLE bss.products_derived_usage_type_version (
 CREATE TRIGGER products_derived_usage_type_version_append_only BEFORE UPDATE OR DELETE ON bss.products_derived_usage_type_version FOR EACH ROW EXECUTE FUNCTION bss.products_derived_usage_type_version_append_only();
 ```
 
+The forward migration `m20261119_000015_quota_catalog` creates the quota catalog store (P-D-274). Every key leads with
+`tenant_id` and every foreign key is tenant-qualified, so no child row names another tenant's parent. Six tables are
+append-only: each has one `PL/pgSQL` function `bss.<table>_append_only()` raising
+`'<table> is append-only: % is not permitted'`, run by a `BEFORE UPDATE OR DELETE` row trigger and by a
+`BEFORE TRUNCATE` statement trigger, since a row trigger does not fire on `TRUNCATE`. The candidate has
+`bss.products_quota_candidate_guard()`, run the same two ways: a `DELETE` or a `TRUNCATE` is refused as append-only,
+any `UPDATE` of a decided (`approved` or `rejected`) candidate raises `'products_quota_candidate is decided: UPDATE is
+not permitted'`, and an `UPDATE` that changes `tenant_id`, `id`, `target_id`, `origin`, `snapshot_row_id`,
+`record_id`, `capability_key`, `record_json`, `record_digest`, `evidence_json`, `created_by` or `created_at` raises
+`'products_quota_candidate content is immutable'`.
+
+On SQLite, which has no `TRUNCATE`, two `RAISE(ABORT, …)` triggers per table refuse the same verbs with fixed
+messages, and the candidate's triggers compare with `IS NOT`, SQLite's null-safe form. `REPLACE` (and `INSERT OR
+REPLACE`) settles a key conflict by deleting the stored row, which fires no delete trigger, so every key of every
+quota table has a `BEFORE INSERT` trigger that refuses a row whose key is stored. Its message is SQLite's own text for
+a unique failure on that key, so a plain `INSERT` is refused with the same text as without the trigger. The abort of a
+trigger is `SQLITE_CONSTRAINT_TRIGGER` (code 1811), which sea-orm does not classify as a unique failure, so the
+repositories' typed refusals of a duplicate insert rest on toolkit-db's fallback that matches the message text. Every
+quota table is `WITHOUT ROWID`, so no statement can reach a row through `rowid`. SQLite maps `uuid`, `jsonb` and
+`timestamptz` to text, `bigint` to integer, and each `~` CHECK to `length` and `GLOB` tests.
+
+The owner ruled on 2026-11-19 that the migration's `down` refuses while any quota row exists, so a revert never loses
+stored evidence. `down` first reads every quota table that exists, on both engines, and fails with a message naming
+each table that holds a row (`<table> holds a row`) before it drops anything. On empty tables it drops the tables,
+children first, then on Postgres the functions, and `up` applies again. No name is a legacy table, so the schema guard
+(P-D-195) is unchanged. A stored row that does not read as its stored shape is a corrupt row naming its table, tenant
+and id. Writes record `products_audit_log` rows with `subject_kind` `quota_adapter_target`, `quota_snapshot` or
+`quota_candidate`.
+
+```sql
+CREATE TABLE IF NOT EXISTS bss.products_quota_adapter_target (
+    tenant_id uuid NOT NULL, id uuid NOT NULL,
+    plugin_instance_id text NOT NULL, target_key text NOT NULL, name text NOT NULL,
+    created_by uuid NOT NULL, created_at timestamptz NOT NULL,
+    CONSTRAINT products_quota_adapter_target_pkey PRIMARY KEY (tenant_id, id),
+    CONSTRAINT chk_products_quota_adapter_target_key CHECK (length(target_key) BETWEEN 1 AND 255),
+    CONSTRAINT chk_products_quota_adapter_target_name CHECK (length(name) BETWEEN 1 AND 200)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_quota_adapter_target_binding
+    ON bss.products_quota_adapter_target USING btree (tenant_id, plugin_instance_id, target_key);
+CREATE INDEX IF NOT EXISTS idx_products_quota_adapter_target_name
+    ON bss.products_quota_adapter_target USING btree (tenant_id, name, id);
+
+CREATE TABLE IF NOT EXISTS bss.products_quota_snapshot (
+    tenant_id uuid NOT NULL, id uuid NOT NULL, target_id uuid NOT NULL,
+    snapshot_id uuid NOT NULL, source_revision text NOT NULL, observed_at timestamptz NOT NULL,
+    item_count bigint NOT NULL, content_digest text NOT NULL,
+    snapshot_json jsonb NOT NULL, evidence_json jsonb NOT NULL, review_json jsonb NOT NULL,
+    created_by uuid NOT NULL, created_at timestamptz NOT NULL,
+    CONSTRAINT products_quota_snapshot_pkey PRIMARY KEY (tenant_id, id),
+    CONSTRAINT fk_products_quota_snapshot_target FOREIGN KEY (tenant_id, target_id)
+        REFERENCES bss.products_quota_adapter_target (tenant_id, id),
+    CONSTRAINT chk_products_quota_snapshot_revision CHECK (source_revision ~ '^(0|[1-9][0-9]{0,38})$'),
+    CONSTRAINT chk_products_quota_snapshot_count CHECK (item_count >= 0),
+    CONSTRAINT chk_products_quota_snapshot_digest CHECK (content_digest ~ '^[0-9a-f]{64}$')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_quota_snapshot_revision
+    ON bss.products_quota_snapshot USING btree (tenant_id, target_id, source_revision);
+
+CREATE TABLE IF NOT EXISTS bss.products_quota_candidate (
+    tenant_id uuid NOT NULL, id uuid NOT NULL, target_id uuid NOT NULL,
+    origin text NOT NULL, snapshot_row_id uuid NULL,
+    record_id uuid NOT NULL, capability_key text NOT NULL,
+    record_json jsonb NOT NULL, record_digest text NOT NULL, evidence_json jsonb NOT NULL,
+    state text NOT NULL, version bigint NOT NULL,
+    proposal_json jsonb NULL, proposal_evidence_json jsonb NULL,
+    created_by uuid NOT NULL, created_at timestamptz NOT NULL,
+    submitted_by uuid NULL, submitted_at timestamptz NULL, submit_note text NULL,
+    decided_by uuid NULL, decided_at timestamptz NULL, decided_note text NULL,
+    definition_id uuid NULL, definition_version bigint NULL,
+    CONSTRAINT products_quota_candidate_pkey PRIMARY KEY (tenant_id, id),
+    CONSTRAINT fk_products_quota_candidate_target FOREIGN KEY (tenant_id, target_id)
+        REFERENCES bss.products_quota_adapter_target (tenant_id, id),
+    CONSTRAINT fk_products_quota_candidate_snapshot FOREIGN KEY (tenant_id, snapshot_row_id)
+        REFERENCES bss.products_quota_snapshot (tenant_id, id),
+    CONSTRAINT chk_products_quota_candidate_origin CHECK (origin IN ('discovery', 'manual')),
+    CONSTRAINT chk_products_quota_candidate_origin_snapshot CHECK ((origin = 'discovery') = (snapshot_row_id IS NOT NULL)),
+    CONSTRAINT chk_products_quota_candidate_state CHECK (state IN ('staged', 'submitted', 'approved', 'rejected')),
+    CONSTRAINT chk_products_quota_candidate_version CHECK (version >= 1),
+    CONSTRAINT chk_products_quota_candidate_digest CHECK (record_digest ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT chk_products_quota_candidate_key CHECK (length(capability_key) BETWEEN 1 AND 255)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_quota_candidate_snapshot_key
+    ON bss.products_quota_candidate USING btree (tenant_id, snapshot_row_id, capability_key)
+    WHERE snapshot_row_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_quota_candidate_manual_record
+    ON bss.products_quota_candidate USING btree (tenant_id, target_id, record_id) WHERE origin = 'manual';
+CREATE INDEX IF NOT EXISTS idx_products_quota_candidate_state
+    ON bss.products_quota_candidate USING btree (tenant_id, state, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_products_quota_candidate_target
+    ON bss.products_quota_candidate USING btree (tenant_id, target_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_products_quota_candidate_created
+    ON bss.products_quota_candidate USING btree (tenant_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS bss.products_quota_mapping_version (
+    tenant_id uuid NOT NULL, mapping_id uuid NOT NULL, version bigint NOT NULL,
+    target_id uuid NOT NULL, capability_key text NOT NULL,
+    plugin_instance_id text NOT NULL, target_key text NOT NULL, mapping_key text NOT NULL,
+    mapping_json jsonb NOT NULL, digest text NOT NULL,
+    profile_id uuid NOT NULL, profile_version bigint NOT NULL, profile_json jsonb NOT NULL, profile_digest text NOT NULL,
+    created_by uuid NOT NULL, created_at timestamptz NOT NULL,
+    CONSTRAINT products_quota_mapping_version_pkey PRIMARY KEY (tenant_id, mapping_id, version),
+    CONSTRAINT fk_products_quota_mapping_version_target FOREIGN KEY (tenant_id, target_id)
+        REFERENCES bss.products_quota_adapter_target (tenant_id, id),
+    CONSTRAINT chk_products_quota_mapping_version_version CHECK (version >= 1 AND profile_version >= 1),
+    CONSTRAINT chk_products_quota_mapping_version_digest CHECK (digest ~ '^[0-9a-f]{64}$' AND profile_digest ~ '^[0-9a-f]{64}$')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_quota_mapping_version_lineage
+    ON bss.products_quota_mapping_version USING btree (tenant_id, target_id, capability_key, version);
+
+CREATE TABLE IF NOT EXISTS bss.products_quota_definition_version (
+    tenant_id uuid NOT NULL, definition_id uuid NOT NULL, version bigint NOT NULL,
+    candidate_id uuid NOT NULL, sku_id uuid NOT NULL, sku_version bigint NOT NULL,
+    metric_uuid uuid NOT NULL, subject_type_uuid uuid NOT NULL, profile_id uuid NOT NULL,
+    mapping_id uuid NOT NULL, mapping_version bigint NOT NULL,
+    content_json jsonb NOT NULL, digest text NOT NULL,
+    created_by uuid NOT NULL, created_at timestamptz NOT NULL,
+    CONSTRAINT products_quota_definition_version_pkey PRIMARY KEY (tenant_id, definition_id, version),
+    CONSTRAINT fk_products_quota_definition_version_mapping FOREIGN KEY (tenant_id, mapping_id, mapping_version)
+        REFERENCES bss.products_quota_mapping_version (tenant_id, mapping_id, version),
+    CONSTRAINT fk_products_quota_definition_version_candidate FOREIGN KEY (tenant_id, candidate_id)
+        REFERENCES bss.products_quota_candidate (tenant_id, id),
+    CONSTRAINT chk_products_quota_definition_version_version CHECK (version >= 1 AND sku_version >= 1),
+    CONSTRAINT chk_products_quota_definition_version_digest CHECK (digest ~ '^[0-9a-f]{64}$')
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_products_quota_definition_version_candidate
+    ON bss.products_quota_definition_version USING btree (tenant_id, candidate_id);
+CREATE INDEX IF NOT EXISTS idx_products_quota_definition_version_sku
+    ON bss.products_quota_definition_version USING btree (tenant_id, sku_id, sku_version);
+
+CREATE TABLE IF NOT EXISTS bss.products_quota_definition_resource_type (
+    tenant_id uuid NOT NULL, definition_id uuid NOT NULL, version bigint NOT NULL,
+    resource_type_uuid uuid NOT NULL,
+    CONSTRAINT products_quota_definition_resource_type_pkey
+        PRIMARY KEY (tenant_id, definition_id, version, resource_type_uuid),
+    CONSTRAINT fk_products_quota_definition_resource_type_definition FOREIGN KEY (tenant_id, definition_id, version)
+        REFERENCES bss.products_quota_definition_version (tenant_id, definition_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS bss.products_quota_availability (
+    tenant_id uuid NOT NULL, definition_id uuid NOT NULL, version bigint NOT NULL, revision bigint NOT NULL,
+    state text NOT NULL, reason_code text NULL,
+    qualification_id uuid NULL, qualification_version bigint NULL, qualification_digest text NULL,
+    observed_at timestamptz NOT NULL, decided_by uuid NOT NULL,
+    CONSTRAINT products_quota_availability_pkey PRIMARY KEY (tenant_id, definition_id, version, revision),
+    CONSTRAINT fk_products_quota_availability_definition FOREIGN KEY (tenant_id, definition_id, version)
+        REFERENCES bss.products_quota_definition_version (tenant_id, definition_id, version),
+    CONSTRAINT chk_products_quota_availability_state CHECK (state IN ('enabled', 'disabled', 'withdrawn')),
+    CONSTRAINT chk_products_quota_availability_reason CHECK ((state = 'enabled') = (reason_code IS NULL)),
+    CONSTRAINT chk_products_quota_availability_revision CHECK (revision >= 1),
+    CONSTRAINT chk_products_quota_availability_qualification CHECK (
+        (qualification_id IS NULL) = (qualification_version IS NULL)
+        AND (qualification_id IS NULL) = (qualification_digest IS NULL))
+);
+
+-- One function and two triggers per append-only table, shown for the adapter target:
+CREATE TRIGGER products_quota_adapter_target_append_only BEFORE UPDATE OR DELETE ON bss.products_quota_adapter_target
+    FOR EACH ROW EXECUTE FUNCTION bss.products_quota_adapter_target_append_only();
+CREATE TRIGGER products_quota_adapter_target_no_truncate BEFORE TRUNCATE ON bss.products_quota_adapter_target
+    FOR EACH STATEMENT EXECUTE FUNCTION bss.products_quota_adapter_target_append_only();
+-- The candidate's guard, the same two ways:
+CREATE TRIGGER products_quota_candidate_guard BEFORE UPDATE OR DELETE ON bss.products_quota_candidate
+    FOR EACH ROW EXECUTE FUNCTION bss.products_quota_candidate_guard();
+CREATE TRIGGER products_quota_candidate_no_truncate BEFORE TRUNCATE ON bss.products_quota_candidate
+    FOR EACH STATEMENT EXECUTE FUNCTION bss.products_quota_candidate_guard();
+```
+
+The six append-only tables are `products_quota_adapter_target`, `products_quota_snapshot`,
+`products_quota_mapping_version`, `products_quota_definition_version`, `products_quota_definition_resource_type`
+and `products_quota_availability`. Each list reads the caller's tenant through a tenant-led index in its own order:
+the targets through `idx_products_quota_adapter_target_name`, the candidates through
+`idx_products_quota_candidate_created`, `_target` or `_state`. On Postgres the definition list reads
+`sku_id = :sku AND sku_version <= :version` through `idx_products_quota_definition_version_sku`, an `EXISTS` on the
+resource type table when that filter is given, and the page's current availability in one grouped read (P-D-270,
+P-D-272). On SQLite the planner chooses the access path; the migration's tests assert that every list's plan is a
+tenant-led search.
+
 ## 4. Additional context
 
 The replaced design set lives only on `bss/products-backup` at `3a38f0b28` and in git history, under
@@ -1053,6 +1431,8 @@ defined here.
 | `cpt-cf-bss-products-fr-sku-descriptors` | 03 | `lifecycle-approvals` |
 | `cpt-cf-bss-products-fr-sku-metering` | 02 | `sku-categories` |
 | `cpt-cf-bss-products-fr-derived-usage-type` | none (P-D-230, P-D-231, P-D-232, P-D-233, P-D-257) | `derived-usage-types` |
+| `cpt-cf-bss-products-fr-quota-catalog` | none (P-D-266 … P-D-274) | `quota-catalog` |
+| `cpt-cf-bss-products-fr-quota-set-validation` | none (P-D-275, P-D-276) | `quota-set-validation` |
 | `cpt-cf-bss-products-fr-sku-bundle` | 02 | `sku-categories` |
 | `cpt-cf-bss-products-fr-sku-lifecycle` | 03 | `lifecycle-approvals` |
 | `cpt-cf-bss-products-fr-sku-versions` | 02 | `sku-categories` |
@@ -1071,4 +1451,4 @@ registry and Pricing protocol; P-D-196 → the optional category; P-D-197 → th
 P-D-198–P-D-204 → the rules carried from the backup register (replay mechanics, event delivery, the audit
 shape, the request digest, the validation answer, the usage-type resolve bound, the authz label registration);
 P-D-205 → the policy's `If-Match`; P-D-206 → the draft delete; P-D-207 → usage types as the caller and the
-picker; P-D-208 → category retirement; P-D-209 → the fence TTL as a deployment setting; P-D-216 → the override reset; P-D-218 → moving the default category; P-D-219 → the submitter's note on the unit; P-D-220 → a retired category is never the default; P-D-229 → derived usage meters (Products declares, Rating evaluates); P-D-230 → the declaration, grammar, evaluator and canonical bytes; P-D-231 → the derived usage type's storage, doors, grants and audit; P-D-232 → a usage SKU's derived ref and its pin; P-D-233 → the derived meter semantics Products answers to pricing (E1b); P-D-250 → the approvals inbox's source; P-D-251 → one input, and a raw meter moving onto its identity wrapper; P-D-257 → the derived type list carries each type's latest version. Spec §2.2, §4, §6, §7.2–§7.3 and §13 govern the corresponding sections.
+picker; P-D-208 → category retirement; P-D-209 → the fence TTL as a deployment setting; P-D-216 → the override reset; P-D-218 → moving the default category; P-D-219 → the submitter's note on the unit; P-D-220 → a retired category is never the default; P-D-229 → derived usage meters (Products declares, Rating evaluates); P-D-230 → the declaration, grammar, evaluator and canonical bytes; P-D-231 → the derived usage type's storage, doors, grants and audit; P-D-232 → a usage SKU's derived ref and its pin; P-D-233 → the derived meter semantics Products answers to pricing (E1b); P-D-250 → the approvals inbox's source; P-D-251 → one input, and a raw meter moving onto its identity wrapper; P-D-257 → the derived type list carries each type's latest version; P-D-266 → quota catalog ownership; P-D-267 → the quota GTS contract; P-D-268 → quota intake; P-D-269 → quota review and separation of duties; P-D-270 → quota definition versions and SKU applicability; P-D-271 → availability slots; P-D-272 → the catalog reads and the SDK client; P-D-273 → the two quota resources; P-D-274 → migration 000015. The feature `features/quota-catalog.md` owns the quota DoDs. P-D-275 → the quota-set validation for Pricing; P-D-276 → the quota-set judgement; the feature `features/quota-set-validation.md` owns their DoD. Spec §2.2, §4, §6, §7.2–§7.3 and §13 govern the corresponding sections.

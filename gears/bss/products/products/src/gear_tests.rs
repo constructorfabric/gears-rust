@@ -16,11 +16,11 @@ async fn configured_gear_registers_implemented_routes() -> anyhow::Result<()> {
     assert!(gear.runtime.load_full().is_some());
     assert_eq!(
         crate::infra::storage::migrations::Migrator::migrations().len(),
-        16,
-        "the schema guard, coordination and the fourteen PriceBook migrations (000009: the unit's \
+        17,
+        "the schema guard, coordination and the fifteen PriceBook migrations (000009: the unit's \
          note, P-D-219; 000010: no retired default, P-D-220; 000011: retire_pending, P-D-248; \
          000012: the derived usage types, P-D-231; 000013: a derived SKU stores no unit, P-D-259; \
-         000014: the archive mark, P-D-263)"
+         000014: the archive mark, P-D-263; 000015: the quota catalog, P-D-274)"
     );
     let openapi = OpenApiRegistryImpl::new();
     let router = gear.register_rest(&ctx, Router::new(), &openapi)?;
@@ -77,6 +77,18 @@ async fn configured_gear_registers_implemented_routes() -> anyhow::Result<()> {
         "bss_products.list_derived_usage_types",
         "bss_products.get_derived_usage_type",
         "bss_products.get_derived_usage_type_version",
+        "bss_products.create_quota_adapter_target",
+        "bss_products.list_quota_adapter_targets",
+        "bss_products.get_quota_adapter_target",
+        "bss_products.run_quota_discovery",
+        "bss_products.create_quota_candidate",
+        "bss_products.list_quota_candidates",
+        "bss_products.get_quota_candidate",
+        "bss_products.submit_quota_candidate",
+        "bss_products.approve_quota_candidate",
+        "bss_products.reject_quota_candidate",
+        "bss_products.list_quota_definitions",
+        "bss_products.get_quota_definition",
     ];
     expected.sort_unstable();
     assert_eq!(actual, expected);
@@ -251,6 +263,20 @@ async fn served_query_parameters_are_typed_and_the_list_publishes_its_odata_voca
         ],
         "{categories}"
     );
+    // P-D-272: the quota definition list publishes its five terms, each served by `eq` only.
+    let definitions = &api["paths"]["/bss-products/v1/quota-definitions"]["get"];
+    assert_eq!(
+        definitions["x-odata-filter"]["allowedFields"],
+        serde_json::json!({
+            "sku_id": ["eq"],
+            "sku_version": ["eq"],
+            "subject_type_ref": ["eq"],
+            "resource_type_ref": ["eq"],
+            "profile_id": ["eq"]
+        }),
+        "{definitions}"
+    );
+    assert!(definitions["x-odata-orderby"].is_null(), "{definitions}");
     // P-D-213, P-D-214: the history and the versions publish no OData vocabulary.
     for path in [
         "/bss-products/v1/skus/{id}/history",
@@ -306,9 +332,11 @@ async fn skeleton_harness() -> anyhow::Result<(BssProductsGear, GearCtx)> {
         hub: Arc::new(toolkit::ClientHub::new()),
         actor_names: crate::api::rest::ApiState::names_from(&Arc::new(toolkit::ClientHub::new())),
     });
+    let quota = build_quota_state(&api_state.hub, &api_state, &ProductsConfig::default());
     gear.runtime.store(Some(Arc::new(ProductsRuntime {
         enforcer: Arc::new(crate::test_support::flat_in_enforcer(uuid::Uuid::new_v4())),
         api_state,
+        quota,
         pipeline: tokio::sync::Mutex::new(Some(OutboxLifetime::Interim(pipeline))),
     })));
     let ctx = GearCtx::new(
@@ -827,4 +855,211 @@ async fn the_picker_reads_say_how_they_cache_and_narrow() -> anyhow::Result<()> 
         assert!(list.contains(said), "the list says {said}: {list}");
     }
     Ok(())
+}
+
+/// A gear's hub as `init` leaves it: a PDP that allows `tenant` in its own tenant and a legacy
+/// types-registry client that accepts the gear's label schemas; no `TypesRegistryApi`, no
+/// discovery plugin.
+async fn initialized(
+    tenant: uuid::Uuid,
+) -> (
+    BssProductsGear,
+    Arc<toolkit::ClientHub>,
+    crate::test_support::TestDsn,
+) {
+    use toolkit::Gear;
+    use toolkit::contracts::DatabaseCapability;
+    struct NoConfig;
+    impl toolkit::config::ConfigProvider for NoConfig {
+        fn get_gear_config(&self, _gear: &str) -> Option<&serde_json::Value> {
+            None
+        }
+    }
+    let gear = BssProductsGear::default();
+    let dsn = crate::test_support::TestDsn::new("products-quota-init-");
+    let db = toolkit_db::connect_db(
+        &dsn,
+        toolkit_db::ConnectOpts {
+            max_conns: Some(4),
+            min_conns: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations())
+        .await
+        .unwrap();
+    let hub = Arc::new(toolkit::ClientHub::new());
+    hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(Arc::new(
+        crate::test_support::Spanning {
+            tenants: vec![tenant],
+        },
+    ));
+    hub.register::<dyn types_registry_sdk::TypesRegistryClient>(Arc::new(
+        crate::test_support::Accepting,
+    ));
+    let ctx = GearCtx::new(
+        "bss-products",
+        uuid::Uuid::new_v4(),
+        Arc::new(NoConfig),
+        hub.clone(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .with_db(toolkit_db::DBProvider::new(db));
+    gear.init(&ctx).await.unwrap();
+    (gear, hub, dsn)
+}
+
+/// After the gear's own init, the hub's one `dyn ProductsQuotaCatalogClientV1` is Products'
+/// client over the gear's database: it reads as its caller, so an empty catalog answers an empty
+/// page and an unknown version 404. Before the init nothing answers.
+#[tokio::test]
+async fn the_hubs_quota_catalog_is_products_client_after_the_gears_init() {
+    use bss_products_sdk::quota::catalog::{
+        QuotaAvailabilityFilter, QuotaDefinitionListRequest, QuotaVersion,
+    };
+    let empty = toolkit::ClientHub::new();
+    assert!(
+        empty
+            .get::<dyn bss_products_sdk::ProductsQuotaCatalogClientV1>()
+            .is_err()
+    );
+    let tenant = uuid::Uuid::new_v4();
+    let (_gear, hub, _dsn) = initialized(tenant).await;
+    let client = hub
+        .get::<dyn bss_products_sdk::ProductsQuotaCatalogClientV1>()
+        .unwrap();
+    let caller = crate::test_support::authed_ctx(tenant);
+    let page = client
+        .list_quota_definitions(
+            &caller,
+            QuotaDefinitionListRequest {
+                sku_id: uuid::Uuid::new_v4(),
+                sku_version: QuotaVersion::new(1).unwrap(),
+                subject_type_ref: None,
+                resource_type_ref: None,
+                profile_id: None,
+                locale: None,
+                availability: QuotaAvailabilityFilter::All,
+                limit: None,
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(page.items.is_empty() && page.next_cursor.is_none());
+    let missing = client
+        .get_quota_definition(
+            &caller,
+            uuid::Uuid::new_v4(),
+            QuotaVersion::new(1).unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            missing,
+            toolkit::api::canonical_prelude::CanonicalError::NotFound { .. }
+        ),
+        "{missing:?}"
+    );
+}
+
+/// The router the gear's own `register_rest` serves over a fresh database whose hub holds no
+/// types-registry and no discovery plugin, under a PDP that allows the database's tenant; the
+/// first router keeps the outbox running.
+async fn production_router() -> (Router, Router, crate::test_support::TestDsn, uuid::Uuid) {
+    let (db, _, tenant, dsn) = crate::test_support::test_db().await;
+    let (holder, state) = crate::test_support::rest_app_on_db(
+        tenant,
+        |_, _| Router::new(),
+        crate::test_support::resolved_usage_types(),
+        "test",
+        db,
+    )
+    .await;
+    let (router, _) =
+        BssProductsGear::registered_rest(state, crate::test_support::flat_in_enforcer(tenant));
+    (holder, router, dsn, tenant)
+}
+
+/// The gear-built router closes discovery without an adapter: a stored target's discovery is 501
+/// `QUOTA_DISCOVERY_CLOSED` before any read or write, and no snapshot is stored.
+#[tokio::test]
+async fn the_production_wiring_closes_discovery_before_any_effect() {
+    let (_holder, app, dsn, tenant) = production_router().await;
+    let (db, scope) = crate::test_support::repo_connection(&dsn, tenant).await;
+    let target = crate::infra::storage::repo::quota_intake_repo::insert_target(
+        &db.conn().unwrap(),
+        &scope.tenant_only(),
+        tenant,
+        crate::domain::quota::NewQuotaTarget {
+            plugin_instance_id: crate::quota_test_support::TEST_PLUGIN.to_owned(),
+            target_key: "region-1".to_owned(),
+            name: "Region 1".to_owned(),
+        },
+        uuid::Uuid::new_v4(),
+        crate::infra::storage::stored_now(),
+    )
+    .await
+    .unwrap();
+    let response = crate::test_support::post(
+        &app,
+        tenant,
+        &format!(
+            "/bss-products/v1/quota-adapter-targets/{}/discoveries",
+            target.id
+        ),
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), 501);
+    let body = crate::test_support::body_json(response).await;
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("QUOTA_DISCOVERY_CLOSED")),
+        "{body}"
+    );
+    assert_eq!(
+        crate::test_support::raw_i64(&dsn, "SELECT COUNT(*) AS v FROM products_quota_snapshot")
+            .await,
+        0
+    );
+}
+
+/// The gear-built router answers 503 `QUOTA_REGISTRY_UNAVAILABLE` for a target create when the
+/// hub holds no types-registry, and binds nothing.
+#[tokio::test]
+async fn the_production_wiring_answers_503_without_a_registry() {
+    let (_holder, app, dsn, tenant) = production_router().await;
+    let response = crate::test_support::post(
+        &app,
+        tenant,
+        "/bss-products/v1/quota-adapter-targets",
+        serde_json::json!({
+            "plugin_instance_id": crate::quota_test_support::TEST_PLUGIN,
+            "target_key": "region-1",
+            "name": "Region 1"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), 503);
+    let body = crate::test_support::body_json(response).await;
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("QUOTA_REGISTRY_UNAVAILABLE")),
+        "{body}"
+    );
+    assert_eq!(
+        crate::test_support::raw_i64(
+            &dsn,
+            "SELECT COUNT(*) AS v FROM products_quota_adapter_target"
+        )
+        .await,
+        0
+    );
 }

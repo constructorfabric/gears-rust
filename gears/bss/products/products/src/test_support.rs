@@ -1509,6 +1509,117 @@ pub fn violation_for(body: &serde_json::Value, subject: &str) -> Option<String> 
         .and_then(|violation| violation["description"].as_str())
         .map(ToOwned::to_owned)
 }
+// The gear-init fakes: the meter semantics suite and the gear suite both run the gear's own
+// init over them.
+
+/// A permitting PDP whose compiled scope is `In(tenants)` over the owner tenant: one tenant is
+/// the flat-`In` shape a tenant's grant compiles to, several the shape of a grant over a parent
+/// and its children.
+pub struct Spanning {
+    pub tenants: Vec<Uuid>,
+}
+#[async_trait]
+impl AuthZResolverApi for Spanning {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        _req: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Ok(EvaluationResponse {
+            decision: true,
+            context: EvaluationResponseContext {
+                constraints: vec![Constraint {
+                    predicates: vec![Predicate::In(InPredicate::new(
+                        pep_properties::OWNER_TENANT_ID,
+                        self.tenants.clone(),
+                    ))],
+                }],
+                deny_reason: None,
+            },
+        })
+    }
+}
+
+/// The type schemas a batch read answers, by the key it was asked with.
+type SchemasBy<K> =
+    std::collections::HashMap<K, Result<types_registry_sdk::GtsTypeSchema, CanonicalError>>;
+/// The instances a batch read answers, by the key it was asked with.
+type InstancesBy<K> =
+    std::collections::HashMap<K, Result<types_registry_sdk::GtsInstance, CanonicalError>>;
+
+/// The `TypesRegistryClient` the gear's init registers its authz labels with; nothing else is
+/// asked of it.
+pub struct Accepting;
+#[async_trait]
+impl types_registry_sdk::TypesRegistryClient for Accepting {
+    async fn register(
+        &self,
+        _entities: Vec<serde_json::Value>,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, CanonicalError> {
+        Ok(Vec::new())
+    }
+    async fn register_type_schemas(
+        &self,
+        _type_schemas: Vec<serde_json::Value>,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn get_type_schema(
+        &self,
+        _type_id: &str,
+    ) -> Result<types_registry_sdk::GtsTypeSchema, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn get_type_schema_by_uuid(
+        &self,
+        _type_uuid: Uuid,
+    ) -> Result<types_registry_sdk::GtsTypeSchema, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn get_type_schemas(&self, _type_ids: Vec<String>) -> SchemasBy<String> {
+        std::collections::HashMap::new()
+    }
+    async fn get_type_schemas_by_uuid(&self, _type_uuids: Vec<Uuid>) -> SchemasBy<Uuid> {
+        std::collections::HashMap::new()
+    }
+    async fn list_type_schemas(
+        &self,
+        _query: types_registry_sdk::TypeSchemaQuery,
+    ) -> Result<Vec<types_registry_sdk::GtsTypeSchema>, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn register_instances(
+        &self,
+        _instances: Vec<serde_json::Value>,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn get_instance(
+        &self,
+        _id: &str,
+    ) -> Result<types_registry_sdk::GtsInstance, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn get_instance_by_uuid(
+        &self,
+        _uuid: Uuid,
+    ) -> Result<types_registry_sdk::GtsInstance, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+    async fn get_instances(&self, _ids: Vec<String>) -> InstancesBy<String> {
+        std::collections::HashMap::new()
+    }
+    async fn get_instances_by_uuid(&self, _uuids: Vec<Uuid>) -> InstancesBy<Uuid> {
+        std::collections::HashMap::new()
+    }
+    async fn list_instances(
+        &self,
+        _query: types_registry_sdk::InstanceQuery,
+    ) -> Result<Vec<types_registry_sdk::GtsInstance>, CanonicalError> {
+        Err(CanonicalError::internal("unexpected registry call").create())
+    }
+}
+
 // Reuse Pricing's explicit contract provider in the real cross-gear authoring test.
 #[path = "../../../pricing/pricing/tests/policy_support/mod.rs"]
 pub(crate) mod pricing_policy_support;

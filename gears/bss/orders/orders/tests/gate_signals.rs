@@ -139,6 +139,7 @@ fn catalog_answer(cells: Vec<ResolvedCell>) -> CatalogAnswer {
             plan_id: PLAN,
             revision_id: REV,
             cells,
+            quota_terms: None,
         })),
         skus: BTreeMap::from([(SKU, PortAnswer::Answered(sku()))]),
     }

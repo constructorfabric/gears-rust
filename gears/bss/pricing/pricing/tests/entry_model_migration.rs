@@ -137,6 +137,7 @@ impl Lite {
                     && !m.name().contains("000021")
                     && !m.name().contains("000022")
                     && !m.name().contains("000023")
+                    && !m.name().contains("000024")
             })
             .collect();
         run_migrations_for_testing(&self.pool().await, chain).await
@@ -703,6 +704,7 @@ async fn the_forward_migration_moves_the_model_to_the_entry_and_keeps_every_row(
             && !m.name().contains("000021")
             && !m.name().contains("000022")
             && !m.name().contains("000023")
+            && !m.name().contains("000024")
     }) {
         migration.up(&manager).await.unwrap();
     }

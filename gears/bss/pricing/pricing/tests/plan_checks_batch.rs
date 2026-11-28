@@ -310,24 +310,70 @@ async fn the_batch_refuses_a_bad_query_a_missing_grant_and_an_unanswered_registr
     assert!(body.to_string().contains("REGISTRY_UNAVAILABLE"), "{body}");
 }
 
-/// D-482: the checks read is the same statements for one revision and for a wide batch, on a
-/// connection, not under a serializable transaction.
+/// Whether each statement on a Pricing table ran inside a transaction.
+fn in_tx(recorder: &toolkit_db::test_support::QueryRecorder) -> Vec<bool> {
+    recorder
+        .events()
+        .into_iter()
+        .filter(|q| {
+            q.table
+                .as_deref()
+                .is_some_and(|t| t.starts_with("pricing_"))
+        })
+        .map(|q| q.in_tx)
+        .collect()
+}
+
+/// The transactions the statements on Pricing tables ran in, each with the isolation it asked
+/// for; `None` for a statement outside any transaction.
+fn transactions(
+    recorder: &toolkit_db::test_support::QueryRecorder,
+) -> std::collections::BTreeSet<(Option<u64>, Option<String>)> {
+    recorder
+        .events()
+        .into_iter()
+        .filter(|q| {
+            q.table
+                .as_deref()
+                .is_some_and(|t| t.starts_with("pricing_"))
+        })
+        .map(|q| (q.tx_id, q.tx_isolation.map(|level| format!("{level:?}"))))
+        .collect()
+}
+
+/// One transaction, asked for at serializable.
+fn one_serializable_transaction(recorder: &toolkit_db::test_support::QueryRecorder) {
+    let seen = transactions(recorder);
+    assert_eq!(seen.len(), 1, "one transaction: {seen:?}");
+    let (id, isolation) = seen.into_iter().next().unwrap();
+    assert!(id.is_some(), "inside a transaction");
+    assert_eq!(isolation.as_deref(), Some("Serializable"), "serializable");
+}
+
+/// D-482, D-544: the checks read is the same thirteen statements for one revision and for a wide
+/// batch (the quota set rows and rules are two of them), all in one serializable read
+/// transaction, so a set's two statements see one snapshot.
 #[tokio::test]
-async fn the_checks_read_is_eleven_statements_whatever_the_set() {
+async fn the_checks_read_is_thirteen_statements_whatever_the_set() {
     let (f, catalog, recorder) = recorded().await;
     let one = draft_with_entries(&f, &catalog, "one", 1).await;
     recorder.clear();
     let (status, body) = get(&f, &format!("/plan-revisions/{one}/checks")).await;
     assert_eq!(status, 200, "{body}");
     let single = sql(&recorder);
+    let read = in_tx(&recorder);
     assert!(
-        recorder.events().iter().all(|q| !q.in_tx),
-        "the checks read is not a transaction: {:?}",
-        recorder
-            .events()
+        !read.is_empty() && read.iter().all(|in_tx| *in_tx),
+        "the checks read is one transaction: {read:?}"
+    );
+    one_serializable_transaction(&recorder);
+    assert_eq!(
+        single
             .iter()
-            .map(|q| q.in_tx)
-            .collect::<Vec<_>>()
+            .filter(|statement| statement.contains("pricing_plan_quota"))
+            .count(),
+        2,
+        "{single:#?}"
     );
     let mut narrow_ids = Vec::new();
     for i in 0..5 {
@@ -345,11 +391,12 @@ async fn the_checks_read_is_eleven_statements_whatever_the_set() {
     let (status, body) = get(&f, &batch_path(&wide)).await;
     assert_eq!(status, 200, "{body}");
     let fifty = sql(&recorder);
-    assert_eq!(single.len(), 11, "{single:#?}");
+    assert_eq!(single.len(), 13, "{single:#?}");
     assert_eq!(single, five, "one revision and five");
     assert_eq!(
         five, fifty,
         "five revisions of one entry and fifty of twenty"
     );
-    assert!(recorder.events().iter().all(|q| !q.in_tx));
+    assert!(in_tx(&recorder).iter().all(|in_tx| *in_tx));
+    one_serializable_transaction(&recorder);
 }

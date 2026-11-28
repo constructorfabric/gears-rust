@@ -41,7 +41,7 @@ fn the_chain_names_the_plan_summary_migration() {
     );
     assert_eq!(
         names.last().map(String::as_str),
-        Some("m20261003_000023_book_archive")
+        Some("m20261121_000024_plan_quota_rules")
     );
 }
 

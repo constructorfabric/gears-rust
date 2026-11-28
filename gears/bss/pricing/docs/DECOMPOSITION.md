@@ -17,16 +17,18 @@
   - [2.5 Approvals - HIGH](#25-approvals---high)
   - [2.6 Promotions & Migrations - HIGH](#26-promotions--migrations---high)
   - [2.7 Read Contract & Events - HIGH](#27-read-contract--events---high)
+  - [2.8 Plan Quota Rules - HIGH](#28-plan-quota-rules---high)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
 
 ## 1. Overview
 
-Seven features match seven design slices and own 58 DoDs. Part 2a defines every phase in full, with all
+Eight features match eight design slices and own 63 DoDs. Part 2a defines every phase in full, with all
 implementation boxes unchecked. Phase 2b demolishes the legacy code; phase 2c builds foundation, books/entries,
 prices/reference recovery, prices approvals and core events. Phase 3 adds plans (the owner defers promotions, D-409, migration requests and retirement, D-410, and the sold-as bundle and grants, D-411);
 phase 4 adds resolution, pinned reads and consumer goldens; quote is not built (D-415). [DESIGN](DESIGN.md) defines the architecture.
+An eighth feature, plan quota rules, implements the quotas package's feature 2 (D-540) and owns 5 of the 63 DoDs.
 
 The spec is `docs/superpowers/specs/2026-09-24-pricebook-model-design.md`, especially §2.2, §5–§8, §12–§13.
 [DECISIONS](DECISIONS.md) D-384–D-433 records the living rules and explicit no-listener/outbox decisions.
@@ -131,6 +133,20 @@ The spec is `docs/superpowers/specs/2026-09-24-pricebook-model-design.md`, espec
 - **Requirements**: `cpt-cf-bss-pricing-fr-resolve`, `cpt-cf-bss-pricing-fr-price-read`, `cpt-cf-bss-pricing-fr-quote`, `cpt-cf-bss-pricing-fr-events`.
 - **Architecture**: `cpt-cf-bss-pricing-component-read-contract`, `cpt-cf-bss-pricing-component-events`, `cpt-cf-bss-pricing-component-prices`, `cpt-cf-bss-pricing-principle-book-money-independent`, `cpt-cf-bss-pricing-constraint-two-backends`.
 
+### 2.8 [Plan Quota Rules](features/plan-quota-rules.md) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-pricing-feature-plan-quota-rules`
+
+- **Type**: Supporting
+- **Phases**: the quotas programme, after plans and the read contract.
+- **Purpose**: Attach allocation rules to plan revisions and freeze the selected rules with the accepted price terms (quotas package feature 2, `cpt-cf-bss-quotas-feature-plan-rules`).
+- **Depends On**: `cpt-cf-bss-pricing-feature-plans`, `cpt-cf-bss-pricing-feature-read-contract-events`; Products' quota catalog (`ProductsQuotaCatalogClientV1`).
+- **Scope**: 5 implementation DoDs in the linked FEATURE; migration 000024; APIs and storage in slice 08 (D-540 … D-548).
+- **Out of scope**: Enabling a definition for sale (quotas feature 5); a change (increase) acceptance; grant definitions.
+- **Design slice**: [08-plan-quota-rules.md](design/08-plan-quota-rules.md).
+- **Requirements**: `cpt-cf-bss-pricing-fr-plan-quota-rules`, `cpt-cf-bss-pricing-nfr-authz`, `cpt-cf-bss-pricing-nfr-tenant-isolation`, `cpt-cf-bss-pricing-nfr-two-backends`, `cpt-cf-bss-pricing-nfr-idempotency-concurrency`.
+- **Architecture**: `cpt-cf-bss-pricing-component-plans`, `cpt-cf-bss-pricing-component-approvals`, `cpt-cf-bss-pricing-component-read-contract`, `cpt-cf-bss-pricing-constraint-two-backends`, `cpt-cf-bss-pricing-constraint-no-row-locks`, `cpt-cf-bss-pricing-constraint-one-replay-store`.
+
 ## 3. Feature Dependencies
 
 ```mermaid
@@ -138,6 +154,8 @@ flowchart LR
   foundation --> books-entries --> prices-windows-dimension --> approvals
   approvals --> plans --> promotions-migrations --> read-contract-events
   approvals --> read-contract-events
+  plans --> plan-quota-rules
+  read-contract-events --> plan-quota-rules
 ```
 
 This graph orders delivery of the full feature set. Core typed events in entry 2.7 are an explicit phase 2

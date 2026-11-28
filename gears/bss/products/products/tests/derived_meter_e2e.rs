@@ -636,6 +636,7 @@ fn sale_query(
         term: Term::Rolling,
         billing_terms,
         hold_policy_version: 1,
+        expected_quota_digest: None,
     }
 }
 

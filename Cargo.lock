@@ -2341,10 +2341,14 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
+ "gts",
  "proptest",
  "rust_decimal",
+ "schemars 1.2.3",
  "serde",
+ "serde_json",
  "time",
  "uuid",
 ]

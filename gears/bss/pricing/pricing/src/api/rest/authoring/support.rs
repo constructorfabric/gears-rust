@@ -239,6 +239,31 @@ pub fn stored_status(status: i32) -> Result<StatusCode, CanonicalError> {
         .and_then(|s| StatusCode::from_u16(s).ok())
         .ok_or_else(|| CanonicalError::internal("invalid stored status").create())
 }
+/// A key's answer as data: its status, its body and its `ETag`, as an endpoint renders it. A
+/// caller that is not an endpoint (an SDK's local client) reads the body; an endpoint renders it
+/// with [`Answer::response`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answer {
+    pub status: StatusCode,
+    pub body: serde_json::Value,
+    pub etag: Option<u64>,
+}
+impl Answer {
+    /// The answer as the endpoint sends it.
+    /// # Errors
+    /// An `ETag` that is not a header value.
+    pub fn response(&self) -> Result<Response, CanonicalError> {
+        response(self.status, &self.body, self.etag)
+    }
+    /// A stored answer: `{etag, body}` under its stored status.
+    fn stored(status: i32, stored: &serde_json::Value) -> Result<Self, CanonicalError> {
+        Ok(Self {
+            status: stored_status(status)?,
+            body: stored["body"].clone(),
+            etag: stored["etag"].as_u64(),
+        })
+    }
+}
 /// Replay a completed command before detached dependency observations.
 /// # Errors
 /// A conflicting payload or live claim retains its usual canonical refusal.
@@ -249,6 +274,21 @@ pub async fn replay(
     key: &str,
     digest: &[u8],
 ) -> Result<Option<Response>, DoorError> {
+    match replay_answer(db, tenant, endpoint, key, digest).await? {
+        Some(answer) => Ok(Some(answer.response()?)),
+        None => Ok(None),
+    }
+}
+/// [`replay`] as data.
+/// # Errors
+/// As [`replay`].
+pub async fn replay_answer(
+    db: &Db,
+    tenant: Uuid,
+    endpoint: &str,
+    key: &str,
+    digest: &[u8],
+) -> Result<Option<Answer>, DoorError> {
     let conn = db.conn()?;
     let Some(claim) = repo::idempotency_repo::lookup_idempotency_key(
         &conn,
@@ -265,11 +305,7 @@ pub async fn replay(
     let Some((status, body)) = held(claim, digest)? else {
         return Ok(None);
     };
-    Ok(Some(response(
-        stored_status(status)?,
-        &body["body"],
-        body["etag"].as_u64(),
-    )?))
+    Ok(Some(Answer::stored(status, &body)?))
 }
 /// Claim a POST's key inside the mutation transaction, or replay its stored answer.
 /// # Errors
@@ -281,6 +317,21 @@ pub async fn claim(
     key: &str,
     digest: &[u8],
 ) -> Result<Option<Response>, DoorError> {
+    match claim_answer(tx, tenant, endpoint, key, digest).await? {
+        Some(answer) => Ok(Some(answer.response()?)),
+        None => Ok(None),
+    }
+}
+/// [`claim`] as data.
+/// # Errors
+/// As [`claim`].
+pub async fn claim_answer(
+    tx: &impl DBRunner,
+    tenant: Uuid,
+    endpoint: &str,
+    key: &str,
+    digest: &[u8],
+) -> Result<Option<Answer>, DoorError> {
     let now = crate::infra::storage::stored_now();
     let scope = AccessScope::for_tenant(tenant);
     let claim = repo::idempotency_repo::claim_idempotency_key(
@@ -297,11 +348,7 @@ pub async fn claim(
     let Some((status, body)) = held(claim, digest)? else {
         return Ok(None);
     };
-    Ok(Some(response(
-        stored_status(status)?,
-        &body["body"],
-        body["etag"].as_u64(),
-    )?))
+    Ok(Some(Answer::stored(status, &body)?))
 }
 /// Record the answer of a claimed key in the same transaction and render it.
 /// # Errors
@@ -315,6 +362,22 @@ pub async fn answer<T: serde::Serialize>(
     body: &T,
     etag: Option<u64>,
 ) -> Result<Response, DoorError> {
+    Ok(record(tx, tenant, endpoint, key, status, body, etag)
+        .await?
+        .response()?)
+}
+/// [`answer`] as data: the answer recorded.
+/// # Errors
+/// As [`answer`].
+pub async fn record<T: serde::Serialize>(
+    tx: &impl DBRunner,
+    tenant: Uuid,
+    endpoint: &str,
+    key: &str,
+    status: StatusCode,
+    body: &T,
+    etag: Option<u64>,
+) -> Result<Answer, DoorError> {
     let body = value(body)?;
     if repo::idempotency_repo::answer_idempotency_key(
         tx,
@@ -333,7 +396,7 @@ pub async fn answer<T: serde::Serialize>(
             .create()
             .into());
     }
-    Ok(response(status, &body, etag)?)
+    Ok(Answer { status, body, etag })
 }
 #[derive(Debug, thiserror::Error)]
 pub enum DoorError {
@@ -361,10 +424,12 @@ const CURRENCY_NOT_LISTED: &str = "the currency table no longer lists the book's
 /// Refusals of the shared approval engine and the `prices` subject, with their codes.
 ///
 /// A pure-rule refusal is 400 with its code (D-403); a conflict is 409; separation of duties
-/// and the submitter-only withdraw are 403. Database errors stay typed for the retry loop. A
-/// draft whose stored currency scale is not the table's today is 409 `CURRENCY_SCALE_CHANGED`,
-/// and a draft in a currency the table no longer lists is 409 `BOOK_CURRENCY_INVALID`, at submit
-/// and at apply alike; each detail says what the caller can do.
+/// and the submitter-only withdraw are 403; a registry or quota catalog that cannot answer is 503
+/// `REGISTRY_UNAVAILABLE` or `QUOTA_CATALOG_UNAVAILABLE` (D-545). Database errors stay typed for
+/// the retry loop. A draft whose stored currency scale is not the table's today is 409
+/// `CURRENCY_SCALE_CHANGED`, and a draft in a currency the table no longer lists is 409
+/// `BOOK_CURRENCY_INVALID`, at submit and at apply alike; each detail says what the caller can
+/// do.
 #[must_use]
 pub fn approval_failure(error: bss_approval::ApprovalError) -> DoorError {
     use bss_approval::ApprovalError as A;
@@ -403,6 +468,7 @@ pub fn approval_failure(error: bss_approval::ApprovalError) -> DoorError {
             | "PRICE_BOUND"
             | "PRICE_ALREADY_ENDED" => conflict(code).into(),
             "REGISTRY_UNAVAILABLE" => unavailable().into(),
+            "QUOTA_CATALOG_UNAVAILABLE" => crate::infra::plan_quota::unavailable().into(),
             "PRICE_NOT_FOUND" => missing_what("price").into(),
             "REVISION_NOT_FOUND" => missing_what("plan_revision").into(),
             "ENTRY_NOT_FOUND" => missing_entry().into(),
@@ -410,6 +476,8 @@ pub fn approval_failure(error: bss_approval::ApprovalError) -> DoorError {
         },
         A::ApplyRefused { code, detail } => match code {
             "REGISTRY_UNAVAILABLE" => unavailable().into(),
+            // D-545: a quota catalog that cannot answer at the final approve publishes nothing.
+            "QUOTA_CATALOG_UNAVAILABLE" => crate::infra::plan_quota::unavailable().into(),
             // D-520: the cancel's own race, a price that started between submit and apply, keeps
             // its code; every other apply refusal is APPLY_REFUSED naming its cause.
             "PRICE_ALREADY_STARTED" => conflict_because(code, detail).into(),

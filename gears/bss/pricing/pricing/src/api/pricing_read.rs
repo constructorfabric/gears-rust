@@ -1,4 +1,6 @@
 //! Authorized in-process pricing reads over the same snapshots as REST.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 use crate::{
     api::rest::authoring::{
         AuthoringState,
@@ -24,7 +26,7 @@ use bss_pricing_sdk::{
     read::{
         AcceptedBinding, BindingSelection, ChargeKind, ImmutablePrice, IncompleteCommercialInputs,
         PlanQuery, PriceModel, PriceQuery, PriceState, PricingReadV1, ResolveQuery,
-        ResolvedBindings, ResolvedCell, RevisionRef, Tier,
+        ResolvedBindings, ResolvedCell, RevisionRef,
     },
     terms::{BillingCycle, BillingTiming, InputSource, InvoiceInputs, Rounding},
 };
@@ -169,36 +171,13 @@ fn corrupt(detail: impl Into<String>) -> CanonicalError {
 fn price_model(
     price_id: Uuid,
     model: Model,
-    data: PriceData,
+    data: &PriceData,
 ) -> Result<PriceModel, CanonicalError> {
-    if let Some(e) = money::validate(model, &data).first() {
+    if let Some(e) = money::validate(model, data).first() {
         return Err(corrupt(format!("price {price_id}: {}", e.code)));
     }
-    Ok(match data {
-        PriceData::Flat { amount } => PriceModel::Flat { amount },
-        PriceData::PerUnit { rate } => PriceModel::PerUnit { unit_amount: rate },
-        PriceData::Package {
-            package_size,
-            package_price,
-        } => PriceModel::Package {
-            package_size,
-            package_price,
-        },
-        PriceData::Tiers { tiers } => {
-            let tiers = tiers
-                .into_iter()
-                .map(|t| Tier {
-                    up_to: t.up_to,
-                    rate: t.rate,
-                })
-                .collect();
-            if model == Model::Volume {
-                PriceModel::Volume { tiers }
-            } else {
-                PriceModel::Graduated { tiers }
-            }
-        }
-    })
+    money::price_model(model, data)
+        .ok_or_else(|| corrupt(format!("price {price_id}: PRICE_MISSING")))
 }
 /// The price as the contract serves it, read as every other read reads a stored price
 /// (`price_repo::in_book`): money and fee in canonical text, and the currency spec stored on the
@@ -218,7 +197,7 @@ fn immutable(
         price_book_entry_id: row.price_book_entry_id,
         money_digest: [0; 32],
         currency: price.currency,
-        model: price_model(row.id, model, data)?,
+        model: price_model(row.id, model, &data)?,
         minimum_fee: price.min_fee,
         effective_from: row.effective_from,
         ends_on: row
@@ -263,6 +242,10 @@ fn required(value: Option<&str>, field: &'static str) -> Result<String, Canonica
         .map(str::to_owned)
         .ok_or_else(|| incomplete(field))
 }
+/// The snapshot as the typed read answers it: every cell with its binding, and the revision's
+/// quota terms read from its stored rules with no catalog call (D-547), `None` for a revision
+/// without rules. The terms carry every rule of the revision, whatever item the read narrows to,
+/// since the set digest covers them all.
 pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, CanonicalError> {
     let mut cells = Vec::new();
     for r in &s.resolved {
@@ -383,9 +366,20 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
             cells.push(ResolvedCell { selection, binding });
         }
     }
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-preview
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-accept:p1:inst-quota-terms
+    let quota_terms = s
+        .quota
+        .as_ref()
+        .map(crate::infra::plan_quota::quota_terms)
+        .transpose()
+        .map_err(DoorError::from)?;
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-accept:p1:inst-quota-terms
+    // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-preview
     Ok(ResolvedBindings {
         plan_id: s.revision.plan_id,
         revision_id: s.revision.id,
         cells,
+        quota_terms,
     })
 }

@@ -211,14 +211,18 @@ impl CommercialTermsService {
         // still hash to the issued terms digest; never replace BillingTerms or descriptors. The
         // receipt is pricing's own row, checked when it was issued, so a refusal here is a
         // corrupt row (a logged 500), never the caller's error.
-        validate_stored_terms(&receipt.query, &receipt.bindings, &receipt.terms_digest).map_err(
-            |refusal| {
-                RepoError::CorruptRow(format!(
-                    "acceptance receipt {}: {}",
-                    receipt.acceptance_id, refusal.code
-                ))
-            },
-        )?;
+        validate_stored_terms(
+            &receipt.query,
+            &receipt.bindings,
+            receipt.quota.as_ref(),
+            &receipt.terms_digest,
+        )
+        .map_err(|refusal| {
+            RepoError::CorruptRow(format!(
+                "acceptance receipt {}: {}",
+                receipt.acceptance_id, refusal.code
+            ))
+        })?;
         let reader = PricingReadProvider::new(self.state.clone(), self.enforcer.clone());
         let mut prices = Vec::with_capacity(receipt.bindings.len());
         for binding in &receipt.bindings {

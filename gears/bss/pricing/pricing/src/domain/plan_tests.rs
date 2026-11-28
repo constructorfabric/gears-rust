@@ -324,6 +324,11 @@ fn ctx(name: &str, book: u128, items: Vec<Item>) -> PlanContext {
             gl: Some("4000-GEN".into()),
             tax_category: Some("standard".into()),
         },
+        quota_rules: Vec::new(),
+        quota_digest: String::new(),
+        quota_verdict: None,
+        quota_sku_versions: std::collections::BTreeMap::new(),
+        revision_version: 1,
     }
 }
 fn basic() -> PlanContext {
@@ -512,6 +517,7 @@ fn subject_of(c: &PlanContext, n: u128) -> Subject {
         item: it.id,
         sku: it.sku_id,
         entry: it.price_book_entry_id,
+        quota: None,
     }
 }
 
@@ -1170,4 +1176,29 @@ fn spec_8_a_revision_blocked_by_a_pending_price_unit_turns_green_once_it_is_appr
             .blocked_by()
             .is_empty()
     );
+}
+
+/// D-544: a revision without rules has no quota row, even beside a verdict, and its checks are
+/// the rows they were.
+#[test]
+fn a_revision_without_rules_has_no_quota_row() {
+    let plain = basic();
+    let mut judged = basic();
+    judged.quota_verdict = Some(bss_products_sdk::quota::validation::QuotaSetValidation {
+        rules: Vec::new(),
+        checks: Vec::new(),
+    });
+    for c in [&plain, &judged] {
+        let rows = checks(c, today());
+        assert!(
+            rows.iter().all(|k| !k.code.starts_with("QUOTA_")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|k| &k.subjects)
+                .all(|s| s.quota.is_none())
+        );
+    }
+    assert_eq!(checks(&plain, today()), checks(&judged, today()));
 }

@@ -301,3 +301,64 @@ fn a_stored_token_outside_its_set_is_a_corrupt_row_naming_it() {
         assert!(detail.ends_with(&format!("is not a {set}")), "{detail}");
     }
 }
+
+/// D-541, D-542, D-547: a quota rule's basis, its subject and its definition's kind carry the
+/// SDK's tokens, and its saved availability Products' states; each maps to and from its domain
+/// enum one to one.
+#[test]
+fn quota_rule_sets_carry_the_sdk_and_products_tokens() {
+    assert_eq!(
+        round_trips(
+            PricingQuotaBasis::ALL,
+            PricingQuotaBasis::as_str,
+            PricingQuotaBasis::stored,
+        ),
+        [
+            PlanQuotaBasis::Fixed.token(),
+            PlanQuotaBasis::PerPlanUnit.token()
+        ]
+    );
+    assert_eq!(
+        round_trips(
+            PricingQuotaSubjectSelector::ALL,
+            PricingQuotaSubjectSelector::as_str,
+            PricingQuotaSubjectSelector::stored,
+        ),
+        [QuotaSubjectSelector::ResourceOwner.token()]
+    );
+    assert_eq!(
+        round_trips(
+            PricingQuotaKind::ALL,
+            PricingQuotaKind::as_str,
+            PricingQuotaKind::stored,
+        ),
+        [PlanQuotaKind::Allocation.token()]
+    );
+    assert_eq!(
+        PlanQuotaKind::from(PricingQuotaKind::from(PlanQuotaKind::Allocation)),
+        PlanQuotaKind::Allocation
+    );
+    assert_eq!(
+        round_trips(
+            PricingQuotaAvailabilityState::ALL,
+            PricingQuotaAvailabilityState::as_str,
+            PricingQuotaAvailabilityState::stored,
+        ),
+        ["enabled", "disabled", "withdrawn"]
+    );
+    for state in [
+        QuotaAvailabilityState::Enabled,
+        QuotaAvailabilityState::Disabled,
+        QuotaAvailabilityState::Withdrawn,
+    ] {
+        assert_eq!(
+            serde_json::to_value(state).unwrap(),
+            PricingQuotaAvailabilityState::from(state).as_str(),
+            "Products spells {state:?} as Pricing serves it"
+        );
+    }
+    for basis in [PlanQuotaBasis::Fixed, PlanQuotaBasis::PerPlanUnit] {
+        assert_eq!(PricingQuotaBasis::from(basis).as_str(), basis.token());
+        assert_eq!(PlanQuotaBasis::from(PricingQuotaBasis::from(basis)), basis);
+    }
+}

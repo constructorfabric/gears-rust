@@ -72,6 +72,9 @@ pub(super) struct NewSaleQueryDef {
     resolved_bindings_digest: Digest,
     #[serde(with = "crate::commercial::scalars::unsigned")]
     hold_policy_version: u64,
+    /// Not in the schema-2 spelling: this codec writes no expected quota digest and decodes `None`.
+    #[serde(skip)]
+    expected_quota_digest: Option<Digest>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(
@@ -92,6 +95,9 @@ pub(super) struct AcceptanceReceiptDef {
     hold_until: OffsetDateTime,
     #[serde(with = "vec_accepted_binding")]
     bindings: Vec<AcceptedBinding>,
+    /// Not in the schema-2 spelling: this codec writes no quota snapshot and decodes `None`.
+    #[serde(skip)]
+    quota: Option<bss_pricing_sdk::acceptance::AcceptedQuotaSnapshot>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "bss_pricing_sdk::read::Tier", deny_unknown_fields)]

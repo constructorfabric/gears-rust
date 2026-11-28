@@ -80,6 +80,9 @@ reference. The prototype model and the explicit dispositions in spec §3 define 
 | Fence | A durable barrier (`retiring` or `type_change_pending`) preventing new reference reservations. |
 | Reservation | A `price_book_entry`, `plan_item` or `sold_as` reference attempt; reserved and confirmed rows both count as live. |
 | Binding | Pricing's period-specific choice of SKU version and descriptors, retained by the consumer. |
+| Adapter target | One discovery plugin instance and an opaque target key, bound in a tenant, from which Products reads quota capability snapshots (P-D-268). |
+| Quota candidate | A capability record, discovered or authored by hand, staged with its registry evidence for review; it sells nothing (P-D-268, P-D-269). |
+| Quota definition | An approved, immutable version of a commercial quota for one SKU: metric, plan units and bounds, policies, enforcement mapping and profile, with its sale availability kept apart (P-D-270, P-D-271). |
 
 ## 2. Actors
 
@@ -140,7 +143,8 @@ from its own registry (spec §2 decision 17, §4, §7.3, §13).
 Typed SKUs; flat categories; billing descriptors and billing-timing override; usage-type resolution; derived
 usage types (P-D-229); lifecycle; durable dated versions; the three SKU approval kinds; policy settings; reference reservations and fences;
 concurrency and idempotency; browse/search and reference summaries; audit and transactional events
-(spec §3 D, §4, §6, §7.2–§7.3).
+(spec §3 D, §4, §6, §7.2–§7.3); the commercial quota catalog of the quotas package (P-D-266) and the validation of
+a complete quota set for Pricing (P-D-275).
 
 ### 4.2 Out of Scope
 
@@ -265,6 +269,64 @@ CPU, for example), as versioned data with one evaluator that Rating calls (P-D-2
 **Rationale**: owner decision of 2026-10-01 (P-D-229; rating T-D-39); the declaration, grammar and evaluator (P-D-230);
 the storage, doors, grants and audit (P-D-231); the SKU's binding and pin (P-D-232); the meter semantics answered to
 pricing (P-D-233).
+
+#### `fr-quota-catalog`
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-products-fr-quota-catalog`
+
+The registry shall keep the commercial quota catalog of the quotas package (`cpt-cf-bss-quotas-fr-catalog`,
+`cpt-cf-bss-quotas-fr-plan-catalog`): it stages authorized discovery and manual records as candidates, approves them
+into immutable definition versions, and serves them to plan authors (P-D-266).
+
+**Rules**
+
+- Products registers the quota schemas and the discovery plugin specification, and no metric, unit or policy
+  instance. The adapter owner registers those instances in its own namespace against Products' schemas, and its
+  records reference them (P-D-267).
+- An adapter target binds one registered discovery plugin instance and an opaque target key in the tenant.
+  Discovery reads one complete snapshot; incomplete, mixed or mismatched pages store nothing (P-D-268).
+- Every record is judged against types-registry: registered schema and ancestry, the right family for each
+  reference, no minor version in any segment and Products' own segments at `v1`, exact units on one canonical
+  unit, valid accounting and scope policies, English display text. A rejected record becomes no candidate; a
+  registry outage stores nothing (P-D-268).
+- One snapshot per target and revision: the same content recovers the stored candidates, other content conflicts,
+  a lower revision is stale. Drift and retirement are noted for review and change nothing published (P-D-268).
+- A submitter proposes a candidate for one SKU version with plan units whose bounds convert exactly, a fixed and/or
+  per-plan-unit basis (`fixed` and `per_plan_unit` on REST, `Fixed` and `PerPlanUnit` in the SDK), and reviewed
+  conditions with English text; an approver other than the submitter and a manual record's author publishes it
+  (P-D-269). A new version of a named definition is for the same SKU and metric, from any adapter target (P-D-270).
+- An approved definition version, its mapping and its profile never change; a definition applies to the SKU
+  version it was approved against and later ones; every version is unavailable for sale until qualification
+  (P-D-270, P-D-271).
+- Plan authors list the definitions applicable to a SKU version and read exact versions, with localized text, units,
+  bounds, conditions and availability with its reason, without a registry call per row (P-D-272).
+- Grants: `quota_definition` read, author, submit, approve; `quota_adapter_target` read, author (P-D-273).
+
+**Rationale**: the quotas package (ADR 0001, feature 1); owner decisions of 2026-11-19.
+
+#### `fr-quota-set-validation`
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-products-fr-quota-set-validation`
+
+The registry shall validate a complete set of plan quota rules for Pricing against its catalog
+(`cpt-cf-bss-quotas-fr-plan-amount`, `cpt-cf-bss-quotas-fr-qualification-recheck`,
+`cpt-cf-bss-quotas-fr-qualification-changes`): it resolves each exact definition version the caller may read and
+reports every rule and set check it finds (P-D-275, P-D-276).
+
+**Rules**
+
+- `ProductsQuotaCatalogClientV1::validate_quota_set` serves Pricing in the same process, as its caller, under `read`
+  on `quota_definition`; there is no REST endpoint and no new permission (P-D-275).
+- Each rule is judged for its exact version and digest, its SKU and SKU version, its basis and unit, its amount on
+  the unit's grid and its final limit at the quantity, its exact conversion, its scope policy, and the version's
+  availability (P-D-276).
+- The rules of one logical binding need one profile content, one adapter target and one scope selection, whatever
+  their dimension value; an increase or an unchanged set keeps a rule for every prior limit; an increase needs
+  increase support and no lower limit, and an unchanged set equal limits (P-D-276).
+- The answer is facts: every check found and each resolved definition. Only a malformed request, the PDP and a
+  stored row that does not read are errors (P-D-275).
+
+**Rationale**: the quotas package (feature 2, DESIGN §3.3.1.1–§3.3.1.3); owner decision of 2026-11-21.
 
 #### `fr-sku-bundle`
 
@@ -548,11 +610,16 @@ an optional `Idempotency-Key` (spec §7.2 products row, with §2.2 amendments).
 | Categories | `GET /categories` (paged, filtered and ordered on the toolkit's OData), `GET /categories/{id}`, `POST /categories`, `PATCH /categories/{id}`, `POST /categories/{id}/retire`; the reads carry `sku_count`, the SKUs that are not retired naming the category (P-D-215). |
 | Approvals | `GET /approval-units?state&kind&refId` (newest first with `$orderby=submitted_at desc`) and `GET /approval-units/counts` by state and kind (P-D-227), `GET /approval-units/{id}`, each unit with `caller_can_approve` (P-D-228), `POST /approval-units/{id}/approve`, `/reject`, `/withdraw`; approve/reject carry `generation`, reject requires a note; every unit carries its `submit_note` (P-D-219). |
 | Approval policy | `GET /approval-policy` with a content `ETag`, `PUT /approval-policy` under `If-Match`: the tenant default quorum and its optional per-kind overrides (P-D-205); `DELETE /approval-policy/{kind}` under `If-Match` resets a kind's override to the default, and the default is never deleted (P-D-216). The fence TTL is a deployment setting, not a tenant one (P-D-209). |
+| Quota catalog | Adapter targets: `POST /quota-adapter-targets`, `GET /quota-adapter-targets`, `GET /quota-adapter-targets/{id}`, and `POST /quota-adapter-targets/{id}/discoveries` (P-D-268). Candidates: `POST /quota-candidates` for a manual record, `GET /quota-candidates`, `GET /quota-candidates/{id}`, and `POST /quota-candidates/{id}/submit`, `/approve` and `/reject` under `If-Match` (P-D-269). Definitions: `GET /quota-definitions` and `GET /quota-definitions/{id}/versions/{version}` (P-D-272). |
 
 The `products-sdk` surface exposes `Sku`, `SkuType`, `Lifecycle`, `Category`, `SkuVersion` and
 `SkuChangedPayload`. The usage-type catalog port remains available, and the `SkuUsageV1` port, which pricing
 fills, carries pricing's usage of SKUs to the SKU reads (P-D-197). `ProductCatalogClientV1` and its browse
 transport (`GET /bss-products/v1/browse`) remain until phase 2, as required by the Task 3 interface boundary.
+`ProductsQuotaCatalogClientV1` serves the two quota definition reads in-process, as its caller (P-D-272), and
+validates a complete set of plan quota rules for Pricing with `validate_quota_set`, with no REST endpoint (P-D-275).
+Its module also holds the quota GTS schemas, the discovery plugin specification, exact units and the canonical
+digests (P-D-267).
 
 ### 7.2 External Integration Contracts
 
@@ -566,6 +633,9 @@ transport (`GET /bss-products/v1/browse`) remain until phase 2, as required by t
   resolvable reference and a unit (spec §4, §15).
 - **Approval library**: both gears own their approval storage and implement the shared `bss-approval` subject
   contract for collection, validation, locking, snapshot, apply and unlock (spec §6).
+- **Quota discovery plugin**: adapters implement `ProductsQuotaDiscoveryPluginClientV1` (P-D-267); Products calls
+  it read-only. The adapter owner registers its plugin instance under the discovery specification in
+  types-registry, which Products reads as the caller to judge each record (P-D-268).
 
 ## 8. Use Cases
 
@@ -860,6 +930,68 @@ transport (`GET /bss-products/v1/browse`) remain until phase 2, as required by t
 - **Then** the sale is accepted; a policy with another unit or another accrual is refused `METER_POLICY_MISMATCH`, a raw
   meter is answered as unconfigured, another tenant's type is unknown, and a store outage is 503 (P-D-233).
 
+**AC #33. Quota intake and replay — `fr-quota-catalog`**
+
+- **Given** an adapter target whose plugin answers one complete snapshot with valid records and one record that names
+  an unregistered metric, and a second tenant (quotas criterion Q-C37).
+- **When** an administrator runs discovery, runs it again at the same revision, runs it at that revision with other
+  content, and authors a manual record for the target.
+- **Then** the first run stages one candidate per valid record and lists the other as rejected
+  `QUOTA_REFERENCE_UNKNOWN`; the second answers the stored candidates; the third is 409 `QUOTA_SOURCE_CONFLICT`; a unit
+  named as the metric is refused `QUOTA_REFERENCE_FAMILY`; the second tenant cannot read or discover the target; the
+  manual record passes the same judgement and keeps its author (P-D-268).
+
+**AC #34. Units, versions and continuity — `fr-quota-catalog`**
+
+- **Given** records on a bytes metric in GB and in GiB, a metric that is not an allocation metric, and snapshots that
+  are incomplete (quotas criterion Q-C38).
+- **When** the records are judged, discovered and proposed.
+- **Then** only allocation metrics enter; GB and GiB reach bytes by their own factors, and a GiB step is inexact in
+  GB; a zero denominator and a zero step are refused; pages of two revisions and a registry outage store nothing and
+  answer 503; a capability missing from a complete snapshot is a `retired` note and a changed registry record a
+  `drift` note, and neither changes a published definition (P-D-267, P-D-268).
+
+**AC #35. Catalog reads — `fr-quota-catalog`**
+
+- **Given** definitions of one SKU approved at SKU versions 2 and 4, and a second tenant (quotas criterion Q-C57).
+- **When** a plan author lists the catalog for SKU versions 1, 2 and 4, with and without `availability=all`, pages
+  with a cursor, and reads an exact version.
+- **Then** each list answers the versions approved at that SKU version or earlier; the default list answers enabled
+  versions only, none before qualification, and `all` adds the disabled ones with reason `qualification_pending`; a
+  cursor under other filters, or one that another tenant sends, is 400; an older version reads as stored after a
+  newer one; a PDP outage is 503, not an empty page; and no read asks the registry (P-D-270, P-D-271, P-D-272).
+
+**AC #36. Registry evolution — `fr-quota-catalog`**
+
+- **Given** a record on a derived capability schema with validated properties, references that carry a minor version
+  or name a `v2` family, and an approved definition (quotas criterion Q-C67).
+- **When** the records are judged, and the registry later revises the content of the definition's metric.
+- **Then** the derived schema is accepted with its evidence; the minor-bearing and `v2` references are refused
+  `QUOTA_VERSION_UNSUPPORTED`; the approved definition reads with its original content and digests (P-D-267,
+  P-D-270).
+
+**AC #37. Review with separation, and no sale before qualification — `fr-quota-catalog`, `nfr-authz`**
+
+- **Given** a candidate submitted by its author, and a manual candidate authored by one actor and submitted by
+  another.
+- **When** the submitter approves the first, the author approves the second, a reject is sent without a note, and an
+  independent approver approves the first.
+- **Then** both approvals by the submitter and the author are 403 `SOD_VIOLATION`, the reject is 400 `NOTE_REQUIRED`,
+  and the independent approval publishes definition version 1 with availability `disabled`, reason
+  `qualification_pending` and no qualification reference (P-D-269, P-D-271).
+
+**AC #38. Quota-set validation — `fr-quota-set-validation`**
+
+- **Given** definitions approved in the caller's tenant, one of them not enabled, a definition of a second tenant,
+  and Pricing's plan rules on them (quotas criteria Q-C02, Q-C58 and Q-C65).
+- **When** Pricing validates sets that name an unknown or foreign version, a changed digest, another SKU, a unit
+  outside the allowed ones, an amount off the grid or a fraction, a wrong scope selection, rules of one binding on
+  two adapter targets, or a decrease, and a valid set.
+- **Then** each set is answered with each check on its rule and field, and no content of a foreign definition is
+  answered; the valid set answers its definitions; a version that is not enabled is reported
+  `QUOTA_QUALIFICATION_UNAVAILABLE` with its state and reason; a malformed request is 400 `VALIDATION` (P-D-275,
+  P-D-276).
+
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
@@ -870,6 +1002,7 @@ transport (`GET /bss-products/v1/browse`) remain until phase 2, as required by t
 | Toolkit REST, authz and SecureORM | Existing API infrastructure, deny-by-default permissions, scoped storage and transactional writes. | `p1` |
 | Outbox and audit infrastructure | Persists domain events and terminal approval records with their state changes. | `p1` |
 | SQLite and Postgres harnesses | Verify the same storage semantics on both supported backends. | `p1` |
+| Types-registry and quota discovery adapters | Resolve and validate the quota schemas and every entity a record references, read as the caller; adapters answer capability snapshots through the discovery plugin. Without an adapter, discovery is closed (P-D-267, P-D-268). | `p1` |
 
 ## 11. Assumptions
 
@@ -913,6 +1046,8 @@ in their actor, requirement or use-case blocks above.
 | `fr-sku-descriptors`, `fr-sku-versions` | Spec §2 decision 14; §2.2; §4; §7.1; §8; §12. |
 | `fr-sku-metering`, `fr-sku-bundle` | Spec §3 D; §4; §5; §15. |
 | `fr-derived-usage-type` | Owner decision of 2026-10-01 (P-D-229; rating T-D-39); P-D-230; P-D-231; P-D-232; P-D-233. |
+| `fr-quota-catalog` | Owner decisions of 2026-11-19 (quotas programme); the quotas package's ADR 0001 and feature 1; P-D-266 … P-D-274; AC #33 … #37. |
+| `fr-quota-set-validation` | Owner decision of 2026-11-21 (quotas programme); the quotas package's feature 2 and DESIGN §3.3.1.1; P-D-275, P-D-276; AC #38. |
 | `fr-sku-lifecycle`, `fr-sku-retire-fenced`, `fr-reference-registry` | Spec §2 decision 17; §2.2; §4; §6; §7.2; §13. |
 | `fr-approval-units`, `fr-concurrency-idempotency` | Spec §2 decision 8; §2.2; §3 items 23 and 27; §6; §7.2; §14. |
 | `fr-events`, `fr-read-model` | Spec §3 item 43; §4; §6; §7.3; §12–§13. |

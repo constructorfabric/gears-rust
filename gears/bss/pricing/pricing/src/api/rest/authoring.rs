@@ -10,6 +10,7 @@ pub mod inbox_source;
 mod names;
 pub mod plan_items;
 mod plan_list;
+pub(crate) mod plan_quota;
 mod plan_routes;
 pub(crate) mod plans;
 mod price_book_entries;
@@ -812,9 +813,12 @@ fn approval_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              receipt's revision says when it was submitted and approved (D-461) and, while it is \
              pending, its vote progress (D-462). Refusals: 400 NOTE_TOO_LONG for a note over 2000 \
              characters, judged before anything is read, and BODY_UNEXPECTED for any other key; \
-             400 REVISION_CHECKS_RED with the red checks; 409 REVISION_NOT_DRAFT or \
-             ROW_LOCKED_PENDING; 503 REGISTRY_UNAVAILABLE when Products cannot answer the checks' \
-             SKU reads.",
+             400 REVISION_CHECKS_RED with the red checks, a red quota row included; 409 \
+             REVISION_NOT_DRAFT or ROW_LOCKED_PENDING; 503 REGISTRY_UNAVAILABLE when Products \
+             cannot answer the checks' SKU reads, QUOTA_CATALOG_UNAVAILABLE when the Products \
+             quota catalog cannot answer the checks of a revision with quota rules (D-545). A \
+             Products refusal of the quota rules' validation is answered as Products gave it, for \
+             example 403 when the caller has no read on quota_definition (D-542).",
         )
         .tag("Pricing")
         .authenticated()
@@ -1035,7 +1039,11 @@ fn approval_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
              scale and is never refused for it), or BOOK_CURRENCY_INVALID when the table no \
              longer lists the book's currency; 503 REGISTRY_UNAVAILABLE when Products cannot \
              answer a read the applying vote's rules make: a plan revision's checks, or a usage \
-             chain's dated metering (D-402).",
+             chain's dated metering (D-402); 503 QUOTA_CATALOG_UNAVAILABLE when the Products \
+             quota catalog cannot answer the applying vote's checks of a revision with quota rules \
+             (D-545). A Products refusal of the applying vote's quota rules validation is answered \
+             as Products gave it, for example 403 when the caller has no read on quota_definition \
+             (D-542).",
         )
         .tag("Pricing")
         .authenticated()

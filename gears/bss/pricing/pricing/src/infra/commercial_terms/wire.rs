@@ -1,4 +1,7 @@
-//! Versioned receipt storage. Decoding never recalculates an issued digest or defaults a field.
+//! Versioned receipt storage. Decoding never recalculates an issued digest. It defaults a member
+//! only where its absence has a meaning, and then to `None`: a binding's `meter` on a receipt
+//! written before D-514, and the receipt's `quota` and its query's `expected_quota_digest` on a
+//! receipt without quota terms (D-548). A present quota member is never `null`.
 mod scalars;
 mod v1;
 use crate::infra::storage::RepoError;

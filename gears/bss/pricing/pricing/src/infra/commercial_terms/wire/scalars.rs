@@ -96,6 +96,28 @@ pub(super) mod date_option {
     }
 }
 
+/// A member that may be absent but is never `null`: present, it must hold a value. Used with
+/// `#[serde(default)]`, so only absence decodes as `None`.
+pub(super) fn present<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+/// An optional digest written only when present (`skip_serializing_if`); present, it is a digest,
+/// never `null`.
+pub(super) mod digest_present {
+    use serde::{Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<[u8; 32]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => super::digest::serialize(v, s),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 32]>, D::Error> {
+        super::digest::deserialize(d).map(Some)
+    }
+}
+
 /// Serde must reject a missing nullable field instead of silently defaulting it.
 pub(super) fn required_option<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
     d: D,

@@ -1,5 +1,6 @@
-//! The seventeen grantable Products permissions, registered as GTS instances. A derived usage type
-//! has one, `author` (P-D-231): its reads are `sku:read` (O-3).
+//! The grantable Products permissions, registered as GTS instances. A derived usage type has one,
+//! `author` (P-D-231): its reads are `sku:read` (O-3). The quota catalog's two resources have their
+//! own (P-D-273).
 #![allow(unknown_lints)]
 #![allow(de0901_gts_string_pattern)]
 use crate::authz::{actions, labels};
@@ -175,6 +176,66 @@ gts_instance! {
     }
 }
 
+gts_instance! {
+    #[gts_static(QUOTA_DEFINITION_READ)]
+    AuthzPermissionV1 {
+        id:gts_id!("cf.toolkit.authz.permission.v1~cf.bss.products.quota_definition_read.v1"),
+        resource_type:labels::QUOTA_DEFINITION.to_owned(),
+        action:actions::READ.to_owned(),
+        display_name:"Read quota definition".to_owned(),
+    }
+}
+
+gts_instance! {
+    #[gts_static(QUOTA_DEFINITION_AUTHOR)]
+    AuthzPermissionV1 {
+        id:gts_id!("cf.toolkit.authz.permission.v1~cf.bss.products.quota_definition_author.v1"),
+        resource_type:labels::QUOTA_DEFINITION.to_owned(),
+        action:actions::AUTHOR.to_owned(),
+        display_name:"Author quota definition".to_owned(),
+    }
+}
+
+gts_instance! {
+    #[gts_static(QUOTA_DEFINITION_SUBMIT)]
+    AuthzPermissionV1 {
+        id:gts_id!("cf.toolkit.authz.permission.v1~cf.bss.products.quota_definition_submit.v1"),
+        resource_type:labels::QUOTA_DEFINITION.to_owned(),
+        action:actions::SUBMIT.to_owned(),
+        display_name:"Submit quota definition".to_owned(),
+    }
+}
+
+gts_instance! {
+    #[gts_static(QUOTA_DEFINITION_APPROVE)]
+    AuthzPermissionV1 {
+        id:gts_id!("cf.toolkit.authz.permission.v1~cf.bss.products.quota_definition_approve.v1"),
+        resource_type:labels::QUOTA_DEFINITION.to_owned(),
+        action:actions::APPROVE.to_owned(),
+        display_name:"Approve quota definition".to_owned(),
+    }
+}
+
+gts_instance! {
+    #[gts_static(QUOTA_ADAPTER_TARGET_READ)]
+    AuthzPermissionV1 {
+        id:gts_id!("cf.toolkit.authz.permission.v1~cf.bss.products.quota_adapter_target_read.v1"),
+        resource_type:labels::QUOTA_ADAPTER_TARGET.to_owned(),
+        action:actions::READ.to_owned(),
+        display_name:"Read quota adapter target".to_owned(),
+    }
+}
+
+gts_instance! {
+    #[gts_static(QUOTA_ADAPTER_TARGET_AUTHOR)]
+    AuthzPermissionV1 {
+        id:gts_id!("cf.toolkit.authz.permission.v1~cf.bss.products.quota_adapter_target_author.v1"),
+        resource_type:labels::QUOTA_ADAPTER_TARGET.to_owned(),
+        action:actions::AUTHOR.to_owned(),
+        display_name:"Author quota adapter target".to_owned(),
+    }
+}
+
 /// Enumerate the exact typed permissions registered by this catalog.
 #[must_use]
 pub fn all() -> Vec<&'static AuthzPermissionV1> {
@@ -196,5 +257,11 @@ pub fn all() -> Vec<&'static AuthzPermissionV1> {
         &APPROVAL_UNIT_APPROVE,
         &APPROVAL_UNIT_SETTINGS,
         &DERIVED_USAGE_TYPE_AUTHOR,
+        &QUOTA_DEFINITION_READ,
+        &QUOTA_DEFINITION_AUTHOR,
+        &QUOTA_DEFINITION_SUBMIT,
+        &QUOTA_DEFINITION_APPROVE,
+        &QUOTA_ADAPTER_TARGET_READ,
+        &QUOTA_ADAPTER_TARGET_AUTHOR,
     ]
 }

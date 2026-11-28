@@ -146,6 +146,8 @@ The claim stays protected during delayed fulfillment and uncertain outcomes. A t
 
 G03 requires proof of admission ownership, atomic persistence, recovery and retention. These conditions extend the acquisition contract. They do not prescribe a lease API or resource-cleanup mechanism.
 
+Pricing and Products check only the form of a plan rule's scope value: 1 to 255 printable ASCII bytes for each required dimension (pricing D-541, products P-D-276). Neither resolves an alias or recognizes a wildcard. The scope authority must refuse a wildcard and an unresolved alias, and resolve an alias to its canonical owner ID, before admission. A prior limit that Pricing sends to Products for an increase carries no scope, so this feature's claim keeps the scope of a compatible increase equal to the original acquisition's.
+
 ### 3.4 Change and distribution boundaries
 
 The initial profile allows compatible quantity increases under the same binding and acquisition. It refuses numerical cap decreases and base-plan changes before effects.

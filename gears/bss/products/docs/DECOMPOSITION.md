@@ -15,6 +15,8 @@
   - [2.3 Lifecycle & Approvals - HIGH](#23-lifecycle--approvals---high)
   - [2.4 Read Model & Events - MEDIUM](#24-read-model--events---medium)
   - [2.5 Derived Usage Types - MEDIUM](#25-derived-usage-types---medium)
+  - [2.6 Quota Catalog - HIGH](#26-quota-catalog---high)
+  - [2.7 Quota Set Validation - HIGH](#27-quota-set-validation---high)
 - [3. Feature Dependencies](#3-feature-dependencies)
 
 <!-- /toc -->
@@ -23,9 +25,12 @@
 
 Four features, one per design slice, implement the SKU registry in dependency order after the phase 1b
 structural rewrite, during phase 1c of the PriceBook programme. A fifth, derived usage types, implements P-D-229 on
-DESIGN §3 directly, with no slice of its own. Phase 1a supplies `bss-approval`.
+DESIGN §3 directly, with no slice of its own. A sixth, the quota catalog, implements the quotas package's feature 1
+(P-D-266) on DESIGN §3 directly. A seventh, the quota-set validation, implements Products' part of the quotas
+package's feature 2 (P-D-275) on DESIGN §3 directly. Phase 1a supplies `bss-approval`.
 [DESIGN §3](DESIGN.md#3-technical-architecture) defines the architecture and schema; the features
-own the 36 implementation DoDs (31 in the four slices' features, 5 in derived usage types). The source is `docs/superpowers/specs/2026-09-24-pricebook-model-design.md`
+own the 42 implementation DoDs (31 in the four slices' features, 5 in derived usage types, 5 in the quota
+catalog, 1 in the quota-set validation). The source is `docs/superpowers/specs/2026-09-24-pricebook-model-design.md`
 (spec §2.2, §4, §6, §7.2–§7.3 and §13), with the amendments recorded in [DECISIONS](DECISIONS.md).
 Phase 0 and phase 1 remain unmerged until the phase 2 integration gate (spec §11).
 
@@ -101,11 +106,41 @@ Phase 0 and phase 1 remain unmerged until the phase 2 integration gate (spec §1
 - **Requirements**: `cpt-cf-bss-products-fr-derived-usage-type`.
 - **Architecture**: `cpt-cf-bss-products-component-registry`, `cpt-cf-bss-products-component-events`; `cpt-cf-bss-products-constraint-two-backends`.
 
+### 2.6 [Quota Catalog](features/quota-catalog.md) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-products-feature-quota-catalog`
+
+- **Type**: Supporting
+- **Phases**: the quotas programme, after the derived usage types
+- **Depends On**: `cpt-cf-bss-products-feature-foundation`; types-registry's `TypesRegistryApi`.
+- **Purpose**: Turn authorized adapter evidence and manual records into reviewed, versioned quota definitions a plan author can select (quotas package feature 1, `cpt-cf-bss-quotas-feature-catalog`).
+- **Scope**: Migration `000015`; the quota GTS schemas and discovery plugin specification in `products-sdk`, with no metric, unit or policy instance, which adapter owners register (P-D-267); adapter targets, discovery intake, candidates, review, definition versions and availability slots; two catalog reads and `ProductsQuotaCatalogClientV1` (P-D-266 … P-D-274).
+- **Out of scope**: A discovery adapter and its instances; qualification records and sale availability decisions; the quota-set validation Pricing calls (entry 2.7).
+- **Design slice**: none; [DESIGN](DESIGN.md) §3.1, §3.2, §3.3, §3.4, §3.5 and §3.7 design it.
+- **Requirements**: `cpt-cf-bss-products-fr-quota-catalog`, `cpt-cf-bss-products-nfr-authz`, `cpt-cf-bss-products-nfr-audit`, `cpt-cf-bss-products-nfr-tenant-isolation`, `cpt-cf-bss-products-nfr-two-backends`.
+- **Architecture**: `cpt-cf-bss-products-component-quota-catalog`; `cpt-cf-bss-products-constraint-two-backends`.
+
+### 2.7 [Quota Set Validation](features/quota-set-validation.md) - HIGH
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-products-feature-quota-set-validation`
+
+- **Type**: Supporting
+- **Phases**: the quotas programme, after the quota catalog
+- **Depends On**: `cpt-cf-bss-products-feature-quota-catalog`.
+- **Purpose**: Validate a complete set of plan quota rules for Pricing (quotas package feature 2, Products' part).
+- **Scope**: The SDK method and its judgement (P-D-275, P-D-276); no migration.
+- **Out of scope**: Plan rules themselves (Pricing); qualification records (feature 5).
+- **Design slice**: none; [DESIGN](DESIGN.md) §3.2, §3.3 and §3.4 design it.
+- **Requirements**: `cpt-cf-bss-products-fr-quota-set-validation`, `cpt-cf-bss-products-nfr-authz`, `cpt-cf-bss-products-nfr-tenant-isolation`.
+- **Architecture**: `cpt-cf-bss-products-component-quota-catalog`; `cpt-cf-bss-products-constraint-two-backends`.
+
 ## 3. Feature Dependencies
 
 foundation → sku-categories → lifecycle-approvals → read-model-events
 
 foundation → derived-usage-types
+
+foundation → quota-catalog → quota-set-validation
 
 This is implementation order, not independent release order. Type changes and retirement require both
 the local registry and reciprocal guards from the last feature; a remote count is never a substitute.

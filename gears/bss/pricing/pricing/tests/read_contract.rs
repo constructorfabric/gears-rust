@@ -1396,11 +1396,12 @@ async fn exactly_the_reads_that_declare_an_etag_answer_one() {
         assert_eq!(!tag.is_empty(), declares, "{path}: ETag {tag:?}");
         measured += 1;
     }
-    // 27 with the currency table (D-537), which declares no ETag; 26 was run 9.7's batch checks
+    // 28 with the quota rules read (D-540), whose ETag is the revision's version; 27 with the
+    // currency table (D-537), which declares no ETag; 26 was run 9.7's batch checks
     // read (D-482); 25 was run 9.8b's plans counts (D-485). 24 was run 9.6's reservations read and
     // effective-policy read (D-480, D-481), which declare no ETag. 22 was run 9.3's unit counts
     // (D-470).
-    assert_eq!(measured, 27, "every GET operation is measured");
+    assert_eq!(measured, 28, "every GET operation is measured");
 }
 
 // ------------------------------------------------------------------ phase 9 review R27: the writes' ETag
@@ -1717,6 +1718,12 @@ async fn exactly_the_writes_that_declare_an_etag_answer_one() {
     writes
         .call(f, &me, delete, &item_path, json!({}), None)
         .await;
+    // D-543: the draft's quota rules cleared, which asks Products nothing.
+    let tag = etag_of(f, &revision_path).await;
+    let replace = ("PUT", "/plan-revisions/{id}/quota-rules");
+    let path = format!("{revision_path}/quota-rules");
+    let body = json!({"quota_rules": []});
+    writes.call(f, &me, replace, &path, body, Some(&tag)).await;
     let submit = ("POST", "/plan-revisions/{id}/submit");
     let path = format!("{revision_path}/submit");
     let receipt = writes.call(f, &me, submit, &path, json!({}), None).await.1;
@@ -1779,7 +1786,7 @@ async fn exactly_the_writes_that_declare_an_etag_answer_one() {
         unmeasured.is_empty(),
         "every write op is measured: {unmeasured:?}"
     );
-    assert_eq!(measured.len(), 34, "the 34 write ops of the 61");
+    assert_eq!(measured.len(), 35, "the 35 write ops of the 63");
 }
 
 // ------------------------------------------------------------------ phase 4 review F1: what was refused
@@ -1898,4 +1905,117 @@ async fn busy_prices(f: &Fixture) {
             .await
             .unwrap();
     }
+}
+
+mod quota_support;
+
+/// D-547: `GET /resolve` answers a ruled revision's quota terms, the terms the typed read answers:
+/// the stored set digest and every rule without its availability, with its pinned evidence (the
+/// quota kind and the rule unit's grid and maximum included). A quota-free revision's answer has
+/// no `quota_terms` member, so every earlier answer stays as it was.
+#[tokio::test]
+async fn get_resolve_answers_the_quota_terms() {
+    use bss_pricing_sdk::read::PricingReadV1;
+    let (f, catalog) = setup().await;
+    let fake = quota_support::install(&f);
+    let (published, saved, [cpu, _]) =
+        quota_support::published_with_rules(&f, &catalog, &fake).await;
+    let (s, b) = resolve(
+        &f,
+        &format!("plan_revision_id={}&date=2026-10-01", published.revision),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    let terms = &b["quota_terms"];
+    assert_eq!(
+        terms["quota_rules_digest"], saved["quota_rules_digest"],
+        "{b}"
+    );
+    let rules = terms["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 2, "{b}");
+    for (n, rule) in rules.iter().enumerate() {
+        let mut stored = saved["quota_rules"][n].clone();
+        stored.as_object_mut().unwrap().remove("availability");
+        assert_eq!(
+            rule["rule"], stored,
+            "the rule as stored, without availability"
+        );
+    }
+    let repeated = |c: char| c.to_string().repeat(64);
+    assert_eq!(
+        rules[0]["evidence"],
+        json!({
+            "sku_id": published.sku, "sku_version": "3",
+            "metric_ref": quota_support::VCPU_METRIC, "metric_digest": repeated('b'),
+            "quota_kind": "allocation",
+            "canonical_unit_ref": quota_support::VCPU_UNIT, "unit_digest": repeated('c'),
+            "unit_numerator": "1", "unit_denominator": "1",
+            "unit_min": "0", "unit_step": "1", "unit_max": "1024",
+            "mapping": {"id": Uuid::from_u128(0xa1), "version": "1", "digest": repeated('d')},
+            "profile": {"id": Uuid::from_u128(0xb1), "version": "2", "digest": repeated('e')},
+            "accounting_policy_ref": cpu.accounting_policy_ref,
+            "accounting_policy_digest": repeated('2'),
+            "scope_policy_ref": cpu.scope_policy_ref,
+            "scope_policy_digest": repeated('3'),
+            "initial_set_supported": true, "increase_supported": false,
+        }),
+        "{b}"
+    );
+    assert_eq!(
+        rules[1]["evidence"]["metric_ref"],
+        quota_support::RAM_METRIC
+    );
+    assert_eq!(rules[1]["evidence"]["unit_max"], "4096", "{b}");
+    // The typed read answers the same terms.
+    let provider = bss_pricing::api::pricing_read::PricingReadProvider::new(
+        f.state.clone(),
+        std::sync::Arc::new(plan_support::entry_support::enforcer_for(
+            f.ctx.subject_tenant_id(),
+        )),
+    );
+    let typed = provider
+        .resolve(
+            &f.ctx,
+            bss_pricing_sdk::read::ResolveQuery {
+                catalog: bss_pricing_sdk::read::CatalogRef {
+                    tenant_id: f.ctx.subject_tenant_id(),
+                },
+                revision_id: published.revision,
+                date: date("2026-10-01"),
+                item_id: None,
+                pins: vec![],
+            },
+        )
+        .await
+        .unwrap()
+        .quota_terms
+        .unwrap();
+    for (rest, typed) in rules.iter().zip(&typed.rules) {
+        assert_eq!(rest["rule"]["rule_id"], typed.rule.rule_id.to_string());
+        assert_eq!(rest["evidence"]["metric_ref"], typed.evidence.metric_ref);
+        assert_eq!(
+            rest["evidence"]["profile"]["version"],
+            typed.evidence.profile.version.to_string()
+        );
+        assert_eq!(
+            rest["evidence"]["quota_kind"],
+            typed.evidence.quota_kind.token()
+        );
+        assert_eq!(rest["evidence"]["unit_min"], typed.evidence.unit_min);
+        assert_eq!(rest["evidence"]["unit_step"], typed.evidence.unit_step);
+        assert_eq!(
+            rest["evidence"]["unit_max"],
+            json!(typed.evidence.unit_max),
+            "{b}"
+        );
+    }
+    // A quota-free revision's answer has no member.
+    let free = world().await;
+    let (s, b) = resolve(
+        &free.f,
+        &format!("plan_revision_id={}&date=2026-10-05", free.revision),
+    )
+    .await;
+    assert_eq!(s, 200, "{b}");
+    assert!(b.get("quota_terms").is_none(), "{b}");
 }

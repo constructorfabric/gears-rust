@@ -1,9 +1,13 @@
 //! Schema-1 receipt and hold DTOs. A shape changes in place and keeps schema version 1 (D-532);
 //! a stored field is never reinterpreted.
+//!
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-acceptance:p1
 use super::scalars;
-use bss_pricing_sdk::{Digest, acceptance as a, read as r, terms as t};
+use bss_pricing_sdk::{Digest, acceptance as a, plan_quota as q, read as r, terms as t};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::num::NonZeroU64;
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
@@ -127,6 +131,15 @@ pub(super) struct NewSaleQuery {
 
     #[serde(with = "scalars::integer")]
     pub hold_policy_version: u64,
+
+    /// The preview's selected quota digest (D-548). Absent on a request without one, and omitted
+    /// when absent, so a quota-free receipt keeps its bytes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "scalars::digest_present"
+    )]
+    pub expected_quota_digest: Option<Digest>,
 }
 impl From<a::NewSaleQuery> for NewSaleQuery {
     fn from(v: a::NewSaleQuery) -> Self {
@@ -145,6 +158,7 @@ impl From<a::NewSaleQuery> for NewSaleQuery {
             billing_terms: v.billing_terms.into(),
             resolved_bindings_digest: v.resolved_bindings_digest,
             hold_policy_version: v.hold_policy_version,
+            expected_quota_digest: v.expected_quota_digest,
         }
     }
 }
@@ -165,6 +179,7 @@ impl From<NewSaleQuery> for a::NewSaleQuery {
             billing_terms: v.billing_terms.into(),
             resolved_bindings_digest: v.resolved_bindings_digest,
             hold_policy_version: v.hold_policy_version,
+            expected_quota_digest: v.expected_quota_digest,
         }
     }
 }
@@ -190,6 +205,15 @@ pub(super) struct AcceptanceReceipt {
     pub hold_until: OffsetDateTime,
 
     pub bindings: Vec<AcceptedBinding>,
+
+    /// The frozen quota evidence (D-548). Absent on a receipt without rules, and omitted when
+    /// absent, so a quota-free receipt keeps its bytes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "scalars::present"
+    )]
+    pub quota: Option<AcceptedQuotaSnapshot>,
 }
 impl From<a::AcceptanceReceipt> for AcceptanceReceipt {
     fn from(v: a::AcceptanceReceipt) -> Self {
@@ -201,6 +225,7 @@ impl From<a::AcceptanceReceipt> for AcceptanceReceipt {
             accepted_at: v.accepted_at,
             hold_until: v.hold_until,
             bindings: v.bindings.into_iter().map(Into::into).collect(),
+            quota: v.quota.map(Into::into),
         }
     }
 }
@@ -219,7 +244,373 @@ impl TryFrom<AcceptanceReceipt> for a::AcceptanceReceipt {
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect::<Result<_, _>>()?,
+            quota: v.quota.map(Into::into),
         })
+    }
+}
+
+/// The frozen quota snapshot (D-548): digests as lowercase hex, versions and revisions as
+/// canonical decimal text from 1, the quantity as exact text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AcceptedQuotaSnapshot {
+    #[serde(with = "scalars::digest")]
+    pub selected_quota_digest: Digest,
+
+    #[serde(with = "scalars::digest")]
+    pub quota_snapshot_digest: Digest,
+
+    #[serde(with = "scalars::decimal")]
+    pub original_quantity: Decimal,
+
+    pub rules: Vec<AcceptedQuotaRule>,
+}
+impl From<a::AcceptedQuotaSnapshot> for AcceptedQuotaSnapshot {
+    fn from(v: a::AcceptedQuotaSnapshot) -> Self {
+        Self {
+            selected_quota_digest: v.selected_quota_digest,
+            quota_snapshot_digest: v.quota_snapshot_digest,
+            original_quantity: v.original_quantity,
+            rules: v.rules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+impl From<AcceptedQuotaSnapshot> for a::AcceptedQuotaSnapshot {
+    fn from(v: AcceptedQuotaSnapshot) -> Self {
+        Self {
+            selected_quota_digest: v.selected_quota_digest,
+            quota_snapshot_digest: v.quota_snapshot_digest,
+            original_quantity: v.original_quantity,
+            rules: v.rules.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AcceptedQuotaRule {
+    pub rule: ResolvedQuotaRule,
+
+    pub limit: String,
+
+    #[serde(with = "scalars::integer")]
+    pub availability_revision: NonZeroU64,
+}
+impl From<a::AcceptedQuotaRule> for AcceptedQuotaRule {
+    fn from(v: a::AcceptedQuotaRule) -> Self {
+        Self {
+            rule: v.rule.into(),
+            limit: v.limit,
+            availability_revision: v.availability_revision,
+        }
+    }
+}
+impl From<AcceptedQuotaRule> for a::AcceptedQuotaRule {
+    fn from(v: AcceptedQuotaRule) -> Self {
+        Self {
+            rule: v.rule.into(),
+            limit: v.limit,
+            availability_revision: v.availability_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ResolvedQuotaRule {
+    pub rule: PlanQuotaRule,
+
+    pub evidence: PinnedQuotaEvidence,
+}
+impl From<r::ResolvedQuotaRule> for ResolvedQuotaRule {
+    fn from(v: r::ResolvedQuotaRule) -> Self {
+        Self {
+            rule: v.rule.into(),
+            evidence: v.evidence.into(),
+        }
+    }
+}
+impl From<ResolvedQuotaRule> for r::ResolvedQuotaRule {
+    fn from(v: ResolvedQuotaRule) -> Self {
+        Self {
+            rule: v.rule.into(),
+            evidence: v.evidence.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum PlanQuotaBasis {
+    Fixed,
+    PerPlanUnit,
+}
+impl From<q::PlanQuotaBasis> for PlanQuotaBasis {
+    fn from(v: q::PlanQuotaBasis) -> Self {
+        match v {
+            q::PlanQuotaBasis::Fixed => Self::Fixed,
+            q::PlanQuotaBasis::PerPlanUnit => Self::PerPlanUnit,
+        }
+    }
+}
+impl From<PlanQuotaBasis> for q::PlanQuotaBasis {
+    fn from(v: PlanQuotaBasis) -> Self {
+        match v {
+            PlanQuotaBasis::Fixed => Self::Fixed,
+            PlanQuotaBasis::PerPlanUnit => Self::PerPlanUnit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum QuotaSubjectSelector {
+    ResourceOwner,
+}
+impl From<q::QuotaSubjectSelector> for QuotaSubjectSelector {
+    fn from(v: q::QuotaSubjectSelector) -> Self {
+        match v {
+            q::QuotaSubjectSelector::ResourceOwner => Self::ResourceOwner,
+        }
+    }
+}
+impl From<QuotaSubjectSelector> for q::QuotaSubjectSelector {
+    fn from(v: QuotaSubjectSelector) -> Self {
+        match v {
+            QuotaSubjectSelector::ResourceOwner => Self::ResourceOwner,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum PlanQuotaKind {
+    Allocation,
+}
+impl From<q::PlanQuotaKind> for PlanQuotaKind {
+    fn from(v: q::PlanQuotaKind) -> Self {
+        match v {
+            q::PlanQuotaKind::Allocation => Self::Allocation,
+        }
+    }
+}
+impl From<PlanQuotaKind> for q::PlanQuotaKind {
+    fn from(v: PlanQuotaKind) -> Self {
+        match v {
+            PlanQuotaKind::Allocation => Self::Allocation,
+        }
+    }
+}
+
+/// An exact version reference: a definition, a mapping or a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct VersionRef {
+    #[serde(with = "scalars::uuid")]
+    pub id: Uuid,
+
+    #[serde(with = "scalars::integer")]
+    pub version: NonZeroU64,
+
+    #[serde(with = "scalars::digest")]
+    pub digest: Digest,
+}
+impl From<q::QuotaDefinitionRef> for VersionRef {
+    fn from(v: q::QuotaDefinitionRef) -> Self {
+        Self {
+            id: v.id,
+            version: v.version,
+            digest: v.digest,
+        }
+    }
+}
+impl From<VersionRef> for q::QuotaDefinitionRef {
+    fn from(v: VersionRef) -> Self {
+        Self {
+            id: v.id,
+            version: v.version,
+            digest: v.digest,
+        }
+    }
+}
+impl From<r::QuotaOwnerRef> for VersionRef {
+    fn from(v: r::QuotaOwnerRef) -> Self {
+        Self {
+            id: v.id,
+            version: v.version,
+            digest: v.digest,
+        }
+    }
+}
+impl From<VersionRef> for r::QuotaOwnerRef {
+    fn from(v: VersionRef) -> Self {
+        Self {
+            id: v.id,
+            version: v.version,
+            digest: v.digest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PlanQuotaRule {
+    #[serde(with = "scalars::uuid")]
+    pub rule_id: Uuid,
+
+    pub definition_ref: VersionRef,
+
+    #[serde(with = "scalars::uuid")]
+    pub item_id: Uuid,
+
+    #[serde(deserialize_with = "scalars::required_option")]
+    pub dimension_value: Option<String>,
+
+    pub logical_binding_key: String,
+
+    pub subject_selector: QuotaSubjectSelector,
+
+    pub scope_selection: BTreeMap<String, String>,
+
+    pub amount: String,
+
+    pub unit_ref: String,
+
+    pub basis: PlanQuotaBasis,
+}
+impl From<q::PlanQuotaRuleV1> for PlanQuotaRule {
+    fn from(v: q::PlanQuotaRuleV1) -> Self {
+        Self {
+            rule_id: v.rule_id,
+            definition_ref: v.definition_ref.into(),
+            item_id: v.item_id,
+            dimension_value: v.dimension_value,
+            logical_binding_key: v.logical_binding_key,
+            subject_selector: v.subject_selector.into(),
+            scope_selection: v.scope_selection,
+            amount: v.amount,
+            unit_ref: v.unit_ref,
+            basis: v.basis.into(),
+        }
+    }
+}
+impl From<PlanQuotaRule> for q::PlanQuotaRuleV1 {
+    fn from(v: PlanQuotaRule) -> Self {
+        Self {
+            rule_id: v.rule_id,
+            definition_ref: v.definition_ref.into(),
+            item_id: v.item_id,
+            dimension_value: v.dimension_value,
+            logical_binding_key: v.logical_binding_key,
+            subject_selector: v.subject_selector.into(),
+            scope_selection: v.scope_selection,
+            amount: v.amount,
+            unit_ref: v.unit_ref,
+            basis: v.basis.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PinnedQuotaEvidence {
+    #[serde(with = "scalars::uuid")]
+    pub sku_id: Uuid,
+
+    #[serde(with = "scalars::integer")]
+    pub sku_version: NonZeroU64,
+
+    pub metric_ref: String,
+
+    #[serde(with = "scalars::digest")]
+    pub metric_digest: Digest,
+
+    pub quota_kind: PlanQuotaKind,
+
+    pub canonical_unit_ref: String,
+
+    #[serde(with = "scalars::digest")]
+    pub unit_digest: Digest,
+
+    pub unit_numerator: String,
+
+    pub unit_denominator: String,
+
+    pub unit_min: String,
+
+    pub unit_step: String,
+
+    #[serde(deserialize_with = "scalars::required_option")]
+    pub unit_max: Option<String>,
+
+    pub mapping: VersionRef,
+
+    pub profile: VersionRef,
+
+    pub accounting_policy_ref: String,
+
+    #[serde(with = "scalars::digest")]
+    pub accounting_policy_digest: Digest,
+
+    pub scope_policy_ref: String,
+
+    #[serde(with = "scalars::digest")]
+    pub scope_policy_digest: Digest,
+
+    pub initial_set_supported: bool,
+
+    pub increase_supported: bool,
+}
+impl From<r::PinnedQuotaEvidence> for PinnedQuotaEvidence {
+    fn from(v: r::PinnedQuotaEvidence) -> Self {
+        Self {
+            sku_id: v.sku_id,
+            sku_version: v.sku_version,
+            metric_ref: v.metric_ref,
+            metric_digest: v.metric_digest,
+            quota_kind: v.quota_kind.into(),
+            canonical_unit_ref: v.canonical_unit_ref,
+            unit_digest: v.unit_digest,
+            unit_numerator: v.unit_numerator,
+            unit_denominator: v.unit_denominator,
+            unit_min: v.unit_min,
+            unit_step: v.unit_step,
+            unit_max: v.unit_max,
+            mapping: v.mapping.into(),
+            profile: v.profile.into(),
+            accounting_policy_ref: v.accounting_policy_ref,
+            accounting_policy_digest: v.accounting_policy_digest,
+            scope_policy_ref: v.scope_policy_ref,
+            scope_policy_digest: v.scope_policy_digest,
+            initial_set_supported: v.initial_set_supported,
+            increase_supported: v.increase_supported,
+        }
+    }
+}
+impl From<PinnedQuotaEvidence> for r::PinnedQuotaEvidence {
+    fn from(v: PinnedQuotaEvidence) -> Self {
+        Self {
+            sku_id: v.sku_id,
+            sku_version: v.sku_version,
+            metric_ref: v.metric_ref,
+            metric_digest: v.metric_digest,
+            quota_kind: v.quota_kind.into(),
+            canonical_unit_ref: v.canonical_unit_ref,
+            unit_digest: v.unit_digest,
+            unit_numerator: v.unit_numerator,
+            unit_denominator: v.unit_denominator,
+            unit_min: v.unit_min,
+            unit_step: v.unit_step,
+            unit_max: v.unit_max,
+            mapping: v.mapping.into(),
+            profile: v.profile.into(),
+            accounting_policy_ref: v.accounting_policy_ref,
+            accounting_policy_digest: v.accounting_policy_digest,
+            scope_policy_ref: v.scope_policy_ref,
+            scope_policy_digest: v.scope_policy_digest,
+            initial_set_supported: v.initial_set_supported,
+            increase_supported: v.increase_supported,
+        }
     }
 }
 
@@ -1051,3 +1442,7 @@ impl From<BillingTerms> for t::BillingTerms {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "v1_tests.rs"]
+mod v1_tests;

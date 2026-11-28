@@ -682,3 +682,154 @@ async fn dimension_matrix_default_fallback_and_uncovered_cells_match_rest() {
     assert_eq!(uncovered.cells.len(), 3);
     assert!(uncovered.cells.iter().all(|c| c.binding.is_none()));
 }
+
+mod quota_support;
+
+/// The resolve query of `revision` in the fixture tenant on 2026-10-01.
+fn quota_resolve_query(
+    f: &plan_support::Fixture,
+    revision: uuid::Uuid,
+) -> bss_pricing_sdk::read::ResolveQuery {
+    bss_pricing_sdk::read::ResolveQuery {
+        catalog: bss_pricing_sdk::read::CatalogRef {
+            tenant_id: f.ctx.subject_tenant_id(),
+        },
+        revision_id: revision,
+        date: seam_support::date("2026-10-01"),
+        item_id: None,
+        pins: vec![],
+    }
+}
+
+/// The real read provider of the fixture tenant.
+fn quota_provider(
+    f: &plan_support::Fixture,
+) -> bss_pricing::api::pricing_read::PricingReadProvider {
+    bss_pricing::api::pricing_read::PricingReadProvider::new(
+        f.state.clone(),
+        std::sync::Arc::new(plan_support::entry_support::enforcer_for(
+            f.ctx.subject_tenant_id(),
+        )),
+    )
+}
+
+/// D-547: resolve answers every stored rule of a revision with the evidence its definition pinned
+/// at the save (the quota kind and the rule unit's grid and maximum included), and the revision's
+/// stored set digest, the one the revision read answers.
+#[tokio::test]
+async fn resolve_carries_the_quota_terms_of_every_rule() {
+    use bss_pricing_sdk::read::{PinnedQuotaEvidence, QuotaOwnerRef};
+    let (f, catalog) = plan_support::setup().await;
+    let fake = quota_support::install(&f);
+    let (d, saved, [cpu, memory]) = quota_support::published_with_rules(&f, &catalog, &fake).await;
+    let resolved = quota_provider(&f)
+        .resolve(&f.ctx, quota_resolve_query(&f, d.revision))
+        .await
+        .unwrap();
+    let terms = resolved
+        .quota_terms
+        .expect("a revision with rules resolves its terms");
+    assert_eq!(terms.rules.len(), 2);
+    let digest = bss_pricing::infra::usage_policy_wire::digest_text(terms.quota_rules_digest);
+    assert_eq!(digest, saved["quota_rules_digest"]);
+    let (s, read, _) = f
+        .call(
+            "GET",
+            &format!("/plan-revisions/{}", d.revision),
+            serde_json::json!(null),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(s, 200, "{read}");
+    assert_eq!(read["state"], "published", "{read}");
+    assert_eq!(digest, read["quota_rules_digest"]);
+    for (resolved, definition) in terms.rules.iter().zip([&cpu, &memory]) {
+        assert_eq!(resolved.evidence.metric_ref, definition.metric_ref);
+        let unit = &definition.allowed_units[0];
+        assert_eq!(
+            (
+                &resolved.evidence.unit_min,
+                &resolved.evidence.unit_step,
+                &resolved.evidence.unit_max
+            ),
+            (&unit.min, &unit.step, &unit.max),
+            "the grid and maximum of the rule's unit"
+        );
+        assert_eq!(resolved.rule.definition_ref.id, definition.definition_id);
+        assert_eq!(resolved.rule.item_id, d.items[0]);
+    }
+    assert_eq!(terms.rules[0].rule.rule_id, uuid::Uuid::from_u128(1));
+    assert_eq!(terms.rules[0].rule.amount, "10");
+    assert_eq!(terms.rules[1].rule.amount, "20");
+    let three = std::num::NonZeroU64::new(3).unwrap();
+    let digest_of = |c: char| [u8::from_str_radix(&format!("{c}{c}"), 16).unwrap(); 32];
+    assert_eq!(
+        terms.rules[0].evidence,
+        PinnedQuotaEvidence {
+            sku_id: d.sku,
+            sku_version: three,
+            metric_ref: quota_support::VCPU_METRIC.into(),
+            metric_digest: digest_of('b'),
+            quota_kind: bss_pricing_sdk::plan_quota::PlanQuotaKind::Allocation,
+            canonical_unit_ref: quota_support::VCPU_UNIT.into(),
+            unit_digest: digest_of('c'),
+            unit_numerator: "1".into(),
+            unit_denominator: "1".into(),
+            unit_min: "0".into(),
+            unit_step: "1".into(),
+            unit_max: Some("1024".into()),
+            mapping: QuotaOwnerRef {
+                id: uuid::Uuid::from_u128(0xa1),
+                version: std::num::NonZeroU64::MIN,
+                digest: digest_of('d'),
+            },
+            profile: QuotaOwnerRef {
+                id: uuid::Uuid::from_u128(0xb1),
+                version: std::num::NonZeroU64::new(2).unwrap(),
+                digest: digest_of('e'),
+            },
+            accounting_policy_ref: cpu.accounting_policy_ref.clone(),
+            accounting_policy_digest: digest_of('2'),
+            scope_policy_ref: cpu.scope_policy_ref.clone(),
+            scope_policy_digest: digest_of('3'),
+            initial_set_supported: true,
+            increase_supported: false,
+        },
+        "the evidence the rule's definition pinned at the save"
+    );
+}
+
+/// D-547: a revision without rules resolves with no quota terms, so its answer is as before.
+#[tokio::test]
+async fn a_quota_free_revision_resolves_without_terms() {
+    let f = ReadFixture::new().await;
+    let resolved = f
+        .provider
+        .resolve(&f.ctx, f.resolve_query.clone())
+        .await
+        .unwrap();
+    assert!(!resolved.cells.is_empty());
+    assert_eq!(resolved.quota_terms, None);
+}
+
+/// D-547: resolve reads the terms from the stored rules: with the quota catalog down it still
+/// answers them, and it asks the catalog nothing.
+#[tokio::test]
+async fn resolve_reads_the_quota_terms_without_a_catalog_call() {
+    let (f, catalog) = plan_support::setup().await;
+    let fake = quota_support::install(&f);
+    let (d, _, _) = quota_support::published_with_rules(&f, &catalog, &fake).await;
+    let asked = fake.requests().len();
+    fake.go_down();
+    let resolved = quota_provider(&f)
+        .resolve(&f.ctx, quota_resolve_query(&f, d.revision))
+        .await
+        .unwrap();
+    assert_eq!(resolved.quota_terms.map(|t| t.rules.len()), Some(2));
+    assert_eq!(
+        fake.requests().len(),
+        asked,
+        "resolve asks the catalog nothing"
+    );
+}

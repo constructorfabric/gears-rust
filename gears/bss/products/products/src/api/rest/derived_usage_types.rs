@@ -8,6 +8,8 @@
 //!   SKU adopts one only at its own approved first publish (Run 3).
 //! - **Reads** ask `sku:read` (O-3). The decision stays that grant (403 / 503). The SQL filter is
 //!   `tenant_only()` of it, beside the caller's tenant, so a SKU `resource_id` never selects a derived row.
+//!   The `ClientHub` read of one version ([`declaration_in`], P-D-277) runs the version read in a catalog
+//!   tenant the caller names, under `sku:read` in that tenant.
 //! - **The order of the checks** (P-D-202): the caller, the PDP, the JSON body, the replay store,
 //!   the request's shape, the identity and the declaration rules (and, for a new version, its
 //!   type), then each input through the usage-type catalog as the caller; then one transaction
@@ -27,7 +29,7 @@ use super::{
     tx_to_canonical,
 };
 use crate::{
-    authz::{access_scope, actions, labels, resource_types},
+    authz::{access_scope, access_scope_in, actions, labels, resource_types},
     domain::{
         derived::{
             self, ACTION_CREATE, ACTION_VERSION, CODE_TAKEN, DerivedPin, DerivedUsageType,
@@ -48,6 +50,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bss_products_sdk::derived::{DerivedUsageDeclaration, MeterId};
+use bss_products_sdk::derived_read::StoredDerivedDeclaration;
 use bss_rest::conditional_get::{PRIVATE_REVALIDATE, respond};
 use std::sync::Arc;
 use toolkit::api::{
@@ -299,6 +302,25 @@ pub(crate) async fn read_scope(
     ctx: &SecurityContext,
 ) -> Result<AccessScope, CanonicalError> {
     access_scope(enforcer, ctx, &resource_types::SKU, actions::READ, None)
+        .await
+        .map_err(|e| {
+            super::authz_error_to_canonical(e, |reason| {
+                SkuResource::permission_denied()
+                    .with_reason(reason)
+                    .create()
+            })
+        })
+}
+
+/// `sku:read` in a catalog tenant the caller names (P-D-277): the PDP judges the caller's grant in `tenant`, and the
+/// compiled scope must hold it (403 denied, 503 unreachable, as [`read_scope`]). SQL reads use
+/// [`AccessScope::tenant_only`] of it, beside `tenant`.
+pub(crate) async fn read_scope_in(
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    tenant: Uuid,
+) -> Result<AccessScope, CanonicalError> {
+    access_scope_in(enforcer, ctx, &resource_types::SKU, actions::READ, tenant)
         .await
         .map_err(|e| {
             super::authz_error_to_canonical(e, |reason| {
@@ -762,20 +784,77 @@ async fn get_derived_usage_type_version(
     let Ok(version) = MeterId::parse_version(&n) else {
         return Err(not_found());
     };
-    let tenant = ctx.subject_tenant_id();
-    let conn = state.db.conn().map_err(|e| tx_to_canonical(e.into()))?;
-    let t = store::find_type(&conn, &scope, tenant, &code)
-        .await
-        .map_err(|e| stored_row_error(&e))?
-        .ok_or_else(not_found)?;
-    let v = store::find_version(&conn, &scope, tenant, t.id, version)
-        .await
-        .map_err(|e| stored_row_error(&e))?
-        .ok_or_else(not_found)?;
-    let mut body = version_dto(&t, &v).map_err(|e| stored_row_error(&e))?;
+    let mut body = version_in(&state, &scope, ctx.subject_tenant_id(), &code, version).await?;
     // P-D-262: the version's creator.
     state.actor_names.fill(&ctx, &mut body).await;
     Ok(Json(body).into_response())
+}
+
+/// One stored version as the version read answers it, read in `tenant` under `scope`: the version endpoint and the
+/// `ClientHub` read ([`declaration_in`]) share it, so they answer the same refusals and the same digest. 404 when the
+/// tenant holds no type with the code, or the type no such version; a store failure keeps the shared mapping, and a
+/// stored row that does not read is a corrupt row (500).
+async fn version_in(
+    state: &ApiState,
+    scope: &AccessScope,
+    tenant: Uuid,
+    code: &str,
+    version: u32,
+) -> Result<ProductsDerivedUsageTypeVersion, CanonicalError> {
+    let conn = state.db.conn().map_err(|e| tx_to_canonical(e.into()))?;
+    let t = store::find_type(&conn, scope, tenant, code)
+        .await
+        .map_err(|e| stored_row_error(&e))?
+        .ok_or_else(not_found)?;
+    let v = store::find_version(&conn, scope, tenant, t.id, version)
+        .await
+        .map_err(|e| stored_row_error(&e))?
+        .ok_or_else(not_found)?;
+    version_dto(&t, &v).map_err(|e| stored_row_error(&e))
+}
+
+/// The `ClientHub` read of one stored version (P-D-277): the version read of `meter`, in `catalog_tenant` that the
+/// caller names, under `sku:read` in that tenant.
+///
+/// - **The order** (P-D-202): the caller and the named tenant, then the PDP, then the store.
+/// - **The refusals** are the version endpoint's: a nil subject, subject tenant or catalog tenant is 403 before the PDP is
+///   asked (an in-process caller has no 401); a denied `sku:read` in the catalog tenant is 403 and an unreachable PDP
+///   503; an unknown code or version is the endpoint's 404; a store failure keeps the endpoint's mapping; a stored row that does
+///   not read is the endpoint's data-loss 500.
+/// - **The answer** is the endpoint's: the stored declaration, the STORED digest, the output unit as `canonical_unit` and
+///   `derived-v1:<digest>`. No consumer identity is trusted: every caller goes through the PDP.
+///
+/// # Errors
+/// As above.
+pub(crate) async fn declaration_in(
+    state: &ApiState,
+    enforcer: &PolicyEnforcer,
+    ctx: &SecurityContext,
+    catalog_tenant: Uuid,
+    meter: &MeterId,
+) -> Result<StoredDerivedDeclaration, CanonicalError> {
+    if ctx.subject_id().is_nil() || ctx.subject_tenant_id().is_nil() || catalog_tenant.is_nil() {
+        return Err(DerivedUsageTypeResource::permission_denied()
+            .with_reason("a declaration is read by an identified caller in a named catalog tenant")
+            .create());
+    }
+    let scope = read_scope_in(enforcer, ctx, catalog_tenant)
+        .await?
+        .tenant_only();
+    let read = version_in(state, &scope, catalog_tenant, meter.code(), meter.version()).await?;
+    let declaration = DerivedUsageDeclaration::try_from(&read.declaration).map_err(|error| {
+        stored_row_error(&RepoError::CorruptRow(format!(
+            "derived usage type {} version {} declaration: {error}",
+            read.id, read.version
+        )))
+    })?;
+    Ok(StoredDerivedDeclaration {
+        meter: meter.clone(),
+        declaration,
+        digest: read.digest,
+        canonical_unit: read.canonical_unit,
+        accrual_policy_version: read.accrual_policy_version,
+    })
 }
 
 /// The tenant's stored version that `meter` names, read under `scope`, with the declaration as the doors serve it: what

@@ -15,7 +15,7 @@ use bss_orders_sdk::{
     models::OrderVersion,
 };
 use bss_pricing_sdk::{
-    acceptance::{AcceptanceReceipt, Term},
+    acceptance::{AcceptanceReceipt, AcceptedQuotaSnapshot, Term},
     digest,
     read::{BindingSelection, PriceState, ResolvedBindings, ResolvedCell},
     terms::BillingCycle,
@@ -70,12 +70,14 @@ fn reseal(receipt: &mut AcceptanceReceipt) {
                 binding: Some(b.clone()),
             })
             .collect(),
+        quota_terms: None,
     };
     if let Ok(selected) = digest::selected_bindings_digest(&resolved, &receipt.query.selections) {
         receipt.query.resolved_bindings_digest = selected;
     }
     receipt.request_digest = digest::request_digest(&receipt.query);
-    receipt.terms_digest = digest::terms_digest(&receipt.query, &receipt.bindings);
+    receipt.terms_digest =
+        digest::terms_digest(&receipt.query, &receipt.bindings, receipt.quota.as_ref());
 }
 fn evidence(receipt: &AcceptanceReceipt) -> SelectionEvidence<'_> {
     SelectionEvidence {
@@ -283,6 +285,29 @@ fn resealed_receipt_rules_refuse_with_their_exact_error() {
     }
 }
 
+/// This copy of Orders does not carry quota terms, and its pin has no member for them: a receipt
+/// with an expected quota digest or a frozen quota snapshot is refused as `Unsupported` under
+/// valid issuer digests, never pinned without them.
+#[test]
+fn a_receipt_with_quota_terms_is_unsupported_not_dropped() {
+    let mut expected = golden().receipt().clone();
+    expected.query.expected_quota_digest = Some([7; 32]);
+    reseal(&mut expected);
+    let mut frozen = golden().receipt().clone();
+    frozen.quota = Some(AcceptedQuotaSnapshot {
+        selected_quota_digest: [7; 32],
+        quota_snapshot_digest: [8; 32],
+        original_quantity: frozen.query.quantity,
+        rules: Vec::new(),
+    });
+    reseal(&mut frozen);
+    assert_eq!(
+        [new_pin(expected).map(drop), new_pin(frozen).map(drop)],
+        [Err(CodecError::Unsupported), Err(CodecError::Unsupported)],
+        "an expected quota digest, a frozen quota snapshot"
+    );
+}
+
 /// An encoder refusal is `Unsupported`, not `Malformed`: nothing was decoded (D-220).
 #[test]
 fn a_value_the_encoder_refuses_is_unsupported() {
@@ -340,7 +365,10 @@ fn issuer_hashes_do_not_replace_exact_binding_comparison() {
     let mut bindings = r.bindings.clone();
     bindings[2].meter.as_mut().unwrap().version = "changed".into();
     // Current public Pricing digest excludes meter. Preserve it and compare full values anyway.
-    assert_eq!(digest::terms_digest(&r.query, &bindings), r.terms_digest);
+    assert_eq!(
+        digest::terms_digest(&r.query, &bindings, r.quota.as_ref()),
+        r.terms_digest
+    );
     assert_eq!(
         pin.verify_selection(
             &r.query,
@@ -648,6 +676,7 @@ fn a_duplicate_item_under_valid_issuer_digests_is_a_mismatch() {
                 binding: Some(b.clone()),
             })
             .collect(),
+        quota_terms: None,
     };
     // Precondition: the issuer digest accepts the duplicated item.
     assert_eq!(

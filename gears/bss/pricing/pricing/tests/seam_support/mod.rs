@@ -416,6 +416,7 @@ pub fn sale_query() -> bss_pricing_sdk::acceptance::NewSaleQuery {
             selection: selections[0].clone(),
             binding: Some(binding),
         }],
+        quota_terms: None,
     };
     NewSaleQuery {
         tenant_axes: TenantAxes {
@@ -439,6 +440,7 @@ pub fn sale_query() -> bss_pricing_sdk::acceptance::NewSaleQuery {
         term: Term::Rolling,
         billing_terms,
         hold_policy_version: 1,
+        expected_quota_digest: None,
     }
 }
 

@@ -76,7 +76,7 @@ This feature covers draft replacement, concurrent editing, copy/clone, approval,
 
 ### 2.1 Plan quota authoring and acceptance
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-quotas-flow-plan-rules`
+- [x] `p1` - **ID**: `cpt-cf-bss-quotas-flow-plan-rules`
 
 **Actor**: `cpt-cf-bss-quotas-actor-seller`.
 
@@ -88,20 +88,20 @@ This feature covers draft replacement, concurrent editing, copy/clone, approval,
 
 **Steps**:
 
-1. [ ] - `p1` - Read the draft revision and its selected items. - `inst-read`
-2. [ ] - `p1` - Select exact approved quota definitions, units and profile conditions from Products. - `inst-select`
-3. [ ] - `p1` - Enter amounts, rule bases and logical bindings separately from charging terms. - `inst-edit`
-4. [ ] - `p1` - Submit the complete quota collection using the saved revision version and operation identity. - `inst-replace`
-5. [ ] - `p1` - Read checks for that exact saved revision and inspect every failed rule or field. - `inst-check`
-6. [ ] - `p1` - Recheck qualification, then submit and publish through existing approval operations. - `inst-publish`
-7. [ ] - `p1` - Show the selected quota terms and charging terms with the preview digest. - `inst-preview`
-8. [ ] - `p1` - Freeze the selected terms and original quantity only after the expected quota digest matches. - `inst-accept`
+1. [x] - `p1` - Read the draft revision and its selected items. - `inst-read`
+2. [x] - `p1` - Select exact approved quota definitions, units and profile conditions from Products. - `inst-select`
+3. [x] - `p1` - Enter amounts, rule bases and logical bindings separately from charging terms. - `inst-edit`
+4. [x] - `p1` - Submit the complete quota collection using the saved revision version and operation identity. - `inst-replace`
+5. [x] - `p1` - Read checks for that exact saved revision and inspect every failed rule or field. - `inst-check`
+6. [x] - `p1` - Recheck qualification, then submit and publish through existing approval operations. - `inst-publish`
+7. [x] - `p1` - Show the selected quota terms and charging terms with the preview digest. - `inst-preview`
+8. [x] - `p1` - Freeze the selected terms and original quantity only after the expected quota digest matches. - `inst-accept`
 
 ## 3. Processes / Business Logic (CDSL)
 
 ### 3.1 Plan quota authoring and acceptance checks
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-quotas-algo-plan-rules`
+- [x] `p1` - **ID**: `cpt-cf-bss-quotas-algo-plan-rules`
 
 **Input**: Authorized owner request and the pinned evidence defined in DESIGN §3.3.1.1–3.3.1.3.
 
@@ -109,16 +109,16 @@ This feature covers draft replacement, concurrent editing, copy/clone, approval,
 
 **Steps**:
 
-1. [ ] - `p1` - Authorize the caller and target scope for replay or new mutation - `inst-authority`
-2. [ ] - `p1` - Look up the scoped operation identity and compare the original request content before checking the revision required for a new write - `inst-replay`
-3. [ ] - `p1` - **IF** the same authorized operation and content already have a recorded result - `inst-known-operation`
-   1. [ ] - `p1` - **RETURN** the original result without applying it again or requiring its old revision to be current - `inst-replay-result`
-4. [ ] - `p1` - **IF** an existing operation identity has different content - `inst-conflicting-operation`
-   1. [ ] - `p1` - **RETURN** a content conflict without altering the recorded result - `inst-conflict-result`
-5. [ ] - `p1` - Validate the new complete replacement and obtain external evidence before the local transaction - `inst-validate`
-6. [ ] - `p1` - Inside the owner transaction, recheck draft state, revision version and item bindings. Reject a stale new operation without writes - `inst-fence`
-7. [ ] - `p1` - Commit normalized rules, pinned evidence, digest, audit, version and operation result together. Serialize concurrent requests with the same operation identity through the owner idempotency contract - `inst-commit`
-8. [ ] - `p1` - **RETURN** the saved collection and new revision version without provisioning quota - `inst-result`
+1. [x] - `p1` - Authorize the caller and target scope for replay or new mutation - `inst-authority`
+2. [x] - `p1` - Look up the scoped operation identity and compare the original request content before checking the revision required for a new write - `inst-replay`
+3. [x] - `p1` - **IF** the same authorized operation and content already have a recorded result - `inst-known-operation`
+   1. [x] - `p1` - **RETURN** the original result without applying it again or requiring its old revision to be current - `inst-replay-result`
+4. [x] - `p1` - **IF** an existing operation identity has different content - `inst-conflicting-operation`
+   1. [x] - `p1` - **RETURN** a content conflict without altering the recorded result - `inst-conflict-result`
+5. [x] - `p1` - Validate the new complete replacement and obtain external evidence before the local transaction - `inst-validate`
+6. [x] - `p1` - Inside the owner transaction, recheck draft state, revision version and item bindings. Reject a stale new operation without writes - `inst-fence`
+7. [x] - `p1` - Commit normalized rules, pinned evidence, digest, audit, version and operation result together. Serialize concurrent requests with the same operation identity through the owner idempotency contract - `inst-commit`
+8. [x] - `p1` - **RETURN** the saved collection and new revision version without provisioning quota - `inst-result`
 
 ### 3.2 Quantity and charging examples
 
@@ -157,7 +157,7 @@ A known retry with the same scoped operation identity and content returns its or
 
 After an uncertain response, recover through the same operation identity. Read the current revision before making further edits. Replay still requires authorization and follows the owner's idempotency retention contract.
 
-Save and check operations retain qualification and availability evidence with its observation revision and time. This evidence does not serialize every catalog change with Pricing. Submit, approval, publication (including scheduled publication) and new purchase acceptance must each recheck eligibility through owner contracts.
+Save and check operations retain qualification and availability evidence with its observation revision and time. This evidence does not serialize every catalog change with Pricing. Submit, approval, publication (including scheduled publication) and new purchase acceptance must each recheck eligibility through owner contracts. A scheduled publication relies on acceptance's recheck of every sale.
 
 An observed withdrawal blocks new use but preserves historical reads. Uncertain dependencies block the guarded action while leaving saved drafts and accepted purchases intact. Authors can read and remove draft rules whose qualification was withdrawn. They cannot resubmit those rules as an eligible replacement. Complete-set validation reports every failure it can determine without dropping a rule.
 
@@ -185,11 +185,13 @@ This feature uses the owner states defined in DESIGN. It adds no lifecycle state
 
 Owners must implement this behavior and retain passing evidence for every criterion below. Under `DOCS-ONLY` traceability, FEATURE checkboxes and evidence references track implementation. They do not claim that code markers exist or tests have run.
 
+Implementation evidence: Pricing feature [Plan Quota Rules](../../../pricing/docs/features/plan-quota-rules.md) (D-540 … D-546), with its preview and acceptance (D-547, D-548), and Products feature [Quota Set Validation](../../../products/docs/features/quota-set-validation.md) (P-D-275, P-D-276).
+
 **Implements**: `cpt-cf-bss-quotas-flow-plan-rules`, `cpt-cf-bss-quotas-algo-plan-rules`.
 
 **Constraints**: `cpt-cf-bss-quotas-constraint-qualified-profiles`.
 
-**Touches**: PricingQuotaAuthoringClientV1, PricingReadV1::resolve and SellabilityV1::check (DESIGN §3.3.1.2 and §3.6.1). State retention follows `cpt-cf-bss-quotas-db-owner-state` and the evidence entities in `cpt-cf-bss-quotas-entity-evidence-chain`.
+**Touches**: PricingQuotaAuthoringClientV1 and Pricing's quota-rule endpoints, PricingReadV1::resolve and SellabilityV1::check (DESIGN §3.3.1.2 and §3.6.1). State retention follows `cpt-cf-bss-quotas-db-owner-state` and the evidence entities in `cpt-cf-bss-quotas-entity-evidence-chain`.
 
 Follow the security, error, storage, task-runtime and API rules in DESIGN §2.2 and §3.3.7 without exceptions. Check scope on reads, writes, replay and recovery. Test concurrent calls, foreign scopes, lost responses and restart wherever the flow has external effects.
 

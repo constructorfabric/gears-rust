@@ -116,6 +116,18 @@ pub enum RepoRefusal {
     /// The derived usage type version's key: a concurrent writer took this version number
     /// (P-D-231).
     DerivedVersionTaken,
+    /// `uq_products_quota_adapter_target_binding`: the tenant has bound this plugin instance and
+    /// target key (P-D-268).
+    QuotaTargetTaken,
+    /// `uq_products_quota_snapshot_revision`: the target has a snapshot at this revision; the
+    /// caller reads it and answers a replay or a conflict (P-D-268).
+    QuotaSnapshotTaken,
+    /// `uq_products_quota_candidate_manual_record`: the target has a manual candidate for this
+    /// record id (P-D-268).
+    QuotaManualRecordTaken,
+    /// Any unique key of the rows an approval writes: a concurrent approval wrote first
+    /// (P-D-270).
+    QuotaApprovalContended,
 }
 
 impl RepoRefusal {
@@ -132,7 +144,9 @@ impl RepoRefusal {
             Self::CategoryNotFound => "CATEGORY_NOT_FOUND",
             Self::VersionOrder => "VERSION_ORDER",
             Self::DerivedCodeTaken => "DERIVED_CODE_TAKEN",
-            Self::DerivedVersionTaken => "CONTENDED",
+            Self::DerivedVersionTaken | Self::QuotaApprovalContended => "CONTENDED",
+            Self::QuotaTargetTaken => "QUOTA_TARGET_TAKEN",
+            Self::QuotaSnapshotTaken | Self::QuotaManualRecordTaken => "QUOTA_SOURCE_CONFLICT",
         }
     }
 }

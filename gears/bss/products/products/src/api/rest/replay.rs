@@ -9,16 +9,17 @@ use axum::{
     response::Response,
 };
 use serde_json::Value;
-use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::secure::{AccessScope, DBRunner};
 use uuid::Uuid;
 
+/// The claim of a keyed request, or `None` without a key; a key the header cannot carry is
+/// refused as the caller's endpoint names its refusals.
 pub(super) fn input(
     state: &ApiState,
     headers: &HeaderMap,
     endpoint: String,
     body: &Value,
-) -> Result<Option<IdempotencyClaimInput>, CanonicalError> {
+) -> Result<Option<IdempotencyClaimInput>, crate::domain::error::DomainError> {
     Ok(idempotency_key(headers)?.map(|key| {
         IdempotencyClaimInput::new(
             endpoint,

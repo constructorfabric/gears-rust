@@ -1223,7 +1223,7 @@ async fn revision_fingerprint_commits_policy_digest_and_stale_selection_cannot_p
         .await
         .unwrap()
         .unwrap();
-    let before = content(&row, &selected, std::slice::from_ref(&original));
+    let before = content(&row, &selected, std::slice::from_ref(&original), None).unwrap();
     for field in ["digest", "version", "id"] {
         let mut different = original.clone();
         match field {
@@ -1233,7 +1233,7 @@ async fn revision_fingerprint_commits_policy_digest_and_stale_selection_cannot_p
         }
         assert_ne!(
             before,
-            content(&row, &selected, &[different]),
+            content(&row, &selected, &[different], None).unwrap(),
             "fingerprint ignores policy {field}"
         );
     }

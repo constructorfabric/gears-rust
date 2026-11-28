@@ -47,3 +47,7 @@ pub mod infra;
 /// why a test-support module earns its place in this crate in particular.
 #[cfg(test)]
 pub mod test_support;
+
+/// The quota intake's test doubles and fixtures, shared by its suites.
+#[cfg(test)]
+pub mod quota_test_support;

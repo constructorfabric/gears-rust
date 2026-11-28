@@ -252,6 +252,7 @@ impl Catalog {
                 plan_id: PLAN,
                 revision_id: REVISION,
                 cells: vec![bound_cell(ITEM, None, SKU)],
+                quota_terms: None,
             })),
             skus: BTreeMap::from([(SKU, PortAnswer::Answered(sku(SKU, SELLER)))]),
         }

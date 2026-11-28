@@ -415,7 +415,7 @@ impl SubmitPreparation {
                 "the frozen overlap evidence does not cover the receipt",
             ));
         }
-        let terms = terms_digest(&line.query, &receipt.bindings);
+        let terms = terms_digest(&line.query, &receipt.bindings, receipt.quota.as_ref());
         let (acceptance_id, hold_until) = (receipt.acceptance_id, receipt.hold_until);
         let bindings = receipt.bindings.clone();
         let pin = match OrderPin::new(

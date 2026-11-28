@@ -151,6 +151,9 @@ secrecy = { workspace = true }
 
 [dev-dependencies]
 bss-pricing = { workspace = true }
+# `MockTypesRegistry`, the in-memory registry the quota intake tests read through the production
+# adapter.
+types-registry-sdk = { workspace = true, features = ["test-util"] }
 # The approvals inbox over this gear and pricing in one process (P-D-250): the facade's own router.
 bss-approvals = { workspace = true }
 # The SKU list and counts prove a fixed statement count with toolkit-db's `QueryRecorder`

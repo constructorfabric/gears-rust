@@ -1329,6 +1329,18 @@ const DOOR_ACTIONS: &[(&str, &str)] = &[
     ("bss_products.list_derived_usage_types", "read"),
     ("bss_products.get_derived_usage_type", "read"),
     ("bss_products.get_derived_usage_type_version", "read"),
+    ("bss_products.create_quota_adapter_target", "author"),
+    ("bss_products.list_quota_adapter_targets", "read"),
+    ("bss_products.get_quota_adapter_target", "read"),
+    ("bss_products.run_quota_discovery", "author"),
+    ("bss_products.create_quota_candidate", "author"),
+    ("bss_products.list_quota_candidates", "read"),
+    ("bss_products.get_quota_candidate", "read"),
+    ("bss_products.submit_quota_candidate", "submit"),
+    ("bss_products.approve_quota_candidate", "approve"),
+    ("bss_products.reject_quota_candidate", "approve"),
+    ("bss_products.list_quota_definitions", "read"),
+    ("bss_products.get_quota_definition", "read"),
 ];
 
 /// The router the gear's own `register_rest` serves over the fixture's state, under `enforcer`
@@ -1378,7 +1390,8 @@ fn served_doors(f: &Fixture) -> Vec<(Method, String, &'static str)> {
                 .replace("{id}", &Uuid::new_v4().to_string())
                 .replace("{kind}", "sku_publish")
                 .replace("{code}", "cloudlets")
-                .replace("{n}", "1");
+                .replace("{n}", "1")
+                .replace("{version}", "1");
             let path = match id {
                 "bss_products.sku_version_as_of" => format!("{path}?date=2026-09-27"),
                 "bss_products.browse" => format!("{path}?kind=sku"),

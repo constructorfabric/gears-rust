@@ -10,12 +10,20 @@
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-item-rules:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-coverage:p1
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-blocked-by:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-checks:p1
+//!
+//! A revision with quota rules adds the nine quota rows of D-544 after every other row
+//! ([`super::plan_quota::check_rows`]), judged on the verdict its reader read from Products.
+//! Without that verdict the rows fail closed ([`super::plan_quota::unjudged_rows`]): the
+//! revision never reads ready.
 use super::{
     book::{self, Book},
     price::{self, Price},
     price_book_entry::{ChargeKind, ReferenceState as EntryReferenceState, validate_entry_kind},
 };
+use bss_pricing_sdk::plan_quota::PlanQuotaRuleV1;
 use bss_products_sdk::models::{Lifecycle, Sku, SkuType};
+use bss_products_sdk::quota::validation::QuotaSetValidation;
 use std::collections::{BTreeMap, BTreeSet};
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
@@ -154,16 +162,32 @@ pub struct PlanContext {
     pub published_sku_ids: Vec<Uuid>,
     pub quorum: u32,
     pub defaults: Defaults,
+    /// The revision's quota rules as stored, by `rule_id` (D-544); empty for a revision without
+    /// rules.
+    pub quota_rules: Vec<PlanQuotaRuleV1>,
+    /// The stored set digest, lowercase hex: the empty set's for a revision without rules.
+    pub quota_digest: String,
+    /// Products' answer for the rules, which every reader of the checks reads fresh (D-544);
+    /// `None` until it is read, and the checks of a revision with rules then fail closed.
+    pub quota_verdict: Option<QuotaSetValidation>,
+    /// Each ruled item's SKU version on the sale date, read with the verdict (D-542); a SKU
+    /// without one is absent.
+    pub quota_sku_versions: BTreeMap<Uuid, i64>,
+    /// The revision's stored version, read in the same snapshot: the version the checks judged
+    /// (D-544).
+    pub revision_version: i64,
 }
-/// An item a check row is about (D-466): the item, its SKU and the entry it names. The wire names
-/// (`item_id`, ...) are the DTO's, `PricingPlanCheckSubject`; the domain names the aggregates (the
-/// phase 9 review's R55).
+/// An item a check row is about (D-466): the item, its SKU and the entry it names, and for a quota
+/// row the rule and its member (D-544). The wire names (`item_id`, ...) are the DTO's,
+/// `PricingPlanCheckSubject`; the domain names the aggregates (the phase 9 review's R55).
 #[toolkit_macros::domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subject {
     pub item: Uuid,
     pub sku: Uuid,
     pub entry: Option<Uuid>,
+    /// `None` for every row but a quota row.
+    pub quota: Option<super::plan_quota::RuleSubject>,
 }
 /// A pending price that blocks a check row (D-466): its approval unit, the price and its entry.
 /// Ordered by unit, then price, as [`Check::blocked_by`] orders its units. The wire names are the
@@ -334,7 +358,13 @@ pub fn published_rev(
 /// The sale date: `available_from`, or today for "at publish" (the prototype's `planFrom`).
 #[must_use]
 pub fn sale_date(revision: &Revision, today: Date) -> Date {
-    revision.available_from.unwrap_or(today)
+    sale_date_of(revision.available_from, today)
+}
+/// [`sale_date`] of a revision known by its `available_from` alone: the one definition every
+/// reader of a sale date uses, a stored row's included.
+#[must_use]
+pub fn sale_date_of(available_from: Option<Date>, today: Date) -> Date {
+    available_from.unwrap_or(today)
 }
 /// The revision's book, if the context carries it.
 #[must_use]
@@ -659,6 +689,7 @@ fn subjects(ctx: &PlanContext, ids: &BTreeSet<Uuid>) -> Vec<Subject> {
             item: it.id,
             sku: it.sku_id,
             entry: it.price_book_entry_id,
+            quota: None,
         })
         .collect()
 }
@@ -899,7 +930,9 @@ fn info_rows(ctx: &PlanContext) -> Vec<Check> {
     .collect()
 }
 
-/// Every check of a revision on its sale date (the prototype's `validatePlan`), in a fixed order.
+/// Every check of a revision on its sale date (the prototype's `validatePlan`), in a fixed order;
+/// a revision with quota rules ends with the quota rows (D-544), judged on the verdict in `ctx`,
+/// or red without one.
 #[must_use]
 pub fn checks(ctx: &PlanContext, today: Date) -> Vec<Check> {
     let sale = sale_date(&ctx.revision, today);
@@ -909,6 +942,19 @@ pub fn checks(ctx: &PlanContext, today: Date) -> Vec<Check> {
     out.extend(structure_rows(ctx, &t));
     out.extend(sku_rows(ctx, &t));
     out.extend(info_rows(ctx));
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-check
+    if !ctx.quota_rules.is_empty() {
+        if let Some(verdict) = &ctx.quota_verdict {
+            out.extend(super::plan_quota::check_rows(ctx, verdict, sale));
+        } else {
+            tracing::error!(
+                revision_id = %ctx.revision.id,
+                "pricing: a revision's quota rules were checked without Products' verdict"
+            );
+            out.extend(super::plan_quota::unjudged_rows(ctx));
+        }
+    }
+    // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-check
     out
 }
 #[cfg(test)]

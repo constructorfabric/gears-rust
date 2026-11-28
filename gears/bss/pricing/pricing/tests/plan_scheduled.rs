@@ -1114,8 +1114,15 @@ async fn the_checks_answer_a_due_revision_the_same_before_and_after_the_switch_i
         .await
         .unwrap();
     assert_eq!(stored(&f, rev2).await, "published", "persisted");
-    for (revision, before) in [rev2, pro.rev1].into_iter().zip(before) {
-        let after = get(&f, &format!("/plan-revisions/{revision}/checks")).await;
+    for (revision, mut before) in [rev2, pro.rev1].into_iter().zip(before) {
+        let mut after = get(&f, &format!("/plan-revisions/{revision}/checks")).await;
+        // D-544: the checks name the version they judged, which the persisted switch moves; the
+        // rows, the readiness and the rest stay the same.
+        let (was, is) = (
+            before.as_object_mut().unwrap().remove("revision_version"),
+            after.as_object_mut().unwrap().remove("revision_version"),
+        );
+        assert!(was.is_some() && is.is_some(), "{revision}");
         assert_eq!(after, before, "{revision}");
     }
 }

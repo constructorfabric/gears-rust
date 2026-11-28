@@ -12,8 +12,8 @@
       "logical_binding_key": "compute",
       "subject_selector": "resource_owner",
       "amount": "10",
-      "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.bss.products.vcpu.v1",
-      "basis": "PerPlanUnit",
+      "unit_ref": "gts.cf.bss.products.quota_unit.v1~cf.compute.quota_adapter.vcpu.v1",
+      "basis": "per_plan_unit",
       "scope_selection": {
         "region": "region-1",
         "resource_pool": "pool-1"

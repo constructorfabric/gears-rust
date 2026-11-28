@@ -3,10 +3,11 @@
 //! plan's published revision into a new plan, the draft revision's PATCH and delete, and the
 //! revision's checks read over fresh SKUs (D-408).
 //!
-//! A copy writes the revision, every copied item (`unreserved`, no receipt) and one attach op per
-//! item in ONE transaction (D-413); the door then drives the attach ops best-effort and answers
-//! 201, and the ticker finishes what it could not. A draft revision belongs to its author (D-404):
-//! only its `created_by` edits or deletes it and its items.
+//! A copy writes the revision, every copied item (`unreserved`, no receipt), its quota rules on
+//! the copied items (D-545) and one attach op per item in ONE transaction (D-413); the endpoint
+//! then drives the attach ops best-effort and answers 201, and the ticker finishes what it could
+//! not. A draft revision belongs to its author (D-404): only its `created_by` edits or deletes it
+//! and its items.
 //!
 //! Every read renders a revision's state as it reads today (D-447), derived in memory from the
 //! stored rows; no read writes. The three doors that can meet a due scheduled revision — the
@@ -14,6 +15,8 @@
 //! event and audit row.
 //!
 //! @cpt-dod:cpt-cf-bss-pricing-dod-plan-clone:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-checks:p1
+//! @cpt-dod:cpt-cf-bss-pricing-dod-plan-quota-rules-governance:p1
 use super::{
     AuthoringState, configuration,
     dto::{
@@ -32,13 +35,15 @@ use crate::{
     },
     infra::{
         events::TxOutbox,
-        plan_revisions, reference_registry, reference_work,
+        plan_quota, plan_revisions, reference_registry, reference_work,
         storage::{
             RepoError,
             entity::{plan as plan_entity, plan_item, plan_revision, price, price_book_entry},
             repo::{
-                approval_repo, book_repo, dimension_repo, plan_item_repo, plan_repo,
-                plan_revision_repo, price_book_entry_repo, price_repo, reference_op_repo,
+                approval_repo, book_repo, dimension_repo, plan_item_repo,
+                plan_quota_repo::{self, StoredSet},
+                plan_repo, plan_revision_repo, price_book_entry_repo, price_repo,
+                reference_op_repo,
             },
         },
     },
@@ -51,7 +56,10 @@ use bss_products_sdk::models::Sku;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use toolkit_canonical_errors::CanonicalError;
-use toolkit_db::secure::{AccessScope, DBRunner};
+use toolkit_db::{
+    DbTx,
+    secure::{AccessScope, DBRunner},
+};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -154,9 +162,11 @@ async fn plan_body(
 /// grouped read of the entries the items name, one admission of those entries' books under the
 /// caller's `price_book` read (`books`, or none without that grant) and one grouped read of the
 /// admitted entries' default-chain prices on the sale date. A draft or pending revision also
-/// reads the in-effect revision's item SKUs, one statement whether or not one is in effect.
+/// reads the in-effect revision's item SKUs, one statement whether or not one is in effect. Its
+/// quota rules and their stored digest are read in two more statements of the caller's read
+/// transaction, one snapshot (D-540); no digest is computed and Products is not asked.
 async fn revision_read(
-    tx: &impl DBRunner,
+    tx: &DbTx<'_>,
     books: Option<&AccessScope>,
     tenant: Uuid,
     m: plan_revision::Model,
@@ -231,11 +241,14 @@ async fn revision_read(
     } else {
         None
     };
+    let quota = plan_quota_repo::for_revision(tx, &children, tenant, m.id).await?;
     Ok(dto::PricingPlanRevisionReadDto {
         revision: dto,
         sale_date: sale.to_string(),
         entries: summaries,
         carried_sku_ids,
+        quota_rules: dto::quota_rules(&quota)?,
+        quota_rules_digest: quota.digest,
     })
 }
 /// A unit's instants, keyed as the DTOs read them (D-461).
@@ -282,7 +295,10 @@ pub(super) fn progress_of(
         quorum_required: unit.quorum_required,
     })
 }
-fn etag(version: i64) -> Result<u64, CanonicalError> {
+/// A stored version as the `ETag` a read answers.
+/// # Errors
+/// 500 for a negative stored version.
+pub(super) fn etag(version: i64) -> Result<u64, CanonicalError> {
     Ok(
         crate::api::rest::preconditions::RowVersion::from_stored(version)
             .map_err(CanonicalError::from)?
@@ -556,9 +572,10 @@ pub(super) async fn patch(
     )?)
 }
 
-/// `POST /plans/{id}/revisions`: copy the published revision into a new draft (D-413), then drive
-/// the attach ops of its items best-effort and answer 201 with the answer the key recorded. A due
-/// scheduled revision is switched first (D-451), so the copy is of the revision in effect.
+/// `POST /plans/{id}/revisions`: copy the published revision into a new draft (D-413), its quota
+/// rules onto the copied items (D-545), then drive the attach ops of its items best-effort and
+/// answer 201 with the answer the key recorded. A due scheduled revision is switched first
+/// (D-451), so the copy is of the revision in effect.
 /// # Errors
 /// 404 for an unknown plan; 409 `REVISION_DRAFT_EXISTS` while a draft or pending revision exists;
 /// 409 `REVISION_SCHEDULED` while a revision waits for its sale date (D-451); 409
@@ -596,7 +613,7 @@ pub(super) async fn copy(
     Ok(response)
 }
 async fn copy_in(
-    tx: &(impl DBRunner + Sync),
+    tx: &DbTx<'_>,
     outbox: &TxOutbox,
     scope: &AccessScope,
     ctx: &SecurityContext,
@@ -663,8 +680,12 @@ async fn copy_in(
         },
     )
     .await?;
-    let (items, ops) = copy_items(tx, &children, ctx, correlation, source.id, r.id, now).await?;
+    let (items, ops, copies) =
+        copy_items(tx, &children, ctx, correlation, source.id, r.id, now).await?;
     // @cpt-end:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-1
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-copy
+    copy_quota_rules(tx, &children, ctx, (source.id, r.id), &copies, now).await?;
+    // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-copy
     support::audit(tx, ctx, correlation, "plan_revision.copy", r.id, 1).await?;
     let body = PricingPlanRevisionDto::of(&r, items)?;
     let response = support::answer(
@@ -682,8 +703,9 @@ async fn copy_in(
 
 /// Copy every item of the `source` revision into the new draft `target`, in the caller's
 /// transaction (D-413): each copy is written `unreserved` with no receipt and authored by the
-/// caller, with one attach op per copy. Answers the copies and their op ids, for the door to drive
-/// after its commit.
+/// caller, with one attach op per copy. Answers the copies, their op ids, for the endpoint to
+/// drive after its commit, and each source item's copy (source item id to copy id), for the quota
+/// rules (D-545).
 async fn copy_items(
     tx: &impl DBRunner,
     children: &AccessScope,
@@ -692,11 +714,13 @@ async fn copy_items(
     source: Uuid,
     target: Uuid,
     now: time::OffsetDateTime,
-) -> Result<(Vec<plan_item::Model>, Vec<Uuid>), DoorError> {
+) -> Result<(Vec<plan_item::Model>, Vec<Uuid>, BTreeMap<Uuid, Uuid>), DoorError> {
     let tenant = ctx.subject_tenant_id();
     let mut items = Vec::new();
     let mut ops = Vec::new();
+    let mut copies = BTreeMap::new();
     for from in plan_item_repo::for_revision(tx, children, tenant, source).await? {
+        let from_id = from.id;
         // D-467: a copy is a new row, which the repository writes `paid` with no quantity
         // whatever the source row carries; an item without an entry stays one (D-512), so the
         // draft's checks show it ITEM_ENTRY_MISSING.
@@ -721,14 +745,71 @@ async fn copy_items(
         ops.push(op.op_id);
         reference_op_repo::insert(tx, children, op).await?;
         // @cpt-end:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-2
+        copies.insert(from_id, copy.id);
         items.push(copy);
     }
-    Ok((items, ops))
+    Ok((items, ops, copies))
+}
+
+/// Copy the `source` revision's quota rules into the new draft `target`, in the caller's
+/// transaction (D-545): each rule onto the copy of its item (`copies`), with its rule id, exact
+/// definition reference, evidence and availability observation, and the set digest computed again
+/// over the moved rules, whose item ids it covers. A source without rules writes nothing.
+/// Eligibility is never copied: the copy's checks, submit and votes ask Products again.
+/// # Errors
+/// A stored rule that does not convert, or names an item the copy does not carry, is a corrupt
+/// row; storage failures.
+async fn copy_quota_rules(
+    tx: &DbTx<'_>,
+    children: &AccessScope,
+    ctx: &SecurityContext,
+    (source, target): (Uuid, Uuid),
+    copies: &BTreeMap<Uuid, Uuid>,
+    now: time::OffsetDateTime,
+) -> Result<(), DoorError> {
+    let tenant = ctx.subject_tenant_id();
+    let set = plan_quota_repo::for_revision(tx, children, tenant, source).await?;
+    if set.rules.is_empty() {
+        return Ok(());
+    }
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-remap
+    let moved = set
+        .rules
+        .iter()
+        .map(|row| {
+            let mut rule = plan_quota::rule_of(row)?;
+            rule.item_id = copies.get(&rule.item_id).copied().ok_or_else(|| {
+                RepoError::CorruptRow(format!(
+                    "plan quota rule {} of revision {source} names item {}, which the copy does \
+                     not carry",
+                    rule.rule_id, rule.item_id
+                ))
+            })?;
+            Ok(rule)
+        })
+        .collect::<Result<Vec<_>, RepoError>>()?;
+    let digest = crate::infra::usage_policy_wire::digest_text(
+        bss_pricing_sdk::digest::quota_rules_digest(&moved),
+    );
+    plan_quota_repo::copy(
+        tx,
+        children,
+        tenant,
+        source,
+        target,
+        copies,
+        digest,
+        ctx.subject_id(),
+        now,
+    )
+    .await?;
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-remap
+    Ok(())
 }
 
 /// `POST /plans/{id}/clone`: a new plan (its own code and name) whose draft rev 1 copies the
 /// source plan's PUBLISHED revision — the one in effect: a due scheduled revision is switched
-/// first (D-451) — book, sale date and items, under D-413, then drive the
+/// first (D-451) — book, sale date, items and quota rules (D-545), under D-413, then drive the
 /// attach ops of its items best-effort and answer 201 with the new plan. The body's
 /// `available_from` overrides the copied sale date, and null clears it (D-463). Nothing of the
 /// source's approval is copied: no decision, no `approved_by_unit_id` or `published_at`, no pin;
@@ -788,7 +869,7 @@ pub(super) async fn clone(
     reason = "authorized context, replay identity and input belong to one transaction"
 )]
 async fn clone_in(
-    tx: &(impl DBRunner + Sync),
+    tx: &DbTx<'_>,
     outbox: &TxOutbox,
     (scope, books): (&AccessScope, Option<&AccessScope>),
     ctx: &SecurityContext,
@@ -869,8 +950,12 @@ async fn clone_in(
         },
     )
     .await?;
-    let (items, ops) = copy_items(tx, &children, ctx, correlation, published.id, r.id, now).await?;
+    let (items, ops, copies) =
+        copy_items(tx, &children, ctx, correlation, published.id, r.id, now).await?;
     // @cpt-end:cpt-cf-bss-pricing-algo-plans-clone-and-retire:p1:inst-plans-clone-and-retire-1
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-copy
+    copy_quota_rules(tx, &children, ctx, (published.id, r.id), &copies, now).await?;
+    // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-copy
     support::audit(tx, ctx, correlation, "plan.clone", p.id, 1).await?;
     support::audit(tx, ctx, correlation, "plan_revision.create", r.id, 1).await?;
     // A write answers what it wrote (D-453): the new draft with the items it copied (D-460).
@@ -907,7 +992,7 @@ async fn clone_in(
 /// # Errors
 /// 404 for a revision the tenant does not hold.
 pub(super) async fn get_revision(
-    tx: &impl DBRunner,
+    tx: &DbTx<'_>,
     scope: &AccessScope,
     books: Option<&AccessScope>,
     tenant: Uuid,
@@ -1146,10 +1231,11 @@ async fn remap(
     }
     Ok(())
 }
-/// `DELETE /plan-revisions/{id}`: remove an unlocked draft of the caller with every item, each
-/// with its delete op, in one transaction (D-414); then drive the releases best-effort and
-/// answer 204. The last revision of a never-published plan takes the plan with it in the same
-/// transaction, freeing its code (D-417); a plan with a published revision stays as it is.
+/// `DELETE /plan-revisions/{id}`: remove an unlocked draft of the caller with its quota rules and
+/// set row (D-545) and every item, each with its delete op, in one transaction (D-414); then drive
+/// the releases best-effort and answer 204. The last revision of a never-published plan takes the
+/// plan with it in the same transaction, freeing its code (D-417); a plan with a published revision
+/// stays as it is.
 /// # Errors
 /// 404; 409 `REVISION_NOT_DRAFT`; 403 `NOT_DRAFT_AUTHOR`; 409 `ITEM_CONFIRMATION_PENDING` while
 /// an item's confirm is outstanding; 409 `STALE_REVISION` for a lost race.
@@ -1168,6 +1254,7 @@ pub(super) async fn delete_revision(
             let children = AccessScope::for_tenant(tenant);
             let m = find_revision(tx, &scope, tenant, id).await?;
             editable(&m, &ctx)?;
+            drop_quota_rules(tx, &children, tenant, id).await?;
             let mut ops = Vec::new();
             for item in plan_item_repo::for_revision(tx, &children, tenant, id).await? {
                 ops.push(plan_items::remove(tx, &children, &ctx, correlation, item.id).await?);
@@ -1193,38 +1280,73 @@ pub(super) async fn delete_revision(
     plan_items::drive_best_effort(&state, &original_ctx, &ops).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
+/// A draft's quota rules and set row, removed before its items, which the rules name (D-545).
+async fn drop_quota_rules(
+    tx: &impl DBRunner,
+    children: &AccessScope,
+    tenant: Uuid,
+    id: Uuid,
+) -> Result<(), DoorError> {
+    // @cpt-begin:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-item-delete
+    plan_quota_repo::delete_for_draft(tx, children, tenant, id).await?;
+    // @cpt-end:cpt-cf-bss-pricing-algo-plan-quota-rules-govern:p1:inst-quota-item-delete
+    Ok(())
+}
 
 /// `GET /plan-revisions/{id}/checks`: every check on the sale date (D-408, D-482). The stored
-/// state is read on a connection, not under a serializable transaction; then every item SKU is
-/// read fresh in one `skus_for_write`, never from a cache, so a SKU deprecated since the last
-/// read turns its check red at once. A SKU Products no longer knows (404) is unavailable in the
-/// checks; any other definite refusal is answered as Products gave it; a registry that cannot
-/// answer is 503 `REGISTRY_UNAVAILABLE`.
+/// state is read in one serializable read transaction, so the revision, its items and its quota
+/// set are one snapshot (D-544); then, outside it, every item SKU is read fresh in one
+/// `skus_for_write`, never from a cache, so a SKU deprecated since the last read turns its check
+/// red at once, and a revision with quota rules is validated by Products' quota catalog
+/// ([`judge_quotas`]). A SKU Products no longer knows (404) is unavailable in the checks; any
+/// other definite refusal is answered as Products gave it; a registry that cannot answer is 503
+/// `REGISTRY_UNAVAILABLE`, a quota catalog that cannot answer 503 `QUOTA_CATALOG_UNAVAILABLE`,
+/// never a green answer. A read that stays contended past its retries is 409 `CONTENDED`.
 /// # Errors
-/// 404 for a revision the tenant does not hold; the registry's refusal or unavailability.
+/// 404 for a revision the tenant does not hold; the registry's or the catalog's refusal or
+/// unavailability; 409 `CONTENDED`.
 pub(super) async fn checks(
     state: &AuthoringState,
     scope: AccessScope,
     ctx: SecurityContext,
     id: Uuid,
 ) -> Result<Response, CanonicalError> {
-    let tenant = ctx.subject_tenant_id();
-    let today = today();
-    let conn = state.db.conn().map_err(DoorError::from)?;
-    let mut context = stored_context(&conn, &scope, tenant, id, today).await?;
-    // @cpt-begin:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-3
-    context.skus = fresh_skus(&state.hub, &ctx, context.items.iter().map(|i| i.sku_id)).await?;
-    let body = checks_dto(&context, today);
-    // @cpt-end:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-3
+    let body = checks_body(state, scope, &ctx, id).await?;
     support::response(StatusCode::OK, &body, None)
 }
-/// `GET /plan-revisions/checks`: the checks of 1 to 50 revisions, each byte-identical to the
-/// single read (D-482). One `stored_contexts` and, when any revision is held, one
-/// `skus_for_write` over the union of their SKUs. A revision the tenant does not hold, or one
-/// outside the caller's plan-read scope, is `missing`. An answer that is all `missing` makes no
-/// Products call.
+/// [`checks`]'s answer, for a caller already authorized as `read` on `plan` (`scope`): the
+/// endpoint and the SDK's `check_plan_revision` answer it alike (D-540).
 /// # Errors
-/// Products' definite refusal as it gave it; 503 `REGISTRY_UNAVAILABLE`.
+/// As [`checks`].
+pub async fn checks_body(
+    state: &AuthoringState,
+    scope: AccessScope,
+    ctx: &SecurityContext,
+    id: Uuid,
+) -> Result<PricingPlanChecksDto, CanonicalError> {
+    let tenant = ctx.subject_tenant_id();
+    let today = today();
+    let mut context = support::transaction_door_read(&state.db.db(), move |tx| {
+        let scope = scope.clone();
+        Box::pin(async move { stored_context(tx, &scope, tenant, id, today).await })
+    })
+    .await?;
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-3
+    context.skus = fresh_skus(&state.hub, ctx, context.items.iter().map(|i| i.sku_id)).await?;
+    judge_quotas(&state.hub, ctx, [&mut context], today).await?;
+    let body = checks_dto(&context, today);
+    // @cpt-end:cpt-cf-bss-pricing-flow-plans:p1:inst-plans-flow-3
+    Ok(body)
+}
+/// `GET /plan-revisions/checks`: the checks of 1 to 50 revisions, each byte-identical to the
+/// single read (D-482). One `stored_contexts` in one serializable read transaction and, when any
+/// revision is held, one `skus_for_write` over the union of their SKUs and the quota validation
+/// of each revision with rules ([`judge_quotas`]), outside it. A revision the tenant does not
+/// hold, or one outside the caller's plan-read scope, is `missing`. An answer that is all
+/// `missing` makes no Products call.
+/// # Errors
+/// Products' definite refusal as it gave it; 503 `REGISTRY_UNAVAILABLE` or
+/// `QUOTA_CATALOG_UNAVAILABLE`; 409 `CONTENDED` for a read contended past its retries.
 pub(super) async fn checks_batch(
     state: &AuthoringState,
     scope: AccessScope,
@@ -1233,8 +1355,12 @@ pub(super) async fn checks_batch(
 ) -> Result<Response, CanonicalError> {
     let tenant = ctx.subject_tenant_id();
     let today = today();
-    let conn = state.db.conn().map_err(DoorError::from)?;
-    let mut contexts = stored_contexts(&conn, &scope, tenant, &ids, today).await?;
+    let read = ids.clone();
+    let mut contexts = support::transaction_door_read(&state.db.db(), move |tx| {
+        let (scope, read) = (scope.clone(), read.clone());
+        Box::pin(async move { stored_contexts(tx, &scope, tenant, &read, today).await })
+    })
+    .await?;
     if !contexts.is_empty() {
         let named: Vec<Uuid> = contexts
             .values()
@@ -1249,6 +1375,7 @@ pub(super) async fn checks_batch(
                 .cloned()
                 .collect();
         }
+        judge_quotas(&state.hub, &ctx, contexts.values_mut(), today).await?;
     }
     let mut items = Vec::new();
     let mut missing = Vec::new();
@@ -1267,6 +1394,86 @@ pub(super) async fn checks_batch(
         None,
     )
 }
+/// Products' verdict for each context that holds quota rules, read fresh on every checks read
+/// (D-542, D-544): one SKU version read per distinct SKU and sale date across the contexts, then
+/// one validation per revision with rules, as the caller, both outside any transaction and on a
+/// task of their own. A context without rules reads nothing and asks no catalog. A set none of
+/// whose SKUs has a version on the sale date asks no catalog either: Pricing's own rows report
+/// each rule.
+/// # Errors
+/// 503 `QUOTA_CATALOG_UNAVAILABLE` or `REGISTRY_UNAVAILABLE` for an outage, never a green answer;
+/// a Products refusal as Products gave it.
+async fn judge_quotas<'a>(
+    hub: &toolkit::ClientHub,
+    ctx: &SecurityContext,
+    contexts: impl IntoIterator<Item = &'a mut PlanContext>,
+    today: time::Date,
+) -> Result<(), CanonicalError> {
+    use crate::domain::plan_quota::RuleItem;
+    use bss_products_sdk::quota::validation::QuotaSetValidation;
+    // @cpt-begin:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-check
+    let ruled: Vec<&mut PlanContext> = contexts
+        .into_iter()
+        .filter(|context| !context.quota_rules.is_empty())
+        .collect();
+    let ruled_skus = |context: &PlanContext| -> BTreeSet<Uuid> {
+        context
+            .quota_rules
+            .iter()
+            .filter_map(|rule| context.items.iter().find(|item| item.id == rule.item_id))
+            .map(|item| item.sku_id)
+            .collect()
+    };
+    let mut wanted: BTreeMap<time::Date, BTreeSet<Uuid>> = BTreeMap::new();
+    for context in &ruled {
+        let sale = plan::sale_date(&context.revision, today);
+        wanted.entry(sale).or_default().extend(ruled_skus(context));
+    }
+    let mut versions_on = BTreeMap::new();
+    for (sale, skus) in wanted {
+        let skus: Vec<Uuid> = skus.into_iter().collect();
+        versions_on.insert(sale, plan_quota::sku_versions(hub, ctx, &skus, sale).await?);
+    }
+    for context in ruled {
+        let sale = plan::sale_date(&context.revision, today);
+        let own = ruled_skus(context);
+        let versions: BTreeMap<Uuid, i64> = versions_on
+            .get(&sale)
+            .into_iter()
+            .flatten()
+            .filter(|(sku, _)| own.contains(sku))
+            .map(|(sku, version)| (*sku, *version))
+            .collect();
+        let items: Vec<RuleItem> = context
+            .items
+            .iter()
+            .map(|item| RuleItem {
+                id: item.id,
+                sku_id: item.sku_id,
+                // The request reads only each item's SKU; the rows judge the dimension.
+                dimension_key: None,
+            })
+            .collect();
+        let request = plan_quota::set_request(
+            &context.quota_rules,
+            &items,
+            &versions,
+            plan_quota::Purpose::Authoring,
+        );
+        let verdict = if request.rules.is_empty() {
+            QuotaSetValidation {
+                rules: Vec::new(),
+                checks: Vec::new(),
+            }
+        } else {
+            plan_quota::validate(hub, ctx, request).await?
+        };
+        context.quota_verdict = Some(verdict);
+        context.quota_sku_versions = versions;
+    }
+    // @cpt-end:cpt-cf-bss-pricing-flow-plan-quota-rules:p1:inst-quota-check
+    Ok(())
+}
 fn checks_dto(context: &PlanContext, today: time::Date) -> PricingPlanChecksDto {
     let rows = plan::checks(context, today);
     let ready = plan::ready(&rows);
@@ -1275,6 +1482,8 @@ fn checks_dto(context: &PlanContext, today: time::Date) -> PricingPlanChecksDto 
         ready,
         sale_date: plan::sale_date(&context.revision, today).to_string(),
         quorum_required: context.quorum,
+        revision_version: context.revision_version,
+        quota_rules_digest: context.quota_digest.clone(),
     }
 }
 /// Every SKU named, read fresh through one `skus_for_write` and never from a cache (D-408): the
@@ -1320,7 +1529,7 @@ fn corrupt(what: String) -> DoorError {
 /// # Errors
 /// 404 for a revision the tenant does not hold; storage failures.
 pub async fn stored_context(
-    tx: &impl DBRunner,
+    tx: &DbTx<'_>,
     scope: &AccessScope,
     tenant: Uuid,
     id: Uuid,
@@ -1332,17 +1541,20 @@ pub async fn stored_context(
         .ok_or_else(|| support::missing_what("plan_revision").into())
 }
 /// The checks' stored context for every revision among `ids` the caller's scope admits, each
-/// built from the same reads as [`stored_context`] (D-482). Eleven statements whatever the number
-/// of revisions and entries, once any revision is held: the revisions, their plans, their items,
-/// the entries, the prices, the books, the dimensions, the plans' revisions, the in-effect items,
-/// the policy and the settings. An id the tenant does not hold, or the scope does not admit, is
-/// absent. The caller's scope is used only to admit the revisions; the rest is the tenant's, as
-/// the single read's is.
+/// built from the same reads as [`stored_context`] (D-482, D-544). Thirteen statements whatever
+/// the number of revisions and entries, once any revision is held: the revisions, their plans,
+/// their items, their quota set rows and their quota rules, the entries, the prices, the books,
+/// the dimensions, the plans' revisions, the in-effect items, the policy and the settings. It
+/// takes the caller's transaction, so the quota set rows and rules (and the rest) are one
+/// snapshot. Each context carries its revision's stored rules and set digest (the empty set's
+/// for a revision without rules), and no quota verdict: each checks read asks Products. An id
+/// the tenant does not hold, or the scope does not admit, is absent. The caller's scope is used
+/// only to admit the revisions; the rest is the tenant's, as the single read's is.
 ///
 /// # Errors
 /// Storage failures, including a corrupt row.
 pub async fn stored_contexts(
-    tx: &impl DBRunner,
+    tx: &DbTx<'_>,
     scope: &AccessScope,
     tenant: Uuid,
     ids: &[Uuid],
@@ -1365,6 +1577,7 @@ pub async fn stored_contexts(
     for row in plan_item_repo::for_revisions(tx, &children, tenant, &revision_ids).await? {
         items_of.entry(row.revision_id).or_default().push(row);
     }
+    let quota_sets = plan_quota_repo::for_revisions(tx, &children, tenant, &revision_ids).await?;
     let entry_ids = named_entries(&items_of);
     let entries_by_id: BTreeMap<Uuid, price_book_entry::Model> =
         price_book_entry_repo::find_many(tx, &children, tenant, &entry_ids)
@@ -1394,12 +1607,7 @@ pub async fn stored_contexts(
                 )
             })
             .collect();
-    let mut dimension_values = Vec::new();
-    for d in dimension_repo::list(tx, &children, tenant).await? {
-        let values: Vec<String> = serde_json::from_value(d.values)
-            .map_err(|_| corrupt(format!("dimension {} values", d.key)))?;
-        dimension_values.push((d.key, values));
-    }
+    let dimension_values = dimension_registry(tx, tenant).await?;
     let mut siblings_of: BTreeMap<Uuid, Vec<plan_revision::Model>> = BTreeMap::new();
     for row in plan_revision_repo::for_plans(tx, &children, tenant, &plan_ids).await? {
         siblings_of.entry(row.plan_id).or_default().push(row);
@@ -1428,6 +1636,7 @@ pub async fn stored_contexts(
         dimension_values: &dimension_values,
         quorum,
         defaults: &defaults,
+        quota_sets: &quota_sets,
     };
     let mut out = BTreeMap::new();
     for revision in revisions {
@@ -1447,6 +1656,7 @@ struct Loaded<'a> {
     dimension_values: &'a [(String, Vec<String>)],
     quorum: u32,
     defaults: &'a plan::Defaults,
+    quota_sets: &'a BTreeMap<Uuid, StoredSet>,
 }
 fn assemble(
     revision: &plan_revision::Model,
@@ -1469,6 +1679,16 @@ fn assemble(
         .and_then(|published| loaded.published_skus.get(&published.id).cloned())
         .unwrap_or_default();
     let rows = rows_of(revision, loaded)?;
+    let (quota_rules, quota_digest) = match loaded.quota_sets.get(&revision.id) {
+        Some(set) => (
+            set.rules
+                .iter()
+                .map(plan_quota::rule_of)
+                .collect::<Result<Vec<_>, _>>()?,
+            set.digest.clone(),
+        ),
+        None => (Vec::new(), plan_quota_repo::empty_digest()),
+    };
     Ok(PlanContext {
         plan: plan::Plan {
             id: plan_row.id,
@@ -1490,7 +1710,27 @@ fn assemble(
         published_sku_ids,
         quorum: loaded.quorum,
         defaults: loaded.defaults.clone(),
+        quota_rules,
+        quota_digest,
+        quota_verdict: None,
+        quota_sku_versions: BTreeMap::new(),
+        revision_version: revision.version,
     })
+}
+/// The tenant's dimension registry: each key with its values, ONE statement.
+/// # Errors
+/// Storage failures; a stored value list that does not read is a corrupt row.
+pub(super) async fn dimension_registry(
+    tx: &impl DBRunner,
+    tenant: Uuid,
+) -> Result<Vec<(String, Vec<String>)>, DoorError> {
+    let mut out = Vec::new();
+    for d in dimension_repo::list(tx, &AccessScope::for_tenant(tenant), tenant).await? {
+        let values: Vec<String> = serde_json::from_value(d.values)
+            .map_err(|_| corrupt(format!("dimension {} values", d.key)))?;
+        out.push((d.key, values));
+    }
+    Ok(out)
 }
 fn named_entries(items_of: &BTreeMap<Uuid, Vec<plan_item::Model>>) -> Vec<Uuid> {
     let mut entry_ids = BTreeSet::new();

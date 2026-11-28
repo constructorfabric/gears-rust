@@ -161,6 +161,14 @@ impl Gear for BssPricingGear {
             .register::<dyn bss_products_sdk::sku_usage::SkuUsageV1>(Arc::new(
                 crate::api::sku_usage::PricingSkuUsage::new(state.clone(), (*enforcer).clone()),
             ));
+        // D-540: plan quota rules are authored in-process too, over the endpoints' functions.
+        ctx.client_hub()
+            .register::<dyn bss_pricing_sdk::plan_quota::PricingQuotaAuthoringClientV1>(Arc::new(
+                crate::api::plan_quota_authoring::PricingQuotaAuthoringProvider::new(
+                    state.clone(),
+                    enforcer.clone(),
+                ),
+            ));
         ctx.client_hub()
             .register::<dyn bss_pricing_sdk::read::PricingReadV1>(Arc::new(
                 crate::api::pricing_read::PricingReadProvider::new(state.clone(), enforcer.clone()),
@@ -324,3 +332,7 @@ impl MigrationTrait for InvalidOutboxMigration {
 // Run 9.6 (D-480, D-481): method | path | resource:action | If-Match | Idempotency-Key
 // GET /plan-revisions/{id}/reservations plan:read false false
 // GET /approval-policy/{kind}/effective price_book_entry:read for prices, plan:read for plan_revision false false
+
+// Quota rules (D-540, D-543): method | path | resource:action | If-Match | Idempotency-Key
+// GET /plan-revisions/{id}/quota-rules plan:read false false
+// PUT /plan-revisions/{id}/quota-rules plan:author true true

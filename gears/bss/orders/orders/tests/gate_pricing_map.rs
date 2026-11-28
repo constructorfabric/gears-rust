@@ -79,6 +79,7 @@ fn resolved(cells: Vec<ResolvedCell>) -> Result<Arc<ResolvedBindings>, ReadFailu
         plan_id: plan,
         revision_id: rev,
         cells,
+        quota_terms: None,
     }))
 }
 /// Every pub field of `AcceptedBinding`, `ImmutablePrice` (state `Approved`) and `InvoiceInputs`.

@@ -40,7 +40,9 @@ fn declared_status_and_code(err: &DomainError) -> (u16, Option<&'static str>) {
         },
         DomainError::AuditUnavailable(_)
         | DomainError::UsageTypeUnavailable(_)
-        | DomainError::UsageUnavailable(_) => (503, None),
+        | DomainError::UsageUnavailable(_)
+        | DomainError::QuotaUnavailable { .. } => (503, None),
+        DomainError::QuotaClosed { .. } => (501, None),
     }
 }
 
@@ -79,9 +81,17 @@ fn one_of_every_variant() -> Vec<DomainError> {
         DomainError::UsageUnavailable("detail".to_owned()),
         DomainError::UnrecognizedUnit("detail".to_owned()),
         DomainError::MeterDeclarationIncomplete("detail".to_owned()),
+        DomainError::QuotaUnavailable {
+            code: "QUOTA_REGISTRY_UNAVAILABLE",
+            detail: "detail".to_owned(),
+        },
+        DomainError::QuotaClosed {
+            code: "QUOTA_DISCOVERY_CLOSED",
+            detail: "detail".to_owned(),
+        },
     ]
 }
-const DOMAIN_ERROR_VARIANTS: usize = 16;
+const DOMAIN_ERROR_VARIANTS: usize = 18;
 
 #[test]
 fn every_domain_error_variant_lands_in_its_declared_category() {
@@ -347,4 +357,137 @@ fn a_refusal_names_the_resource_it_refuses() {
         let canonical = CanonicalError::from(err);
         assert_eq!(canonical.resource_type(), Some(expected), "{name}");
     }
+}
+
+/// A quota row's miss names that row's quota resource wherever it is mapped (P-D-273): a target's
+/// miss the adapter target, a candidate's or a definition's miss the quota definition. That is
+/// the only quota rule outside an endpoint: a quota code names no quota resource of its own, so
+/// the endpoint that refuses it (`quota_refusal`) is the one rule that decides. A quota 503 and
+/// 501 carry their code.
+#[test]
+fn a_quota_refusal_names_the_quota_resource() {
+    use super::Refused;
+    use crate::authz::labels;
+    let id = uuid::Uuid::new_v4();
+    for (what, expected) in [
+        ("quota_adapter_target", labels::QUOTA_ADAPTER_TARGET),
+        ("quota_candidate", labels::QUOTA_DEFINITION),
+        ("quota_definition", labels::QUOTA_DEFINITION),
+    ] {
+        let canonical = CanonicalError::from(DomainError::NotFound { what, id });
+        assert_eq!(canonical.resource_type(), Some(expected), "{what}");
+    }
+    let conflict = |code| DomainError::Conflict {
+        code,
+        detail: "x".into(),
+    };
+    let report = |code| {
+        let mut r = ValidationReport::new();
+        r.violate(code, "record.unit_ref", "unknown");
+        DomainError::Validation(r)
+    };
+    for err in [
+        conflict("QUOTA_TARGET_TAKEN"),
+        conflict("QUOTA_SOURCE_CONFLICT"),
+        conflict("QUOTA_SOURCE_STALE"),
+        conflict("QUOTA_CANDIDATE_STATE"),
+        report("QUOTA_TARGET_PLUGIN_UNKNOWN"),
+        report("QUOTA_REFERENCE_UNKNOWN"),
+        DomainError::QuotaClosed {
+            code: "QUOTA_DISCOVERY_CLOSED",
+            detail: "no adapter".into(),
+        },
+        DomainError::QuotaUnavailable {
+            code: "QUOTA_REGISTRY_UNAVAILABLE",
+            detail: "down".into(),
+        },
+    ] {
+        assert_eq!(Refused::of_quota(&err), None, "{err:?}");
+    }
+    let closed = CanonicalError::from(DomainError::QuotaClosed {
+        code: "QUOTA_DISCOVERY_CLOSED",
+        detail: "no adapter".into(),
+    });
+    assert_eq!(closed.status_code(), 501);
+    assert!(
+        closed.detail().starts_with("QUOTA_DISCOVERY_CLOSED: "),
+        "{closed:?}"
+    );
+    let down = CanonicalError::from(DomainError::QuotaUnavailable {
+        code: "QUOTA_REGISTRY_UNAVAILABLE",
+        detail: "types-registry did not answer".into(),
+    });
+    assert_eq!(down.status_code(), 503);
+    assert!(
+        down.detail().starts_with("QUOTA_REGISTRY_UNAVAILABLE: "),
+        "{down:?}"
+    );
+    for (label, expected) in [
+        (labels::QUOTA_DEFINITION, labels::QUOTA_DEFINITION),
+        (labels::QUOTA_ADAPTER_TARGET, labels::QUOTA_ADAPTER_TARGET),
+    ] {
+        let denied = crate::infra::error_mapping::permission_denied(label, "no".into());
+        assert_eq!(denied.resource_type(), Some(expected));
+    }
+}
+
+/// A quota endpoint names its own quota resource on every refusal, whatever the code (P-D-273): a
+/// generic validation, contention, idempotency, stale revision, separation or note refusal never
+/// names the SKU. A miss still names the quota row that is missing.
+#[test]
+fn a_quota_endpoint_names_its_own_resource_whatever_the_code() {
+    use super::{QuotaResource, quota_refusal};
+    use crate::authz::labels;
+    let report = |code, field| {
+        let mut r = ValidationReport::new();
+        r.violate(code, field, "x");
+        DomainError::Validation(r)
+    };
+    let refusals = || {
+        vec![
+            report("VALIDATION", "body"),
+            report("FIELD_TOO_LONG", "note"),
+            report("VALIDATION", "If-Match"),
+            report("NOTE_REQUIRED", "note"),
+            DomainError::Conflict {
+                code: "CONTENDED",
+                detail: "x".into(),
+            },
+            DomainError::IdempotencyConflict("x".into()),
+            DomainError::IdempotencyKeyInFlight("x".into()),
+            DomainError::StaleRevision {
+                expected: 1,
+                found: 2,
+            },
+            DomainError::Forbidden {
+                code: "SOD_VIOLATION",
+                detail: "x".into(),
+            },
+            DomainError::Conflict {
+                code: "QUOTA_SOURCE_CONFLICT",
+                detail: "x".into(),
+            },
+        ]
+    };
+    for (resource, label) in [
+        (QuotaResource::AdapterTarget, labels::QUOTA_ADAPTER_TARGET),
+        (QuotaResource::Definition, labels::QUOTA_DEFINITION),
+    ] {
+        for err in refusals() {
+            let name = format!("{err:?}");
+            assert_eq!(
+                quota_refusal(err, resource).resource_type(),
+                Some(label),
+                "{name}"
+            );
+        }
+    }
+    let missing_target = DomainError::NotFound {
+        what: "quota_adapter_target",
+        id: uuid::Uuid::new_v4(),
+    };
+    assert_eq!(
+        quota_refusal(missing_target, QuotaResource::Definition).resource_type(),
+        Some(labels::QUOTA_ADAPTER_TARGET)
+    );
 }

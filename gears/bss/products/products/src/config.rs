@@ -131,7 +131,36 @@ pub struct ProductsConfig {
     /// wins over this: the value is the last step of `gear.rs`'s four, not the
     /// first. Default [`UsageTypeCatalogSource::Unconfigured`].
     pub usage_type_catalog_mode: UsageTypeCatalogSource,
+
+    /// How long one quota discovery page call may take, in milliseconds (P-D-268; default 5000,
+    /// at least 1). Discovery reads before any transaction opens, so the bound costs latency only.
+    pub quota_discovery_timeout_ms: u32,
+
+    /// How many records a quota discovery page asks an adapter for (P-D-268; default 50, 1 to
+    /// 200). An adapter may answer fewer.
+    pub quota_discovery_page_size: u32,
+
+    /// The most records one quota discovery snapshot may hold (P-D-268; default 10 000, at least
+    /// 1); a larger snapshot is incomplete.
+    pub quota_discovery_max_items: u32,
+
+    /// How long one quota discovery may take to read its pages and judge its records, in
+    /// milliseconds (P-D-268; default 25 000, at least 1); a discovery past it is incomplete and
+    /// stores nothing, and its staging transaction is not cut. The discovery operation declares
+    /// this deadline plus 15 s for the staging as its own request timeout when the routes
+    /// register (40 s by default), so a slow discovery answers 503 here before the API gateway
+    /// cuts the request, whatever the gateway's default timeout is. A gateway
+    /// `defaults.max_request_timeout` below that still caps it.
+    pub quota_discovery_deadline_ms: u32,
 }
+
+/// [`ProductsConfig::quota_discovery_timeout_ms`]'s default: five seconds (P-D-268).
+pub const QUOTA_DISCOVERY_TIMEOUT_MS_DEFAULT: u32 = 5_000;
+/// [`ProductsConfig::quota_discovery_max_items`]'s default (P-D-268).
+pub const QUOTA_DISCOVERY_MAX_ITEMS_DEFAULT: u32 = 10_000;
+/// [`ProductsConfig::quota_discovery_deadline_ms`]'s default: 25 seconds, so the discovery
+/// operation declares a 40 s request timeout (P-D-268).
+pub const QUOTA_DISCOVERY_DEADLINE_MS_DEFAULT: u32 = 25_000;
 
 impl Default for ProductsConfig {
     fn default() -> Self {
@@ -142,6 +171,10 @@ impl Default for ProductsConfig {
             require_broker: false,
             usage_type_resolver_timeout_ms: USAGE_TYPE_RESOLVER_TIMEOUT_MS_DEFAULT,
             usage_type_catalog_mode: UsageTypeCatalogSource::Unconfigured,
+            quota_discovery_timeout_ms: QUOTA_DISCOVERY_TIMEOUT_MS_DEFAULT,
+            quota_discovery_page_size: bss_products_sdk::quota::discovery::DEFAULT_PAGE_SIZE,
+            quota_discovery_max_items: QUOTA_DISCOVERY_MAX_ITEMS_DEFAULT,
+            quota_discovery_deadline_ms: QUOTA_DISCOVERY_DEADLINE_MS_DEFAULT,
         }
     }
 }
@@ -181,10 +214,25 @@ impl ProductsConfig {
         std::time::Duration::from_millis(u64::from(self.usage_type_resolver_timeout_ms))
     }
 
+    /// How the quota intake reads a discovery adapter (P-D-268): the page size it asks for, the
+    /// time one page may take, the most records a snapshot may hold and the time the whole read
+    /// may take.
+    #[must_use]
+    pub fn quota_settings(&self) -> crate::domain::quota::snapshot::QuotaSettings {
+        let millis = |ms: u32| std::time::Duration::from_millis(u64::from(ms));
+        crate::domain::quota::snapshot::QuotaSettings {
+            page_size: self.quota_discovery_page_size,
+            timeout: millis(self.quota_discovery_timeout_ms),
+            max_items: self.quota_discovery_max_items,
+            deadline: millis(self.quota_discovery_deadline_ms),
+        }
+    }
+
     /// Boot-time validation: a zero resolver timeout would answer every
     /// usage-type resolve `Unavailable`, and a zero fence TTL would make every
     /// fence no pending unit holds expirable the moment it exists (RS-62), so
-    /// both are refused before anything runs.
+    /// both are refused before anything runs. The quota discovery's settings
+    /// are refused outside their ranges for the same reason (P-D-268).
     ///
     /// # Errors
     ///
@@ -201,6 +249,34 @@ impl ProductsConfig {
             return Err(
                 "fence_ttl_minutes = 0 admits nothing at all: every read's orphan-fence recovery \
                  would lift a fence the moment it exists"
+                    .to_owned(),
+            );
+        }
+        if self.quota_discovery_timeout_ms == 0 {
+            return Err(
+                "quota_discovery_timeout_ms = 0 admits nothing at all: every discovery page would \
+                 time out before it is asked"
+                    .to_owned(),
+            );
+        }
+        let most = bss_products_sdk::quota::discovery::MAX_PAGE_SIZE;
+        if !(1..=most).contains(&self.quota_discovery_page_size) {
+            return Err(format!(
+                "quota_discovery_page_size = {} is outside 1 to {most}",
+                self.quota_discovery_page_size
+            ));
+        }
+        if self.quota_discovery_max_items == 0 {
+            return Err(
+                "quota_discovery_max_items = 0 admits nothing at all: every discovery snapshot \
+                 would exceed the bound"
+                    .to_owned(),
+            );
+        }
+        if self.quota_discovery_deadline_ms == 0 {
+            return Err(
+                "quota_discovery_deadline_ms = 0 admits nothing at all: every discovery would \
+                 pass its deadline before its first page"
                     .to_owned(),
             );
         }
