@@ -1,0 +1,55 @@
+[
+  {
+    "$id": "gts://gts.cf.bss.products.service_parameters.v1~cf.backup.resource_adapter.managed_backup_parameters.v1~",
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "x-gts-final": true,
+    "allOf": [
+      { "$ref": "gts://gts.cf.bss.products.service_parameters.v1~" },
+      {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["frequency"],
+        "properties": {
+          "frequency": {
+            "type": "string",
+            "enum": ["daily", "hourly"],
+            "description": "How often the service takes a backup."
+          },
+          "keep_copies": {
+            "type": "string",
+            "enum": ["7", "14", "30"],
+            "default": "14",
+            "description": "How many backup copies the service keeps for each workload."
+          },
+          "encrypt": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether the service encrypts backup copies at rest."
+          }
+        }
+      }
+    ]
+  },
+  {
+    "id": "gts.cf.bss.products.service_type.v1~cf.backup.resource_adapter.managed_backup.v1",
+    "name": "managed_backup",
+    "display_name": {
+      "en": "Managed backup"
+    },
+    "description": {
+      "en": "Scheduled backup of the tenant's workloads, kept and restored by the backup service."
+    },
+    "unit": {
+      "code": "protected_workload",
+      "display_name": {
+        "en": "Protected workload"
+      },
+      "description": {
+        "en": "One workload whose data the service backs up."
+      }
+    },
+    "parameters_schema_ref": "gts.cf.bss.products.service_parameters.v1~cf.backup.resource_adapter.managed_backup_parameters.v1~",
+    "target_rules": ["resource_tenant"],
+    "properties": {}
+  }
+]

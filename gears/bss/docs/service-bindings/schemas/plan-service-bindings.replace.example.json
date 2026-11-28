@@ -1,0 +1,49 @@
+{
+  "service_bindings": [
+    {
+      "binding_id": "0f1e2d3c-4b5a-4697-8a1b-00000000e001",
+      "service_key": "backup",
+      "definition_ref": {
+        "id": "0f1e2d3c-4b5a-4697-8a1b-00000000b001",
+        "version": "1",
+        "digest": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "item_id": "0f1e2d3c-4b5a-4697-8a1b-00000000d001",
+      "dimension_value": null,
+      "basis": "per_plan_unit",
+      "coefficient": "1",
+      "target_rule": "resource_tenant",
+      "parameters": {
+        "frequency": "daily"
+      },
+      "policies": {
+        "retention": { "kind": "not_applicable" },
+        "export": { "kind": "not_applicable" },
+        "disposal": { "kind": "not_applicable" }
+      }
+    },
+    {
+      "binding_id": "0f1e2d3c-4b5a-4697-8a1b-00000000e002",
+      "service_key": "backup",
+      "definition_ref": {
+        "id": "0f1e2d3c-4b5a-4697-8a1b-00000000b001",
+        "version": "1",
+        "digest": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "item_id": "0f1e2d3c-4b5a-4697-8a1b-00000000d001",
+      "dimension_value": "hourly",
+      "basis": "per_plan_unit",
+      "coefficient": "1",
+      "target_rule": "resource_tenant",
+      "parameters": {
+        "frequency": "hourly",
+        "keep_copies": "30"
+      },
+      "policies": {
+        "retention": { "kind": "not_applicable" },
+        "export": { "kind": "not_applicable" },
+        "disposal": { "kind": "not_applicable" }
+      }
+    }
+  ]
+}

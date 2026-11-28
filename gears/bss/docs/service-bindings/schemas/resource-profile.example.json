@@ -1,0 +1,28 @@
+{
+  "profile_id": "0f1e2d3c-4b5a-4697-8a1b-00000000a001",
+  "version": "1",
+  "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+  "capability": "resource",
+  "contract_major": "1",
+  "operations": {
+    "provision": true,
+    "withdraw": true,
+    "pause": true,
+    "restore": true,
+    "service_stop": true,
+    "export": false,
+    "delete": false,
+    "hold": false
+  },
+  "pause_preserves_data": true,
+  "preparation": true,
+  "target_rules": ["resource_tenant"],
+  "change_support": {
+    "initial_set": true,
+    "increase": true
+  },
+  "output_keys": [],
+  "display_name": "Managed service, tenant-wide",
+  "conditions": "Pausing keeps the service data. Restore continues the same service.",
+  "locale": "en"
+}
