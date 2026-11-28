@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-toolkit
-description: "ToolKit framework compliance review sub-agent for toolkit-pr-review. Covers all 17 TOOLKIT-* rules, on gear code built on ToolKit. Applies its module to the whole pull request. Returns JSON array only."
+description: "ToolKit framework compliance review sub-agent for toolkit-pr-review. Covers all 17 TOOLKIT-* rules, on gear code built on ToolKit. Applies its module to the whole pull request. Returns a JSON pass object."
 tools: Read, Bash
 model: inherit
 ---

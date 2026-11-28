@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-security
-description: "Security review sub-agent for toolkit-pr-review. Covers RUST-SEC-001..002, RUST-NO-006, RUST-DEP-001. Applies its module to the whole pull request. Returns JSON array only."
+description: "Security review sub-agent for toolkit-pr-review. Covers RUST-SEC-001..002, RUST-NO-006, RUST-DEP-001. Applies its module to the whole pull request. Returns a JSON pass object."
 tools: Read, Bash
 model: inherit
 ---

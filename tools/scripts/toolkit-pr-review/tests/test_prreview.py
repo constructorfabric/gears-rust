@@ -339,7 +339,9 @@ class TestPrepareOffline(unittest.TestCase):
                 by_name = {a["name"]: a for a in ctx["agents"]}
                 self.assertEqual(sorted(by_name), sorted(budget.MODULES + ["architecture"]))
                 for m in budget.MODULES:
-                    self.assertEqual(sorted(by_name[m]["files"]), sorted(ctx["all_files"]),
+                    expected = ctx["all_files"] if m in {"security", "toolkit"} else [
+                        p for p in ctx["all_files"] if classify.is_rust(p)]
+                    self.assertEqual(sorted(by_name[m]["files"]), sorted(expected),
                                      f"{m} was not given every file")
 
     def test_only_the_security_agent_carries_the_manifests(self):

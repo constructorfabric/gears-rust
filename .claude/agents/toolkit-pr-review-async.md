@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-async
-description: "Async, concurrency & performance review sub-agent for toolkit-pr-review. Covers RUST-ASYNC-001, RUST-CONC-001, RUST-PERF-001, RUST-NO-004..005. Applies its module to the whole pull request. Returns JSON array only."
+description: "Async, concurrency & performance review sub-agent for toolkit-pr-review. Covers RUST-ASYNC-001, RUST-CONC-001, RUST-PERF-001, RUST-NO-004..005. Applies its module to the whole pull request. Returns a JSON pass object."
 tools: Read, Bash
 model: inherit
 ---

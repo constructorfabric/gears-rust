@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-architecture
-description: "PR-level architecture review sub-agent for toolkit-pr-review. Owns RUST-ARCH-001, the one pass that needs a view of the whole diff. Returns JSON array only."
+description: "PR-level architecture review sub-agent for toolkit-pr-review. Owns RUST-ARCH-001, the one pass that needs a view of the whole diff. Returns a JSON pass object."
 tools: Read, Bash
 model: inherit
 ---
