@@ -107,7 +107,7 @@ mod tests {
             subject_id: subject,
             request_id: request,
             fact_id: NodeKey("construct:t:fact-1".to_owned()),
-            category: Category::Skill,
+            category: Category::PROJECT,
         });
 
         assert!(logs_contain("construct::audit"));
@@ -116,7 +116,7 @@ mod tests {
         assert!(logs_contain(&format!("caller={subject}")));
         assert!(logs_contain(&format!("request_id={request}")));
         assert!(logs_contain("fact_id=construct:t:fact-1"));
-        assert!(logs_contain("category=\"skill\""));
+        assert!(logs_contain("category=\"project\""));
     }
 
     #[tracing_test::traced_test]

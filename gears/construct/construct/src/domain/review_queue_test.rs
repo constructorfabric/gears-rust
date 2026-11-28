@@ -16,7 +16,7 @@ use crate::domain::error::DomainError;
 use crate::domain::one_step::OneStepPath;
 use crate::domain::plan::Plan;
 use crate::domain::plan::{Change, NodeKey, Origin};
-use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_writes::ProfileWrites;
@@ -24,7 +24,8 @@ use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
     CLAIM_HOLD, NotStored, OutsideChange, Resolution, ReviewConflict, ReviewOutcome,
-    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, close_on_change,
+    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText, Sweep,
+    close_on_change, close_orphaned,
 };
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
@@ -56,8 +57,13 @@ impl Fixture {
     /// `conflicts` times.
     fn new(conflicts: u32) -> Self {
         let profile = MemoryProfile::with(vec![
-            stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
-            stored_fact(Category::Role, "roles", json!({ "title": "Engineer" }), 20),
+            stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+            stored_fact(
+                Category::PRODUCT,
+                "roles",
+                json!({ "title": "Engineer" }),
+                20,
+            ),
         ]);
         let writer = MemoryWriter::new(Arc::clone(&profile), conflicts);
         Self {
@@ -99,7 +105,7 @@ impl Fixture {
                     events: Arc::new(RecordingAdmissionEvents::default()),
                     drops,
                 }),
-                catalog: Arc::new(PropertyCatalog::load().unwrap()),
+                catalog: Arc::new(Catalog::load().unwrap()),
             })
         });
         ReviewQueueService::new(
@@ -140,7 +146,7 @@ impl Fixture {
         self.profile
             .live()
             .into_iter()
-            .find(|fact| fact.category == Category::Skill)
+            .find(|fact| fact.category == Category::PROJECT)
             .unwrap()
             .node_key
     }
@@ -160,7 +166,7 @@ impl Fixture {
 
     fn corrected(name: &str) -> Resolution {
         Resolution::Corrected {
-            property: "skills".to_owned(),
+            property: "project".to_owned(),
             value: json!({ "name": name }),
             reason: None,
         }
@@ -195,7 +201,7 @@ async fn a_flag_opens_a_request_with_the_flagged_value_and_records_it() {
     let request = fixture.flagged().await;
 
     assert_eq!(request.fact_id, skill);
-    assert_eq!(request.property, "skills");
+    assert_eq!(request.property, "project");
     assert_eq!(
         request.status,
         ReviewStatus::Open {
@@ -214,7 +220,7 @@ async fn a_flag_opens_a_request_with_the_flagged_value_and_records_it() {
             subject_id: fixture.subject,
             request_id: request.id,
             fact_id: skill,
-            category: Category::Skill,
+            category: Category::PROJECT,
         }]
     );
 }
@@ -577,7 +583,7 @@ async fn a_delete_of_a_fact_already_gone_closes_the_request_as_deleted() {
 }
 
 #[tokio::test]
-async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
+async fn a_correction_replaces_the_fact_in_place_as_the_reviewer() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
 
@@ -590,9 +596,9 @@ async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
     let ReviewOutcome::Corrected(new_key) = outcome_of(&closed).clone() else {
         panic!("corrected: {closed:?}");
     };
-    assert_ne!(
+    assert_eq!(
         new_key, request.fact_id,
-        "a replace gives the fact a new id"
+        "a correction changes the fact where it stands, so its links and owned nodes stay"
     );
     let [plan] = fixture.writer.plans().try_into().unwrap();
     assert_eq!(
@@ -606,14 +612,16 @@ async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
         &plan.steps[..],
         [step] if step.confidence.is_none() && matches!(
             &step.change,
-            Change::ReplaceEntity { old, key, properties }
+            Change::ReplaceEntity { old, key, properties, .. }
                 if *old == request.fact_id && *key == new_key
                     && properties[0].value == json!({ "name": "Go" })
         )
     ));
     let live = fixture.profile.live();
-    assert!(live.iter().all(|fact| fact.node_key != request.fact_id));
-    assert!(live.iter().any(|fact| fact.node_key == new_key));
+    assert!(
+        live.iter()
+            .any(|fact| fact.node_key == new_key && fact.value == json!({ "name": "Go" }))
+    );
     assert!(matches!(
         fixture.events.taken().last(),
         Some(ReviewQueueEvent::Resolved {
@@ -746,7 +754,7 @@ async fn a_correction_takes_only_the_facts_property_with_a_value_its_schema_take
     };
 
     let other_property = resolve("roles", json!({ "title": "Lead" })).await;
-    let bad_value = resolve("skills", json!({ "name": "" })).await;
+    let bad_value = resolve("project", json!({ "name": "" })).await;
 
     assert!(
         matches!(
@@ -786,7 +794,7 @@ async fn a_corrections_value_is_checked_before_its_fact_is_read() {
             &fixture.reviewer(),
             request.id,
             Resolution::Corrected {
-                property: "skills".to_owned(),
+                property: "project".to_owned(),
                 value: json!({ "name": "" }),
                 reason: None,
             },
@@ -809,7 +817,7 @@ async fn a_corrections_value_is_checked_before_its_fact_is_read() {
 #[tokio::test]
 async fn a_correction_of_a_stored_property_no_person_type_has_is_internal() {
     let fixture = Fixture::new(0);
-    let odd = stored_fact(Category::Skill, "retired_property", json!("x"), 30);
+    let odd = stored_fact(Category::PROJECT, "retired_property", json!("x"), 30);
     fixture.profile.facts.lock().unwrap().push(odd.clone());
     let request = fixture
         .service()
@@ -1130,6 +1138,64 @@ async fn the_subjects_delete_after_a_landed_correction_closes_the_request_as_the
     );
 }
 
+#[tokio::test]
+async fn the_sweep_closes_a_left_over_request_as_the_recorded_delete_of_the_reviewer() {
+    // A reviewer's delete landed and its close failed: the fact is gone, and the claim recorded the delete.
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.reviews.close_fails.store(true, Ordering::SeqCst);
+    let unclosed = fixture
+        .service()
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Deleted { reason: None },
+        )
+        .await;
+    assert!(
+        matches!(
+            unclosed,
+            Err(DomainError::ReviewConflict(ReviewConflict::NotClosed {
+                outcome: ReviewOutcome::Deleted,
+                ..
+            }))
+        ),
+        "{unclosed:?}"
+    );
+    fixture.reviews.close_fails.store(false, Ordering::SeqCst);
+    let writes = ProfileWrites::new(
+        Arc::clone(&fixture.profile) as _,
+        Arc::clone(&fixture.writer) as _,
+        Arc::new(ServiceIdentity::new(Uuid::new_v4())),
+        2,
+    );
+    // Not removed by the delete that sweeps: it closes as the reviewer's recorded delete.
+    let swept = close_orphaned(
+        fixture.reviews.as_ref(),
+        fixture.events.as_ref(),
+        &writes,
+        &AccessScope::allow_all(),
+        request.subject(),
+        Sweep {
+            by: fixture.subject,
+            except: None,
+            removed_now: &[],
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(swept, 1);
+    let ReviewStatus::Closed(done) = fixture.status() else {
+        panic!("closed");
+    };
+    assert_eq!(
+        (done.outcome, done.by),
+        (ReviewOutcome::Deleted, fixture.reviewer),
+        "the reviewer's delete, not the subject's"
+    );
+}
+
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_correction_whose_close_failed_is_closed_as_it_by_the_next_resolution() {
@@ -1418,4 +1484,37 @@ async fn a_closed_or_unknown_request_cannot_be_resolved() {
         matches!(elsewhere, Err(DomainError::NoSuchReviewRequest(_))),
         "a reviewer of another tenant does not find it: {elsewhere:?}"
     );
+}
+
+#[tokio::test]
+async fn a_correction_in_place_has_landed_only_when_the_fact_holds_another_value_than_the_flagged_one()
+ {
+    use crate::domain::review_queue::{Closed, ReviewOutcome, ReviewStatus, landed};
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    let ReviewStatus::Open { value: flagged } = request.status.clone() else {
+        panic!("open");
+    };
+    let pending = Closed {
+        outcome: ReviewOutcome::Corrected(request.fact_id.clone()),
+        by: fixture.reviewer,
+        at: time::OffsetDateTime::UNIX_EPOCH,
+        reason: None,
+    };
+    let facts = |value: Value| {
+        let mut fact =
+            crate::test_support::stored_fact(request.category, &request.property, value, 1);
+        fact.node_key = request.fact_id.clone();
+        crate::domain::profile_writes::SubjectFacts {
+            version: Some(1),
+            facts: vec![fact],
+            generation: 0,
+        }
+    };
+
+    assert!(
+        !landed(&request, &pending, &facts(flagged)),
+        "the write never landed"
+    );
+    assert!(landed(&request, &pending, &facts(json!({ "name": "Go" }))));
 }

@@ -33,6 +33,8 @@ mod fact_test;
 #[cfg(test)]
 mod graph_test;
 #[cfg(test)]
+mod linked_test;
+#[cfg(test)]
 mod root_test;
 
 /// The reason graph storage gives a refused compare-and-set, and a

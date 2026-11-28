@@ -49,8 +49,8 @@ mod tests {
             tenant_id: Uuid::new_v4(),
             subject_id: Uuid::new_v4(),
             caller: Uuid::new_v4(),
-            categories: vec![Category::Identity, Category::Skill],
-            granted: vec![Category::Identity, Category::Role, Category::Skill],
+            categories: vec![Category::ME, Category::PROJECT],
+            granted: vec![Category::ME, Category::PRODUCT, Category::PROJECT],
             served: true,
         };
 
@@ -61,8 +61,8 @@ mod tests {
         assert!(logs_contain(&format!("tenant_id={}", event.tenant_id)));
         assert!(logs_contain(&format!("subject_id={}", event.subject_id)));
         assert!(logs_contain(&format!("caller={}", event.caller)));
-        assert!(logs_contain("categories=identity,skill"));
-        assert!(logs_contain("granted=identity,role,skill"));
+        assert!(logs_contain("categories=me,project"));
+        assert!(logs_contain("granted=me,product,project"));
         assert!(logs_contain("served=true"));
     }
 }

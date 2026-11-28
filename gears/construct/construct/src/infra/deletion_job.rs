@@ -605,8 +605,8 @@ mod tests {
             subject_id: Uuid::new_v4(),
         };
         let profile = MemoryProfile::with(vec![stored_fact(
-            Category::Skill,
-            "skills",
+            Category::PROJECT,
+            "project",
             json!({ "name": "Rust" }),
             10,
         )]);

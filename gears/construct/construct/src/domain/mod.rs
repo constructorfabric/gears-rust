@@ -51,6 +51,8 @@ mod plan_test;
 #[cfg(test)]
 mod profile_read_test;
 #[cfg(test)]
+mod profile_test;
+#[cfg(test)]
 mod record_intake_test;
 #[cfg(test)]
 mod review_queue_test;

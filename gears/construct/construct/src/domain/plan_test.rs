@@ -86,7 +86,7 @@ fn a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none()
     use crate::domain::plan::{Change, NodeKey, Property};
 
     let stored = NodeKey("construct:t:stored".to_owned());
-    let property = Property::new("skills", serde_json::json!({ "name": "Rust" }));
+    let property = Property::new("project", serde_json::json!({ "name": "Rust" }));
     let touching = [
         Change::AddProperty {
             entity: stored.clone(),
@@ -99,6 +99,7 @@ fn a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none()
         Change::ReplaceEntity {
             old: stored.clone(),
             key: NodeKey("construct:t:new".to_owned()),
+            owner: None,
             properties: vec![property.clone()],
         },
         Change::RemoveEntity {
@@ -106,7 +107,7 @@ fn a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none()
         },
         Change::RemoveProperty {
             entity: stored.clone(),
-            name: "skills".to_owned(),
+            name: "project".to_owned(),
         },
     ];
 
@@ -115,6 +116,7 @@ fn a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none()
     }
     let new = Change::AddEntity {
         key: NodeKey("construct:t:new".to_owned()),
+        owner: None,
         properties: vec![property],
     };
     assert_eq!(new.touches(), None);

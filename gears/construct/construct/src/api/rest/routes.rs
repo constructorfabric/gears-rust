@@ -17,6 +17,7 @@ const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
 const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
 const SUBJECT_FACTS_TAG: &str = "Subject facts";
 const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
+const PROFILE_NODE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile/nodes/{fact_id}";
 const SUBJECT_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts";
 const SUBJECT_FACT_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/{fact_id}";
 const SUBJECT_EXPORT_PATH: &str = "/construct/v1/subjects/{subject_id}/export";
@@ -170,6 +171,43 @@ pub fn register_routes(
         .register(subject, openapi);
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
 
+    subject = OperationBuilder::get(PROFILE_NODE_PATH)
+        .operation_id("construct.get_profile_node")
+        .summary("Read one node of a subject's profile")
+        .description(
+            "Read one node of the profile, for a caller the platform lets act for the subject: \
+             the node, the nodes it owns, the nodes one link away grouped by link kind with the \
+             fields of each link, and where it was learned from: the tools, with a count each. \
+             Every node in the answer is of a kind the caller may read: a reader without the \
+             permission for a kind sees no node of it, also not as a neighbour. A node the \
+             caller may not read, or the subject does not have, is answered with 404.",
+        )
+        .tag("Profiles")
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject whose profile is read")
+        .path_param("fact_id", "The node's id, as the profile read gives it")
+        .query_param_typed(
+            "tenant",
+            false,
+            "Tenant of the subject, when not the caller's own",
+            "string",
+        )
+        .handler(handlers::get_profile_node)
+        .json_response_with_schema::<dto::ProfileNodeDto>(
+            openapi,
+            StatusCode::OK,
+            "The node with what it owns, what it links to and where it was learned",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide the profile read",
+        )
+        .register(subject, openapi);
+
     router
         .merge(not_stored(records))
         .merge(not_stored(subject))
@@ -254,12 +292,14 @@ pub fn register_subject_control_routes(
         .operation_id("construct.delete_subject_fact")
         .summary("Delete one of the subject's own facts")
         .description(
-            "Soft-deletes one live fact of the caller; it is not served from the next read, \
-             and an open review request on it closes as deleted. Owner only. Another subject, \
-             or a fact the subject does not have, answers 404. 503 when the profile kept \
-             changing while the delete was written, or when the fact was deleted but its \
-             review request could not be closed; sending the delete again then closes the \
-             request and answers 204.",
+            "Soft-deletes one live fact of the caller; it is not served from the next read. \
+             The nodes the fact owns go with it, and the open review requests of the fact and \
+             of those nodes close as deleted. Owner only. Another subject, or a fact the \
+             subject does not have, answers 404, unless the delete closes a review request \
+             an earlier delete left open: then it answers 204, whichever fact it names. 503 \
+             when the profile kept changing while the delete was written, or when a review \
+             request could not be closed; sending the delete again then closes it and \
+             answers 204.",
         )
         .tag(SUBJECT_FACTS_TAG)
         .authenticated()
@@ -284,7 +324,7 @@ pub fn register_subject_control_routes(
         .summary("Export a subject's data")
         .description(
             "All of a subject's data in the caller's tenant, as a JSON file: the settings, \
-             every live fact with its origin, and every review request, open and closed. For the data protection officer, under \
+             every live fact with its origin, and every review request, open and closed. The links between facts are not part of it yet. For the data protection officer, under \
              the permission to export a subject's data; without it, 403. A subject \
              without data in the tenant exports empty, like one with no profile.",
         )
@@ -457,7 +497,7 @@ pub fn register_review_queue_routes(
             "Close an open review request of the caller's tenant as `rejected` (with a \
              `reason`), `deleted`, or `corrected` (with `property`, the fact's own property, \
              and its new `value`). A correction passes the sensitive-data checks and Admission \
-             and gives the fact a new id; when they refuse it, 422 and the request stays \
+             and replaces the fact in place; when they refuse it, 422 and the request stays \
              open. A correction of a fact that is gone closes the request as deleted. Needs \
              the permission to resolve review requests; without it, 403. An unknown \
              request answers 404, a closed one 409.",
@@ -576,10 +616,10 @@ pub fn register_admin_facts_routes(
         .summary("Edit a subject's fact")
         .description(
             "Stores a new value for the fact's own property in place of the fact, with the \
-             administrator as origin; the fact gets a new id. An open review request on the \
+             administrator as origin; the fact keeps its id. An open review request on the \
              fact closes as corrected; while a reviewer resolves it, 409. When the edit was \
              stored but the request did not close, 409 with reason `WRITTEN_NOT_CLOSED`: the \
-             fact has its new id already, so the edit is not sent again. The value passes \
+             fact has its new value already, so the edit is not sent again. The value passes \
              the sensitive-data checks and Admission; when they refuse it, 422 names the \
              reason, nothing is stored and a review request stays open. A fact the subject \
              does not have answers 404. Needs the permission to administer a subject's \
@@ -595,7 +635,7 @@ pub fn register_admin_facts_routes(
         .json_response_with_schema::<dto::StoredFactDto>(
             openapi,
             StatusCode::OK,
-            "The fact as stored, under its new id",
+            "The fact as stored, under its own id",
         )
         .standard_errors(openapi)
         .error_422(openapi)
@@ -614,11 +654,13 @@ pub fn register_admin_facts_routes(
         .summary("Delete a subject's fact")
         .description(
             "Soft-deletes one live fact as the subject's delete does, with the administrator \
-             as origin; an open review request on it closes as deleted, and while a reviewer \
-             resolves it, 409. A fact the subject does not have answers 404. 503 when the \
-             profile kept changing, or when the fact was deleted but its review request \
-             could not be closed; sending the delete again then closes it. Works while \
-             personalization is off. Needs the permission to administer a subject's facts; \
+             as origin; the nodes the fact owns go with it, and the open review requests of \
+             the fact and of those nodes close as deleted, and while a reviewer resolves the \
+             fact's request, 409. A fact the subject does not have answers 404, unless the \
+             delete closes a review request an earlier delete left open: then it answers \
+             204, whichever fact it names. 503 when the profile kept changing, or when a \
+             review request could not be closed; sending the delete again then closes it. \
+             Works while personalization is off. Needs the permission to administer a subject's facts; \
              without it, 403.",
         )
         .tag(ADMIN_FACTS_TAG)

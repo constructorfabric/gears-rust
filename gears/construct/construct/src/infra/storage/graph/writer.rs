@@ -7,9 +7,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use construct_sdk::gts::{HAS_FACT_TYPE, PROFILE_ROOT_TYPE};
+use construct_sdk::linked_schema::{OWNER, Schema, SchemaPrefix};
 use futures::{TryStreamExt, stream};
 use graph_storage_sdk::GraphStorageClientV1;
-use graph_storage_sdk::models::{EdgeSpec, IngestOptions, IngestOutcome, IngestRequest, NodeSpec};
+use graph_storage_sdk::models::{
+    EdgeSpec, IngestOptions, IngestOutcome, IngestRequest, NodeSpec, NodeView,
+};
 use time::OffsetDateTime;
 use tokio::time::{Instant, timeout_at};
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
@@ -17,18 +20,19 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::fact::fact_node;
+use super::fact::{fact_node, fact_of, learned_of, link_payload};
 use super::reader::{MAX_FACTS, Stored, read_generation, read_stored};
-use super::root::{ProfileVersion, Root};
+use super::root::{MAX_MARKS, ProfileVersion, Root};
 use super::types::GraphTypes;
 use super::{
     CAS_CONFLICT, ContextSubject, DEFAULT_CALL_TIMEOUT, bounded, graph_error, subject_in_context,
 };
 use crate::domain::deletion::{KnownTenants, ProfileGenerations, ProfileRoots, RootRemoval};
 use crate::domain::error::DomainError;
-use crate::domain::plan::{Change, NodeKey, Plan};
+use crate::domain::plan::{Change, NodeKey, Origin, Plan};
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::{FactCount, FullProfile};
+use crate::domain::profile::{Mark, profile_schema};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The reason graph storage gives a write that lost a serialization race; it
@@ -209,6 +213,38 @@ impl GraphPlanWriter {
             Ok(Ok(())) => {}
             Ok(Err((key, err))) => unfinished(key, &err, left),
             Err(_) => cut_short(left, deadline <= call_end, self.timeout),
+        }
+    }
+
+    /// Delete the link edges under `edge_keys`, one after another, by `deadline`. A link whose delete fails stays,
+    /// and is read again, so the person or the model can remove it once more.
+    async fn unlink(&self, ctx: &SecurityContext, edge_keys: &BTreeSet<String>, deadline: Instant) {
+        for edge_key in edge_keys {
+            if !self.unlink_one(ctx, edge_key, deadline).await {
+                return;
+            }
+        }
+    }
+
+    /// Delete one link edge by `deadline`; false when no more should be tried.
+    async fn unlink_one(&self, ctx: &SecurityContext, edge_key: &str, deadline: Instant) -> bool {
+        if Instant::now() >= deadline {
+            link_stays("the write is out of time");
+            return false;
+        }
+        let cut = deadline.min(Instant::now() + self.timeout);
+        let edge_key = edge_key.to_owned();
+        let sent = self.ports.client.delete_edge(ctx, &edge_key);
+        match timeout_at(cut, sent).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => {
+                link_stays(&format!("its delete failed: {err}"));
+                true
+            }
+            Err(_) => {
+                link_stays("its delete did not answer in time");
+                false
+            }
         }
     }
 
@@ -407,46 +443,196 @@ pub(super) fn resendable(err: &CanonicalError) -> bool {
     }
 }
 
-/// What a plan's steps write: the new fact nodes, their edges from the root,
-/// and the keys of the facts they remove.
+/// What a plan's steps write: the new fact nodes, their edges from the root, the links, the keys of the facts they
+/// remove and the keys of the link edges they remove.
 #[derive(Default)]
 struct Changes {
     nodes: Vec<NodeSpec>,
+    /// The nodes among `nodes` that are new: the rest change a stored node where it stands.
+    added: usize,
     edges: Vec<EdgeSpec>,
     removals: BTreeSet<NodeKey>,
+    unlinks: BTreeSet<String>,
 }
 
 /// The changes of a plan's steps.
-fn changes(plan: &Plan, root: &NodeKey, now: OffsetDateTime) -> Result<Changes, DomainError> {
+fn changes(
+    plan: &Plan,
+    stored: &Stored,
+    now: OffsetDateTime,
+    prefix: &SchemaPrefix,
+) -> Result<Changes, DomainError> {
+    let root = &stored.key;
     let mut changes = Changes::default();
     for step in &plan.steps {
-        if let Some(node) = fact_node(plan, step, now)? {
-            changes.edges.push(EdgeSpec {
-                type_id: HAS_FACT_TYPE.to_owned(),
-                src_node_key: root.0.clone(),
-                dst_node_key: node.node_key.clone(),
-                discriminator: None,
-                payload: None,
-            });
+        let old_node = |key: &NodeKey| stored.facts.iter().find(|node| node.node_key == key.0);
+        let previous = match &step.change {
+            Change::ReplaceEntity { old, .. } => old_node(old),
+            _ => None,
+        };
+        if let Some(node) = fact_node(plan, step, now, prefix, previous)? {
+            let in_place =
+                matches!(&step.change, Change::ReplaceEntity { old, key, .. } if old == key);
+            if !in_place {
+                changes.added += 1;
+                changes.edges.push(EdgeSpec {
+                    type_id: HAS_FACT_TYPE.to_owned(),
+                    src_node_key: root.0.clone(),
+                    dst_node_key: node.node_key.clone(),
+                    discriminator: None,
+                    payload: None,
+                });
+            }
             changes.nodes.push(node);
         }
         match &step.change {
-            Change::ReplaceEntity { old, .. } | Change::RemoveEntity { entity: old } => {
+            Change::ReplaceEntity { old, key, .. } if old != key => {
                 changes.removals.insert(old.clone());
             }
-            Change::AddEntity { .. }
+            Change::RemoveEntity { entity: old } => {
+                // A node goes with the nodes it owns, however deep; its links go with each of them, as graph
+                // storage deletes a node with its edges.
+                changes.removals.extend(with_owned(stored, old));
+            }
+            Change::AddLink { kind, from, to, .. } => {
+                if profile_schema().link(kind).is_none() {
+                    return Err(DomainError::internal(format!("unknown link kind `{kind}`")));
+                }
+                changes.edges.push(EdgeSpec {
+                    type_id: Schema::link_type_id(prefix, kind),
+                    src_node_key: from.0.clone(),
+                    dst_node_key: to.0.clone(),
+                    discriminator: None,
+                    payload: Some(link_payload(plan, step, now)?),
+                });
+            }
+            Change::RemoveLink { kind, from, to } => {
+                let held = stored.links.iter().find(|held| {
+                    held.link.kind == *kind && held.link.from == *from && held.link.to == *to
+                });
+                // A link already gone is gone: its node was removed with it.
+                if let Some(held) = held {
+                    changes.unlinks.insert(held.edge_key.clone());
+                }
+            }
+            Change::ReplaceEntity { .. }
+            | Change::AddEntity { .. }
             | Change::AddProperty { .. }
             | Change::ReplaceProperty { .. }
             | Change::RemoveProperty { .. } => {}
         }
     }
+    // A link this plan removes and adds again stays: the ingest stores its edge, and the delete must not follow.
+    let added: Vec<(&str, &NodeKey, &NodeKey)> = plan
+        .steps
+        .iter()
+        .filter_map(|step| match &step.change {
+            Change::AddLink { kind, from, to, .. } => Some((kind.as_str(), from, to)),
+            _ => None,
+        })
+        .collect();
+    for step in &plan.steps {
+        let Change::RemoveLink { kind, from, to } = &step.change else {
+            continue;
+        };
+        if added.contains(&(kind.as_str(), from, to)) {
+            for held in stored.links.iter().filter(|held| {
+                held.link.kind == *kind && held.link.from == *from && held.link.to == *to
+            }) {
+                changes.unlinks.remove(&held.edge_key);
+            }
+        }
+    }
     Ok(changes)
+}
+
+/// Say why a removed link is still there: it is removed again by a later write or by the person.
+fn link_stays(why: &str) {
+    tracing::warn!(why, "a removed link stays until it is removed again");
+}
+
+/// `node` and the nodes it owns, however deep.
+fn with_owned(stored: &Stored, node: &NodeKey) -> Vec<NodeKey> {
+    let mut gone = vec![node.clone()];
+    let mut at = 0;
+    while at < gone.len() {
+        let parent = gone[at].clone();
+        for child in stored.facts.iter().filter(|candidate| {
+            candidate
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get(OWNER))
+                .and_then(serde_json::Value::as_str)
+                == Some(parent.0.as_str())
+        }) {
+            let key = NodeKey(child.node_key.clone());
+            if !gone.contains(&key) {
+                gone.push(key);
+            }
+        }
+        at += 1;
+    }
+    gone
+}
+
+/// The marks the root holds after `plan`: what it held, and, for a person's own forget, a mark for each node it
+/// removes and each message the node was learned from, so the same message does not create the node again. The
+/// newest [`MAX_MARKS`].
+fn marks_after(stored: &Stored, plan: &Plan) -> Vec<Mark> {
+    let mut marks = stored.root.marks.clone();
+    if matches!(plan.origin, Origin::Subject { .. }) {
+        for step in &plan.steps {
+            let Change::RemoveEntity { entity } = &step.change else {
+                continue;
+            };
+            // The nodes it owns go with it, and so do their messages.
+            for removed in with_owned(stored, entity) {
+                if let Some(node) = stored.facts.iter().find(|node| node.node_key == removed.0) {
+                    marks_of(node, &mut marks);
+                }
+            }
+        }
+    }
+    let skip = marks.len().saturating_sub(MAX_MARKS);
+    marks.split_off(skip)
+}
+
+/// Add to `marks` one for each message the removed stored `node` was learned from.
+fn marks_of(node: &NodeView, marks: &mut Vec<Mark>) {
+    let Ok(fact) = fact_of(node) else {
+        return;
+    };
+    let Some(key) = Mark::identity(fact.category, &fact.value) else {
+        return;
+    };
+    let learned = node
+        .payload
+        .as_ref()
+        .and_then(serde_json::Value::as_object)
+        .map(learned_of)
+        .unwrap_or_default();
+    for place in learned {
+        let Some(message) = place.message else {
+            continue;
+        };
+        let mark = Mark {
+            kind: fact.category.name().to_owned(),
+            key: key.clone(),
+            tool: place.tool,
+            message,
+        };
+        if !marks.contains(&mark) {
+            marks.push(mark);
+        }
+    }
 }
 
 /// One plan's ingest, and the removals the root lists after it.
 struct Batch {
     request: IngestRequest,
     listed: BTreeSet<NodeKey>,
+    /// The link edges to delete once the ingest has committed.
+    unlinks: BTreeSet<String>,
 }
 
 /// How many facts a root's removal deletes at once.
@@ -496,11 +682,14 @@ fn batch(
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
     let root = stored.key.clone();
+    let prefix = SchemaPrefix::of(subject.subject_id);
     let Changes {
         mut nodes,
+        added,
         edges,
         removals,
-    } = changes(plan, &root, now)?;
+        unlinks,
+    } = changes(plan, stored, now, &prefix)?;
     if let Some(key) = removals.iter().find(|key| !live.contains(key.0.as_str())) {
         return Err(DomainError::internal(format!(
             "the plan removes {}, which is not a fact of the profile it was built on",
@@ -509,7 +698,7 @@ fn batch(
     }
     // A fact listed for removal still counts until its delete has run, so a
     // profile never grows past what one read takes, even when deletes fail.
-    let facts = live.len() + nodes.len();
+    let facts = live.len() + added;
     if facts > max_facts {
         return Err(DomainError::ProfileFull(FullProfile {
             subject: *subject,
@@ -518,7 +707,10 @@ fn batch(
         }));
     }
     listed.extend(removals);
-    let root_now = Root { removals: listed };
+    let root_now = Root {
+        removals: listed,
+        marks: marks_after(stored, plan),
+    };
     let payload = root_now.payload(subject.subject_id, versions, versions.next(stored.version)?)?;
     nodes.push(NodeSpec {
         node_key: root.0,
@@ -536,6 +728,7 @@ fn batch(
             idempotency_key: Some(Uuid::now_v7().to_string()),
         },
         listed: root_now.removals,
+        unlinks,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-batch
 }
@@ -610,7 +803,7 @@ impl PlanWriter for GraphPlanWriter {
                 subject_id: plan.subject_id,
             },
         )?;
-        by(deadline, self.ports.types.ensure(ctx)).await?;
+        by(deadline, self.ports.types.ensure(ctx, plan.subject_id)).await?;
 
         // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-read-root
         let stored = by(deadline, self.read(ctx, &subject)).await?;
@@ -641,7 +834,11 @@ impl PlanWriter for GraphPlanWriter {
                 OffsetDateTime::now_utc(),
             )
         };
-        let Batch { request, listed } = match build(&stored) {
+        let Batch {
+            request,
+            listed,
+            unlinks,
+        } = match build(&stored) {
             // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-full
             // Facts listed for removal count until their delete has run, and
             // only a stored write runs it. Run those deletes now and build
@@ -667,6 +864,7 @@ impl PlanWriter for GraphPlanWriter {
                 // Committed: every listed fact is already left out of reads, so
                 // a removal that fails now is finished by a later write.
                 self.remove(ctx, &listed, deadline).await;
+                self.unlink(ctx, &unlinks, deadline).await;
                 // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup
                 Ok(Written::Stored)
             }

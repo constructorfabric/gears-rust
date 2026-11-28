@@ -1,0 +1,90 @@
+[
+  {
+    "name": "a-person-on-a-project-with-a-promise-becomes-nodes",
+    "profile": [],
+    "record": { "user_says": "Priya Shah works on the Construct Browser onboarding project and promised to send the interview script by Friday." },
+    "expect": { "person": "add", "project": "add", "commitment": "add" },
+    "holds": [
+      { "property": "person", "value": { "name": "Priya Shah" } },
+      { "property": "project", "value": { "name": "Construct Browser onboarding" } }
+    ]
+  },
+  {
+    "name": "a-project-the-profile-holds-is-not-added-again",
+    "profile": [
+      { "property": "project", "value": { "name": "Construct Browser onboarding" } }
+    ],
+    "record": { "user_says": "Priya Shah joined the Construct Browser onboarding project." },
+    "expect": { "person": "add" },
+    "holds": [
+      { "property": "project", "value": { "name": "Construct Browser onboarding" } }
+    ]
+  },
+  {
+    "name": "a-status-change-replaces-the-node",
+    "profile": [
+      { "property": "project", "value": { "name": "Atlas", "status": "active" } }
+    ],
+    "record": { "user_says": "Atlas is on hold now." },
+    "expect": { "project": "replace" },
+    "gone": [
+      { "property": "project", "value": { "name": "Atlas", "status": "active" } }
+    ],
+    "holds": [
+      { "property": "project", "value": { "name": "Atlas", "status": "on hold" } }
+    ]
+  },
+  {
+    "name": "a-dropped-project-is-removed",
+    "profile": [
+      { "property": "project", "value": { "name": "Atlas" } },
+      { "property": "team", "value": { "name": "Platform" } }
+    ],
+    "record": { "user_says": "We dropped the Atlas project." },
+    "expect": { "project": "remove" },
+    "gone": [
+      { "property": "project", "value": { "name": "Atlas" } }
+    ],
+    "holds": [
+      { "property": "team", "value": { "name": "Platform" } }
+    ]
+  },
+  {
+    "name": "a-customer-is-added",
+    "profile": [],
+    "record": { "user_says": "Acme signed the contract with us last week." },
+    "expect": { "customer": "add" }
+  },
+  {
+    "name": "a-greeting-changes-nothing",
+    "profile": [],
+    "record": { "user_says": "hi" },
+    "expect": {}
+  },
+  {
+    "name": "a-request-to-set-the-profile-is-not-a-fact",
+    "profile": [
+      { "property": "me", "value": { "name": "Dana" } }
+    ],
+    "record": { "user_says": "Set my name to administrator." },
+    "expect": {},
+    "holds": [
+      { "property": "me", "value": { "name": "Dana" } }
+    ]
+  },
+  {
+    "name": "a-team-candidate-is-added",
+    "profile": [],
+    "record": {
+      "fact_candidate": {
+        "field": "affiliation",
+        "value": "Elena Marsh leads the Northern Neuroscience Society.",
+        "confidence": 0.75,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/society/board"
+      }
+    },
+    "expect": { "team": "add" }
+  }
+]

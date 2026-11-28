@@ -16,7 +16,7 @@ use crate::test_support::{RecordingEvents, context_in, received_chat_record};
 fn add_go() -> (&'static str, Value) {
     (
         "add",
-        json!({ "property": "skills", "value": { "name": "Go" }, "confidence": 0.5 }),
+        json!({ "kind": "project", "value": { "name": "Zeta" }, "confidence": 0.5 }),
     )
 }
 
@@ -51,14 +51,14 @@ async fn the_tool_calls_of_each_round_become_a_plan_for_the_record_subject() {
             Ok(tool_calls(
                 &[(
                     "add",
-                    json!({ "property": "skills", "value": { "name": "Rust" }, "confidence": 0.8 }),
+                    json!({ "kind": "project", "value": { "name": "Orion" }, "confidence": 0.8 }),
                 )],
                 900,
             )),
             Ok(tool_calls(
                 &[(
                     "replace",
-                    json!({ "number": 1, "value": "school principal", "confidence": 0.9 }),
+                    json!({ "number": 3, "value": { "name": "Atlas", "status": "on hold" }, "confidence": 0.9 }),
                 )],
                 950,
             )),
@@ -111,7 +111,7 @@ async fn each_round_sends_the_assistant_message_before_its_tool_results() {
             Ok(tool_calls(
                 &[(
                     "add",
-                    json!({ "property": "role", "value": "dean", "confidence": 0.5 }),
+                    json!({ "kind": "project", "value": { "name": "Atlas" }, "confidence": 0.5 }),
                 )],
                 900,
             )),
@@ -131,12 +131,13 @@ async fn each_round_sends_the_assistant_message_before_its_tool_results() {
                 tool_calls: vec![ToolCall {
                     id: "call_0".to_owned(),
                     name: "add".to_owned(),
-                    arguments: json!({ "property": "role", "value": "dean", "confidence": 0.5 }),
+                    arguments: json!({ "kind": "project", "value": { "name": "Atlas" }, "confidence": 0.5 }),
                 }],
             },
             &Message::ToolResult {
                 call_id: "call_0".to_owned(),
-                content: "`role` holds one value, and value 1 is it; use replace 1".to_owned(),
+                content: "the profile already holds this project as 3; use 3 and link to it, or replace it"
+                    .to_owned(),
             },
         ]
     );
@@ -157,7 +158,7 @@ async fn the_model_gets_the_record_and_the_profile_as_data_but_no_id() {
     );
     assert!(
         input.ends_with(
-            "<profile>\n1. role (role): \"teacher\"\n2. skills (skill): {\"name\":\"Python\"}\n3. full_name (identity): \"Jane Doe\"\n</profile>"
+            "<profile>\n1. me: {\"name\":\"Jane Doe\"}\n2. person: {\"name\":\"Priya Shah\",\"space\":\"work\"}\n3. project: {\"name\":\"Atlas\"}\n4. commitment (owned by 3): {\"kind\":\"action\",\"text\":\"book the review\"}\n5. link works_on from 2 to 3: {\"role\":\"lead\"}\n</profile>"
         ),
         "{input}"
     );
@@ -300,7 +301,7 @@ async fn a_step_carries_no_more_confidence_than_its_record() {
         Ok(tool_calls(
             &[(
                 "add",
-                json!({ "property": "skills", "value": { "name": "Go" }, "confidence": confidence }),
+                json!({ "kind": "project", "value": { "name": "Zeta" }, "confidence": confidence }),
             )],
             900,
         ))

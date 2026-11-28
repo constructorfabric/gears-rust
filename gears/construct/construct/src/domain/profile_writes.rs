@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::error::DomainError;
 use super::plan::{Change, NodeKey, Origin, Plan, Step};
 use super::planner::processing::{PlanWriter, ProcessingContexts, Written};
+use super::profile::{owned_by, owners};
 use super::profile_read::{StoredFact, read_failure};
 use super::subject_settings::SubjectKey;
 
@@ -84,7 +85,8 @@ pub(crate) enum Attempt<T> {
 /// What a removal of one fact did.
 #[domain_model]
 pub(crate) enum Removed {
-    Removed(StoredFact),
+    /// The fact, and the nodes it owns, however deep: the removal took them with it.
+    Removed(Box<StoredFact>, Vec<StoredFact>),
     /// No live fact had the id, at the first read or after a conflict.
     Gone,
 }
@@ -247,6 +249,17 @@ impl ProfileWrites {
         self.with_reruns(deadline, "delete", move || async move {
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
             let current = Self::before_write(deadline, "delete", self.read(construct, key)).await?;
+            let ownership = owners(
+                current
+                    .facts
+                    .iter()
+                    .map(|fact| (&fact.node_key, fact.owner.as_ref())),
+            );
+            let owned: Vec<StoredFact> = owned_by(&ownership, fact_id)
+                .iter()
+                .filter_map(|key| current.facts.iter().find(|fact| &fact.node_key == key))
+                .cloned()
+                .collect();
             let Some(fact) = current
                 .facts
                 .into_iter()
@@ -264,7 +277,7 @@ impl ProfileWrites {
                 .await?;
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-write
             Ok(match written {
-                Written::Stored => Attempt::Done(Removed::Removed(fact)),
+                Written::Stored => Attempt::Done(Removed::Removed(Box::new(fact), owned)),
                 Written::Conflict => Attempt::Conflict,
             })
         })

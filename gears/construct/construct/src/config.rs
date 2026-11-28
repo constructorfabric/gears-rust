@@ -494,7 +494,7 @@ mod tests {
             "processing_identity": "8b0b4c4e-0000-4000-8000-000000000001",
             "model": { "upstream_alias": "llm", "model": "gpt-x" },
             "processing": { "workers": 2 },
-            "admission": { "entity_kinds": ["skill"], "max_steps": 10 },
+            "admission": { "entity_kinds": ["project"], "max_steps": 10 },
             "profile_category_check": "per_category",
         }))
         .expect("known keys");
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(config.processing.queue_capacity.get(), 256);
         assert_eq!(
             config.admission.entity_kinds,
-            Some(vec!["skill".to_owned()])
+            Some(vec!["project".to_owned()])
         );
         assert_eq!(config.admission.max_steps, 10);
         assert_eq!(
@@ -543,7 +543,7 @@ mod tests {
     fn an_entity_kind_that_is_not_one_is_refused() {
         assert!(valid(serde_json::json!({ "admission": { "entity_kinds": ["skills"] } })).is_err());
         assert!(
-            valid(serde_json::json!({ "admission": { "entity_kinds": ["skill", "role"] } }))
+            valid(serde_json::json!({ "admission": { "entity_kinds": ["project", "product"] } }))
                 .is_ok()
         );
     }

@@ -88,6 +88,7 @@ fn a_root_payload_reads_back_as_written_with_the_counter_stamped() {
     let subject = Uuid::new_v4();
     let root = Root {
         removals: BTreeSet::from([NodeKey("construct:t:a".to_owned())]),
+        marks: Vec::new(),
     };
 
     let payload = root.payload(subject, &PayloadCounter, 4).unwrap();
@@ -95,6 +96,31 @@ fn a_root_payload_reads_back_as_written_with_the_counter_stamped() {
     assert_eq!(
         payload,
         json!({ "subject_id": subject.to_string(), "version": 4, "removals": ["construct:t:a"] })
+    );
+    assert_eq!(
+        Root::from_payload(&key(), subject, Some(&payload)).unwrap(),
+        root
+    );
+}
+
+#[test]
+fn the_marks_of_a_root_read_back_as_written() {
+    let subject = Uuid::new_v4();
+    let root = Root {
+        removals: BTreeSet::new(),
+        marks: vec![crate::domain::profile::Mark {
+            kind: "project".to_owned(),
+            key: "atlas".to_owned(),
+            tool: "chat".to_owned(),
+            message: "thread-1/msg-2".to_owned(),
+        }],
+    };
+
+    let payload = root.payload(subject, &PayloadCounter, 2).unwrap();
+
+    assert_eq!(
+        payload["marks"],
+        json!([{ "kind": "project", "key": "atlas", "tool": "chat", "message": "thread-1/msg-2" }])
     );
     assert_eq!(
         Root::from_payload(&key(), subject, Some(&payload)).unwrap(),

@@ -396,8 +396,8 @@ async fn the_value_cap_measures_a_value_as_a_whole_not_each_piece() {
     };
     // Three pieces of 2 characters each: every piece fits, the value does not.
     let plan = connector_plan(vec![add_value(
-        "skill",
-        "skills",
+        "project",
+        "project",
         serde_json::json!({ "name": "Go", "level": "C1", "since": "21" }),
     )]);
 
@@ -416,8 +416,8 @@ async fn the_value_cap_counts_no_keys() {
         ..AdmissionFixture::default()
     };
     let plan = connector_plan(vec![add_value(
-        "skill",
-        "skills",
+        "project",
+        "project",
         serde_json::json!({ "a_long_field_name": "Go", "level": "C1" }),
     )]);
 
@@ -560,6 +560,7 @@ async fn a_replace_whose_new_value_is_blocked_is_dropped_whole_so_the_old_value_
         change: Change::ReplaceEntity {
             old: crate::domain::plan::NodeKey("old".to_owned()),
             key: crate::domain::plan::NodeKey("new".to_owned()),
+            owner: None,
             properties: vec![
                 Property::new("name", "Acme"),
                 Property::new("salary", "90k"),
@@ -797,6 +798,7 @@ async fn a_redaction_in_a_replace_dropped_whole_is_not_reported() {
         change: Change::ReplaceEntity {
             old: crate::domain::plan::NodeKey("old".to_owned()),
             key: crate::domain::plan::NodeKey("new".to_owned()),
+            owner: None,
             properties: vec![
                 Property::new("contact", "call +49 30 1234"),
                 Property::new("diagnosis", "asthma"),
@@ -1012,7 +1014,7 @@ async fn checked(plan: &Plan, checks: &[(SensitiveDataKind, &'static str)]) -> V
 async fn a_redaction_inside_an_object_keeps_the_json_and_the_other_fields() {
     let fixture = AdmissionFixture::default();
     let plan = connector_plan(vec![add_value(
-        "identity",
+        "me",
         "contact_note",
         serde_json::json!({ "note": "call +49 30 1234 now", "label": "work" }),
     )]);
@@ -1076,7 +1078,7 @@ async fn two_pieces_of_one_value_give_one_event_per_kind() {
 async fn a_found_number_cannot_be_redacted_so_its_value_is_blocked() {
     let fixture = AdmissionFixture::default();
     let plan = connector_plan(vec![add_value(
-        "identity",
+        "me",
         "phone",
         serde_json::json!({ "number": 4_930_123 }),
     )]);
@@ -1099,6 +1101,7 @@ async fn one_blocked_piece_drops_its_whole_value_and_reports_no_redaction_in_it(
         entity_kind: "note".to_owned(),
         change: Change::AddEntity {
             key: crate::domain::plan::NodeKey("n".to_owned()),
+            owner: None,
             properties: vec![
                 Property::new(
                     "health_note",
@@ -1133,4 +1136,147 @@ async fn one_blocked_piece_drops_its_whole_value_and_reports_no_redaction_in_it(
     let events = fixture.events.taken();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, "blocked");
+}
+
+#[tokio::test]
+async fn a_link_is_not_an_entity_kind_the_tenant_must_allow() {
+    let fixture = AdmissionFixture {
+        rules: crate::domain::admission::AdmissionRules {
+            entity_kinds: only(&["project"]),
+            ..open_rules()
+        },
+        ..AdmissionFixture::default()
+    };
+    let mut plan = connector_plan(vec![add_entity("project", &[("name", "Atlas")])]);
+    plan.steps.push(crate::domain::plan::Step {
+        entity_kind: "works_on".to_owned(),
+        change: crate::domain::plan::Change::AddLink {
+            kind: "works_on".to_owned(),
+            from: crate::domain::plan::NodeKey("a".to_owned()),
+            to: crate::domain::plan::NodeKey("b".to_owned()),
+            properties: vec![crate::domain::plan::Property::new(
+                "works_on",
+                serde_json::json!({}),
+            )],
+        },
+        confidence: Some(0.9),
+    });
+
+    admitted(admit(&fixture, plan, &[]).await);
+}
+
+#[tokio::test]
+async fn a_link_to_a_node_admission_drops_is_dropped_with_it() {
+    use crate::domain::plan::{Change, NodeKey, Property, Step};
+    let fixture = AdmissionFixture::default();
+    let (kept, blocked) = (NodeKey("kept".to_owned()), NodeKey("blocked".to_owned()));
+    let node = |key: &NodeKey, name: &str| Step {
+        entity_kind: "project".to_owned(),
+        change: Change::AddEntity {
+            key: key.clone(),
+            owner: None,
+            properties: vec![Property::new(
+                "project",
+                serde_json::json!({ "name": name }),
+            )],
+        },
+        confidence: Some(0.9),
+    };
+    let plan = crate::domain::plan::Plan {
+        steps: vec![
+            node(&kept, "Atlas"),
+            node(&blocked, "Orion"),
+            Step {
+                entity_kind: "related_to".to_owned(),
+                change: Change::AddLink {
+                    kind: "related_to".to_owned(),
+                    from: kept,
+                    to: blocked,
+                    properties: vec![Property::new("related_to", serde_json::json!({}))],
+                },
+                confidence: Some(0.9),
+            },
+        ],
+        ..connector_plan(Vec::new())
+    };
+    // The second project holds a value no one may store: its one value is blocked.
+    let blocked_value = found(SensitiveDataKind::Contacts, at(1, 0), Vec::new());
+
+    let admitted = admitted(admit(&fixture, plan, &[blocked_value]).await);
+
+    let stored: Vec<&str> = admitted
+        .plan
+        .steps
+        .iter()
+        .map(|step| step.entity_kind.as_str())
+        .collect();
+    assert_eq!(
+        stored,
+        ["project"],
+        "the link to the dropped project goes with it"
+    );
+}
+
+#[tokio::test]
+async fn a_node_owned_by_a_dropped_node_is_dropped_with_it_however_deep() {
+    use crate::domain::plan::{Change, NodeKey, Property, Step};
+    let fixture = AdmissionFixture::default();
+    let add = |kind: &str, key: &str, owner: Option<&str>, value: serde_json::Value| Step {
+        entity_kind: kind.to_owned(),
+        change: Change::AddEntity {
+            key: NodeKey(key.to_owned()),
+            owner: owner.map(|owner| NodeKey(owner.to_owned())),
+            properties: vec![Property::new(kind, value)],
+        },
+        confidence: Some(0.9),
+    };
+    let plan = crate::domain::plan::Plan {
+        steps: vec![
+            add(
+                "project",
+                "kept",
+                None,
+                serde_json::json!({ "name": "Atlas" }),
+            ),
+            add(
+                "project",
+                "blocked",
+                None,
+                serde_json::json!({ "name": "Orion" }),
+            ),
+            add(
+                "decision",
+                "child",
+                Some("blocked"),
+                serde_json::json!({ "text": "ship" }),
+            ),
+            add(
+                "question",
+                "grandchild",
+                Some("child"),
+                serde_json::json!({ "text": "when?" }),
+            ),
+            add(
+                "decision",
+                "sibling",
+                Some("kept"),
+                serde_json::json!({ "text": "wait" }),
+            ),
+        ],
+        ..connector_plan(Vec::new())
+    };
+    let blocked_value = found(SensitiveDataKind::Contacts, at(1, 0), Vec::new());
+
+    let admitted = admitted(admit(&fixture, plan, &[blocked_value]).await);
+
+    let kept: Vec<&str> = admitted
+        .plan
+        .steps
+        .iter()
+        .map(|step| match &step.change {
+            Change::AddEntity { key, .. } => key.0.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(kept, ["kept", "sibling"]);
 }

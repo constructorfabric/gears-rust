@@ -1,37 +1,33 @@
 use std::collections::BTreeMap;
 
-use construct_sdk::person_types::{Cardinality, PERSON_TYPES, PROPERTIES, property_schema};
+use construct_sdk::linked_schema::{LinkKind, NodeKind, Schema};
 use jsonschema::{Draft, Validator};
 use serde_json::Value;
 use toolkit_macros::domain_model;
 
 use crate::domain::error::DomainError;
-use crate::domain::profile::Category;
+use crate::domain::profile::{Category, profile_schema};
 
-/// One property of the person types: its category, its cardinality and its schema.
+/// A JSON schema with its compiled validator.
 #[domain_model]
 #[derive(Debug)]
-pub struct PropertySpec {
-    pub category: Category,
-    pub cardinality: Cardinality,
+struct Checked {
     schema: Value,
     validator: Validator,
 }
 
-impl PropertySpec {
-    /// The property's JSON schema in its person type.
-    #[must_use]
-    pub fn schema(&self) -> &Value {
-        &self.schema
+impl Checked {
+    fn compile(name: &str, schema: Value) -> Result<Self, DomainError> {
+        let validator = jsonschema::options()
+            .with_draft(Draft::Draft7)
+            .build(&schema)
+            .map_err(|error| {
+                DomainError::internal(format!("the schema of {name} does not compile: {error}"))
+            })?;
+        Ok(Self { schema, validator })
     }
 
-    /// Checks a value against the property's schema.
-    ///
-    /// # Errors
-    ///
-    /// The first rule the value breaks and where, followed by the schema the property takes. The reason does not
-    /// repeat the value.
-    pub fn check(&self, value: &Value) -> Result<(), String> {
+    fn check(&self, value: &Value) -> Result<(), String> {
         let Some(error) = self.validator.iter_errors(value).next() else {
             return Ok(());
         };
@@ -49,74 +45,120 @@ impl PropertySpec {
     }
 }
 
-/// Every property of the person types, by name.
+/// One node kind: its category and the schema of the object of fields a node of it holds.
 #[domain_model]
 #[derive(Debug)]
-pub struct PropertyCatalog {
-    properties: BTreeMap<&'static str, PropertySpec>,
+pub struct KindSpec {
+    pub category: Category,
+    checked: Checked,
 }
 
-impl PropertyCatalog {
-    /// Reads every property from the person types the SDK ships.
+impl KindSpec {
+    /// The kind in the schema.
+    #[must_use]
+    pub fn kind(&self) -> &'static NodeKind {
+        self.category.kind()
+    }
+
+    /// The JSON schema of the kind's fields.
+    #[must_use]
+    pub fn schema(&self) -> &Value {
+        &self.checked.schema
+    }
+
+    /// Checks the fields of a node against the kind's schema.
     ///
     /// # Errors
     ///
-    /// [`DomainError::Internal`] when a person type does not parse or a property has no schema.
-    pub fn load() -> Result<Self, DomainError> {
-        let mut schemas = BTreeMap::new();
-        for person_type in PERSON_TYPES {
-            let schema: Value = serde_json::from_str(person_type.schema).map_err(|error| {
-                DomainError::internal(format!(
-                    "person type {} does not parse: {error}",
-                    person_type.type_id
-                ))
-            })?;
-            schemas.insert(person_type.type_id, schema);
-        }
-        let mut properties = BTreeMap::new();
-        for property in PROPERTIES {
-            let category = Category::from_type_id(property.type_id).ok_or_else(|| {
-                DomainError::internal(format!("{} is not a person type", property.type_id))
-            })?;
-            let schema = schemas
-                .get(property.type_id)
-                .and_then(|schema| property_schema(schema, property.name))
-                .ok_or_else(|| {
-                    DomainError::internal(format!(
-                        "{} has no schema for {}",
-                        property.type_id, property.name
-                    ))
-                })?;
-            let validator = jsonschema::options()
-                .with_draft(Draft::Draft7)
-                .build(&schema)
-                .map_err(|error| {
-                    DomainError::internal(format!(
-                        "the schema of {} does not compile: {error}",
-                        property.name
-                    ))
-                })?;
-            properties.insert(
-                property.name,
-                PropertySpec {
-                    category,
-                    cardinality: property.cardinality,
-                    schema,
-                    validator,
-                },
-            );
-        }
-        Ok(Self { properties })
+    /// The first rule the value breaks and where, followed by the schema the kind takes. The reason does not repeat
+    /// the value.
+    pub fn check(&self, value: &Value) -> Result<(), String> {
+        self.checked.check(value)
     }
+}
 
-    /// The property named `property`, or `None` when the person types have no such property.
+/// One link kind and the schema of its fields.
+#[domain_model]
+#[derive(Debug)]
+pub struct LinkSpec {
+    kind: &'static LinkKind,
+    checked: Checked,
+}
+
+impl LinkSpec {
+    /// The link kind in the schema.
     #[must_use]
-    pub fn get(&self, property: &str) -> Option<&PropertySpec> {
-        self.properties.get(property)
+    pub fn kind(&self) -> &'static LinkKind {
+        self.kind
     }
 
-    /// The names of all properties, in alphabetical order.
-    pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
-        self.properties.keys().copied()
+    /// The JSON schema of the link's fields.
+    #[must_use]
+    pub fn schema(&self) -> &Value {
+        &self.checked.schema
+    }
+
+    /// Checks the fields of a link against the link kind's schema.
+    ///
+    /// # Errors
+    ///
+    /// As [`KindSpec::check`].
+    pub fn check(&self, value: &Value) -> Result<(), String> {
+        self.checked.check(value)
+    }
+}
+
+/// Every node kind and link kind of the profile schema, by name, with its schema compiled.
+#[domain_model]
+#[derive(Debug)]
+pub struct Catalog {
+    kinds: BTreeMap<&'static str, KindSpec>,
+    links: BTreeMap<&'static str, LinkSpec>,
+}
+
+impl Catalog {
+    /// Reads every kind and link kind from the profile schema.
+    ///
+    /// # Errors
+    ///
+    /// [`DomainError::Internal`] when a schema does not compile.
+    pub fn load() -> Result<Self, DomainError> {
+        let schema = profile_schema();
+        let mut kinds = BTreeMap::new();
+        for kind in &schema.nodes {
+            let category = Category::from_name(kind.name).ok_or_else(|| {
+                DomainError::internal(format!("{} is not a kind of the schema", kind.name))
+            })?;
+            let checked = Checked::compile(kind.name, Schema::fields_schema(kind))?;
+            kinds.insert(kind.name, KindSpec { category, checked });
+        }
+        let mut links = BTreeMap::new();
+        for kind in &schema.links {
+            let checked = Checked::compile(kind.name, Schema::link_fields_schema(kind))?;
+            links.insert(kind.name, LinkSpec { kind, checked });
+        }
+        Ok(Self { kinds, links })
+    }
+
+    /// The node kind named `name`, or `None` when the schema has no such kind.
+    #[must_use]
+    pub fn kind(&self, name: &str) -> Option<&KindSpec> {
+        self.kinds.get(name)
+    }
+
+    /// The link kind named `name`, or `None` when the schema has no such link kind.
+    #[must_use]
+    pub fn link(&self, name: &str) -> Option<&LinkSpec> {
+        self.links.get(name)
+    }
+
+    /// The names of all node kinds, in alphabetical order.
+    pub fn kind_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.kinds.keys().copied()
+    }
+
+    /// The names of all link kinds, in alphabetical order.
+    pub fn link_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.links.keys().copied()
     }
 }

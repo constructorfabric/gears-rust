@@ -36,6 +36,8 @@ fn fact(category: Category, property: &str, value: serde_json::Value) -> StoredF
         category,
         property: property.to_owned(),
         value,
+        owner: None,
+        learned: Vec::new(),
         origin: OriginKind::Connector,
         stored_at: OffsetDateTime::UNIX_EPOCH,
         produced_at: None,
@@ -44,9 +46,9 @@ fn fact(category: Category, property: &str, value: serde_json::Value) -> StoredF
 
 fn facts() -> Vec<StoredFact> {
     vec![
-        fact(Category::Skill, "skills", json!({ "name": "Rust" })),
-        fact(Category::Identity, "full_name", json!("Ada Lovelace")),
-        fact(Category::Skill, "skills", json!({ "name": "Go" })),
+        fact(Category::PROJECT, "project", json!({ "name": "Rust" })),
+        fact(Category::ME, "full_name", json!("Ada Lovelace")),
+        fact(Category::PROJECT, "project", json!({ "name": "Go" })),
     ]
 }
 
@@ -176,7 +178,7 @@ async fn a_caller_the_platform_lets_act_for_the_subject_reads_its_facts_by_categ
     assert_eq!(view.subject_id, subject);
     assert_eq!(
         kinds(&view),
-        [(Category::Identity, 1), (Category::Skill, 2)],
+        [(Category::ME, 1), (Category::PROJECT, 2)],
         "in category order, only categories with facts"
     );
     let event = &events.taken()[0];
@@ -184,10 +186,10 @@ async fn a_caller_the_platform_lets_act_for_the_subject_reads_its_facts_by_categ
         (event.tenant_id, event.subject_id, event.caller),
         (tenant, subject, caller.subject_id())
     );
-    assert_eq!(event.categories, [Category::Identity, Category::Skill]);
+    assert_eq!(event.categories, [Category::ME, Category::PROJECT]);
     assert_eq!(
         event.granted,
-        Category::ALL,
+        Category::all(),
         "the grant, also the categories without facts"
     );
     assert!(event.served);
@@ -201,7 +203,7 @@ async fn a_fact_under_an_open_review_request_is_not_served() {
     let reviews = Arc::new(MemoryReviews::default());
     let flagged = stored
         .iter()
-        .find(|fact| fact.category == Category::Identity)
+        .find(|fact| fact.category == Category::ME)
         .unwrap();
     reviews.open_on(
         SubjectKey {
@@ -227,7 +229,7 @@ async fn a_fact_under_an_open_review_request_is_not_served() {
 
     assert_eq!(
         kinds(&view),
-        [(Category::Skill, 2)],
+        [(Category::PROJECT, 2)],
         "the identity under review is left out, its category with it"
     );
 }
@@ -347,7 +349,7 @@ async fn a_category_the_scope_leaves_out_is_not_listed() {
     let events = Arc::new(RecordingProfileEvents::default());
     let service = profile_service(
         &db,
-        Arc::new(CategoryResolver(&["skill"])),
+        Arc::new(CategoryResolver(&["project"])),
         facts(),
         Arc::clone(&events),
         CategoryCheck::OneCall,
@@ -359,10 +361,10 @@ async fn a_category_the_scope_leaves_out_is_not_listed() {
         .await
         .unwrap();
 
-    assert_eq!(kinds(&view), [(Category::Skill, 2)]);
+    assert_eq!(kinds(&view), [(Category::PROJECT, 2)]);
     let event = &events.taken()[0];
-    assert_eq!(event.categories, [Category::Skill]);
-    assert_eq!(event.granted, [Category::Skill]);
+    assert_eq!(event.categories, [Category::PROJECT]);
+    assert_eq!(event.granted, [Category::PROJECT]);
 }
 
 #[tokio::test]
@@ -370,7 +372,7 @@ async fn per_category_the_policy_service_is_asked_for_each_category() {
     let db = inmem_db().await;
     let service = profile_service(
         &db,
-        Arc::new(PerCategoryResolver(&["identity"])),
+        Arc::new(PerCategoryResolver(&["me"])),
         facts(),
         Arc::default(),
         CategoryCheck::PerCategory,
@@ -382,7 +384,7 @@ async fn per_category_the_policy_service_is_asked_for_each_category() {
         .await
         .unwrap();
 
-    assert_eq!(kinds(&view), [(Category::Identity, 1)]);
+    assert_eq!(kinds(&view), [(Category::ME, 1)]);
 }
 
 #[tokio::test]
@@ -517,9 +519,9 @@ async fn a_constraint_that_names_no_tenant_grants_nothing() {
         }
     };
 
-    let categories_only = read_under(vec![category_is("skill")]).await;
+    let categories_only = read_under(vec![category_is("project")]).await;
     let subject_only = read_under(vec![subject_is(subject)]).await;
-    let with_the_tenant = read_under(vec![tenant_is(tenant), category_is("skill")]).await;
+    let with_the_tenant = read_under(vec![tenant_is(tenant), category_is("project")]).await;
 
     for refused in [categories_only, subject_only] {
         assert!(
@@ -535,8 +537,8 @@ async fn categories_come_only_from_the_constraints_that_reach_the_subject() {
     let db = inmem_db().await;
     let (tenant, other_tenant, subject) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
     let resolver = FixedScope(vec![
-        vec![tenant_is(tenant), category_is("skill")],
-        vec![tenant_is(other_tenant), category_is("identity")],
+        vec![tenant_is(tenant), category_is("project")],
+        vec![tenant_is(other_tenant), category_is("me")],
     ]);
     let service = profile_service(
         &db,
@@ -553,7 +555,7 @@ async fn categories_come_only_from_the_constraints_that_reach_the_subject() {
 
     assert_eq!(
         kinds(&view),
-        [(Category::Skill, 2)],
+        [(Category::PROJECT, 2)],
         "identity is granted only elsewhere"
     );
 }
@@ -600,7 +602,7 @@ impl AuthZResolverApi for FailsForCategory {
         if category.as_deref() == Some(self.0) {
             return Err(CanonicalError::service_unavailable().create());
         }
-        PerCategoryResolver(&["identity", "role", "skill", "preference"])
+        PerCategoryResolver(&["me", "product", "project", "team"])
             .evaluate(ctx, request)
             .await
     }
@@ -611,7 +613,7 @@ async fn per_category_a_failed_policy_call_fails_the_read_instead_of_hiding_the_
     let db = inmem_db().await;
     let service = profile_service(
         &db,
-        Arc::new(FailsForCategory("role")),
+        Arc::new(FailsForCategory("product")),
         facts(),
         Arc::default(),
         CategoryCheck::PerCategory,
@@ -698,7 +700,7 @@ async fn a_tenant_answer_lets_the_caller_read_every_subject_in_that_tenant() {
         let view = service.read(&caller, None, subject).await.unwrap();
         assert_eq!(
             kinds(&view),
-            [(Category::Identity, 1), (Category::Skill, 2)],
+            [(Category::ME, 1), (Category::PROJECT, 2)],
             "{who}"
         );
     }
@@ -724,10 +726,7 @@ async fn another_caller_reads_on_a_constraint_that_names_the_subject() {
         .await
         .unwrap();
 
-    assert_eq!(
-        kinds(&view),
-        [(Category::Identity, 1), (Category::Skill, 2)]
-    );
+    assert_eq!(kinds(&view), [(Category::ME, 1), (Category::PROJECT, 2)]);
 }
 
 #[tokio::test]
@@ -780,9 +779,9 @@ async fn two_category_filters_in_one_constraint_grant_only_their_overlap() {
             tenant_is(tenant),
             Predicate::In(InPredicate::new(
                 CATEGORY_PROPERTY,
-                ["skill".to_owned(), "identity".to_owned()],
+                ["project".to_owned(), "me".to_owned()],
             )),
-            category_is("skill"),
+            category_is("project"),
         ]])),
         facts(),
         Arc::default(),
@@ -794,7 +793,7 @@ async fn two_category_filters_in_one_constraint_grant_only_their_overlap() {
         .await
         .unwrap();
 
-    assert_eq!(kinds(&view), [(Category::Skill, 2)]);
+    assert_eq!(kinds(&view), [(Category::PROJECT, 2)]);
 }
 
 #[tokio::test]
@@ -866,7 +865,7 @@ async fn per_category_an_answer_that_cannot_be_compiled_hides_its_category() {
     let db = inmem_db().await;
     let service = profile_service(
         &db,
-        Arc::new(UncompilableFor("skill")),
+        Arc::new(UncompilableFor("project")),
         facts(),
         Arc::default(),
         CategoryCheck::PerCategory,
@@ -878,7 +877,7 @@ async fn per_category_an_answer_that_cannot_be_compiled_hides_its_category() {
         .await
         .unwrap();
 
-    assert_eq!(kinds(&view), [(Category::Identity, 1)]);
+    assert_eq!(kinds(&view), [(Category::ME, 1)]);
     assert!(
         logs_contain("cannot be compiled"),
         "a plugin defect is said where an operator looks"
@@ -1021,7 +1020,11 @@ impl AuthZResolverApi for CategoriesElsewhere {
             return Ok(allowed(vec![tenant_is(tenant)]));
         };
         Ok(allowed(if self.other_category {
-            let other = if asked == "skill" { "role" } else { "skill" };
+            let other = if asked == "project" {
+                "product"
+            } else {
+                "project"
+            };
             vec![tenant_is(tenant), category_is(other)]
         } else {
             vec![tenant_is(tenant), subject_is(Uuid::new_v4())]
@@ -1064,9 +1067,9 @@ async fn a_fact_stored_before_the_tenants_retention_period_is_not_served() {
     let db = inmem_db().await;
     let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
     let now = OffsetDateTime::now_utc();
-    let mut old = fact(Category::Skill, "skills", json!({ "name": "COBOL" }));
+    let mut old = fact(Category::PROJECT, "project", json!({ "name": "COBOL" }));
     old.stored_at = now - time::Duration::days(31);
-    let mut new = fact(Category::Skill, "skills", json!({ "name": "Rust" }));
+    let mut new = fact(Category::PROJECT, "project", json!({ "name": "Rust" }));
     new.stored_at = now - time::Duration::days(29);
     let service = profile_service(
         &db,
@@ -1148,4 +1151,310 @@ async fn a_period_reaching_before_the_earliest_time_hides_nothing() {
         view.categories.iter().map(|g| g.facts.len()).sum::<usize>(),
         facts().len()
     );
+}
+
+// --- One node, with what it owns and links to ---
+
+fn learned(tool: &str, message: &str) -> crate::domain::profile_read::LearnedFrom {
+    crate::domain::profile_read::LearnedFrom {
+        tool: tool.to_owned(),
+        message: Some(message.to_owned()),
+    }
+}
+
+/// Priya, the project she works on, its commitment, a team that does the project, and the links.
+struct Linked {
+    facts: Vec<StoredFact>,
+    links: Vec<crate::domain::profile_read::StoredLinkFact>,
+}
+
+impl Linked {
+    fn new() -> Self {
+        let mut priya = fact(Category::PERSON, "person", json!({ "name": "Priya Shah" }));
+        priya.learned = vec![learned("chat", "m1")];
+        let mut project = fact(
+            Category::PROJECT,
+            "project",
+            json!({ "name": "Construct Browser onboarding" }),
+        );
+        project.learned = vec![
+            learned("chat", "m1"),
+            learned("chat", "m2"),
+            learned("mail", "m3"),
+        ];
+        let mut promise = fact(
+            Category::COMMITMENT,
+            "commitment",
+            json!({ "kind": "promise", "text": "send the interview script" }),
+        );
+        promise.owner = Some(project.node_key.clone());
+        let team = fact(Category::TEAM, "team", json!({ "name": "Platform" }));
+        let link = |kind: &str, from: &StoredFact, to: &StoredFact, fields, tool: &str| {
+            crate::domain::profile_read::StoredLinkFact {
+                link: crate::domain::profile::Link {
+                    kind: kind.to_owned(),
+                    from: from.node_key.clone(),
+                    to: to.node_key.clone(),
+                    fields,
+                },
+                learned: vec![learned(tool, "m")],
+            }
+        };
+        let links = vec![
+            link(
+                "works_on",
+                &priya,
+                &project,
+                json!({ "role": "lead" }),
+                "chat",
+            ),
+            link("done_by", &project, &team, json!({}), "mail"),
+            link("owner", &promise, &priya, json!({}), "chat"),
+        ];
+        Self {
+            facts: vec![priya, project, promise, team],
+            links,
+        }
+    }
+
+    fn key(&self, kind: Category) -> NodeKey {
+        self.facts
+            .iter()
+            .find(|fact| fact.category == kind)
+            .unwrap()
+            .node_key
+            .clone()
+    }
+
+    async fn read(
+        &self,
+        resolver: Arc<dyn AuthZResolverApi>,
+        node: &NodeKey,
+    ) -> Result<crate::domain::profile_read::NodeDetails, DomainError> {
+        let db = inmem_db().await;
+        let service = profile_service_over(
+            &db,
+            resolver,
+            Arc::new(FixedFacts::with_links(
+                self.facts.clone(),
+                self.links.clone(),
+            )),
+            Uuid::new_v4(),
+            Arc::default(),
+            CategoryCheck::OneCall,
+        );
+        let subject = Uuid::new_v4();
+        service
+            .read_node(&subject_in(Uuid::new_v4(), subject), None, subject, node)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn a_node_is_read_with_what_it_owns_what_it_links_to_and_where_it_was_learned() {
+    let linked = Linked::new();
+
+    let details = linked
+        .read(Arc::new(AllowResolver), &linked.key(Category::PROJECT))
+        .await
+        .unwrap();
+
+    assert_eq!(details.node.category, Category::PROJECT);
+    let owned: Vec<&str> = details
+        .owned
+        .iter()
+        .map(|fact| fact.property.as_str())
+        .collect();
+    assert_eq!(owned, ["commitment"]);
+    let groups: Vec<(&str, usize)> = details
+        .neighbours
+        .iter()
+        .map(|group| (group.link.as_str(), group.neighbours.len()))
+        .collect();
+    assert_eq!(
+        groups,
+        [("done_by", 1), ("works_on", 1)],
+        "grouped by link kind"
+    );
+    let works_on = &details.neighbours[1].neighbours[0];
+    assert_eq!(
+        works_on.direction,
+        crate::domain::profile_read::LinkDirection::In
+    );
+    assert_eq!(works_on.fields, json!({ "role": "lead" }));
+    assert_eq!(works_on.node.category, Category::PERSON);
+    assert_eq!(
+        details.neighbours[0].neighbours[0].direction,
+        crate::domain::profile_read::LinkDirection::Out
+    );
+    // The project's own three places and its two links: chat twice, mail once from the node, then the links.
+    let tools: Vec<(&str, usize)> = details
+        .learned_from
+        .iter()
+        .map(|count| (count.tool.as_str(), count.count))
+        .collect();
+    assert_eq!(tools, [("chat", 3), ("mail", 2)]);
+}
+
+#[tokio::test]
+async fn a_reader_without_the_permission_for_projects_sees_no_project_and_no_neighbour_of_one() {
+    let linked = Linked::new();
+    let no_projects: Arc<dyn AuthZResolverApi> =
+        Arc::new(CategoryResolver(&["person", "commitment", "team"]));
+
+    let project = linked
+        .read(Arc::clone(&no_projects), &linked.key(Category::PROJECT))
+        .await;
+    let priya = linked
+        .read(no_projects, &linked.key(Category::PERSON))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(project, Err(DomainError::NoSuchFact(_))),
+        "{project:?}"
+    );
+    let groups: Vec<&str> = priya
+        .neighbours
+        .iter()
+        .map(|group| group.link.as_str())
+        .collect();
+    assert_eq!(
+        groups,
+        ["owner"],
+        "works_on leads to a project, so it is not shown"
+    );
+    assert!(
+        priya.learned_from.iter().all(|count| count.count <= 2),
+        "a link to a project is not counted either"
+    );
+}
+
+#[tokio::test]
+async fn a_node_the_subject_does_not_have_is_not_found() {
+    let linked = Linked::new();
+
+    let missing = linked
+        .read(
+            Arc::new(AllowResolver),
+            &NodeKey("construct:nothing".to_owned()),
+        )
+        .await;
+
+    assert!(
+        matches!(missing, Err(DomainError::NoSuchFact(_))),
+        "{missing:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_node_read_the_caller_may_not_make_is_audited_like_a_refused_profile_read() {
+    let linked = Linked::new();
+    let db = inmem_db().await;
+    let events = Arc::new(RecordingProfileEvents::default());
+    let service = profile_service_over(
+        &db,
+        Arc::new(CategoryResolver(&["person"])),
+        Arc::new(FixedFacts::with_links(
+            linked.facts.clone(),
+            linked.links.clone(),
+        )),
+        Uuid::new_v4(),
+        Arc::clone(&events),
+        CategoryCheck::OneCall,
+    );
+    let subject = Uuid::new_v4();
+
+    let refused = service
+        .read_node(
+            &subject_in(Uuid::new_v4(), subject),
+            None,
+            subject,
+            &linked.key(Category::PROJECT),
+        )
+        .await;
+
+    assert!(
+        matches!(refused, Err(DomainError::NoSuchFact(_))),
+        "{refused:?}"
+    );
+    let [event] = events.taken().try_into().expect("one event");
+    assert!(event.categories.is_empty());
+    assert_eq!(event.granted, [Category::PERSON]);
+}
+
+/// One node read of the linked fixture, the way a caller who may read every category makes it, with the audit
+/// event it left.
+async fn audited_node_read(
+    personalization: bool,
+    node: impl FnOnce(&Linked) -> NodeKey,
+) -> (
+    Result<(), DomainError>,
+    crate::domain::profile_read::ProfileReadEvent,
+) {
+    let linked = Linked::new();
+    let node = node(&linked);
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    seed_subject_settings(
+        &db,
+        SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        },
+        SubjectSettings {
+            personalization_enabled: personalization,
+            erasure_in_progress: false,
+        },
+    )
+    .await;
+    let events = Arc::new(RecordingProfileEvents::default());
+    let service = profile_service_over(
+        &db,
+        Arc::new(AllowResolver),
+        Arc::new(FixedFacts::with_links(linked.facts, linked.links)),
+        Uuid::new_v4(),
+        Arc::clone(&events),
+        CategoryCheck::OneCall,
+    );
+    let read = service
+        .read_node(&subject_in(tenant, subject), None, subject, &node)
+        .await
+        .map(|_| ());
+    let [event] = events.taken().try_into().expect("one event");
+    (read, event)
+}
+
+#[tokio::test]
+async fn a_node_read_is_audited_with_the_categories_it_served() {
+    let (read, event) = audited_node_read(true, |linked| linked.key(Category::PERSON)).await;
+
+    assert!(read.is_ok(), "{read:?}");
+    assert!(event.served);
+    assert_eq!(event.granted, Category::all());
+    // The person, and what it is linked to: the projects it works on, and their commitments. Not the unlinked team.
+    assert_eq!(
+        event.categories,
+        [Category::COMMITMENT, Category::PERSON, Category::PROJECT]
+    );
+}
+
+#[tokio::test]
+async fn a_node_the_subject_does_not_hold_is_audited_as_served_and_refused() {
+    let (read, event) = audited_node_read(true, |_| NodeKey("construct:nothing".to_owned())).await;
+
+    assert!(matches!(read, Err(DomainError::NoSuchFact(_))), "{read:?}");
+    assert!(event.served);
+    assert_eq!(event.granted, Category::all());
+    assert!(event.categories.is_empty());
+}
+
+#[tokio::test]
+async fn a_node_read_with_personalization_off_is_audited_as_not_served() {
+    let (read, event) = audited_node_read(false, |linked| linked.key(Category::PERSON)).await;
+
+    assert!(matches!(read, Err(DomainError::NoSuchFact(_))), "{read:?}");
+    assert!(!event.served);
+    assert!(event.granted.is_empty(), "not asked when nothing is served");
+    assert!(event.categories.is_empty());
 }

@@ -1,16 +1,14 @@
-use std::collections::HashSet;
-
 use serde_json::{Value, json};
 
-use super::catalog::PropertyCatalog;
+use super::catalog::Catalog;
 use super::draft::PlanDraft;
-use super::test_data::{
-    SUBJECT, TENANT, catalog, is_new_key, node_key, origin, profile, schema_in_person_type,
-};
-use super::tools::{ADD, REMOVE, REPLACE, ToolRefusal};
+use super::test_data::{SUBJECT, TENANT, catalog, is_new_key, node_key, origin, profile};
+use super::tools::{ADD, LINK, REMOVE, REPLACE, ToolRefusal};
 use crate::domain::model_client::ToolCall;
-use crate::domain::plan::{Change, NodeKey, Property, Step};
-use crate::domain::profile::{Category, Fact, Profile};
+use crate::domain::plan::{Change, NodeKey, Plan};
+
+// The profile of `test_data::profile`: 1 me, 2 person Priya Shah, 3 project Atlas, 4 commitment owned by 3, and 5
+// the link works_on from 2 to 3. The nodes this plan adds are numbered from 6.
 
 fn call(name: &str, arguments: Value) -> ToolCall {
     ToolCall {
@@ -20,10 +18,24 @@ fn call(name: &str, arguments: Value) -> ToolCall {
     }
 }
 
-fn add(property: &str, value: &Value) -> ToolCall {
+fn add(kind: &str, value: &Value) -> ToolCall {
     call(
         ADD,
-        json!({ "property": property, "value": value, "confidence": 0.9 }),
+        json!({ "kind": kind, "value": value, "confidence": 0.9 }),
+    )
+}
+
+fn add_owned(kind: &str, value: &Value, owner: usize) -> ToolCall {
+    call(
+        ADD,
+        json!({ "kind": kind, "value": value, "owner": owner, "confidence": 0.9 }),
+    )
+}
+
+fn link(kind: &str, from: usize, to: usize) -> ToolCall {
+    call(
+        LINK,
+        json!({ "kind": kind, "from": from, "to": to, "confidence": 0.9 }),
     )
 }
 
@@ -38,11 +50,7 @@ fn remove(number: usize) -> ToolCall {
     call(REMOVE, json!({ "number": number, "confidence": 0.9 }))
 }
 
-fn refusal_after(
-    catalog: &PropertyCatalog,
-    before: &[ToolCall],
-    refused: &ToolCall,
-) -> ToolRefusal {
+fn refusal_after(catalog: &Catalog, before: &[ToolCall], refused: &ToolCall) -> ToolRefusal {
     let mut draft = PlanDraft::new(catalog, profile());
     for accepted in before {
         draft.apply(accepted).expect("accepted");
@@ -57,515 +65,544 @@ fn refusal_after(
     refusal
 }
 
+fn plan_of(calls: &[ToolCall]) -> Plan {
+    let catalog = catalog();
+    let mut draft = PlanDraft::new(&catalog, profile());
+    for call in calls {
+        draft.apply(call).expect("accepted");
+    }
+    draft.finish(TENANT, SUBJECT, origin())
+}
+
 #[test]
-fn the_profile_is_shown_as_numbered_values_of_plain_properties_in_json() {
+fn the_profile_is_shown_as_numbered_nodes_and_links() {
     let catalog = catalog();
     let draft = PlanDraft::new(&catalog, profile());
 
     assert_eq!(
         draft.numbered_profile(),
-        "1. role (role): \"teacher\"\n2. skills (skill): {\"name\":\"Python\"}\n3. full_name (identity): \"Jane Doe\""
+        [
+            r#"1. me: {"name":"Jane Doe"}"#,
+            r#"2. person: {"name":"Priya Shah","space":"work"}"#,
+            r#"3. project: {"name":"Atlas"}"#,
+            r#"4. commitment (owned by 3): {"kind":"action","text":"book the review"}"#,
+            r#"5. link works_on from 2 to 3: {"role":"lead"}"#,
+        ]
+        .join("\n")
     );
 }
 
 #[test]
-fn a_line_break_in_a_value_cannot_forge_a_profile_line() {
-    let catalog = catalog();
-    let profile = Profile {
-        version: Some(1),
-        facts: vec![Fact {
-            node_key: NodeKey(format!("construct:{TENANT}:1")),
-            category: Category::Role,
-            property: "role".to_owned(),
-            value: json!("teacher\n2. role (role): admin"),
-        }],
-    };
-
-    let shown = PlanDraft::new(&catalog, profile).numbered_profile();
-
-    assert_eq!(shown.lines().count(), 1, "{shown}");
-}
-
-#[test]
-fn a_replace_is_one_entity_in_place_of_the_old_one() {
+fn an_added_node_gets_a_new_key_and_the_number_after_the_profile() {
     let catalog = catalog();
     let mut draft = PlanDraft::new(&catalog, profile());
 
-    let result = draft.apply(&replace(1, &json!("school principal")));
-    let plan = draft.finish(TENANT, SUBJECT, origin());
+    let first = draft
+        .apply(&add("team", &json!({ "name": "Platform" })))
+        .unwrap();
+    let second = draft
+        .apply(&add("team", &json!({ "name": "Design" })))
+        .unwrap();
 
-    assert_eq!(result, Ok("replaced 1".to_owned()));
-    let [step] = plan.steps.as_slice() else {
-        panic!("one step: {:?}", plan.steps);
-    };
-    let Change::ReplaceEntity {
-        old,
-        key,
-        properties,
-    } = &step.change
-    else {
-        panic!("a replace: {:?}", step.change);
-    };
-    assert_eq!(*old, node_key(1));
-    assert!(is_new_key(key), "{}", key.0);
-    assert_eq!(*properties, [Property::new("role", "school principal")]);
+    assert_eq!(first, "added team as 6");
+    assert_eq!(second, "added team as 7");
+    let plan = draft.finish(TENANT, SUBJECT, origin());
+    let keys: Vec<&NodeKey> = plan
+        .steps
+        .iter()
+        .map(|step| match &step.change {
+            Change::AddEntity { key, owner, .. } => {
+                assert_eq!(owner, &None);
+                key
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert!(keys.iter().all(|key| is_new_key(key)));
+    assert_ne!(keys[0], keys[1]);
+    assert_eq!(plan.profile_version, Some(7));
+}
+
+#[test]
+fn a_node_with_the_name_of_a_held_one_is_refused_with_the_number_of_the_held_one() {
+    let catalog = catalog();
+
+    let same = refusal_after(
+        &catalog,
+        &[],
+        &add("project", &json!({ "name": "  atlas " })),
+    );
+
     assert_eq!(
-        (step.entity_kind.as_str(), step.confidence),
-        ("role", Some(0.9))
+        same,
+        ToolRefusal::AlreadyExists {
+            kind: "project".to_owned(),
+            number: 3
+        }
+    );
+    assert!(same.to_string().contains("as 3"), "{same}");
+    let twice = refusal_after(
+        &catalog,
+        &[add("project", &json!({ "name": "Orion" }))],
+        &add("project", &json!({ "name": "ORION" })),
+    );
+    assert_eq!(
+        twice,
+        ToolRefusal::AlreadyAdded {
+            kind: "project".to_owned(),
+            number: 6
+        }
     );
 }
 
 #[test]
-fn an_add_and_a_remove_keep_their_confidence_in_a_plan_on_the_profile_version() {
+fn a_name_is_the_same_only_within_its_kind_and_its_owner() {
     let catalog = catalog();
     let mut draft = PlanDraft::new(&catalog, profile());
 
     draft
-        .apply(&call(
-            ADD,
-            json!({ "property": "skills", "value": { "name": "Rust" }, "confidence": 0.8 }),
+        .apply(&add("team", &json!({ "name": "Atlas" })))
+        .expect("a team may share a name with a project");
+    draft
+        .apply(&add_owned(
+            "commitment",
+            &json!({ "kind": "action", "text": "book the review" }),
+            2,
         ))
-        .expect("added");
-    draft
-        .apply(&call(REMOVE, json!({ "number": 2, "confidence": 0.7 })))
-        .expect("removed");
-    let plan = draft.finish(TENANT, SUBJECT, origin());
+        .expect("another owner, another commitment");
+    let held = draft.apply(&add_owned(
+        "commitment",
+        &json!({ "kind": "action", "text": "Book the review" }),
+        3,
+    ));
 
     assert_eq!(
-        (
-            plan.tenant_id,
-            plan.subject_id,
-            &plan.origin,
-            plan.profile_version
-        ),
-        (TENANT, SUBJECT, &origin(), Some(7))
+        held,
+        Err(ToolRefusal::AlreadyExists {
+            kind: "commitment".to_owned(),
+            number: 4
+        })
     );
-    let [added, removed] = plan.steps.as_slice() else {
-        panic!("an add and a remove: {:?}", plan.steps);
+}
+
+#[test]
+fn a_kind_the_schema_does_not_have_is_refused_with_the_kinds_it_has() {
+    let catalog = catalog();
+
+    let refusal = refusal_after(&catalog, &[], &add("pets", &json!({ "name": "Rex" })));
+
+    let ToolRefusal::UnknownKind { kind, known } = refusal else {
+        panic!("{refusal:?}");
     };
-    let Change::AddEntity { key, properties } = &added.change else {
-        panic!("an add: {:?}", added.change);
-    };
-    assert!(is_new_key(key), "{}", key.0);
-    assert_eq!(
-        *properties,
-        [Property::new("skills", json!({ "name": "Rust" }))]
-    );
-    assert_eq!(
-        (added.entity_kind.as_str(), added.confidence),
-        ("skill", Some(0.8))
-    );
-    assert_eq!(
-        *removed,
-        Step {
-            entity_kind: "skill".to_owned(),
-            change: Change::RemoveEntity {
-                entity: node_key(2)
-            },
-            confidence: Some(0.7),
-        }
-    );
-}
-
-#[test]
-fn every_new_value_gets_its_own_new_key_also_when_it_returns() {
-    let catalog = catalog();
-    let mut keys = HashSet::new();
-    for _ in 0..2 {
-        let mut draft = PlanDraft::new(&catalog, profile());
-        draft
-            .apply(&add("skills", &json!({ "name": "Rust" })))
-            .expect("added");
-        draft
-            .apply(&add("skills", &json!({ "name": "Go" })))
-            .expect("added");
-        for step in draft.finish(TENANT, SUBJECT, origin()).steps {
-            let Change::AddEntity { key, .. } = step.change else {
-                panic!("an add");
-            };
-            assert!(is_new_key(&key), "{}", key.0);
-            keys.insert(key);
-        }
-    }
-
-    assert_eq!(keys.len(), 4);
-}
-
-#[test]
-fn confidence_from_zero_to_one_is_taken() {
-    let catalog = catalog();
-    for confidence in [0.0, 1.0] {
-        let mut draft = PlanDraft::new(&catalog, profile());
-        let result = draft.apply(&call(
-            ADD,
-            json!({ "property": "skills", "value": { "name": "Go" }, "confidence": confidence }),
-        ));
-        assert_eq!(result, Ok("added skills".to_owned()), "{confidence}");
-    }
-}
-
-#[test]
-fn confidence_outside_zero_to_one_is_refused_by_every_tool() {
-    let catalog = catalog();
-    for confidence in [-0.1, 1.5] {
-        for refused in [
-            call(
-                ADD,
-                json!({ "property": "skills", "value": { "name": "Go" }, "confidence": confidence }),
-            ),
-            call(
-                REPLACE,
-                json!({ "number": 1, "value": "dean", "confidence": confidence }),
-            ),
-            call(REMOVE, json!({ "number": 1, "confidence": confidence })),
-        ] {
-            assert_eq!(
-                refusal_after(&catalog, &[], &refused),
-                ToolRefusal::BadConfidence,
-                "{} {confidence}",
-                refused.name
-            );
-        }
-    }
-}
-
-#[test]
-fn an_unknown_tool_is_refused() {
-    assert_eq!(
-        refusal_after(&catalog(), &[], &call("merge", json!({}))),
-        ToolRefusal::UnknownTool("merge".to_owned())
-    );
-}
-
-#[test]
-fn a_refusal_repeats_at_most_a_short_part_of_what_the_model_sent() {
-    let long = "x".repeat(10_000);
-    let catalog = catalog();
-
-    for refused in [
-        call(&long, json!({})),
-        add(&long, &json!("teal")),
-        call(
-            ADD,
-            json!({ "property": "skills", "value": {}, "confidence": 0.5, &long: 1 }),
-        ),
-    ] {
-        let refusal = refusal_after(&catalog, &[], &refused);
-        let shown = match &refusal {
-            ToolRefusal::UnknownProperty { property, .. } => property.clone(),
-            other => other.to_string(),
-        };
-        assert!(shown.chars().count() < 200, "{refusal:?}");
-    }
-}
-
-#[test]
-fn arguments_that_do_not_fit_the_tool_are_refused() {
-    let refused = call(
-        ADD,
-        json!({ "property": "skills", "value": { "name": "Go" } }),
-    );
-
-    assert_eq!(
-        refusal_after(&catalog(), &[], &refused),
-        ToolRefusal::BadArguments("missing field `confidence`".to_owned())
-    );
-}
-
-#[test]
-fn a_number_outside_the_profile_is_refused() {
-    let catalog = catalog();
-    for number in [0, 4] {
-        assert_eq!(
-            refusal_after(&catalog, &[], &remove(number)),
-            ToolRefusal::UnknownNumber(number)
-        );
-    }
-}
-
-#[test]
-fn a_number_already_used_is_refused() {
-    assert_eq!(
-        refusal_after(
-            &catalog(),
-            &[remove(2)],
-            &replace(2, &json!({ "name": "Go" }))
-        ),
-        ToolRefusal::NumberUsed(2)
-    );
-}
-
-#[test]
-fn an_unknown_property_is_refused_with_the_known_ones() {
-    let refusal = refusal_after(&catalog(), &[], &add("favourite_colour", &json!("teal")));
-
-    let ToolRefusal::UnknownProperty { property, known } = refusal else {
-        panic!("an unknown property: {refusal:?}");
-    };
-    assert_eq!(property, "favourite_colour");
+    assert_eq!(kind, "pets");
     assert!(
-        known.split(", ").any(|name| name == "research_areas"),
+        known.contains("project") && known.contains("commitment"),
         "{known}"
     );
 }
 
 #[test]
-fn a_write_to_each_developer_property_is_accepted() {
+fn a_value_that_does_not_fit_its_kind_is_refused_without_repeating_it() {
     let catalog = catalog();
-    let mut draft = PlanDraft::new(&catalog, profile());
-    let writes = [
-        ("projects", json!("Atlas")),
-        ("repositories", json!("https://github.com/acme/api")),
-        (
-            "programming_languages",
-            json!({ "name": "Rust", "level": "advanced" }),
+    let value = json!({ "name": "Atlas 2", "status": "x".repeat(500) });
+
+    let refusal = refusal_after(&catalog, &[], &add("project", &value));
+
+    let ToolRefusal::ValueDoesNotFit { kind, reason } = &refusal else {
+        panic!("{refusal:?}");
+    };
+    assert_eq!(kind, "project");
+    assert!(
+        reason.starts_with("`/status` breaks `maxLength`"),
+        "{reason}"
+    );
+    assert!(!refusal.to_string().contains("xxxxx"), "{refusal}");
+}
+
+#[test]
+fn an_entry_needs_an_owner_of_a_kind_that_may_own_it_and_a_thing_takes_none() {
+    let catalog = catalog();
+    let decision = json!({ "text": "ship in March" });
+
+    assert!(matches!(
+        refusal_after(&catalog, &[], &add("decision", &decision)),
+        ToolRefusal::OwnerRequired { .. }
+    ));
+    assert!(matches!(
+        refusal_after(&catalog, &[], &add_owned("decision", &decision, 4)),
+        ToolRefusal::WrongOwner { number: 4, .. }
+    ));
+    assert!(matches!(
+        refusal_after(&catalog, &[], &add_owned("decision", &decision, 5)),
+        ToolRefusal::NotANode(5)
+    ));
+    assert!(matches!(
+        refusal_after(&catalog, &[], &add_owned("decision", &decision, 99)),
+        ToolRefusal::UnknownNumber(99)
+    ));
+    assert!(matches!(
+        refusal_after(
+            &catalog,
+            &[],
+            &add_owned("team", &json!({ "name": "Platform" }), 3)
         ),
-        ("tools_and_frameworks", json!({ "name": "Docker" })),
-        ("development_environment", json!("Neovim on Ubuntu")),
-        ("coding_conventions", json!("tests before code")),
-    ];
-
-    for (property, value) in &writes {
-        draft
-            .apply(&add(property, value))
-            .unwrap_or_else(|refusal| panic!("{property}: {refusal:?}"));
-    }
-
-    let plan = draft.finish(TENANT, SUBJECT, origin());
-    assert_eq!(plan.steps.len(), writes.len());
+        ToolRefusal::OwnerNotAllowed { .. }
+    ));
 }
 
 #[test]
-fn a_write_to_remembered_notes_is_accepted() {
+fn an_entry_can_be_owned_by_a_node_this_plan_adds() {
+    let plan = plan_of(&[
+        add("project", &json!({ "name": "Orion" })),
+        add_owned("decision", &json!({ "text": "ship in March" }), 6),
+    ]);
+
+    let [project, decision] = &plan.steps[..] else {
+        panic!("{:?}", plan.steps);
+    };
+    let (Change::AddEntity { key: project, .. }, Change::AddEntity { owner, .. }) =
+        (&project.change, &decision.change)
+    else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(owner.as_ref(), Some(project));
+}
+
+#[test]
+fn the_profile_holds_one_me() {
     let catalog = catalog();
-    let mut draft = PlanDraft::new(&catalog, profile());
 
-    draft
-        .apply(&add("remembered_notes", &json!("sister is called Anna")))
-        .unwrap_or_else(|refusal| panic!("remembered_notes: {refusal:?}"));
-
-    let plan = draft.finish(TENANT, SUBJECT, origin());
-    assert_eq!(plan.steps.len(), 1);
-}
-
-#[test]
-fn a_value_that_breaks_the_property_schema_is_refused_with_the_schema() {
-    let catalog = catalog();
-    for (refused, property) in [
-        (add("orcid_id", &json!("orcid of Jane")), "orcid_id"),
-        (replace(3, &json!("   ")), "full_name"),
-    ] {
-        let refusal = refusal_after(&catalog, &[], &refused);
-        let ToolRefusal::ValueDoesNotFit {
-            property: refused_property,
-            reason,
-        } = refusal
-        else {
-            panic!("a value that does not fit: {refusal:?}");
-        };
-        assert_eq!(refused_property, property);
-        let schema = schema_in_person_type(property);
-        assert!(reason.ends_with(&format!("it takes {schema}")), "{reason}");
-    }
-}
-
-#[test]
-fn a_second_value_of_a_single_value_property_is_refused() {
-    let refusal = refusal_after(&catalog(), &[], &add("role", &json!("dean")));
+    let refusal = refusal_after(&catalog, &[], &add("me", &json!({ "name": "Someone" })));
 
     assert_eq!(
         refusal,
-        ToolRefusal::SecondValue {
-            property: "role".to_owned(),
-            number: 1,
+        ToolRefusal::SecondNode {
+            kind: "me".to_owned(),
+            number: 1
         }
-    );
-    assert_eq!(
-        refusal.to_string(),
-        "`role` holds one value, and value 1 is it; use replace 1"
     );
 }
 
 #[test]
-fn a_single_value_cannot_be_added_twice_in_one_plan() {
-    assert_eq!(
-        refusal_after(
-            &catalog(),
-            &[add("timezone", &json!("UTC"))],
-            &add("timezone", &json!("Europe/Berlin"))
+fn a_link_joins_two_nodes_by_number_and_may_use_a_node_this_plan_adds() {
+    let plan = plan_of(&[
+        add("project", &json!({ "name": "Orion" })),
+        link("works_on", 2, 6),
+        call(
+            LINK,
+            json!({ "kind": "works_on", "from": 1, "to": 3, "fields": { "role": "advisor" }, "confidence": 0.8 }),
         ),
-        ToolRefusal::SecondValueInPlan {
-            property: "timezone".to_owned()
-        }
+    ]);
+
+    let [_, orion, advisor] = &plan.steps[..] else {
+        panic!("{:?}", plan.steps);
+    };
+    assert_eq!(orion.entity_kind, "works_on");
+    let Change::AddLink { kind, from, to, .. } = &orion.change else {
+        panic!("{orion:?}");
+    };
+    assert_eq!(
+        (kind.as_str(), from, to),
+        (
+            "works_on",
+            &node_key(2),
+            match &plan.steps[0].change {
+                Change::AddEntity { key, .. } => key,
+                other => panic!("{other:?}"),
+            }
+        )
     );
+    let Change::AddLink { properties, .. } = &advisor.change else {
+        panic!("{advisor:?}");
+    };
+    assert_eq!(properties[0].value, json!({ "role": "advisor" }));
+    assert_eq!(advisor.confidence, Some(0.8));
 }
 
 #[test]
-fn a_single_value_cannot_be_added_after_it_was_replaced() {
+fn a_link_is_refused_for_an_unknown_kind_wrong_ends_a_held_link_or_bad_fields() {
+    let catalog = catalog();
+
+    assert!(matches!(
+        refusal_after(&catalog, &[], &link("friend_of", 1, 2)),
+        ToolRefusal::UnknownLinkKind { .. }
+    ));
+    // works_on goes from a person to a project, not the other way round.
+    assert!(matches!(
+        refusal_after(&catalog, &[], &link("works_on", 3, 2)),
+        ToolRefusal::LinkEnd { number: 3, .. }
+    ));
     assert_eq!(
+        refusal_after(&catalog, &[], &link("works_on", 2, 3)),
+        ToolRefusal::LinkExists {
+            kind: "works_on".to_owned(),
+            from: 2,
+            to: 3
+        }
+    );
+    assert!(matches!(
+        refusal_after(&catalog, &[], &link("works_on", 2, 5)),
+        ToolRefusal::NotANode(5)
+    ));
+    assert!(matches!(
         refusal_after(
-            &catalog(),
-            &[replace(1, &json!("school principal"))],
-            &add("role", &json!("dean"))
-        ),
-        ToolRefusal::SecondValueInPlan {
-            property: "role".to_owned()
-        }
-    );
-}
-
-#[test]
-fn a_single_value_can_be_added_after_its_old_value_is_removed() {
-    let catalog = catalog();
-    let mut draft = PlanDraft::new(&catalog, profile());
-
-    draft.apply(&remove(1)).expect("removed");
-
-    assert_eq!(
-        draft.apply(&add("role", &json!("dean"))),
-        Ok("added role".to_owned())
-    );
-}
-
-#[test]
-fn a_value_the_profile_already_holds_is_refused() {
-    let catalog = catalog();
-    for (refused, number) in [
-        (add("skills", &json!({ "name": "Python" })), 2),
-        (add("skills", &json!({ "name": " python " })), 2),
-        (add("role", &json!(" Teacher ")), 1),
-        (replace(3, &json!("Jane Doe")), 3),
-    ] {
-        assert_eq!(
-            refusal_after(&catalog, &[], &refused),
-            ToolRefusal::AlreadyHeld { number },
-            "{}",
-            refused.arguments
-        );
-    }
-}
-
-#[test]
-fn a_replace_that_only_fixes_case_or_spacing_is_taken() {
-    let catalog = catalog();
-    let mut draft = PlanDraft::new(&catalog, profile());
-
-    assert_eq!(
-        draft.apply(&replace(3, &json!("Jane  doe"))),
-        Ok("replaced 3".to_owned())
-    );
-}
-
-#[test]
-fn a_replace_to_a_value_another_fact_holds_is_refused() {
-    let catalog = catalog();
-    let mut facts = profile().facts;
-    facts.push(Fact {
-        node_key: NodeKey(format!("construct:{TENANT}:4")),
-        category: Category::Skill,
-        property: "skills".to_owned(),
-        value: json!({ "name": "Go" }),
-    });
-    let mut draft = PlanDraft::new(
-        &catalog,
-        Profile {
-            version: Some(7),
-            facts,
-        },
-    );
-
-    assert_eq!(
-        draft.apply(&replace(2, &json!({ "name": "go" }))),
-        Err(ToolRefusal::AlreadyHeld { number: 4 })
-    );
-}
-
-#[test]
-fn a_replace_to_a_value_the_plan_already_writes_is_refused() {
-    for before in [
-        add("skills", &json!({ "name": "Rust" })),
-        replace(2, &json!({ "name": "Rust" })),
-    ] {
-        let mut facts = profile().facts;
-        facts.push(Fact {
-            node_key: NodeKey(format!("construct:{TENANT}:4")),
-            category: Category::Skill,
-            property: "skills".to_owned(),
-            value: json!({ "name": "Go" }),
-        });
-        let catalog = catalog();
-        let mut draft = PlanDraft::new(
             &catalog,
-            Profile {
-                version: Some(7),
-                facts,
-            },
-        );
-        draft.apply(&before).expect("accepted");
-
-        assert_eq!(
-            draft.apply(&replace(4, &json!({ "name": "Rust" }))),
-            Err(ToolRefusal::AlreadyAdded {
-                property: "skills".to_owned()
-            }),
-            "{}",
-            before.arguments
-        );
-    }
+            &[],
+            &call(
+                LINK,
+                json!({ "kind": "works_on", "from": 1, "to": 3, "fields": { "mood": "good" }, "confidence": 0.9 })
+            )
+        ),
+        ToolRefusal::ValueDoesNotFit { .. }
+    ));
+    assert_eq!(
+        refusal_after(&catalog, &[link("works_on", 1, 3)], &link("works_on", 1, 3)),
+        ToolRefusal::LinkExists {
+            kind: "works_on".to_owned(),
+            from: 1,
+            to: 3
+        }
+    );
 }
 
 #[test]
-fn a_value_the_plan_already_adds_is_refused() {
+fn a_replace_changes_the_node_where_it_stands() {
+    let plan = plan_of(&[replace(3, &json!({ "name": "Atlas", "status": "on hold" }))]);
+
+    let Change::ReplaceEntity {
+        old,
+        key,
+        owner,
+        properties,
+    } = &plan.steps[0].change
+    else {
+        panic!("{:?}", plan.steps);
+    };
+    assert_eq!(old, &node_key(3));
+    assert_eq!(
+        key, old,
+        "the key stays, so the links and the owned nodes stay"
+    );
+    assert_eq!(owner, &None);
+    assert_eq!(properties[0].name, "project");
+    assert_eq!(
+        properties[0].value,
+        json!({ "name": "Atlas", "status": "on hold" })
+    );
+    assert_eq!(plan.steps[0].entity_kind, "project");
+}
+
+#[test]
+fn a_replace_that_changes_nothing_or_takes_the_name_of_another_node_is_refused() {
+    let catalog = catalog();
+
+    assert_eq!(
+        refusal_after(&catalog, &[], &replace(3, &json!({ "name": "Atlas" }))),
+        ToolRefusal::AlreadyHeld { number: 3 }
+    );
+    let mut other = PlanDraft::new(&catalog, profile());
+    other
+        .apply(&add("project", &json!({ "name": "Orion" })))
+        .unwrap();
+    assert!(matches!(
+        refusal_after(
+            &catalog,
+            &[],
+            &replace(2, &json!({ "name": "Jane", "age": "old" }))
+        ),
+        ToolRefusal::ValueDoesNotFit { .. }
+    ));
+}
+
+#[test]
+fn a_number_names_one_replace_or_remove() {
+    let catalog = catalog();
+
     assert_eq!(
         refusal_after(
-            &catalog(),
-            &[add("skills", &json!({ "name": "Rust" }))],
-            &add("skills", &json!({ "name": "Rust" }))
+            &catalog,
+            &[replace(3, &json!({ "name": "Atlas", "status": "done" }))],
+            &remove(3)
+        ),
+        ToolRefusal::NumberUsed(3)
+    );
+    assert_eq!(
+        refusal_after(
+            &catalog,
+            &[remove(2)],
+            &replace(2, &json!({ "name": "Priya" }))
+        ),
+        ToolRefusal::NumberUsed(2)
+    );
+    assert_eq!(
+        refusal_after(&catalog, &[], &remove(42)),
+        ToolRefusal::UnknownNumber(42)
+    );
+}
+
+#[test]
+fn a_remove_takes_the_owned_nodes_with_it_and_hides_what_goes_with_the_gone() {
+    let catalog = catalog();
+    let mut draft = PlanDraft::new(&catalog, profile());
+
+    draft.apply(&remove(3)).expect("a project goes");
+
+    assert_eq!(
+        draft.numbered_profile(),
+        [
+            r#"1. me: {"name":"Jane Doe"}"#,
+            r#"2. person: {"name":"Priya Shah","space":"work"}"#,
+        ]
+        .join("\n")
+    );
+    let plan = draft.finish(TENANT, SUBJECT, origin());
+    // One step: the writer removes what the node owns, and graph storage its links.
+    let removed: Vec<&NodeKey> = plan
+        .steps
+        .iter()
+        .map(|step| match &step.change {
+            Change::RemoveEntity { entity } => entity,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(removed, [&node_key(3)]);
+    assert!(
+        !plan
+            .steps
+            .iter()
+            .any(|step| matches!(step.change, Change::RemoveLink { .. }))
+    );
+}
+
+#[test]
+fn a_link_is_removed_by_its_number_and_a_gone_node_cannot_be_linked() {
+    let catalog = catalog();
+
+    let plan = plan_of(&[remove(5)]);
+
+    assert_eq!(
+        plan.steps[0].change,
+        Change::RemoveLink {
+            kind: "works_on".to_owned(),
+            from: node_key(2),
+            to: node_key(3)
+        }
+    );
+    assert_eq!(
+        refusal_after(&catalog, &[remove(3)], &link("works_on", 1, 3)),
+        ToolRefusal::NumberUsed(3)
+    );
+    assert_eq!(
+        refusal_after(&catalog, &[remove(5)], &remove(5)),
+        ToolRefusal::NumberUsed(5)
+    );
+}
+
+#[test]
+fn a_remove_stops_at_an_owned_node_this_plan_already_changed() {
+    let catalog = catalog();
+
+    let refusal = refusal_after(
+        &catalog,
+        &[replace(
+            4,
+            &json!({ "kind": "action", "text": "book the review early" }),
+        )],
+        &remove(3),
+    );
+
+    assert_eq!(refusal, ToolRefusal::NumberUsed(4));
+}
+
+#[test]
+fn a_call_that_is_no_tool_or_has_bad_arguments_is_refused() {
+    let catalog = catalog();
+
+    assert!(matches!(
+        refusal_after(&catalog, &[], &call("delete", json!({}))),
+        ToolRefusal::UnknownTool(_)
+    ));
+    assert!(matches!(
+        refusal_after(&catalog, &[], &call(ADD, json!({ "kind": "team" }))),
+        ToolRefusal::BadArguments(_)
+    ));
+    assert_eq!(
+        refusal_after(
+            &catalog,
+            &[],
+            &call(
+                ADD,
+                json!({ "kind": "team", "value": { "name": "T" }, "confidence": 2 })
+            )
+        ),
+        ToolRefusal::BadConfidence
+    );
+}
+
+#[test]
+fn the_tools_offer_the_kinds_and_the_link_kinds_of_the_schema() {
+    let catalog = catalog();
+    let draft = PlanDraft::new(&catalog, profile());
+
+    let tools = draft.tools();
+
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    assert_eq!(names, [ADD, LINK, REPLACE, REMOVE]);
+    let kinds = &tools[0].parameters["properties"]["kind"]["enum"];
+    assert!(kinds.as_array().unwrap().contains(&json!("commitment")));
+    let links = &tools[1].parameters["properties"]["kind"]["enum"];
+    assert!(links.as_array().unwrap().contains(&json!("works_on")));
+}
+
+#[test]
+fn a_replace_counts_as_the_one_me_and_a_rename_to_a_name_this_plan_adds_is_refused() {
+    let catalog = catalog();
+
+    assert_eq!(
+        refusal_after(
+            &catalog,
+            &[replace(1, &json!({ "name": "Jane D." }))],
+            &add("me", &json!({ "name": "Someone" }))
+        ),
+        ToolRefusal::SecondNode {
+            kind: "me".to_owned(),
+            number: 1
+        }
+    );
+    assert_eq!(
+        refusal_after(
+            &catalog,
+            &[add("project", &json!({ "name": "Orion" }))],
+            &replace(3, &json!({ "name": "orion" }))
+        ),
+        ToolRefusal::AlreadyHeld { number: 6 }
+    );
+    assert_eq!(
+        refusal_after(
+            &catalog,
+            &[replace(3, &json!({ "name": "Orion" }))],
+            &add("project", &json!({ "name": "Orion" }))
         ),
         ToolRefusal::AlreadyAdded {
-            property: "skills".to_owned()
+            kind: "project".to_owned(),
+            number: 3
         }
     );
 }
 
 #[test]
-fn the_model_input_holds_no_id() {
+fn a_node_with_a_new_node_under_it_is_not_removed_in_the_same_plan() {
     let catalog = catalog();
-    let mut draft = PlanDraft::new(&catalog, profile());
-    let mut shown = vec![draft.numbered_profile()];
-    shown.extend(
-        draft
-            .tools()
-            .iter()
-            .map(|tool| format!("{} {} {}", tool.name, tool.description, tool.parameters)),
-    );
-    for tool_call in [
-        replace(1, &json!("dean")),
-        remove(1),
-        remove(4),
-        add("full_name", &json!("J. Doe")),
-        add("skills", &json!({ "name": "Rust" })),
-    ] {
-        shown.push(match draft.apply(&tool_call) {
-            Ok(result) => result,
-            Err(refusal) => refusal.to_string(),
-        });
-    }
-    let ids: Vec<String> = profile()
-        .facts
-        .iter()
-        .map(|fact| fact.node_key.0.clone())
-        .chain([
-            TENANT.to_string(),
-            SUBJECT.to_string(),
-            "construct:".to_owned(),
-        ])
-        .collect();
 
-    for text in &shown {
-        for id in &ids {
-            assert!(!text.contains(id.as_str()), "{text} shows {id}");
-        }
-        assert!(!text.contains("gts."), "{text} shows a type id");
-    }
+    let refusal = refusal_after(
+        &catalog,
+        &[add_owned(
+            "decision",
+            &json!({ "text": "ship in March" }),
+            3,
+        )],
+        &remove(3),
+    );
+
+    assert_eq!(refusal, ToolRefusal::OwnsNewNodes(3));
 }

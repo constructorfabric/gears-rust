@@ -20,7 +20,8 @@ use super::profile::Category;
 use super::profile_read::{StoredFact, settings_scope};
 use super::profile_writes::{ProfileWrites, Removed, WriteError};
 use super::review_queue::{
-    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_change,
+    OutsideChange, ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, Sweep,
+    close_on_change, close_orphaned,
 };
 use super::subject_access::{authorize, own};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
@@ -253,7 +254,8 @@ impl SubjectControlService {
     /// Soft-delete one live fact of the subject: a plan with one removal,
     /// written against the profile's version, and read and written again
     /// after a short pause on a conflict, within the rerun limit and the
-    /// budget. An open review request on the fact closes as deleted.
+    /// budget. The nodes the fact owns go with it, and the open review requests of the fact and of those nodes
+    /// close as deleted.
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
     /// fact deleted without its delete event, and its review request open
@@ -267,9 +269,11 @@ impl SubjectControlService {
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact,
     /// also when a concurrent write removed it before a rerun; unavailable
     /// when the profile kept changing past the reruns or the budget, when the
-    /// writer failed and the fact is not seen gone after it, or when the
-    /// fact's review request could not be closed, the last two of which a
-    /// repeat of the delete finishes; otherwise as [`Self::view`].
+    /// writer failed and the fact is not seen gone after it, or when a review
+    /// request of the fact or of a node it owned could not be closed, the last
+    /// two of which a repeat of the delete finishes. A delete that closes a
+    /// request an earlier delete left open answers as done, whichever fact it
+    /// names; otherwise as [`Self::view`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-delete:p1
     /// @cpt-dod:cpt-cf-construct-dod-review-queue-subject-control:p1
@@ -413,8 +417,10 @@ impl FactDelete<'_> {
     /// Soft-delete the fact `fact_id`: a plan with one removal, written
     /// against the profile's version, and read and written again after a
     /// short pause on a conflict, within the rerun limit and the budget.
-    /// `deleted` records the fact a delete removed; then the fact's open
-    /// review request closes as deleted.
+    /// `deleted` records the fact a delete removed and each node it owned; then
+    /// the open review requests of the fact and of every node it took with it
+    /// close as deleted, and so do those an earlier delete left open on a node
+    /// that is gone (its close failed).
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
     /// fact deleted without its event, and its review request open until the
@@ -423,16 +429,17 @@ impl FactDelete<'_> {
     /// # Errors
     ///
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact
-    /// and no open request on it, also when a concurrent write removed it
+    /// and the delete closes no open request, also when a concurrent write removed it
     /// before a rerun; unavailable when the profile kept changing past the
     /// reruns or the budget, when the writer failed and the fact is not seen
-    /// gone after it, or when the fact's review request could not be closed,
-    /// the last two of which a repeat of the delete finishes; not configured
+    /// gone after it, or when a review request of the fact or of a node it
+    /// owned could not be closed, the last two of which a repeat of the delete
+    /// finishes (it answers as done when it closes one); not configured
     /// without a processing identity.
     pub(crate) async fn run(
         &self,
         fact_id: &NodeKey,
-        deleted: impl FnOnce(&StoredFact),
+        mut deleted: impl FnMut(&StoredFact),
     ) -> Result<(), DomainError> {
         // The context writes nothing, so the budget may cut it off.
         let (construct, _) = ProfileWrites::before_write(
@@ -455,13 +462,18 @@ impl FactDelete<'_> {
                     fact_id.0
                 )),
             })?;
-        if let Removed::Removed(fact) = &removed {
+        // A removal takes the nodes the fact owns with it, however deep, so each of them is deleted too: it gets its
+        // delete event, and its open review request closes as deleted.
+        if let Removed::Removed(fact, owned) = &removed {
             deleted(fact);
+            for fact in owned {
+                deleted(fact);
+            }
         }
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
         // A fact already gone may still have an open request left by an
         // earlier delete whose close failed; this closes it.
-        let closed = close_on_change(
+        let named = close_on_change(
             self.requests,
             self.events,
             self.writes,
@@ -471,25 +483,61 @@ impl FactDelete<'_> {
             OutsideChange {
                 by: self.by,
                 outcome: ReviewOutcome::Deleted,
-                changed: matches!(removed, Removed::Removed(_)),
+                changed: matches!(removed, Removed::Removed(..)),
             },
         )
-        .await
-        .map_err(|err| match err {
-            // A store that did not answer: a repeat finds the fact gone and
-            // closes the request.
+        .await;
+        // The nodes the fact owned went with it: their requests close as deleted too, and so does one an earlier
+        // delete left open when its close failed. This runs also when the close above failed, so that one failure
+        // does not leave the others open.
+        let removed_now: Vec<NodeKey> = match &removed {
+            Removed::Removed(fact, owned) => std::iter::once(fact.node_key.clone())
+                .chain(owned.iter().map(|fact| fact.node_key.clone()))
+                .collect(),
+            Removed::Gone => Vec::new(),
+        };
+        let swept = close_orphaned(
+            self.requests,
+            self.events,
+            self.writes,
+            self.scope,
+            self.key,
+            Sweep {
+                by: self.by,
+                except: None,
+                removed_now: &removed_now,
+            },
+        )
+        .await;
+        // A store that did not answer: a repeat finds the fact gone and closes what is left.
+        let not_closed = |err: DomainError| match err {
             DomainError::Unavailable(_) | DomainError::Database(_) => {
                 DomainError::Unavailable(format!(
-                    "fact {} is deleted, but its review request was not closed; send the \
-                     delete again: {err}",
+                    "fact {} is deleted, but a review request on it or on a node it owned was not \
+                     closed; send the delete again: {err}",
                     fact_id.0
                 ))
             }
             other => other,
-        })?;
+        };
+        // The sweep also closes the named request, which is gone with its fact: when it did everything, a failure
+        // of the close above is behind it.
+        let (closed, swept) = match (named, swept) {
+            (Ok(closed), Ok(swept)) => (closed, swept),
+            (Err(err), Ok(swept)) => {
+                tracing::warn!(
+                    error = %err,
+                    fact_id = %fact_id.0,
+                    "construct: the close of the request on a deleted fact failed; the sweep closed what was open"
+                );
+                (false, swept)
+            }
+            (_, Err(err)) => return Err(not_closed(err)),
+        };
         match removed {
-            Removed::Removed(_) => Ok(()),
-            Removed::Gone if closed => Ok(()),
+            Removed::Removed(..) => Ok(()),
+            // A repeat that closed a request has finished the delete.
+            Removed::Gone if closed || swept > 0 => Ok(()),
             Removed::Gone => Err(no_such_fact(fact_id)),
         }
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close

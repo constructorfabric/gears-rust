@@ -4,14 +4,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use construct_sdk::person_types::PERSON_TYPES;
 use serde_json::{Value, json};
 use tokio::time::Instant;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::agent::{AgentMessage, Planner, PlannerCaps};
-use super::catalog::PropertyCatalog;
+use super::catalog::Catalog;
 use super::processing::{
     ManageDeadlines, Managed, PlanWriter, Processing, ProcessingContexts, ProcessingPorts,
     ProfileSource, Written,
@@ -22,7 +21,7 @@ use crate::domain::model_client::{
     ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
 };
 use crate::domain::plan::{NodeKey, Origin, Plan};
-use crate::domain::profile::{Category, Fact, Profile};
+use crate::domain::profile::{Category, Fact, Link, Profile};
 use crate::domain::record_intake::{IntakeEvents, ReceivedRecord};
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks};
 use crate::domain::subject_settings::SubjectSettings;
@@ -34,33 +33,8 @@ use crate::test_support::{
 pub(super) const TENANT: Uuid = Uuid::from_u128(0x6b1f_0c2a_93d4_4e8f_a1b2_c3d4_e5f6_0718);
 pub(super) const SUBJECT: Uuid = Uuid::from_u128(0x2c9e_7a41_5b3f_4d6e_8f90_1a2b_3c4d_5e6f);
 
-pub(super) fn catalog() -> PropertyCatalog {
-    PropertyCatalog::load().expect("the catalog")
-}
-
-/// The schema of `property` read straight from the JSON of its person type, following a reference into the type's
-/// own definitions.
-pub(super) fn schema_in_person_type(property: &str) -> Value {
-    PERSON_TYPES
-        .iter()
-        .map(|person_type| {
-            serde_json::from_str::<Value>(person_type.schema).expect("a JSON schema")
-        })
-        .find_map(|document| {
-            let found = document
-                .pointer(&format!(
-                    "/allOf/1/properties/payload/properties/{property}"
-                ))?
-                .clone();
-            Some(match found["$ref"].as_str() {
-                Some(reference) => document
-                    .pointer(reference.trim_start_matches('#'))
-                    .expect("a definition")
-                    .clone(),
-                None => found,
-            })
-        })
-        .expect("a property of a person type")
+pub(super) fn catalog() -> Catalog {
+    Catalog::load().expect("the catalog")
 }
 
 pub(super) fn origin() -> Origin {
@@ -73,35 +47,51 @@ pub(super) fn origin() -> Origin {
     }
 }
 
+/// The profile the planner tests read: the person, another person, a project, a commitment the project owns and
+/// the link from the other person to the project. Its lines are numbered 1 to 4 for the nodes and 5 for the link.
 pub(super) fn profile() -> Profile {
+    let key = |tail: &str| NodeKey(format!("construct:{TENANT}:{tail}"));
+    let project = key("a7e3f9b1-2c4d-4e6f-8a0b-1c3d5e7f9a2b");
+    let priya = key("5d2c8a3e-0f41-4b7a-9c6d-2e8f1a3b4c5d");
     Profile {
         version: Some(7),
         facts: vec![
             Fact {
-                node_key: NodeKey(format!(
-                    "construct:{TENANT}:5d2c8a3e-0f41-4b7a-9c6d-2e8f1a3b4c5d"
-                )),
-                category: Category::Role,
-                property: "role".to_owned(),
-                value: json!("teacher"),
+                node_key: key("c4b6d8e0-1f3a-4c5e-9b7d-0e2f4a6c8e1b"),
+                category: Category::ME,
+                property: "me".to_owned(),
+                value: json!({ "name": "Jane Doe" }),
+                owner: None,
             },
             Fact {
-                node_key: NodeKey(format!(
-                    "construct:{TENANT}:a7e3f9b1-2c4d-4e6f-8a0b-1c3d5e7f9a2b"
-                )),
-                category: Category::Skill,
-                property: "skills".to_owned(),
-                value: json!({ "name": "Python" }),
+                node_key: priya.clone(),
+                category: Category::PERSON,
+                property: "person".to_owned(),
+                value: json!({ "name": "Priya Shah", "space": "work" }),
+                owner: None,
             },
             Fact {
-                node_key: NodeKey(format!(
-                    "construct:{TENANT}:c4b6d8e0-1f3a-4c5e-9b7d-0e2f4a6c8e1b"
-                )),
-                category: Category::Identity,
-                property: "full_name".to_owned(),
-                value: json!("Jane Doe"),
+                node_key: project.clone(),
+                category: Category::PROJECT,
+                property: "project".to_owned(),
+                value: json!({ "name": "Atlas" }),
+                owner: None,
+            },
+            Fact {
+                node_key: key("e1d2c3b4-a596-4877-8695-a4b3c2d1e0f9"),
+                category: Category::COMMITMENT,
+                property: "commitment".to_owned(),
+                value: json!({ "kind": "action", "text": "book the review" }),
+                owner: Some(project.clone()),
             },
         ],
+        links: vec![Link {
+            kind: "works_on".to_owned(),
+            from: priya,
+            to: project,
+            fields: json!({ "role": "lead" }),
+        }],
+        marks: Vec::new(),
     }
 }
 
@@ -422,7 +412,7 @@ pub(super) fn adding_rust(plans: usize) -> Vec<Answer> {
                 Ok(tool_calls(
                     &[(
                         "add",
-                        json!({ "property": "skills", "value": { "name": "Rust" }, "confidence": 0.8 }),
+                        json!({ "kind": "project", "value": { "name": "Orion" }, "confidence": 0.8 }),
                     )],
                     900,
                 )),

@@ -405,15 +405,15 @@ impl GraphStorageClientV1 for Scripted {
 
 // --- One subject's profile ----------------------------------------------------
 
-struct Profiles {
-    client: Arc<dyn GraphStorageClientV1>,
-    ctx: SecurityContext,
-    tenant: Uuid,
-    subject: Uuid,
+pub(super) struct Profiles {
+    pub(super) client: Arc<dyn GraphStorageClientV1>,
+    pub(super) ctx: SecurityContext,
+    pub(super) tenant: Uuid,
+    pub(super) subject: Uuid,
 }
 
 impl Profiles {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let tenant = Uuid::new_v4();
         Self {
             client: graph_storage(),
@@ -424,7 +424,7 @@ impl Profiles {
     }
 
     /// Another subject's profile in the same graph storage and tenant.
-    fn neighbour(&self) -> Self {
+    pub(super) fn neighbour(&self) -> Self {
         Self {
             client: Arc::clone(&self.client),
             ctx: self.ctx.clone(),
@@ -433,7 +433,7 @@ impl Profiles {
         }
     }
 
-    fn writer_with(
+    pub(super) fn writer_with(
         client: Arc<dyn GraphStorageClientV1>,
         removal: Arc<dyn FactRemoval>,
     ) -> GraphPlanWriter {
@@ -447,7 +447,7 @@ impl Profiles {
         })
     }
 
-    fn writer(&self) -> GraphPlanWriter {
+    pub(super) fn writer(&self) -> GraphPlanWriter {
         Self::writer_with(
             Arc::clone(&self.client),
             Arc::new(SoftDelete::new(Arc::clone(&self.client))),
@@ -462,7 +462,7 @@ impl Profiles {
         )
     }
 
-    fn reader(&self) -> GraphProfileSource {
+    pub(super) fn reader(&self) -> GraphProfileSource {
         GraphProfileSource::new(
             Arc::clone(&self.client),
             Arc::new(PayloadCounter),
@@ -471,14 +471,14 @@ impl Profiles {
         )
     }
 
-    async fn read(&self) -> Profile {
+    pub(super) async fn read(&self) -> Profile {
         self.reader()
             .read(&self.ctx, self.tenant, self.subject)
             .await
             .expect("the profile reads")
     }
 
-    async fn stored(&self) -> Vec<StoredFact> {
+    pub(super) async fn stored(&self) -> Vec<StoredFact> {
         self.reader()
             .stored(&self.ctx, self.subject_key())
             .await
@@ -486,7 +486,7 @@ impl Profiles {
     }
 
     /// A record's plan for this subject, built on `version`.
-    fn plan(&self, version: Option<u64>, steps: Vec<Step>) -> Plan {
+    pub(super) fn plan(&self, version: Option<u64>, steps: Vec<Step>) -> Plan {
         let mut plan = connector_plan(steps);
         plan.tenant_id = self.tenant;
         plan.subject_id = self.subject;
@@ -494,7 +494,7 @@ impl Profiles {
         plan
     }
 
-    async fn write(&self, version: Option<u64>, steps: Vec<Step>) -> Written {
+    pub(super) async fn write(&self, version: Option<u64>, steps: Vec<Step>) -> Written {
         self.writer()
             .write(&self.ctx, &self.plan(version, steps))
             .await
@@ -502,23 +502,23 @@ impl Profiles {
     }
 
     /// A write a case starts from; it has to land.
-    async fn given(&self, version: Option<u64>, steps: Vec<Step>) {
+    pub(super) async fn given(&self, version: Option<u64>, steps: Vec<Step>) {
         assert_eq!(self.write(version, steps).await, Written::Stored);
     }
 
     /// Send `request` to graph storage as it is, past the writer.
-    async fn ingest_directly(&self, request: IngestRequest) {
+    pub(super) async fn ingest_directly(&self, request: IngestRequest) {
         self.client.ingest(&self.ctx, request).await.unwrap();
     }
 
-    fn subject_key(&self) -> SubjectKey {
+    pub(super) fn subject_key(&self) -> SubjectKey {
         SubjectKey {
             tenant_id: self.tenant,
             subject_id: self.subject,
         }
     }
 
-    async fn root(&self) -> Option<Root> {
+    pub(super) async fn root(&self) -> Option<Root> {
         let key = root_key(&self.subject_key());
         match self.client.get_node(&self.ctx, &key.0, None).await {
             Ok(node) => {
@@ -529,7 +529,7 @@ impl Profiles {
         }
     }
 
-    async fn is_live(&self, key: &str) -> bool {
+    pub(super) async fn is_live(&self, key: &str) -> bool {
         self.client
             .get_node(&self.ctx, &key.to_owned(), None)
             .await
@@ -538,11 +538,11 @@ impl Profiles {
 }
 
 fn skills(name: &str) -> Value {
-    json!({ "name": name, "level": "expert" })
+    json!({ "name": name })
 }
 
 fn add_skill(name: &str) -> Step {
-    add_value("skill", "skills", skills(name))
+    add_value("project", "project", skills(name))
 }
 
 fn key_of(step: &Step) -> String {
@@ -554,11 +554,12 @@ fn key_of(step: &Step) -> String {
 
 fn replace(old: &str, name: &str) -> Step {
     Step {
-        entity_kind: "skill".to_owned(),
+        entity_kind: "project".to_owned(),
         change: Change::ReplaceEntity {
             old: FactKey(old.to_owned()),
             key: FactKey(format!("construct:{}", Uuid::new_v4())),
-            properties: vec![Property::new("skills", skills(name))],
+            owner: None,
+            properties: vec![Property::new("project", skills(name))],
         },
         confidence: Some(0.9),
     }
@@ -566,7 +567,7 @@ fn replace(old: &str, name: &str) -> Step {
 
 fn remove(old: &str) -> Step {
     Step {
-        entity_kind: "skill".to_owned(),
+        entity_kind: "project".to_owned(),
         change: Change::RemoveEntity {
             entity: FactKey(old.to_owned()),
         },
@@ -587,7 +588,7 @@ fn values(profile: &Profile) -> Vec<(Category, String, Value)> {
 fn skill_values(names: &[&str]) -> Vec<(Category, String, Value)> {
     names
         .iter()
-        .map(|name| (Category::Skill, "skills".to_owned(), skills(name)))
+        .map(|name| (Category::PROJECT, "project".to_owned(), skills(name)))
         .collect()
 }
 
@@ -601,7 +602,9 @@ async fn a_subject_without_a_profile_reads_empty() {
         profiles.read().await,
         Profile {
             version: None,
-            facts: Vec::new()
+            facts: Vec::new(),
+            links: Vec::new(),
+            marks: Vec::new(),
         }
     );
 }
@@ -614,7 +617,7 @@ async fn a_first_plan_creates_the_root_and_reads_back_whole() {
         .write(
             None,
             vec![
-                add_value("identity", "full_name", json!("Ada Lovelace")),
+                add_value("me", "me", json!({ "name": "Ada Lovelace" })),
                 add_skill("Rust"),
             ],
         )
@@ -627,11 +630,11 @@ async fn a_first_plan_creates_the_root_and_reads_back_whole() {
         values(&profile),
         [
             (
-                Category::Identity,
-                "full_name".to_owned(),
-                json!("Ada Lovelace")
+                Category::ME,
+                "me".to_owned(),
+                json!({ "name": "Ada Lovelace" })
             ),
-            (Category::Skill, "skills".to_owned(), skills("Rust")),
+            (Category::PROJECT, "project".to_owned(), skills("Rust")),
         ]
     );
 }
@@ -763,6 +766,7 @@ async fn a_root_written_outside_construct_refuses_every_write_as_a_defect() {
     // version moves to 2, the counter stays at 1.
     let unchanged = Root {
         removals: BTreeSet::from([FactKey("construct:elsewhere".to_owned())]),
+        marks: Vec::new(),
     }
     .payload(profiles.subject, &PayloadCounter, 1)
     .unwrap();
@@ -804,9 +808,15 @@ async fn a_new_fact_whose_key_is_held_is_a_defect_and_stores_nothing() {
     profiles.given(None, vec![add_skill("Rust")]).await;
     let plan = profiles.plan(Some(1), vec![add_skill("Go")]);
     // Someone else holds the key the plan's new fact claims.
-    let held = super::fact::fact_node(&plan, &plan.steps[0], time::OffsetDateTime::now_utc())
-        .unwrap()
-        .unwrap();
+    let held = super::fact::fact_node(
+        &plan,
+        &plan.steps[0],
+        time::OffsetDateTime::now_utc(),
+        &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     profiles
         .ingest_directly(IngestRequest {
             nodes: vec![held],
@@ -832,16 +842,22 @@ async fn a_new_fact_whose_key_is_held_is_a_defect_and_stores_nothing() {
 #[tokio::test]
 async fn a_root_key_held_by_another_type_is_a_defect() {
     let profiles = Profiles::new();
-    // A neighbour's write registers the types in the tenant.
-    profiles
-        .neighbour()
-        .given(None, vec![add_skill("Go")])
-        .await;
+    // The subject's types are registered in the tenant, by their prefix.
+    GraphTypes::new(Arc::clone(&profiles.client) as Arc<dyn GraphStorageClientV1>)
+        .ensure(&profiles.ctx, profiles.subject)
+        .await
+        .unwrap();
     // A fact node under the subject's root key.
     let plan = profiles.plan(None, vec![add_skill("Rust")]);
-    let mut node = super::fact::fact_node(&plan, &plan.steps[0], time::OffsetDateTime::now_utc())
-        .unwrap()
-        .unwrap();
+    let mut node = super::fact::fact_node(
+        &plan,
+        &plan.steps[0],
+        time::OffsetDateTime::now_utc(),
+        &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     node.node_key = root_key(&profiles.subject_key()).0;
     profiles
         .ingest_directly(IngestRequest {
@@ -886,7 +902,7 @@ async fn a_has_fact_edge_to_a_node_of_no_person_type_is_a_defect() {
         .await;
 
     match read {
-        Err(DomainError::Internal(msg)) => assert!(msg.contains("no person type"), "{msg}"),
+        Err(DomainError::Internal(msg)) => assert!(msg.contains("no node kind"), "{msg}"),
         other => panic!("{other:?}"),
     }
 }
@@ -1032,6 +1048,7 @@ async fn a_listed_key_that_is_not_a_fact_of_the_root_is_never_deleted() {
     let root = root_key(&profiles.subject_key());
     let planted = Root {
         removals: BTreeSet::from([FactKey(their_key.clone())]),
+        marks: Vec::new(),
     }
     .payload(profiles.subject, &PayloadCounter, 2)
     .unwrap();
@@ -1459,7 +1476,12 @@ async fn a_profile_read_asks_for_the_root_and_at_most_its_facts() {
     let reads = scripted.reads.lock().unwrap().clone();
     assert_eq!(reads.len(), 1);
     assert_eq!(reads[0].max_nodes, Some(MAX_PROFILE_NODES));
-    assert_eq!(reads[0].depth, 1);
+    // The facts one has-fact edge from the root, and the links between them one hop more.
+    assert_eq!(reads[0].depth, 2);
+    assert!(
+        reads[0].include_edge_payload,
+        "the links' fields come with the read"
+    );
     assert_eq!(reads[0].seeds, [root_key(&profiles.subject_key()).0]);
 }
 
@@ -1501,9 +1523,15 @@ async fn a_profile_past_what_one_read_takes_is_full() {
     let one_more = add_skill("one more");
     let one_more_key = key_of(&one_more);
     let plan = profiles.plan(Some(1), vec![one_more]);
-    let node = super::fact::fact_node(&plan, &plan.steps[0], time::OffsetDateTime::now_utc())
-        .unwrap()
-        .unwrap();
+    let node = super::fact::fact_node(
+        &plan,
+        &plan.steps[0],
+        time::OffsetDateTime::now_utc(),
+        &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+        None,
+    )
+    .unwrap()
+    .unwrap();
     profiles
         .ingest_directly(IngestRequest {
             nodes: vec![node],
@@ -2196,14 +2224,14 @@ async fn registration_is_remembered_per_tenant_and_a_failed_one_is_not() {
         construct_in(Uuid::new_v4()),
     );
 
-    types.ensure(&first).await.unwrap();
-    types.ensure(&first).await.unwrap();
-    types.ensure(&second).await.unwrap();
+    types.ensure(&first, first.subject_id()).await.unwrap();
+    types.ensure(&first, first.subject_id()).await.unwrap();
+    types.ensure(&second, second.subject_id()).await.unwrap();
     scripted
         .fail_next_registration
         .store(true, Ordering::SeqCst);
-    let failed = types.ensure(&third).await;
-    types.ensure(&third).await.unwrap();
+    let failed = types.ensure(&third, third.subject_id()).await;
+    types.ensure(&third, third.subject_id()).await.unwrap();
 
     assert!(
         matches!(failed, Err(DomainError::Unavailable(_))),
@@ -2212,31 +2240,39 @@ async fn registration_is_remembered_per_tenant_and_a_failed_one_is_not() {
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
 }
 
-/// The registry as an earlier release left it: the person types without the
-/// properties added since.
-fn earlier_person_types() -> Vec<TypeRegistration> {
-    construct_sdk::profile_types::graph_types()
+/// Every type the current release registers for the person `subject`: the shared root and edge, then the person's
+/// node and link kinds.
+fn current_types(subject: Uuid) -> Vec<TypeRegistration> {
+    let prefix = construct_sdk::linked_schema::SchemaPrefix::of(subject);
+    let shared = construct_sdk::profile_types::graph_types()
         .into_iter()
-        .map(|graph_type| {
-            let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
-            if let Some(Value::Object(properties)) =
-                schema.pointer_mut("/allOf/1/properties/payload/properties")
+        .map(|graph_type| TypeRegistration {
+            type_id: graph_type.type_id.to_owned(),
+            schema: serde_json::from_str(graph_type.schema).unwrap(),
+        });
+    let own = crate::domain::profile::profile_schema()
+        .graph_types(&prefix)
+        .into_iter()
+        .map(|graph_type| TypeRegistration {
+            type_id: graph_type.type_id,
+            schema: graph_type.schema,
+        });
+    shared.chain(own).collect()
+}
+
+/// The registry as an earlier release left it: the node types without the
+/// `learned` property added since.
+fn earlier_person_types(subject: Uuid) -> Vec<TypeRegistration> {
+    current_types(subject)
+        .into_iter()
+        .map(|mut registration| {
+            if let Some(Value::Object(properties)) = registration
+                .schema
+                .pointer_mut("/allOf/1/properties/payload/properties")
             {
-                for added in [
-                    "projects",
-                    "repositories",
-                    "programming_languages",
-                    "tools_and_frameworks",
-                    "development_environment",
-                    "coding_conventions",
-                ] {
-                    properties.remove(added);
-                }
+                properties.remove("learned");
             }
-            TypeRegistration {
-                type_id: graph_type.type_id.to_owned(),
-                schema,
-            }
+            registration
         })
         .collect()
 }
@@ -2246,16 +2282,15 @@ async fn assert_current_types_stored(
     client: &Arc<dyn GraphStorageClientV1>,
     ctx: &SecurityContext,
 ) {
-    for graph_type in construct_sdk::profile_types::graph_types() {
+    for registration in current_types(ctx.subject_id()) {
         let stored = client
-            .get_type(ctx, &graph_type.type_id.parse().unwrap())
+            .get_type(ctx, &registration.type_id.parse().unwrap())
             .await
             .unwrap();
         assert_eq!(
-            stored.schema,
-            serde_json::from_str::<Value>(graph_type.schema).unwrap(),
+            stored.schema, registration.schema,
             "{}",
-            graph_type.type_id
+            registration.type_id
         );
     }
 }
@@ -2266,22 +2301,27 @@ async fn schemas_of_an_earlier_version_are_upgraded_on_registration() {
     let client = graph_storage();
     let tenant = Uuid::new_v4();
     let ctx = construct_in(tenant);
-    let earlier = earlier_person_types();
+    let earlier = earlier_person_types(ctx.subject_id());
     client.register_types(&ctx, earlier.clone()).await.unwrap();
+    let current = current_types(ctx.subject_id());
     let changed = earlier
         .iter()
         .filter(|registered| {
-            let current = construct_sdk::profile_types::graph_types()
-                .into_iter()
-                .find(|graph_type| graph_type.type_id == registered.type_id)
+            let now = current
+                .iter()
+                .find(|now| now.type_id == registered.type_id)
                 .unwrap();
-            serde_json::from_str::<Value>(current.schema).unwrap() != registered.schema
+            now.schema != registered.schema
         })
         .count();
-    assert_eq!(changed, 3, "the role, skill and preference types differ");
+    assert_eq!(
+        changed,
+        crate::domain::profile::profile_schema().nodes.len(),
+        "the node types differ"
+    );
 
     GraphTypes::new(Arc::clone(&client))
-        .ensure(&ctx)
+        .ensure(&ctx, ctx.subject_id())
         .await
         .unwrap();
 
@@ -2297,11 +2337,14 @@ async fn registering_unchanged_schemas_logs_no_upgrade() {
     let ctx = construct_in(Uuid::new_v4());
     // The tenant already holds the current schemas, as after a restart.
     GraphTypes::new(Arc::clone(&client))
-        .ensure(&ctx)
+        .ensure(&ctx, ctx.subject_id())
         .await
         .unwrap();
 
-    GraphTypes::new(client).ensure(&ctx).await.unwrap();
+    GraphTypes::new(client)
+        .ensure(&ctx, ctx.subject_id())
+        .await
+        .unwrap();
 
     assert!(!logs_contain("graph types upgraded in the tenant"));
 }
@@ -2311,7 +2354,7 @@ async fn a_registration_sent_again_after_a_lost_race_still_upgrades() {
     let client = graph_storage();
     let ctx = construct_in(Uuid::new_v4());
     client
-        .register_types(&ctx, earlier_person_types())
+        .register_types(&ctx, earlier_person_types(ctx.subject_id()))
         .await
         .unwrap();
     let scripted = Scripted::over(Arc::clone(&client));
@@ -2320,7 +2363,7 @@ async fn a_registration_sent_again_after_a_lost_race_still_upgrades() {
         .store(true, Ordering::SeqCst);
 
     GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>)
-        .ensure(&ctx)
+        .ensure(&ctx, ctx.subject_id())
         .await
         .unwrap();
 
@@ -2334,30 +2377,27 @@ async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_reme
     let ctx = construct_in(Uuid::new_v4());
     // A newer release registered a property this one does not know, so this
     // release's schema would remove it.
-    let newer: Vec<TypeRegistration> = construct_sdk::profile_types::graph_types()
+    let newer: Vec<TypeRegistration> = current_types(ctx.subject_id())
         .into_iter()
-        .map(|graph_type| {
-            let mut schema: Value = serde_json::from_str(graph_type.schema).unwrap();
-            if let Some(Value::Object(properties)) =
-                schema.pointer_mut("/allOf/1/properties/payload/properties")
+        .map(|mut registration| {
+            if let Some(Value::Object(properties)) = registration
+                .schema
+                .pointer_mut("/allOf/1/properties/payload/properties")
             {
                 properties.insert(
                     "added_by_a_later_release".to_owned(),
                     json!({ "type": "string" }),
                 );
             }
-            TypeRegistration {
-                type_id: graph_type.type_id.to_owned(),
-                schema,
-            }
+            registration
         })
         .collect();
     client.register_types(&ctx, newer).await.unwrap();
     let scripted = Scripted::over(Arc::clone(&client));
     let types = GraphTypes::new(Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>);
 
-    let first = types.ensure(&ctx).await;
-    let second = types.ensure(&ctx).await;
+    let first = types.ensure(&ctx, ctx.subject_id()).await;
+    let second = types.ensure(&ctx, ctx.subject_id()).await;
 
     assert!(matches!(first, Err(DomainError::Internal(_))), "{first:?}");
     assert!(
@@ -2370,16 +2410,16 @@ async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_reme
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 4);
     // The refused change left the newer schemas in place, on every type that
     // has payload properties to add one to.
-    for graph_type in construct_sdk::profile_types::graph_types() {
-        let current: Value = serde_json::from_str(graph_type.schema).unwrap();
-        if current
+    for registration in current_types(ctx.subject_id()) {
+        if registration
+            .schema
             .pointer("/allOf/1/properties/payload/properties")
             .is_none()
         {
             continue;
         }
         let stored = client
-            .get_type(&ctx, &graph_type.type_id.parse().unwrap())
+            .get_type(&ctx, &registration.type_id.parse().unwrap())
             .await
             .unwrap();
         assert!(
@@ -2388,7 +2428,7 @@ async fn a_tenant_whose_schema_is_newer_than_the_release_is_refused_and_not_reme
                 .pointer("/allOf/1/properties/payload/properties/added_by_a_later_release")
                 .is_some(),
             "{}",
-            graph_type.type_id
+            registration.type_id
         );
     }
 }
@@ -2401,7 +2441,8 @@ async fn a_registration_that_loses_a_race_is_sent_once_more() {
         .conflict_next_registration
         .store(true, Ordering::SeqCst);
 
-    types.ensure(&construct_in(Uuid::new_v4())).await.unwrap();
+    let ctx = construct_in(Uuid::new_v4());
+    types.ensure(&ctx, ctx.subject_id()).await.unwrap();
 
     assert_eq!(scripted.registrations.load(Ordering::SeqCst), 2);
 }
@@ -2415,7 +2456,11 @@ async fn a_value_its_type_refuses_stores_nothing() {
         None,
         vec![
             add_skill("Rust"),
-            add_value("skill", "skills", json!({ "name": "Go", "level": "guru" })),
+            add_value(
+                "project",
+                "project",
+                json!({ "name": "Go", "level": "guru" }),
+            ),
         ],
     );
 
@@ -2459,7 +2504,7 @@ async fn a_property_change_is_refused_and_stores_nothing() {
         .writer()
         .write(
             &profiles.ctx,
-            &profiles.plan(None, vec![replace_property("skill", "skills", "Rust")]),
+            &profiles.plan(None, vec![replace_property("project", "project", "Rust")]),
         )
         .await;
 
@@ -2540,7 +2585,7 @@ async fn a_stored_fact_names_who_it_came_from_and_when() {
         assert_eq!(fact.origin, kind);
         assert_eq!(
             (fact.property.as_str(), &fact.value),
-            ("skills", &skills("Rust"))
+            ("project", &skills("Rust"))
         );
         assert!(fact.produced_at.is_some(), "{kind:?}");
         let node = profiles

@@ -24,8 +24,8 @@
 
 pub mod api;
 pub mod gts;
+pub mod linked_schema;
 pub mod models;
-pub mod person_types;
 pub mod profile_types;
 pub mod reason;
 

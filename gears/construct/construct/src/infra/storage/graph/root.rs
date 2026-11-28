@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::plan::NodeKey;
+use crate::domain::profile::Mark;
 use crate::domain::subject_settings::SubjectKey;
 
 /// The node key of a subject's first profile root in its tenant, that of
@@ -77,13 +78,29 @@ impl crate::domain::deletion::ProfileGenerations for FirstGeneration {
 struct RootPayload<R> {
     subject_id: Uuid,
     removals: R,
+    /// What the person forgot; a root written before marks existed has none, and a root without any writes none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<StoredMark>,
 }
+
+/// A mark as the root's payload holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredMark {
+    kind: String,
+    key: String,
+    tool: String,
+    message: String,
+}
+
+/// The most marks a root keeps: the newest.
+pub const MAX_MARKS: usize = 200;
 
 /// What the root holds besides its subject and its version: the keys of the
 /// removed facts whose soft delete may still be pending.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Root {
     pub removals: BTreeSet<NodeKey>,
+    pub marks: Vec<Mark>,
 }
 
 impl Root {
@@ -137,6 +154,16 @@ impl Root {
         }
         Ok(Self {
             removals: parsed.removals.into_iter().map(NodeKey).collect(),
+            marks: parsed
+                .marks
+                .into_iter()
+                .map(|mark| Mark {
+                    kind: mark.kind,
+                    key: mark.key,
+                    tool: mark.tool,
+                    message: mark.message,
+                })
+                .collect(),
         })
     }
 
@@ -158,6 +185,16 @@ impl Root {
                 .iter()
                 .map(|key| key.0.as_str())
                 .collect::<Vec<_>>(),
+            marks: self
+                .marks
+                .iter()
+                .map(|mark| StoredMark {
+                    kind: mark.kind.clone(),
+                    key: mark.key.clone(),
+                    tool: mark.tool.clone(),
+                    message: mark.message.clone(),
+                })
+                .collect(),
         };
         let Ok(Value::Object(mut fields)) = serde_json::to_value(payload) else {
             return Err(DomainError::internal(

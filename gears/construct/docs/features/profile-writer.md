@@ -12,14 +12,14 @@
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Shape of a Fact](#shape-of-a-fact)
   - [Origin of a Fact](#origin-of-a-fact)
-  - [Cardinality of a Fact](#cardinality-of-a-fact)
+  - [Owner and Number of a Node](#owner-and-number-of-a-node)
   - [Write a Plan](#write-a-plan)
   - [Read a Profile](#read-a-profile)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Person Types](#person-types)
   - [Fact Origin in the Payload](#fact-origin-in-the-payload)
-  - [Cardinality Table](#cardinality-table)
+  - [Owner Table](#owner-table)
   - [Profile Root and Has-Fact Edge](#profile-root-and-has-fact-edge)
   - [Profile Version](#profile-version)
   - [Fact Node from a Plan](#fact-node-from-a-plan)
@@ -42,18 +42,24 @@
 
 The Profile Writer (`cpt-cf-construct-component-profile-writer`) stores an admitted plan in graph storage, and the
 planner reads the profile back through the same layout. The planner's work started this document with the part it stores:
-Construct's person types (`cpt-cf-construct-contract-person-types`), what one stored fact looks like, where its origin
-is kept, and how many values of a property one subject may hold. This part adds the write and the read:
+Construct's profile schema (`cpt-cf-construct-contract-person-types`): the node kinds and link kinds a person's profile
+holds, what one stored node looks like, where its origin and the places it was learned from are kept, who owns it, and how
+many nodes of a kind one subject may hold. This part adds the write and the read:
 the subject's root node, one write per plan with the root as the compare-and-set, the removal of replaced and removed
-facts, and the registration of the types.
+facts, and the registration of the types, per person.
 
 ### 1.2 Purpose
 
-The DESIGN leaves "the properties of the person types" to the feature design. A person has four categories:
-identity, role, skill and preference. Each is one GTS graph node type, which the profile writer stores and the
-planner, the profile reader and the subject control read.
+The DESIGN leaves "the properties of the person types" to the feature design. A person's profile is a graph of nodes
+and links, defined by a schema of node kinds and link kinds. The default schema holds the things a person works with
+(`person`, `project`, `product`, `activity`, `team`, `customer`, `partner`, `competitor`), the entries that hang on
+them (`commitment`, `decision`, `question`, `metric`), the reference nodes (`ticket`, `source`), the person's own
+direct properties (`me`), and the links between them. Each node kind and each link kind is one GTS graph type, which
+the profile writer stores and the planner, the profile reader and the subject control read. The kinds are named by
+their registered names, which the model, the REST API and the permission policy use as the category.
 
-**In scope**: the four person types, the shape of a fact, the origin of a fact, the cardinality of each property; the
+**In scope**: the node and link kinds, the shape of a fact (a node), the origin of a fact, the owner and the number of
+nodes of each kind; the
 profile's root node and the edge from the root to a fact; the write of an admitted plan and the read of a profile;
 the registration of the types.
 
@@ -89,7 +95,7 @@ deleted key cannot be reused, which Erasure keeps (`cpt-cf-construct-algo-erasur
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-construct-actor-graph-storage` | Stores each fact as a node of a person type and validates it against the type's whole chain. |
+| `cpt-cf-construct-actor-graph-storage` | Stores each fact as a node of a node kind's type, and each link as an edge of a link kind's type, and validates them against the type's whole chain. |
 | `cpt-cf-construct-actor-connector` | The usual source of a fact. Its record becomes the fact's origin. |
 
 ### 1.4 References
@@ -112,16 +118,23 @@ security context's is refused.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-profile-writer-fact-shape`
 
-1. [ ] - `p1` - A fact is one node of the person type of its category, derived from graph storage's owned node:
-   `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.<category>.v1~` - `inst-fact-node`
-2. [ ] - `p1` - The node's `payload` holds one fact property and `origin`, and `record` when the fact came from a
-   record; nothing else. The fact property names the fact. It is the plain key the model writes
+1. [ ] - `p1` - A fact is one node of the graph type of its kind, derived from graph storage's owned node:
+   `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.u<person>.<kind>.v1~`. The type id carries a
+   per-person prefix, `u` and the person's subject id as 32 hex digits, so two people's kinds never collide in one
+   tenant - `inst-fact-node`
+2. [ ] - `p1` - The node's `payload` holds one property, named like the kind, whose value is the object of the node's
+   fields, and `origin`; `learned`, the tool and the message of each write that touched it, newest last, at most 50;
+   `record` when the node came from a record; and `owner`, the key of the node that owns it, for an entry kind;
+   nothing else. The kind name is the plain key the model writes
    (`cpt-cf-construct-principle-model-never-sees-ids`) - `inst-fact-property`
-3. [ ] - `p1` - A property whose value is an object (an entry such as a job or a skill) carries the fact's fields. A
-   plan step adds, replaces or removes the whole value: a change to one field is a replace of the fact -
+3. [ ] - `p1` - A plan step adds, replaces or removes the whole value: a change to one field is a replace of the node.
+   A replace changes the node where it stands, under its key, so its links and the nodes it owns stay -
    `inst-fact-fields`
 4. [ ] - `p1` - The payload is closed: an unknown property is refused, and a new property is a backward-compatible
    change of the type - `inst-fact-closed`
+5. [ ] - `p1` - A link is one edge of the graph type of its link kind, a static edge whose payload holds `fields`,
+   `origin` and `record`. The type names the kinds at its ends. Graph storage deletes an edge with either of its nodes -
+   `inst-fact-link`
 
 ### Origin of a Fact
 
@@ -150,21 +163,22 @@ security context's is refused.
 6. [ ] - `p1` - The planner does not show `origin` or `record` to the model: they hold identifiers -
    `inst-origin-hidden`
 
-### Cardinality of a Fact
+### Owner and Number of a Node
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-profile-writer-fact-cardinality`
 
-1. [ ] - `p1` - A fact holds one value. Several values of a property are several facts, each its own node; a list inside
-   one value would need its own type and a reason, and no property has one. A day-based window, such as
-   `focus_windows`, is one fact per day - `inst-cardinality-one-value`
-2. [ ] - `p1` - Each fact property is `One` or `Many`. `One`: a subject holds at most one value, such as `full_name`.
-   `Many`: a subject may hold several, such as `skills`, or a preference a person can have more than one of, such as
-   `notification_type` - `inst-cardinality-kinds`
-3. [ ] - `p1` - The table lives in the SDK next to the schemas, because graph storage refuses unknown `x-` keywords in
-   a type - `inst-cardinality-place`
-4. [ ] - `p1` - The planner's tools refuse to add a second value of a `One` property and tell the model to replace
-   it. A one-step plan without the planner turns such an add into a replace. Admission does not check it: its
-   checks are the ones the DESIGN lists - `inst-cardinality-use`
+1. [ ] - `p1` - Every node is owned by the profile root, which is the person, or by a node: an entry (`commitment`,
+   `decision`, `question`, `metric`) is owned by a thing. Forgetting a node forgets the nodes it owns, however deep -
+   `inst-cardinality-one-value`
+2. [ ] - `p1` - Two nodes of one kind and one owner with the same value of the kind's key property (`name`, `text`,
+   `label` or `id`), compared without case and spacing, are the same node. The kind `me`, the person's own name, age,
+   profession and description, holds one node at most - `inst-cardinality-kinds`
+3. [ ] - `p1` - The kinds, their owners, their key property and whether they are reference nodes live in the SDK next
+   to the schemas, because graph storage refuses unknown `x-` keywords in a type - `inst-cardinality-place`
+4. [ ] - `p1` - The planner's tools refuse to add a second node of one name and tell the model the number of the node
+   that exists, so it links to it. A one-step plan without the planner adds only a kind the root owns, and turns a second
+   `me` into a refusal naming the held one. Admission does not check it: its checks are the ones the DESIGN lists -
+   `inst-cardinality-use`
 
 ### Write a Plan
 
@@ -175,11 +189,11 @@ security context's is refused.
 **Output**: Stored, or a conflict when the profile changed after the plan was built on it. Or an error: the profile is full, graph storage is unavailable or does not answer in time, the deadline passed (unavailable when it passed before the ingest was sent: nothing was written; result unknown when it passed after), or something is defective: the plan, the stored root, or the deployment when graph storage refuses Construct's own permission.
 
 **Steps**:
-1. [x] - `p1` - A plan without steps stores nothing and answers stored. A plan for another tenant than the security context's is refused. Otherwise make sure Construct's graph types exist in the tenant: register the root, the edge and the person types the first time this process writes there, and remember the tenant only when the registration succeeded. Registering the same schemas again converges, so a restart or a second instance is safe; two first registrations in a tenant race, and the one refused as a conflict is sent once more - `inst-write-register`
+1. [x] - `p1` - A plan without steps stores nothing and answers stored. A plan for another tenant than the security context's is refused. Otherwise make sure Construct's graph types exist in the tenant: register the root, the edge, and the node and link kinds of the person written for, the first time this process writes there for that person, and remember the tenant only when the registration succeeded. Registering the same schemas again converges, so a restart or a second instance is safe; two first registrations in a tenant race, and the one refused as a conflict is sent once more - `inst-write-register`
 2. [x] - `p1` - Read the profile as Read a Profile does: the root and every live fact one has-fact edge from it, also the facts the root lists for removal whose delete has not run yet. **IF** the root's version, none for a subject without a root, is not the plan's, **RETURN** conflict: the profile changed after the plan was built, logged at debug - `inst-write-read-root`
 3. [x] - `p1` - Of the removals the root still lists, keep only those that are live facts of this root. A listed fact that is gone was removed and drops off the list; a listed key that is not a fact of this root is never deleted, so a root someone else rewrote cannot make Construct delete another node - `inst-write-pending`
 4. [x] - `p1` - Build one ingest: a node and a has-fact edge from the root for each added fact and each replacing fact, and the root, listing the kept removals and the facts this plan replaces or removes. **IF** the plan removes a key that is not a live fact of the profile, the plan is defective. **IF** the live facts, those still listed included, plus the new ones would pass the limit (999 facts, what one read takes), **RETURN** profile full: a full profile takes removals, and new facts once its deletes have run - `inst-write-batch`
-5. [x] - `p1` - A fact node is its category's person type, with the one property, its `origin` and, for a record's fact, its `record`. It claims its new key with `expected_version = 0`, so a key in use is a conflict, never an overwrite. A step that changes one property of a node rather than a whole fact, a fact without exactly one property, or a property named `origin` or `record`, which the envelope would overwrite, is a defect; the message names the kind of change or the name, never a value - `inst-write-fact`
+5. [x] - `p1` - A fact node is its category's type for the person, with the one property, its `origin`, the places it was learned from, its owner for an entry kind and, for a record's fact, its `record`. A replace of a node under its own key changes the node where it stands and adds this write's place to the ones it holds; a link is an edge between the keys the step names, with its fields, origin and record; removing a node removes the nodes it owns and, as graph storage deletes a node with its edges, its links; removing a link deletes its edge after the write has committed; a person's own forget leaves a mark on the root for each message the node was learned from, so the same message does not create it again. It claims its new key with `expected_version = 0`, so a key in use is a conflict, never an overwrite. A step that changes one property of a node rather than a whole fact, a fact without exactly one property, or a property named `origin` or `record`, which the envelope would overwrite, is a defect; the message names the kind of change or the name, never a value - `inst-write-fact`
 6. [x] - `p1` - The origin names the producer, the method, the model for an agent, `produced_at` in UTC (the record's `observed_at`, or the time of the write for a person or an agent) and the step's confidence as the decimal the model gave, as the table in Origin of a Fact says - `inst-write-origin`
 7. [x] - `p1` - The root's expected version is its version, or 0 for a subject without one: 0 claims a key no node holds, so two first writes cannot both create the root. A stored version beyond graph storage's range is a defect of the root, not a conflict. Every write first notes the tenant for retention (`cpt-cf-construct-feature-retention`), since a profile may be the tenant's only data; the store keeps the tenants it noted, so that is one insert per tenant and process - `inst-write-expected`
 8. [x] - `p1` - Send the ingest with a new idempotency key, waiting at most 10 seconds by default. **IF** graph storage answers `CAS_CONFLICT`, nothing was stored; read the root again. Every write of Construct's moves the counter: **IF** the counter moved, another write landed in between, **RETURN** conflict, logged at warn with the expected and the stored version. **IF** it did not, it is a defect, internal and logged at error: the root was written outside Construct or its key is held by a removed node, so every later write is refused too, or a key a new fact claims is already held. A send without an answer keeps running in graph storage, so a resend can lose the compare-and-set to it: once a send's result was unknown, a refused compare-and-set is sent once more with the same key, and when the earlier send committed its receipt answers stored. **IF** the result is unknown (no answer in time, unavailable, deadline exceeded, or a lost serialization race), send the same request with the same key again after a pause that doubles each time, plus a random share of it, logged at warn, up to 3 sends in all, the send that checks a refusal included; after the last one, or a refusal after an unknown result with no send left to check it, **RETURN** result unknown. A send throttled after an unknown result is result unknown too. Result unknown answers `503` with a detail that says the write may have been stored; every other unavailable write stored nothing. Any other refusal is an error, an unknown error included: it says nothing about the write - `inst-write-ingest`
@@ -198,7 +212,7 @@ security context's is refused.
 **Steps**:
 1. [x] - `p1` - A tenant other than the security context's is refused. Traverse one has-fact edge from the subject's root in its current generation (`cpt-cf-construct-algo-erasure-root-key`), taking at most 1000 nodes and waiting at most 10 seconds by default; no answer in time is unavailable. A read that graph storage marks as seeing more than one graph state (a write landed while it ran, on a store without snapshots) is sent again, three times in all, then unavailable: its root could carry a newer version than its facts. Graph storage refusing the 1000 nodes is internal and names its `traversal_max_nodes` setting, which the deployment has set too low - `inst-read-traverse`
 2. [x] - `p1` - **IF** there is no root, **RETURN** no version and no facts. **IF** the traversal was cut short by its node budget, **RETURN** profile full, because a partial profile would let the planner add what is already stored; cut short for any other reason, **RETURN** internal: it is a limit of graph storage's, not a full profile. **IF** the root's key is held by a node of another type, or the root names another subject, it is a defect, internal. Otherwise read the version and the removal list from the root - `inst-read-root`
-3. [x] - `p1` - **RETURN** every node of a person type that a has-fact edge from this root points to and that the root does not list for removal, as its category, its property and its value. The traversal walks edges both ways and matches derived types, so a node only linked into the root, or reached by another edge type, is no fact. A node a has-fact edge from the root points to that is of no person type, or that holds not exactly one fact property besides its origin and record, is a defect, internal and named by its key - `inst-read-facts`
+3. [x] - `p1` - **RETURN** every node of a node kind's type that a has-fact edge from this root points to and that the root does not list for removal, as its category, its property and its value. The traversal walks edges both ways and matches derived types, so a node only linked into the root, or reached by another edge type, is no fact. The links between those nodes are read in the same traversal, one hop further. A node a has-fact edge from the root points to that is of no node kind, or that holds not exactly one fact property besides its origin and record, is a defect, internal and named by its key - `inst-read-facts`
 
 ## 4. States (CDSL)
 
@@ -210,27 +224,30 @@ None. A fact is created, replaced or removed by a plan; it has no state of its o
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-person-types`
 
-The SDK **MUST** ship the four person types as JSON schemas and **MUST** expose them with their ids for registration.
-It **MUST** give the schema of each property on its own, with the shapes the type defines once put in place.
+The SDK **MUST** ship the default schema, its node kinds and link kinds, and **MUST** build the graph type of each for a
+person, with the per-person prefix, for registration. It **MUST** give the schema of the fields of each kind on its own.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-fact-shape`
 
 **Touches**:
 - Contract: `cpt-cf-construct-contract-person-types`
-- Code: `construct_sdk::person_types::{PERSON_TYPES, property_schema}`, `gears/construct/construct-sdk/schemas/`
+- Code: `construct_sdk::linked_schema::{default_schema, Schema, SchemaPrefix}`, `gears/construct/construct-sdk/schemas/`
 
-**Verified by**: the SDK unit tests `each_schema_names_its_type_and_derives_from_the_owned_node`,
-`a_whole_node_of_each_type_fits_its_chain_with_a_real_origin`, `a_payload_holds_exactly_one_fact_and_its_origin`,
-`each_constrained_value_fits_its_form_and_nothing_else`, `every_text_value_has_a_length_limit_it_enforces`,
-`every_number_has_bounds_it_enforces` and `every_property_schema_stands_alone`, and `gts-validator`.
+**Verified by**: the SDK unit tests `the_default_schema_has_the_kinds_of_the_linked_profile`,
+`every_link_names_kinds_of_the_schema_and_no_name_is_used_twice`, `the_links_of_the_story_are_there`,
+`the_prefix_of_a_person_keeps_the_kinds_of_two_people_apart`,
+`the_graph_types_are_every_node_and_link_kind_and_derive_from_their_family`,
+`a_node_holds_the_object_of_its_fields_in_one_property_named_like_its_kind`,
+`a_node_of_an_entry_kind_names_its_owner` and `a_link_holds_its_fields_its_origin_and_the_record`, and
+`gts-validator`.
 
 ### Fact Origin in the Payload
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-fact-origin`
 
-Every person type **MUST** require `origin` as graph storage's provenance attribute, and **MUST** take `record` beside
-it for a fact that came from a record.
+Every node and link type **MUST** require `origin` as graph storage's provenance attribute, and **MUST** take `record`
+beside it for a node or link that came from a record, and `learned` on a node.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-fact-origin`
@@ -239,23 +256,25 @@ it for a fact that came from a record.
 - Requirement: `cpt-cf-construct-fr-fact-origin`
 - Code: the `origin` and `record` members of the schemas in `gears/construct/construct-sdk/schemas/`
 
-**Verified by**: the SDK unit tests `the_origin_is_required_and_is_graph_storage_provenance`,
-`a_fact_from_a_record_names_the_record_beside_its_origin` and `every_type_takes_the_same_record`.
+**Verified by**: the SDK unit tests `a_node_holds_the_object_of_its_fields_in_one_property_named_like_its_kind` and
+`a_link_holds_its_fields_its_origin_and_the_record`, and the graph tests
+`each_node_and_link_records_the_tool_and_the_message_it_came_from`.
 
-### Cardinality Table
+### Owner Table
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-cardinality`
 
-The SDK **MUST** state the cardinality of every fact property of every person type, and of nothing else.
+The SDK **MUST** state the owner of every node kind, the property that names a node of it, and whether the profile holds
+one node of it only, and the kinds at the ends of every link kind.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-fact-cardinality`
 
 **Touches**:
-- Code: `construct_sdk::person_types::{Cardinality, FactProperty, PROPERTIES}`
+- Code: `construct_sdk::linked_schema::{NodeKind, LinkKind, Owner}`
 
-**Verified by**: the SDK unit tests `every_fact_property_has_a_cardinality_and_only_those` and
-`each_property_holds_one_value_unless_a_person_can_have_several`.
+**Verified by**: the SDK unit tests `every_link_names_kinds_of_the_schema_and_no_name_is_used_twice` and
+`the_default_schema_has_the_kinds_of_the_linked_profile`.
 
 ### Profile Root and Has-Fact Edge
 
@@ -263,7 +282,7 @@ The SDK **MUST** state the cardinality of every fact property of every person ty
 
 The SDK **MUST** ship the root node type, an owned node whose closed payload holds the subject, the version (from 1)
 and the removal list, and the has-fact edge type, a static edge with no payload. It **MUST** list them for
-registration before the person types.
+registration before the node and link kinds.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-write`
@@ -293,7 +312,7 @@ The profile version **MUST** sit behind one interface that reads it from a store
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-profile-writer-fact-payload`
 
-The writer **MUST** store each new fact as a node of its category's person type, with the one property, the origin of the table in Origin of a Fact, the step's confidence as the decimal the model gave, and the record for a record's fact, and **MUST** claim the node's new key. It **MUST** take the key and the property from the step's own change, and **MUST** refuse a change of one property of a node without naming its value.
+The writer **MUST** store each new fact as a node of its category's type for the person, with the one property, the origin of the table in Origin of a Fact, the step's confidence as the decimal the model gave, and the record for a record's fact, and **MUST** claim the node's new key. It **MUST** take the key and the property from the step's own change, and **MUST** refuse a change of one property of a node without naming its value.
 
 **Implements**:
 - `cpt-cf-construct-algo-profile-writer-write`
@@ -349,10 +368,10 @@ The profile read **MUST** return the root's version and every fact one has-fact 
 
 ## 6. Acceptance Criteria
 
-- [ ] Graph storage accepts the four person types, and validates a node of each type against the whole chain,
+- [ ] Graph storage accepts the node and link kinds of the default schema, and validates a node of each type against the whole chain,
       origin included.
 - [ ] A node whose payload has no origin, two facts, an unknown property, or an incomplete record is refused.
-- [ ] Every fact property has exactly one cardinality.
+- [ ] Every node kind has one owner, and every link kind names the kinds at its ends.
 - [ ] Construct's types are registered before the first write in each tenant, idempotently: a restart against an
       already-registered tenant converges rather than conflicting
       (`the_types_register_again_after_a_restart_without_conflict`).

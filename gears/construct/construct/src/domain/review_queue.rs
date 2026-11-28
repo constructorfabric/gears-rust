@@ -24,6 +24,7 @@ pub use super::one_step::NotStored;
 use super::one_step::{Gone, NewFact, OneStepDone, OneStepPath};
 use super::plan::{NodeKey, Origin};
 use super::profile::Category;
+use super::profile_read::StoredFact;
 use super::profile_writes::{ProfileWrites, Removed, SubjectFacts, WRITE_LANDED, WriteError};
 use super::subject_access;
 use super::subject_settings::SubjectKey;
@@ -675,6 +676,69 @@ pub(crate) async fn close_on_change(
     Ok(true)
 }
 
+/// What a [`close_orphaned`] sweep closes as: who closes, which request it leaves to its caller, and which nodes
+/// this delete removed.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sweep<'a> {
+    pub by: Uuid,
+    pub except: Option<&'a NodeKey>,
+    pub removed_now: &'a [NodeKey],
+}
+
+/// Closes as deleted, by `sweep.by`, every open request of the subject whose fact is no longer live, except the one on
+/// `except`: a delete takes the nodes its fact owns with it, and an earlier delete may have left such a request
+/// open when its close failed. `removed_now` are the nodes this delete removed: a request on one of them closes as
+/// this delete's, and any other as an outside change that did not change the fact, so that a resolution its claim
+/// recorded and the profile holds closes as that one. Every close is tried; the first failure is returned after the
+/// rest. How many requests it closed.
+///
+/// # Errors
+///
+/// When the requests or the profile cannot be read, or a close fails.
+pub(crate) async fn close_orphaned(
+    requests: &dyn ReviewRequests,
+    events: &dyn ReviewQueueEvents,
+    writes: &ProfileWrites,
+    scope: &AccessScope,
+    key: SubjectKey,
+    sweep: Sweep<'_>,
+) -> Result<usize, DomainError> {
+    let read_failed = |err: DomainError| {
+        tracing::warn!(error = %err, "construct: the requests on removed nodes could not be read");
+        err
+    };
+    let open = requests
+        .under_review(scope, key)
+        .await
+        .map_err(read_failed)?;
+    if open.is_empty() {
+        return Ok(0);
+    }
+    let live = writes.facts(key).await.map_err(read_failed)?.facts;
+    let (mut closed, mut failed) = (0, None);
+    for fact_id in open
+        .iter()
+        .filter(|fact_id| Some(*fact_id) != sweep.except)
+        .filter(|fact_id| !live.iter().any(|fact| &fact.node_key == *fact_id))
+    {
+        let change = OutsideChange {
+            by: sweep.by,
+            outcome: ReviewOutcome::Deleted,
+            changed: sweep.removed_now.contains(fact_id),
+        };
+        match close_on_change(requests, events, writes, scope, key, fact_id, change).await {
+            Ok(true) => closed += 1,
+            Ok(false) => {}
+            Err(err) => {
+                tracing::warn!(error = %err, fact_id = %fact_id.0, "construct: a request on a removed node was not closed");
+                failed.get_or_insert(err);
+            }
+        }
+    }
+    failed.map_or(Ok(closed), Err)
+}
+
 /// A reviewer's decision on an open request.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
@@ -734,8 +798,8 @@ pub(crate) enum Wrote {
     Nothing,
     /// The correction stored this fact.
     Corrected(NewFact),
-    /// The delete removed the fact.
-    Removed,
+    /// The delete removed the fact, and these nodes it owned.
+    Removed(Vec<StoredFact>),
 }
 
 /// What a resolution wrote, and how its close ended: the closed request, or
@@ -1263,13 +1327,9 @@ impl ReviewQueueService {
             Resolution::Deleted { reason } => {
                 let closing = hold.closing(ReviewOutcome::Deleted, reason);
                 hold.pend(&closing).await?;
-                let wrote = if self
-                    .remove(request, &hold.resolver.origin(), deadline)
-                    .await?
-                {
-                    Wrote::Removed
-                } else {
-                    Wrote::Nothing
+                let wrote = match self.remove(request, hold, deadline).await? {
+                    Some(owned) => Wrote::Removed(owned),
+                    None => Wrote::Nothing,
                 };
                 (closing, wrote)
             }
@@ -1331,14 +1391,16 @@ impl ReviewQueueService {
     }
 
     /// Delete the fact under review, as the subject's delete does, with the
-    /// resolver as origin. A fact already gone is done. Whether this delete
-    /// removed it.
+    /// resolver as origin. A fact already gone is done. The nodes it owned
+    /// that this delete removed with it, or none when it found the fact gone.
+    /// The requests of the removed nodes close as deleted.
     async fn remove(
         &self,
         request: &ReviewRequest,
-        origin: &Origin,
+        hold: &Hold<'_>,
         deadline: Instant,
-    ) -> Result<bool, WriteError> {
+    ) -> Result<Option<Vec<StoredFact>>, WriteError> {
+        let origin = &hold.resolver.origin();
         // @cpt-begin:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-read
         let key = request.subject();
         let (construct, _) = self.writes.construct(key.tenant_id).await?;
@@ -1349,10 +1411,36 @@ impl ReviewQueueService {
             .remove(&construct, key, &request.fact_id, origin, deadline)
             .await?
         {
-            Removed::Removed(_) => Ok(true),
+            Removed::Removed(_, owned) => {
+                // The request being resolved closes with the resolution. The delete is done: a request that
+                // does not close here is closed by the next delete of the subject.
+                if let Err(err) = close_orphaned(
+                    self.requests.as_ref(),
+                    self.events.as_ref(),
+                    &self.writes,
+                    hold.scope,
+                    key,
+                    Sweep {
+                        by: hold.resolver.by(),
+                        except: Some(&request.fact_id),
+                        removed_now: &owned
+                            .iter()
+                            .map(|fact| fact.node_key.clone())
+                            .collect::<Vec<_>>(),
+                    },
+                )
+                .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "construct: a request on a node the delete removed was not closed"
+                    );
+                }
+                Ok(Some(owned))
+            }
             Removed::Gone => {
                 found_gone(request);
-                Ok(false)
+                Ok(None)
             }
         }
         // @cpt-end:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-write
@@ -1608,10 +1696,24 @@ impl Hold<'_> {
 }
 
 /// Whether the write of `pending`, an earlier resolution of `request`, is
-/// in `facts`: its corrected fact is there, or its deleted fact is gone.
-fn landed(request: &ReviewRequest, pending: &Closed, facts: &SubjectFacts) -> bool {
+/// in `facts`: its corrected fact is there, or its deleted fact is gone. A
+/// correction changes the fact where it stands, so its key was there before
+/// the write: the correction landed when the fact holds another value than
+/// the one that was flagged.
+pub(crate) fn landed(request: &ReviewRequest, pending: &Closed, facts: &SubjectFacts) -> bool {
     let has = |key: &NodeKey| facts.facts.iter().any(|fact| &fact.node_key == key);
     match &pending.outcome {
+        ReviewOutcome::Corrected(new) if *new == request.fact_id => {
+            let flagged = match &request.status {
+                ReviewStatus::Open { value } => Some(value),
+                ReviewStatus::Closed(_) => None,
+            };
+            facts
+                .facts
+                .iter()
+                .find(|fact| &fact.node_key == new)
+                .is_some_and(|fact| flagged.is_none_or(|flagged| &fact.value != flagged))
+        }
         ReviewOutcome::Corrected(new) => has(new),
         ReviewOutcome::Deleted => !has(&request.fact_id),
         ReviewOutcome::Rejected => false,

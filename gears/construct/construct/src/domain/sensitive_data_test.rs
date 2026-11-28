@@ -247,8 +247,8 @@ async fn a_finding_in_a_value_the_plan_does_not_hold_drops_the_record() {
 #[test]
 fn an_object_value_gives_its_strings_and_numbers_but_not_its_keys() {
     let plan = connector_plan(vec![add_value(
-        "skill",
-        "skills",
+        "project",
+        "project",
         // Keys in alphabetical order, so the walk order is the same whether or
         // not serde_json keeps insertion order.
         serde_json::json!({ "current": true, "name": "Python", "tags": ["rust", "c"], "years": 5 }),

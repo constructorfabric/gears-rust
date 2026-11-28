@@ -261,7 +261,7 @@ mod tests {
             )]),
             ScopeConstraint::new(vec![
                 ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, key.tenant_id),
-                ScopeFilter::r#in("category", vec![ScopeValue::from("skill")]),
+                ScopeFilter::r#in("category", vec![ScopeValue::from("project")]),
             ]),
         ] {
             assert!(

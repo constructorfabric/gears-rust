@@ -18,7 +18,7 @@ use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
 use crate::domain::one_step::{NotStored, OneStepPath};
 use crate::domain::plan::{Change, NodeKey, Origin, Plan};
-use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::catalog::Catalog;
 use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::OriginKind;
@@ -66,7 +66,7 @@ fn one_step_path(
             events: Arc::new(RecordingAdmissionEvents::default()),
             drops,
         }),
-        catalog: Arc::new(PropertyCatalog::load().unwrap()),
+        catalog: Arc::new(Catalog::load().unwrap()),
     })
 }
 
@@ -94,8 +94,8 @@ impl Fixture {
                     subject_id: subject,
                 },
                 vec![
-                    stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
-                    stored_fact(Category::Identity, "headline", json!("Engineer"), 20),
+                    stored_fact(Category::PROJECT, "project", json!({ "name": "Rust" }), 10),
+                    stored_fact(Category::ME, "me", json!({ "name": "Engineer" }), 20),
                 ],
             ),
         )
@@ -199,7 +199,7 @@ impl Fixture {
         .flag(
             &context_of(self.subject, self.tenant),
             self.subject,
-            &self.fact("skills"),
+            &self.fact("project"),
             Some(ReviewText::new("wrong").unwrap()),
         )
         .await
@@ -230,7 +230,7 @@ async fn an_administrator_reads_all_facts_with_their_requests_and_the_read_is_re
         .page
         .items
         .iter()
-        .find(|item| item.fact.property == "skills")
+        .find(|item| item.fact.property == "project")
         .unwrap();
     assert_eq!(
         skill.review_request.as_ref().map(|r| r.id),
@@ -242,7 +242,7 @@ async fn an_administrator_reads_all_facts_with_their_requests_and_the_read_is_re
             tenant_id: fixture.tenant,
             subject_id: fixture.subject,
             by: fixture.admin,
-            categories: [Category::Identity, Category::Skill].into(),
+            categories: [Category::ME, Category::PROJECT].into(),
         }]
     );
 }
@@ -250,7 +250,7 @@ async fn an_administrator_reads_all_facts_with_their_requests_and_the_read_is_re
 #[tokio::test]
 async fn a_caller_without_the_permission_or_with_a_narrower_scope_is_no_administrator() {
     let fixture = Fixture::new();
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
 
     for resolver in [
         Arc::new(DenyResolver) as Arc<dyn AuthZResolverApi>,
@@ -262,14 +262,14 @@ async fn a_caller_without_the_permission_or_with_a_narrower_scope_is_no_administ
             .read(&admin, fixture.subject, &ODataQuery::default())
             .await;
         let add = service
-            .add(&admin, fixture.subject, "skills", &json!({ "name": "Go" }))
+            .add(&admin, fixture.subject, "project", &json!({ "name": "Go" }))
             .await;
         let edit = service
             .edit(
                 &admin,
                 fixture.subject,
                 &skill,
-                "skills",
+                "project",
                 &json!({ "name": "Go" }),
             )
             .await;
@@ -294,13 +294,13 @@ async fn each_operation_asks_for_the_permission_to_administer_facts_in_the_calle
     let service = fixture.service_over(Arc::clone(&resolver) as _, Some(ON), Vec::new());
     let admin = fixture.admin();
 
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
     service
         .read(&admin, fixture.subject, &ODataQuery::default())
         .await
         .unwrap();
     service
-        .add(&admin, fixture.subject, "skills", &json!({ "name": "Go" }))
+        .add(&admin, fixture.subject, "project", &json!({ "name": "Go" }))
         .await
         .unwrap();
     let edited = service
@@ -308,7 +308,7 @@ async fn each_operation_asks_for_the_permission_to_administer_facts_in_the_calle
             &admin,
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Zig" }),
         )
         .await
@@ -330,7 +330,7 @@ async fn each_operation_asks_for_the_permission_to_administer_facts_in_the_calle
 #[tokio::test]
 async fn a_subject_of_another_tenant_answers_as_one_without_a_profile() {
     let fixture = Fixture::new();
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
     let service = fixture.service();
     let elsewhere = context_of(fixture.admin, Uuid::new_v4());
 
@@ -343,7 +343,7 @@ async fn a_subject_of_another_tenant_answers_as_one_without_a_profile() {
             &elsewhere,
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -369,14 +369,14 @@ async fn an_add_stores_a_new_fact_as_the_administrator() {
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
         .unwrap();
 
-    assert_eq!(added.category, Category::Skill);
-    assert_eq!(added.property.name, "skills");
+    assert_eq!(added.category, Category::PROJECT);
+    assert_eq!(added.property.name, "project");
     assert_eq!(added.property.value, json!({ "name": "Go" }));
     let [plan] = fixture.writer.plans().try_into().unwrap();
     assert_eq!(
@@ -403,7 +403,7 @@ async fn an_add_stores_a_new_fact_as_the_administrator() {
             subject_id: fixture.subject,
             by: fixture.admin,
             fact_id: added.node_key,
-            category: Category::Skill,
+            category: Category::PROJECT,
         }]
     );
 }
@@ -417,8 +417,8 @@ async fn an_add_for_a_subject_without_a_profile_creates_it() {
         .add(
             &fixture.admin(),
             fixture.subject,
-            "headline",
-            &json!("Engineer"),
+            "me",
+            &json!({ "name": "Engineer" }),
         )
         .await
         .unwrap();
@@ -439,7 +439,7 @@ async fn an_add_of_a_held_value_or_a_second_one_valued_value_names_the_held_fact
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "Rust" }),
         )
         .await;
@@ -447,17 +447,17 @@ async fn an_add_of_a_held_value_or_a_second_one_valued_value_names_the_held_fact
         .add(
             &fixture.admin(),
             fixture.subject,
-            "headline",
-            &json!("Manager"),
+            "me",
+            &json!({ "name": "Manager" }),
         )
         .await;
 
     assert!(
-        matches!(&same, Err(DomainError::FactHeld(key)) if key == &fixture.fact("skills")),
+        matches!(&same, Err(DomainError::FactHeld(key)) if key == &fixture.fact("project")),
         "{same:?}"
     );
     assert!(
-        matches!(&second, Err(DomainError::FactHeld(key)) if key == &fixture.fact("headline")),
+        matches!(&second, Err(DomainError::FactHeld(key)) if key == &fixture.fact("me")),
         "{second:?}"
     );
     assert!(fixture.writer.plans().is_empty());
@@ -472,7 +472,7 @@ async fn an_unknown_property_or_a_value_its_schema_does_not_take_is_invalid() {
         .add(&fixture.admin(), fixture.subject, "shoe_size", &json!(42))
         .await;
     let misfit = service
-        .add(&fixture.admin(), fixture.subject, "skills", &json!(42))
+        .add(&fixture.admin(), fixture.subject, "project", &json!(42))
         .await;
 
     assert!(
@@ -493,13 +493,13 @@ async fn an_unknown_property_or_a_value_its_schema_does_not_take_is_invalid() {
 async fn an_add_or_edit_while_personalization_is_off_stores_nothing_and_says_why() {
     let fixture = Fixture::new();
     let service = fixture.service_over(Arc::new(AllowResolver), Some(OFF), Vec::new());
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
 
     let add = service
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -508,7 +508,7 @@ async fn an_add_or_edit_while_personalization_is_off_stores_nothing_and_says_why
             &fixture.admin(),
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -560,7 +560,7 @@ async fn a_blocked_value_stores_nothing() {
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "secret" }),
         )
         .await;
@@ -576,13 +576,13 @@ async fn a_blocked_value_stores_nothing() {
 async fn without_the_opt_in_an_add_or_edit_is_not_configured_and_read_and_delete_work() {
     let fixture = Fixture::new();
     let service = fixture.service_over(Arc::new(AllowResolver), None, Vec::new());
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
 
     let add = service
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -591,7 +591,7 @@ async fn without_the_opt_in_an_add_or_edit_is_not_configured_and_read_and_delete
             &fixture.admin(),
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -612,9 +612,9 @@ async fn without_the_opt_in_an_add_or_edit_is_not_configured_and_read_and_delete
 }
 
 #[tokio::test]
-async fn an_edit_replaces_the_fact_under_a_new_key_as_the_administrator() {
+async fn an_edit_replaces_the_fact_in_place_as_the_administrator() {
     let fixture = Fixture::new();
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
 
     let edited = fixture
         .service()
@@ -622,13 +622,16 @@ async fn an_edit_replaces_the_fact_under_a_new_key_as_the_administrator() {
             &fixture.admin(),
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
         .unwrap();
 
-    assert_ne!(edited.node_key, skill);
+    assert_eq!(
+        edited.node_key, skill,
+        "an edit changes the fact where it stands"
+    );
     let [plan] = fixture.writer.plans().try_into().unwrap();
     assert_eq!(
         plan.origin,
@@ -645,7 +648,7 @@ async fn an_edit_replaces_the_fact_under_a_new_key_as_the_administrator() {
             .profile
             .live()
             .iter()
-            .all(|fact| fact.node_key != skill)
+            .any(|fact| fact.node_key == skill && fact.value == json!({ "name": "Go" }))
     );
     assert_eq!(
         fixture.events.taken(),
@@ -655,7 +658,7 @@ async fn an_edit_replaces_the_fact_under_a_new_key_as_the_administrator() {
             by: fixture.admin,
             fact_id: skill,
             new_fact_id: edited.node_key,
-            category: Category::Skill,
+            category: Category::PROJECT,
         }]
     );
 }
@@ -669,9 +672,9 @@ async fn an_edit_of_another_property_or_a_missing_fact_stores_nothing() {
         .edit(
             &fixture.admin(),
             fixture.subject,
-            &fixture.fact("skills"),
-            "headline",
-            &json!("Manager"),
+            &fixture.fact("project"),
+            "me",
+            &json!({ "name": "Manager" }),
         )
         .await;
     let missing = service
@@ -679,7 +682,7 @@ async fn an_edit_of_another_property_or_a_missing_fact_stores_nothing() {
             &fixture.admin(),
             fixture.subject,
             &NodeKey("construct:t:nothing".to_owned()),
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -712,7 +715,7 @@ async fn an_edit_of_a_fact_under_review_closes_the_request_as_corrected_by_the_a
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
@@ -754,7 +757,7 @@ async fn a_refused_edit_of_a_fact_under_review_leaves_the_request_open() {
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -790,7 +793,7 @@ async fn an_edit_or_delete_while_a_reviewer_holds_the_request_is_a_conflict() {
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -814,7 +817,7 @@ async fn an_edit_or_delete_while_a_reviewer_holds_the_request_is_a_conflict() {
 #[tokio::test]
 async fn a_delete_removes_the_fact_as_the_administrator_also_while_personalization_is_off() {
     let fixture = Fixture::new();
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
     let service = fixture.service_over(Arc::new(AllowResolver), Some(OFF), Vec::new());
 
     service
@@ -850,7 +853,7 @@ async fn a_delete_removes_the_fact_as_the_administrator_also_while_personalizati
             subject_id: fixture.subject,
             by: fixture.admin,
             fact_id: skill,
-            category: Category::Skill,
+            category: Category::PROJECT,
         }]
     );
 }
@@ -950,7 +953,7 @@ impl PlanWriter for AddedMeanwhile {
             };
             let property = &properties[0];
             self.profile.facts.lock().unwrap().push(stored_fact(
-                Category::Skill,
+                Category::PROJECT,
                 &property.name,
                 property.value.clone(),
                 30,
@@ -966,7 +969,7 @@ impl PlanWriter for AddedMeanwhile {
 #[tokio::test]
 async fn a_writer_failure_is_unavailable_and_records_nothing() {
     let fixture = Fixture::new();
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
     let service = fixture.service_writing(
         Arc::new(AllowResolver),
         Some(ON),
@@ -976,14 +979,14 @@ async fn a_writer_failure_is_unavailable_and_records_nothing() {
     let admin = fixture.admin();
 
     let add = service
-        .add(&admin, fixture.subject, "skills", &json!({ "name": "Go" }))
+        .add(&admin, fixture.subject, "project", &json!({ "name": "Go" }))
         .await;
     let edit = service
         .edit(
             &admin,
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -1013,7 +1016,7 @@ async fn an_add_after_a_conflict_is_built_again_on_the_new_version() {
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
@@ -1038,7 +1041,7 @@ async fn an_add_whose_value_lands_meanwhile_is_held_on_the_new_version() {
         .add(
             &fixture.admin(),
             fixture.subject,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -1050,7 +1053,7 @@ async fn an_add_whose_value_lands_meanwhile_is_held_on_the_new_version() {
 #[tokio::test]
 async fn an_edit_whose_fact_goes_away_before_the_write_stores_nothing() {
     let fixture = Fixture::new();
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
     let writer = MemoryWriter::racing(Arc::clone(&fixture.profile));
     let service = fixture.service_writing(
         Arc::new(AllowResolver),
@@ -1064,7 +1067,7 @@ async fn an_edit_whose_fact_goes_away_before_the_write_stores_nothing() {
             &fixture.admin(),
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -1091,7 +1094,7 @@ async fn an_edit_of_a_fact_under_review_that_goes_away_meanwhile_closes_the_requ
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -1137,7 +1140,7 @@ async fn corrected_but_not_closed(fixture: &Fixture) -> (ReviewRequest, NodeKey)
         &context_of(Uuid::new_v4(), fixture.tenant),
         request.id,
         crate::domain::review_queue::Resolution::Corrected {
-            property: "skills".to_owned(),
+            property: "project".to_owned(),
             value: json!({ "name": "Go" }),
             reason: None,
         },
@@ -1170,7 +1173,7 @@ async fn an_edit_or_delete_of_a_fact_an_earlier_resolution_replaced_writes_nothi
             &edit_fixture.admin(),
             edit_fixture.subject,
             &edit_request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Zig" }),
         )
         .await;
@@ -1183,9 +1186,13 @@ async fn an_edit_or_delete_of_a_fact_an_earlier_resolution_replaced_writes_nothi
         )
         .await;
 
-    // The edit reads the fact first and finds it replaced; the delete
-    // settles the request as the correction in the profile.
-    assert!(matches!(edit, Err(DomainError::NoSuchFact(_))), "{edit:?}");
+    // The correction changed the fact where it stands, so the edit finds it,
+    // and like the delete settles the request as the correction in the
+    // profile.
+    assert!(
+        matches!(edit, Err(DomainError::ReviewConflict(ReviewConflict::Closed(id))) if id == edit_request.id),
+        "{edit:?}"
+    );
     assert!(
         matches!(delete, Err(DomainError::ReviewConflict(ReviewConflict::Closed(id))) if id == delete_request.id),
         "{delete:?}"
@@ -1224,7 +1231,7 @@ async fn an_edit_or_delete_stored_but_not_closed_is_recorded_and_says_so() {
             &edit_fixture.admin(),
             edit_fixture.subject,
             &edit_request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -1313,7 +1320,7 @@ async fn an_edit_closes_a_request_flagged_after_its_check_unless_a_reviewer_hold
             &free.admin(),
             free.subject,
             &free_request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
@@ -1323,7 +1330,7 @@ async fn an_edit_closes_a_request_flagged_after_its_check_unless_a_reviewer_hold
             &held.admin(),
             held.subject,
             &held_request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
@@ -1353,7 +1360,7 @@ async fn an_edit_whose_close_of_a_request_flagged_after_its_check_fails_gives_th
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
@@ -1396,7 +1403,7 @@ async fn an_edit_leaves_a_request_flagged_after_its_check_with_a_recorded_write_
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await
@@ -1415,16 +1422,11 @@ async fn an_edit_leaves_a_request_flagged_after_its_check_with_a_recorded_write_
 async fn a_policy_service_that_outlasts_the_budget_cuts_off_an_add_edit_or_delete() {
     let fixture = Fixture::new();
     let service = fixture.service_over(Arc::new(SlowResolver(BUDGET * 2)), Some(ON), Vec::new());
-    let skill = fixture.fact("skills");
+    let skill = fixture.fact("project");
 
     let started = tokio::time::Instant::now();
     let added = service
-        .add(
-            &fixture.admin(),
-            fixture.subject,
-            "headline",
-            &json!("Lead"),
-        )
+        .add(&fixture.admin(), fixture.subject, "me", &json!("Lead"))
         .await;
     assert!(
         matches!(added, Err(DomainError::Unavailable(_))),
@@ -1442,7 +1444,7 @@ async fn a_policy_service_that_outlasts_the_budget_cuts_off_an_add_edit_or_delet
             &fixture.admin(),
             fixture.subject,
             &skill,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;
@@ -1491,7 +1493,7 @@ async fn an_edit_of_a_fact_under_review_resolves_it_within_the_edits_budget() {
             &fixture.admin(),
             fixture.subject,
             &request.fact_id,
-            "skills",
+            "project",
             &json!({ "name": "Go" }),
         )
         .await;

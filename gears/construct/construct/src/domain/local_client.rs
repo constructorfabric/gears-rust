@@ -92,12 +92,7 @@ where
 }
 
 fn fact_category(category: Category) -> FactCategory {
-    match category {
-        Category::Identity => FactCategory::Identity,
-        Category::Role => FactCategory::Role,
-        Category::Skill => FactCategory::Skill,
-        Category::Preference => FactCategory::Preference,
-    }
+    FactCategory::new(category.name())
 }
 
 fn fact_origin(origin: OriginKind) -> FactOrigin {

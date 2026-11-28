@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use construct::domain::plan::{Change, NodeKey, Plan};
 use construct::domain::planner::agent::{Planner, PlannerCaps};
-use construct::domain::planner::catalog::PropertyCatalog;
+use construct::domain::planner::catalog::Catalog;
 use construct::domain::profile::{Fact, Profile};
 use construct::domain::record_intake::{DropEvent, Envelope, IntakeEvents, ReceivedRecord};
 use construct::infra::model::chat_completions::{ChatCompletionsModel, ChatCompletionsSettings};
@@ -161,7 +161,7 @@ fn chat(role: &str, text: &str) -> Value {
     })
 }
 
-fn profile(case: &Case, catalog: &PropertyCatalog) -> Profile {
+fn profile(case: &Case, catalog: &Catalog) -> Profile {
     Profile {
         version: Some(1),
         facts: case
@@ -170,13 +170,16 @@ fn profile(case: &Case, catalog: &PropertyCatalog) -> Profile {
             .map(|held| Fact {
                 node_key: NodeKey(format!("construct:{TENANT}:{}", Uuid::new_v4())),
                 category: catalog
-                    .get(&held.property)
-                    .expect("a listed property")
+                    .kind(&held.property)
+                    .expect("a listed kind")
                     .category,
                 property: held.property.clone(),
                 value: held.value.clone(),
+                owner: None,
             })
             .collect(),
+        links: Vec::new(),
+        marks: Vec::new(),
     }
 }
 
@@ -215,7 +218,9 @@ fn outcome(profile: &Profile, plan: Option<&Plan>) -> Outcome {
                 removes.insert(property_of(entity));
                 gone.insert(entity.clone());
             }
-            _ => panic!("the planner changes whole entities only"),
+            // A link joins nodes the decisions already name.
+            Change::AddLink { .. } | Change::RemoveLink { .. } => {}
+            _ => panic!("the planner changes whole entities and links only"),
         }
     }
     held.extend(
@@ -410,7 +415,7 @@ impl ServiceGatewayClientV1 for DirectGateway {
     }
 }
 
-fn planner(catalog: PropertyCatalog) -> Planner {
+fn planner(catalog: Catalog) -> Planner {
     let required = |name: &str| {
         std::env::var(name).unwrap_or_else(|_| panic!("set {name} to run the evaluation"))
     };
@@ -457,8 +462,8 @@ fn payload_schema(type_id: &str) -> Value {
 }
 
 #[test]
-fn every_case_fits_the_person_types_and_its_record_type() {
-    let catalog = PropertyCatalog::load().expect("the catalog");
+fn every_case_fits_the_profile_schema_and_its_record_type() {
+    let catalog = Catalog::load().expect("the catalog");
     let cases = cases();
     let mut names = BTreeSet::new();
     for case in &cases {
@@ -469,8 +474,8 @@ fn every_case_fits_the_person_types_and_its_record_type() {
         );
         for held in case.profile.iter().chain(&case.gone).chain(&case.holds) {
             let spec = catalog
-                .get(&held.property)
-                .unwrap_or_else(|| panic!("{}: no property {}", case.name, held.property));
+                .kind(&held.property)
+                .unwrap_or_else(|| panic!("{}: no kind {}", case.name, held.property));
             spec.check(&held.value)
                 .unwrap_or_else(|error| panic!("{}: {}: {error}", case.name, held.property));
         }
@@ -499,8 +504,8 @@ fn every_case_fits_the_person_types_and_its_record_type() {
         }
         for property in case.expect.keys() {
             assert!(
-                catalog.get(property).is_some(),
-                "{}: no property {property}",
+                catalog.kind(property).is_some(),
+                "{}: no kind {property}",
                 case.name
             );
         }
@@ -519,9 +524,9 @@ fn every_case_fits_the_person_types_and_its_record_type() {
 #[tokio::test]
 #[ignore = "calls a model: set CONSTRUCT_EVAL_URL, CONSTRUCT_EVAL_MODEL and CONSTRUCT_EVAL_API_KEY"]
 async fn the_planner_meets_the_decision_target() {
-    let catalog = PropertyCatalog::load().expect("the catalog");
+    let catalog = Catalog::load().expect("the catalog");
     let cases = cases();
-    let planner = planner(PropertyCatalog::load().expect("the catalog"));
+    let planner = planner(Catalog::load().expect("the catalog"));
     let ctx = context();
     let mut report = String::new();
     let mut right = 0_usize;

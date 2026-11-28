@@ -1,7 +1,8 @@
 //! A fact's node: its type, payload, origin and record; and a stored node read
 //! back as a fact.
 
-use construct_sdk::gts::{IDENTITY_TYPE, PROFILE_ROOT_TYPE, SKILL_TYPE};
+use construct_sdk::gts::PROFILE_ROOT_TYPE;
+use construct_sdk::linked_schema::SchemaPrefix;
 use graph_storage_sdk::models::{ElementEnvelope, GraphRevision, NodeSpec, NodeView, Subject};
 use proptest::prelude::*;
 use serde_json::{Value, json};
@@ -18,18 +19,28 @@ use crate::test_support::{
     add_entity, add_value, by_a_person, connector_plan, remove_entity, replace_property,
 };
 
+fn project_type() -> String {
+    Category::PROJECT.type_id(&SchemaPrefix::of(Uuid::nil()))
+}
+
 fn now() -> OffsetDateTime {
     OffsetDateTime::parse("2026-10-20T12:00:00Z", &Rfc3339).unwrap()
 }
 
 fn skills() -> Value {
-    json!({ "name": "Rust", "level": "expert" })
+    json!({ "name": "Rust" })
 }
 
 fn node_of(plan: &Plan) -> NodeSpec {
-    fact_node(plan, &plan.steps[0], now())
-        .expect("a fact node")
-        .expect("a step that stores a fact")
+    fact_node(
+        plan,
+        &plan.steps[0],
+        now(),
+        &SchemaPrefix::of(plan.subject_id),
+        None,
+    )
+    .expect("a fact node")
+    .expect("a step that stores a fact")
 }
 
 fn internal(result: Result<Option<NodeSpec>, DomainError>) -> String {
@@ -41,14 +52,17 @@ fn internal(result: Result<Option<NodeSpec>, DomainError>) -> String {
 
 #[test]
 fn a_records_fact_names_the_connector_its_record_and_when_it_was_observed() {
-    let plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+    let plan = connector_plan(vec![add_value("project", "project", skills())]);
 
     let node = node_of(&plan);
 
-    assert_eq!(node.type_id, SKILL_TYPE);
+    assert_eq!(
+        node.type_id,
+        Category::PROJECT.type_id(&SchemaPrefix::of(plan.subject_id))
+    );
     assert_eq!(node.expected_version, Some(0), "claims its new key");
     let payload = node.payload.unwrap();
-    assert_eq!(payload["skills"], skills());
+    assert_eq!(payload["project"], skills());
     assert_eq!(
         payload["origin"]["produced_by"]["subject_id"],
         "connector-a"
@@ -62,7 +76,8 @@ fn a_records_fact_names_the_connector_its_record_and_when_it_was_observed() {
         payload["record"],
         json!({ "connector": "connector-a", "provenance": "chat_engine/thread-42/msg-7", "version": "v1" })
     );
-    assert_eq!(payload.as_object().unwrap().len(), 3);
+    // The fact, its origin, where it was learned and the record.
+    assert_eq!(payload.as_object().unwrap().len(), 4);
 }
 
 #[test]
@@ -75,7 +90,7 @@ fn a_confidence_is_stored_as_the_decimal_the_model_gave() {
         (0.0, json!(0.0)),
         (1.0, json!(1.0)),
     ] {
-        let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+        let mut plan = connector_plan(vec![add_value("project", "project", skills())]);
         plan.steps[0].confidence = Some(given);
 
         let payload = node_of(&plan).payload.unwrap();
@@ -87,10 +102,16 @@ fn a_confidence_is_stored_as_the_decimal_the_model_gave() {
 #[test]
 fn a_confidence_that_is_no_finite_number_is_a_defect() {
     for given in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+        let mut plan = connector_plan(vec![add_value("project", "project", skills())]);
         plan.steps[0].confidence = Some(given);
 
-        let message = internal(fact_node(&plan, &plan.steps[0], now()));
+        let message = internal(fact_node(
+            &plan,
+            &plan.steps[0],
+            now(),
+            &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+            None,
+        ));
 
         assert!(message.contains("confidence"), "{given}: {message}");
     }
@@ -99,7 +120,7 @@ fn a_confidence_that_is_no_finite_number_is_a_defect() {
 #[test]
 fn an_agents_fact_names_the_subject_and_the_agent_as_model() {
     let agent = Uuid::new_v4();
-    let mut plan = connector_plan(vec![add_value("identity", "full_name", json!("Ada"))]);
+    let mut plan = connector_plan(vec![add_value("me", "me", json!({ "name": "Ada" }))]);
     plan.origin = Origin::Agent { agent };
 
     let payload = node_of(&plan).payload.unwrap();
@@ -127,13 +148,16 @@ fn a_persons_fact_names_the_person_and_a_step_without_confidence_stores_none() {
         ),
     ] {
         let plan = by_a_person(
-            connector_plan(vec![add_value("identity", "full_name", json!("Ada"))]),
+            connector_plan(vec![add_value("me", "me", json!({ "name": "Ada" }))]),
             origin,
         );
 
         let node = node_of(&plan);
 
-        assert_eq!(node.type_id, IDENTITY_TYPE);
+        assert_eq!(
+            node.type_id,
+            Category::ME.type_id(&SchemaPrefix::of(plan.subject_id))
+        );
         let payload = node.payload.unwrap();
         assert_eq!(
             payload["origin"]["produced_by"]["subject_id"],
@@ -141,49 +165,79 @@ fn a_persons_fact_names_the_person_and_a_step_without_confidence_stores_none() {
         );
         assert_eq!(payload["origin"]["method"], method);
         assert!(payload["origin"].get("confidence").is_none());
-        assert_eq!(payload.as_object().unwrap().len(), 2);
+        // The fact, its origin and where it was learned.
+        assert_eq!(payload.as_object().unwrap().len(), 3);
     }
 }
 
 #[test]
 fn a_removal_stores_no_node() {
-    let plan = connector_plan(vec![remove_entity("skill")]);
+    let plan = connector_plan(vec![remove_entity("project")]);
 
-    assert!(fact_node(&plan, &plan.steps[0], now()).unwrap().is_none());
+    assert!(
+        fact_node(
+            &plan,
+            &plan.steps[0],
+            now(),
+            &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+            None
+        )
+        .unwrap()
+        .is_none()
+    );
 }
 
 #[test]
 fn a_step_of_no_known_category_is_a_defect() {
     let plan = connector_plan(vec![add_value("hobby", "chess", json!("yes"))]);
 
-    let message = internal(fact_node(&plan, &plan.steps[0], now()));
+    let message = internal(fact_node(
+        &plan,
+        &plan.steps[0],
+        now(),
+        &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+        None,
+    ));
 
     assert!(message.contains("hobby"), "{message}");
 }
 
 #[test]
 fn a_fact_must_hold_exactly_one_property() {
-    let two = connector_plan(vec![add_entity("skill", &[("a", "1"), ("b", "2")])]);
+    let two = connector_plan(vec![add_entity("project", &[("a", "1"), ("b", "2")])]);
     let none = connector_plan(vec![Step {
-        entity_kind: "skill".to_owned(),
+        entity_kind: "project".to_owned(),
         change: Change::AddEntity {
             key: NodeKey("k".to_owned()),
+            owner: None,
             properties: Vec::new(),
         },
         confidence: Some(0.9),
     }]);
 
     for plan in [two, none] {
-        internal(fact_node(&plan, &plan.steps[0], now()));
+        internal(fact_node(
+            &plan,
+            &plan.steps[0],
+            now(),
+            &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+            None,
+        ));
     }
 }
 
 #[test]
 fn a_fact_property_named_as_the_envelope_is_a_defect() {
     for name in ["origin", "record"] {
-        let plan = connector_plan(vec![add_value("skill", name, skills())]);
+        let plan = connector_plan(vec![add_value("project", name, skills())]);
 
-        let message = internal(fact_node(&plan, &plan.steps[0], now()));
+        let message = internal(fact_node(
+            &plan,
+            &plan.steps[0],
+            now(),
+            &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+            None,
+        ));
 
         assert!(message.contains(name), "{message}");
     }
@@ -192,7 +246,7 @@ fn a_fact_property_named_as_the_envelope_is_a_defect() {
 #[test]
 fn a_property_change_is_refused_without_its_value_in_the_message() {
     let entity = NodeKey("construct:t:fact".to_owned());
-    let secret = Property::new("skills", json!("a secret value"));
+    let secret = Property::new("project", json!("a secret value"));
     for (change, kind) in [
         (
             Change::AddProperty {
@@ -211,15 +265,25 @@ fn a_property_change_is_refused_without_its_value_in_the_message() {
         (
             Change::RemoveProperty {
                 entity,
-                name: "skills".to_owned(),
+                name: "project".to_owned(),
             },
             "remove-property",
         ),
     ] {
-        let mut plan = connector_plan(vec![replace_property("skill", "skills", "a secret value")]);
+        let mut plan = connector_plan(vec![replace_property(
+            "project",
+            "project",
+            "a secret value",
+        )]);
         plan.steps[0].change = change;
 
-        let message = internal(fact_node(&plan, &plan.steps[0], now()));
+        let message = internal(fact_node(
+            &plan,
+            &plan.steps[0],
+            now(),
+            &construct_sdk::linked_schema::SchemaPrefix::of(plan.subject_id),
+            None,
+        ));
 
         assert!(message.contains(kind), "{message}");
         assert!(
@@ -265,13 +329,13 @@ pub(super) fn view(type_id: &str, payload: Option<Value>) -> NodeView {
 #[test]
 fn a_stored_fact_reads_back_as_its_property_and_value() {
     let fact = fact_of(&view(
-        SKILL_TYPE,
-        Some(json!({ "skills": skills(), "origin": {}, "record": {} })),
+        &project_type(),
+        Some(json!({ "project": skills(), "origin": {}, "record": {} })),
     ))
     .expect("a fact");
 
-    assert_eq!(fact.category, Category::Skill);
-    assert_eq!(fact.property, "skills");
+    assert_eq!(fact.category, Category::PROJECT);
+    assert_eq!(fact.property, "project");
     assert_eq!(fact.value, skills());
     assert_eq!(fact.node_key.0, "construct:t:fact");
 }
@@ -279,21 +343,21 @@ fn a_stored_fact_reads_back_as_its_property_and_value() {
 #[test]
 fn a_fact_node_that_holds_no_single_fact_is_a_defect_named_by_its_key() {
     for (type_id, payload, what) in [
-        (SKILL_TYPE, None, "has no payload"),
+        (&project_type(), None, "has no payload"),
         (
-            SKILL_TYPE,
+            &project_type(),
             Some(json!({ "origin": {}, "record": {} })),
             "exactly one fact property",
         ),
         (
-            SKILL_TYPE,
-            Some(json!({ "skills": skills(), "other": "a secret value", "origin": {} })),
+            &project_type(),
+            Some(json!({ "project": skills(), "other": "a secret value", "origin": {} })),
             "exactly one fact property",
         ),
         (
-            PROFILE_ROOT_TYPE,
+            &PROFILE_ROOT_TYPE.to_owned(),
             Some(json!({ "removals": [] })),
-            "no person type",
+            "no node kind",
         ),
     ] {
         match fact_of(&view(type_id, payload)) {
@@ -309,7 +373,7 @@ fn a_fact_node_that_holds_no_single_fact_is_a_defect_named_by_its_key() {
 
 #[test]
 fn a_records_time_is_stored_in_utc() {
-    let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+    let mut plan = connector_plan(vec![add_value("project", "project", skills())]);
     let Origin::Connector { observed_at, .. } = &mut plan.origin else {
         panic!("a record's plan");
     };
@@ -327,7 +391,7 @@ proptest! {
     /// the same `f32`.
     #[test]
     fn a_confidence_reads_back_as_the_value_given(given in 0.0_f32..=1.0) {
-        let mut plan = connector_plan(vec![add_value("skill", "skills", skills())]);
+        let mut plan = connector_plan(vec![add_value("project", "project", skills())]);
         plan.steps[0].confidence = Some(given);
 
         let payload = node_of(&plan).payload.unwrap();
@@ -342,7 +406,7 @@ proptest! {
     /// same category, property and value.
     #[test]
     fn a_stored_fact_reads_back_as_written(
-        category in prop::sample::select(Category::ALL.to_vec()),
+        category in prop::sample::select(Category::all()),
         property in "[a-z_]{1,16}".prop_filter("no envelope member", |name| {
             name != "origin" && name != "record"
         }),
@@ -374,25 +438,30 @@ proptest! {
 
 #[test]
 fn a_stored_node_that_breaks_the_fact_shape_is_reported_with_its_key() {
-    let skill = |payload: Value| view(SKILL_TYPE, Some(payload));
+    let skill = |payload: Value| view(&project_type(), Some(payload));
     for (what, node) in [
         (
             "of no person type",
             view(PROFILE_ROOT_TYPE, Some(json!({}))),
         ),
-        ("without a payload", view(SKILL_TYPE, None)),
-        ("with a payload that is no object", skill(json!(["skills"]))),
+        ("without a payload", view(&project_type(), None)),
+        (
+            "with a payload that is no object",
+            skill(json!(["project"])),
+        ),
         (
             "without a fact property",
             skill(json!({ "origin": { "method": "admin.edit" } })),
         ),
         (
             "with two fact properties",
-            skill(json!({ "skills": skills(), "name": "x", "origin": { "method": "admin.edit" } })),
+            skill(
+                json!({ "project": skills(), "name": "x", "origin": { "method": "admin.edit" } }),
+            ),
         ),
         (
             "with an origin of no known source",
-            skill(json!({ "skills": skills(), "origin": { "method": "somewhere.else" } })),
+            skill(json!({ "project": skills(), "origin": { "method": "somewhere.else" } })),
         ),
     ] {
         let result = stored_fact_of(&node);
@@ -409,9 +478,9 @@ fn a_stored_node_that_breaks_the_fact_shape_is_reported_with_its_key() {
 #[test]
 fn a_produced_at_that_does_not_parse_is_served_as_absent_and_logged() {
     let node = view(
-        SKILL_TYPE,
+        &project_type(),
         Some(json!({
-            "skills": skills(),
+            "project": skills(),
             "origin": { "method": "admin.edit", "produced_at": "yesterday" },
         })),
     );
@@ -429,9 +498,9 @@ fn a_produced_at_that_does_not_parse_is_served_as_absent_and_logged() {
 #[test]
 fn a_produced_at_that_is_not_a_string_is_served_as_absent_and_logged() {
     let node = view(
-        SKILL_TYPE,
+        &project_type(),
         Some(json!({
-            "skills": skills(),
+            "project": skills(),
             "origin": { "method": "admin.edit", "produced_at": 1_700_000_000 },
         })),
     );

@@ -12,8 +12,8 @@ use super::agent::{AgentMessage, Planner};
 use crate::domain::admission::{Admission, AdmissionOutcome};
 use crate::domain::deletion::ProfileGenerations;
 use crate::domain::error::DomainError;
-use crate::domain::plan::{Change, Plan};
-use crate::domain::profile::Profile;
+use crate::domain::plan::{Change, NodeKey, Plan};
+use crate::domain::profile::{Profile, owned_by, ownership};
 use crate::domain::profile_writes::{WRITE_BUDGET, WRITER_LIMIT};
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
@@ -183,15 +183,19 @@ impl Changes {
         plan.steps
             .iter()
             .fold(Self::default(), |changes, step| match step.change {
-                Change::AddEntity { .. } | Change::AddProperty { .. } => Self {
-                    added: changes.added + 1,
-                    ..changes
-                },
+                Change::AddEntity { .. } | Change::AddProperty { .. } | Change::AddLink { .. } => {
+                    Self {
+                        added: changes.added + 1,
+                        ..changes
+                    }
+                }
                 Change::ReplaceEntity { .. } | Change::ReplaceProperty { .. } => Self {
                     replaced: changes.replaced + 1,
                     ..changes
                 },
-                Change::RemoveEntity { .. } | Change::RemoveProperty { .. } => Self {
+                Change::RemoveEntity { .. }
+                | Change::RemoveProperty { .. }
+                | Change::RemoveLink { .. } => Self {
                     removed: changes.removed + 1,
                     ..changes
                 },
@@ -327,6 +331,7 @@ impl Processing {
             .read(ctx, record.tenant_id, subject_id)
             .await
             .map_err(|_| Failure::ProfileRead)?;
+        let owners = ownership(&profile.facts);
         let Some(mut plan) = self.planner.plan(ctx, record, profile).await else {
             return Ok(Run::Done);
         };
@@ -336,7 +341,7 @@ impl Processing {
         if plan.steps.is_empty() {
             return Ok(Run::Done);
         }
-        self.skip_under_review(scope, &mut plan)
+        self.skip_under_review(scope, &mut plan, &owners)
             .await
             .map_err(|err| {
                 tracing::warn!(
@@ -449,6 +454,7 @@ impl Processing {
             .profiles
             .read(ctx, message.tenant_id, message.subject_id)
             .await?;
+        let owners = ownership(&profile.facts);
         let mut plan = match self.planner.plan_message(ctx, message, profile).await {
             Ok(plan) => plan,
             Err(reason) => return Ok(Prepared::Nothing(NothingStored::Dropped(reason))),
@@ -460,7 +466,8 @@ impl Processing {
         // the agent's scope a request the scope does not reach would not
         // freeze its fact.
         let (_, construct) = self.ports.contexts.for_tenant(message.tenant_id).await?;
-        self.skip_under_review(&construct, &mut plan).await?;
+        self.skip_under_review(&construct, &mut plan, &owners)
+            .await?;
         if plan.steps.is_empty() {
             return Ok(Prepared::Nothing(NothingStored::UnderReview));
         }
@@ -522,7 +529,8 @@ impl Processing {
     }
 
     /// Drops every step of `plan` that would change or remove a fact under an
-    /// open review request, or add a property to it. The planner still sees
+    /// open review request, remove a node that owns one (a removal takes what
+    /// the node owns with it), or add a property to it. The planner still sees
     /// the fact, so the model does not add it again. `construct` is
     /// Construct's own scope in the plan's tenant.
     ///
@@ -538,6 +546,7 @@ impl Processing {
         &self,
         construct: &AccessScope,
         plan: &mut Plan,
+        owners: &[(NodeKey, NodeKey)],
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-skip:p1:inst-skip-drop
         let under_review = self
@@ -556,9 +565,19 @@ impl Processing {
         }
         let planned = plan.steps.len();
         plan.steps.retain(|step| {
-            step.change
+            let own = step
+                .change
                 .touches()
-                .is_none_or(|entity| !under_review.contains(entity))
+                .is_none_or(|entity| !under_review.contains(entity));
+            // A removal takes the nodes the node owns with it, so one that would take a node under review is
+            // dropped too.
+            let below = match &step.change {
+                Change::RemoveEntity { entity } => owned_by(owners, entity)
+                    .iter()
+                    .any(|owned| under_review.contains(owned)),
+                _ => false,
+            };
+            own && !below
         });
         let dropped = planned - plan.steps.len();
         if dropped > 0 {
