@@ -36,7 +36,7 @@ Authorization: Bearer <tenant-token>
 | `q=a%26b%3Dc` | an escaped `&` and `=` stay escaped |
 | ``q=a\|b{c}[d]\e^f`g&n=%C3%A9&n=é&bad=%zz`` | characters the gateway used to escape (`\|`, `{`, `}`, `[`, `]`, `\`, `^`, backtick), raw UTF-8 bytes and a malformed escape stay as sent |
 
-A literal `;` is not forwarded as sent: see Scenario D.
+A literal `;` may not be forwarded as sent: see Scenario D.
 
 ### Expected behavior
 
@@ -60,26 +60,28 @@ Because names are decoded, allowlisting `my key` also admits `my+key`, which an 
 
 ## Scenario C: a transform that changes the query
 
-A transform plugin sees the decoded pairs. When it changes them (adds, removes or edits a pair), the upstream gets the pairs form-encoded: `q=a%20b` plus an added `added=1` goes out as `q=a+b&added=1`. A transform that leaves the pairs as they were keeps the client's bytes.
+A transform plugin sees the decoded pairs. When it changes them (adds, removes or edits a pair), the upstream gets the pairs form-encoded: `q=a%20b` plus an added `added=1` goes out as `q=a+b&added=1`. A transform that leaves the pairs as they were keeps the client's bytes, except that a query with a literal `;` is re-encoded when any transform is bound.
 
 Every pair is encoded again from its decoded form, the ones the transform left alone too: they lose their original encoding, and an invalid escape such as `%FF` decodes to U+FFFD and goes out as `%EF%BF%BD`.
 
 Rust test only: no built-in transform plugin changes the query, and the e2e suite cannot register one.
 
-## Scenario D: a literal `;` goes out encoded
+## Scenario D: a literal `;` that hides an unchecked name goes out encoded
 
-The allowlist splits pairs on `&` only, so `model=x;admin=1` is the one parameter `model` with the value `x;admin=1`. Rack 2, older Python `parse_qs` and older Go `net/url` also split on `;` and would read an `admin` the allowlist never checked. A query with a literal `;` that the allowlist admits is therefore sent as its decoded pairs, form-encoded, as in Scenario C. The request is not rejected.
+The allowlist splits pairs on `&` only, so `model=x;admin=1` is the one parameter `model` with the value `x;admin=1`. Rack 2, older Python `parse_qs` and older Go `net/url` also split on `;` and would read an `admin` the allowlist never checked. When splitting the query on `;` as well as `&` yields a name the allowlist does not admit, the query is sent as its decoded pairs, form-encoded, as in Scenario C. The request is not rejected. When every name from that split is admitted and no transform is bound, the query is forwarded as sent. Tokens after a `;` inside a value count as names: a presigned URL with `X-Amz-SignedHeaders=host;x-amz-date` is re-encoded unless `x-amz-date` is allowlisted. AWS SDKs build presigned URLs with `%3B` (`host%3Bx-amz-date`), which passes unchanged. With a transform bound, any literal `;` is re-encoded.
 
-Route with `"query_allowlist": ["model"]`:
+Route with `"query_allowlist": ["model", "page"]`:
 
 | Query | Result |
 |---|---|
 | `model=x;admin=1` | `200`; the upstream gets `model=x%3Badmin%3D1` |
 | `model=x%3Badmin%3D1` | `200`; no literal `;`, the upstream gets the query as sent |
+| `model=x;page=2` | `200`; `model` and `page` are both admitted, the upstream gets the query as sent |
+| `model=x;page=2;` | `200`; the trailing `;` adds no name, the upstream gets the query as sent |
 
 Route with `"query_allowlist": []`: `model=x;admin=1` is `400` `QUERY_NOT_ALLOWED`, `X-OAGW-Error-Source: gateway`, not forwarded. An empty allowlist admits no parameter, so a query with a `;` is never forwarded as sent.
 
 ## What to check
 
-- The query is never decoded and re-encoded on its way through, unless a transform changed it or it has a literal `;`.
+- The query is never decoded and re-encoded on its way through, unless a transform changed it, splitting on `;` as well as `&` yields a name the allowlist does not admit, or a transform is bound and the query has a literal `;`.
 - The auth plugin's signing phase ([ADR-0023](../../../docs/ADR/0023-request-signing.md)) sees the query that will be sent: the client's bytes when nothing changed it, the form-encoded pairs otherwise (Rust tests).

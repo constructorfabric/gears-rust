@@ -239,7 +239,7 @@ Call your external service through OAGW's proxy endpoint: `{METHOD} /api/oagw/v1
 
 #### Query forwarded as sent
 - **Scenario**: [positive-7.8-raw-query-forwarded-as-sent.md](proxy-api/request-transforms/positive-7.8-raw-query-forwarded-as-sent.md)
-- **Mechanism**: The upstream gets the client's query byte for byte: `%2B` vs `+`, `%20`, unescaped reserved characters, characters the gateway used to escape, raw UTF-8 bytes, repeated keys, empty values, keys without `=`, escape case and order. The allowlist checks the names decoded as `application/x-www-form-urlencoded` (`my%20key` and `my+key` are `my key`). A transform that changes the pairs, or a literal `;` (which the allowlist does not split on and some upstreams do), makes the gateway form-encode them again.
+- **Mechanism**: The upstream gets the client's query byte for byte: `%2B` vs `+`, `%20`, unescaped reserved characters, characters the gateway used to escape, raw UTF-8 bytes, repeated keys, empty values, keys without `=`, escape case and order. The allowlist checks the names decoded as `application/x-www-form-urlencoded` (`my%20key` and `my+key` are `my key`). A transform that changes the pairs, or a literal `;` such that splitting on `;` as well as `&` yields a name the allowlist does not admit (the allowlist does not split on `;`, some upstreams do), or a literal `;` while a transform is bound, makes the gateway form-encode them again.
 
 ---
 

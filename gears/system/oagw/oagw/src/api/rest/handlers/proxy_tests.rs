@@ -178,8 +178,8 @@ mod addressing {
     /// `%20`, reserved characters left unescaped, repeated keys, empty
     /// values, keys without `=`, the case of escapes and the order. Before,
     /// the query was decoded and re-encoded, which changed all of these.
-    /// A literal `;` is not among them: see
-    /// `a_literal_semicolon_is_sent_encoded`.
+    /// A literal `;` is the exception when it makes a name the allowlist does
+    /// not admit: see `a_literal_semicolon_is_sent_encoded_unless_its_keys_are_admitted`.
     #[tokio::test]
     async fn query_is_forwarded_as_sent() {
         let h = AppHarness::builder().build().await;
@@ -277,11 +277,12 @@ mod addressing {
 
     /// The allowlist splits the query on `&` only, so `model=x;admin=1` is
     /// one parameter, `model`. An upstream that also splits on `;` would
-    /// read an `admin` nobody checked, so a query with a literal `;` goes
-    /// out form-encoded: the `;` as `%3B`. An escaped `;` is sent as is, and
-    /// a route whose allowlist is empty admits no parameter at all.
+    /// read an `admin` nobody checked, so such a query goes out
+    /// form-encoded: the `;` as `%3B`. When the `;` split yields only
+    /// admitted keys, the query is sent as is, as is an escaped `;`. A route
+    /// whose allowlist is empty admits no parameter at all.
     #[tokio::test]
-    async fn a_literal_semicolon_is_sent_encoded() {
+    async fn a_literal_semicolon_is_sent_encoded_unless_its_keys_are_admitted() {
         let h = AppHarness::builder().build().await;
         let mut guard = MockGuard::new();
         guard.mock("GET", "/semi", ok_text("ok"));
@@ -290,10 +291,14 @@ mod addressing {
         let id = upstream(&h, &alias, h.mock_port(), None).await;
         let semi = guard.path("/semi");
         let open = guard.path("/open");
-        route(&h, &id, &["GET"], &semi, &["model"]).await;
+        route(&h, &id, &["GET"], &semi, &["model", "page"]).await;
         route(&h, &id, &["GET"], &open, &[]).await;
 
-        for query in ["model=x;admin=1", "model=x%3Badmin%3D1&model=a%20b"] {
+        for query in [
+            "model=x;admin=1",
+            "model=x%3Badmin%3D1&model=a%20b",
+            "model=x;page=a%20b;",
+        ] {
             send(&h, Method::GET, &format!("{alias}{semi}?{query}"), &[])
                 .await
                 .assert_status(200);
@@ -303,6 +308,7 @@ mod addressing {
             [
                 format!("{semi}?model=x%3Badmin%3D1"),
                 format!("{semi}?model=x%3Badmin%3D1&model=a%20b"),
+                format!("{semi}?model=x;page=a%20b;"),
             ]
         );
 
@@ -315,7 +321,7 @@ mod addressing {
         .await;
         resp.assert_status(400);
         resp.assert_body_contains(oagw_sdk::field::QUERY_NOT_ALLOWED);
-        assert_eq!(guard.recorded_requests().await.len(), 2);
+        assert_eq!(guard.recorded_requests().await.len(), 3);
     }
 
     /// Adds `added=1` when its binding config has `add`; otherwise leaves
@@ -343,7 +349,13 @@ mod addressing {
         let mut guard = MockGuard::new();
         guard.mock("GET", "/t", ok_text("ok"));
         let path = guard.path("/t");
-        for (name, config) in [("keep", json!({})), ("add", json!({"add": "1"}))] {
+        for (name, config, query) in [
+            ("keep", json!({}), "q=a%20b&q=a%2Bb"),
+            ("add", json!({"add": "1"}), "q=a%20b&q=a%2Bb"),
+            // A bound transform re-encodes a literal `;` even when it
+            // leaves the query alone.
+            ("semi", json!({}), "q=a;q=b"),
+        ] {
             let alias = unique_alias(name);
             let plugins = json!({"items": [{
                 "plugin_ref": REQUEST_ID_TRANSFORM_PLUGIN_ID,
@@ -351,20 +363,16 @@ mod addressing {
             }]});
             let id = upstream(&h, &alias, h.mock_port(), Some(plugins)).await;
             route(&h, &id, &["GET"], &path, &["q"]).await;
-            send(
-                &h,
-                Method::GET,
-                &format!("{alias}{path}?q=a%20b&q=a%2Bb"),
-                &[],
-            )
-            .await
-            .assert_status(200);
+            send(&h, Method::GET, &format!("{alias}{path}?{query}"), &[])
+                .await
+                .assert_status(200);
         }
         assert_eq!(
             uris(&guard.recorded_requests().await),
             [
                 format!("{path}?q=a%20b&q=a%2Bb"),
                 format!("{path}?q=a+b&q=a%2Bb&added=1"),
+                format!("{path}?q=a%3Bq%3Db"),
             ]
         );
     }

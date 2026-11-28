@@ -506,8 +506,8 @@ async fn signed_request_verifies_at_the_upstream() {
 /// Without a transform the gateway forwards the client's raw query, and the
 /// signer rewrites what it sends: `+` read as a space, `%2B` kept, `%7E` as
 /// the unreserved `~`, `*` as `%2A`, the order kept. A query with a literal
-/// `;`, which the gateway re-encodes (`%3B`), is signed as re-encoded. Each request
-/// verifies at the upstream.
+/// `;` that yields an unadmitted name (`admin`) is re-encoded (`%3B`) and
+/// signed as re-encoded. Each request verifies at the upstream.
 #[tokio::test]
 async fn raw_query_is_signed_as_sent() {
     const RAW: &str = "/v1/raw";
@@ -570,7 +570,7 @@ async fn raw_query_is_signed_as_sent() {
         assert_eq!(resp.status(), StatusCode::OK, "{query}");
     }
     let rec = guard.recorded_requests().await;
-    assert_eq!(rec.len(), 2);
+    assert_eq!(rec.len(), CASES.len());
     for (r, (_, sent)) in rec.iter().zip(CASES) {
         assert_eq!(r.uri, format!("{}?{sent}", guard.path(RAW)));
         verify(r, SECRET).unwrap();

@@ -37,7 +37,7 @@ date: 2026-11-19
 
 Some upstreams accept only signed requests. AWS services, for example, require [Signature Version 4](https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv.html): the signature covers the method, path, query, selected headers, a hash of the body and the time. Any change to these after signing makes the upstream reject the request ([#5842](https://github.com/constructorfabric/gears-rust/issues/5842)).
 
-[ADR-0003](./0003-plugin-system.md#execution-order) runs the auth plugin once, before guards. In the [Data Plane](../../oagw/src/infra/proxy/service.rs), several steps change the request after that: header rules, transform plugins (headers and query), endpoint selection, the `Host` header, `request_ref` key injection ([ADR-0022](./0022-request-secret-refs.md)) and the URL build, which form-encodes the query again when a transform changed it or it has a literal `;`. `AuthPlugin::authenticate` also does not see the request: it only lists headers to set. A plugin therefore has no place where it can see and sign the request as it is sent.
+[ADR-0003](./0003-plugin-system.md#execution-order) runs the auth plugin once, before guards. In the [Data Plane](../../oagw/src/infra/proxy/service.rs), several steps change the request after that: header rules, transform plugins (headers and query), endpoint selection, the `Host` header, `request_ref` key injection ([ADR-0022](./0022-request-secret-refs.md)) and the URL build, which form-encodes the query again when a transform changed it or splitting it on `;` as well as `&` yields a name the allowlist does not admit (or a transform is bound and it has a literal `;`). `AuthPlugin::authenticate` also does not see the request: it only lists headers to set. A plugin therefore has no place where it can see and sign the request as it is sent.
 
 Separately, the `allowlist` passthrough mode forwarded only the first line of a repeated header, so the outbound request lost values the client sent.
 
@@ -135,7 +135,7 @@ The plugin gets the same `config` and security context as `authenticate`. Header
 
 ### What the plugin sees
 
-- **URL**: scheme, endpoint host and port, the path and the query exactly as they go on the request line. The query is the client's, byte for byte, or the form-encoded pairs when a transform changed them or the query has a literal `;`.
+- **URL**: scheme, endpoint host and port, the path and the query exactly as they go on the request line. The query is the client's, byte for byte, or the form-encoded pairs when a transform changed them or splitting the query on `;` as well as `&` yields a name the allowlist does not admit, or a transform is bound and the query has a literal `;`.
 - **Headers**: every line the request is sent with, names in lowercase. A repeated name keeps all its lines, in the order they are sent; order across names has no meaning in HTTP and is not kept. The view includes `Host`, with the port unless it is the scheme's default, the headers `authenticate` set, and, for a WebSocket handshake, `Connection`, `Upgrade` and `Sec-WebSocket-*`.
 - **Body**: the buffered bytes, or `Streamed` for a body streamed from an in-process SDK caller. REST callers are always buffered. A WebSocket handshake has an empty body.
 
