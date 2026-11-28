@@ -537,8 +537,25 @@ pub fn service_with_deadline(
     policy_enforcer: PolicyEnforcer,
     sync_deadline: std::time::Duration,
 ) -> Arc<ConcreteService> {
+    Arc::new(build_service(
+        db,
+        api_base_url,
+        github,
+        policy_enforcer,
+        sync_deadline,
+    ))
+}
+
+/// The service before it is shared, for a test that adds to it.
+pub fn build_service(
+    db: Db,
+    api_base_url: &str,
+    github: Arc<dyn GithubPort>,
+    policy_enforcer: PolicyEnforcer,
+    sync_deadline: std::time::Duration,
+) -> Service {
     let db = Arc::new(DBProvider::new(db));
-    Arc::new(Service::new(
+    Service::new(
         Arc::clone(&db),
         Arc::new(SeaOrmRepoRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmIssueRepository::new(Arc::clone(&db))),
@@ -591,7 +608,7 @@ pub fn service_with_deadline(
             github_mirror::infra::telemetry_sink::JsonlTelemetrySink::start()
                 .expect("telemetry writer starts"),
         ),
-    ))
+    )
 }
 
 pub fn service_over(db: Db, api_base_url: &str) -> Arc<ConcreteService> {

@@ -84,9 +84,26 @@ GitHub's anonymous rate limit).
 
 `github_token_secret` names a secret in the credential store (`credstore` gear): the
 gear reads it on its first request to GitHub, so a replaced token takes effect after a restart. It is a
-single gear-wide credential: every tenant's sync authenticates to GitHub with it, so
-don't point one deployment's token at repositories whose visibility should differ per
-tenant.
+gear-wide credential: every sync that names no credential of its own authenticates to
+GitHub with it, so don't point one deployment's token at repositories whose visibility
+should differ per tenant.
+
+A sync can name its own credential instead: `credential_key` (and optionally
+`credential_tenant_id`, which must be the caller's tenant) on
+`POST /github-mirror/v1/repos/{owner}/{name}/sync`, or
+`GithubMirrorClientV1::sync_repository_with(ctx, owner, name, SyncOptions { credential })`
+in process. The secret is read from the credential store as the caller, the sync never
+falls back to another token, and a repository the credential read stays bound to it:
+later syncs and resumes that name no credential keep using it.
+
+```yaml
+      # GitHub clients kept for named credentials, one per token (default 64).
+      max_credential_clients: 64
+      # Leave out every REST route (`/github-mirror/v1/*` and the GitHub-compatible
+      # `/repos/*`, `/user*`); the gear is then reached only through the SDK.
+      rest:
+        enabled: false
+```
 
 ## Documentation
 

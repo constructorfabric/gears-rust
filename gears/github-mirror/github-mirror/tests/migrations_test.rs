@@ -221,3 +221,29 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_credential_binding_columns_come_and_go_with_their_migration() {
+    let conn = Database::connect("sqlite::memory:")
+        .await
+        .expect("in-memory database must connect");
+    Migrator::up(&conn, None).await.expect("up must succeed");
+    let manager = SchemaManager::new(&conn);
+
+    for table in ["gm_repo_sync_status", "gm_active_syncs"] {
+        assert!(
+            manager.has_column(table, "credential_key").await.unwrap(),
+            "{table}.credential_key must exist after up()"
+        );
+    }
+
+    Migrator::down(&conn, Some(1))
+        .await
+        .expect("the last migration must roll back");
+    for table in ["gm_repo_sync_status", "gm_active_syncs"] {
+        assert!(
+            !manager.has_column(table, "credential_key").await.unwrap(),
+            "{table}.credential_key must be gone after m0003's down()"
+        );
+    }
+}

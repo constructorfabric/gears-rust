@@ -5879,6 +5879,7 @@ fn repo_sync_status_active_model(
         status: ActiveValue::Set(r.status.as_str().to_owned()),
         last_session_id: ActiveValue::Set(r.last_session_id),
         last_synced_at: ActiveValue::Set(r.last_synced_at.clone()),
+        credential_key: ActiveValue::Set(r.credential_key.clone()),
     }
 }
 
@@ -5892,6 +5893,7 @@ impl TryFrom<repo_sync_status::Model> for RepoSyncStatusRecord {
             status: parse_stored("repository run status", &m.status)?,
             last_session_id: m.last_session_id,
             last_synced_at: m.last_synced_at,
+            credential_key: m.credential_key,
         })
     }
 }
@@ -5914,6 +5916,7 @@ impl RepoSyncStatusRepository for SeaOrmRepoSyncStatusRepository {
             repo_sync_status::Column::Status,
             repo_sync_status::Column::LastSessionId,
             repo_sync_status::Column::LastSyncedAt,
+            repo_sync_status::Column::CredentialKey,
         ])
         .map_err(map_scope_error)?;
 
@@ -5979,6 +5982,30 @@ impl RepoSyncStatusRepository for SeaOrmRepoSyncStatusRepository {
         }
         let result = update.exec(&conn).await.map_err(map_scope_error)?;
         Ok(result.rows_affected > 0)
+    }
+
+    async fn bind_credential(
+        &self,
+        scope: &AccessScope,
+        repo_full_name: &str,
+        credential_key: Option<&str>,
+    ) -> Result<(), DomainError> {
+        let conn = self.db.conn()?;
+        RepoSyncStatusEntity::update_many()
+            .secure()
+            .scope_with(scope)
+            .filter(
+                sea_orm::Condition::all()
+                    .add(repo_sync_status::Column::RepoFullName.eq(repo_full_name)),
+            )
+            .col_expr(
+                repo_sync_status::Column::CredentialKey,
+                Expr::value(credential_key.map(ToOwned::to_owned)),
+            )
+            .exec(&conn)
+            .await
+            .map_err(map_scope_error)?;
+        Ok(())
     }
 
     async fn list(
@@ -6295,6 +6322,7 @@ fn active_sync_model(
         owner_id: ActiveValue::Set(r.owner_id),
         scope_json: ActiveValue::Set(stored_scope_json(r)?),
         since: ActiveValue::Set(r.since.map(|at| at.to_rfc3339())),
+        credential_key: ActiveValue::Set(r.credential_key.clone()),
         updated_at: ActiveValue::Set(r.updated_at.clone()),
     })
 }
@@ -6323,6 +6351,7 @@ impl TryFrom<active_syncs::Model> for ActiveSyncRecord {
             owner_id: m.owner_id,
             scope,
             since,
+            credential_key: m.credential_key,
             updated_at: m.updated_at,
         })
     }
@@ -6409,6 +6438,10 @@ impl ActiveSyncRepository for SeaOrmActiveSyncRepository {
             .col_expr(
                 active_syncs::Column::Since,
                 Expr::value(record.since.map(|at| at.to_rfc3339())),
+            )
+            .col_expr(
+                active_syncs::Column::CredentialKey,
+                Expr::value(record.credential_key.clone()),
             )
             .col_expr(
                 active_syncs::Column::UpdatedAt,

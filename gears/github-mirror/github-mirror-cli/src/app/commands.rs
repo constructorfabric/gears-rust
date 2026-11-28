@@ -130,6 +130,7 @@ pub fn sync_request(service: &Service, flags: &SyncFlags<'_>) -> Result<SyncRequ
         force: flags.force,
         since: flags.since.map(parse_since).transpose()?,
         max_concurrent_tasks: flags.max_concurrent,
+        credential: None,
     })
 }
 

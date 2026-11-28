@@ -24,6 +24,7 @@ use crate::domain::repo::{
     IssueState, ListingDirection, ListingFilter, ListingSort, PageWindow, RepoRunStatus,
 };
 use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
+use crate::domain::service::{CredentialRef, SyncRequest};
 use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 
 use super::dto::{
@@ -76,6 +77,13 @@ pub struct SyncQuery {
     /// RFC3339 instant; closed issues and pull requests older than this are
     /// not collected.
     pub since: Option<String>,
+    /// Credential-store key of the GitHub token this sync reads with
+    /// (gears-rust#5970). Omit to keep the credential the repository is
+    /// bound to, or the gear-wide token.
+    pub credential_key: Option<String>,
+    /// Tenant of `credential_key`; defaults to the caller's own, and no
+    /// other is accepted.
+    pub credential_tenant_id: Option<uuid::Uuid>,
 }
 
 impl SyncQuery {
@@ -106,6 +114,24 @@ impl SyncQuery {
             scope.collection.timeline = CollectionMode::parse(mode)?;
         }
         Ok(Some(scope))
+    }
+
+    /// The credential this request names.
+    ///
+    /// # Errors
+    /// `Validation` when a tenant is given without a key.
+    fn credential(&self, ctx: &SecurityContext) -> Result<Option<CredentialRef>, DomainError> {
+        match (&self.credential_key, self.credential_tenant_id) {
+            (Some(key), tenant_id) => Ok(Some(CredentialRef {
+                tenant_id: tenant_id.unwrap_or_else(|| ctx.subject_tenant_id()),
+                key: key.clone(),
+            })),
+            (None, Some(_)) => Err(DomainError::Validation {
+                field: "credential_tenant_id".to_owned(),
+                message: "names the tenant of `credential_key`, which is missing".to_owned(),
+            }),
+            (None, None) => Ok(None),
+        }
     }
 
     /// # Errors
@@ -426,21 +452,17 @@ pub async fn sync_repository(
     Query(query): Query<SyncQuery>,
 ) -> ApiResult<(StatusCode, JsonBody<SyncAcceptedDto>)> {
     validate_repo_path(&owner, &name)?;
-    let scope = query.scope(svc.default_scope())?;
-    let since = query.since()?;
-    let queued = svc
-        .enqueue_sync(
-            &ctx,
-            &owner,
-            &name,
-            scope,
-            ForceMode::from_flags(
-                query.force.unwrap_or(false),
-                query.force_full.unwrap_or(false),
-            ),
-            since,
-        )
-        .await?;
+    let request = SyncRequest {
+        scope: query.scope(svc.default_scope())?,
+        force: ForceMode::from_flags(
+            query.force.unwrap_or(false),
+            query.force_full.unwrap_or(false),
+        ),
+        since: query.since()?,
+        credential: query.credential(&ctx)?,
+        ..SyncRequest::default()
+    };
+    let queued = svc.enqueue_sync_with(&ctx, &owner, &name, request).await?;
     Ok((
         StatusCode::ACCEPTED,
         Json(SyncAcceptedDto {

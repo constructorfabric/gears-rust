@@ -72,6 +72,32 @@ pub struct WorkflowStep {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Where the GitHub token of one sync lives: a secret in the platform's
+/// credential store, named by its tenant and key.
+///
+/// The reference is not the token. The gear reads the secret when the sync
+/// is requested, as the caller, so the credential store's own access rules
+/// decide whether the caller may use it. `tenant_id` must be the caller's
+/// own tenant; a secret a parent tenant shares is reached through it by the
+/// credential store's hierarchical resolution.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialRef {
+    pub tenant_id: uuid::Uuid,
+    /// The secret's key, `[a-zA-Z0-9_-]`, at most 255 characters.
+    pub key: String,
+}
+
+/// What an in-process caller asks of a sync beyond naming the repository.
+#[domain_model]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncOptions {
+    /// The credential this sync reads GitHub with. `None` keeps the
+    /// credential the repository is already bound to, or the gear-wide
+    /// `github_token_secret` for a repository that is not bound to one.
+    pub credential: Option<CredentialRef>,
+}
+
 /// Runtime identity of the mirror gear.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1203,6 +1203,8 @@ pub struct RepoSyncStatusDto {
     /// RFC3339 time of the last run that completed.
     #[schema(format = DateTime)]
     pub last_synced_at: Option<String>,
+    /// Credential-store key of the credential that last read the repository; null for the gear-wide token.
+    pub credential_key: Option<String>,
 }
 
 impl From<RepoSyncStatusRecord> for RepoSyncStatusDto {
@@ -1213,6 +1215,7 @@ impl From<RepoSyncStatusRecord> for RepoSyncStatusDto {
             status: r.status.into(),
             last_session_id: r.last_session_id.map(|id| id.to_string()),
             last_synced_at: r.last_synced_at,
+            credential_key: r.credential_key,
         }
     }
 }
