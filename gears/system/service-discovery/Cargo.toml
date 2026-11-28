@@ -11,6 +11,29 @@ keywords = ["constructorfabric", "cf-gears"]
 categories = ["development-tools"]
 metadata.docs.rs.all-features = true
 
+[features]
+default = []
+storage-k8s = ["dep:k8s-cluster-plugin"]
+storage-postgres = ["dep:postgres-cluster-plugin"]
+storage-redis = ["dep:redis-cluster-plugin"]
+# Runs the shared-directory storage contract against real PostgreSQL, Redis and
+# k3s containers (docs/TESTING.md 4), so a default `cargo test` never needs
+# Docker. Every reference to the optional crates below is test-only, so this
+# feature adds nothing to the gear's own artifact beyond the three storage
+# backends. Run with `make test-integration LANE=service-discovery-storage` or
+# `make test-service-discovery-k8s`.
+integration = [
+    "storage-k8s",
+    "storage-postgres",
+    "storage-redis",
+    "dep:testcontainers",
+    "dep:testcontainers-modules",
+    "dep:kube",
+    "dep:k8s-openapi",
+    "dep:serde-saphyr",
+    "dep:tempfile",
+]
+
 [lib]
 name = "service_discovery"
 
@@ -38,6 +61,18 @@ utoipa = { workspace = true }
 axum = { workspace = true }
 uuid = { workspace = true }
 inventory = { workspace = true }
+cluster-sdk = { workspace = true }
+serde_json = { workspace = true }
+k8s-cluster-plugin = { package = "cf-k8s-cluster-plugin", path = "../cluster/plugins/k8s-cluster-plugin", optional = true }
+postgres-cluster-plugin = { package = "cf-postgres-cluster-plugin", path = "../cluster/plugins/postgres-cluster-plugin", optional = true }
+redis-cluster-plugin = { package = "cf-redis-cluster-plugin", path = "../cluster/plugins/redis-cluster-plugin", optional = true }
+# Real-backend fixtures for the `integration` feature; see `[features]`.
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true, features = ["k3s"] }
+kube = { workspace = true, optional = true, features = ["client", "runtime", "rustls-tls", "aws-lc-rs"] }
+k8s-openapi = { workspace = true, optional = true, features = ["latest"] }
+serde-saphyr = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 toolkit = { workspace = true, features = ["test-support"] }
@@ -49,3 +84,6 @@ serde_json = { workspace = true }
 toolkit-transport-grpc = { workspace = true }
 secrecy = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+standalone-cluster-plugin = { workspace = true }
+# The workspace's pinned PostgreSQL, Redis and k3s images (docs/TESTING.md 4.4).
+test-containers = { workspace = true }

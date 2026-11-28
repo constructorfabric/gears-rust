@@ -765,6 +765,60 @@ impl ClusterCacheBackend for K8sCache {
         }
     }
 
+    async fn compare_and_swap_value(
+        &self,
+        key: &str,
+        expected_value: &[u8],
+        new_value: &[u8],
+        ttl: Ttl,
+    ) -> Result<CacheEntry, ClusterError> {
+        self.runtime.check_value_size(new_value)?;
+        let api = self.runtime.api();
+        let name = self.runtime.object_name(key);
+
+        let Some(mut current) = self.runtime.read_live(key).await? else {
+            return Err(ClusterError::CasConflict {
+                key: key.to_owned(),
+                current: None,
+            });
+        };
+        let current_entry = current.spec.to_cache_entry()?;
+        if current_entry.value.as_slice() != expected_value {
+            return Err(ClusterError::CasConflict {
+                key: key.to_owned(),
+                current: Some(current_entry),
+            });
+        }
+        let version = next_version(current_entry.version);
+        current.spec =
+            ClusterCacheEntrySpec::new(new_value, version, expiry_deadline(ttl, Timestamp::now())?);
+        match self
+            .runtime
+            .timed(
+                "compare_and_swap cache value",
+                guarded::replace(&api, &name, &current, CallSite::CompareAndSwap),
+            )
+            .await?
+        {
+            Replaced::Applied(applied) => {
+                self.runtime.arm_sweeper(key, ttl);
+                applied.spec.to_cache_entry()
+            }
+            Replaced::Conflict | Replaced::Gone => {
+                let current = self
+                    .runtime
+                    .read_live(key)
+                    .await?
+                    .map(|entry| entry.spec.to_cache_entry())
+                    .transpose()?;
+                Err(ClusterError::CasConflict {
+                    key: key.to_owned(),
+                    current,
+                })
+            }
+        }
+    }
+
     async fn compare_and_delete(
         &self,
         key: &str,

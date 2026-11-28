@@ -412,6 +412,23 @@ and default to 30 s.
   without depending on k8s probes.
 - **Actors**: `cpt-cf-actor-oop-worker`, `cpt-cf-actor-flight-control`
 
+#### Directory Persistence and Replication
+
+- [ ] `p1` - **ID**: `cpt-cf-fr-directory-persistence`
+
+In deployments with multiple Flight Control replicas, DirectoryService MUST use shared persistent storage so all
+replicas expose a consistent directory and registrations survive process restarts. Service-discovery MUST support
+the in-memory backend for single-process deployments and configurable Kubernetes, PostgreSQL, and Redis cache
+backends for shared deployments. The shared backend MUST provide atomic compare-and-set operations for registration
+ownership and lease renewal. Replicas MUST consume cache changes, perform periodic full snapshots to recover missed
+events, and reclaim expired registrations and ownership claims. A steady-state heartbeat MUST require one backend
+mutation and zero backend reads; cache misses and compare-and-set conflicts MAY require reads. A restarted replica
+MUST rebuild its local read model from the shared snapshot before reporting ready.
+
+- **Rationale**: Replicated control-plane pods must not maintain divergent or process-local registrations. Persistent
+  shared storage allows restarts and replica scaling without losing directory state.
+- **Actors**: `cpt-cf-actor-flight-control`, `cpt-cf-actor-platform-op`
+
 #### Public vs. Internal API Distinction
 
 - [ ] `p1` - **ID**: `cpt-cf-fr-api-visibility`

@@ -1,4 +1,5 @@
 # Override file for an existing PostgreSQL server/database/user.
+# The Flight Control image must enable `service-discovery-storage-postgres`.
 # Create Secret flight-control-postgres with key password before installation.
 extraEnv:
   - name: TYPES_REGISTRY_DB_PASSWORD
@@ -24,3 +25,9 @@ config:
           dbname: "flight_control"
           # Remove the SQLite-only field inherited from values.yaml.
           file: null
+      service-discovery:
+        config:
+          storage:
+            backend: "postgres"
+            postgres:
+              connection_string: "postgres://flight_control:${TYPES_REGISTRY_DB_PASSWORD}@postgres.default.svc.cluster.local:5432/flight_control"

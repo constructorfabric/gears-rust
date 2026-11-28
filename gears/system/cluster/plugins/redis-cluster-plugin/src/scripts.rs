@@ -195,6 +195,29 @@ return {1, ver}
 ",
 };
 
+/// `cache_cas_value` — exact-value-guarded write. DESIGN.md §6.
+pub const CACHE_CAS_VALUE: ScriptSpec = ScriptSpec {
+    name: "cache_cas_value",
+    source: r"
+-- KEYS[1]=entry  ARGV[1]=expected_value  ARGV[2]=new_value
+--                ARGV[3]=px_or_-1       ARGV[4]=channel
+-- Returns: {1, new_version} on success
+--          {0, current_version, current_value} on value mismatch
+--          {0} when the key is absent
+local cur = redis.call('HGET', KEYS[1], 'v')
+if not cur then return {0} end
+if cur ~= ARGV[1] then
+    return {0, redis.call('HGET', KEYS[1], 'ver'), cur}
+end
+local ver = redis.call('HINCRBY', KEYS[1], 'ver', 1)
+redis.call('HSET', KEYS[1], 'v', ARGV[2])
+if ARGV[3] == '-1' then redis.call('PERSIST', KEYS[1])
+else redis.call('PEXPIRE', KEYS[1], ARGV[3]) end
+if ARGV[4] ~= '' then redis.call('PUBLISH', ARGV[4], 'C') end
+return {1, ver}
+",
+};
+
 /// `cache_compare_and_delete` — value-guarded delete. DESIGN.md §6.
 ///
 /// Guarded on the **value**, not the version, and that is the whole point:
@@ -272,6 +295,7 @@ pub const CACHE_SCRIPTS: &[ScriptSpec] = &[
     CACHE_PUT,
     CACHE_PUT_IF_ABSENT,
     CACHE_CAS,
+    CACHE_CAS_VALUE,
     CACHE_COMPARE_AND_DELETE,
     CACHE_DELETE,
 ];
@@ -285,6 +309,7 @@ pub const ALL_SCRIPTS: &[ScriptSpec] = &[
     CACHE_PUT,
     CACHE_PUT_IF_ABSENT,
     CACHE_CAS,
+    CACHE_CAS_VALUE,
     CACHE_COMPARE_AND_DELETE,
     CACHE_DELETE,
     LOCK_RENEW,

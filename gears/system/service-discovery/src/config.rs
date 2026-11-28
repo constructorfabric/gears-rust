@@ -1,5 +1,6 @@
 //! Operator-facing configuration schema for the service-discovery gear.
 
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -107,6 +108,9 @@ impl LeaseConfig {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceDiscoveryConfig {
+    /// Persistent directory storage. Defaults to process-local memory.
+    #[serde(default)]
+    pub storage: StorageConfig,
     /// Peer identities permitted to act on any gear's registration (see
     /// [`crate::server::make_directory_service`]). Empty by default.
     #[serde(default)]
@@ -138,6 +142,71 @@ pub struct ServiceDiscoveryConfig {
     /// Instance-lease policy. Both `ttl` and `grace` default to 30s.
     #[serde(default)]
     pub lease: LeaseConfig,
+}
+
+/// Shared cache plugin selection for service-discovery.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Backend to use. `memory` keeps the existing single-process behavior.
+    #[serde(default)]
+    pub backend: StorageBackend,
+    /// The selected plugin's own configuration.
+    #[serde(default)]
+    #[cfg_attr(
+        not(feature = "storage-k8s"),
+        allow(
+            dead_code,
+            reason = "the field is read only when the k8s backend is compiled in"
+        )
+    )]
+    pub k8s: Option<serde_json::Value>,
+    /// The selected plugin's own configuration.
+    #[serde(default)]
+    #[cfg_attr(
+        not(feature = "storage-postgres"),
+        allow(
+            dead_code,
+            reason = "the field is read only when the postgres backend is compiled in"
+        )
+    )]
+    pub postgres: Option<serde_json::Value>,
+    /// The selected plugin's own configuration.
+    #[serde(default)]
+    #[cfg_attr(
+        not(feature = "storage-redis"),
+        allow(
+            dead_code,
+            reason = "the field is read only when the redis backend is compiled in"
+        )
+    )]
+    pub redis: Option<serde_json::Value>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: StorageBackend::Memory,
+            k8s: None,
+            postgres: None,
+            redis: None,
+        }
+    }
+}
+
+/// Storage mode selected at startup.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// Local in-memory directory.
+    #[default]
+    Memory,
+    /// Kubernetes-backed shared directory.
+    K8s,
+    /// PostgreSQL-backed shared directory.
+    Postgres,
+    /// Redis-backed shared directory.
+    Redis,
 }
 
 #[cfg(test)]

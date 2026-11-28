@@ -21,7 +21,8 @@ workspace = true
 # re-exported — consumers keep their own `testcontainers` dev-dependency, which
 # keeps `Postgres::default()` unreachable through `test_containers::`.
 testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
+testcontainers-modules = { workspace = true, features = ["k3s"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Scoped env-var mutation for the override tests; `std::env::set_var` is

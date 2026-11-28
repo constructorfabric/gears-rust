@@ -1,6 +1,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-//! Single source of truth for the database container images this workspace's
-//! integration tests start.
+//! Single source of truth for the database (and k3s) container images this
+//! workspace's integration tests start.
 //!
 //! Every fixture that brings up a database goes through this crate, so a
 //! version change is one edit here instead of a grep across ~240 call sites
@@ -32,8 +32,11 @@
 //! | `GEARS_TEST_CLICKHOUSE_TAG` | [`CLICKHOUSE_TAG`] |
 //! | `GEARS_TEST_REDIS_TAG` | [`REDIS_TAG`] |
 //! | `GEARS_TEST_KAFKA_TAG` | [`KAFKA_TAG`] |
+//! | `GEARS_TEST_K3S_TAG` | [`K3S_TAG`] |
 //!
-//! An unset *or empty* variable means "use the constant".
+//! An unset *or empty* variable means "use the constant". For k3s, the
+//! deprecated `K8S_PLUGIN_K3S_TAG` is still honored when `GEARS_TEST_K3S_TAG`
+//! is unset.
 //!
 //! Only concrete tags belong in the constants below. A floating alias such as
 //! `lts` or `latest` re-points under CI with nothing in the diff to show it,
@@ -63,11 +66,12 @@
 //! # }
 //! ```
 
+use std::path::Path;
 use std::time::Duration;
 
 use testcontainers::{ContainerRequest, GenericImage, ImageExt, core::Mount};
 use testcontainers_modules::{
-    kafka::apache::Kafka, mysql::Mysql, postgres::Postgres, redis::Redis,
+    k3s::K3s, kafka::apache::Kafka, mysql::Mysql, postgres::Postgres, redis::Redis,
 };
 
 /// A `PostgreSQL` request with its data directory on a tmpfs: a test database
@@ -138,6 +142,14 @@ pub const REDIS_TAG: &str = "8.12-alpine";
 /// on.
 pub const KAFKA_TAG: &str = "4.3.1";
 
+/// Tag of the `rancher/k3s` image.
+///
+/// Newer than the module's own default (v1.28) on purpose: from 1.34 a guarded
+/// `PUT` on a custom resource deleted since the read answers `404` rather than
+/// `409`, and the k8s cluster plugin's suite covers that path. Run against a
+/// 1.33 or older tag through [`ENV_K3S_TAG`] for the `409` path.
+pub const K3S_TAG: &str = "v1.37.1-k3s1";
+
 /// Repository of the `netshoot` image: `tc` for the benchmarks that add
 /// round-trip time to a database container (`netem`, run with `NET_ADMIN`
 /// in that container's network namespace).
@@ -168,6 +180,12 @@ pub const ENV_CLICKHOUSE_TAG: &str = "GEARS_TEST_CLICKHOUSE_TAG";
 pub const ENV_REDIS_TAG: &str = "GEARS_TEST_REDIS_TAG";
 /// Environment variable overriding [`KAFKA_TAG`].
 pub const ENV_KAFKA_TAG: &str = "GEARS_TEST_KAFKA_TAG";
+/// Environment variable overriding [`K3S_TAG`].
+pub const ENV_K3S_TAG: &str = "GEARS_TEST_K3S_TAG";
+/// Deprecated override for [`K3S_TAG`], formerly read by the k8s cluster
+/// plugin's integration suite. Still honored when [`ENV_K3S_TAG`] is unset so
+/// existing CI and local setups keep testing the version they ask for.
+pub const ENV_K3S_TAG_LEGACY: &str = "K8S_PLUGIN_K3S_TAG";
 /// Environment variable overriding [`NETSHOOT_TAG`].
 pub const ENV_NETSHOOT_TAG: &str = "GEARS_TEST_NETSHOOT_TAG";
 
@@ -250,6 +268,18 @@ pub fn redis_tag() -> String {
 #[must_use]
 pub fn kafka_tag() -> String {
     tag_from(env_override(ENV_KAFKA_TAG), KAFKA_TAG)
+}
+
+/// k3s tag in effect, honoring `GEARS_TEST_K3S_TAG`, then the deprecated
+/// `K8S_PLUGIN_K3S_TAG`. Using the deprecated variable emits a tracing warning.
+#[must_use]
+pub fn k3s_tag() -> String {
+    let legacy = || {
+        let value = env_override(ENV_K3S_TAG_LEGACY)?;
+        tracing::warn!("{ENV_K3S_TAG_LEGACY} is deprecated; set {ENV_K3S_TAG} instead");
+        Some(value)
+    };
+    tag_from(env_override(ENV_K3S_TAG).or_else(legacy), K3S_TAG)
 }
 
 /// `netshoot` image reference in effect (`repository:tag`), honoring
@@ -347,6 +377,20 @@ pub fn kafka() -> ContainerRequest<Kafka> {
 /// A `Redis` container request on the pinned tag.
 pub fn redis() -> ContainerRequest<Redis> {
     ContainerRequest::from(Redis::default()).with_tag(redis_tag())
+}
+
+/// A privileged single-node k3s container request on the pinned tag.
+///
+/// k3s writes its kubeconfig into `conf_dir`, from which
+/// `K3s::read_kube_config` reads it back. The mount is an image-level setting,
+/// so it is applied here, before the tag override turns the image into a
+/// `ContainerRequest`. k3s runs a full control plane, which needs a privileged
+/// container in the host user namespace.
+pub fn k3s(conf_dir: impl AsRef<Path>) -> ContainerRequest<K3s> {
+    ContainerRequest::from(K3s::default().with_conf_mount(conf_dir))
+        .with_tag(k3s_tag())
+        .with_privileged(true)
+        .with_userns_mode("host")
 }
 
 /// A `TimescaleDB` image on the pinned tag.
@@ -458,6 +502,7 @@ mod tests {
         assert_eq!(CLICKHOUSE_TAG, "25.6");
         assert_eq!(REDIS_TAG, "8.12-alpine");
         assert_eq!(KAFKA_TAG, "4.3.1");
+        assert_eq!(K3S_TAG, "v1.37.1-k3s1");
         assert_eq!(NETSHOOT_IMAGE, "nicolaka/netshoot");
         assert_eq!(
             NETSHOOT_TAG,
@@ -488,6 +533,7 @@ mod tests {
             CLICKHOUSE_TAG,
             REDIS_TAG,
             KAFKA_TAG,
+            K3S_TAG,
             NETSHOOT_TAG,
         ] {
             assert!(
@@ -535,6 +581,8 @@ mod tests {
         assert_eq!(ENV_CLICKHOUSE_TAG, "GEARS_TEST_CLICKHOUSE_TAG");
         assert_eq!(ENV_REDIS_TAG, "GEARS_TEST_REDIS_TAG");
         assert_eq!(ENV_KAFKA_TAG, "GEARS_TEST_KAFKA_TAG");
+        assert_eq!(ENV_K3S_TAG, "GEARS_TEST_K3S_TAG");
+        assert_eq!(ENV_K3S_TAG_LEGACY, "K8S_PLUGIN_K3S_TAG");
         assert_eq!(ENV_GRAPH_LANE_REQUIRED, "GEARS_TEST_PG_GRAPH_REQUIRED");
     }
 
@@ -546,7 +594,7 @@ mod tests {
         /// (environment variable, accessor it must reach, constant it falls back to)
         type AccessorCase = (&'static str, fn() -> String, &'static str);
 
-        let cases: [AccessorCase; 8] = [
+        let cases: [AccessorCase; 9] = [
             (ENV_POSTGRES_TAG, postgres_tag, POSTGRES_TAG),
             (
                 ENV_POSTGRES_GRAPH_TAG,
@@ -559,19 +607,56 @@ mod tests {
             (ENV_CLICKHOUSE_TAG, clickhouse_tag, CLICKHOUSE_TAG),
             (ENV_REDIS_TAG, redis_tag, REDIS_TAG),
             (ENV_KAFKA_TAG, kafka_tag, KAFKA_TAG),
+            (ENV_K3S_TAG, k3s_tag, K3S_TAG),
         ];
-        for (var, accessor, default) in cases {
-            temp_env::with_var(var, Some("sentinel-value"), || {
-                assert_eq!(
-                    accessor(),
-                    "sentinel-value",
-                    "{var} did not reach its accessor"
-                );
-            });
-            temp_env::with_var(var, None::<&str>, || {
-                assert_eq!(accessor(), default, "{var} unset should yield the constant");
-            });
-        }
+        // The legacy k3s variable would otherwise leak into the "unset" case.
+        temp_env::with_var(ENV_K3S_TAG_LEGACY, None::<&str>, || {
+            for (var, accessor, default) in cases {
+                temp_env::with_var(var, Some("sentinel-value"), || {
+                    assert_eq!(
+                        accessor(),
+                        "sentinel-value",
+                        "{var} did not reach its accessor"
+                    );
+                });
+                temp_env::with_var(var, None::<&str>, || {
+                    assert_eq!(accessor(), default, "{var} unset should yield the constant");
+                });
+            }
+        });
+    }
+
+    /// `K8S_PLUGIN_K3S_TAG` keeps working for existing setups, but the new
+    /// name wins when both are set, and an empty value is ignored as for the
+    /// other overrides.
+    #[test]
+    #[serial]
+    fn k3s_tag_falls_back_to_the_legacy_variable() {
+        temp_env::with_vars(
+            [
+                (ENV_K3S_TAG, None),
+                (ENV_K3S_TAG_LEGACY, Some("legacy-tag")),
+            ],
+            || assert_eq!(k3s_tag(), "legacy-tag"),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_K3S_TAG, Some("new-tag")),
+                (ENV_K3S_TAG_LEGACY, Some("legacy-tag")),
+            ],
+            || assert_eq!(k3s_tag(), "new-tag"),
+        );
+        temp_env::with_vars(
+            [
+                (ENV_K3S_TAG, Some("")),
+                (ENV_K3S_TAG_LEGACY, Some("legacy-tag")),
+            ],
+            || assert_eq!(k3s_tag(), "legacy-tag"),
+        );
+        temp_env::with_vars(
+            [(ENV_K3S_TAG, None), (ENV_K3S_TAG_LEGACY, Some(""))],
+            || assert_eq!(k3s_tag(), K3S_TAG),
+        );
     }
 
     /// Resolved accessors, not constants: asserting against `POSTGRES_TAG`
@@ -593,6 +678,10 @@ mod tests {
         assert_eq!(
             kafka().descriptor(),
             format!("apache/kafka:{}", kafka_tag())
+        );
+        assert_eq!(
+            k3s(std::env::temp_dir()).descriptor(),
+            format!("rancher/k3s:{}", k3s_tag())
         );
         assert_eq!(
             postgres_named("cluster_test").descriptor(),
@@ -618,6 +707,12 @@ mod tests {
         });
         temp_env::with_var(ENV_KAFKA_TAG, Some("tag-under-test"), || {
             assert_eq!(kafka().descriptor(), "apache/kafka:tag-under-test");
+        });
+        temp_env::with_var(ENV_K3S_TAG, Some("tag-under-test"), || {
+            assert_eq!(
+                k3s(std::env::temp_dir()).descriptor(),
+                "rancher/k3s:tag-under-test"
+            );
         });
     }
 

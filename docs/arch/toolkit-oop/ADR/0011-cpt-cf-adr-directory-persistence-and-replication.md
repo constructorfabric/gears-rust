@@ -185,18 +185,21 @@ Staleness between replicas is the watch delivery delay, normally well under a se
 |---|---|---|---|
 | `directory/inst/<gear>/<instance>` | endpoints, version, labels, gRPC services, `openapi_spec_hash` | register | none |
 | `directory/lease/<gear>/<instance>` | `expires_at` (epoch ms), `reported_state`, registration generation | register, every heartbeat | `ttl + grace` |
-| `directory/claim/<service>` | owning gear | first registration of a gRPC service name | none |
+| `directory/generation-sequence/<shard>` | monotonic registration-generation counter | each fresh registration | none |
+| `directory/claim/<service>` | stable owner or a time-stamped reservation | registration, deregistration, janitor | none |
 
 * Segments are encoded into the cache key grammar (`[a-zA-Z0-9_-]`, `cluster-sdk` `CACHE_KEY_RULE`). gRPC service names
   contain `.`, so service and instance segments are always encoded, for example as unpadded lowercase base32.
-* A heartbeat uses one atomic conditional mutation of the lease key. The mutation checks the registration generation
-  and writes both `expires_at` and `reported_state`; this prevents an old operation from changing a later registration.
-  A replica with a current local generation performs one backend write. A replica missing the local registration first
-  reads the authoritative instance/lease pair, then performs one backend write. A reported-state change is still one
-  write because state and deadline share the lease value. Adapters must use an atomic compare-and-swap/upsert primitive
-  or a backend transaction; a cache without that guarantee is not a valid shared directory backend.
-* A replica that sees a lease-key `Changed` event applies the event's absolute `expires_at` and state, not `now + ttl`.
-  Only `Changed` on an instance key triggers a `get`.
+* Generation counters are sharded by the first byte of the instance UUID. An instance always uses the same shard,
+  preserving its monotonic generations while bounding persistent generation metadata to 256 keys.
+* A heartbeat uses one atomic value-guarded mutation of the lease key. The mutation checks the registration generation
+  and writes both `expires_at` and `reported_state`; this prevents an old operation from changing a later registration
+  even if a cache entry version resets after delete/re-create. A replica with a current local record and lease version
+  performs one backend write. A replica missing the local registration first reads the authoritative instance/lease
+  pair, then performs one backend write. A reported-state change is still one write because state and deadline share
+  the lease value. Every supported cache plugin must implement value-guarded CAS atomically.
+* Cache watch events carry keys only. A replica fetches the current lease value on a lease-key `Changed` event and
+  applies its absolute `expires_at` and state, not `now + ttl`; a changed instance key triggers a fetch of its record.
 * The backend removes an expired lease key itself (read-path expiry and sweeper in each plugin). `Expired` or `Deleted`
   on a lease key makes the instance invisible on every replica.
 
@@ -239,10 +242,9 @@ plugin's rules.
   `GearManager` snapshot. With a shared backend this is only local garbage collection, for records whose removal the
   replica missed; the backend and the janitor own the shared keys.
 * **Shared backend**: the backend expires lease keys. A janitor on every replica deletes instance keys whose lease key
-  is gone, lease keys whose instance key is gone, and claims that no visible instance backs. It uses
-  `compare_and_delete`, so replicas racing on the same key are harmless and no leader election is needed. It runs on
-  `Expired`/`Deleted` events and on a slow periodic scan, which also catches keys orphaned while every replica was
-  down.
+  is gone and lease keys whose instance key is gone. It CASes orphaned claims to the empty-owner tombstone rather than
+  deleting them, so the claim's cache version remains a fence against stale registrars. It runs periodically, which
+  also catches keys orphaned while every replica was down.
 
 ### Protocol changes
 
@@ -325,20 +327,29 @@ Kubernetes plugin) and for every watch-triggered `get`.
 ### gRPC service-name ownership across replicas
 
 `GearManager` serializes the ownership check and insert with a process mutex (`reg_lock`), which cannot cover several
-replicas. With a shared backend, ownership uses the claim key:
+replicas. With a shared backend, ownership uses one fenced claim key per service:
 
-* Registration creates `directory/claim/<service>` with `put_if_absent`. If the key exists, the returned entry names
-  the holder.
-* A claim held by another gear is a recoverable conflict while a visible instance of that gear advertises the name.
-  Otherwise it is taken over with `compare_and_swap` against the entry's version; a lost swap means another replica
-  won, and the registration re-reads the claim.
+* Each claim value is either `stable(owner)` or `pending(owner, previous_owner, token, started_at)`. A stable empty
+  owner means the service is currently unclaimed. Pending reservations block competitors while a registration writes
+  its record. They are kept until the janitor resolves them rather than expiring at the cache layer, so their cache
+  entry versions cannot reset and alias a stale writer.
+* Registration reserves each service key with `put_if_absent` or per-key CAS. A reservation over another stable owner
+  is allowed only when that owner has no live advertising instance. The reservation is checked again after it is
+  acquired. Once the instance and lease are written, the registrar CASes its pending reservations to stable ownership
+  and verifies them before returning success. A stale registrar cannot commit after another owner has reserved the
+  key: readers advertise a service only when the current stable claim names that record's gear.
+* A conflict releases only reservations acquired by that call. A process crash can leave a pending reservation; the
+  periodic janitor resolves reservations older than 60 seconds by restoring a still-live previous owner, finalizing a
+  live pending owner's record, or setting the owner to empty. Stable orphan claims are likewise set to empty. Claim
+  keys are retained as version fences rather than deleted and recreated.
 * Claims need a backend that declares `CacheConsistency::Linearizable`. A backend configured for eventually
   consistent reads (for example the Kubernetes plugin with `cache_reads: cached`) is refused at startup.
 * Pinned owners (`grpc_service_owners` config and the owners compiled into the binary) are checked before the backend
   is touched, in each replica's memory. Replicas of one application share image and config, so they agree; a pin
   conflict stays permanent, as today.
-* Registration writes claims, then the instance key, then the lease key. A failure part-way returns an error and the
-  worker retries; keys left behind are removed by the janitor.
+* Registration reserves claims, writes the lease and instance keys, then finalizes the claims. A failure part-way
+  returns an error and the worker retries; orphan records and claims are hidden by claim filtering and repaired by the
+  janitor.
 
 With `memory`, the existing mutex-based logic stays.
 

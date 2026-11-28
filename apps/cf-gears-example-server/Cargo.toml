@@ -15,6 +15,9 @@ workspace = true
 
 [features]
 default = []
+service-discovery-storage-k8s = ["service_discovery/storage-k8s"]
+service-discovery-storage-postgres = ["service_discovery/storage-postgres"]
+service-discovery-storage-redis = ["service_discovery/storage-redis"]
 file-parser = ["dep:file_parser"]
 github-mirror = ["dep:github_mirror", "credstore"]
 simple-user-settings = ["dep:simple_user_settings"]
