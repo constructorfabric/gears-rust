@@ -8,11 +8,17 @@ use super::super::core::Outbox;
 use super::super::handler::HandlerResult;
 use super::super::statements::OutboxStatements;
 use super::super::store::OutboxStore;
-use super::super::strategy::{ProcessContext, ProcessingStrategy};
+use super::super::strategy::{Pass, ProcessContext, ProcessingStrategy};
 use super::super::subscription::TraceMailbox;
 use super::super::types::OutboxError;
 use crate::Db;
 use toolkit_taskward::{Directive, WorkerAction};
+
+/// Minimum delay before probing a contended partition again. A crashed holder's
+/// default 30 s lease costs at most a few hundred timed lease probes per partition
+/// and instance; ordinary contention ends within one or two checks. Local
+/// notifications can still wake the sleep early.
+pub const CONTENDED_RECHECK_FLOOR: Duration = Duration::from_millis(100);
 
 /// Report emitted by a processor execution cycle.
 #[derive(Debug, Clone)]
@@ -217,9 +223,30 @@ impl<S: ProcessingStrategy> WorkerAction for PartitionProcessor<S> {
             stop_grace: self.tuning.stop_grace,
         };
 
-        let result = self.strategy.process(&ctx, effective_size).await?;
+        let pr = match self.strategy.process(&ctx, effective_size).await? {
+            Pass::Processed(pr) => Some(pr),
+            Pass::Empty => None,
+            Pass::Contended => {
+                // Another processor holds the partition. It is not told about
+                // anything this instance enqueued meanwhile, and the idle poker
+                // is minutes away: look again once the holder's pass is most
+                // likely over (a notification still wakes the sleep early).
+                debug!(
+                    partition_id = self.partition_id,
+                    "partition held by another processor; looking again"
+                );
+                return Ok(Directive::Sleep(
+                    self.tuning.active_interval.max(CONTENDED_RECHECK_FLOOR),
+                    ProcessorReport {
+                        partition_id: self.partition_id,
+                        messages_processed: 0,
+                        handler_result: HandlerResult::Success,
+                    },
+                ));
+            }
+        };
 
-        if let Some(pr) = result {
+        if let Some(pr) = pr {
             let has_more = pr.count >= effective_size;
             let clamped_pc = pr.processed_count.map(|pc| pc.min(pr.count));
             self.partition_mode.transition(

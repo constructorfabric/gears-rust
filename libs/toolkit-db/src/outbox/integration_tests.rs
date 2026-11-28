@@ -29,7 +29,9 @@ use super::handler::{
 use super::prioritizer::SharedPrioritizer;
 use super::record::{Record, Records};
 use super::store::OutboxStore;
-use super::strategy::{LeasedStrategy, ProcessContext, ProcessingStrategy, TransactionalStrategy};
+use super::strategy::{
+    LeasedStrategy, Pass, ProcessContext, ProcessResult, ProcessingStrategy, TransactionalStrategy,
+};
 use super::subscription::TraceMailbox;
 use super::tables::OutboxTables;
 use super::trace::TraceState;
@@ -2753,7 +2755,7 @@ async fn run_transactional(
         cancel: &CancellationToken::new(),
         stop_grace: Duration::from_secs(1),
     };
-    strategy.process(&ctx, msg_batch_size).await.unwrap()
+    processed(strategy.process(&ctx, msg_batch_size).await.unwrap())
 }
 
 #[tokio::test]
@@ -2854,13 +2856,32 @@ async fn transactional_batch_processes_multiple_in_single_tx() {
 // Chapter 5: Decoupled Processing
 // ======================================================================
 
+/// The processed batch of a pass, if any; the older helpers below answer in that shape.
+fn processed(pass: Pass) -> Option<ProcessResult> {
+    match pass {
+        Pass::Processed(result) => Some(result),
+        Pass::Empty | Pass::Contended => None,
+    }
+}
+
 async fn run_leased(
     db: &Db,
     partition_id: i64,
     handler: impl LeasedHandler + 'static,
     lease_duration: Duration,
     msg_batch_size: u32,
-) -> Option<super::strategy::ProcessResult> {
+) -> Option<ProcessResult> {
+    processed(run_leased_pass(db, partition_id, handler, lease_duration, msg_batch_size).await)
+}
+
+/// Like `run_leased`, but hands back the whole pass, contention included.
+async fn run_leased_pass(
+    db: &Db,
+    partition_id: i64,
+    handler: impl LeasedHandler + 'static,
+    lease_duration: Duration,
+    msg_batch_size: u32,
+) -> Pass {
     let conn = db.sea_internal();
     let backend = conn.get_database_backend();
     drop(conn);
@@ -2890,17 +2911,134 @@ async fn run_leased(
     strategy.process(&ctx, msg_batch_size).await.unwrap()
 }
 
+#[tokio::test]
+async fn a_leased_pass_reports_contention_while_another_processor_holds_the_lease() {
+    let db = setup_db("ch5_contended_lease").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&t, &db, "q", 0, &["a"]).await;
+    // Another instance holds the partition for the next 30 s.
+    simulate_crash(&db, pid, 30).await;
+    let count = Arc::new(AtomicU32::new(0));
+    let handler = || CountingSuccessHandler {
+        count: Arc::clone(&count),
+    };
+
+    let pass = run_leased_pass(&db, pid, handler(), Duration::from_secs(30), 10).await;
+    assert!(matches!(pass, Pass::Contended), "{pass:?}");
+    assert_eq!(
+        count.load(Ordering::Relaxed),
+        0,
+        "nothing is read under a foreign lease"
+    );
+
+    // The holder is gone: the next pass takes the lease and the message.
+    expire_lease(&db, pid).await;
+    let pass = run_leased_pass(&db, pid, handler(), Duration::from_secs(30), 10).await;
+    assert!(
+        matches!(pass, Pass::Processed(ProcessResult { count: 1, .. })),
+        "{pass:?}"
+    );
+    let pass = run_leased_pass(&db, pid, handler(), Duration::from_secs(30), 10).await;
+    assert!(matches!(pass, Pass::Empty), "{pass:?}");
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn a_contended_partition_makes_the_processor_look_again_after_active_interval() {
+    // The stranding this closes: instance A delivers a message and makes the
+    // empty pass that follows a full batch; instance B enqueues into the same
+    // partition meanwhile, is notified locally, finds A's lease and used to go
+    // Idle — and A, never notified about B's message, looked again only at its
+    // idle poker, ten minutes later by default.
+    use super::workers::processor::{CONTENDED_RECHECK_FLOOR, PartitionProcessor, ProcessorReport};
+
+    let db = setup_db("ch5_contended_processor").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&t, &db, "q", 0, &["a"]).await;
+    simulate_crash(&db, pid, 30).await;
+    let count = Arc::new(AtomicU32::new(0));
+    let strategy = LeasedStrategy::new(
+        Arc::new(CountingSuccessHandler {
+            count: Arc::clone(&count),
+        }),
+        "test-BBBBBB".to_owned(),
+        LeaseConfig {
+            duration: Duration::from_secs(30),
+            headroom: Duration::from_secs(2),
+        },
+    );
+    let look_again = Duration::from_millis(250);
+    let tuning = WorkerTuning::processor().active_interval(look_again);
+    let mut processor = PartitionProcessor::new(strategy, pid, tuning, db.clone(), &t.outbox);
+    let cancel = CancellationToken::new();
+
+    let directive = processor.execute(&cancel).await.unwrap();
+    assert!(
+        matches!(
+            directive,
+            Directive::Sleep(
+                d,
+                ProcessorReport {
+                    messages_processed: 0,
+                    ..
+                }
+            ) if d == look_again
+        ),
+        "a held partition is looked at again after active_interval, not left to the idle poker: {directive:?}"
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+
+    // A low-latency profile must not turn a crashed holder into a busy lease probe.
+    let strategy = LeasedStrategy::new(
+        Arc::new(CountingSuccessHandler {
+            count: Arc::clone(&count),
+        }),
+        "test-CCCCCC".to_owned(),
+        LeaseConfig::default(),
+    );
+    let mut low_latency = PartitionProcessor::new(
+        strategy,
+        pid,
+        WorkerTuning::processor_low_latency(),
+        db.clone(),
+        &t.outbox,
+    );
+    let directive = low_latency.execute(&cancel).await.unwrap();
+    assert!(
+        matches!(directive, Directive::Sleep(d, ..) if d == CONTENDED_RECHECK_FLOOR),
+        "contention must respect the recheck floor: {directive:?}"
+    );
+
+    expire_lease(&db, pid).await;
+    let directive = processor.execute(&cancel).await.unwrap();
+    assert!(
+        matches!(
+            directive,
+            Directive::Idle(ProcessorReport {
+                messages_processed: 1,
+                ..
+            })
+        ),
+        "{directive:?}"
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+}
+
 /// Like `run_leased`, but drives the ack against a caller-supplied trace mailbox so a
 /// test can subscribe to a trace before the ack runs and observe whether it is
 /// resolved.
-async fn run_leased_sharing_trace_mailbox(
+async fn run_leased_pass_sharing_trace_mailbox(
     db: &Db,
     partition_id: i64,
     handler: impl LeasedHandler + 'static,
     lease_duration: Duration,
     msg_batch_size: u32,
     trace_mailbox: &TraceMailbox,
-) -> Option<super::strategy::ProcessResult> {
+) -> Pass {
     let conn = db.sea_internal();
     let backend = conn.get_database_backend();
     drop(conn);
@@ -2961,7 +3099,7 @@ async fn run_leased_under(
         cancel,
         stop_grace: Duration::from_secs(1),
     };
-    strategy.process(&ctx, msg_batch_size).await.unwrap()
+    processed(strategy.process(&ctx, msg_batch_size).await.unwrap())
 }
 
 /// Steals the partition lease while the handler runs, so the ack that follows
@@ -3032,7 +3170,7 @@ async fn a_lost_lease_before_ack_delivers_no_completion() {
     );
     let sub = trace_mailbox.registry().subscribe("lease-lost-1");
 
-    let result = run_leased_sharing_trace_mailbox(
+    let result = run_leased_pass_sharing_trace_mailbox(
         &db,
         pid,
         LeaseStealingHandler {
@@ -3046,8 +3184,8 @@ async fn a_lost_lease_before_ack_delivers_no_completion() {
     .await;
 
     assert!(
-        result.is_none(),
-        "the ack must roll back when the lease was lost"
+        matches!(result, Pass::Contended),
+        "the ack must roll back and report contention when the lease was lost: {result:?}"
     );
 
     let sea = db.sea_internal();
@@ -5191,6 +5329,80 @@ async fn builder_multiple_queues() {
 // ======================================================================
 // Chapter 11: End-to-End Lifecycle
 // ======================================================================
+
+#[tokio::test]
+async fn e2e_contended_worker_delivers_without_another_notification() {
+    use super::workers::processor::{PartitionProcessor, ProcessorReport};
+    use toolkit_taskward::{WorkerBuilder, WorkerListener};
+
+    // Observe completed passes so the lease is released only after the worker
+    // has actually encountered contention. No scheduling sleeps establish that
+    // precondition, and this listener never wakes the worker.
+    struct Reports(tokio::sync::mpsc::UnboundedSender<ProcessorReport>);
+    impl WorkerListener<ProcessorReport> for Reports {
+        fn on_complete(&self, _duration: Duration, directive: &Directive<ProcessorReport>) {
+            self.0.send(directive.payload().clone()).unwrap();
+        }
+    }
+
+    let db = setup_db("ch11_contended_worker").await;
+    let t = make_default_test_outbox().await;
+    t.outbox.register_queue(&db, "q", 1).await.unwrap();
+    let pid = t.outbox.all_partition_ids()[0];
+    enqueue_and_sequence(&t, &db, "q", 0, &["a"]).await;
+    simulate_crash(&db, pid, 30).await;
+
+    let count = Arc::new(AtomicU32::new(0));
+    let strategy = LeasedStrategy::new(
+        Arc::new(CountingSuccessHandler {
+            count: Arc::clone(&count),
+        }),
+        "test-BBBBBB".to_owned(),
+        LeaseConfig::default(),
+    );
+    let tuning = WorkerTuning::processor_low_latency();
+    let processor = PartitionProcessor::new(strategy, pid, tuning.clone(), db.clone(), &t.outbox);
+    let cancel = CancellationToken::new();
+    let (reports, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let notify = Arc::new(tokio::sync::Notify::new());
+    // Model the sequencer's initial wake. No further notification is sent.
+    notify.notify_one();
+    let worker = WorkerBuilder::<ProcessorReport>::new("contended-test", cancel.clone())
+        .pacing(&tuning)
+        // An idle worker must stay asleep: neither a poker nor a local enqueue
+        // can rescue this delivery. Only the contention recheck can do so.
+        .notifier(notify)
+        .listener(Reports(reports))
+        .build(processor);
+
+    let scenario = async {
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let first = received.recv().await.expect("first processor pass");
+            assert_eq!(first.messages_processed, 0);
+            assert_eq!(count.load(Ordering::Relaxed), 0);
+
+            // Updating the foreign lease in the database sends no notification.
+            expire_lease(&db, pid).await;
+            loop {
+                let report = received.recv().await.expect("processor stays running");
+                if report.messages_processed > 0 {
+                    assert_eq!(report.messages_processed, 1);
+                    break;
+                }
+            }
+        })
+        .await;
+        cancel.cancel();
+        result
+    };
+
+    // Joining in this task leaves no detached worker on a timeout or assertion
+    // failure; normal success and timeout both cancel and finish the loop.
+    let ((), delivered) = tokio::join!(worker.run(), scenario);
+    delivered.expect("a contended worker must deliver without another notification");
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    assert_eq!(read_processor_state(&db, pid).await.processed_seq, 1);
+}
 
 #[tokio::test]
 async fn e2e_happy_path_enqueue_through_reap() {

@@ -258,6 +258,18 @@ process holds no subscription for a completion to be delivered to, so a stable
 name would buy nothing. Mail addressed to a process that is gone is collected
 by the sweep, and a restarted process asks `trace_status` instead.
 
+### A partition held by another instance
+
+A processor that finds its partition leased by another instance (or, in
+transactional mode, locked by one) reports the pass as contended and looks
+again after `max(active_interval, CONTENDED_RECHECK_FLOOR)` — the floor, set in
+`workers/processor.rs`, bounds the lease probes of a low-latency profile; a
+local notification still wakes the sleep earlier. It does not go idle: the
+holder is told nothing about a message *this* instance enqueued meanwhile, and
+would otherwise look at the partition only at its idle poker — minutes later by
+default — while the holder's own lease ends within moments (it releases on ack,
+after one empty pass).
+
 ### Being told when a batch is stuck
 
 A subscription is one channel of state: `InFlight`, `Retrying` while a handler
