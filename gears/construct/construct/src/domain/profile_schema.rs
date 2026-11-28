@@ -69,6 +69,7 @@ impl ProfileSchemas for DefaultSchemas {
 }
 
 /// One change to a schema. A request holds several, applied in order to a copy: all of them hold, or none is made.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SchemaChange {
