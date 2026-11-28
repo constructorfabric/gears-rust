@@ -73,6 +73,8 @@ struct Claims {
     /// The Firebase user id. Stable across email changes and sign-in methods,
     /// which is why the allowlist is keyed on it rather than on an address.
     sub: String,
+    /// Required and checked by the library; kept so the result carries it.
+    exp: u64,
     iat: u64,
     /// When the user signed in. Firebase always sets it and documents it as
     /// required, so a token without it is not one Firebase issued.
@@ -118,6 +120,15 @@ pub enum Refusal {
     KeysUnavailable(String),
     /// The local crypto backend cannot verify tokens.
     CryptoUnavailable(String),
+}
+
+/// An admin's verified token: who it is and until when the token holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedIdentity {
+    /// The Firebase uid.
+    pub uid: String,
+    /// The token's verified `exp`.
+    pub expires_at: time::OffsetDateTime,
 }
 
 /// One allowlisted account. A token is admitted only when its uid and its
@@ -234,13 +245,13 @@ impl FirebaseVerifier {
         Self::assemble(project_id, identities, None, JWK_URL, FETCH_DEADLINE, None)
     }
 
-    /// The uid behind an admin's ID token.
+    /// The uid behind an admin's ID token, and the token's verified expiry.
     ///
     /// # Errors
     ///
     /// [`Refusal`] for every reason the token is not an admin's, including the
     /// one that is not the caller's fault.
-    pub async fn verify_identity(&self, token: &str) -> Result<String, Refusal> {
+    pub async fn verify_identity(&self, token: &str) -> Result<VerifiedIdentity, Refusal> {
         if token.len() > MAX_TOKEN_BYTES {
             return Err(Refusal::NotAValidToken(
                 "token exceeds size limit".to_owned(),
@@ -275,7 +286,7 @@ impl FirebaseVerifier {
     /// Google's would make every one of those tests a network call, and the
     /// rules that matter here -- audience, issuer, expiry, and above all the
     /// allowlist -- have nothing to do with where the key came from.
-    fn check(&self, token: &str, key: &DecodingKey) -> Result<String, Refusal> {
+    fn check(&self, token: &str, key: &DecodingKey) -> Result<VerifiedIdentity, Refusal> {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.leeway = 0;
         validation.validate_nbf = true;
@@ -314,6 +325,10 @@ impl FirebaseVerifier {
         if uid.is_empty() {
             return Err(Refusal::NotAValidToken("empty subject".to_owned()));
         }
+        let expires_at = i64::try_from(data.claims.exp)
+            .ok()
+            .and_then(|exp| time::OffsetDateTime::from_unix_timestamp(exp).ok())
+            .ok_or_else(|| Refusal::NotAValidToken("expiry out of range".to_owned()))?;
 
         let email = data.claims.email.filter(|value| !value.trim().is_empty());
 
@@ -328,7 +343,7 @@ impl FirebaseVerifier {
             return Err(Refusal::IdentityNotAllowed { uid, email });
         }
 
-        Ok(uid)
+        Ok(VerifiedIdentity { uid, expires_at })
     }
 
     /// One signing key, from cache when the cache is still good.
@@ -614,10 +629,21 @@ pub(crate) mod tests {
 
     #[test]
     fn the_configured_admin_is_admitted() {
-        let uid = verifier()
+        let verified = verifier()
             .check(&token_for(ADMIN_UID), &key())
             .expect("the admin must get in");
-        assert_eq!(uid, ADMIN_UID);
+        assert_eq!(verified.uid, ADMIN_UID);
+    }
+
+    /// The result carries the token's own `exp`, so a cache sharing one
+    /// verification cannot hand it out after the token expired.
+    #[test]
+    fn the_verified_expiry_is_the_tokens_exp() {
+        let exp = chrono::Utc::now().timestamp() + 1234;
+        let verified = verifier()
+            .check(&signed_claims(serde_json::json!({"exp": exp})), &key())
+            .expect("the admin must get in");
+        assert_eq!(verified.expires_at.unix_timestamp(), exp);
     }
 
     /// The test this whole module exists for.
@@ -883,7 +909,8 @@ pub(crate) mod tests {
             verifier
                 .verify_identity(&token_for(ADMIN_UID))
                 .await
-                .unwrap(),
+                .unwrap()
+                .uid,
             ADMIN_UID
         );
     }
@@ -1071,7 +1098,8 @@ pub(crate) mod tests {
             verifier
                 .verify_identity(&token_for(ADMIN_UID))
                 .await
-                .unwrap(),
+                .unwrap()
+                .uid,
             ADMIN_UID
         );
         assert_eq!(
@@ -1112,7 +1140,8 @@ pub(crate) mod tests {
             verifier
                 .verify_identity(&token_for(ADMIN_UID))
                 .await
-                .unwrap(),
+                .unwrap()
+                .uid,
             ADMIN_UID,
             "the cached key still serves"
         );
@@ -1131,7 +1160,8 @@ pub(crate) mod tests {
             verifier
                 .verify_identity(&token_for(ADMIN_UID))
                 .await
-                .unwrap(),
+                .unwrap()
+                .uid,
             ADMIN_UID
         );
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
@@ -1189,7 +1219,8 @@ pub(crate) mod tests {
             verifier
                 .verify_identity(&token_for(ADMIN_UID))
                 .await
-                .unwrap(),
+                .unwrap()
+                .uid,
             ADMIN_UID
         );
         assert_eq!(fetches.load(Ordering::SeqCst), 1);
@@ -1221,7 +1252,7 @@ pub(crate) mod tests {
         assert!(
             verifier
                 .check(&padded, &key())
-                .is_ok_and(|uid| uid == ADMIN_UID),
+                .is_ok_and(|verified| verified.uid == ADMIN_UID),
             "without the guard this token verifies"
         );
         assert!(matches!(

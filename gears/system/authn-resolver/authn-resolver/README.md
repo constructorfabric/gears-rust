@@ -51,12 +51,13 @@ publication capability. None depends on the registry gear crate or declares it i
 The primary consumer is the API Gateway's authentication middleware:
 
 ```rust
-use authn_resolver_sdk::AuthNResolverClient;
+use authn_resolver_sdk::{AuthNResolverClient, AuthenticationRequest};
 
 let authn = hub.get::<dyn AuthNResolverClient>()?;
 
-// Authenticate a bearer token
-let result = authn.authenticate("eyJhbGciOiJSUzI1NiIs...").await?;
+// Request fresh validation.
+let request = AuthenticationRequest::new("eyJhbGciOiJSUzI1NiIs...");
+let result = authn.authenticate(&request).await?;
 let security_context = result.security_context;
 // security_context contains: subject_id, subject_tenant_id, token_scopes, bearer_token
 ```

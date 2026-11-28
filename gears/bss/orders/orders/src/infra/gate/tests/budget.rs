@@ -123,7 +123,7 @@ fn config_rejects_unknown_key_zero_and_duplicate_identity() {
 fn config_refuses_an_unresolved_empty_or_blank_commercial_identity() {
     type Break = fn(&mut CommercialIdentityConfig);
     let seller = uuid::Uuid::from_u128(7);
-    let cases: [(&str, Break); 4] = [
+    let cases: [(&str, Break); 6] = [
         ("unresolved", |i| {
             i.client_secret = secrecy::SecretString::from("${ORDERS_SECRET_NOT_SET}");
         }),
@@ -136,6 +136,13 @@ fn config_refuses_an_unresolved_empty_or_blank_commercial_identity() {
         ("blank scope", |i| {
             i.scopes = vec!["read".to_owned(), " ".to_owned()];
         }),
+        // Not an RFC 6749 scope-token: rejected at load, never on traffic.
+        ("scope with a space", |i| {
+            i.scopes = vec!["pricing read".to_owned()];
+        }),
+        ("too many scopes", |i| {
+            i.scopes = vec!["read".to_owned(); 65];
+        }),
     ];
     for (name, break_it) in cases {
         let mut id = identity(7);
@@ -144,8 +151,17 @@ fn config_refuses_an_unresolved_empty_or_blank_commercial_identity() {
             commercial_identities: vec![id],
             ..GateConfig::default()
         };
-        let message = config.validate().unwrap_err().to_string();
+        let error = config.validate().unwrap_err();
+        let message = format!("{error:#}");
         assert!(message.contains(&seller.to_string()), "{name}: {message}");
+        if name.contains("scope") {
+            assert!(
+                error
+                    .downcast_ref::<authn_resolver_sdk::ScopeSetError>()
+                    .is_some(),
+                "{name}: the ScopeSetError stays in the chain"
+            );
+        }
         assert!(
             !message.contains("ORDERS_SECRET_NOT_SET"),
             "{name}: {message}"

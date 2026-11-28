@@ -43,7 +43,10 @@ struct RejectingAuthN;
 
 #[async_trait]
 impl AuthNResolverClient for RejectingAuthN {
-    async fn authenticate(&self, _token: &str) -> Result<AuthenticationResult, AuthNResolverError> {
+    async fn authenticate(
+        &self,
+        _request: &authn_resolver_sdk::AuthenticationRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
         Err(AuthNResolverError::Unauthorized(
             "health tests: auth must never be invoked for health endpoints".to_owned(),
         ))

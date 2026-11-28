@@ -23,10 +23,7 @@ use crate::domain::ports::JwksProvider;
 use crate::infra::circuit_breaker::{HostCircuitBreakers, host_key};
 use crate::infra::oidc::OidcDiscovery;
 use crate::infra::retry::{idp_get_error, send_with_retry};
-use crate::infra::single_flight::{
-    SingleFlightGate, release_single_flight_gate as release_gate,
-    single_flight_gate_with_leadership as acquire_gate,
-};
+use crate::infra::single_flight::{SingleFlightGate, SingleFlightLease};
 use crate::infra::ttl_cache::{Timestamped, TtlCache};
 use crate::infra::url_policy::loggable_url;
 
@@ -211,9 +208,12 @@ impl JwksFetcher {
 
         // `should_refresh` is true only for the caller that created the gate.
         // Followers wait here, then re-check cache populated by the leader.
-        let (gate, should_refresh) = acquire_gate(&self.in_flight, issuer);
+        // The lease is returned on drop, so a cancelled caller cannot leave
+        // the gate behind and turn every later caller into a follower.
+        let (lease, should_refresh) =
+            SingleFlightLease::acquire_with_leadership(&self.in_flight, issuer);
         let result = {
-            let _single_flight_guard = gate.mutex.lock().await;
+            let _single_flight_guard = lease.gate().mutex.lock().await;
 
             if !should_refresh && let Some(entry) = self.cache.get_fresh(issuer) {
                 debug!(
@@ -235,7 +235,7 @@ impl JwksFetcher {
                 self.fetch_and_cache(issuer, discovery_base).await
             }
         };
-        release_gate(&self.in_flight, issuer, &gate);
+        drop(lease);
         result
     }
 
@@ -851,6 +851,78 @@ mod tests {
             1,
             "concurrent force refreshes should share one JWKS endpoint call"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_force_refresh_returns_its_lease() -> anyhow::Result<()> {
+        let server = MockServer::start();
+        let discovery_base_raw = server.url("/realms/platform");
+        let discovery_base = Url::parse(&discovery_base_raw)?;
+        let issuer = discovery_base.as_str();
+        let discovery_body = json!({
+            "issuer": discovery_base_raw.clone(),
+            "jwks_uri": server.url("/keys"),
+        });
+        server.mock(move |when, then| {
+            when.method(GET)
+                .path("/realms/platform/.well-known/openid-configuration");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(discovery_body);
+        });
+        let new_keys = serde_json::to_string(&cached_jwks_with_kid("new-kid"))?;
+        let keys = server.mock(move |when, then| {
+            when.method(GET).path("/keys");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(new_keys);
+        });
+        let discovery = Arc::new(OidcDiscovery::new_allowing_insecure_http_for_tests(
+            3600,
+            10,
+            crate::infra::idp_http::IdpHttpClient::insecure_for_tests(),
+            crate::config::default_retry_policy_config(),
+        ));
+        let fetcher = make_fetcher_with_deps(
+            JwksFetcherConfig {
+                ttl: Duration::from_hours(1),
+                stale_ttl: Duration::from_hours(24),
+                max_entries: 10,
+                refresh_on_unknown_kid: true,
+                refresh_min_interval: Duration::ZERO,
+            },
+            discovery,
+            MetricsHarness::new().metrics(),
+        );
+        fetcher.inject_cached_jwks(issuer, cached_jwks_with_kid("old-kid"));
+
+        // Another refresh holds the gate, so this one waits as a follower.
+        let (holder, leader) =
+            SingleFlightLease::acquire_with_leadership(&fetcher.in_flight, issuer);
+        assert!(leader);
+        let held = holder.gate().mutex.lock().await;
+        let mut waiter = Box::pin(fetcher.force_refresh(issuer, &discovery_base));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err(),
+            "waits while the gate is held"
+        );
+        drop(waiter);
+        drop(held);
+        drop(holder);
+        assert!(
+            fetcher.in_flight.is_empty(),
+            "the cancelled waiter's lease was returned"
+        );
+
+        // The next force refresh leads and fetches instead of joining a
+        // leaked gate and returning the fresh but outdated cached set.
+        let refreshed = fetcher.force_refresh(issuer, &discovery_base).await?;
+        assert_eq!(first_kid(&refreshed), Some("new-kid"));
+        keys.assert_calls(1);
+        assert!(fetcher.in_flight.is_empty());
         Ok(())
     }
 

@@ -9,7 +9,9 @@ async fn plugin_trait_accept_all_succeeds() {
     let service = Service::from_config(&StaticAuthNPluginConfig::default());
     let plugin: &dyn AuthNResolverPluginClient = &service;
 
-    let result = plugin.authenticate("any-token").await;
+    let result = plugin
+        .authenticate(&authn_resolver_sdk::AuthenticationRequest::new("any-token"))
+        .await;
     assert!(result.is_ok());
 }
 
@@ -18,7 +20,9 @@ async fn plugin_trait_empty_token_unauthorized() {
     let service = Service::from_config(&StaticAuthNPluginConfig::default());
     let plugin: &dyn AuthNResolverPluginClient = &service;
 
-    let result = plugin.authenticate("").await;
+    let result = plugin
+        .authenticate(&authn_resolver_sdk::AuthenticationRequest::new(""))
+        .await;
     assert!(result.is_err());
     match result.unwrap_err() {
         AuthNResolverError::Unauthorized(_) => {}
@@ -40,11 +44,7 @@ async fn plugin_trait_s2s_valid_credentials() {
     let service = Service::from_config(&cfg);
     let plugin: &dyn AuthNResolverPluginClient = &service;
 
-    let request = ClientCredentialsRequest {
-        client_id: "svc".to_owned(),
-        client_secret: SecretString::from("secret"),
-        scopes: vec![],
-    };
+    let request = ClientCredentialsRequest::new("svc".to_owned(), SecretString::from("secret"));
     let result = plugin.exchange_client_credentials(&request).await;
     assert!(result.is_ok());
 }
@@ -54,11 +54,7 @@ async fn plugin_trait_s2s_invalid_credentials() {
     let service = Service::from_config(&StaticAuthNPluginConfig::default());
     let plugin: &dyn AuthNResolverPluginClient = &service;
 
-    let request = ClientCredentialsRequest {
-        client_id: "unknown".to_owned(),
-        client_secret: SecretString::from("bad"),
-        scopes: vec![],
-    };
+    let request = ClientCredentialsRequest::new("unknown".to_owned(), SecretString::from("bad"));
     let result = plugin.exchange_client_credentials(&request).await;
     assert!(result.is_err());
     match result.unwrap_err() {

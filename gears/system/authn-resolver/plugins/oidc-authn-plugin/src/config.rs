@@ -146,6 +146,14 @@ impl OidcAuthNGearConfig {
         if clock_skew_leeway_secs > 300 {
             return Err(anyhow!("`jwt.clock_skew_leeway` must be <= 300s"));
         }
+        let authenticate_result_cache_ttl =
+            humantime::parse_duration(&jwt.authenticate_result_cache_ttl)
+                .map_err(|error| anyhow!("invalid `jwt.authenticate_result_cache_ttl`: {error}"))?;
+        if authenticate_result_cache_ttl > MAX_AUTHENTICATE_RESULT_CACHE_TTL {
+            return Err(anyhow!(
+                "`jwt.authenticate_result_cache_ttl` must be <= 300s"
+            ));
+        }
 
         let mut jwt_claim_mapping = jwt.claim_mapping;
         trim_subject_tenant_id(
@@ -274,6 +282,7 @@ impl OidcAuthNGearConfig {
                 s2s_claim_mapper,
                 claim_mapper_options,
                 s2s_default_subject_type: s2s_oauth.default_subject_type,
+                authenticate_result_cache_ttl,
                 circuit_breaker: circuit_breaker_config,
                 retry_policy: retry_policy_config,
                 s2s,
@@ -755,6 +764,10 @@ pub struct OidcPluginConfig {
     /// S2S subject-type fallback applied after claim mapping.
     pub s2s_default_subject_type: String,
 
+    /// How long a bearer-token `authenticate` result may be reused by the
+    /// caller; zero means no-store. See `jwt.authenticate_result_cache_ttl`.
+    pub authenticate_result_cache_ttl: Duration,
+
     /// Circuit-breaker behavior used for Oidc network operations.
     pub circuit_breaker: Option<CircuitBreakerConfig>,
 
@@ -780,6 +793,12 @@ pub struct JwtConfigInput {
     /// Must be less than or equal to `300s`.
     #[serde(default = "default_clock_skew_leeway")]
     pub clock_skew_leeway: String,
+    /// Maximum caller reuse of a successful bearer validation, as a [`humantime`] duration.
+    /// Measured from validation start and capped at verified JWT expiry. Zero (default),
+    /// missing expiry or elapsed expiry disables reuse. Maximum 300s to bound the delay
+    /// before new calls observe revocation or signing key removal.
+    #[serde(default = "default_authenticate_result_cache_ttl")]
+    pub authenticate_result_cache_ttl: String,
     /// Enables audience (`aud`) claim validation.
     ///
     /// When `true`, tokens without an `aud` claim are rejected.
@@ -816,6 +835,14 @@ fn default_supported_algorithms() -> Vec<String> {
 fn default_clock_skew_leeway() -> String {
     "60s".to_owned()
 }
+
+fn default_authenticate_result_cache_ttl() -> String {
+    "0s".to_owned()
+}
+
+/// Upper bound on `jwt.authenticate_result_cache_ttl`: bounds how long a
+/// revoked token or removed key can stay accepted by caching callers.
+pub const MAX_AUTHENTICATE_RESULT_CACHE_TTL: Duration = Duration::from_secs(300);
 
 fn parse_supported_algorithms(inputs: &[String]) -> Result<Vec<Algorithm>> {
     if inputs.is_empty() {
@@ -1971,6 +1998,47 @@ mod gear_input_tests {
                 .to_string()
                 .contains("`jwt.clock_skew_leeway` must be <= 300s"),
             "error should identify clock skew bound: {error}"
+        );
+    }
+
+    fn resolve_with_result_ttl(ttl: Option<&str>) -> Result<ResolvedGearConfig> {
+        let ttl = ttl.map_or_else(String::new, |ttl| {
+            format!(r#""authenticate_result_cache_ttl": "{ttl}","#)
+        });
+        let json = format!(
+            r#"{{
+            "jwt": {{
+                {ttl}
+                "trusted_issuers": [{{ "issuer": "https://oidc/realms/platform" }}],
+                "claim_mapping": {{ "subject_tenant_id": "tenant_id", "subject_type": "sub_type" }}
+            }},
+            "s2s_oauth": {{
+                "discovery_url": "https://oidc/realms/platform",
+                "default_subject_type": "{{subject_user_type}}"
+            }}
+        }}"#
+        );
+        let config: OidcAuthNGearConfig =
+            serde_json::from_str(&expand_test_gts(&json)).expect("config should deserialize");
+        config.resolve()
+    }
+
+    #[test]
+    fn authenticate_result_cache_ttl_defaults_to_no_store_and_is_bounded() {
+        let ttl = |input| {
+            resolve_with_result_ttl(input)
+                .map(|resolved| resolved.plugin.authenticate_result_cache_ttl)
+        };
+        assert_eq!(ttl(None).unwrap(), Duration::ZERO);
+        assert_eq!(ttl(Some("0s")).unwrap(), Duration::ZERO);
+        assert_eq!(ttl(Some("30s")).unwrap(), Duration::from_secs(30));
+        assert_eq!(ttl(Some("300s")).unwrap(), Duration::from_secs(300));
+        let error = ttl(Some("301s")).expect_err("over the bound");
+        assert!(error.to_string().contains("must be <= 300s"), "{error}");
+        let error = ttl(Some("soon")).expect_err("not a duration");
+        assert!(
+            error.to_string().contains("authenticate_result_cache_ttl"),
+            "{error}"
         );
     }
 

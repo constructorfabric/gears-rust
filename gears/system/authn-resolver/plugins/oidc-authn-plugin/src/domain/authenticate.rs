@@ -8,24 +8,27 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use authn_resolver_sdk::{
-    AuthNResolverError, AuthNResolverPluginClient, AuthNResolverPluginSpecV1, AuthenticationResult,
-    ClientCredentialsRequest,
+    AuthNResolverError, AuthNResolverPluginClient, AuthNResolverPluginSpecV1,
+    AuthenticationRequest, AuthenticationResult, CacheControl, ClientCredentialsRequest,
 };
+use secrecy::ExposeSecret as _;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit_macros::domain_model;
 use tracing::{debug, error, instrument};
 
-use crate::config::{INSTANCE_SUFFIX, IssuerTrustConfig, JwtValidationConfig};
+use crate::config::{
+    INSTANCE_SUFFIX, IssuerTrustConfig, JwtValidationConfig, MAX_AUTHENTICATE_RESULT_CACHE_TTL,
+};
 use crate::domain::claim_mapper::{
     ClaimMapperConfig, ClaimMapperOptions, Claims, default_config as default_claim_mapper_config,
 };
 use crate::domain::error::AuthNError;
 use crate::domain::metrics::AuthNMetrics;
-use crate::domain::ports::{ClientCredentialsExchanger, JwksProvider};
+use crate::domain::ports::{ClientCredentialsExchanger, ExchangedToken, JwksProvider};
 use crate::domain::token_type::{TokenType, detect_token_type};
 use crate::domain::validator::{JwtClaims, JwtValidator};
 
@@ -43,6 +46,8 @@ pub struct OidcAuthNPlugin {
     s2s_claim_mapper_config: ClaimMapperConfig,
     claim_mapper_options: ClaimMapperOptions,
     s2s_default_subject_type: String,
+    /// Caller reuse allowed for bearer-token results; zero means no-store.
+    authenticate_result_cache_ttl: Duration,
     /// Injected metrics handle shared across all plugin components.
     metrics: Arc<AuthNMetrics>,
     /// S2S token exchange port.
@@ -68,6 +73,7 @@ pub struct OidcAuthNPluginBuilder {
     s2s_claim_mapper_config: ClaimMapperConfig,
     claim_mapper_options: ClaimMapperOptions,
     s2s_default_subject_type: String,
+    authenticate_result_cache_ttl: Duration,
 }
 
 impl OidcAuthNPluginBuilder {
@@ -85,7 +91,17 @@ impl OidcAuthNPluginBuilder {
             s2s_claim_mapper_config: default_claim_mapper_config(),
             claim_mapper_options: ClaimMapperOptions::default(),
             s2s_default_subject_type,
+            authenticate_result_cache_ttl: Duration::ZERO,
         }
+    }
+
+    /// Permit caller reuse from validation start until the earlier of `ttl` and verified
+    /// `exp`. Zero disables reuse (default). This builder caps `ttl` at
+    /// [`MAX_AUTHENTICATE_RESULT_CACHE_TTL`] (300s). File configuration rejects larger values.
+    #[must_use]
+    pub fn authenticate_result_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.authenticate_result_cache_ttl = ttl.min(MAX_AUTHENTICATE_RESULT_CACHE_TTL);
+        self
     }
 
     /// Set the claim mapper used for bearer-token authentication.
@@ -136,6 +152,7 @@ impl OidcAuthNPluginBuilder {
             s2s_claim_mapper_config: self.s2s_claim_mapper_config,
             claim_mapper_options: self.claim_mapper_options,
             s2s_default_subject_type: self.s2s_default_subject_type,
+            authenticate_result_cache_ttl: self.authenticate_result_cache_ttl,
             metrics,
             token_exchanger,
             is_registered: AtomicBool::new(false),
@@ -238,11 +255,16 @@ impl OidcAuthNPlugin {
 
 #[async_trait]
 impl AuthNResolverPluginClient for OidcAuthNPlugin {
+    /// Validate the JWT on every call, regardless of the requested cache policy.
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
+        let bearer_token = request.bearer_token.expose_secret();
         let start = Instant::now();
+        // Reuse is authorized relative to the start: slow validation must not
+        // extend it.
+        let validation_started = time::OffsetDateTime::now_utc();
         let result = async {
             let jwt_claims = OidcAuthNPlugin::authenticate(self, bearer_token)
                 .await
@@ -267,7 +289,13 @@ impl AuthNResolverPluginClient for OidcAuthNPlugin {
                 "authentication completed"
             );
 
-            Ok(AuthenticationResult { security_context })
+            let cache_control = authenticate_cache_control(
+                self.authenticate_result_cache_ttl,
+                validation_started,
+                security_context.expires_at(),
+                time::OffsetDateTime::now_utc(),
+            );
+            Ok(AuthenticationResult::new(security_context).with_cache_control(cache_control))
         }
         .await;
 
@@ -295,32 +323,42 @@ impl AuthNResolverPluginClient for OidcAuthNPlugin {
 
         let result = async {
             // Exchange credentials for an access token (JWT).
-            let access_token = self
+            let exchanged = self
                 .token_exchanger
                 .exchange(request, &self.issuer_trust)
                 .await
                 .map_err(AuthNResolverError::from)?;
 
             // Validate the obtained JWT through the existing validation pipeline.
-            let jwt_claims = OidcAuthNPlugin::authenticate(self, &access_token)
-                .await
-                .map_err(AuthNResolverError::from)?;
+            let jwt_claims =
+                OidcAuthNPlugin::authenticate(self, exchanged.access_token.expose_secret())
+                    .await
+                    .map_err(AuthNResolverError::from)?;
 
             // Map claims to SecurityContext with the obtained token as bearer.
             // S2S service-account tokens skip first-party ratio tracking to
             // avoid skewing the interactive-user gauge.
             let claims = jwt_claims_to_map(jwt_claims);
-            let security_context = crate::domain::claim_mapper::map_with_bearer_opts(
+            let (builder, jwt_expiry) = crate::domain::claim_mapper::prepare_with_bearer(
                 &claims,
                 &self.s2s_claim_mapper_config,
                 &self.claim_mapper_options,
-                Some(&access_token),
+                Some(exchanged.access_token.expose_secret()),
                 &self.metrics,
-                false,
-                Some(self.s2s_default_subject_type.as_str()),
+                Some(crate::domain::claim_mapper::S2sMapping {
+                    default_subject_type: &self.s2s_default_subject_type,
+                }),
             )?;
 
-            Ok(AuthenticationResult { security_context })
+            // Decided after mapping, so a credential expiring meanwhile is caught.
+            let wall = time::OffsetDateTime::now_utc();
+            let (expiry, cache_control) =
+                exchange_deadlines(&exchanged, jwt_expiry, Instant::now(), wall)?;
+            let security_context = crate::domain::claim_mapper::build(match expiry {
+                Some(expiry) => builder.expires_at(expiry),
+                None => builder,
+            })?;
+            Ok(AuthenticationResult::new(security_context).with_cache_control(cache_control))
         }
         .await;
 
@@ -363,6 +401,70 @@ fn jwt_claims_to_map(jwt_claims: JwtClaims) -> Claims {
             serde_json::Map::new()
         }
     }
+}
+
+/// Bound credential expiry by both JWT and OAuth deadlines, then cap reuse at expiry.
+/// Read `wall` before `now` and project both exchange deadlines onto that pair so
+/// a backward wall-clock jump cannot extend either lifetime.
+///
+/// # Errors
+///
+/// `TokenAcquisitionFailed` when the credential has already expired: a zero
+/// `expires_in`, or a short one spent on the exchange.
+fn exchange_deadlines(
+    exchanged: &ExchangedToken,
+    jwt_expiry: Option<time::OffsetDateTime>,
+    now: Instant,
+    wall: time::OffsetDateTime,
+) -> Result<(Option<time::OffsetDateTime>, CacheControl), AuthNResolverError> {
+    let oauth_expiry = exchanged
+        .expires_at
+        .map(|deadline| exchanged.rebase(deadline, now, wall));
+    let expiry = match (jwt_expiry, oauth_expiry) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    if expiry.is_some_and(|expiry| expiry <= wall) {
+        return Err(AuthNResolverError::TokenAcquisitionFailed(
+            "acquired credential is already expired".to_owned(),
+        ));
+    }
+    let cache_until = exchanged.rebase(exchanged.cache_until, now, wall);
+    let cache_until = expiry.map_or(cache_until, |expiry| expiry.min(cache_until));
+    // A disabled or elapsed reuse policy does not expire the credential.
+    let cache_control = if cache_until > wall {
+        CacheControl::until(cache_until)
+    } else {
+        CacheControl::no_store()
+    };
+    Ok((expiry, cache_control))
+}
+
+/// Permit reuse until the earlier of verified expiry and validation start plus `ttl`.
+/// Zero TTL or a missing, elapsed or unrepresentable deadline yields no-store.
+fn authenticate_cache_control(
+    ttl: Duration,
+    validation_started: time::OffsetDateTime,
+    expires_at: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> CacheControl {
+    if ttl.is_zero() {
+        return CacheControl::no_store();
+    }
+    let Some(expires_at) = expires_at else {
+        return CacheControl::no_store();
+    };
+    let Some(until) = time::Duration::try_from(ttl)
+        .ok()
+        .and_then(|ttl| validation_started.checked_add(ttl))
+    else {
+        return CacheControl::no_store();
+    };
+    let until = until.min(expires_at);
+    if until <= now {
+        return CacheControl::no_store();
+    }
+    CacheControl::until(until)
 }
 
 #[cfg(test)]

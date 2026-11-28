@@ -187,8 +187,9 @@ method to the `Authorization` carrier.
   listener. This is a separate type from the tenant `SecurityContext`, not a nil-tenant instance of it.
 * **`PeerAuthenticated` / `PlatformIdentity` are for workload policy only** — they never substitute for tenant-plane JWT
   validation, and `PlatformSecurityContext` is never passed to the tenant `PolicyEnforcer`.
-* **Per-hop cost** is ~0.5 ms (JWKS-cached). Deferred mitigation: bounded positive-result caching in the AuthN Resolver
-  client SDK; triggered only if benchmarks exceed budget.
+* **Per-hop cost** is ~0.5 ms with cached JWKS. The default adapter validates each call. An opt-in
+  `CachingAuthenticator` can reuse a successful validation of the same token within the producer's deadline,
+  credential expiry and consumer TTL. See [inbound authentication caching](../../authorization/DESIGN.md#inbound-authentication-caching-opt-in).
 
 ### NFR impact
 

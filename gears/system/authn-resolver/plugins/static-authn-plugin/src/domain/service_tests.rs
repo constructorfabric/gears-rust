@@ -175,11 +175,8 @@ fn test_exchange_s2s_with_bearer_token() {
 
     let service = Service::from_config(&cfg);
 
-    let request = ClientCredentialsRequest {
-        client_id: "my-service".to_owned(),
-        client_secret: SecretString::from("my-secret"),
-        scopes: vec![],
-    };
+    let request =
+        ClientCredentialsRequest::new("my-service".to_owned(), SecretString::from("my-secret"));
 
     let result = service.exchange_client_credentials(&request);
     assert!(result.is_some());
@@ -200,11 +197,8 @@ fn test_exchange_s2s_with_bearer_token() {
 fn s2s_exchange_returns_identity_for_valid_credentials() {
     let service = Service::from_config(&s2s_config());
 
-    let request = ClientCredentialsRequest {
-        client_id: "my-service".to_owned(),
-        client_secret: SecretString::from("my-secret"),
-        scopes: vec![],
-    };
+    let request =
+        ClientCredentialsRequest::new("my-service".to_owned(), SecretString::from("my-secret"));
 
     let result = service.exchange_client_credentials(&request);
     assert!(result.is_some());
@@ -229,11 +223,8 @@ fn s2s_exchange_returns_identity_for_valid_credentials() {
 fn s2s_exchange_rejects_wrong_secret() {
     let service = Service::from_config(&s2s_config());
 
-    let request = ClientCredentialsRequest {
-        client_id: "my-service".to_owned(),
-        client_secret: SecretString::from("wrong-secret"),
-        scopes: vec![],
-    };
+    let request =
+        ClientCredentialsRequest::new("my-service".to_owned(), SecretString::from("wrong-secret"));
 
     let result = service.exchange_client_credentials(&request);
     assert!(result.is_none());
@@ -243,11 +234,10 @@ fn s2s_exchange_rejects_wrong_secret() {
 fn s2s_exchange_rejects_unknown_client_id() {
     let service = Service::from_config(&s2s_config());
 
-    let request = ClientCredentialsRequest {
-        client_id: "unknown-service".to_owned(),
-        client_secret: SecretString::from("my-secret"),
-        scopes: vec![],
-    };
+    let request = ClientCredentialsRequest::new(
+        "unknown-service".to_owned(),
+        SecretString::from("my-secret"),
+    );
 
     let result = service.exchange_client_credentials(&request);
     assert!(result.is_none());
@@ -257,11 +247,8 @@ fn s2s_exchange_rejects_unknown_client_id() {
 fn s2s_exchange_returns_none_with_no_credentials_configured() {
     let service = Service::from_config(&default_config());
 
-    let request = ClientCredentialsRequest {
-        client_id: "any-service".to_owned(),
-        client_secret: SecretString::from("any-secret"),
-        scopes: vec![],
-    };
+    let request =
+        ClientCredentialsRequest::new("any-service".to_owned(), SecretString::from("any-secret"));
 
     let result = service.exchange_client_credentials(&request);
     assert!(result.is_none());

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use authn_resolver_sdk::{
-    AuthNResolverError, AuthNResolverPluginClient, AuthNResolverPluginSpecV1, AuthenticationResult,
-    ClientCredentialsRequest,
+    AuthNResolverError, AuthNResolverPluginClient, AuthNResolverPluginSpecV1,
+    AuthenticationRequest, AuthenticationResult, ClientCredentialsRequest,
 };
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
@@ -28,7 +28,10 @@ struct Named(&'static str);
 
 #[async_trait]
 impl AuthNResolverPluginClient for Named {
-    async fn authenticate(&self, _token: &str) -> Result<AuthenticationResult, AuthNResolverError> {
+    async fn authenticate(
+        &self,
+        _request: &AuthenticationRequest,
+    ) -> Result<AuthenticationResult, AuthNResolverError> {
         Err(AuthNResolverError::Unauthorized(self.0.to_owned()))
     }
 
@@ -67,7 +70,10 @@ fn hub_with(registry: &Arc<MockTypesRegistry>) -> Arc<ClientHub> {
 
 /// The plugin `service` selected, by the name it refused the token with.
 async fn selected(service: &Service) -> Result<String, DomainError> {
-    match service.authenticate("token").await {
+    match service
+        .authenticate(&AuthenticationRequest::new("token"))
+        .await
+    {
         Err(DomainError::Unauthorized(name)) => Ok(name),
         Err(other) => Err(other),
         Ok(_) => panic!("a fake plugin never authenticates"),

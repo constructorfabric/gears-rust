@@ -34,7 +34,7 @@ fn identity(seller: Uuid) -> CommercialIdentityConfig {
 #[tokio::test]
 async fn service_context_is_the_exchanged_principal_of_the_configured_seller() {
     let resolver = Arc::new(FakeResolver::new(SERVICE, SELLER));
-    let authority = AuthnAuthority::new(resolver.clone(), &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(resolver.clone(), &[identity(SELLER)]).unwrap();
     let ctx = authority.service_context(SELLER).await.unwrap();
     assert_eq!(ctx.subject_id(), SERVICE);
     assert_eq!(ctx.subject_tenant_id(), SELLER);
@@ -44,14 +44,17 @@ async fn service_context_is_the_exchanged_principal_of_the_configured_seller() {
     );
     assert_eq!(
         resolver.requests.lock().as_slice(),
-        [("orders-gate".to_owned(), vec!["pricing.read".to_owned()])]
+        [(
+            "orders-gate".to_owned(),
+            Some(authn_resolver_sdk::ScopeSet::new(["pricing.read"]).unwrap())
+        )]
     );
 }
 
 #[tokio::test]
 async fn an_unconfigured_seller_is_not_provisioned_and_never_exchanges() {
     let resolver = Arc::new(FakeResolver::new(SERVICE, SELLER));
-    let authority = AuthnAuthority::new(resolver.clone(), &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(resolver.clone(), &[identity(SELLER)]).unwrap();
     let other = Uuid::from_u128(0x0e);
     assert!(matches!(
         authority.service_context(other).await,
@@ -90,7 +93,7 @@ fn configured_identities_without_a_resolver_refuse_startup() {
 async fn exchange_failures_are_typed() {
     let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.failure = Some(|| AuthNResolverError::TokenAcquisitionFailed("bad".to_owned()));
-    let authority = AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]).unwrap();
     assert!(matches!(
         authority.service_context(SELLER).await,
         Err(AuthorityError::Exchange(
@@ -99,7 +102,7 @@ async fn exchange_failures_are_typed() {
     ));
     let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.failure = Some(|| AuthNResolverError::NoPluginAvailable);
-    let authority = AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]).unwrap();
     assert!(matches!(
         authority.service_context(SELLER).await,
         Err(AuthorityError::Unavailable)
@@ -110,7 +113,7 @@ async fn exchange_failures_are_typed() {
 async fn a_hung_exchange_times_out_at_the_configured_deadline() {
     let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.stall = true;
-    let inner = Arc::new(AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]));
+    let inner = Arc::new(AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]).unwrap());
     let authority = DeadlineAuthority::new(inner, AUTHORITY_EXCHANGE_DEADLINE);
     let started = tokio::time::Instant::now();
     assert!(matches!(
@@ -131,7 +134,7 @@ async fn the_catalog_binding_bounds_its_authority_at_the_budget_deadline() {
     let budget = Arc::new(Budget::from_config(&config, Arc::new(NoGateSignals)));
     let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.stall = true;
-    let inner = Arc::new(AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]));
+    let inner = Arc::new(AuthnAuthority::new(Arc::new(resolver), &[identity(SELLER)]).unwrap());
     let binding = CatalogBinding::new(inner, AuthorityState::Bound, budget);
     let started = tokio::time::Instant::now();
     assert!(matches!(
@@ -144,10 +147,24 @@ async fn the_catalog_binding_bounds_its_authority_at_the_budget_deadline() {
 #[tokio::test]
 async fn every_call_exchanges_and_no_context_is_cached() {
     let resolver = Arc::new(FakeResolver::new(SERVICE, SELLER));
-    let authority = AuthnAuthority::new(resolver.clone(), &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(resolver.clone(), &[identity(SELLER)]).unwrap();
     authority.service_context(SELLER).await.unwrap();
     authority.service_context(SELLER).await.unwrap();
     assert_eq!(resolver.exchanges(), 2);
+}
+
+#[test]
+fn invalid_scopes_are_rejected_at_construction_naming_the_seller() {
+    let resolver = Arc::new(FakeResolver::new(SERVICE, SELLER));
+    let mut id = identity(SELLER);
+    id.scopes = vec!["pricing read".to_owned()];
+    let error = AuthnAuthority::new(resolver.clone(), &[id]).expect_err("rejected");
+    assert!(error.to_string().contains(&SELLER.to_string()), "{error:#}");
+    assert_eq!(
+        error.downcast_ref::<authn_resolver_sdk::ScopeSetError>(),
+        Some(&authn_resolver_sdk::ScopeSetError::InvalidToken { index: 0 })
+    );
+    assert_eq!(resolver.exchanges(), 0);
 }
 
 #[test]
@@ -155,7 +172,7 @@ fn debug_never_prints_the_secret() {
     let resolver = Arc::new(FakeResolver::new(SERVICE, SELLER));
     let mut id = identity(SELLER);
     id.client_secret = secrecy::SecretString::from("hunter2");
-    let text = format!("{:?}", AuthnAuthority::new(resolver, &[id]));
+    let text = format!("{:?}", AuthnAuthority::new(resolver, &[id]).unwrap());
     assert!(!text.contains("hunter2"), "{text}");
 }
 
@@ -165,14 +182,14 @@ fn debug_never_prints_the_secret() {
 #[tokio::test]
 async fn an_exchanged_principal_outside_the_seller_or_not_a_service_is_misprovisioned() {
     let elsewhere = Arc::new(FakeResolver::new(SERVICE, Uuid::from_u128(0x40e)));
-    let authority = AuthnAuthority::new(elsewhere, &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(elsewhere, &[identity(SELLER)]).unwrap();
     assert!(matches!(
         authority.service_context(SELLER).await,
         Err(AuthorityError::Misprovisioned)
     ));
     let mut untyped = FakeResolver::new(SERVICE, SELLER);
     untyped.subject_type = None;
-    let authority = AuthnAuthority::new(Arc::new(untyped), &[identity(SELLER)]);
+    let authority = AuthnAuthority::new(Arc::new(untyped), &[identity(SELLER)]).unwrap();
     assert!(matches!(
         authority.service_context(SELLER).await,
         Err(AuthorityError::Misprovisioned)

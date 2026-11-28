@@ -48,6 +48,8 @@ serde = { workspace = true }
 postcard = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
+# `SecurityContext::expires_at` (RFC 3339 on the wire).
+time = { workspace = true }
 # A denial on the platform auth plane, and cache saturation on its hot path,
 # both used to be invisible in production. Not optional: `shared_secret` is
 # compiled unconditionally.

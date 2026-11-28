@@ -1,4 +1,6 @@
 //! Explicit operator configuration. Unknown settings and unsafe lock routes fail boot.
+use anyhow::Context as _;
+use authn_resolver_sdk::{ScopeSet, ScopeSetError};
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use toolkit_macros::ExpandVars;
@@ -212,15 +214,27 @@ pub struct CommercialIdentityConfig {
     /// The client secret reference.
     #[expand_vars]
     pub client_secret: SecretString,
-    /// Requested scopes.
+    /// Requested scopes; empty requests the `IdP` defaults. Each must be an RFC 6749
+    /// scope-token, checked by [`GateConfig::validate`] and parsed once by
+    /// [`Self::scope_set`].
     #[serde(default)]
     pub scopes: Vec<String>,
+}
+
+impl CommercialIdentityConfig {
+    /// The configured scopes as a validated set; `None` requests the `IdP` defaults.
+    ///
+    /// # Errors
+    /// A scope is not an RFC 6749 scope-token, or the list exceeds the `ScopeSet` bounds.
+    pub fn scope_set(&self) -> Result<Option<ScopeSet>, ScopeSetError> {
+        ScopeSet::optional(&self.scopes)
+    }
 }
 
 impl GateConfig {
     /// Reject a deadline (port, authority exchange or acceptance) outside `1..=60000` ms, a
     /// duplicated seller identity, an empty or unresolved (`${`) `client_secret`, a blank
-    /// `client_id` or scope, a per-caller limit outside `1..=600`, an out-of-range `gate.breaker`
+    /// `client_id`, scopes that are not valid RFC 6749 scope-tokens, a per-caller limit outside `1..=600`, an out-of-range `gate.breaker`
     /// value, and
     /// `dev_stubs` without the `gate-dev-stubs` feature or without a fixture path.
     ///
@@ -264,11 +278,12 @@ impl GateConfig {
                 "bss-orders: gate.commercial_identities[{}]: client_id must not be blank",
                 identity.seller_tenant_id
             );
-            anyhow::ensure!(
-                identity.scopes.iter().all(|s| !s.trim().is_empty()),
-                "bss-orders: gate.commercial_identities[{}]: a scope is blank",
-                identity.seller_tenant_id
-            );
+            identity.scope_set().with_context(|| {
+                format!(
+                    "bss-orders: gate.commercial_identities[{}]: invalid scopes",
+                    identity.seller_tenant_id
+                )
+            })?;
         }
         for (key, value) in [
             (

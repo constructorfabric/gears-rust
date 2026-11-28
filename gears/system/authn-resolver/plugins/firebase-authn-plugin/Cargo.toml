@@ -37,6 +37,7 @@ jsonwebtoken = { workspace = true }
 thiserror = { workspace = true }
 http = { workspace = true }
 secrecy = { workspace = true }
+time = { workspace = true }
 
 [dev-dependencies]
 toolkit = { workspace = true, features = ["test-support"] }

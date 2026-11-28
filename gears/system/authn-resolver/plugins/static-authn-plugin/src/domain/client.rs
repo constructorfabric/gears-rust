@@ -5,18 +5,21 @@
 
 use async_trait::async_trait;
 use authn_resolver_sdk::{
-    AuthNResolverError, AuthNResolverPluginClient, AuthenticationResult, ClientCredentialsRequest,
+    AuthNResolverError, AuthNResolverPluginClient, AuthenticationRequest, AuthenticationResult,
+    ClientCredentialsRequest,
 };
+use secrecy::ExposeSecret as _;
 
 use super::service::Service;
 
 #[async_trait]
 impl AuthNResolverPluginClient for Service {
+    /// Look up the token on every call.
     async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResult, AuthNResolverError> {
-        self.authenticate(bearer_token)
+        self.authenticate(request.bearer_token.expose_secret())
             .ok_or_else(|| AuthNResolverError::Unauthorized("invalid token".to_owned()))
     }
 

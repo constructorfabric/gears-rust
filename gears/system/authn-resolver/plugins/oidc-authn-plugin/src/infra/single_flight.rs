@@ -35,21 +35,13 @@ impl SingleFlightGate {
     }
 }
 
-/// Acquires the per-key gate, creating it if absent, and discards the leadership flag.
-pub fn single_flight_gate(
-    in_flight: &DashMap<String, Arc<SingleFlightGate>>,
-    key: &str,
-) -> Arc<SingleFlightGate> {
-    single_flight_gate_with_leadership(in_flight, key).0
-}
-
 /// Acquire the per-key gate and report whether this caller created it.
 ///
 /// The boolean is `true` for the first caller for `key`; that caller is
 /// responsible for doing the underlying work. Later callers get `false`, wait on
 /// the same gate, and can reuse whatever result/cache state the first caller
 /// produced.
-pub fn single_flight_gate_with_leadership(
+fn single_flight_gate_with_leadership(
     in_flight: &DashMap<String, Arc<SingleFlightGate>>,
     key: &str,
 ) -> (Arc<SingleFlightGate>, bool) {
@@ -67,8 +59,53 @@ pub fn single_flight_gate_with_leadership(
     }
 }
 
+/// A lease on the gate for one key, released on drop. The only way to take
+/// one: cancellation while waiting for or holding [`SingleFlightGate::mutex`]
+/// releases the lease, and the last holder removes the gate.
+pub struct SingleFlightLease<'a> {
+    in_flight: &'a DashMap<String, Arc<SingleFlightGate>>,
+    key: &'a str,
+    gate: Arc<SingleFlightGate>,
+}
+
+impl<'a> SingleFlightLease<'a> {
+    /// Acquire the gate for `key`, creating it if absent.
+    pub fn acquire(in_flight: &'a DashMap<String, Arc<SingleFlightGate>>, key: &'a str) -> Self {
+        Self::acquire_with_leadership(in_flight, key).0
+    }
+
+    /// Acquire the gate for `key` and report whether this caller created it.
+    ///
+    /// The first caller for `key` gets `true` and does the underlying work.
+    /// Later callers get `false`, wait on the same gate, and can reuse what
+    /// the first caller produced.
+    pub fn acquire_with_leadership(
+        in_flight: &'a DashMap<String, Arc<SingleFlightGate>>,
+        key: &'a str,
+    ) -> (Self, bool) {
+        let (gate, leader) = single_flight_gate_with_leadership(in_flight, key);
+        let lease = Self {
+            in_flight,
+            key,
+            gate,
+        };
+        (lease, leader)
+    }
+
+    /// The leased gate.
+    pub fn gate(&self) -> &SingleFlightGate {
+        &self.gate
+    }
+}
+
+impl Drop for SingleFlightLease<'_> {
+    fn drop(&mut self) {
+        release_single_flight_gate(self.in_flight, self.key, &self.gate);
+    }
+}
+
 /// Releases a lease on `gate` and removes it from `in_flight` once no holders remain.
-pub fn release_single_flight_gate(
+fn release_single_flight_gate(
     in_flight: &DashMap<String, Arc<SingleFlightGate>>,
     key: &str,
     gate: &Arc<SingleFlightGate>,

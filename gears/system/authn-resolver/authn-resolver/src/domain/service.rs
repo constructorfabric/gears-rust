@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use authn_resolver_sdk::{
-    AuthNResolverPluginClient, AuthNResolverPluginSpecV1, AuthenticationResult,
-    ClientCredentialsRequest,
+    AuthNResolverPluginClient, AuthNResolverPluginSpecV1, AuthenticationRequest,
+    AuthenticationResult, ClientCredentialsRequest,
 };
 use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance, is_discovery_outage};
@@ -127,7 +127,8 @@ impl Service {
         Ok(gts_id)
     }
 
-    /// Authenticate a bearer token via the selected plugin.
+    /// Authenticate a bearer token via the selected plugin, forwarding the
+    /// request (including its cache control) unchanged.
     ///
     /// # Errors
     ///
@@ -136,11 +137,11 @@ impl Service {
     #[tracing::instrument(skip_all)]
     pub async fn authenticate(
         &self,
-        bearer_token: &str,
+        request: &AuthenticationRequest,
     ) -> Result<AuthenticationResult, DomainError> {
         let plugin = self.get_plugin().await?;
         plugin
-            .authenticate(bearer_token)
+            .authenticate(request)
             .await
             .map_err(DomainError::from)
     }
