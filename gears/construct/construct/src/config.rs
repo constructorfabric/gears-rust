@@ -352,7 +352,8 @@ impl ConstructConfig {
             // their spelling here; a name that no schema has matches no step, so it admits nothing.
             return Err(InvalidConfig(format!(
                 "admission.entity_kinds names {unknown:?}, which is not spelled as an entity kind: lower-case \
-                 letters, digits and `_`, starting with a letter, at most 40 characters"
+                 letters, digits and `_`, starting with a letter, at most {} characters",
+                crate::domain::profile_schema::MAX_NAME
             )));
         }
         let floor = admission.confidence_floor;

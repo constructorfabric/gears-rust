@@ -391,3 +391,21 @@ fn a_name_the_process_keeps_already_costs_nothing_and_a_fresh_one_costs_one() {
         "a removed kind added back"
     );
 }
+
+#[test]
+fn a_property_that_compiles_alone_but_not_as_a_member_of_the_node_is_refused() {
+    // Alone its root `$schema` is not read and it compiles as draft 7; nested, it is a resource of its own with
+    // its own dialect, where `items` as an array is no schema.
+    let mut kind = pets();
+    kind.properties.push(PropertyDoc {
+        name: "tags".to_owned(),
+        required: false,
+        schema: json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/tags",
+            "items": [{ "type": "string" }]
+        }),
+    });
+    let reason = refusal(&[SchemaChange::AddNodeKind { kind }]);
+    assert!(reason.contains("together"), "{reason}");
+}

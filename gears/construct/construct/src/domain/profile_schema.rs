@@ -281,6 +281,21 @@ fn check_properties(what: &str, properties: &[PropertyDoc]) -> Result<(), Schema
                 ))
             })?;
     }
+    // A schema that compiles alone can fail once it is a member of the object a node holds, as one that names its
+    // own dialect and `$id` does: the whole is what every message of the person is checked against, and graph
+    // storage compiles it nested too. Checked here, a refusal charges the person no names.
+    let members: serde_json::Map<String, serde_json::Value> = properties
+        .iter()
+        .map(|property| (property.name.clone(), property.schema.clone()))
+        .collect();
+    jsonschema::options()
+        .with_draft(Draft::Draft7)
+        .build(&serde_json::json!({ "type": "object", "properties": members }))
+        .map_err(|error| {
+            SchemaRefusal(format!(
+                "the properties of {what} do not make a valid JSON schema together: {error}"
+            ))
+        })?;
     Ok(())
 }
 
