@@ -388,7 +388,7 @@ pub fn register_schema_routes(
         .description(
             "Add or remove node kinds, link kinds and their properties while the gear runs. \
              The changes are applied in order to a copy and checked as a whole: one that \
-             breaks a rule (an invalid JSON schema, a name already in use, a link to a kind \
+             breaks a rule (an invalid JSON schema, or one with a `$ref` that starts with `#`, a name already in use, a link to a kind \
              that does not exist, a kind graph storage refuses) refuses the request with 422 \
              and the schema does not change (any failure after the names it brought in were \
              charged, such as a refusal by graph storage or a lost race, leaves them charged to \

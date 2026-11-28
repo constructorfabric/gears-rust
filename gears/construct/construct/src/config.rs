@@ -349,10 +349,10 @@ impl ConstructConfig {
             .find(|kind| !crate::domain::profile_schema::name_ok(kind))
         {
             // A person's host may add kinds to that person's schema at run time, so the names are checked for
-            // their spelling here; a name no schema has never meets a step, so it admits nothing.
+            // their spelling here; a name that no schema has matches no step, so it admits nothing.
             return Err(InvalidConfig(format!(
                 "admission.entity_kinds names {unknown:?}, which is not spelled as an entity kind: lower-case \
-                 letters, digits and `_`, starting with a letter"
+                 letters, digits and `_`, starting with a letter, at most 40 characters"
             )));
         }
         let floor = admission.confidence_floor;

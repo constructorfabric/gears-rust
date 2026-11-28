@@ -803,8 +803,9 @@ impl GraphPlanWriter {
 
 #[async_trait]
 impl PlanWriter for GraphPlanWriter {
-    /// Reads the profile, builds the plan's one ingest, sends it and runs the
-    /// cleanup, every graph storage call by `deadline`.
+    /// Reads the profile, builds the plan's one ingest, reads the person's schema once more and answers a conflict
+    /// when it changed since the write began, sends the ingest and runs the cleanup, every graph storage call by
+    /// `deadline`.
     #[tracing::instrument(skip_all, fields(tenant_id = %plan.tenant_id, subject_id = %plan.subject_id))]
     async fn write_by(
         &self,

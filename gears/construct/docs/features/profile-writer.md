@@ -403,7 +403,7 @@ applied in order to a copy and checked as a whole, so all hold or none is made.
   and 32 properties a kind. A refusal answers 422 with the reason and the schema does not change. Any failure after the names were charged (a refusal or an outage of graph storage, a change that loses a race, a database error) leaves them charged to the person; a refusal by the rules, or by the budget, charges nothing.
 - **From the next message**: the planner, the profile read and the writer read the person's schema when they start.
   A message being planned finishes with the catalog it started with; the write then reads the schema again, so a
-  change that lands between the two can refuse that message's write, which is dropped as any failed write is. The writer also reads the schema once more just before it stores, and answers a conflict when it differs from the one the write was built on. A change landing after that check leaves a node of a removed kind hidden from every read, until the next change, an erasure or the retention period sweeps it.
+  change that lands between the two can refuse that message's write. The writer also reads the schema once more just before it stores, and answers a conflict when it differs from the one the write was built on; the message is planned again, up to the re-run limit, and dropped only then. A change landing after that check leaves a node of a removed kind hidden from every read, until the next change, an erasure or the retention period sweeps it, unless a change adds the kind back before then: the node then shows again as a live fact, under the kind's new property schema.
 - **Graph storage**: a change registers the types of the schema for the person, under the per-person prefix, before it
   is stored; graph storage's refusal, such as a removed kind added again with a schema it holds as incompatible, is the
   answer and the schema does not change. Graph storage has no call to remove a type, so a removed kind stays registered, unused.
@@ -411,7 +411,7 @@ applied in order to a copy and checked as a whole, so all hold or none is made.
   own, are forgotten in one write. From the moment the schema is stored those nodes are in no read: the profile
   read, the planner and the subject's own view skip a node of a kind the schema does not have. If the removal fails or
   the process stops before it, the nodes stay in graph storage, hidden, and the call answers 503 and says so. Sending an
-  empty change (`{"changes": []}`) or any other change finishes the removal; sending the same removal again is refused,
+  empty change (`{"changes": []}`) or any other change that does not add the kind back finishes the removal; sending the same removal again is refused,
   as the kind is gone, and a change that adds the kind back does not finish it: the nodes show again with the kind. An erasure and the retention
   period remove such nodes too, and the removal is logged on the audit target with the node count. A message planned just before the change can still write a node of the removed kind;
   it is hidden and swept the same way. The kind also leaves the owners and link ends that name it; a link kind left

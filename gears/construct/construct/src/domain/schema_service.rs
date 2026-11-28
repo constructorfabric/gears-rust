@@ -90,7 +90,7 @@ pub trait SchemaEvents: Send + Sync {
 }
 
 /// A person's schema and its version: how many times it was changed, an erasure counting as one. Version 0 is the
-/// default schema nobody changed.
+/// default schema of a person with no row.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaView {

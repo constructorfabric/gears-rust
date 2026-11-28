@@ -104,10 +104,12 @@ pub struct SubjectSchemaDto {
     #[schema(value_type = String)]
     pub subject_id: Uuid,
     /// The schema: `nodes`, the node kinds with their properties, and `links`, the link kinds with the kinds at their
-    /// ends and their fields. Each property is a name and its JSON schema (draft 7).
+    /// ends and their fields. Each property is a name and its JSON schema (draft 7), with no `$ref` that starts with `#`: graph storage would resolve
+    /// it against the node.
     #[schema(value_type = Object)]
     pub schema: SchemaDoc,
-    /// How many times the schema was changed; 0 for the default schema nobody changed.
+    /// How many times the schema was changed, an erasure counting as one; 0 for the default schema of a person with no
+    /// row.
     pub version: i64,
 }
 
