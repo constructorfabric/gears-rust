@@ -53,6 +53,29 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(run([alert(1, "a/b.rs")], [entry(expires="2026-11-12")]), 0)
 
 
+class CommitBindingTest(unittest.TestCase):
+    def inst(self, sha: str) -> dict:
+        a = alert(1, "a/b.rs")
+        a["most_recent_instance"]["commit_sha"] = sha
+        return a
+
+    def test_matching_commit_passes(self) -> None:
+        self.assertIsNone(codeql_gate.commit_mismatch("abc", [self.inst("abc")], "abc"))
+
+    def test_no_alerts_still_requires_matching_analysis(self) -> None:
+        self.assertIsNone(codeql_gate.commit_mismatch("abc", [], "abc"))
+        self.assertIsNotNone(codeql_gate.commit_mismatch("def", [], "abc"))
+
+    def test_missing_analysis_fails_closed(self) -> None:
+        self.assertIsNotNone(codeql_gate.commit_mismatch(None, [], "abc"))
+
+    def test_alert_on_another_commit_fails_closed(self) -> None:
+        self.assertIsNotNone(codeql_gate.commit_mismatch("abc", [self.inst("def")], "abc"))
+
+    def test_missing_sha_fails_closed(self) -> None:
+        self.assertIsNotNone(codeql_gate.commit_mismatch("abc", [], ""))
+
+
 class AllowlistValidationTest(unittest.TestCase):
     def _load(self, text: str):
         import tempfile

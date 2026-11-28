@@ -12,7 +12,11 @@ after that date it stops suppressing. An entry may carry `alert = N` to accept o
 alert number instead of every alert of the rule in the matching path. Dismissing the alert in the Security tab also
 works: dismissed alerts are not open.
 
-Environment: GH_TOKEN, GITHUB_REPOSITORY, GITHUB_REF (set by Actions).
+The alerts API is keyed by ref (branch), not by commit, so the gate first requires that the
+latest CodeQL analysis of the ref is the one for GITHUB_SHA and that every alert's most recent
+instance is on that commit; otherwise it fails closed (a later push was analysed first, re-run).
+
+Environment: GH_TOKEN, GITHUB_REPOSITORY, GITHUB_REF, GITHUB_SHA (set by Actions).
 Tests call `evaluate()` directly with alerts and allowlist entries; the CLI takes no file paths.
 """
 import datetime
@@ -22,18 +26,46 @@ import os
 import subprocess
 import sys
 import tomllib
+import urllib.parse
 
 BLOCKING = {"high", "critical"}
 ALLOWLIST = ".github/codeql-allowlist.toml"
 
 
-def fetch_alerts(repo: str, ref: str) -> list[dict]:
+def gh_api(path: str) -> list[dict]:
     out = subprocess.run(
-        ["gh", "api", "--paginate", "--slurp",
-         f"repos/{repo}/code-scanning/alerts?state=open&tool_name=CodeQL&ref={ref}&per_page=100"],
+        ["gh", "api", "--paginate", "--slurp", path],
         check=True, capture_output=True, text=True,
     ).stdout
     return [a for page in json.loads(out) for a in page]
+
+
+def fetch_alerts(repo: str, ref: str) -> list[dict]:
+    q = urllib.parse.quote(ref, safe="")
+    return gh_api(f"repos/{repo}/code-scanning/alerts?state=open&tool_name=CodeQL&ref={q}&per_page=100")
+
+
+def fetch_latest_analysis_sha(repo: str, ref: str) -> str | None:
+    """Commit SHA of the most recent CodeQL analysis of `ref` (the API lists newest first)."""
+    q = urllib.parse.quote(ref, safe="")
+    out = subprocess.run(
+        ["gh", "api", f"repos/{repo}/code-scanning/analyses?tool_name=CodeQL&ref={q}&per_page=1"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    analyses = json.loads(out)
+    return analyses[0].get("commit_sha") if analyses else None
+
+
+def commit_mismatch(latest_sha: str | None, alerts: list[dict], sha: str) -> str | None:
+    """Reason the results cannot be tied to `sha`, or None when they are."""
+    if not sha:
+        return "GITHUB_SHA is not set"
+    if latest_sha != sha:
+        return f"the latest CodeQL analysis of the ref is for {latest_sha}, not {sha}"
+    stale = [a["number"] for a in alerts if a["most_recent_instance"].get("commit_sha") != sha]
+    if stale:
+        return f"alert(s) {stale} have a most recent instance on another commit than {sha}"
+    return None
 
 
 def load_allowlist(path: str) -> list[dict]:
@@ -94,7 +126,13 @@ def evaluate(alerts: list[dict], entries: list[dict], today: str) -> int:
 
 
 def main() -> int:
-    alerts = fetch_alerts(os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"])
+    repo, ref, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"], os.environ.get("GITHUB_SHA", "")
+    alerts = fetch_alerts(repo, ref)
+    reason = commit_mismatch(fetch_latest_analysis_sha(repo, ref), alerts, sha)
+    if reason:
+        print(f"::error::CodeQL results cannot be tied to the commit being released: {reason}. "
+              "Failing closed; re-run once the analysis of this commit is the latest.")
+        return 1
     return evaluate(alerts, load_allowlist(ALLOWLIST), datetime.date.today().isoformat())
 
 
