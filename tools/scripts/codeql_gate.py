@@ -30,6 +30,8 @@ import urllib.parse
 
 BLOCKING = {"high", "critical"}
 ALLOWLIST = ".github/codeql-allowlist.toml"
+# Categories uploaded by .github/workflows/codeql.yml (`/language:<matrix.language>`); a test keeps them in sync.
+EXPECTED_CATEGORIES = {"/language:rust", "/language:python", "/language:actions"}
 
 
 def gh_api(path: str) -> list[dict]:
@@ -45,23 +47,32 @@ def fetch_alerts(repo: str, ref: str) -> list[dict]:
     return gh_api(f"repos/{repo}/code-scanning/alerts?state=open&tool_name=CodeQL&ref={q}&per_page=100")
 
 
-def fetch_latest_analysis_sha(repo: str, ref: str) -> str | None:
-    """Commit SHA of the most recent CodeQL analysis of `ref` (the API lists newest first)."""
+def fetch_analyses(repo: str, ref: str) -> list[dict]:
+    """Processed CodeQL analyses of `ref`, newest first. Uploads still being processed are not listed."""
     q = urllib.parse.quote(ref, safe="")
     out = subprocess.run(
-        ["gh", "api", f"repos/{repo}/code-scanning/analyses?tool_name=CodeQL&ref={q}&per_page=1"],
+        ["gh", "api", f"repos/{repo}/code-scanning/analyses?tool_name=CodeQL&ref={q}&per_page=100"],
         check=True, capture_output=True, text=True,
     ).stdout
-    analyses = json.loads(out)
-    return analyses[0].get("commit_sha") if analyses else None
+    return json.loads(out)
 
 
-def commit_mismatch(latest_sha: str | None, alerts: list[dict], sha: str) -> str | None:
-    """Reason the results cannot be tied to `sha`, or None when they are."""
+def commit_mismatch(analyses: list[dict], alerts: list[dict], sha: str) -> str | None:
+    """Reason the results cannot be tied to `sha`, or None when they are.
+
+    Needs the newest processed analysis of the ref to be for `sha`, one processed analysis of
+    `sha` per expected category (a SARIF upload still being processed is not listed, and the
+    analyze step's wait for processing is bounded), and every alert on `sha`.
+    """
     if not sha:
         return "GITHUB_SHA is not set"
-    if latest_sha != sha:
-        return f"the latest CodeQL analysis of the ref is for {latest_sha}, not {sha}"
+    latest = analyses[0].get("commit_sha") if analyses else None
+    if latest != sha:
+        return f"the latest processed CodeQL analysis of the ref is for {latest}, not {sha}"
+    done = {a.get("category") for a in analyses if a.get("commit_sha") == sha}
+    missing = sorted(EXPECTED_CATEGORIES - done)
+    if missing:
+        return f"no processed analysis of {sha} for {', '.join(missing)} (upload missing or still processing)"
     stale = [a["number"] for a in alerts if a["most_recent_instance"].get("commit_sha") != sha]
     if stale:
         return f"alert(s) {stale} have a most recent instance on another commit than {sha}"
@@ -128,7 +139,7 @@ def evaluate(alerts: list[dict], entries: list[dict], today: str) -> int:
 def main() -> int:
     repo, ref, sha = os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF"], os.environ.get("GITHUB_SHA", "")
     alerts = fetch_alerts(repo, ref)
-    reason = commit_mismatch(fetch_latest_analysis_sha(repo, ref), alerts, sha)
+    reason = commit_mismatch(fetch_analyses(repo, ref), alerts, sha)
     if reason:
         print(f"::error::CodeQL results cannot be tied to the commit being released: {reason}. "
               "Failing closed; re-run once the analysis of this commit is the latest.")

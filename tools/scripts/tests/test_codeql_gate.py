@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -53,6 +54,13 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(run([alert(1, "a/b.rs")], [entry(expires="2026-11-12")]), 0)
 
 
+CATS = sorted(codeql_gate.EXPECTED_CATEGORIES)
+
+
+def analyses(sha: str, cats=CATS) -> list[dict]:
+    return [{"commit_sha": sha, "category": c} for c in cats]
+
+
 class CommitBindingTest(unittest.TestCase):
     def inst(self, sha: str) -> dict:
         a = alert(1, "a/b.rs")
@@ -60,20 +68,33 @@ class CommitBindingTest(unittest.TestCase):
         return a
 
     def test_matching_commit_passes(self) -> None:
-        self.assertIsNone(codeql_gate.commit_mismatch("abc", [self.inst("abc")], "abc"))
+        self.assertIsNone(codeql_gate.commit_mismatch(analyses("abc"), [self.inst("abc")], "abc"))
 
     def test_no_alerts_still_requires_matching_analysis(self) -> None:
-        self.assertIsNone(codeql_gate.commit_mismatch("abc", [], "abc"))
-        self.assertIsNotNone(codeql_gate.commit_mismatch("def", [], "abc"))
+        self.assertIsNone(codeql_gate.commit_mismatch(analyses("abc"), [], "abc"))
+        self.assertIsNotNone(codeql_gate.commit_mismatch(analyses("def"), [], "abc"))
 
     def test_missing_analysis_fails_closed(self) -> None:
-        self.assertIsNotNone(codeql_gate.commit_mismatch(None, [], "abc"))
+        self.assertIsNotNone(codeql_gate.commit_mismatch([], [], "abc"))
+
+    def test_newer_commit_analysed_first_fails_closed(self) -> None:
+        self.assertIsNotNone(codeql_gate.commit_mismatch(analyses("def") + analyses("abc"), [], "abc"))
+
+    def test_category_still_processing_fails_closed(self) -> None:
+        self.assertIsNotNone(codeql_gate.commit_mismatch(analyses("abc", CATS[:-1]), [], "abc"))
 
     def test_alert_on_another_commit_fails_closed(self) -> None:
-        self.assertIsNotNone(codeql_gate.commit_mismatch("abc", [self.inst("def")], "abc"))
+        self.assertIsNotNone(codeql_gate.commit_mismatch(analyses("abc"), [self.inst("def")], "abc"))
 
     def test_missing_sha_fails_closed(self) -> None:
-        self.assertIsNotNone(codeql_gate.commit_mismatch("abc", [], ""))
+        self.assertIsNotNone(codeql_gate.commit_mismatch(analyses("abc"), [], ""))
+
+    def test_expected_categories_match_workflow_matrix(self) -> None:
+        wf = (Path(__file__).resolve().parents[3] / ".github/workflows/codeql.yml").read_text()
+        m = re.search(r"language:\s*\[([^\]]+)\]", wf)
+        self.assertIsNotNone(m)
+        langs = {x.strip() for x in m.group(1).split(",")}
+        self.assertEqual({f"/language:{x}" for x in langs}, codeql_gate.EXPECTED_CATEGORIES)
 
 
 class AllowlistValidationTest(unittest.TestCase):
