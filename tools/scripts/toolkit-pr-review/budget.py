@@ -1,26 +1,9 @@
 #!/usr/bin/env python3
-"""Cost estimation for toolkit-pr-review.
+"""Estimate review input tokens before starting model calls.
 
-Review work is split **by subject, not by file**: six agents, one rule module each, and
-every one of them reads the whole diff. This module estimates what that costs before the
-run starts, so an oversized PR is refused at `prepare` rather than discovered on the bill.
-
-Why this replaces the file-sharding packer that used to live here, measured on the five
-PRs the original skill reviewed (4676, 4705, 4738, 4777, 4778):
-
-| design                | agents | rules per agent | findings | reproduced the original |
-|-----------------------|--------|-----------------|----------|-------------------------|
-| one agent per shard   |   27   |  55-94 KB       |   156    |  44%                    |
-| two agents per shard   |   49   |  46 KB          |   241    |  53%                    |
-| six subject agents    |   35   |  11-21 KB       |   197    |  58%                    |
-
-Splitting by file forces every agent to carry every rule, because an agent that owns only
-some files must still apply all rules to them. Splitting by subject is what keeps a single
-agent's rule load small, and that load is the variable that moved the numbers.
-
-Subject agents cost more than file shards (+55% tokens here) because the diff is read six
-times instead of once. That is the trade this design makes deliberately: the duplicated
-reads are what let one agent see a defect and its consequence in two different files.
+Each subject module reads the scoped diff and source. The pipeline estimate includes
+separate discovery/evidence passes plus collect, matching and formatting. It is a
+planning estimate, not a tokenizer, billing total or limit on source exploration.
 """
 
 from __future__ import annotations
@@ -97,3 +80,18 @@ def agent_costs(corpus_tokens: int, diff_tokens: int) -> dict[str, int]:
 
 def total_cost(corpus_tokens: int, diff_tokens: int) -> int:
     return sum(agent_costs(corpus_tokens, diff_tokens).values())
+
+
+def pipeline_costs(corpus_tokens: int, diff_tokens: int) -> tuple[dict[str, int], int]:
+    """Two source passes per module, plus draft/receipt and post-processing input.
+
+    This is a planning estimate, not a cap on source exploration or a billing claim.
+    Closure may need unchanged consumers beyond this initial corpus.
+    """
+    policy = sum(_size(p) for p in (DOCS / "policies").glob("*.*"))
+    costs = {m: 2 * (n + est_tokens(policy)) + 8_000
+             for m, n in agent_costs(corpus_tokens, diff_tokens).items()}
+    # Architecture also needs targeted full-source context during closure.
+    costs["architecture"] += corpus_tokens
+    post = 3 * (est_tokens(policy) + 12_000)  # collect, history matching, format
+    return costs, post

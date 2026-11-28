@@ -17,3 +17,7 @@ Open additional docs only when relevant:
 - If the task adds/changes dependencies (Cargo.toml), introduces a new crate, involves working with 3rd-party crates (such as those for serialization/deserialization), open `@/guidelines/DEPENDENCIES.md`.
 
 - If the task touches ToolKit/Gear architecture (Gear layout, `@/lib/toolkit*`, plugins, REST wiring, ClientHub, OpenAPI, lifecycle/stateful tasks, SSE, standardized HTTP errors), open `@/docs/toolkit_unified_system/README.md`.
+
+## ToolKit Rust review entrypoint
+
+For toolkit-pr-review, follow `.claude/skills/toolkit-pr-review/SKILL.md` and its frozen Python gates. Other workflows, including Constructor Studio, remain separate.

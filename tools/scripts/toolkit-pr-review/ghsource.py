@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import subprocess
 from urllib.parse import quote
 
@@ -23,8 +24,26 @@ class SourceError(RuntimeError):
     pass
 
 
+# Repository-local variables exported by Git hooks must not redirect an explicit cwd.
+GIT_LOCATION_VARS = frozenset({
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE", "GIT_REPLACE_REF_BASE",
+    "GIT_NO_REPLACE_OBJECTS", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_QUARANTINE_PATH",
+})
+
+
+def git_environment() -> dict[str, str]:
+    """Preserve the caller environment except Git's repository/config routing overrides."""
+    return {key: value for key, value in os.environ.items()
+            if key not in GIT_LOCATION_VARS
+            and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+
+
 def run(cmd: list[str], check: bool = True) -> str:
-    p = subprocess.run(cmd, capture_output=True, text=True)
+    p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       env=git_environment() if cmd[0] == "git" else None)
     if check and p.returncode != 0:
         raise SourceError(f"{' '.join(cmd[:3])}...: {p.stderr.strip()[:300]}")
     return p.stdout
@@ -72,7 +91,7 @@ def ensure_objects(repo: str, pr: int | None, shas: list[str]) -> bool:
     def have(sha: str) -> bool:
         return subprocess.run(
             ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
-            capture_output=True,
+            capture_output=True, env=git_environment(),
         ).returncode == 0
 
     if all(have(s) for s in shas):
@@ -90,7 +109,7 @@ def ensure_objects(repo: str, pr: int | None, shas: list[str]) -> bool:
 
 
 def read_blob_git(sha: str, path: str) -> bytes | None:
-    p = subprocess.run(["git", "cat-file", "-p", f"{sha}:{path}"], capture_output=True)
+    p = subprocess.run(["git", "cat-file", "-p", f"{sha}:{path}"], capture_output=True, env=git_environment())
     return p.stdout if p.returncode == 0 else None
 
 
@@ -109,7 +128,7 @@ def read_blob_api(repo: str, sha: str, path: str) -> bytes | None:
 
 
 def blob_size_git(sha: str, path: str) -> int | None:
-    p = subprocess.run(["git", "cat-file", "-s", f"{sha}:{path}"], capture_output=True, text=True)
+    p = subprocess.run(["git", "cat-file", "-s", f"{sha}:{path}"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=git_environment())
     if p.returncode != 0:
         return None
     try:
@@ -143,7 +162,7 @@ def local_base(base_ref: str | None, branch: str) -> str:
         if not cand:
             continue
         if subprocess.run(["git", "rev-parse", "--verify", "--quiet", cand],
-                          capture_output=True).returncode == 0:
+                          capture_output=True, env=git_environment()).returncode == 0:
             mb = run(["git", "merge-base", cand, branch], check=False).strip()
             if mb:
                 return mb

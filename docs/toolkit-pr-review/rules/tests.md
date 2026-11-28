@@ -25,7 +25,7 @@ test files or test modules, integration tests under `tests/`, test helper functi
 A `TEST-QUALITY-9` finding about a deleted test in a file that still exists anchors on the removed
 line itself: set `"side": "LEFT"` and take `line` from that file's `ranges.left` in `context.json`.
 If the file's `status` is `deleted` it has no line on either side that survives as a comment target,
-so omit `line` and `side` entirely rather than guessing.
+use subject=file with line=null and side=null rather than guessing.
 
 ## Check IDs to Apply
 
