@@ -399,11 +399,11 @@ applied in order to a copy and checked as a whole, so all hold or none is made.
   `profile_schema_changed`.
 - **Rules**: names are lower case letters, digits and `_` and at most 40 characters; `origin`, `record`, `learned` and
   `owner` are reserved; a name may not repeat; a kind's key is one of its properties; an owner or a link end names a
-  kind of the schema; every property is a JSON schema (draft 7). A schema holds at most 64 node kinds, 64 link kinds
+  kind of the schema; every property is a JSON schema (draft 7) with no `$ref` into the document (`#`, `#/..`), as graph storage places a property in the node's own type, where such a reference would resolve against the node. A schema holds at most 64 node kinds, 64 link kinds
   and 32 properties a kind. A refusal answers 422 with the reason and the schema does not change. Any failure after the names were charged (a refusal or an outage of graph storage, a change that loses a race, a database error) leaves them charged to the person; a refusal by the rules, or by the budget, charges nothing.
 - **From the next message**: the planner, the profile read and the writer read the person's schema when they start.
   A message being planned finishes with the catalog it started with; the write then reads the schema again, so a
-  change that lands between the two can refuse that message's write, which is dropped as any failed write is.
+  change that lands between the two can refuse that message's write, which is dropped as any failed write is. The writer also reads the schema once more just before it stores, and answers a conflict when it differs from the one the write was built on. A change landing after that check leaves a node of a removed kind hidden from every read, until the next change, an erasure or the retention period sweeps it.
 - **Graph storage**: a change registers the types of the schema for the person, under the per-person prefix, before it
   is stored; graph storage's refusal, such as a removed kind added again with a schema it holds as incompatible, is the
   answer and the schema does not change. Graph storage has no call to remove a type, so a removed kind stays registered, unused.

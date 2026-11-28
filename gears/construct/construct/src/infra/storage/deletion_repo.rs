@@ -337,8 +337,11 @@ impl DeletionStore for DeletionTables {
                         .map_err(map_scope_error)?;
                     // The schema the host set holds the person's own kind names and descriptions: an erased person
                     // starts anew with the default schema. The row stays, with its count of the names the process
-                    // keeps for the person, so erasing does not give the person a new budget for them.
-                    SubjectSchemaEntity::update_many()
+                    // keeps for the person, so erasing does not give the person a new budget for them. A person with
+                    // no row gets one, at version 1 with nothing charged: a change that read the person's schema as
+                    // absent before the erasure then finds the row when it inserts its own, and conflicts, rather
+                    // than storing its kind names after the erasure.
+                    let reset = SubjectSchemaEntity::update_many()
                         .secure()
                         .scope_with(&scope)
                         .filter(
@@ -346,7 +349,10 @@ impl DeletionStore for DeletionTables {
                                 .add(schemas::Column::TenantId.eq(key.tenant_id))
                                 .add(schemas::Column::SubjectId.eq(key.subject_id)),
                         )
-                        .col_expr(schemas::Column::SchemaJson, Expr::value(default_schema))
+                        .col_expr(
+                            schemas::Column::SchemaJson,
+                            Expr::value(default_schema.clone()),
+                        )
                         .col_expr(
                             schemas::Column::Version,
                             Expr::col(schemas::Column::Version).add(1),
@@ -354,6 +360,22 @@ impl DeletionStore for DeletionTables {
                         .exec(tx)
                         .await
                         .map_err(map_scope_error)?;
+                    if reset.rows_affected == 0 {
+                        let fence = schemas::ActiveModel {
+                            tenant_id: ActiveValue::Set(key.tenant_id),
+                            subject_id: ActiveValue::Set(key.subject_id),
+                            schema_json: ActiveValue::Set(default_schema),
+                            names_charged: ActiveValue::Set(0),
+                            version: ActiveValue::Set(1),
+                        };
+                        SubjectSchemaEntity::insert(fence.clone())
+                            .secure()
+                            .scope_with_model(&scope, &fence)
+                            .map_err(map_scope_error)?
+                            .exec(tx)
+                            .await
+                            .map_err(map_scope_error)?;
+                    }
                     Ok(true)
                     // @cpt-end:cpt-cf-construct-algo-erasure-erase:p1:inst-erase-finish
                 })

@@ -398,8 +398,8 @@ pub fn register_schema_routes(
              this call. Removing a node kind forgets all its nodes after the new schema is \
              stored; they are hidden from every read from then on. When that removal fails \
              the answer is 503 and the schema is already changed: send an empty change \
-             (`{\"changes\": []}`) or any other change to finish it; sending the same \
-             removal again is refused, as the kind is gone. Owner only: another person's \
+             (`{\"changes\": []}`) or any other change that does not add the removed kind \
+             back to finish it; sending the same removal again is refused, as the kind is gone. Owner only: another person's \
              schema is refused with 403.",
         )
         .tag(SUBJECT_SCHEMA_TAG)

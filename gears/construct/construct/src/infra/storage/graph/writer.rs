@@ -883,6 +883,15 @@ impl PlanWriter for GraphPlanWriter {
             // @cpt-end:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-full
             built => built?,
         };
+        // The schema the write was built on must still be the person's: a change that stored its schema meanwhile
+        // may have removed a kind of this plan, and the write would keep a node that no read shows. The caller
+        // plans again on the new schema. A change landing after this check leaves such a node hidden, as any
+        // node of a removed kind is, until the next change, an erasure or the retention period sweeps it.
+        let current = by(deadline, self.schemas.schema(*subject.key())).await?;
+        if *current != *schema {
+            tracing::debug!("the person's schema changed while the write was built");
+            return Ok(Written::Conflict);
+        }
         match self.ingest(ctx, request, deadline).await? {
             Written::Stored => {
                 // @cpt-begin:cpt-cf-construct-algo-profile-writer-write:p1:inst-write-cleanup

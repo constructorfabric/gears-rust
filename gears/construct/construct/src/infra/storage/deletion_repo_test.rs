@@ -860,3 +860,54 @@ async fn an_erasure_resets_the_schema_to_the_default_and_keeps_the_count_of_name
     };
     assert_eq!(untouched.doc, changed);
 }
+
+#[tokio::test]
+async fn a_schema_change_that_read_no_row_conflicts_with_an_erasure_that_finished_first() {
+    use crate::domain::profile_schema::{SchemaLookup, SchemaStore, SubjectSchemaRepository as _};
+    use construct_sdk::linked_schema::default_schema;
+    use construct_sdk::schema_doc::SchemaDoc;
+
+    let t = tables().await;
+    let key = subject();
+    let conn = t.db.conn().expect("connection");
+    let repo = crate::infra::storage::subject_schema_repo::SeaOrmSubjectSchemaRepository::new();
+    let scope = toolkit_security::AccessScope::allow_all();
+    t.store
+        .mark(&tenant_scope(key), key, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    // The change reads the person's schema: no row.
+    assert!(matches!(
+        repo.find(&conn, &scope, key).await.unwrap(),
+        SchemaLookup::Absent
+    ));
+
+    assert!(finish_marked(&t, key).await);
+
+    let mut changed = SchemaDoc::of(&default_schema());
+    changed.links.clear();
+    assert!(
+        matches!(
+            repo.reserve_names(&conn, &scope, key, None, &changed, 0, 3)
+                .await
+                .unwrap(),
+            SchemaStore::Conflict
+        ),
+        "its charge finds the erasure's row"
+    );
+    assert!(
+        matches!(
+            repo.store(&conn, &scope, key, None, &changed, 3)
+                .await
+                .unwrap(),
+            SchemaStore::Conflict
+        ),
+        "so does its store"
+    );
+    let SchemaLookup::Stored(row) = repo.find(&conn, &scope, key).await.unwrap() else {
+        panic!("the erasure left a row");
+    };
+    assert_eq!(row.doc, SchemaDoc::of(&default_schema()));
+    assert_eq!(row.names_charged, 0);
+    assert!(row.version >= 1);
+}

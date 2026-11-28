@@ -304,7 +304,7 @@ fn link_fields_and_link_kinds_are_added_and_removed() {
 }
 
 #[test]
-fn properties_that_compile_alone_but_not_together_are_refused() {
+fn a_local_ref_that_would_not_resolve_in_the_node_is_refused() {
     let mut kind = pets();
     kind.properties.push(PropertyDoc {
         name: "alias".to_owned(),
@@ -312,7 +312,25 @@ fn properties_that_compile_alone_but_not_together_are_refused() {
         schema: json!({ "$ref": "#/definitions/x", "definitions": { "x": { "type": "string" } } }),
     });
     let reason = refusal(&[SchemaChange::AddNodeKind { kind }]);
-    assert!(reason.contains("together"), "{reason}");
+    assert!(reason.contains("reference into the document"), "{reason}");
+}
+
+#[test]
+fn a_reference_into_the_document_is_refused_in_a_property_schema() {
+    for schema in [
+        json!({ "$ref": "#" }),
+        json!({ "type": "object", "properties": { "next": { "$ref": "#" } } }),
+        json!({ "anyOf": [{ "type": "string" }, { "$ref": "#/definitions/x" }] }),
+    ] {
+        let mut kind = pets();
+        kind.properties.push(PropertyDoc {
+            name: "branch".to_owned(),
+            required: false,
+            schema,
+        });
+        let reason = refusal(&[SchemaChange::AddNodeKind { kind }]);
+        assert!(reason.contains("reference into the document"), "{reason}");
+    }
 }
 
 #[test]

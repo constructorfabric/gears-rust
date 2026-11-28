@@ -201,8 +201,7 @@ impl OneStepPath {
     ///
     /// # Errors
     ///
-    /// Internal when no person type has `property`, a stored fact's own
-    /// property; [`DomainError::InvalidValue`] for a value its schema does
+    /// [`DomainError::InvalidValue`] for a value its schema does
     /// not take; `pend`'s error; unavailable when the profile kept changing;
     /// may have been written when the writer failed.
     #[allow(
@@ -226,12 +225,11 @@ impl OneStepPath {
         PF: Future<Output = Result<(), DomainError>>,
     {
         let catalog = self.catalogs.of(key).await?;
-        let spec = catalog.kind(property).ok_or_else(|| {
-            DomainError::internal(format!(
-                "stored fact {} has property `{property}`, which is no kind of the schema",
-                fact.0
-            ))
-        })?;
+        // A kind the schema no longer has: the person's host removed it after the fact was read, and the fact is
+        // hidden from every read now, so the correction finds it gone as the reread would.
+        let Some(spec) = catalog.kind(property) else {
+            return Ok(OneStepDone::Skipped(Gone));
+        };
         spec.check(value)
             .map_err(|rule| DomainError::InvalidValue {
                 field: "value",

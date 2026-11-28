@@ -216,7 +216,8 @@ pub fn removed_node_kinds(old: &SchemaDoc, new: &SchemaDoc) -> Vec<String> {
         .collect()
 }
 
-fn name_ok(name: &str) -> bool {
+/// Whether `name` is spelled as a kind or property name may be.
+pub(crate) fn name_ok(name: &str) -> bool {
     let mut chars = name.chars();
     name.len() <= MAX_NAME
         && chars.next().is_some_and(|first| first.is_ascii_lowercase())
@@ -261,6 +262,15 @@ fn check_properties(what: &str, properties: &[PropertyDoc]) -> Result<(), Schema
                 property.name
             ));
         }
+        // Graph storage places a property in the node's own type, where a reference to the document (`#`, `#/..`)
+        // resolves against the node, not against the property: such a schema would be accepted here and refuse the
+        // values it describes there.
+        if let Some(reference) = local_ref(&property.schema) {
+            return refuse(format!(
+                "property `{}` of {what} refers to `{reference}`: a reference into the document is not allowed in a property schema",
+                property.name
+            ));
+        }
         jsonschema::options()
             .with_draft(Draft::Draft7)
             .build(&property.schema)
@@ -271,8 +281,8 @@ fn check_properties(what: &str, properties: &[PropertyDoc]) -> Result<(), Schema
                 ))
             })?;
     }
-    // A schema that compiles alone can fail once it is a member of the object a node holds, as one with a local
-    // `$ref` does: the whole is what every message of the person is checked against.
+    // A schema that compiles alone can fail once it is a member of the object a node holds: the whole is what
+    // every message of the person is checked against.
     let members: serde_json::Map<String, serde_json::Value> = properties
         .iter()
         .map(|property| (property.name.clone(), property.schema.clone()))
@@ -286,6 +296,23 @@ fn check_properties(what: &str, properties: &[PropertyDoc]) -> Result<(), Schema
             ))
         })?;
     Ok(())
+}
+
+/// The first `$ref` in `schema` that points into the document it is in, if any.
+fn local_ref(schema: &serde_json::Value) -> Option<&str> {
+    match schema {
+        serde_json::Value::Object(map) => {
+            map.iter()
+                .find_map(|(key, value)| match (key.as_str(), value) {
+                    ("$ref", serde_json::Value::String(target)) if target.starts_with('#') => {
+                        Some(target.as_str())
+                    }
+                    _ => local_ref(value),
+                })
+        }
+        serde_json::Value::Array(items) => items.iter().find_map(local_ref),
+        _ => None,
+    }
 }
 
 /// Checks the rules a schema keeps: names, sizes, no duplicate, a key that is a property, every kind a link or an

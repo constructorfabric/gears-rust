@@ -2829,3 +2829,43 @@ async fn the_directory_hands_on_graph_storages_cursor_and_leaves_out_a_root_it_c
     assert!(logs_contain("has no payload"));
     assert!(logs_contain("is not the root of subject"));
 }
+
+/// Answers the default schema once, then a schema without links: the person's host changed it during a write.
+struct ChangesAfterFirstRead(AtomicU32);
+
+#[async_trait]
+impl crate::domain::profile_schema::ProfileSchemas for ChangesAfterFirstRead {
+    async fn schema(
+        &self,
+        _key: crate::domain::subject_settings::SubjectKey,
+    ) -> Result<Arc<construct_sdk::linked_schema::Schema>, DomainError> {
+        let mut doc = construct_sdk::schema_doc::SchemaDoc::of(
+            &construct_sdk::linked_schema::default_schema(),
+        );
+        if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+            doc.links.clear();
+        }
+        Ok(Arc::new(doc.build()))
+    }
+}
+
+#[tokio::test]
+async fn a_write_whose_schema_changed_while_it_was_built_stores_nothing_and_conflicts() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let writer = profiles
+        .writer()
+        .with_schemas(Arc::new(ChangesAfterFirstRead(AtomicU32::new(0))));
+
+    let written = writer
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await
+        .expect("the write answers");
+
+    assert!(matches!(written, Written::Conflict), "{written:?}");
+    let profile = profiles.read().await;
+    assert_eq!(profile.version, Some(1), "nothing was stored");
+}
