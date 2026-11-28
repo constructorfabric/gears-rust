@@ -29,6 +29,12 @@
 - [ ] Use valid Gears DESIGN IDs and priority markers from the template
 
 ### Semantic
+- [ ] Follow cross-gear dependency rules and `SecurityContext`/middleware boundaries from `{gears_md}`
+- [ ] For REST/API, error, auth, OData, lifecycle, or DB-access design decisions, follow the relevant chapter(s) of `{toolkit_unified_system}`
+- [ ] Document security boundaries against `{gears_security}` and FIPS-sensitive behavior against `{fips_requirements}` when applicable
+- [ ] Follow `{testing_policy}` when defining testability/test-layering expectations
+- [ ] Before designing bespoke storage, check `{gears_md}`'s gear catalog for an existing gear that already covers the need (for example a generic graph-based storage gear); when adopting an existing gear as-is, record the evaluation and outcome as an ADR — see `{repo_adrs}`, `{repo_arch}`, and gear-local `docs/ADR/` directories when present for this repo's reuse-vs-build precedent
+- [ ] Before scoping new functionality, check `{gears_md}`'s gear catalog, `{repo_playbook}`'s broader standards/tooling map, `{repo_arch}` for existing cross-cutting DESIGN precedent, and candidate existing gears' `PRD.md`/`DESIGN.md` for overlap with functionality that already exists or is already planned
 - [ ] Trace design elements to PRD, ADR, and UPSTREAM_REQS IDs when those sources exist
 - [ ] Preserve PRD intent and scope; document any deviation as an explicit approved scope change
 - [ ] Cover referenced ADR decisions and keep ADR and PRD links valid

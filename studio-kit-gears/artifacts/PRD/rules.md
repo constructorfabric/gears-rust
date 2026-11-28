@@ -29,6 +29,9 @@
 - [ ] Use valid Gears PRD IDs and priority markers from the template
 
 ### Semantic
+- [ ] Follow `{iso_29148}` for requirements-standard conventions
+- [ ] Before capturing requirements for a new or evolving gear, check `{gears_md}`'s gear catalog, `{repo_playbook}`'s broader standards/tooling map, and candidate existing gears' `PRD.md`/`DESIGN.md` for functionality that already covers, or is already planned for, the same need
+- [ ] For cross-cutting product requirements, check `{repo_arch}` for existing precedent PRDs (e.g. FIPS at `{fips_requirements}`)
 - [ ] Author requirements as WHAT and WHY, not implementation HOW
   - VALID: "The gear returns the submitted message together with the caller's tenant"
   - INVALID: "The handler deserializes the body with serde and calls `ctx.tenant_id()`"

@@ -1,0 +1,63 @@
+# Constructor Studio Gears Kit - CI/build command facade.
+# Kit-owned, user-editable mapping from a logical operation name (used by
+# modules/code-stage-router.md and docs/TESTING.md's local CI routing table)
+# to the real shell command this repository runs for it.
+#
+# Why this file exists: code-stage-router.md's GearsCodeClose/GearsCodeChainSweep
+# units gate on real local commands (build+lint+test, full workspace check,
+# dependency policy, per-condition heavier lanes). Those commands used to be
+# hardcoded literal `make ...` invocations directly in the PDSL prose, which only
+# work inside this exact repository's own Makefile. A kit installed standalone
+# (outside the constructorfabric/gears-rust checkout) into a project with a
+# different or absent Makefile would otherwise fail on the very first gate
+# command with a plain "No rule to make target" error.
+#
+# A standalone install should edit THIS file to point each operation at
+# whatever this project's own equivalent command is (a different Makefile
+# target, a plain `cargo` invocation, a shell script, anything) — never edit
+# modules/code-stage-router.md's or docs/TESTING.md's prose to do this; those
+# files describe *when*/*why* a gate applies, this file is the only place that
+# says *what command* actually runs. Leave a command as an empty string ("")
+# to mean "this operation has no equivalent in this project, skip it" —
+# GearsCodeClose/GearsCodeChainSweep already treat an empty mapped command as
+# a no-op, not an error.
+#
+# <GEAR> is substituted by the calling PDSL unit before the command is run; it
+# is a plain per-invocation placeholder, not a `{variable}` kit-manifest
+# reference (resolved separately via `cfs resolve-vars`). `e2e_local` below
+# deliberately uses `run_e2e.py`'s `--gear` discovery mode (every e2e-launcher
+# suite whose Cargo features include this gear, no-op if none match) rather
+# than `--suite`, since GEARS_GEAR is the only value the calling PDSL unit
+# actually tracks — there is no mechanical GEAR -> SUITE mapping (suite names
+# under testing/e2e/suites/ don't consistently mirror gear directory names).
+#
+# The defaults below are this repository's own real commands — confirmed
+# against the live Makefile and docs/TESTING.md §7.4 at the time this file was
+# written. If `make`'s target list here ever drifts from the real Makefile,
+# trust the Makefile and update this file to match, the same rule
+# docs/TESTING.md §7.3/7.4 already state for themselves.
+
+# Always-required per-slice gate (GearsCodeClose's base check, every close).
+gear_ci = "make gear-ci GEAR=<GEAR>"
+dylint = "make dylint"
+
+# Chain-sweep's fuller local pass (fmt + clippy + full test suite + dependency
+# policy, the latter only transitively via `check`'s own `security` ->
+# `deny fips-policy` chain, not a direct target of `check` itself), run once
+# when the gear's whole planned chain just finished — see GearsCodeChainSweep
+# in modules/code-stage-router.md.
+full_check = "make check GEAR=<GEAR>"
+
+# Conditionally-routed checks — docs/TESTING.md §7.4 is the authoritative table
+# for *which condition* maps to *which one of these*; this file only supplies
+# the command string each named operation actually runs.
+deny = "make deny"
+shear = "make shear"
+openapi = "make openapi GEAR=<GEAR>"
+gts_docs = "make gts-docs"
+test_fips = "make test-fips"
+test_graph_storage = "make test-graph-storage"
+test_onnx_embedding_plugin = "cargo test -p cf-gears-graph-storage-onnx-embedding-plugin"
+test_onnx_embedding_compile_check = "cargo check -p cf-gears-graph-storage --features onnx"
+test_magika = "cargo test -p cf-gears-file-parser --features magika"
+e2e_local = "make e2e-local GEAR=<GEAR>"

@@ -249,7 +249,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Links to machine-readable schemas/types are provided (when available)
 - [ ] Schema location in repo specified
 - [ ] Schema/type format specified (JSON Schema, TypeScript, OpenAPI, etc.)
-- [ ] If the domain model uses GTS identifiers, type schemas, well-known instances, traits, or type registries, validate the modeling against `guidelines/GTS.md`
+- [ ] If the domain model uses GTS identifiers, type schemas, well-known instances, traits, or type registries, validate the modeling against `{guidelines_gts}`
 
 ### ARCH-DESIGN-006: API Contracts Authority
 **Severity**: CRITICAL
@@ -267,7 +267,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] REST routes use the framework's canonical OperationBuilder/operation-registration pattern, including explicit response and error metadata
 - [ ] Error envelopes use the canonical Problem/RFC-9457 shape when exposed over HTTP
 - [ ] Wire errors avoid stack traces, internal diagnostics, secrets, and implementation-only identifiers
-- [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `guidelines/GTS.md` appropriately instead of closed string enums where extensibility/semantics are required
+- [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `{guidelines_gts}` appropriately instead of closed string enums where extensibility/semantics are required
 
 ### ARCH-DESIGN-007: Interaction Sequences
 **Severity**: HIGH
@@ -289,7 +289,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Internal vs external interfaces distinguished
 - [ ] Coupling between components minimized
 - [ ] Cohesion within components maximized
-- [ ] If extensibility is type-driven, ensure the design references `guidelines/GTS.md` for extension-point modeling
+- [ ] If extensibility is type-driven, ensure the design references `{guidelines_gts}` for extension-point modeling
 
 ### ARCH-DESIGN-009: Technology Stack Alignment
 **Severity**: MEDIUM
@@ -347,6 +347,13 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] ADR links include a clear trace to PRD context or requirement IDs
 - [ ] Design references to ADRs are complete and do not omit critical decisions
 - [ ] Any deviation from ADR decisions is explicitly justified and approved
+
+### SEM-DESIGN-005: DECOMPOSITION/FEATURE Realization Consistency
+**Severity**: CRITICAL
+
+- [ ] Every realized DECOMPOSITION feature entry and FEATURE document is still consistent with DESIGN's components, constraints, principles, and sequences as DESIGN currently reads — not as DESIGN stood when that FEATURE was authored
+- [ ] A DESIGN amendment made after an earlier FEATURE's slice was already closed does not silently invalidate that slice's already-implemented behavior
+- [ ] DECOMPOSITION's feature boundaries still match DESIGN's current component boundaries; no component was split, merged, or reassigned in DESIGN without DECOMPOSITION being updated to match
 
 ---
 
@@ -429,7 +436,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] API endpoint authorization documented
 - [ ] Least privilege principle applied
 - [ ] Privilege escalation prevention documented
-- [ ] If authorization depends on type/category/discriminator values, check whether `guidelines/GTS.md` should be used for type-driven permissions and extensible authorization semantics
+- [ ] If authorization depends on type/category/discriminator values, check whether `{guidelines_gts}` should be used for type-driven permissions and extensible authorization semantics
 
 ### SEC-DESIGN-003: Data Protection
 **Severity**: CRITICAL
@@ -598,7 +605,7 @@ Before evaluating each checklist item, the expert MUST:
 - [ ] Integration middleware documented (if applicable)
 - [ ] API gateway strategy documented (if applicable)
 - [ ] Service mesh strategy documented (if applicable)
-- [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `guidelines/GTS.md` appropriately instead of closed string enums where extensibility/semantics are required
+- [ ] If API discriminator fields, resource types, or extensible constants are modeled, validate that the design uses `{guidelines_gts}` appropriately instead of closed string enums where extensibility/semantics are required
 
 ### INT-DESIGN-002: External System Integration
 **Severity**: HIGH
@@ -1041,11 +1048,11 @@ For quick reviews, use this condensed table format:
 
 When reviewing PRs that add or change design documents, additionally focus on:
 
-- [ ] Alignment with existing architecture (`docs/ARCHITECTURE_MANIFEST.md`)
+- [ ] Alignment with existing architecture (`{architecture_manifest}`)
 - [ ] Trade-off analysis — are alternatives considered and justified?
 - [ ] API contract consistency with existing endpoints and conventions
 - [ ] Security considerations — authentication, authorization, data protection
-- [ ] If the design touches GTS identifiers, type schemas, well-known instances, discriminator/const-enum-like values, `x-gts-traits` / `x-gts-traits-schema`, type registries, or type-driven authorization/extension points, review it against `guidelines/GTS.md`
+- [ ] If the design touches GTS identifiers, type schemas, well-known instances, discriminator/const-enum-like values, `x-gts-traits` / `x-gts-traits-schema`, type registries, or type-driven authorization/extension points, review it against `{guidelines_gts}`
 - [ ] Compliance with `artifacts/DESIGN/template.md` template structure
 - [ ] Identify antipatterns — god objects, leaky abstractions, tight coupling
 - [ ] Compare proposed design with existing industry patterns in SaaS platforms

@@ -5,7 +5,7 @@ manifest_version = "1.0"
 [[kits]]
 slug = "gears"
 name = "Gears"
-version = "0.1.0"
+version = "0.2.0"
 
 [[kits.resources]]
 id = "prd_template"
@@ -257,6 +257,119 @@ user_modifiable = true
 public = true
 
 [[kits.resources]]
+id = "skill_toolkit_pr_review"
+kind = "skill"
+source = ".claude/skills/toolkit-pr-review"
+install_path = ".claude/skills/toolkit-pr-review"
+type = "directory"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "skill_gear_creator"
+kind = "skill"
+source = ".claude/skills/gear-creator"
+install_path = ".claude/skills/gear-creator"
+type = "directory"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_architecture"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-architecture.md"
+install_path = ".claude/agents/toolkit-pr-review-architecture.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_async"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-async.md"
+install_path = ".claude/agents/toolkit-pr-review-async.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_design"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-design.md"
+install_path = ".claude/agents/toolkit-pr-review-design.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_errors"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-errors.md"
+install_path = ".claude/agents/toolkit-pr-review-errors.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_security"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-security.md"
+install_path = ".claude/agents/toolkit-pr-review-security.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_tests"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-tests.md"
+install_path = ".claude/agents/toolkit-pr-review-tests.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "agent_toolkit_pr_review_toolkit"
+kind = "agent"
+source = ".claude/agents/toolkit-pr-review-toolkit.md"
+install_path = ".claude/agents/toolkit-pr-review-toolkit.md"
+type = "file"
+user_modifiable = true
+public = true
+mode = "readonly"
+tools = ["Read", "Bash"]
+
+[[kits.resources]]
+id = "workflow_toolkit_review"
+kind = "skill"
+source = "studio-kit-gears/workflows/toolkit-review.md"
+install_path = "workflows/toolkit-review.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
+id = "workflow_gear_creator"
+kind = "skill"
+source = "studio-kit-gears/workflows/gear-creator.md"
+install_path = "workflows/gear-creator.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
 id = "workflow_coding"
 kind = "skill"
 source = "studio-kit-gears/workflows/coding.md"
@@ -275,6 +388,15 @@ user_modifiable = true
 public = true
 
 [[kits.resources]]
+id = "workflow_init"
+kind = "skill"
+source = "studio-kit-gears/workflows/init.md"
+install_path = "workflows/init.md"
+type = "file"
+user_modifiable = true
+public = true
+
+[[kits.resources]]
 id = "scripts"
 kind = "script"
 source = "studio-kit-gears/scripts"
@@ -287,6 +409,22 @@ id = "change_impact_config"
 kind = "script"
 source = "studio-kit-gears/scripts/change-impact-analysis.toml"
 install_path = "scripts/change-impact-analysis.toml"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "ci_commands"
+kind = "script"
+source = "studio-kit-gears/scripts/ci-commands.toml"
+install_path = "scripts/ci-commands.toml"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "project_paths"
+kind = "script"
+source = "studio-kit-gears/scripts/project-paths.toml"
+install_path = "scripts/project-paths.toml"
 type = "file"
 user_modifiable = true
 
@@ -392,6 +530,162 @@ id = "gears_code_phase"
 kind = "other"
 source = "studio-kit-gears/plans/code-phase.md"
 install_path = "plans/code-phase.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "ensure_dna_script"
+kind = "script"
+source = "studio-kit-gears/scripts/ensure-dna.py"
+install_path = "scripts/ensure-dna.py"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "iso_29148"
+kind = "other"
+source = "studio-kit-gears/artifacts/ISO_29148.md"
+install_path = "artifacts/ISO_29148.md"
+type = "file"
+user_modifiable = true
+
+# Repo-wide convention docs cited by codebase/ and artifacts/*/rules.md via {var}
+# placeholders. Declared here so a kit installed outside this gears-rust checkout gets its
+# own copy, and the kit never hardcodes an install-specific path (see studio-kit-gears/README.md).
+
+[[kits.resources]]
+id = "gears_md"
+kind = "other"
+source = "docs/GEARS.md"
+install_path = "docs/GEARS.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "architecture_manifest"
+kind = "other"
+source = "docs/ARCHITECTURE_MANIFEST.md"
+install_path = "docs/ARCHITECTURE_MANIFEST.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "toolkit_unified_system"
+kind = "directory"
+source = "docs/toolkit_unified_system"
+install_path = "docs/toolkit_unified_system"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "toolkit_pr_review_docs"
+kind = "directory"
+source = "docs/toolkit-pr-review"
+install_path = "docs/toolkit-pr-review"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "toolkit_pr_review_scripts"
+kind = "script"
+source = "tools/scripts/toolkit-pr-review"
+install_path = "tools/scripts/toolkit-pr-review"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "repo_adrs"
+kind = "directory"
+source = "docs/adrs"
+install_path = "docs/adrs"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "guidelines_readme"
+kind = "other"
+source = "guidelines/README.md"
+install_path = "guidelines/README.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "guidelines_security"
+kind = "other"
+source = "guidelines/SECURITY.md"
+install_path = "guidelines/SECURITY.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "guidelines_dependencies"
+kind = "other"
+source = "guidelines/DEPENDENCIES.md"
+install_path = "guidelines/DEPENDENCIES.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "guidelines_gts"
+kind = "other"
+source = "guidelines/GTS.md"
+install_path = "guidelines/GTS.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "dna_root"
+kind = "directory"
+source = "guidelines/DNA"
+install_path = "guidelines/DNA"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "testing_policy"
+kind = "other"
+source = "docs/TESTING.md"
+install_path = "docs/TESTING.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "e2e_guide"
+kind = "other"
+source = "testing/e2e/README.md"
+install_path = "testing/e2e/README.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "fips_requirements"
+kind = "directory"
+source = "docs/security/fips"
+install_path = "docs/security/fips"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "gears_security"
+kind = "other"
+source = "docs/security/SECURITY.md"
+install_path = "docs/security/SECURITY.md"
+type = "file"
+user_modifiable = true
+
+[[kits.resources]]
+id = "repo_arch"
+kind = "directory"
+source = "docs/arch"
+install_path = "docs/arch"
+type = "directory"
+user_modifiable = true
+
+[[kits.resources]]
+id = "repo_playbook"
+kind = "other"
+source = "docs/REPO_PLAYBOOK.md"
+install_path = "docs/REPO_PLAYBOOK.md"
 type = "file"
 user_modifiable = true
 

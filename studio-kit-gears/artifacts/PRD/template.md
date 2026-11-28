@@ -84,7 +84,7 @@ REQUIREMENT LANGUAGE:
 
 ## 3. Operational Concept & Environment
 
-> **Note**: Runtime, OS, architecture, lifecycle policy, and integration patterns are defined once at the project/foundational level, not per gear. **Before writing this section, identify and link the foundational documents that actually exist in this repository** — these are typically repository-level: an architecture manifest (e.g. `docs/ARCHITECTURE_MANIFEST.md`) and the foundational `guidelines/`. Additionally, if this gear sits beneath a parent system/gear that has its own PRD, link that parent/root PRD too. Link only the sources that actually exist; don't invent a root PRD if this gear has no parent one. Document only gear-specific deviations here. **Delete this section if no special constraints.**
+> **Note**: Runtime, OS, architecture, lifecycle policy, and integration patterns are defined once at the project/foundational level, not per gear. **Before writing this section, identify and link the foundational documents that actually exist in this repository** — these are typically repository-level: an architecture manifest (e.g. `{architecture_manifest}`) and the foundational guidelines (`{guidelines_readme}` indexes `{guidelines_security}`, `{guidelines_dependencies}`, and `{dna_root}`; `{guidelines_gts}` is a separate, review-stage-only resource not indexed there). Additionally, if this gear sits beneath a parent system/gear that has its own PRD, link that parent/root PRD too. Link only the sources that actually exist; don't invent a root PRD if this gear has no parent one. Document only gear-specific deviations here. **Delete this section if no special constraints.**
 
 ### 3.1 Gear-Specific Environment Constraints
 
@@ -128,7 +128,7 @@ The system **MUST** {do something specific and verifiable}.
 
 ## 6. Non-Functional Requirements
 
-> **Global baselines**: Project-wide NFRs (performance, security, reliability, scalability) are defined once at the project/foundational level. **Before writing this section, identify and link the baseline sources that actually exist in this repository** — these are typically repository-level — an architecture manifest (e.g. `docs/ARCHITECTURE_MANIFEST.md`) and the foundational `guidelines/`. Additionally, if this gear sits beneath a parent system/gear that has its own PRD, link that parent/root PRD too. Link only the sources that actually exist; don't invent a root PRD if this gear has no parent one. Document only gear-specific NFRs here: **exclusions** from defaults or **standalone** requirements.
+> **Global baselines**: Project-wide NFRs (performance, security, reliability, scalability) are defined once at the project/foundational level. **Before writing this section, identify and link the baseline sources that actually exist in this repository** — these are typically repository-level — an architecture manifest (e.g. `{architecture_manifest}`) and the foundational guidelines (`{guidelines_readme}` indexes `{guidelines_security}`, `{guidelines_dependencies}`, and `{dna_root}`; `{guidelines_gts}` is a separate, review-stage-only resource not indexed there). Additionally, if this gear sits beneath a parent system/gear that has its own PRD, link that parent/root PRD too. Link only the sources that actually exist; don't invent a root PRD if this gear has no parent one. Document only gear-specific NFRs here: **exclusions** from defaults or **standalone** requirements.
 >
 > **Testing strategy**: NFRs verified via automated benchmarks, security scans, and monitoring unless otherwise specified.
 
