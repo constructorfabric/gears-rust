@@ -105,9 +105,9 @@ pub struct ConsumerBuilder<M = ()> {
     pub(crate) listeners: Vec<Arc<dyn ConsumerRuntimeListener>>,
     /// Offset manager state; `()` until `offset_manager` selects one.
     pub(crate) offset_manager: M,
-    /// Broker client resolved from ClientHub or supplied by tests.
+    /// Broker client resolved from `ClientHub` or supplied by tests.
     pub(crate) broker: Option<Arc<dyn EventBrokerApi>>,
-    /// Security context used by the SDK runtime for EventBrokerApi calls.
+    /// Security context used by the SDK runtime for `EventBrokerApi` calls.
     pub(crate) security_context: SecurityContext,
 }
 
@@ -137,6 +137,7 @@ impl ConsumerBuilder<()> {
         }
     }
 
+    #[must_use]
     pub fn new_unbound() -> Self {
         Self {
             group: None,
@@ -165,10 +166,12 @@ impl ConsumerBuilder<()> {
 
 // Common methods available in all commit-mode states.
 impl<M> ConsumerBuilder<M> {
+    #[must_use]
     pub fn group(mut self, group: ConsumerGroupRef) -> Self {
         self.group = Some(group);
         self
     }
+    #[must_use]
     pub fn topics<I>(mut self, topics: I) -> Self
     where
         I: IntoIterator<Item = GtsInstanceId>,
@@ -176,6 +179,7 @@ impl<M> ConsumerBuilder<M> {
         self.topics.extend(topics);
         self
     }
+    #[must_use]
     pub fn subscription_interests<I>(mut self, interests: I) -> Self
     where
         I: IntoIterator<Item = SubscriptionInterest>,
@@ -193,6 +197,7 @@ impl<M> ConsumerBuilder<M> {
     /// `InvalidConsumerOptions`, before the JOIN request is sent. Under
     /// [`OwnershipFilter::OnlyMine`] the broker refuses a tenant other than the
     /// caller's.
+    #[must_use]
     pub fn subject_tenant(mut self, id: Uuid) -> Self {
         self.subject_tenant = InterestTenant::Tenant(id);
         self
@@ -200,15 +205,18 @@ impl<M> ConsumerBuilder<M> {
     /// Which of the tenant's events the consumer reads. Default:
     /// [`OwnershipFilter::OnlyMine`], the events addressed to the caller. Set
     /// [`OwnershipFilter::EntireTenant`] to read unowned events.
+    #[must_use]
     pub fn ownership_filter(mut self, filter: OwnershipFilter) -> Self {
         self.ownership_filter = filter;
         self
     }
     /// Whether to stop at self-managed tenant boundaries. Default: `BarrierMode::Respect`.
+    #[must_use]
     pub fn barrier_mode(mut self, mode: BarrierMode) -> Self {
         self.barrier_mode = mode;
         self
     }
+    #[must_use]
     pub fn event_type_patterns<I>(mut self, pats: I) -> Self
     where
         I: IntoIterator<Item = GtsIdPattern>,
@@ -219,6 +227,7 @@ impl<M> ConsumerBuilder<M> {
     /// Delivers only events whose `subject_type` matches one of `patterns`, on every
     /// interest the consumer joins with. A delivery filter with no authorization
     /// meaning: it never widens what the caller may read. At most 32 patterns.
+    #[must_use]
     pub fn subject_types<I>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = GtsIdPattern>,
@@ -229,6 +238,7 @@ impl<M> ConsumerBuilder<M> {
     /// Number of slots the consumer runs, each with its own subscription. The slots
     /// join the consumer's one group, which splits the topic's partitions between
     /// them. Default: 1; `start()` refuses 0.
+    #[must_use]
     pub fn parallelism(mut self, n: u32) -> Self {
         self.parallelism = n;
         self
@@ -240,6 +250,7 @@ impl<M> ConsumerBuilder<M> {
     /// `ascii_only`, `field_too_long` or `user_agent_grammar`) when the consumer
     /// creates its default anonymous group and on every JOIN; `start()` refuses it first with `InvalidTextField`, before
     /// any broker call.
+    #[must_use]
     pub fn client_agent(mut self, ua: impl Into<String>) -> Self {
         self.client_agent = ua.into();
         self
@@ -247,6 +258,7 @@ impl<M> ConsumerBuilder<M> {
     /// Drop the streaming connection and re-JOIN after K consecutive
     /// `heartbeat` frames with no intervening events.
     /// Default: 10 (≈ 50 s of silence at the broker's 5 s default cadence).
+    #[must_use]
     pub fn heartbeat_drop_threshold(mut self, k: usize) -> Self {
         self.heartbeat_drop_threshold = k;
         self
@@ -254,10 +266,12 @@ impl<M> ConsumerBuilder<M> {
     /// How long the broker keeps each slot's subscription after its stream closes; it is
     /// kept alive while a stream is open. Default: 60 s. `start()` refuses a zero
     /// duration with `InvalidConsumerOptions`, before any broker call.
+    #[must_use]
     pub fn session_timeout(mut self, d: Duration) -> Self {
         self.session_timeout = Some(d);
         self
     }
+    #[must_use]
     pub fn filter(mut self, engine: GtsInstanceId, expr: impl Into<String>) -> Self {
         self.filter = Some(Filter {
             engine,
@@ -265,32 +279,39 @@ impl<M> ConsumerBuilder<M> {
         });
         self
     }
+    #[must_use]
     pub fn profile(mut self, profile: ConsumerProfile) -> Self {
         self.profile = profile;
         self
     }
+    #[must_use]
     pub fn buffering(mut self, buffering: ConsumerBuffering) -> Self {
         self.settings_overrides.buffering = Some(buffering);
         self
     }
+    #[must_use]
     pub fn batching(mut self, batching: ConsumerBatching) -> Self {
         self.settings_overrides.batching = Some(batching);
         self
     }
+    #[must_use]
     pub fn slow_detection(mut self, slow_detection: ConsumerSlowDetection) -> Self {
         self.settings_overrides.slow_detection = Some(slow_detection);
         self
     }
     /// Overrides the profile's handler backoff: a delivery the handler retries or
     /// fails waits `base_delay`, doubling per attempt up to `max_delay`.
+    #[must_use]
     pub fn retry(mut self, retry: ConsumerRetry) -> Self {
         self.settings_overrides.retry = Some(retry);
         self
     }
+    #[must_use]
     pub fn listener_settings(mut self, listener: ConsumerListenerSettings) -> Self {
         self.settings_overrides.listener = Some(listener);
         self
     }
+    #[must_use]
     pub fn register_listener<L>(mut self, listener: L) -> Self
     where
         L: ConsumerRuntimeListener + 'static,
@@ -298,6 +319,7 @@ impl<M> ConsumerBuilder<M> {
         self.listeners.push(Arc::new(listener));
         self
     }
+    #[must_use]
     pub fn commit_mode(mut self, mode: ConsumerCommitMode) -> Self {
         self.commit_mode = mode;
         self
@@ -305,6 +327,7 @@ impl<M> ConsumerBuilder<M> {
     /// Sets the identity the consumer joins and reads as; the default is
     /// `SecurityContext::anonymous()`. `start()` refuses a context with a nil subject
     /// or a nil tenant unless it carries a bearer token (see `require_identity`).
+    #[must_use]
     pub fn security_context(mut self, ctx: SecurityContext) -> Self {
         self.security_context = ctx;
         self
@@ -331,7 +354,7 @@ impl<M> ConsumerBuilder<M> {
     /// it on every JOIN, so each slot would end at its first JOIN and an anonymous group
     /// would be left without members.
     pub(crate) fn effective_settings(&self) -> Result<ConsumerSettings, EventBrokerError> {
-        let settings = ConsumerSettings::resolve(self.profile.clone(), self.settings_overrides);
+        let settings = ConsumerSettings::resolve(self.profile, self.settings_overrides);
         settings.validate()?;
         if self.parallelism < 1 {
             return Err(EventBrokerError::InvalidConsumerOptions {
@@ -395,12 +418,12 @@ impl ConsumerBuilder<()> {
             subject_types: self.subject_types,
             parallelism: self.parallelism,
             client_agent: self.client_agent,
-            heartbeat_drop_threshold: self.heartbeat_drop_threshold,
             session_timeout: self.session_timeout,
             filter: self.filter,
             profile: self.profile,
             settings_overrides: self.settings_overrides,
             commit_mode: self.commit_mode,
+            heartbeat_drop_threshold: self.heartbeat_drop_threshold,
             listeners: self.listeners,
             offset_manager: m.into_builder_state(),
             broker: self.broker,
@@ -745,7 +768,7 @@ where
     }
 }
 
-pub(crate) fn subscription_filter_ref_to_filter(filter: &SubscriptionFilterRef) -> Filter {
+pub fn subscription_filter_ref_to_filter(filter: &SubscriptionFilterRef) -> Filter {
     Filter {
         engine: filter.engine.clone(),
         expression: filter.expression.clone(),
@@ -764,11 +787,13 @@ impl<M, H> ConsumerRouteBuilder<M, H, RouteMissingTopic> {
 }
 
 impl<M, H> ConsumerRouteBuilder<M, H, RouteHasTopic> {
+    #[must_use]
     pub fn topic(mut self, topic: GtsInstanceId) -> Self {
         self.topic = Some(topic);
         self
     }
 
+    #[must_use]
     pub fn event_type(mut self, event_type: GtsIdPattern) -> Self {
         self.event_type = Some(event_type);
         self
@@ -779,9 +804,14 @@ impl<M, H> ConsumerRouteBuilder<M, H, RouteHasTopic> {
         handler_kind: ConsumerRouteHandlerKind,
         handler: Arc<dyn DeliverBatch>,
     ) -> ConsumerRoutedReady<M, H> {
-        let topic = self
-            .topic
-            .expect("route topic is required before registering a handler");
+        // `RouteHasTopic` guarantees a topic; a missing one is an SDK bug. `start()`
+        // refuses the consumer instead of the builder panicking.
+        let Some(topic) = self.topic else {
+            self.ready
+                .invalid_routes
+                .push("SDK invariant violated: route builder typestate has no topic".to_owned());
+            return self.ready;
+        };
         self.ready.routes.push(ConsumerRoute {
             topic,
             event_type: self.event_type,
@@ -812,11 +842,13 @@ impl<M> TxConsumerRouteBuilder<M, RouteHasTopic>
 where
     M: CommitOffsetInTx + 'static,
 {
+    #[must_use]
     pub fn topic(mut self, topic: GtsInstanceId) -> Self {
         self.topic = Some(topic);
         self
     }
 
+    #[must_use]
     pub fn event_type(mut self, event_type: GtsIdPattern) -> Self {
         self.event_type = Some(event_type);
         self
@@ -827,9 +859,14 @@ where
         handler_kind: ConsumerRouteHandlerKind,
         handler: Arc<dyn DeliverTxBatch<M>>,
     ) -> TxConsumerRoutedReady<M> {
-        let topic = self
-            .topic
-            .expect("route topic is required before registering a handler");
+        // `RouteHasTopic` guarantees a topic; a missing one is an SDK bug. `start()`
+        // refuses the consumer instead of the builder panicking.
+        let Some(topic) = self.topic else {
+            self.ready
+                .invalid_routes
+                .push("SDK invariant violated: route builder typestate has no topic".to_owned());
+            return self.ready;
+        };
         self.ready.routes.push(ConsumerRoute {
             topic,
             event_type: self.event_type,

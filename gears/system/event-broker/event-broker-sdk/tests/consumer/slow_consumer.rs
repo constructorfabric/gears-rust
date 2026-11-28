@@ -96,12 +96,11 @@ impl BatchHandler<serde_json::Value> for RecordingBatchHandler {
             .lock()
             .unwrap()
             .extend(chunk.iter().map(|event| event.subject().to_owned()));
-        Ok(chunk
-            .last()
-            .map(|event| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |event| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: event.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 

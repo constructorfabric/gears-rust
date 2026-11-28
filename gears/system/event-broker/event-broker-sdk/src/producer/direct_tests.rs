@@ -454,7 +454,7 @@ impl BrokerStub for RecordingBroker {
         if let Some(gate) = gate {
             self.held_reached.notify_one();
             // A dropped sender releases the call too.
-            let _ = gate.await;
+            gate.await.ok();
         }
         Ok(outcome)
     }
@@ -488,7 +488,7 @@ impl BrokerStub for RecordingBroker {
         if let Some(gate) = gate {
             self.held_reached.notify_one();
             // A dropped sender releases the call too.
-            let _ = gate.await;
+            gate.await.ok();
         }
         let head = *self.head.lock().expect("head lock");
         Ok(ProducerCursors {
@@ -520,7 +520,7 @@ impl BrokerStub for RecordingBroker {
         if let Some(gate) = gate {
             self.held_reached.notify_one();
             // A dropped sender releases the call too.
-            let _ = gate.await;
+            gate.await.ok();
         }
         Ok(())
     }
@@ -554,7 +554,7 @@ impl BrokerStub for RecordingBroker {
         if let Some(gate) = gate {
             self.held_reached.notify_one();
             // A dropped sender releases the call too.
-            let _ = gate.await;
+            gate.await.ok();
         }
         Self::event_types()
             .into_iter()
@@ -1412,12 +1412,8 @@ async fn a_stale_outcome_never_moves_the_local_head_back() {
     let broker = RecordingBroker::new(4, []);
     let producer = producer_over(Arc::clone(&broker), ProducerMode::Chained).await;
 
-    producer
-        .advance_after_acceptance(&prepared_at(7), IngestOutcome::Accepted)
-        .await;
-    producer
-        .advance_after_acceptance(&prepared_at(5), IngestOutcome::Duplicate)
-        .await;
+    producer.advance_after_acceptance(&prepared_at(7), IngestOutcome::Accepted);
+    producer.advance_after_acceptance(&prepared_at(5), IngestOutcome::Duplicate);
     let next = producer
         .publish(order(1), Ack::Accepted)
         .await

@@ -88,16 +88,12 @@ fn problem_json(err: impl Into<CanonicalError>) -> Value {
     serde_json::to_value(problem).expect("problem serializes")
 }
 
-fn assert_problem(err: impl Into<CanonicalError>, expected: Value) {
-    assert_eq!(problem_json(err), expected);
+fn assert_problem(err: impl Into<CanonicalError>, expected: &Value) {
+    assert_eq!(&problem_json(err), expected);
 }
 
 #[test]
-fn top_level_event_broker_errors_have_full_canonical_representation() {
-    let group_id = "gts.cf.core.events.consumer_group.v1~00000000-0000-0000-0000-000000000001";
-    let subscription_id = SubscriptionId(fixed_uuid(2));
-    let producer_id = ProducerId(fixed_uuid(3));
-
+fn request_validation_errors_have_full_canonical_representation() {
     let cases = [
         (
             EventBrokerError::InvalidProducerOptions {
@@ -158,71 +154,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                         "field": "event_type",
                         "description": "type is not declared",
                         "reason": reasons::EVENT_TYPE_NOT_DECLARED
-                    }],
-                    "resource_type": resources::EVENT,
-                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
-                }
-            }),
-        ),
-        (
-            EventBrokerError::EventTypeUnknown {
-                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
-                detail: "event type not found".into(),
-            },
-            json!({
-                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
-                "title": "Not Found",
-                "status": 404,
-                "detail": "event type not found",
-                "instance": "/v1/event-broker/test",
-                "trace_id": "trace-123",
-                "context": {
-                    "resource_type": resources::EVENT_TYPE,
-                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
-                }
-            }),
-        ),
-        (
-            EventBrokerError::TypeNotInDeclaredTopic {
-                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
-                expected_topic: "orders".into(),
-                detail: "type belongs to another topic".into(),
-            },
-            json!({
-                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
-                "title": "Failed Precondition",
-                "status": 400,
-                "detail": "Operation precondition not met",
-                "instance": "/v1/event-broker/test",
-                "trace_id": "trace-123",
-                "context": {
-                    "violations": [{
-                        "type": reasons::TYPE_NOT_IN_DECLARED_TOPIC,
-                        "subject": "gts.cf.core.events.event.v1~example.orders.created.v1~",
-                        "description": "type belongs to another topic; expected topic orders"
-                    }],
-                    "resource_type": resources::EVENT,
-                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
-                }
-            }),
-        ),
-        (
-            EventBrokerError::SchemaNotPrepared {
-                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
-                detail: "schema cache missing".into(),
-            },
-            json!({
-                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
-                "title": "Failed Precondition",
-                "status": 400,
-                "detail": "Operation precondition not met",
-                "instance": "/v1/event-broker/test",
-                "trace_id": "trace-123",
-                "context": {
-                    "violations": [{
-                        "type": reasons::SCHEMA_NOT_PREPARED,
-                        "subject": "gts.cf.core.events.event.v1~example.orders.created.v1~",
-                        "description": "schema cache missing"
                     }],
                     "resource_type": resources::EVENT,
                     "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
@@ -321,6 +252,38 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 }
             }),
         ),
+    ];
+
+    for (err, expected) in cases {
+        assert_problem(err, &expected);
+    }
+}
+
+#[test]
+fn not_found_and_authorization_errors_have_full_canonical_representation() {
+    let group_id = "gts.cf.core.events.consumer_group.v1~00000000-0000-0000-0000-000000000001";
+    let subscription_id = SubscriptionId(fixed_uuid(2));
+    let producer_id = ProducerId(fixed_uuid(3));
+
+    let cases = [
+        (
+            EventBrokerError::EventTypeUnknown {
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                detail: "event type not found".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+                "title": "Not Found",
+                "status": 404,
+                "detail": "event type not found",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "resource_type": resources::EVENT_TYPE,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
+                }
+            }),
+        ),
         (
             EventBrokerError::TopicNotFound {
                 topic: "orders".into(),
@@ -357,27 +320,6 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                         "gts.cf.core.events.consumer_group.v1~",
                         "00000000-0000-0000-0000-000000000001"
                     )
-                }
-            }),
-        ),
-        (
-            EventBrokerError::ConsumerGroupHasActiveMembers {
-                detail: "group has active members".into(),
-            },
-            json!({
-                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
-                "title": "Failed Precondition",
-                "status": 400,
-                "detail": "Operation precondition not met",
-                "instance": "/v1/event-broker/test",
-                "trace_id": "trace-123",
-                "context": {
-                    "violations": [{
-                        "type": reasons::CONSUMER_GROUP_HAS_ACTIVE_MEMBERS,
-                        "subject": resources::CONSUMER_GROUP,
-                        "description": "group has active members"
-                    }],
-                    "resource_type": resources::CONSUMER_GROUP
                 }
             }),
         ),
@@ -431,6 +373,84 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 "context": {
                     "resource_type": resources::PRODUCER,
                     "resource_name": producer_id.0.to_string()
+                }
+            }),
+        ),
+    ];
+
+    for (err, expected) in cases {
+        assert_problem(err, &expected);
+    }
+}
+
+#[test]
+fn precondition_and_limit_errors_have_full_canonical_representation() {
+    let cases = [
+        (
+            EventBrokerError::TypeNotInDeclaredTopic {
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                expected_topic: "orders".into(),
+                detail: "type belongs to another topic".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+                "title": "Failed Precondition",
+                "status": 400,
+                "detail": "Operation precondition not met",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "violations": [{
+                        "type": reasons::TYPE_NOT_IN_DECLARED_TOPIC,
+                        "subject": "gts.cf.core.events.event.v1~example.orders.created.v1~",
+                        "description": "type belongs to another topic; expected topic orders"
+                    }],
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
+                }
+            }),
+        ),
+        (
+            EventBrokerError::SchemaNotPrepared {
+                event_type: "gts.cf.core.events.event.v1~example.orders.created.v1~".into(),
+                detail: "schema cache missing".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+                "title": "Failed Precondition",
+                "status": 400,
+                "detail": "Operation precondition not met",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "violations": [{
+                        "type": reasons::SCHEMA_NOT_PREPARED,
+                        "subject": "gts.cf.core.events.event.v1~example.orders.created.v1~",
+                        "description": "schema cache missing"
+                    }],
+                    "resource_type": resources::EVENT,
+                    "resource_name": "gts.cf.core.events.event.v1~example.orders.created.v1~"
+                }
+            }),
+        ),
+        (
+            EventBrokerError::ConsumerGroupHasActiveMembers {
+                detail: "group has active members".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~",
+                "title": "Failed Precondition",
+                "status": 400,
+                "detail": "Operation precondition not met",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {
+                    "violations": [{
+                        "type": reasons::CONSUMER_GROUP_HAS_ACTIVE_MEMBERS,
+                        "subject": resources::CONSUMER_GROUP,
+                        "description": "group has active members"
+                    }],
+                    "resource_type": resources::CONSUMER_GROUP
                 }
             }),
         ),
@@ -549,6 +569,16 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
                 }
             }),
         ),
+    ];
+
+    for (err, expected) in cases {
+        assert_problem(err, &expected);
+    }
+}
+
+#[test]
+fn subscription_and_transport_errors_have_full_canonical_representation() {
+    let cases = [
         (
             EventBrokerError::SubscriptionRecoveryExhausted {
                 attempts: 3,
@@ -708,7 +738,7 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
     ];
 
     for (err, expected) in cases {
-        assert_problem(err, expected);
+        assert_problem(err, &expected);
     }
 }
 
@@ -865,7 +895,7 @@ fn nested_backend_errors_have_full_canonical_representation() {
     ];
 
     for (err, expected) in cases {
-        assert_problem(err, expected);
+        assert_problem(err, &expected);
     }
 }
 
@@ -936,7 +966,7 @@ fn nested_offset_manager_errors_have_full_canonical_representation() {
     ];
 
     for (err, expected) in cases {
-        assert_problem(err, expected);
+        assert_problem(err, &expected);
     }
 }
 

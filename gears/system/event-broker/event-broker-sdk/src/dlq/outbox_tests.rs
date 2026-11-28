@@ -102,7 +102,9 @@ async fn outbox_handle() -> (toolkit_db::outbox::OutboxHandle, toolkit_db::Db) {
     let handle = toolkit_db::outbox::Outbox::builder(db.clone())
         .queue(
             DLQ_QUEUE,
-            toolkit_db::outbox::Partitions::of(DLQ_PARTITIONS as u16),
+            toolkit_db::outbox::Partitions::of(
+                u16::try_from(DLQ_PARTITIONS).expect("the partition count fits u16"),
+            ),
         )
         .leased(NoopProcessor)
         .start()
@@ -138,7 +140,9 @@ async fn capturing_outbox_handle() -> (
     let handle = toolkit_db::outbox::Outbox::builder(db.clone())
         .queue(
             DLQ_QUEUE,
-            toolkit_db::outbox::Partitions::of(DLQ_PARTITIONS as u16),
+            toolkit_db::outbox::Partitions::of(
+                u16::try_from(DLQ_PARTITIONS).expect("the partition count fits u16"),
+            ),
         )
         .leased(CapturingProcessor {
             seen: Arc::clone(&seen),

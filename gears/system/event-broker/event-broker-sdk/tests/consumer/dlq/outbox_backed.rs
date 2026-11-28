@@ -97,7 +97,10 @@ async fn fixture() -> DlqOutboxFixture {
     let processor = RecordingDlqProcessor::default();
     let envelopes = processor.envelopes.clone();
     let handle = Outbox::builder(db.clone())
-        .queue(DLQ_QUEUE, Partitions::of(DLQ_PARTITIONS as u16))
+        .queue(
+            DLQ_QUEUE,
+            Partitions::of(u16::try_from(DLQ_PARTITIONS).expect("the partition count fits u16")),
+        )
         .leased(processor)
         .start()
         .await
@@ -380,7 +383,8 @@ async fn if_dlq_handoff_fails_i_do_not_commit_the_source_offset() {
         .db
         .transaction_ref(|tx| {
             Box::pin(async move {
-                let _ = broken_helper
+                // The enqueue fails on the missing queue, so there is no wake to fire.
+                let _unfired_wake = broken_helper
                     .enqueue(tx, record)
                     .await
                     .map_err(|err| toolkit_db::DbError::InvalidConfig(err.to_string()))?;

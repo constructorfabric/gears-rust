@@ -130,12 +130,13 @@ impl FaultRun {
         }
         let both_handled = || handled.lock().unwrap().len() >= 2;
         // A stall shows as a missing event in the caller's assert, not as a panic here.
-        let _ = tokio::time::timeout(BOUND, async {
+        tokio::time::timeout(BOUND, async {
             while !both_handled() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await;
+        .await
+        .ok();
         let left_before_stop = leave_calls.lock().unwrap().clone();
         let stopped = tokio::time::timeout(BOUND, handle.stop())
             .await

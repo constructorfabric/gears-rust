@@ -144,7 +144,7 @@ impl<P: GtsSchema> std::fmt::Debug for EventBatch<'_, P> {
 
 /// Tracks the committed frontier for one topic partition.
 #[derive(Debug, Clone)]
-pub(crate) struct PartitionFrontier {
+pub struct PartitionFrontier {
     committed: Sequence,
 }
 
@@ -167,10 +167,12 @@ pub enum ConsumerGroupRef {
 }
 
 impl ConsumerGroupRef {
+    #[must_use]
     pub fn id(id: ConsumerGroupId) -> Self {
         Self::Id(id)
     }
 
+    #[must_use]
     pub fn existing(id: ConsumerGroupId) -> Self {
         Self::Id(id)
     }
@@ -178,6 +180,7 @@ impl ConsumerGroupRef {
     /// A group named by its GTS reference. `start()` refuses a consumer with this
     /// reference, because a GTS reference must be resolved to an id before startup;
     /// pass the id with [`Self::id`].
+    #[must_use]
     pub fn gts(gts: GtsInstanceId) -> Self {
         Self::Gts(gts)
     }
@@ -273,6 +276,7 @@ pub struct SubscriptionInterest {
 }
 
 impl SubscriptionInterest {
+    #[must_use]
     pub fn builder() -> SubscriptionInterestBuilder {
         SubscriptionInterestBuilder::default()
     }
@@ -324,7 +328,7 @@ impl SubscriptionInterestBuilder {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumerProfile {
     pub buffering: ConsumerBuffering,
     pub batching: ConsumerBatching,
@@ -334,6 +338,7 @@ pub struct ConsumerProfile {
 }
 
 impl ConsumerProfile {
+    #[must_use]
     pub fn default_profile() -> Self {
         Self {
             buffering: ConsumerBuffering {
@@ -360,6 +365,7 @@ impl ConsumerProfile {
         }
     }
 
+    #[must_use]
     pub fn low_latency() -> Self {
         Self {
             buffering: ConsumerBuffering {
@@ -386,6 +392,7 @@ impl ConsumerProfile {
         }
     }
 
+    #[must_use]
     pub fn high_throughput() -> Self {
         Self {
             buffering: ConsumerBuffering {
@@ -412,6 +419,7 @@ impl ConsumerProfile {
         }
     }
 
+    #[must_use]
     pub fn replay() -> Self {
         Self {
             buffering: ConsumerBuffering {
@@ -438,6 +446,7 @@ impl ConsumerProfile {
         }
     }
 
+    #[must_use]
     pub fn relaxed() -> Self {
         Self {
             buffering: ConsumerBuffering {
@@ -481,6 +490,7 @@ pub struct ConsumerSettings {
 }
 
 impl ConsumerSettings {
+    #[must_use]
     pub fn from_profile(profile: ConsumerProfile) -> Self {
         Self {
             buffering: profile.buffering,
@@ -491,6 +501,7 @@ impl ConsumerSettings {
         }
     }
 
+    #[must_use]
     pub fn resolve(profile: ConsumerProfile, overrides: ConsumerSettingsOverrides) -> Self {
         Self {
             buffering: overrides.buffering.unwrap_or(profile.buffering),
@@ -501,6 +512,10 @@ impl ConsumerSettings {
         }
     }
 
+    /// # Errors
+    ///
+    /// [`EventBrokerError::InvalidConsumerOptions`] naming the first setting out of
+    /// range.
     pub fn validate(&self) -> Result<(), EventBrokerError> {
         if self.buffering.partition_capacity == 0 {
             return Err(EventBrokerError::InvalidConsumerOptions {
@@ -587,10 +602,12 @@ pub enum ConsumerCommitMode {
 }
 
 impl ConsumerCommitMode {
+    #[must_use]
     pub fn auto(interval: Duration) -> Self {
         Self::Auto { interval }
     }
 
+    #[must_use]
     pub fn manual() -> Self {
         Self::Manual
     }
@@ -943,7 +960,7 @@ impl<OM: CommitOffsetInTx> std::fmt::Debug for TxUndecodable<OM> {
 /// What one plain delivery produced: the batch outcome, and the event a typed route's
 /// `Skip` policy advanced past, which the runtime reports.
 #[derive(Debug, Clone)]
-pub(crate) struct Delivered {
+pub struct Delivered {
     pub(crate) outcome: BatchHandlerOutcome,
     pub(crate) skipped: Option<SkippedEvent>,
 }
@@ -960,7 +977,7 @@ impl From<BatchHandlerOutcome> for Delivered {
 /// An event a typed route skipped because its data does not decode as the payload
 /// type. Carries no part of the data.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SkippedEvent {
+pub struct SkippedEvent {
     pub(crate) event_id: Uuid,
     pub(crate) sequence: Sequence,
     pub(crate) type_id: GtsTypeId,
@@ -970,7 +987,7 @@ pub(crate) struct SkippedEvent {
 /// What the plain runtime calls for one topic-partition batch: the events, their
 /// positions in the same order, and the delivery context.
 #[async_trait::async_trait]
-pub(crate) trait DeliverBatch: Send + Sync {
+pub trait DeliverBatch: Send + Sync {
     async fn deliver(
         &self,
         batch: &EventBatch<'_, serde_json::Value>,
@@ -982,7 +999,7 @@ pub(crate) trait DeliverBatch: Send + Sync {
 /// What the transactional runtime calls for one topic-partition batch.
 #[cfg(feature = "db")]
 #[async_trait::async_trait]
-pub(crate) trait DeliverTxBatch<OM: CommitOffsetInTx>: Send + Sync {
+pub trait DeliverTxBatch<OM: CommitOffsetInTx>: Send + Sync {
     async fn deliver(
         &self,
         batch: &EventBatch<'_, serde_json::Value>,
@@ -993,7 +1010,7 @@ pub(crate) trait DeliverTxBatch<OM: CommitOffsetInTx>: Send + Sync {
 }
 
 /// Hands the first event of each batch to an [`EventHandler`].
-pub(crate) struct EventHandlerAdapter<H> {
+pub struct EventHandlerAdapter<H> {
     inner: H,
 }
 
@@ -1025,7 +1042,7 @@ where
 
 /// Decodes the first event of each batch as `P` and hands it to an [`EventHandler<P>`];
 /// an event that does not decode goes by the route's [`Undecodable`] policy.
-pub(crate) struct TypedEventHandlerAdapter<H, P> {
+pub struct TypedEventHandlerAdapter<H, P> {
     inner: H,
     undecodable: Undecodable,
     _payload: std::marker::PhantomData<fn() -> P>,
@@ -1117,7 +1134,7 @@ where
 /// A handler error, typed or fallback, passes through: the runtime reports it and
 /// retries the whole batch, so a prefix the typed handler already handled is handed
 /// to it again (at-least-once).
-pub(crate) struct TypedBatchHandlerAdapter<H, P> {
+pub struct TypedBatchHandlerAdapter<H, P> {
     inner: H,
     undecodable: Undecodable,
     _payload: std::marker::PhantomData<fn() -> P>,
@@ -1226,7 +1243,7 @@ where
 }
 
 /// Hands each batch to a [`BatchHandler`].
-pub(crate) struct BatchHandlerAdapter<H> {
+pub struct BatchHandlerAdapter<H> {
     inner: H,
 }
 
@@ -1253,7 +1270,7 @@ where
 
 /// Hands the first event of each batch to a [`TxEventHandler`].
 #[cfg(feature = "db")]
-pub(crate) struct TxEventHandlerAdapter<H, OM: CommitOffsetInTx> {
+pub struct TxEventHandlerAdapter<H, OM: CommitOffsetInTx> {
     inner: H,
     _offset_manager: std::marker::PhantomData<OM>,
 }
@@ -1292,7 +1309,7 @@ where
 
 /// Hands each batch to a [`TxBatchHandler`].
 #[cfg(feature = "db")]
-pub(crate) struct TxBatchHandlerAdapter<H, OM: CommitOffsetInTx> {
+pub struct TxBatchHandlerAdapter<H, OM: CommitOffsetInTx> {
     inner: H,
     _offset_manager: std::marker::PhantomData<OM>,
 }
@@ -1329,7 +1346,7 @@ where
 /// [`TxEventHandler<P, OM>`] with the delivery's commit handle; an event that does not
 /// decode goes by the route's [`TxUndecodable`] policy.
 #[cfg(feature = "db")]
-pub(crate) struct TxTypedEventHandlerAdapter<H, P, OM: CommitOffsetInTx> {
+pub struct TxTypedEventHandlerAdapter<H, P, OM: CommitOffsetInTx> {
     inner: H,
     undecodable: TxUndecodable<OM>,
     _payload: std::marker::PhantomData<fn() -> P>,
@@ -1412,7 +1429,7 @@ where
 /// error is logged and `Success` returned, and while the consumer owns the partition the
 /// prefix is not handed to the handler again.
 #[cfg(feature = "db")]
-pub(crate) struct TxTypedBatchHandlerAdapter<H, P, OM: CommitOffsetInTx> {
+pub struct TxTypedBatchHandlerAdapter<H, P, OM: CommitOffsetInTx> {
     inner: H,
     undecodable: TxUndecodable<OM>,
     _payload: std::marker::PhantomData<fn() -> P>,

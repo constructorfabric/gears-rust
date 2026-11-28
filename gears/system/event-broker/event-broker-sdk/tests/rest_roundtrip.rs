@@ -8,6 +8,11 @@
 //! per `StreamTransport` framing, since the two share every path but the decoder.
 
 #![cfg(feature = "rest-client")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] functions panic on a failed setup, as the tests do"
+)]
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

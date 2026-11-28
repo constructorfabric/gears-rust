@@ -276,9 +276,8 @@ async fn an_unbound_consumer_with_an_identity_is_refused_for_its_missing_broker(
         .offset_manager(InMemoryOffsetManager::new(Fallback::Earliest))
         .handler(NoopHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("unbound builder cannot open subscriptions"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("unbound builder cannot open subscriptions");
     };
 
     assert!(
@@ -399,9 +398,8 @@ async fn routed_consumer_rejects_route_outside_subscription_topics() {
         )))
         .handler(NoopHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("route validation must fail"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("route validation must fail");
     };
 
     assert!(
@@ -440,9 +438,8 @@ async fn routed_consumer_rejects_duplicate_routes() {
         )))
         .handler(NoopHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("duplicate route validation must fail"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("duplicate route validation must fail");
     };
 
     assert!(
@@ -474,9 +471,8 @@ async fn routed_consumer_without_default_rejects_incomplete_routes() {
         )))
         .handler(NoopHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("route-only consumer without catch-all must fail"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("route-only consumer without catch-all must fail");
     };
 
     assert!(
@@ -500,9 +496,8 @@ async fn routed_consumer_rejects_missing_subscription_topics() {
         )))
         .handler(NoopHandler);
 
-    let err = match ready.start().await {
-        Ok(_) => panic!("routed consumer without topics must fail"),
-        Err(err) => err,
+    let Err(err) = ready.start().await else {
+        panic!("routed consumer without topics must fail");
     };
 
     assert!(

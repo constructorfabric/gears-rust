@@ -14,7 +14,7 @@ use crate::ids::ProducerId;
 use crate::models::ResetScope;
 use crate::sdk::EventBrokerSdk;
 
-use super::direct::{Has, Missing};
+use super::direct::{Has, Missing, required};
 use super::event_factory::PreparedEvent;
 use super::outbox::ProducerOutboxEnvelope;
 use super::registration::{
@@ -37,7 +37,7 @@ type DbProducerBuilderState<Broker, Db, Ctx, Source, Registration, Topics, Patte
 /// Builds the [`DbProducer`] an [`OutboxSetup`](super::OutboxSetup) runs on.
 /// Checks none of its values: `OutboxSetupBuilder::build` checks each one
 /// before it builds this.
-pub(crate) struct DbProducerBuilder<
+pub struct DbProducerBuilder<
     Broker = Missing,
     Db = Missing,
     Ctx = Missing,
@@ -182,11 +182,11 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
     /// for a stored registration of the key whose mode or client agent
     /// differs.
     pub(crate) async fn build(self) -> Result<DbProducer, EventBrokerError> {
-        let broker = self.broker.expect("typestate requires broker");
-        let db = self.db.expect("typestate requires db");
-        let ctx = self.ctx.expect("typestate requires security context");
-        let source = self.source.expect("typestate requires source");
-        let registration = self.registration.expect("typestate requires registration");
+        let broker = required(self.broker, "broker")?;
+        let db = required(self.db, "db")?;
+        let ctx = required(self.ctx, "security context")?;
+        let source = required(self.source, "source")?;
+        let registration = required(self.registration, "registration")?;
 
         let cache = Arc::new(ProducerSchemaCache::new());
         if self.validation_timing == ValidationTiming::Eager {
@@ -227,7 +227,7 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
 /// The core an outbox setup builds on: the schema cache, the partition
 /// registrations and the drain's broker calls.
 #[derive(Clone)]
-pub(crate) struct DbProducer {
+pub struct DbProducer {
     /// Broker the producer publishes to.
     pub(crate) broker: Arc<dyn EventBrokerApi>,
     /// Security context publishes run under.

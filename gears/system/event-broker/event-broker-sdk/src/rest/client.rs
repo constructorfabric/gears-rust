@@ -171,7 +171,7 @@ impl RestBroker {
     /// Attaches the caller's tenant bearer credential, if present, so the broker
     /// authorizes the request as that tenant. The secret is exposed only here,
     /// at the transport boundary.
-    pub(crate) fn authed(&self, rb: RequestBuilder, ctx: &SecurityContext) -> RequestBuilder {
+    pub(crate) fn authed(rb: RequestBuilder, ctx: &SecurityContext) -> RequestBuilder {
         match ctx.bearer_token() {
             Some(token) => rb.bearer_auth(token.expose_secret()),
             None => rb,
@@ -179,7 +179,7 @@ impl RestBroker {
     }
 }
 
-fn to_transport(err: toolkit_http::HttpError) -> EventBrokerError {
+fn to_transport(err: &toolkit_http::HttpError) -> EventBrokerError {
     EventBrokerError::Transport(err.to_string())
 }
 
@@ -209,7 +209,7 @@ fn error_from_bytes(status: u16, bytes: &[u8]) -> EventBrokerError {
 
 /// Kept for the streaming path (`rest::stream`), which reads a response outside
 /// [`RestBroker::call`]; delegates to the shared mapping.
-pub(crate) async fn error_from_response(resp: HttpResponse) -> EventBrokerError {
+pub async fn error_from_response(resp: HttpResponse) -> EventBrokerError {
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await.unwrap_or_default();
     error_from_bytes(status, &bytes)
@@ -217,7 +217,7 @@ pub(crate) async fn error_from_response(resp: HttpResponse) -> EventBrokerError 
 
 /// The HTTP verbs the unary client issues.
 #[derive(Clone, Copy)]
-pub(crate) enum Method {
+pub enum Method {
     Get,
     Post,
     Delete,
@@ -234,7 +234,7 @@ impl Method {
 }
 
 /// Logs a response at debug level, pretty-printing a JSON body when it is one.
-pub(crate) fn log_response(status: u16, bytes: &[u8]) {
+pub fn log_response(status: u16, bytes: &[u8]) {
     let body = match serde_json::from_slice::<serde_json::Value>(bytes) {
         Ok(value) => serde_json::to_string_pretty(&value).unwrap_or_default(),
         Err(_) => String::from_utf8_lossy(bytes).into_owned(),
@@ -272,18 +272,18 @@ impl RestBroker {
             Method::Delete => self.http().delete(url),
         };
         if let Some(body) = &body {
-            rb = rb.json(body).map_err(to_transport)?;
+            rb = rb.json(body).map_err(|err| to_transport(&err))?;
         }
         for (name, value) in headers {
             rb = rb.header(name, value);
         }
-        rb = self.authed(rb, ctx);
+        rb = Self::authed(rb, ctx);
         if self.debug {
-            self.log_request(method, url, ctx, body.as_ref());
+            Self::log_request(method, url, ctx, body.as_ref());
         }
-        let resp = rb.send().await.map_err(to_transport)?;
+        let resp = rb.send().await.map_err(|err| to_transport(&err))?;
         let status = resp.status().as_u16();
-        let bytes = resp.bytes().await.map_err(to_transport)?;
+        let bytes = resp.bytes().await.map_err(|err| to_transport(&err))?;
         if self.debug {
             log_response(status, &bytes);
         }
@@ -293,7 +293,6 @@ impl RestBroker {
     /// Logs the outgoing request. The bearer token is never printed - only
     /// whether one is attached - so a debug trace is safe to share.
     fn log_request(
-        &self,
         method: Method,
         url: &str,
         ctx: &SecurityContext,
@@ -309,9 +308,10 @@ impl RestBroker {
         } else {
             "<none>"
         };
-        let rendered = body
-            .map(|b| serde_json::to_string_pretty(b).unwrap_or_default())
-            .unwrap_or_else(|| "<none>".to_owned());
+        let rendered = body.map_or_else(
+            || "<none>".to_owned(),
+            |b| serde_json::to_string_pretty(b).unwrap_or_default(),
+        );
         tracing::debug!(
             target: "event_broker_sdk::rest",
             method = method.as_str(),
@@ -869,7 +869,7 @@ impl EventBrokerApi for RestBroker {
         ctx: &SecurityContext,
         id: SubscriptionId,
     ) -> Result<crate::api::FrameStream, EventBrokerError> {
-        stream::open(self, ctx, id).await
+        Ok(stream::open(self, ctx, id))
     }
 
     async fn seek(

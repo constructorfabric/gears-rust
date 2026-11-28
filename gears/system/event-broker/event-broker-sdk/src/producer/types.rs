@@ -4,7 +4,7 @@ use crate::api::ProducerMode;
 /// Controls when producer schemas are fetched. Validation is always enabled.
 #[cfg(feature = "outbox")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum ValidationTiming {
+pub enum ValidationTiming {
     #[default]
     Eager,
     Lazy,

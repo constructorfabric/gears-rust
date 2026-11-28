@@ -106,7 +106,7 @@ impl BrokerStub for ScriptedBroker {
         self.entered.send(n).expect("the test listens");
         if let Some(gate) = gate {
             // A dropped sender releases the call too.
-            let _ = gate.await;
+            gate.await.ok();
         }
         Ok(registered(n))
     }
@@ -390,7 +390,9 @@ async fn two_concurrent_replaces_of_one_slot_register_once() {
     let release = broker.gate(1);
     let releaser = async move {
         assert_eq!(timeout(BOUND, entered.recv()).await, Ok(Some(1)));
-        let _ = timeout(Duration::from_millis(300), entered.recv()).await;
+        timeout(Duration::from_millis(300), entered.recv())
+            .await
+            .ok();
         release
             .send(())
             .expect("the first registration is still held");

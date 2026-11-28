@@ -17,6 +17,12 @@
 //! | Outbox producer | Validate and drain durable enqueue | `OutboxSetup`, `OutboxProducer`, toolkit-db outbox | Enqueued row reaches the broker |
 //! | Multi-topic outbox | One queue for multiple topics | `OutboxSetup` topics + outbox queue | Both topics are delivered |
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] functions panic on a failed setup, as the tests do"
+)]
+
 #[cfg(all(feature = "db", feature = "outbox"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -837,9 +843,10 @@ fn charge_event(
     tenant: Uuid,
     charge: BillingCharged,
 ) -> Result<EventV1<BillingCharged>, EventBrokerError> {
-    EventV1::builder(charge.clone())
+    let subject = charge.charge_id.to_string();
+    EventV1::builder(charge)
         .subject_tenant(tenant)
-        .subject(charge.charge_id.to_string())
+        .subject(subject)
         .subject_type_of(GtsTypeId::new(BILLING_SUBJECT))
         .build()
 }

@@ -40,12 +40,12 @@ pub struct ConsumerHandle {
     consumer: Consumer,
 }
 
-pub(crate) struct RoutedHandlerEntry {
+pub struct RoutedHandlerEntry {
     route: ConsumerRoute,
     handler: Arc<dyn DeliverBatch>,
 }
 
-pub(crate) struct RoutedBatchHandler {
+pub struct RoutedBatchHandler {
     default_handler: Option<Arc<dyn DeliverBatch>>,
     routes: Vec<RoutedHandlerEntry>,
 }
@@ -77,13 +77,13 @@ impl RoutedBatchHandler {
 }
 
 #[cfg(feature = "db")]
-pub(crate) struct TxRoutedHandlerEntry<OM: CommitOffsetInTx> {
+pub struct TxRoutedHandlerEntry<OM: CommitOffsetInTx> {
     route: ConsumerRoute,
     handler: Arc<dyn DeliverTxBatch<OM>>,
 }
 
 #[cfg(feature = "db")]
-pub(crate) struct TxRoutedBatchHandler<OM: CommitOffsetInTx> {
+pub struct TxRoutedBatchHandler<OM: CommitOffsetInTx> {
     default_handler: Option<Arc<dyn DeliverTxBatch<OM>>>,
     routes: Vec<TxRoutedHandlerEntry<OM>>,
 }
@@ -230,6 +230,7 @@ impl ConsumerHandle {
 
     /// The subscription each parallelism slot joined last. A slot that has not joined yet,
     /// or is recording a new subscription at that moment, is left out.
+    #[must_use]
     pub fn subscriptions(&self) -> Vec<SubscriptionId> {
         self.consumer.subscriptions()
     }
@@ -242,6 +243,7 @@ impl Default for Consumer {
 }
 
 impl Consumer {
+    #[must_use]
     pub fn new() -> Self {
         Self { slots: Vec::new() }
     }
@@ -475,18 +477,23 @@ impl Consumer {
     }
 
     /// Graceful shutdown: cancel all tasks and await drain.
+    ///
+    /// # Errors
+    ///
+    /// None today: a slot's own error, or its panic, is not reported here.
     pub async fn shutdown(mut self) -> Result<(), EventBrokerError> {
         for slot in &self.slots {
             slot.cancel.cancel();
         }
         for slot in self.slots.drain(..) {
-            let _ = slot.join.await;
+            slot.join.await.ok();
         }
         Ok(())
     }
 
     /// The subscription each parallelism slot joined last. A slot that has not joined yet,
     /// or is recording a new subscription at that moment, is left out.
+    #[must_use]
     pub fn subscriptions(&self) -> Vec<SubscriptionId> {
         self.slots
             .iter()

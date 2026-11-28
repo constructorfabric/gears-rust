@@ -18,7 +18,7 @@ use crate::models::{
 /// name, so a test that strays off its stubbed path fails loudly instead of
 /// passing against a fake answer.
 #[async_trait]
-pub(crate) trait BrokerStub: Send + Sync {
+pub trait BrokerStub: Send + Sync {
     async fn register_producer(
         &self,
         _ctx: &SecurityContext,

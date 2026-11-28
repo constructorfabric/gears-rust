@@ -247,7 +247,7 @@ fn consumer_settings_resolve_explicit_override_over_profile() {
     };
 
     let settings = ConsumerSettings::resolve(
-        profile.clone(),
+        profile,
         ConsumerSettingsOverrides {
             batching: Some(override_batching),
             ..ConsumerSettingsOverrides::default()

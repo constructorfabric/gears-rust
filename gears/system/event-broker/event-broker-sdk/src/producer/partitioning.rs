@@ -6,11 +6,7 @@ use toolkit_stable_hash::murmur3_x86_32;
 /// Every event of one key of one topic lands in one partition, so they drain in
 /// enqueue order.
 #[cfg(feature = "outbox")]
-pub(crate) fn producer_outbox_partition(
-    topic: &str,
-    key: &str,
-    outbox_partition_count: u32,
-) -> u32 {
+pub fn producer_outbox_partition(topic: &str, key: &str, outbox_partition_count: u32) -> u32 {
     let placement = format!("{topic}:{key}");
     (murmur3_x86_32(placement.as_bytes(), 0) & 0x7FFF_FFFF) % outbox_partition_count.max(1)
 }

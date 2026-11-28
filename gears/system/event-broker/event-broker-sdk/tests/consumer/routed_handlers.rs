@@ -204,12 +204,13 @@ impl EventHandler<serde_json::Value> for RawRecorder {
 /// Polls every 10 ms until `predicate` holds or `BOUND` passes; a miss shows in the
 /// test's asserts.
 async fn wait_within_bound(mut predicate: impl FnMut() -> bool) {
-    let _ = tokio::time::timeout(BOUND, async {
+    tokio::time::timeout(BOUND, async {
         while !predicate() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .ok();
 }
 
 fn good_order() -> OrderPlacedV1 {

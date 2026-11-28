@@ -88,6 +88,7 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
     }
 }
 
+#[must_use]
 pub fn producer_registration_migrations() -> Vec<Box<dyn MigrationTrait>> {
     vec![Box::new(CreateProducerRegistrationSchema)]
 }

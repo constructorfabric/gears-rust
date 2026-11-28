@@ -72,7 +72,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use gts::GtsTypeId;
 use toolkit_security::SecurityContext;
@@ -96,6 +96,9 @@ type DirectProducerBuilderState<Broker, Ctx, Source, Topics, Patterns> =
 /// A producer's chain is kept per `(producer, topic)` (ADR-0004 "Chain Scope").
 type ProducerSequenceKey = (ProducerId, String);
 pub(super) type ProducerSequenceCursor = HashMap<ProducerSequenceKey, i64>;
+/// A poisoned lock is recovered: every write is a single insert, `max` or
+/// `extend` of independent per-topic heads, so no entry is left half-written,
+/// and a stale head is corrected from the broker on `SequenceViolation`.
 type SharedProducerSequenceCursor = Arc<std::sync::RwLock<ProducerSequenceCursor>>;
 /// Keyed by topic alone: a `DirectProducer`'s `id` is fixed, so the
 /// topic names its chain.
@@ -326,14 +329,10 @@ impl DirectProducerBuilder<Has, Has, Has, Has, Has> {
     /// `tokio::sync::Semaphore::MAX_PERMITS`; otherwise whatever preparing the
     /// topics and event types, registering the producer, or reading its
     /// cursors fails with.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn build(self) -> Result<DirectProducer, EventBrokerError> {
-        let broker = self.broker.expect("typestate requires broker");
-        let ctx = self.ctx.expect("typestate requires security context");
-        let source = self.source.expect("typestate requires source");
+        let broker = required(self.broker, "broker")?;
+        let ctx = required(self.ctx, "security context")?;
+        let source = required(self.source, "source")?;
         validate_non_empty("topics", &self.topics)?;
         validate_non_empty("event_type_patterns", &self.event_type_patterns)?;
         if source.trim().is_empty() {
@@ -569,10 +568,6 @@ impl DirectProducer {
     /// serialize or on a broken internal invariant (no publish lock for the
     /// event's declared topic, closed publish permits, or a publish that
     /// locked no topic).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish<P: EventPayload>(
         &self,
         event: EventV1<P>,
@@ -619,10 +614,6 @@ impl DirectProducer {
     /// ascending order, when the resend is answered `Duplicate` too.
     /// [`EventBrokerError::Internal`] on a broken internal invariant (closed
     /// publish permits, or a publish that locked no topic).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the producer's sequence-state lock is poisoned.
     pub async fn publish_batch<P: EventPayload>(
         &self,
         events: Vec<EventV1<P>>,
@@ -763,7 +754,7 @@ impl DirectProducer {
         };
         // A batch is all-or-nothing: its one outcome covers every event, so
         // each one advances the local chain.
-        self.advance_all(&prepared, outcome).await;
+        self.advance_all(&prepared, outcome);
         if reused || !taken {
             for (_, chain) in &mut chains {
                 chain.mark_seen();
@@ -791,7 +782,7 @@ impl DirectProducer {
                 })?;
             return Err(EventBrokerError::SequenceTaken { topic });
         }
-        self.advance_all(&prepared, outcome).await;
+        self.advance_all(&prepared, outcome);
         for (_, chain) in &mut chains {
             chain.mark_seen();
         }
@@ -873,7 +864,7 @@ impl DirectProducer {
         let mut cursor = self
             .sequence_state
             .read()
-            .expect("producer sequence state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone();
         for prepared in prepared {
             if let Some(meta) = self.producer_meta_from_cursor(&cursor, &prepared.topic) {
@@ -883,9 +874,9 @@ impl DirectProducer {
         }
     }
 
-    async fn advance_all(&self, prepared: &[PreparedEvent], outcome: IngestOutcome) {
+    fn advance_all(&self, prepared: &[PreparedEvent], outcome: IngestOutcome) {
         for prepared in prepared {
-            self.advance_after_acceptance(prepared, outcome).await;
+            self.advance_after_acceptance(prepared, outcome);
         }
     }
 
@@ -961,7 +952,7 @@ impl DirectProducer {
     /// with these numbers and have each dropped as one more duplicate. The
     /// caller holds the topic's publish lock, so `prepared` carries the head's
     /// next sequence; the state only ever moves forward.
-    pub(super) async fn advance_after_acceptance(
+    pub(super) fn advance_after_acceptance(
         &self,
         prepared: &PreparedEvent,
         outcome: IngestOutcome,
@@ -978,7 +969,7 @@ impl DirectProducer {
         let mut sequence_state = self
             .sequence_state
             .write()
-            .expect("producer sequence state lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         let last = sequence_state
             .entry((ProducerId(producer_id), prepared.topic.clone()))
             .or_insert(sequence);
@@ -992,7 +983,7 @@ impl DirectProducer {
             .await?;
         self.sequence_state
             .write()
-            .expect("producer sequence state lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .extend(cursors.topics.into_iter().map(|topic| {
                 (
                     (self.producer_id, topic.topic.into_string()),
@@ -1014,7 +1005,7 @@ impl DirectProducer {
         let mut sequence_state = self
             .sequence_state
             .write()
-            .expect("producer sequence state lock poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         for &topic in topics {
             let last = cursors
                 .topics
@@ -1061,6 +1052,14 @@ pub(super) fn producer_meta_for_last(
             sequence: Some(last + 1),
         }),
     }
+}
+
+/// Takes a builder field the typestate guarantees is set. A missing one is an
+/// SDK bug, reported as `Internal` instead of a panic.
+pub(super) fn required<T>(value: Option<T>, field: &'static str) -> Result<T, EventBrokerError> {
+    value.ok_or_else(|| {
+        EventBrokerError::Internal(format!("producer builder typestate has no {field}"))
+    })
 }
 
 pub(super) fn validate_non_empty(

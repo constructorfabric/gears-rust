@@ -16,7 +16,7 @@ use crate::ids::ProducerId;
 use super::types::ManagedRegistration;
 
 /// Longest registration key and queue name a row holds (`VARCHAR(255)`).
-pub(crate) const MAX_NAME_LEN: usize = 255;
+pub const MAX_NAME_LEN: usize = 255;
 
 /// One producer id per `(registration key, queue, outbox partition)`: each id
 /// carries exactly one sequence space, that partition's `OutboxMessage.seq`
@@ -49,7 +49,7 @@ impl ScopableEntity for Entity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProducerRegistration {
+pub struct ProducerRegistration {
     pub(crate) slot: RegistrationSlot,
     pub(crate) producer_id: ProducerId,
     pub(crate) mode: ProducerMode,
@@ -60,7 +60,7 @@ pub(crate) struct ProducerRegistration {
 /// Which outbox partition of which queue of which registration key a producer
 /// id serves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RegistrationSlot {
+pub struct RegistrationSlot {
     pub(crate) key: String,
     pub(crate) queue: String,
     /// The outbox partition as toolkit-db delivers it (`OutboxMessage.partition_id`):
@@ -78,7 +78,7 @@ impl RegistrationSlot {
 }
 
 /// A new registration's identity, before it is stored.
-pub(crate) struct NewRegistration<'a> {
+pub struct NewRegistration<'a> {
     pub(crate) slot: &'a RegistrationSlot,
     pub(crate) producer_id: ProducerId,
     pub(crate) mode: ProducerMode,
@@ -86,7 +86,7 @@ pub(crate) struct NewRegistration<'a> {
 }
 
 #[derive(Clone)]
-pub(crate) struct ProducerRegistrationStore {
+pub struct ProducerRegistrationStore {
     db: toolkit_db::Db,
 }
 
@@ -99,14 +99,14 @@ impl ProducerRegistrationStore {
         &self,
         slot: &RegistrationSlot,
     ) -> Result<Option<ProducerRegistration>, EventBrokerError> {
-        let conn = self.db.conn().map_err(map_db_err)?;
+        let conn = self.db.conn().map_err(|err| map_db_err(&err))?;
         let row = Entity::find()
             .filter(slot.filter())
             .secure()
             .scope_with(&AccessScope::allow_all())
             .one(&conn)
             .await
-            .map_err(map_scope_err)?;
+            .map_err(|err| map_scope_err(&err))?;
         row.map(ProducerRegistration::try_from).transpose()
     }
 
@@ -115,14 +115,14 @@ impl ProducerRegistrationStore {
         &self,
         key: &str,
     ) -> Result<Vec<ProducerRegistration>, EventBrokerError> {
-        let conn = self.db.conn().map_err(map_db_err)?;
+        let conn = self.db.conn().map_err(|err| map_db_err(&err))?;
         Entity::find()
             .filter(Column::RegistrationKey.eq(key))
             .secure()
             .scope_with(&AccessScope::allow_all())
             .all(&conn)
             .await
-            .map_err(map_scope_err)?
+            .map_err(|err| map_scope_err(&err))?
             .into_iter()
             .map(ProducerRegistration::try_from)
             .collect()
@@ -151,10 +151,10 @@ impl ProducerRegistrationStore {
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
         };
-        let conn = self.db.conn().map_err(map_db_err)?;
+        let conn = self.db.conn().map_err(|err| map_db_err(&err))?;
         secure_insert::<Entity>(am, &AccessScope::allow_all(), &conn)
             .await
-            .map_err(map_scope_err)?;
+            .map_err(|err| map_scope_err(&err))?;
         Ok(registration)
     }
 
@@ -169,7 +169,7 @@ impl ProducerRegistrationStore {
     ) -> Result<Replaced, EventBrokerError> {
         let generation = current.generation + 1;
         let now = Utc::now();
-        let conn = self.db.conn().map_err(map_db_err)?;
+        let conn = self.db.conn().map_err(|err| map_db_err(&err))?;
         let result = Entity::update_many()
             .col_expr(
                 Column::ProducerId,
@@ -190,7 +190,7 @@ impl ProducerRegistrationStore {
             .scope_with(&AccessScope::allow_all())
             .exec(&conn)
             .await
-            .map_err(map_scope_err)?;
+            .map_err(|err| map_scope_err(&err))?;
         match result.rows_affected {
             0 => Ok(Replaced::Lost),
             1 => Ok(Replaced::Done(ProducerRegistration {
@@ -210,7 +210,7 @@ impl ProducerRegistrationStore {
 
 /// How a generation replace ended.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Replaced {
+pub enum Replaced {
     /// The slot moved to the new id; this is its stored registration.
     Done(ProducerRegistration),
     /// The slot left the expected generation before the update, so the new id
@@ -265,7 +265,7 @@ impl TryFrom<Model> for ProducerRegistration {
     }
 }
 
-pub(crate) fn mode_to_str(mode: ProducerMode) -> &'static str {
+pub fn mode_to_str(mode: ProducerMode) -> &'static str {
     match mode {
         ProducerMode::Stateless => "stateless",
         ProducerMode::Monotonic => "monotonic",
@@ -284,11 +284,11 @@ fn mode_from_str(mode: &str) -> Result<ProducerMode, EventBrokerError> {
     }
 }
 
-fn map_db_err(err: toolkit_db::DbError) -> EventBrokerError {
+fn map_db_err(err: &toolkit_db::DbError) -> EventBrokerError {
     EventBrokerError::Internal(format!("producer registration db access: {err}"))
 }
 
-fn map_scope_err(err: ScopeError) -> EventBrokerError {
+fn map_scope_err(err: &ScopeError) -> EventBrokerError {
     EventBrokerError::Internal(format!("producer registration store: {err}"))
 }
 

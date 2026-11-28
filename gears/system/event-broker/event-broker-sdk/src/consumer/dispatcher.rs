@@ -41,13 +41,13 @@ use crate::sequence::Sequence;
 
 /// Per-partition in-memory cursor for the contiguous processed frontier.
 #[derive(Default)]
-pub(crate) struct PartitionCursor {
+pub struct PartitionCursor {
     frontier: Option<PartitionFrontier>,
     committed: Sequence, // the last offset actually committed to CommitOffset
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct TopicPartitionKey {
+pub struct TopicPartitionKey {
     topic: GtsInstanceId,
     partition: u32,
 }
@@ -65,20 +65,20 @@ impl TopicPartitionKey {
     }
 }
 
-pub(crate) struct PartitionEventBuffer {
+pub struct PartitionEventBuffer {
     capacity: usize,
     events: VecDeque<Buffered>,
 }
 
 /// A buffered event with the position it was delivered at. The runtime reads the
 /// position from here, so it never unwraps the event's own optional members.
-pub(crate) struct Buffered {
+pub struct Buffered {
     pub(crate) event: EventV1,
     pub(crate) at: StoredPosition,
 }
 
 #[derive(Debug)]
-pub(crate) struct EnqueuedPartitionBatch {
+pub struct EnqueuedPartitionBatch {
     pub(crate) buffered_count: usize,
 }
 
@@ -114,7 +114,7 @@ impl PartitionEventBuffer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SlowConsumerReason {
+pub enum SlowConsumerReason {
     BufferHighWatermark,
     HandlerLatencyStrikes,
 }
@@ -127,7 +127,7 @@ fn slow_consumer_trigger(reason: SlowConsumerReason) -> SlowConsumerTrigger {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SlowConsumerSignal {
+pub struct SlowConsumerSignal {
     pub reason: SlowConsumerReason,
     pub buffered_count: usize,
     pub consecutive_slow_handlers: u16,
@@ -136,7 +136,7 @@ pub(crate) struct SlowConsumerSignal {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct PartitionSlowState {
+pub struct PartitionSlowState {
     buffered_count: usize,
     latest_observed_offset: Option<Sequence>,
     last_delivered_offset: Option<Sequence>,
@@ -250,7 +250,7 @@ impl PartitionSlowState {
     }
 }
 
-pub(crate) async fn enqueue_partition_batch(
+pub async fn enqueue_partition_batch(
     buffers: &PartitionBuffers,
     key: TopicPartitionKey,
     event: Buffered,
@@ -292,7 +292,7 @@ async fn next_buffered_partition_batch(
     Some((key, batch))
 }
 
-pub(crate) async fn emit_runtime_event_to(
+pub async fn emit_runtime_event_to(
     listeners: &[Arc<dyn ConsumerRuntimeListener>],
     timeout: Duration,
     event: ConsumerRuntimeEvent,
@@ -327,8 +327,7 @@ impl PartitionCursor {
     pub(crate) fn latest_offset(&self) -> Sequence {
         self.frontier
             .as_ref()
-            .map(PartitionFrontier::committed)
-            .unwrap_or(self.committed)
+            .map_or(self.committed, PartitionFrontier::committed)
     }
 
     pub(crate) fn advance_through_delivered_prefix(
@@ -345,18 +344,19 @@ impl PartitionCursor {
 }
 
 /// The GTS pattern matching every concrete event type: the event envelope base
-/// with a trailing `*`. `gts_id!` validates it at compile time, so the parse here
-/// cannot fail.
-fn all_event_types_pattern() -> GtsIdPattern {
-    GtsIdPattern::try_new(gts_id!("cf.core.events.event.v1~*"))
-        .expect("event envelope wildcard is a valid GTS pattern")
+/// with a trailing `*`. `gts_id!` validates it at compile time, so the parse
+/// does not fail in practice; a failure is reported as `Internal`.
+fn all_event_types_pattern() -> Result<GtsIdPattern, EventBrokerError> {
+    GtsIdPattern::try_new(gts_id!("cf.core.events.event.v1~*")).map_err(|e| {
+        EventBrokerError::Internal(format!("event envelope wildcard pattern is invalid: {e}"))
+    })
 }
 
 /// What one subscription slot runs with, shared by the plain and the transactional
 /// slot: the broker, the JOIN shape, the buffering, retry and slow-consumer settings
 /// and the listeners.
 #[derive(Clone)]
-pub(crate) struct SlotSettings {
+pub struct SlotSettings {
     pub slot_idx: u32,
     pub broker: Arc<dyn EventBrokerApi>,
     /// Shared across slots: every slot of one consumer resolves the same types.
@@ -447,7 +447,7 @@ impl SlotSettings {
 }
 
 /// Runs one subscription slot: JOIN, stream, dispatch, retry, re-JOIN.
-pub(crate) struct SlotDispatcher<H, OM>
+pub struct SlotDispatcher<H, OM>
 where
     H: DeliverBatch + 'static,
     OM: CommitOffset + 'static,
@@ -462,7 +462,7 @@ where
 /// Runs one transactional subscription slot. Unlike [`SlotDispatcher`], this path
 /// never creates an auto-commit timer; offset durability is handler-driven through
 /// `TxCommitHandle::commit_offset_in_tx`.
-pub(crate) struct TxSlotDispatcher<H, OM>
+pub struct TxSlotDispatcher<H, OM>
 where
     H: DeliverTxBatch<OM> + 'static,
     OM: CommitOffsetInTx + 'static,
@@ -543,6 +543,26 @@ enum RetryCause {
     Retry { reason: String },
     /// The handler failed; treated as a retry.
     Failed(String),
+}
+
+impl RetryCause {
+    /// The runtime event reporting this cause for a batch of `topic`'s `partition`.
+    fn runtime_event(&self, topic: &GtsInstanceId, partition: u32) -> ConsumerRuntimeEvent {
+        match self {
+            Self::Retry { reason } => ConsumerRuntimeEvent::HandlerBatchCompleted {
+                topic: topic.clone(),
+                partition,
+                outcome: BatchHandlerOutcome::Retry {
+                    reason: reason.clone(),
+                },
+            },
+            Self::Failed(error) => ConsumerRuntimeEvent::HandlerFailed {
+                topic: topic.clone(),
+                partition,
+                error: error.clone(),
+            },
+        }
+    }
 }
 
 struct SettledBatch {
@@ -629,30 +649,14 @@ trait SlotFlavour: Sync {
         trace!(slot_idx = slot.slot_idx, "{}", Self::TEXTS.starting);
         let group_id = slot.group;
         let mut consecutive_failures = 0u32;
-        let mut assignment = slot.join_subscription(&ctx, &group_id).await?;
-        slot.publish_subscription_id(assignment.id).await;
-
-        // Pre-stream SEEK: resolve a starting position per assigned partition
-        // via OffsetStore::load_position(...) and seed them on the broker before
-        // opening the stream. Without this, the broker returns `409
-        // PositionsNotSet` on stream-open (defensive backstop). A failed SEEK
-        // leaves the subscription and re-JOINs within the re-JOIN budget.
-        if !self.seek_or_leave(&ctx, &group_id, &assignment).await {
-            match self
-                .rejoin_and_seek(
-                    &ctx,
-                    &group_id,
-                    assignment.id,
-                    &mut consecutive_failures,
-                    &cancel,
-                )
-                .await?
-            {
-                Rejoin::Joined(next) => assignment = next,
-                // Every subscription this run joined is left already.
-                Rejoin::Cancelled => return Ok(()),
-            }
-        }
+        let mut assignment = match self
+            .join_and_seek(&ctx, &group_id, &mut consecutive_failures, &cancel)
+            .await?
+        {
+            Rejoin::Joined(assignment) => assignment,
+            // Every subscription this run joined is left already.
+            Rejoin::Cancelled => return Ok(()),
+        };
 
         let cursors: PartitionCursors = Arc::new(RwLock::new(HashMap::new()));
         let buffers: PartitionBuffers = Arc::new(RwLock::new(HashMap::new()));
@@ -671,56 +675,31 @@ trait SlotFlavour: Sync {
             }
 
             let sub_id = assignment.id;
-            // The open waits for the stream's first frame, which a silent connection
-            // never sends, so the wait ends at the slot's cancel too.
-            let opened = tokio::select! {
-                biased;
-                () = cancel.cancelled() => break,
-                opened = slot.open_stream(&ctx, sub_id) => opened,
-            };
-            if cancel.is_cancelled() {
+            let Some(opened) = self.open_unless_cancelled(&ctx, sub_id, &cancel).await else {
                 break;
-            }
+            };
             let (first, rest) = match opened {
                 Ok(opened) => opened,
-                Err(EventBrokerError::SubscriptionRecoveryExhausted { .. })
-                    if Self::OPEN_EXHAUSTION_ENDS_RUN =>
-                {
-                    return Err(EventBrokerError::SubscriptionRecoveryExhausted {
-                        attempts: consecutive_failures,
-                        detail: "stream open: recovery exhausted".into(),
-                    });
-                }
                 Err(e) => {
-                    warn!(
-                        slot_idx = slot.slot_idx,
-                        error = %e,
-                        "{}", Self::TEXTS.open_failed
-                    );
-                    // A member whose stream never opened, or never got past its first
-                    // frame, may still hold a share of the partitions; a JOIN evicts only
-                    // `Disconnected` members. Leave it first; a failed leave leaves it to
-                    // the broker's timeouts.
-                    let _ = slot.broker.leave(&ctx, sub_id).await;
                     match self
-                        .rejoin_and_seek(
+                        .recover_failed_open(
                             &ctx,
                             &group_id,
                             sub_id,
+                            e,
                             &mut consecutive_failures,
                             &cancel,
                         )
                         .await?
                     {
                         Rejoin::Joined(next) => assignment = next,
-                        // `sub_id` is left above, and so is every subscription the
+                        // `sub_id` is left, and so is every subscription the
                         // re-JOIN loop joined.
                         Rejoin::Cancelled => return Ok(()),
                     }
                     continue;
                 }
             };
-            let mut stream = futures_util::stream::iter([Ok(first)]).chain(rest);
             let active = ActiveSubscription {
                 ctx: &ctx,
                 group_id: &group_id,
@@ -730,61 +709,183 @@ trait SlotFlavour: Sync {
 
             // Only an open stream starts the re-JOIN budget over.
             consecutive_failures = 0;
-            let drain_before_rejoin = match self
-                .consume_stream(&cancel, &mut stream, state, active)
-                .await
-            {
-                StreamEnd::Cancelled => break,
-                StreamEnd::Rejoin => false,
-                StreamEnd::DrainThenRejoin => true,
-            };
-
-            // The stream ended, a frame ended it, or a dispatched event dropped it. Re-JOIN
-            // unless cancelled.
-            if cancel.is_cancelled() {
+            let Some(drain_before_rejoin) =
+                self.run_stream(&cancel, state, active, first, rest).await
+            else {
                 break;
-            }
-            if drain_before_rejoin {
-                self.drain_subscription_buffers(&cancel, state, active)
-                    .await;
-                let _ = slot.broker.leave(&ctx, sub_id).await;
-            }
-            // End the old stream before the re-JOIN. The broker evicts a member whose
-            // stream has closed (`Disconnected`) when the next JOIN arrives, but splits
-            // the partitions with one whose stream is still open, and that one then
-            // keeps its share until its stream closes, then `session_timeout`. Closing
-            // the stream is enough without a LEAVE, which a broken transport may not
-            // carry. That is proven in process; over REST the server notices the close
-            // when hyper does, a delay that is not measured (#5819).
-            drop(stream);
-            slot.emit_runtime_event(ConsumerRuntimeEvent::SubscriptionTerminated {
-                subscription: sub_id,
-                reason: ConnectionDropReason::StreamTerminated,
-            })
-            .await;
+            };
             match self
-                .rejoin_and_seek(&ctx, &group_id, sub_id, &mut consecutive_failures, &cancel)
-                .await
+                .rejoin_after_stream(
+                    &ctx,
+                    &group_id,
+                    sub_id,
+                    drain_before_rejoin,
+                    &mut consecutive_failures,
+                    &cancel,
+                )
+                .await?
             {
-                Ok(Rejoin::Joined(next)) => assignment = next,
-                // The graceful LEAVE below leaves `sub_id`. After a drain above it is the
-                // second LEAVE of `sub_id`; the broker answers it `404`, which is ignored.
-                Ok(Rejoin::Cancelled) => break,
-                Err(e) => {
-                    // No re-JOIN follows to evict the closed member, which would keep its
-                    // partitions until another JOIN or `session_timeout`. Leave it, unless
-                    // the drain above did.
-                    if !drain_before_rejoin {
-                        let _ = slot.broker.leave(&ctx, sub_id).await;
-                    }
-                    return Err(e);
-                }
+                Rejoin::Joined(next) => assignment = next,
+                // The graceful LEAVE below leaves `sub_id`. When `run_stream` drained and
+                // left it, this is the second LEAVE; the broker answers `404`, which is
+                // ignored.
+                Rejoin::Cancelled => break,
             }
         }
 
         // Graceful shutdown: leave subscription.
-        let _ = slot.broker.leave(&ctx, assignment.id).await;
+        slot.leave_quietly(&ctx, assignment.id).await;
         Ok(())
+    }
+
+    /// Consumes the open stream of `active` until it ends. Returns `None` when the
+    /// slot is cancelled, else whether the buffers were drained and the
+    /// subscription left before the re-JOIN.
+    async fn run_stream(
+        &self,
+        cancel: &CancellationToken,
+        state: DispatchState<'_>,
+        active: ActiveSubscription<'_>,
+        first: WireFrame,
+        rest: FrameStream,
+    ) -> Option<bool> {
+        let slot = self.settings();
+        let mut stream = futures_util::stream::iter([Ok(first)]).chain(rest);
+        let drain_before_rejoin = match self
+            .consume_stream(cancel, &mut stream, state, active)
+            .await
+        {
+            StreamEnd::Cancelled => return None,
+            StreamEnd::Rejoin => false,
+            StreamEnd::DrainThenRejoin => true,
+        };
+
+        // The stream ended, a frame ended it, or a dispatched event dropped it. Re-JOIN
+        // unless cancelled.
+        if cancel.is_cancelled() {
+            return None;
+        }
+        if drain_before_rejoin {
+            self.drain_subscription_buffers(cancel, state, active).await;
+            slot.leave_quietly(active.ctx, active.sub_id).await;
+        }
+        // End the old stream before the re-JOIN. The broker evicts a member whose
+        // stream has closed (`Disconnected`) when the next JOIN arrives, but splits
+        // the partitions with one whose stream is still open, and that one then
+        // keeps its share until its stream closes, then `session_timeout`. Closing
+        // the stream is enough without a LEAVE, which a broken transport may not
+        // carry. That is proven in process; over REST the server notices the close
+        // when hyper does, a delay that is not measured (#5819).
+        drop(stream);
+        slot.emit_runtime_event(ConsumerRuntimeEvent::SubscriptionTerminated {
+            subscription: active.sub_id,
+            reason: ConnectionDropReason::StreamTerminated,
+        })
+        .await;
+        Some(drain_before_rejoin)
+    }
+
+    /// Opens `sub_id`'s stream, or `None` once the slot is cancelled. The open waits
+    /// for the stream's first frame, which a silent connection never sends, so the
+    /// wait ends at the slot's cancel too.
+    async fn open_unless_cancelled(
+        &self,
+        ctx: &SecurityContext,
+        sub_id: SubscriptionId,
+        cancel: &CancellationToken,
+    ) -> Option<Result<(WireFrame, FrameStream), EventBrokerError>> {
+        let opened = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return None,
+            opened = self.settings().open_stream(ctx, sub_id) => opened,
+        };
+        if cancel.is_cancelled() {
+            return None;
+        }
+        Some(opened)
+    }
+
+    /// Re-JOINs after the stream of `sub_id` ended. When that fails, no re-JOIN
+    /// follows to evict the closed member, which would keep its partitions until
+    /// another JOIN or `session_timeout`, so `sub_id` is left unless `left` says
+    /// the caller did already.
+    async fn rejoin_after_stream(
+        &self,
+        ctx: &SecurityContext,
+        group_id: &ConsumerGroupId,
+        sub_id: SubscriptionId,
+        left: bool,
+        consecutive_failures: &mut u32,
+        cancel: &CancellationToken,
+    ) -> Result<Rejoin, EventBrokerError> {
+        let rejoined = self
+            .rejoin_and_seek(ctx, group_id, sub_id, consecutive_failures, cancel)
+            .await;
+        if rejoined.is_err() && !left {
+            self.settings().leave_quietly(ctx, sub_id).await;
+        }
+        rejoined
+    }
+
+    /// JOINs the slot's first subscription and seeds its positions.
+    ///
+    /// Pre-stream SEEK: resolve a starting position per assigned partition via
+    /// `OffsetStore::load_position(...)` and seed them on the broker before opening
+    /// the stream. Without this, the broker returns `409 PositionsNotSet` on
+    /// stream-open (defensive backstop). A failed SEEK leaves the subscription and
+    /// re-JOINs within the re-JOIN budget. A failed first JOIN ends the run.
+    async fn join_and_seek(
+        &self,
+        ctx: &SecurityContext,
+        group_id: &ConsumerGroupId,
+        consecutive_failures: &mut u32,
+        cancel: &CancellationToken,
+    ) -> Result<Rejoin, EventBrokerError> {
+        let slot = self.settings();
+        let assignment = slot.join_subscription(ctx, group_id).await?;
+        slot.publish_subscription_id(assignment.id).await;
+        if self.seek_or_leave(ctx, group_id, &assignment).await {
+            return Ok(Rejoin::Joined(assignment));
+        }
+        self.rejoin_and_seek(ctx, group_id, assignment.id, consecutive_failures, cancel)
+            .await
+    }
+
+    /// Handles a stream of `sub_id` that did not open: ends the run on
+    /// `SubscriptionRecoveryExhausted` when [`Self::OPEN_EXHAUSTION_ENDS_RUN`],
+    /// otherwise leaves `sub_id` and re-JOINs.
+    async fn recover_failed_open(
+        &self,
+        ctx: &SecurityContext,
+        group_id: &ConsumerGroupId,
+        sub_id: SubscriptionId,
+        error: EventBrokerError,
+        consecutive_failures: &mut u32,
+        cancel: &CancellationToken,
+    ) -> Result<Rejoin, EventBrokerError> {
+        if Self::OPEN_EXHAUSTION_ENDS_RUN
+            && matches!(
+                error,
+                EventBrokerError::SubscriptionRecoveryExhausted { .. }
+            )
+        {
+            return Err(EventBrokerError::SubscriptionRecoveryExhausted {
+                attempts: *consecutive_failures,
+                detail: "stream open: recovery exhausted".into(),
+            });
+        }
+        let slot = self.settings();
+        warn!(
+            slot_idx = slot.slot_idx,
+            error = %error,
+            "{}", Self::TEXTS.open_failed
+        );
+        // A member whose stream never opened, or never got past its first frame,
+        // may still hold a share of the partitions; a JOIN evicts only
+        // `Disconnected` members. Leave it first.
+        slot.leave_quietly(ctx, sub_id).await;
+        self.rejoin_and_seek(ctx, group_id, sub_id, consecutive_failures, cancel)
+            .await
     }
 
     /// Reads the open stream's frames until the stream ends, the slot is cancelled,
@@ -800,7 +901,6 @@ trait SlotFlavour: Sync {
         state: DispatchState<'_>,
         active: ActiveSubscription<'_>,
     ) -> StreamEnd {
-        let slot = self.settings();
         let mut consecutive_heartbeats: usize = 0;
         let mut partitions = StreamPartitions::new(active.affected);
         loop {
@@ -812,81 +912,116 @@ trait SlotFlavour: Sync {
                     None => return StreamEnd::Rejoin,
                 },
             };
-            match frame_result {
-                Ok(WireFrame::Event(event)) => {
+            let frame = match frame_result {
+                Ok(frame) => frame,
+                Err(e) => {
+                    self.warn_frame_error(&e);
+                    return StreamEnd::Rejoin;
+                }
+            };
+            let end = match frame {
+                WireFrame::Event(event) => {
                     consecutive_heartbeats = 0;
-                    if self.dispatch_event(cancel, event, state, active).await {
-                        return StreamEnd::DrainThenRejoin;
-                    }
+                    self.dispatch_event(cancel, event, state, active)
+                        .await
+                        .then_some(StreamEnd::DrainThenRejoin)
                 }
-                Ok(WireFrame::Heartbeat { .. }) => {
+                WireFrame::Heartbeat { .. } => {
                     consecutive_heartbeats += 1;
-                    if consecutive_heartbeats >= slot.heartbeat_drop_threshold {
-                        trace!(
-                            slot_idx = slot.slot_idx,
-                            threshold = slot.heartbeat_drop_threshold,
-                            "{}",
-                            Self::TEXTS.heartbeat_drop
-                        );
-                        return StreamEnd::Rejoin;
-                    }
+                    self.heartbeat_end(consecutive_heartbeats)
                 }
-                Ok(WireFrame::Control {
+                WireFrame::Control {
                     code,
                     positions,
                     reason,
-                }) => {
-                    self.take_frame_positions(active.group_id, active.sub_id, &positions)
-                        .await;
-                    if code == ControlCode::Terminal {
-                        // Gain / lose-all: the subscription is terminating; re-JOIN.
-                        trace!(
-                            slot_idx = slot.slot_idx,
-                            ?reason,
-                            "{}",
-                            Self::TEXTS.terminal
-                        );
-                        return StreamEnd::Rejoin;
-                    }
-                    // Progress: sparse mid-stream update; keep streaming.
+                } => {
+                    self.take_control_frame(active, code, &positions, reason.as_deref())
+                        .await
                 }
-                Ok(WireFrame::Topology {
+                WireFrame::Topology {
                     topology_version: _,
                     assigned,
-                }) => {
-                    // Non-terminal: a broker stream's opening frame (a REST reconnect
-                    // opens a new one), a partition loss or a `topology_version`-only
-                    // change; keep streaming. A gain on an open broker stream ends it
-                    // with a Terminal control frame instead. Changed partitions are
-                    // reported, the opening frame's included: a rebalance between the
-                    // JOIN and the open shows only there.
-                    self.take_frame_positions(active.group_id, active.sub_id, &assigned)
+                } => {
+                    self.take_topology_frame(active, &assigned, &mut partitions)
                         .await;
-                    if let Some(kept) = partitions.take_frame(&assigned) {
-                        slot.emit_runtime_event(ConsumerRuntimeEvent::AssignmentChanged {
-                            subscription: active.sub_id,
-                            assigned: kept,
-                        })
-                        .await;
-                    }
+                    None
                 }
-                Err(e @ EventBrokerError::Transport(_)) => {
-                    warn!(
-                        slot_idx = slot.slot_idx,
-                        error = %e,
-                        "{}", Self::TEXTS.transport_error
-                    );
-                    return StreamEnd::Rejoin;
-                }
-                Err(e) => {
-                    warn!(
-                        slot_idx = slot.slot_idx,
-                        error = %e,
-                        "{}", Self::TEXTS.frame_error
-                    );
-                    return StreamEnd::Rejoin;
-                }
+            };
+            if let Some(end) = end {
+                return end;
             }
+        }
+    }
+
+    /// Ends the stream once `consecutive_heartbeats` reaches the slot's drop
+    /// threshold.
+    fn heartbeat_end(&self, consecutive_heartbeats: usize) -> Option<StreamEnd> {
+        let slot = self.settings();
+        if consecutive_heartbeats < slot.heartbeat_drop_threshold {
+            return None;
+        }
+        trace!(
+            slot_idx = slot.slot_idx,
+            threshold = slot.heartbeat_drop_threshold,
+            "{}",
+            Self::TEXTS.heartbeat_drop
+        );
+        Some(StreamEnd::Rejoin)
+    }
+
+    /// Takes a control frame's positions; a `Terminal` one ends the stream.
+    async fn take_control_frame(
+        &self,
+        active: ActiveSubscription<'_>,
+        code: ControlCode,
+        positions: &[PartitionPosition],
+        reason: Option<&str>,
+    ) -> Option<StreamEnd> {
+        self.take_frame_positions(active.group_id, active.sub_id, positions)
+            .await;
+        // Progress: sparse mid-stream update; keep streaming.
+        if code != ControlCode::Terminal {
+            return None;
+        }
+        // Gain / lose-all: the subscription is terminating; re-JOIN.
+        trace!(
+            slot_idx = self.settings().slot_idx,
+            ?reason,
+            "{}",
+            Self::TEXTS.terminal
+        );
+        Some(StreamEnd::Rejoin)
+    }
+
+    /// Takes a topology frame. Non-terminal: a broker stream's opening frame (a REST
+    /// reconnect opens a new one), a partition loss or a `topology_version`-only
+    /// change; keep streaming. A gain on an open broker stream ends it with a Terminal
+    /// control frame instead. Changed partitions are reported, the opening frame's
+    /// included: a rebalance between the JOIN and the open shows only there.
+    async fn take_topology_frame(
+        &self,
+        active: ActiveSubscription<'_>,
+        assigned: &[PartitionPosition],
+        partitions: &mut StreamPartitions,
+    ) {
+        self.take_frame_positions(active.group_id, active.sub_id, assigned)
+            .await;
+        if let Some(kept) = partitions.take_frame(assigned) {
+            self.settings()
+                .emit_runtime_event(ConsumerRuntimeEvent::AssignmentChanged {
+                    subscription: active.sub_id,
+                    assigned: kept,
+                })
+                .await;
+        }
+    }
+
+    fn warn_frame_error(&self, error: &EventBrokerError) {
+        let slot_idx = self.settings().slot_idx;
+        if matches!(error, EventBrokerError::Transport(_)) {
+            warn!(slot_idx, error = %error, "{}", Self::TEXTS.transport_error);
+        } else {
+            warn!(slot_idx, error = %error, "{}", Self::TEXTS.frame_error);
         }
     }
 
@@ -898,45 +1033,10 @@ trait SlotFlavour: Sync {
         active: ActiveSubscription<'_>,
     ) -> bool {
         let slot = self.settings();
-        // A transport stamps every event it can place, so one without a position is
-        // skipped like an event no topic can be attributed to.
-        let (Some(partition), Some(sequence), Some(sequence_time)) =
-            (event.partition(), event.sequence(), event.sequence_time())
-        else {
-            warn!(
-                event_id = %event.id(),
-                type_id = %event.event_type(),
-                "a delivered event carries no stamped position; skipping it"
-            );
+        let Some((key, buffered)) = self.place_event(event, active.ctx).await else {
             return false;
         };
-        // A topic is what an event's type declares, so it is resolved rather than
-        // read off the frame. A type this consumer has not seen costs one call
-        // here and none afterwards.
-        let topic = match slot
-            .type_cache
-            .topic_of(&slot.broker, active.ctx, event.event_type())
-            .await
-        {
-            Ok(topic) => topic,
-            Err(err) => {
-                warn!(
-                    error = %err,
-                    type_id = %event.event_type(),
-                    "cannot attribute a delivered event to a topic; skipping it"
-                );
-                return false;
-            }
-        };
-        let key = TopicPartitionKey::new(topic, partition);
-        let buffered = Buffered {
-            event,
-            at: StoredPosition {
-                partition,
-                sequence,
-                sequence_time,
-            },
-        };
+        let sequence = buffered.at.sequence;
         let enqueued = match enqueue_partition_batch(
             state.buffers,
             key.clone(),
@@ -966,6 +1066,55 @@ trait SlotFlavour: Sync {
         let batch_events = drain_partition_batch(state.buffers, &key, slot.batch_max_events).await;
         self.process_batch(cancel, state, key, batch_events, active)
             .await
+    }
+
+    /// The partition key and stored position of a delivered event, or `None`, with
+    /// a warning, for an event the slot skips.
+    async fn place_event(
+        &self,
+        event: EventV1,
+        ctx: &SecurityContext,
+    ) -> Option<(TopicPartitionKey, Buffered)> {
+        let slot = self.settings();
+        // A transport stamps every event it can place, so one without a position is
+        // skipped like an event no topic can be attributed to.
+        let (Some(partition), Some(sequence), Some(sequence_time)) =
+            (event.partition(), event.sequence(), event.sequence_time())
+        else {
+            warn!(
+                event_id = %event.id(),
+                type_id = %event.event_type(),
+                "a delivered event carries no stamped position; skipping it"
+            );
+            return None;
+        };
+        // A topic is what an event's type declares, so it is resolved rather than
+        // read off the frame. A type this consumer has not seen costs one call
+        // here and none afterwards.
+        let topic = match slot
+            .type_cache
+            .topic_of(&slot.broker, ctx, event.event_type())
+            .await
+        {
+            Ok(topic) => topic,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    type_id = %event.event_type(),
+                    "cannot attribute a delivered event to a topic; skipping it"
+                );
+                return None;
+            }
+        };
+        let buffered = Buffered {
+            event,
+            at: StoredPosition {
+                partition,
+                sequence,
+                sequence_time,
+            },
+        };
+        Some((TopicPartitionKey::new(topic, partition), buffered))
     }
 
     async fn drain_subscription_buffers(
@@ -1015,8 +1164,7 @@ trait SlotFlavour: Sync {
         let batch_partition = positions[0].partition;
         let batch_offset = positions
             .last()
-            .map(|at| at.sequence)
-            .unwrap_or_else(|| positions[0].sequence);
+            .map_or_else(|| positions[0].sequence, |at| at.sequence);
 
         let mut attempts: u16 = 1;
         let mut backoff = slot.retry_base;
@@ -1038,49 +1186,9 @@ trait SlotFlavour: Sync {
                 .await
             {
                 BatchAttempt::Settled(settled) => {
-                    slot.emit_runtime_event(ConsumerRuntimeEvent::HandlerBatchCompleted {
-                        topic: key.topic.clone(),
-                        partition: batch_partition,
-                        outcome: settled.outcome,
-                    })
-                    .await;
-                    if let Some(skipped) = settled.skipped {
-                        slot.report_skipped_event(&key, skipped).await;
-                    }
-                    let drop_stream = self
-                        .observe_handler_slow_signal(
-                            state,
-                            key.clone(),
-                            started_at.elapsed(),
-                            batch_offset,
-                            active,
-                        )
+                    return self
+                        .settle_batch(state, active, &key, &positions, settled, started_at)
                         .await;
-                    let frontier = {
-                        let mut guard = state.cursors.write().await;
-                        let c = guard.entry(key.clone()).or_default();
-                        let frontier = c.advance_through_delivered_prefix(
-                            &positions[..settled.processed_count],
-                        );
-                        if settled.committed {
-                            c.committed = frontier;
-                        }
-                        frontier
-                    };
-                    if settled.committed {
-                        slot.emit_runtime_event(ConsumerRuntimeEvent::OffsetCommitted {
-                            topic: key.topic.clone(),
-                            partition: batch_partition,
-                            offset: frontier,
-                        })
-                        .await;
-                    }
-                    slot.emit_runtime_event(ConsumerRuntimeEvent::ProgressAdvanced {
-                        subscription: active.sub_id,
-                        progress: vec![partition_progress(&key, frontier)],
-                    })
-                    .await;
-                    return drop_stream;
                 }
                 BatchAttempt::Unusable(error) => {
                     slot.emit_runtime_event(ConsumerRuntimeEvent::HandlerFailed {
@@ -1092,23 +1200,8 @@ trait SlotFlavour: Sync {
                     return true;
                 }
                 BatchAttempt::Again(cause) => {
-                    let event = match &cause {
-                        RetryCause::Retry { reason } => {
-                            ConsumerRuntimeEvent::HandlerBatchCompleted {
-                                topic: key.topic.clone(),
-                                partition: batch_partition,
-                                outcome: BatchHandlerOutcome::Retry {
-                                    reason: reason.clone(),
-                                },
-                            }
-                        }
-                        RetryCause::Failed(error) => ConsumerRuntimeEvent::HandlerFailed {
-                            topic: key.topic.clone(),
-                            partition: batch_partition,
-                            error: error.clone(),
-                        },
-                    };
-                    slot.emit_runtime_event(event).await;
+                    slot.emit_runtime_event(cause.runtime_event(&key.topic, batch_partition))
+                        .await;
                     cause
                 }
             };
@@ -1127,14 +1220,7 @@ trait SlotFlavour: Sync {
             if cancel.is_cancelled() {
                 return false;
             }
-            match cause {
-                RetryCause::Retry { reason } => {
-                    trace!(reason, attempts, "{}", Self::TEXTS.handler_retry);
-                }
-                RetryCause::Failed(error) => {
-                    warn!(error = %error, "{}", Self::TEXTS.handler_err);
-                }
-            }
+            Self::log_retry(cause, attempts);
             slot.emit_runtime_event(ConsumerRuntimeEvent::RetryScheduled {
                 topic: key.topic.clone(),
                 partition: batch_partition,
@@ -1145,11 +1231,83 @@ trait SlotFlavour: Sync {
             // Giving the batch up here advances no cursor: unless the handler
             // committed it, the next start delivers it again (at-least-once).
             tokio::select! {
-                _ = cancel.cancelled() => return false,
-                _ = tokio::time::sleep(backoff) => {}
+                () = cancel.cancelled() => return false,
+                () = tokio::time::sleep(backoff) => {}
             }
             backoff = (backoff * 2).min(slot.retry_max);
             attempts = attempts.saturating_add(1);
+        }
+    }
+
+    /// Applies a settled batch: reports it, moves the partition's cursor through the
+    /// processed prefix of `positions` and checks the handler's latency. Returns
+    /// whether the stream is dropped as slow.
+    async fn settle_batch(
+        &self,
+        state: DispatchState<'_>,
+        active: ActiveSubscription<'_>,
+        key: &TopicPartitionKey,
+        positions: &[StoredPosition],
+        settled: SettledBatch,
+        started_at: Instant,
+    ) -> bool {
+        let slot = self.settings();
+        let batch_partition = positions[0].partition;
+        let batch_offset = positions
+            .last()
+            .map_or_else(|| positions[0].sequence, |at| at.sequence);
+        slot.emit_runtime_event(ConsumerRuntimeEvent::HandlerBatchCompleted {
+            topic: key.topic.clone(),
+            partition: batch_partition,
+            outcome: settled.outcome,
+        })
+        .await;
+        if let Some(skipped) = settled.skipped {
+            slot.report_skipped_event(key, skipped).await;
+        }
+        let drop_stream = self
+            .observe_handler_slow_signal(
+                state,
+                key.clone(),
+                started_at.elapsed(),
+                batch_offset,
+                active,
+            )
+            .await;
+        let frontier = {
+            let mut guard = state.cursors.write().await;
+            let c = guard.entry(key.clone()).or_default();
+            let frontier =
+                c.advance_through_delivered_prefix(&positions[..settled.processed_count]);
+            if settled.committed {
+                c.committed = frontier;
+            }
+            frontier
+        };
+        if settled.committed {
+            slot.emit_runtime_event(ConsumerRuntimeEvent::OffsetCommitted {
+                topic: key.topic.clone(),
+                partition: batch_partition,
+                offset: frontier,
+            })
+            .await;
+        }
+        slot.emit_runtime_event(ConsumerRuntimeEvent::ProgressAdvanced {
+            subscription: active.sub_id,
+            progress: vec![partition_progress(key, frontier)],
+        })
+        .await;
+        drop_stream
+    }
+
+    fn log_retry(cause: RetryCause, attempts: u16) {
+        match cause {
+            RetryCause::Retry { reason } => {
+                trace!(reason, attempts, "{}", Self::TEXTS.handler_retry);
+            }
+            RetryCause::Failed(error) => {
+                warn!(error = %error, "{}", Self::TEXTS.handler_err);
+            }
         }
     }
 
@@ -1312,7 +1470,7 @@ trait SlotFlavour: Sync {
             error = %e,
             "{}", Self::TEXTS.seek_failed
         );
-        let _ = slot.broker.leave(ctx, assignment.id).await;
+        slot.leave_quietly(ctx, assignment.id).await;
         false
     }
 
@@ -1404,6 +1562,12 @@ impl SlotSettings {
                 "stream ended before its first frame".to_owned(),
             )),
         }
+    }
+
+    /// Leaves `subscription_id`. A failed leave is ignored: the broker drops the
+    /// member at its session timeout.
+    async fn leave_quietly(&self, ctx: &SecurityContext, subscription_id: SubscriptionId) {
+        self.broker.leave(ctx, subscription_id).await.ok();
     }
 
     async fn publish_subscription_id(&self, subscription_id: SubscriptionId) {
@@ -1504,7 +1668,7 @@ impl SlotSettings {
         // the broker's `GtsId::matches_pattern` covers for every derived event type;
         // topic-equality in the interest scopes it to the topic.
         let event_type_patterns = if self.event_type_patterns.is_empty() {
-            vec![all_event_types_pattern()]
+            vec![all_event_types_pattern()?]
         } else {
             self.event_type_patterns.clone()
         };
@@ -1656,7 +1820,7 @@ where
             let mut interval = tokio::time::interval(interval);
             loop {
                 tokio::select! {
-                    _ = seek_cancel.cancelled() => break,
+                    () = seek_cancel.cancelled() => break,
                     _ = interval.tick() => {
                         let pending: Vec<_> = {
                             let guard = seek_cursors.read().await;
@@ -1706,7 +1870,8 @@ where
                                     },
                                 ).await;
                             }
-                            let _ = seek_broker.seek(
+                            // A stale seek after a re-JOIN is refused; ignore it.
+                            seek_broker.seek(
                                 &seek_ctx,
                                 seek_sub,
                                 seek_topology_version,
@@ -1715,7 +1880,7 @@ where
                                     partition: key.partition,
                                     value: Position::Exact(latest_offset),
                                 }],
-                            ).await;
+                            ).await.ok();
                         }
                     }
                 }

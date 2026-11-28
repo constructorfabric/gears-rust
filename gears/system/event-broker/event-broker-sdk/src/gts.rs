@@ -241,6 +241,10 @@ impl EventMeta {
     traits_schema = inline(EventV1Traits),
     gts_abstract = true,
 )]
+#[expect(
+    clippy::doc_markdown,
+    reason = "field doc comments are the published JSON Schema descriptions, kept verbatim"
+)]
 pub struct EventV1<P = serde_json::Value> {
     /// Client-provided unique event identifier (UUID).
     id: Uuid,
@@ -646,7 +650,7 @@ impl<P: EventPayload> TryFrom<&EventV1<P>> for EventV1 {
     /// # Errors
     ///
     /// [`EventBrokerError::Internal`] when `data` does not serialize, which names only
-    /// the serde_json failure class.
+    /// the `serde_json` failure class.
     fn try_from(event: &EventV1<P>) -> Result<Self, EventBrokerError> {
         let data = event
             .data

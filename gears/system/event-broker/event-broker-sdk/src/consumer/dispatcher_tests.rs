@@ -186,12 +186,11 @@ impl BatchHandler<serde_json::Value> for AckAllBatchHandler {
                 sequence_of(event),
             )
         }));
-        Ok(chunk
-            .last()
-            .map(|event| BatchHandlerOutcome::AdvanceThrough {
+        Ok(chunk.last().map_or(BatchHandlerOutcome::Success, |event| {
+            BatchHandlerOutcome::AdvanceThrough {
                 offset: event.sequence().expect("a delivered event is stamped"),
-            })
-            .unwrap_or(BatchHandlerOutcome::Success))
+            }
+        }))
     }
 }
 
@@ -2465,7 +2464,7 @@ fn topology_of(partitions: &[(&str, u32)]) -> WireFrame {
     }
 }
 
-/// The `SubscriptionStarted` and `AssignmentChanged` events of the JOINed subscription
+/// The `SubscriptionStarted` and `AssignmentChanged` events of the joined subscription
 /// in a plain slot run on a `ScriptedTopologyBroker` yielding `frames`. The run JOINs
 /// once, so its one `join_subscription` emits one `SubscriptionStarted` and one
 /// `AssignmentChanged` before the stream opens; every later `AssignmentChanged` comes
@@ -2851,6 +2850,10 @@ async fn a_larger_first_frame_reports_the_gained_partitions() {
 /// the subscriptions in `ending_streams`, or else cancels `cancel` and stays open. With
 /// `streams_fail` set, every stream open fails instead. Every injected failure is
 /// `Transport("injected")`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent fault switches of a test double, set per test"
+)]
 struct SeekOrJoinFailsBroker {
     joins: Mutex<u128>,
     seeks: Mutex<Vec<SubscriptionId>>,

@@ -896,7 +896,7 @@ fn a_cloned_event_keeps_every_member() {
     .unwrap();
 
     assert_eq!(
-        serde_json::to_value(event.clone()).unwrap(),
+        serde_json::to_value(event).unwrap(),
         json!({
             "id": EVENT_ID,
             "type": EVENT_TYPE,
@@ -939,11 +939,11 @@ fn the_raw_event_resolves_a_partition_key_as_the_backend_record_does() {
         occurred_at: occurred_at(),
         trace_parent: None,
         data: Some(data),
-        ingest: None,
         partition: None,
         sequence: None,
         sequence_time: None,
         meta: None,
+        ingest: None,
     };
     let internal = |result: Result<String, EventBrokerError>| match result {
         Ok(key) => Ok(key),

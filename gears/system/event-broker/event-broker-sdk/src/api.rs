@@ -77,11 +77,13 @@ pub struct ProducerCursors {
 
 impl ProducerCursors {
     /// True when the producer has no recorded cursor on any topic.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.topics.is_empty()
     }
 
     /// The broker's known `last_sequence` for `topic`, if any.
+    #[must_use]
     pub fn last_sequence(&self, topic: &GtsInstanceId) -> Option<i64> {
         self.topics
             .iter()
@@ -258,6 +260,10 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// # Errors
+    ///
+    /// [`EventBrokerError::InvalidConsumerOptions`] when `expression` is empty or
+    /// longer than 4096 bytes.
     pub fn new(
         engine: GtsInstanceId,
         expression: impl Into<String>,
@@ -274,10 +280,12 @@ impl Filter {
         Ok(Self { engine, expression })
     }
 
+    #[must_use]
     pub fn engine(&self) -> &GtsInstanceId {
         &self.engine
     }
 
+    #[must_use]
     pub fn expression(&self) -> &str {
         &self.expression
     }
@@ -314,43 +322,52 @@ pub struct SubscriptionInterestBuilder {
 }
 
 impl SubscriptionInterest {
+    #[must_use]
     pub fn builder() -> SubscriptionInterestBuilder {
         SubscriptionInterestBuilder::default()
     }
 
+    #[must_use]
     pub fn topic(&self) -> &GtsInstanceId {
         &self.topic
     }
 
     /// The tenant the interest reads; [`InterestTenant::Caller`] unless one
     /// was named.
+    #[must_use]
     pub fn subject_tenant(&self) -> InterestTenant {
         self.subject_tenant
     }
 
+    #[must_use]
     pub fn ownership_filter(&self) -> OwnershipFilter {
         self.ownership_filter
     }
 
+    #[must_use]
     pub fn barrier_mode(&self) -> BarrierMode {
         self.barrier_mode
     }
 
+    #[must_use]
     pub fn types(&self) -> &[GtsIdPattern] {
         &self.types
     }
 
     /// The subject-type selector; empty when the interest has none.
+    #[must_use]
     pub fn subject_types(&self) -> &[GtsIdPattern] {
         &self.subject_types
     }
 
+    #[must_use]
     pub fn filter(&self) -> Option<&Filter> {
         self.filter.as_ref()
     }
 }
 
 impl SubscriptionInterestBuilder {
+    #[must_use]
     pub fn topic(mut self, topic: GtsInstanceId) -> Self {
         self.topic = Some(topic);
         self
@@ -360,6 +377,7 @@ impl SubscriptionInterestBuilder {
     /// when not set. The nil UUID is refused by `build()`. Under
     /// [`OwnershipFilter::OnlyMine`] the broker refuses a tenant other than the
     /// caller's.
+    #[must_use]
     pub fn subject_tenant(mut self, tenant: Uuid) -> Self {
         self.subject_tenant = InterestTenant::Tenant(tenant);
         self
@@ -367,16 +385,19 @@ impl SubscriptionInterestBuilder {
 
     /// Which of the tenant's events the interest reads;
     /// [`OwnershipFilter::OnlyMine`] when not set.
+    #[must_use]
     pub fn ownership_filter(mut self, filter: OwnershipFilter) -> Self {
         self.ownership_filter = filter;
         self
     }
 
+    #[must_use]
     pub fn barrier_mode(mut self, barrier_mode: BarrierMode) -> Self {
         self.barrier_mode = barrier_mode;
         self
     }
 
+    #[must_use]
     pub fn types<I>(mut self, types: I) -> Self
     where
         I: IntoIterator<Item = GtsIdPattern>,
@@ -389,6 +410,7 @@ impl SubscriptionInterestBuilder {
     /// like `types`. A delivery filter with no authorization meaning: it never
     /// widens what the caller may read. At most 32 patterns; none means every
     /// subject type.
+    #[must_use]
     pub fn subject_types<I>(mut self, patterns: I) -> Self
     where
         I: IntoIterator<Item = GtsIdPattern>,
@@ -397,6 +419,7 @@ impl SubscriptionInterestBuilder {
         self
     }
 
+    #[must_use]
     pub fn filter(mut self, filter: Filter) -> Self {
         self.filter = Some(filter);
         self

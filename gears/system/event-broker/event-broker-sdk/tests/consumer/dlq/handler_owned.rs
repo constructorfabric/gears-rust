@@ -78,7 +78,7 @@ impl EventHandler<serde_json::Value> for HandlerOwnedDlqPolicy {
         if event
             .data()
             .and_then(|data| data.get("reject"))
-            .and_then(|value| value.as_bool())
+            .and_then(serde_json::Value::as_bool)
             == Some(true)
         {
             self.park_permanent_failure(&event, delivery).await?;

@@ -261,7 +261,7 @@ fn subscribe_with_subject_types(subject_types: &[String]) -> Result<(), gts::Sto
 
 /// Validates a subscription whose single interest is `interest` against the
 /// committed subscription schema, through `GtsStore` as above.
-fn subscribe_with_interest(interest: serde_json::Value) -> Result<(), gts::StoreError> {
+fn subscribe_with_interest(interest: &serde_json::Value) -> Result<(), gts::StoreError> {
     let type_id = "gts.cf.core.events.subscription.v1~";
     let mut store = gts::GtsStore::new();
     store.register_schema(
@@ -279,7 +279,7 @@ fn subscribe_with_interest(interest: serde_json::Value) -> Result<(), gts::Store
 #[test]
 fn subscription_schema_accepts_an_interest_without_a_tenant_and_each_ownership_filter() {
     for ownership_filter in ["only_mine", "entire_tenant", "tenant_subtree_included"] {
-        subscribe_with_interest(serde_json::json!({
+        subscribe_with_interest(&serde_json::json!({
             "topic": "gts.cf.core.events.topic.v1~fabrikam.shop._.orders.v1",
             "ownership_filter": ownership_filter,
             "types": ["gts.cf.core.events.event.v1~fabrikam.shop.orders.*"],
@@ -305,7 +305,7 @@ fn subscription_schema_refuses_max_depth_and_an_unknown_ownership_filter() {
             interest.extend(extra.clone());
         }
         assert!(
-            subscribe_with_interest(interest).is_err(),
+            subscribe_with_interest(&interest).is_err(),
             "{label} must be refused"
         );
     }
@@ -427,7 +427,7 @@ fn event_identifier_fields_accept_concrete_ids_but_reject_wildcards() {
         .with_allowed_subject_types(["gts.fabrikam.shop.orders.order.v1~"])
         .build(),
 )]
-pub(crate) struct OrderPlacedV1 {
+pub struct OrderPlacedV1 {
     pub order_id: Uuid,
     #[schemars(range(min = 0))]
     pub total_cents: i64,

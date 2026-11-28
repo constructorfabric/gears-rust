@@ -30,7 +30,7 @@ use crate::ids::ProducerId;
 use crate::models::ResetScope;
 
 use super::db::DbProducer;
-use super::direct::{Has, Missing, validate_non_empty};
+use super::direct::{Has, Missing, required, validate_non_empty};
 #[cfg(any(test, feature = "test-util"))]
 use super::outbox::TEST_QUEUE;
 use super::outbox::{PRODUCER_OUTBOX_PAYLOAD_TYPE, ProducerOutboxProcessor};
@@ -287,15 +287,13 @@ impl OutboxSetupBuilder<Has, Has, Has, Has, Has, Has, Has, Has> {
     /// topics and event types, or reading the stored registrations, fails
     /// with.
     pub async fn build(self) -> Result<OutboxSetup, EventBrokerError> {
-        let broker = self.broker.expect("typestate requires broker");
-        let db = self.db.expect("typestate requires db");
-        let ctx = self.ctx.expect("typestate requires security context");
-        let source = self.source.expect("typestate requires source");
-        let registration = self.registration.expect("typestate requires registration");
-        let queue = self.queue.expect("typestate requires queue");
-        let partitions = self
-            .partitions
-            .expect("typestate requires queue partitions");
+        let broker = required(self.broker, "broker")?;
+        let db = required(self.db, "db")?;
+        let ctx = required(self.ctx, "security context")?;
+        let source = required(self.source, "source")?;
+        let registration = required(self.registration, "registration")?;
+        let queue = required(self.queue, "queue")?;
+        let partitions = required(self.partitions, "queue partitions")?;
         validate_non_empty("topics", &self.topics)?;
         validate_non_empty("event_type_patterns", &self.event_type_patterns)?;
         if source.trim().is_empty() {
@@ -822,6 +820,7 @@ impl OutboxProducer {
     }
 }
 
-#[cfg(all(test, feature = "outbox"))]
+#[cfg(test)]
+#[cfg(feature = "outbox")]
 #[path = "outbox_setup_tests.rs"]
 mod tests;

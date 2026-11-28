@@ -19,14 +19,17 @@ use crate::{GtsInstanceId, Sequence};
 /// failures of the partition; counts every call. Nothing else is called.
 #[derive(Default)]
 struct Heads {
-    heads: Mutex<HashMap<u32, i64>>,
+    latest: Mutex<HashMap<u32, i64>>,
     failures: Mutex<HashMap<u32, usize>>,
     resolves: AtomicUsize,
 }
 
 impl Heads {
     fn set(&self, partition: u32, sequence: i64) {
-        self.heads.lock().expect("lock").insert(partition, sequence);
+        self.latest
+            .lock()
+            .expect("lock")
+            .insert(partition, sequence);
     }
 
     /// The next `count` resolves of `partition` fail.
@@ -87,7 +90,7 @@ impl Backend for Heads {
             return Err(BackendError::unavailable("scripted"));
         }
         let head = self
-            .heads
+            .latest
             .lock()
             .expect("lock")
             .get(&at.partition.value())

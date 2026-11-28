@@ -29,6 +29,10 @@ use uuid::Uuid;
 )]
 struct Cli {
     /// Broker base URL, e.g. https://host:8080
+    #[expect(
+        clippy::doc_markdown,
+        reason = "clap prints this doc comment as the --help text"
+    )]
     #[arg(long, global = true, default_value = "http://127.0.0.1:8080")]
     broker: String,
     /// Caller tenant id. Defaults to the standalone demo tenant.
@@ -288,7 +292,8 @@ async fn reset_group_store(
     if let Some(id) = read_stored_group(&conn).unwrap_or(None)
         && let Some(group) = ConsumerGroupId::try_from_gts(&id)
     {
-        let _ = broker.delete_consumer_group(ctx, &group).await;
+        // A group the broker no longer has is still reset locally.
+        broker.delete_consumer_group(ctx, &group).await.ok();
     }
     conn.execute("DELETE FROM group_singleton WHERE k = 1", [])
         .map_err(|e| format!("clearing group store: {e}"))?;
@@ -305,18 +310,17 @@ async fn open_stream(
     tenant: Uuid,
     args: &ConsumeArgs,
 ) -> Result<FrameStream, String> {
-    let group = match &args.group {
-        Some(gts) => ConsumerGroupId::try_from_gts(gts).ok_or_else(|| {
+    let group = if let Some(gts) = &args.group {
+        ConsumerGroupId::try_from_gts(gts).ok_or_else(|| {
             "group must be an anonymous consumer-group GTS id \
-             (gts.cf.core.events.consumer_group.v1~<uuid>)"
+         (gts.cf.core.events.consumer_group.v1~<uuid>)"
                 .to_owned()
-        })?,
-        None => {
-            // Shared subscription: coordinate on ONE anonymous group through a
-            // shared SQLite store so independently launched consumers fan out.
-            let store = args.group_store.clone().unwrap_or_else(default_group_store);
-            resolve_shared_group(broker, ctx, &store).await?
-        }
+        })?
+    } else {
+        // Shared subscription: coordinate on ONE anonymous group through a
+        // shared SQLite store so independently launched consumers fan out.
+        let store = args.group_store.clone().unwrap_or_else(default_group_store);
+        resolve_shared_group(broker, ctx, &store).await?
     };
     let interest =
         SubscriptionInterest::builder()
@@ -361,6 +365,19 @@ async fn open_stream(
         .stream(ctx, assignment.id)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The `Debug` form of `value`, the CLI's raw output of outcomes and frames.
+fn debug_text(value: &impl std::fmt::Debug) -> String {
+    format!("{value:?}")
+}
+
+/// Prints `line` and flushes: a streaming CLI's stdout is block-buffered when
+/// piped, so unflushed lines are lost. A failed flush is ignored, as `println!`
+/// would.
+fn print_flushed(line: &str) {
+    println!("{line}");
+    std::io::stdout().flush().ok();
 }
 
 /// A one-line summary of a frame for the demo consumer.
@@ -417,7 +434,7 @@ async fn run() -> Result<(), String> {
                 .publish(&ctx, &event, Ack::Accepted)
                 .await
                 .map_err(|e| e.to_string())?;
-            println!("{outcome:?}");
+            println!("{}", debug_text(&outcome));
             Ok(())
         }
         Command::Consume(args) => {
@@ -425,12 +442,7 @@ async fn run() -> Result<(), String> {
             let mut stream = open_stream(&broker, &ctx, cli.tenant, &args).await?;
             while let Some(frame) = stream.next().await {
                 match frame {
-                    Ok(frame) => {
-                        // Flush per frame: a streaming CLI's stdout is block-
-                        // buffered when piped, so unflushed frames are lost.
-                        println!("{frame:?}");
-                        let _ = std::io::stdout().flush();
-                    }
+                    Ok(frame) => print_flushed(&debug_text(&frame)),
                     Err(err) => {
                         eprintln!("stream error: {err}");
                         break;
@@ -457,8 +469,7 @@ async fn run() -> Result<(), String> {
                     .publish(&ctx, &e, Ack::Accepted)
                     .await
                     .map_err(|e| e.to_string())?;
-                println!("emit {emitted}: {outcome:?}");
-                let _ = std::io::stdout().flush();
+                print_flushed(&format!("emit {emitted}: {}", debug_text(&outcome)));
                 emitted += 1;
                 if count != 0 && emitted >= count {
                     break;
@@ -472,10 +483,7 @@ async fn run() -> Result<(), String> {
             let mut stream = open_stream(&broker, &ctx, cli.tenant, &args).await?;
             while let Some(frame) = stream.next().await {
                 match frame {
-                    Ok(frame) => {
-                        println!("{}", summarize(&frame));
-                        let _ = std::io::stdout().flush();
-                    }
+                    Ok(frame) => print_flushed(&summarize(&frame)),
                     Err(err) => {
                         eprintln!("stream error: {err}");
                         break;

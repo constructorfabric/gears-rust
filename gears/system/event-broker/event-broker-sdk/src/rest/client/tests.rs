@@ -406,6 +406,8 @@ async fn a_typed_consumer_group_query_renders_its_odata_filter() {
     use axum::routing::get;
     use std::sync::{Arc, Mutex};
 
+    type Pairs = Vec<(String, String)>;
+
     let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
     let recorder = Arc::clone(&seen);
     let base_url = serve(Router::new().route(
@@ -440,7 +442,6 @@ async fn a_typed_consumer_group_query_renders_its_odata_filter() {
     }
 
     let seen = seen.lock().expect("the recorder lock").clone();
-    type Pairs = Vec<(String, String)>;
     let decoded: Vec<Option<Pairs>> = seen
         .iter()
         .map(|query| {

@@ -26,14 +26,17 @@ impl ConsumerDlqOutbox {
         }
     }
 
+    #[must_use]
     pub fn queue(&self) -> &str {
         &self.queue
     }
 
+    #[must_use]
     pub fn partitions(&self) -> u32 {
         self.partitions
     }
 
+    #[must_use]
     pub fn partition_for_record(&self, record: &DeadLetterRecord) -> u32 {
         record.partition % self.partitions
     }
@@ -75,16 +78,19 @@ impl ConsumerDlqOutbox {
 }
 
 impl ConsumerDlqOutboxBuilder {
+    #[must_use]
     pub fn queue(mut self, queue: impl Into<String>) -> Self {
         self.queue = Some(queue.into());
         self
     }
 
+    #[must_use]
     pub fn partitions(mut self, partitions: u32) -> Self {
         self.partitions = Some(partitions);
         self
     }
 
+    #[must_use]
     pub fn build(self) -> ConsumerDlqOutbox {
         ConsumerDlqOutbox {
             outbox: self.outbox,

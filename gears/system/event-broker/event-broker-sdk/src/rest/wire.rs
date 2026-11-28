@@ -28,13 +28,13 @@ use crate::sequence::Sequence;
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PageWire<T> {
+pub struct PageWire<T> {
     pub items: Vec<T>,
     pub page_info: PageInfoWire,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct PageInfoWire {
+pub struct PageInfoWire {
     pub next_cursor: Option<String>,
     pub prev_cursor: Option<String>,
     pub limit: u64,
@@ -46,7 +46,7 @@ pub(crate) struct PageInfoWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct MetaWire {
+pub struct MetaWire {
     pub version: i32,
     pub producer: Option<Uuid>,
     pub previous: Option<i64>,
@@ -55,7 +55,7 @@ pub(crate) struct MetaWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct PublishEventWire {
+pub struct PublishEventWire {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub type_id: GtsTypeId,
@@ -124,7 +124,7 @@ impl TryFrom<&EventV1> for PublishEventWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct PublishBatchWire {
+pub struct PublishBatchWire {
     pub events: Vec<PublishEventWire>,
 }
 
@@ -134,21 +134,21 @@ pub(crate) struct PublishBatchWire {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ProducerModeWire {
+pub enum ProducerModeWire {
     Chained,
     Monotonic,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct RegisterProducerWire {
+pub struct RegisterProducerWire {
     pub mode: ProducerModeWire,
     pub client_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct RegisterProducerResponseWire {
+pub struct RegisterProducerResponseWire {
     pub id: Uuid,
     pub mode: ProducerModeWire,
     pub client_agent: String,
@@ -156,14 +156,14 @@ pub(crate) struct RegisterProducerResponseWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct ProducerTopicCursorsWire {
+pub struct ProducerTopicCursorsWire {
     pub topic: GtsInstanceId,
     pub last_sequence: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct ProducerCursorsResponseWire {
+pub struct ProducerCursorsResponseWire {
     pub id: Uuid,
     pub client_agent: String,
     pub topics: Vec<ProducerTopicCursorsWire>,
@@ -188,7 +188,7 @@ impl From<ProducerCursorsResponseWire> for crate::api::ProducerCursors {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct ResetProducerWire {
+pub struct ResetProducerWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
 }
@@ -210,7 +210,7 @@ impl ResetProducerWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct EventTypeWire {
+pub struct EventTypeWire {
     pub id: GtsTypeId,
     pub topic: GtsInstanceId,
     pub description: Option<String>,
@@ -224,7 +224,7 @@ pub(crate) struct EventTypeWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct TopicWire {
+pub struct TopicWire {
     pub id: GtsInstanceId,
     pub description: Option<String>,
     pub retention: Option<String>,
@@ -232,7 +232,7 @@ pub(crate) struct TopicWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct TopicSegmentsResponseWire {
+pub struct TopicSegmentsResponseWire {
     pub topic: String,
     pub partition: i32,
     pub start_sequence: i64,
@@ -248,7 +248,7 @@ pub(crate) struct TopicSegmentsResponseWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct CreateConsumerGroupWire {
+pub struct CreateConsumerGroupWire {
     pub client_agent: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -265,7 +265,7 @@ impl CreateConsumerGroupWire {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ConsumerGroupKindWire {
+pub enum ConsumerGroupKindWire {
     Anonymous,
     Named,
 }
@@ -300,7 +300,7 @@ impl From<ConsumerGroupKindWire> for crate::models::ConsumerGroupKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct ConsumerGroupWire {
+pub struct ConsumerGroupWire {
     pub id: String,
     pub kind: ConsumerGroupKindWire,
     pub tenant: Uuid,
@@ -315,14 +315,14 @@ pub(crate) struct ConsumerGroupWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct FilterSpecWire {
+pub struct FilterSpecWire {
     pub engine: GtsInstanceId,
     pub expression: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum OwnershipFilterWire {
+pub enum OwnershipFilterWire {
     #[default]
     OnlyMine,
     EntireTenant,
@@ -351,7 +351,7 @@ impl From<OwnershipFilterWire> for crate::api::OwnershipFilter {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum BarrierModeWire {
+pub enum BarrierModeWire {
     #[default]
     Respect,
     Ignore,
@@ -368,7 +368,7 @@ impl From<crate::api::BarrierMode> for BarrierModeWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct InterestWire {
+pub struct InterestWire {
     pub topic: GtsInstanceId,
     /// Absent for the caller's own tenant, which the broker resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -386,7 +386,7 @@ pub(crate) struct InterestWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct JoinSubscriptionWire {
+pub struct JoinSubscriptionWire {
     pub consumer_group: String,
     pub client_agent: String,
     pub interests: Vec<InterestWire>,
@@ -396,14 +396,14 @@ pub(crate) struct JoinSubscriptionWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct FilterSpecResponseWire {
+pub struct FilterSpecResponseWire {
     pub engine: GtsInstanceId,
     pub expression: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct InterestResponseWire {
+pub struct InterestResponseWire {
     pub topic: GtsInstanceId,
     pub subject_tenant: Uuid,
     pub ownership_filter: OwnershipFilterWire,
@@ -417,14 +417,14 @@ pub(crate) struct InterestResponseWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct AssignedPartitionWire {
+pub struct AssignedPartitionWire {
     pub topic: GtsInstanceId,
     pub partition: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct SubscriptionWire {
+pub struct SubscriptionWire {
     pub id: Uuid,
     pub consumer_group: String,
     pub client_agent: String,
@@ -438,7 +438,7 @@ pub(crate) struct SubscriptionWire {
 /// `types` that matched no registered event type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct JoinInterestResponseWire {
+pub struct JoinInterestResponseWire {
     #[serde(flatten)]
     pub interest: InterestResponseWire,
     #[serde(default)]
@@ -449,7 +449,7 @@ pub(crate) struct JoinInterestResponseWire {
 /// `unmatched_types`. A read or a listing answers [`SubscriptionWire`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct JoinSubscriptionResponseWire {
+pub struct JoinSubscriptionResponseWire {
     pub id: Uuid,
     pub consumer_group: String,
     pub client_agent: String,
@@ -467,7 +467,7 @@ pub(crate) struct JoinSubscriptionResponseWire {
 /// (`earliest`/`latest`/`at:<rfc3339>`). Matches the server's `SeekValueDto`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub(crate) enum SeekValueWire {
+pub enum SeekValueWire {
     Exact(i64),
     Sentinel(String),
 }
@@ -485,14 +485,14 @@ impl From<&crate::api::Position> for SeekValueWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct PositionEntryWire {
+pub struct PositionEntryWire {
     pub partition: i32,
     pub value: SeekValueWire,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct SeekSubscriptionWire {
+pub struct SeekSubscriptionWire {
     pub topology_version: i64,
     /// Seek targets keyed by topic GTS id (a `BTreeMap` so the serialized order
     /// is deterministic), each mapping to its per-partition entries.
@@ -520,14 +520,14 @@ impl SeekSubscriptionWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub(crate) struct ResolvedPositionEntryWire {
+pub struct ResolvedPositionEntryWire {
     pub partition: i32,
     pub value: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct SeekResponseWire {
+pub struct SeekResponseWire {
     pub positions: BTreeMap<String, Vec<ResolvedPositionEntryWire>>,
 }
 
@@ -560,7 +560,7 @@ impl SeekResponseWire {
 /// broker adds, or the `topic` an older broker still sends, does not stop the consumer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct EventPayloadWire {
+pub struct EventPayloadWire {
     pub id: Uuid,
     #[serde(rename = "type")]
     pub type_id: GtsTypeId,
@@ -647,7 +647,7 @@ impl EventPayloadWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct PositionWire {
+pub struct PositionWire {
     pub topic: String,
     pub partition: i32,
     pub offset: i64,
@@ -671,7 +671,7 @@ impl PositionWire {
 /// `kind` field. Both the multipart and SSE framings wrap this same body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum FrameWire {
+pub enum FrameWire {
     Event {
         payload: Box<EventPayloadWire>,
     },

@@ -258,7 +258,7 @@ impl PositionViolationBuilder {
     }
 }
 
-/// Which kind of failure a payload decode hit, as serde_json classifies it. It carries
+/// Which kind of failure a payload decode hit, as `serde_json` classifies it. It carries
 /// nothing from the data: serde's own message can quote the offending value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeCategory {
@@ -659,14 +659,7 @@ impl From<EventBrokerError> for CanonicalError {
                 expected_topic,
                 detail,
                 ..
-            } => EventResourceError::failed_precondition()
-                .with_resource(event_type.clone())
-                .with_precondition_violation(
-                    event_type,
-                    format!("{detail}; expected topic {expected_topic}"),
-                    reasons::TYPE_NOT_IN_DECLARED_TOPIC,
-                )
-                .create(),
+            } => type_not_in_declared_topic_to_canonical(event_type, &expected_topic, &detail),
             EventBrokerError::SchemaNotPrepared {
                 event_type, detail, ..
             } => EventResourceError::failed_precondition()
@@ -691,31 +684,13 @@ impl From<EventBrokerError> for CanonicalError {
             EventBrokerError::Decode {
                 event_type,
                 category,
-            } => {
-                let description = format!(
-                    "event data of {event_type} does not decode as the payload type ({category})"
-                );
-                EventResourceError::invalid_argument()
-                    .with_resource(event_type)
-                    .with_field_violation("data", description, category.reason())
-                    .create()
-            }
+            } => decode_to_canonical(event_type, category),
             EventBrokerError::EventDataInvalid {
                 event_type,
                 errors,
                 detail,
                 ..
-            } => {
-                let description = if errors.is_empty() {
-                    detail
-                } else {
-                    format!("{detail}: {}", errors.join("; "))
-                };
-                EventResourceError::invalid_argument()
-                    .with_resource(event_type)
-                    .with_field_violation("data", description, reasons::EVENT_DATA_INVALID)
-                    .create()
-            }
+            } => event_data_invalid_to_canonical(event_type, &errors, detail),
             EventBrokerError::TopicNotFound { topic, detail, .. } => {
                 TopicResourceError::not_found(detail)
                     .with_resource(topic)
@@ -757,13 +732,7 @@ impl From<EventBrokerError> for CanonicalError {
                 expected_previous,
                 detail,
                 ..
-            } => ProducerResourceError::failed_precondition()
-                .with_precondition_violation(
-                    "producer_sequence",
-                    format!("{detail}; expected previous {expected_previous}"),
-                    reasons::SEQUENCE_MISMATCH,
-                )
-                .create(),
+            } => sequence_violation_to_canonical(expected_previous, &detail),
             // A concurrency conflict the caller may retry: re-publishing the
             // event stamps it from a re-read head.
             EventBrokerError::SequenceTaken { topic } => TopicResourceError::aborted(format!(
@@ -810,151 +779,43 @@ impl From<EventBrokerError> for CanonicalError {
                 partitions,
                 detail,
                 ..
-            } => ConsumerGroupResourceError::resource_exhausted(detail.clone())
-                .with_quota_violation(
-                    reasons::CONSUMER_GROUP_CAPACITY,
-                    format!("{detail}; active={active}; partitions={partitions}"),
-                )
-                .create(),
-            // The broker's body: one violation, on the bound that broke, the count
-            // checked first as the broker checks it. `detail` does not travel.
+            } => group_at_capacity_to_canonical(active, partitions, detail),
+            // `detail` does not travel.
             EventBrokerError::BatchTooLarge {
                 count,
                 bytes,
                 max_count,
                 max_bytes,
                 ..
-            } => {
-                let (field, description) = if count > max_count {
-                    (
-                        BATCH_COUNT_FIELD,
-                        format!("batch too large: {count} events (max {max_count})"),
-                    )
-                } else {
-                    (
-                        BATCH_BYTES_FIELD,
-                        format!("batch payload too large: {bytes} bytes (max {max_bytes})"),
-                    )
-                };
-                RequestResourceError::invalid_argument()
-                    .with_field_violation(field, description, reasons::BATCH_TOO_LARGE)
-                    .with_override(Http::status_code(413))
-                    .create()
-            }
+            } => batch_too_large_to_canonical(count, bytes, max_count, max_bytes),
             // The broker's form names the event's batch position in `field`; the SDK's
             // check runs per event and has none.
             EventBrokerError::EventTooLarge { bytes, max } => {
-                RequestResourceError::invalid_argument()
-                    .with_field_violation(
-                        "event",
-                        format!("{bytes} bytes encoded, over the limit of {max}"),
-                        reasons::EVENT_TOO_LARGE,
-                    )
-                    .with_override(Http::status_code(413))
-                    .create()
+                event_too_large_to_canonical(bytes, max)
             }
             EventBrokerError::PartitionKeyTooLong { bytes, max } => {
-                RequestResourceError::invalid_argument()
-                    .with_field_violation(
-                        "partition_key",
-                        format!("{bytes} bytes, over the limit of {max}"),
-                        reasons::PARTITION_KEY_TOO_LONG,
-                    )
-                    .create()
+                partition_key_too_long_to_canonical(bytes, max)
             }
             EventBrokerError::SubscriptionRecoveryExhausted { .. } => {
                 CanonicalError::service_unavailable().create()
             }
             EventBrokerError::InvalidInitialPosition {
                 violations, detail, ..
-            } => {
-                let mut iter = violations.iter().map(PositionViolation::as_field_violation);
-                // Non-empty by construction - the error exists because an
-                // entry was rejected - but the builder's typestate needs the
-                // first violation separately, so the empty case is spelled out.
-                let Some(first) = iter.next() else {
-                    return RequestResourceError::invalid_argument()
-                        .with_format(detail)
-                        .create();
-                };
-                // The offending thing is a field of the request, not a
-                // partition: the violation names an entry in the `positions`
-                // map, and the gear's own SEEK rejection
-                // stamps the same resource. A rejection that differed here
-                // between an implementation and its reference would be a
-                // difference a caller can see.
-                let mut with_violations = RequestResourceError::invalid_argument()
-                    .with_field_violation(first.field, first.description, first.reason);
-                for violation in iter {
-                    with_violations = with_violations.with_field_violation(
-                        violation.field,
-                        violation.description,
-                        violation.reason,
-                    );
-                }
-                with_violations.create()
-            }
+            } => invalid_initial_position_to_canonical(&violations, detail),
             EventBrokerError::PositionsNotSet {
                 unseeded, detail, ..
-            } => {
-                let mut iter = unseeded.into_iter();
-                let Some((topic, partition)) = iter.next() else {
-                    return StreamResourceError::failed_precondition()
-                        .with_precondition_violation(
-                            "stream.positions",
-                            detail,
-                            reasons::POSITIONS_NOT_SET,
-                        )
-                        .create();
-                };
-                let mut with_violations = StreamResourceError::failed_precondition()
-                    .with_precondition_violation(
-                        format!("{topic}:{partition}"),
-                        detail.clone(),
-                        reasons::POSITIONS_NOT_SET,
-                    );
-                for (topic, partition) in iter {
-                    with_violations = with_violations.with_precondition_violation(
-                        format!("{topic}:{partition}"),
-                        detail.clone(),
-                        reasons::POSITIONS_NOT_SET,
-                    );
-                }
-                with_violations.create()
-            }
+            } => positions_not_set_to_canonical(unseeded, detail),
             EventBrokerError::PartitionNotAssigned {
                 topic,
                 partition,
                 detail,
                 ..
-            } => PartitionResourceError::failed_precondition()
-                .with_resource(format!("{topic}:{partition}"))
-                .with_precondition_violation(
-                    format!("{topic}:{partition}"),
-                    detail,
-                    reasons::PARTITION_NOT_ASSIGNED,
-                )
-                .create(),
+            } => partition_not_assigned_to_canonical(&topic, partition, detail),
             EventBrokerError::TopologyVersionMismatch { detail, .. } => {
-                // Minimal body: the subscription resource + the reason, and no
-                // topology version or assignment - the caller re-reads the
-                // subscription for the fresh state.
-                SubscriptionResourceError::failed_precondition()
-                    .with_precondition_violation(
-                        resources::SUBSCRIPTION,
-                        detail,
-                        reasons::TOPOLOGY_VERSION_MISMATCH,
-                    )
-                    .create()
+                topology_version_mismatch_to_canonical(detail)
             }
             EventBrokerError::StreamingInProgress { detail, .. } => {
-                StreamResourceError::failed_precondition()
-                    .with_precondition_violation(
-                        resources::STREAM,
-                        detail,
-                        reasons::STREAMING_IN_PROGRESS,
-                    )
-                    .create()
+                streaming_in_progress_to_canonical(detail)
             }
             EventBrokerError::Backend(err) => CanonicalError::from(err),
             EventBrokerError::OffsetManager(err) => CanonicalError::from(err),
@@ -971,6 +832,204 @@ impl From<EventBrokerError> for CanonicalError {
             EventBrokerError::Other { canonical } => canonical,
         }
     }
+}
+
+fn type_not_in_declared_topic_to_canonical(
+    event_type: String,
+    expected_topic: &str,
+    detail: &str,
+) -> CanonicalError {
+    EventResourceError::failed_precondition()
+        .with_resource(event_type.clone())
+        .with_precondition_violation(
+            event_type,
+            format!("{detail}; expected topic {expected_topic}"),
+            reasons::TYPE_NOT_IN_DECLARED_TOPIC,
+        )
+        .create()
+}
+
+fn sequence_violation_to_canonical(expected_previous: i64, detail: &str) -> CanonicalError {
+    ProducerResourceError::failed_precondition()
+        .with_precondition_violation(
+            "producer_sequence",
+            format!("{detail}; expected previous {expected_previous}"),
+            reasons::SEQUENCE_MISMATCH,
+        )
+        .create()
+}
+
+fn group_at_capacity_to_canonical(active: u32, partitions: u32, detail: String) -> CanonicalError {
+    let description = format!("{detail}; active={active}; partitions={partitions}");
+    ConsumerGroupResourceError::resource_exhausted(detail)
+        .with_quota_violation(reasons::CONSUMER_GROUP_CAPACITY, description)
+        .create()
+}
+
+fn event_too_large_to_canonical(bytes: usize, max: usize) -> CanonicalError {
+    RequestResourceError::invalid_argument()
+        .with_field_violation(
+            "event",
+            format!("{bytes} bytes encoded, over the limit of {max}"),
+            reasons::EVENT_TOO_LARGE,
+        )
+        .with_override(Http::status_code(413))
+        .create()
+}
+
+fn partition_key_too_long_to_canonical(bytes: usize, max: usize) -> CanonicalError {
+    RequestResourceError::invalid_argument()
+        .with_field_violation(
+            "partition_key",
+            format!("{bytes} bytes, over the limit of {max}"),
+            reasons::PARTITION_KEY_TOO_LONG,
+        )
+        .create()
+}
+
+fn partition_not_assigned_to_canonical(
+    topic: &str,
+    partition: u32,
+    detail: String,
+) -> CanonicalError {
+    PartitionResourceError::failed_precondition()
+        .with_resource(format!("{topic}:{partition}"))
+        .with_precondition_violation(
+            format!("{topic}:{partition}"),
+            detail,
+            reasons::PARTITION_NOT_ASSIGNED,
+        )
+        .create()
+}
+
+/// Minimal body: the subscription resource + the reason, and no topology version
+/// or assignment - the caller re-reads the subscription for the fresh state.
+fn topology_version_mismatch_to_canonical(detail: String) -> CanonicalError {
+    SubscriptionResourceError::failed_precondition()
+        .with_precondition_violation(
+            resources::SUBSCRIPTION,
+            detail,
+            reasons::TOPOLOGY_VERSION_MISMATCH,
+        )
+        .create()
+}
+
+fn streaming_in_progress_to_canonical(detail: String) -> CanonicalError {
+    StreamResourceError::failed_precondition()
+        .with_precondition_violation(resources::STREAM, detail, reasons::STREAMING_IN_PROGRESS)
+        .create()
+}
+
+/// `Decode` in its canonical form.
+fn decode_to_canonical(event_type: String, category: DecodeCategory) -> CanonicalError {
+    let description =
+        format!("event data of {event_type} does not decode as the payload type ({category})");
+    EventResourceError::invalid_argument()
+        .with_resource(event_type)
+        .with_field_violation("data", description, category.reason())
+        .create()
+}
+
+/// `EventDataInvalid` in its canonical form: `detail` followed by the per-error
+/// list, if any.
+fn event_data_invalid_to_canonical(
+    event_type: String,
+    errors: &[String],
+    detail: String,
+) -> CanonicalError {
+    let description = if errors.is_empty() {
+        detail
+    } else {
+        format!("{detail}: {}", errors.join("; "))
+    };
+    EventResourceError::invalid_argument()
+        .with_resource(event_type)
+        .with_field_violation("data", description, reasons::EVENT_DATA_INVALID)
+        .create()
+}
+
+/// The broker's `BatchTooLarge` body: one violation, on the bound that broke, the
+/// count checked first as the broker checks it.
+fn batch_too_large_to_canonical(
+    count: usize,
+    bytes: usize,
+    max_count: usize,
+    max_bytes: usize,
+) -> CanonicalError {
+    let (field, description) = if count > max_count {
+        (
+            BATCH_COUNT_FIELD,
+            format!("batch too large: {count} events (max {max_count})"),
+        )
+    } else {
+        (
+            BATCH_BYTES_FIELD,
+            format!("batch payload too large: {bytes} bytes (max {max_bytes})"),
+        )
+    };
+    RequestResourceError::invalid_argument()
+        .with_field_violation(field, description, reasons::BATCH_TOO_LARGE)
+        .with_override(Http::status_code(413))
+        .create()
+}
+
+/// `InvalidInitialPosition` in its canonical form, one field violation per
+/// rejected position.
+fn invalid_initial_position_to_canonical(
+    violations: &[PositionViolation],
+    detail: String,
+) -> CanonicalError {
+    let mut iter = violations.iter().map(PositionViolation::as_field_violation);
+    // Non-empty by construction - the error exists because an entry was
+    // rejected - but the builder's typestate needs the first violation
+    // separately, so the empty case is spelled out.
+    let Some(first) = iter.next() else {
+        return RequestResourceError::invalid_argument()
+            .with_format(detail)
+            .create();
+    };
+    // The offending thing is a field of the request, not a partition: the
+    // violation names an entry in the `positions` map, and the gear's own SEEK
+    // rejection stamps the same resource. A rejection that differed here between
+    // an implementation and its reference would be a difference a caller can see.
+    let mut with_violations = RequestResourceError::invalid_argument().with_field_violation(
+        first.field,
+        first.description,
+        first.reason,
+    );
+    for violation in iter {
+        with_violations = with_violations.with_field_violation(
+            violation.field,
+            violation.description,
+            violation.reason,
+        );
+    }
+    with_violations.create()
+}
+
+/// `PositionsNotSet` in its canonical form, one precondition violation per
+/// unseeded partition.
+fn positions_not_set_to_canonical(unseeded: Vec<(String, u32)>, detail: String) -> CanonicalError {
+    let mut iter = unseeded.into_iter();
+    let Some((topic, partition)) = iter.next() else {
+        return StreamResourceError::failed_precondition()
+            .with_precondition_violation("stream.positions", detail, reasons::POSITIONS_NOT_SET)
+            .create();
+    };
+    let mut with_violations = StreamResourceError::failed_precondition()
+        .with_precondition_violation(
+            format!("{topic}:{partition}"),
+            detail.clone(),
+            reasons::POSITIONS_NOT_SET,
+        );
+    for (topic, partition) in iter {
+        with_violations = with_violations.with_precondition_violation(
+            format!("{topic}:{partition}"),
+            detail.clone(),
+            reasons::POSITIONS_NOT_SET,
+        );
+    }
+    with_violations.create()
 }
 
 /// First field-violation reason on an `InvalidArgument`/`OutOfRange` context, if
@@ -1120,65 +1179,8 @@ impl From<CanonicalError> for EventBrokerError {
                 }
             }
 
-            CanonicalError::FailedPrecondition {
-                ctx,
-                resource_type,
-                resource_name,
-                ..
-            } => {
-                let reason = ctx.violations.first().map(|v| v.type_.as_str());
-                let name = resource_name.clone().unwrap_or_default();
-                match (resource_type.as_deref(), reason) {
-                    (_, Some(reasons::SEQUENCE_MISMATCH)) => Self::SequenceViolation {
-                        // The committed head rides last in the violation's
-                        // description ("... last_sequence=<n>"), not the
-                        // top-level detail, so recover it from there.
-                        expected_previous: ctx
-                            .violations
-                            .first()
-                            .map(|v| expected_previous_from_detail(&v.description))
-                            .unwrap_or_default(),
-                        detail,
-                    },
-                    (_, Some(reasons::CONSUMER_GROUP_HAS_ACTIVE_MEMBERS)) => {
-                        Self::ConsumerGroupHasActiveMembers { detail }
-                    }
-                    (_, Some(reasons::TOPOLOGY_VERSION_MISMATCH)) => {
-                        Self::TopologyVersionMismatch { detail }
-                    }
-                    (_, Some(reasons::STREAMING_IN_PROGRESS)) => {
-                        Self::StreamingInProgress { detail }
-                    }
-                    (_, Some(reasons::IN_TX_OFFSETS_NOT_SUPPORTED)) => {
-                        Self::OffsetManager(OffsetManagerError::InTxNotSupported { detail })
-                    }
-                    // The precondition violation carries no offender payload the
-                    // wire preserves, so the partition list is empty and the
-                    // caller re-reads the subscription for the real one.
-                    (_, Some(reasons::POSITIONS_NOT_SET)) => Self::PositionsNotSet {
-                        unseeded: Vec::new(),
-                        detail,
-                    },
-                    (_, Some(reasons::PARTITION_NOT_ASSIGNED)) => Self::PartitionNotAssigned {
-                        topic: String::new(),
-                        partition: 0,
-                        detail,
-                    },
-                    // The event type rides in `resource_name`; the expected
-                    // topic is not carried, so it takes a neutral value.
-                    (_, Some(reasons::TYPE_NOT_IN_DECLARED_TOPIC)) => {
-                        Self::TypeNotInDeclaredTopic {
-                            event_type: name,
-                            expected_topic: String::new(),
-                            detail,
-                        }
-                    }
-                    (_, Some(reasons::SCHEMA_NOT_PREPARED)) => Self::SchemaNotPrepared {
-                        event_type: name,
-                        detail,
-                    },
-                    _ => Self::Other { canonical },
-                }
+            CanonicalError::FailedPrecondition { .. } => {
+                Self::from_failed_precondition(canonical, detail)
             }
 
             CanonicalError::OutOfRange { ctx, .. } => {
@@ -1289,6 +1291,69 @@ impl EventBrokerError {
         }
     }
 
+    /// A `FailedPrecondition` read back by its first violation's reason; one with
+    /// no reason this SDK knows stays [`EventBrokerError::Other`].
+    fn from_failed_precondition(canonical: CanonicalError, detail: String) -> Self {
+        let CanonicalError::FailedPrecondition {
+            ctx,
+            resource_type,
+            resource_name,
+            ..
+        } = &canonical
+        else {
+            return Self::Other { canonical };
+        };
+        let reason = ctx.violations.first().map(|v| v.type_.as_str());
+        let name = resource_name.clone().unwrap_or_default();
+        match (resource_type.as_deref(), reason) {
+            (_, Some(reasons::SEQUENCE_MISMATCH)) => Self::SequenceViolation {
+                // The committed head rides last in the violation's
+                // description ("... last_sequence=<n>"), not the
+                // top-level detail, so recover it from there.
+                expected_previous: ctx
+                    .violations
+                    .first()
+                    .map(|v| expected_previous_from_detail(&v.description))
+                    .unwrap_or_default(),
+                detail,
+            },
+            (_, Some(reasons::CONSUMER_GROUP_HAS_ACTIVE_MEMBERS)) => {
+                Self::ConsumerGroupHasActiveMembers { detail }
+            }
+            (_, Some(reasons::TOPOLOGY_VERSION_MISMATCH)) => {
+                Self::TopologyVersionMismatch { detail }
+            }
+            (_, Some(reasons::STREAMING_IN_PROGRESS)) => Self::StreamingInProgress { detail },
+            (_, Some(reasons::IN_TX_OFFSETS_NOT_SUPPORTED)) => {
+                Self::OffsetManager(OffsetManagerError::InTxNotSupported { detail })
+            }
+            // The precondition violation carries no offender payload the
+            // wire preserves, so the partition list is empty and the
+            // caller re-reads the subscription for the real one.
+            (_, Some(reasons::POSITIONS_NOT_SET)) => Self::PositionsNotSet {
+                unseeded: Vec::new(),
+                detail,
+            },
+            (_, Some(reasons::PARTITION_NOT_ASSIGNED)) => Self::PartitionNotAssigned {
+                topic: String::new(),
+                partition: 0,
+                detail,
+            },
+            // The event type rides in `resource_name`; the expected
+            // topic is not carried, so it takes a neutral value.
+            (_, Some(reasons::TYPE_NOT_IN_DECLARED_TOPIC)) => Self::TypeNotInDeclaredTopic {
+                event_type: name,
+                expected_topic: String::new(),
+                detail,
+            },
+            (_, Some(reasons::SCHEMA_NOT_PREPARED)) => Self::SchemaNotPrepared {
+                event_type: name,
+                detail,
+            },
+            _ => Self::Other { canonical },
+        }
+    }
+
     /// The measured size and the limit a size violation's description ends with, as
     /// its last two numbers (`"<bytes> bytes ..., over the limit of <max>"`), or zeros
     /// when the first field violation has no such description.
@@ -1366,7 +1431,7 @@ impl From<BackendError> for CanonicalError {
                 breached,
                 detail,
                 ..
-            } => OffsetResourceError::out_of_range(detail.clone())
+            } => OffsetResourceError::out_of_range(detail)
                 .with_field_violation(
                     "offset",
                     format!(
@@ -1474,7 +1539,7 @@ impl OffsetManagerError {
     }
 }
 
-/// The class of a serde_json failure (`io`, `syntax`, `data`, `eof`); serde's own
+/// The class of a `serde_json` failure (`io`, `syntax`, `data`, `eof`); serde's own
 /// message can quote the value.
 ///
 /// `io` cannot happen for in-memory input (`from_slice`, `to_value`); the arm

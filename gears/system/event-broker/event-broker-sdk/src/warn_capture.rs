@@ -1,6 +1,8 @@
 //! `WARN` and `ERROR` capture for the lib test binary, shared by every test that
 //! asserts a logged line.
 
+use std::fmt::Write as _;
+
 /// Records the `WARN` and `ERROR` events a test's thread emits, as
 /// `<LEVEL> <message> <field>=<value>..` lines, while it lives.
 ///
@@ -8,7 +10,7 @@
 /// `set_default`: while one dispatcher is registered, tracing-core asks the default of
 /// whichever thread first hits a call site for its interest, so another test's thread
 /// with no default caches `Interest::never` there and this test's line is never seen.
-pub(crate) struct WarnCapture {
+pub struct WarnCapture {
     lines: SharedWarnLines,
 }
 
@@ -118,12 +120,16 @@ struct WarnLine {
 }
 
 impl tracing::field::Visit for WarnLine {
+    #[expect(
+        clippy::use_debug,
+        reason = "tracing hands every field value over as `dyn Debug`"
+    )]
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
             self.message = format!("{value:?}");
         } else {
-            self.fields
-                .push_str(&format!(" {}={value:?}", field.name()));
+            // Writing to a `String` does not fail.
+            write!(self.fields, " {}={value:?}", field.name()).ok();
         }
     }
 }

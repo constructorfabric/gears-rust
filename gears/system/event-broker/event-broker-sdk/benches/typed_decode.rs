@@ -16,6 +16,11 @@
 //! Run: `cargo bench -p cf-gears-event-broker-sdk --bench typed_decode`. Without `--bench`
 //! (as under `cargo test --benches`) only the memory pass and the correctness checks run.
 
+#![allow(
+    clippy::expect_used,
+    reason = "the benchmark panics on a failed fixture setup"
+)]
+
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
@@ -89,9 +94,7 @@ impl Fixture {
             order_id: "order-0001".to_owned(),
             total_cents: 429_900,
             currency: "EUR".to_owned(),
-            lines: (0..lines)
-                .map(|i| format!("{i:0>width$}", width = LINE_LEN))
-                .collect(),
+            lines: (0..lines).map(|i| format!("{i:0>LINE_LEN$}")).collect(),
         };
         let json_len = |lines: usize| {
             serde_json::to_vec(&::gts::GtsSerializeWrapper(&payload_with(lines)))
@@ -100,11 +103,14 @@ impl Fixture {
         };
         let base = json_len(0);
         let per_line = json_len(1) - base;
-        let lines = (target - base) / per_line;
+        let lines = (target - base).div_euclid(per_line);
         let data = serde_json::to_value(::gts::GtsSerializeWrapper(&payload_with(lines)))
             .expect("payload serializes");
         let size = serde_json::to_vec(&data).expect("data serializes").len();
-        let (low, high) = (target * 95 / 100, target * 105 / 100);
+        let (low, high) = (
+            (target * 95).div_euclid(100),
+            (target * 105).div_euclid(100),
+        );
         assert!(
             (low..=high).contains(&size),
             "data is {size} bytes, outside 5% of {target}"
@@ -230,7 +236,7 @@ impl Stats {
             .collect();
         samples.sort_by(f64::total_cmp);
         Self {
-            median: samples[SAMPLES / 2],
+            median: samples[SAMPLES.div_euclid(2)],
             min: samples[0],
             max: samples[SAMPLES - 1],
         }

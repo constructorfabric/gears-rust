@@ -1,3 +1,9 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helpers outside #[test] functions panic on a failed setup, as the tests do"
+)]
+
 #[path = "producer/builder.rs"]
 mod builder;
 #[path = "producer/direct.rs"]

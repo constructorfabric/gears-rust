@@ -19,10 +19,12 @@ impl std::fmt::Display for SubscriptionId {
 pub struct EventTypeId(pub Uuid);
 
 impl EventTypeId {
+    #[must_use]
     pub fn new(id: Uuid) -> Self {
         Self(id)
     }
 
+    #[must_use]
     pub fn as_uuid(&self) -> Uuid {
         self.0
     }
@@ -38,10 +40,12 @@ impl std::fmt::Display for EventTypeId {
 pub struct ConsumerGroupId(pub Uuid);
 
 impl ConsumerGroupId {
+    #[must_use]
     pub fn new(id: Uuid) -> Self {
         Self(id)
     }
 
+    #[must_use]
     pub fn as_uuid(&self) -> Uuid {
         self.0
     }
@@ -51,6 +55,7 @@ impl ConsumerGroupId {
     /// is the instance suffix - the broker minted it the same way (`GtsInstanceId::
     /// new(<type>, <uuid>)`), so this reproduces exactly what a JOIN/GET/DELETE
     /// path needs.
+    #[must_use]
     pub fn to_gts(self) -> String {
         format!("{CONSUMER_GROUP_RESOURCE_TYPE}{}", self.0)
     }

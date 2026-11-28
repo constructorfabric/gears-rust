@@ -403,12 +403,13 @@ async fn a_transactionally_delivered_event_without_a_stamped_position_is_skipped
     };
     // The skipped frame came first on the stream, so once the stamped event's commit
     // is observed the skip is done. A miss shows in the asserts below.
-    let _ = tokio::time::timeout(BOUND, async {
+    tokio::time::timeout(BOUND, async {
         while committed().is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .ok();
     tokio::time::timeout(BOUND, handle.stop())
         .await
         .expect("the consumer stops within the bound")
@@ -928,12 +929,13 @@ async fn a_transactional_handler_sees_the_topic_of_each_delivery() {
 
     let both_placed = || placements.lock().unwrap().len() == 2;
     // A stall shows as a missing event in the assert below, not as a panic here.
-    let _ = tokio::time::timeout(BOUND, async {
+    tokio::time::timeout(BOUND, async {
         while !both_placed() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await;
+    .await
+    .ok();
     tokio::time::timeout(BOUND, handle.stop())
         .await
         .expect("the consumer stops within the bound")
