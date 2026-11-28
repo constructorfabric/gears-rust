@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use axum::{Extension, Router, http::StatusCode};
 use model_registry_sdk::odata::{ModelFilterField, ProviderFilterField};
-use toolkit::api::operation_builder::OperationBuilderODataExt;
-use toolkit::api::operation_builder::ParamSpec;
+use toolkit::api::operation_builder::{
+    AuthState, HandlerSlot, LicenseState, OperationBuilderODataExt, ParamSpec, ResponseHeaderSpec,
+    ResponseHeaderType,
+};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 use toolkit_gts::gts_id;
 
@@ -40,6 +42,60 @@ fn if_match_param(required: bool) -> ParamSpec {
         })
 }
 
+/// The `{id}` path segment: a provider or model UUID.
+fn id_param(description: &str) -> ParamSpec {
+    ParamSpec::path("id")
+        .description(description)
+        .format("uuid")
+}
+
+/// `ETag` on single-entry success responses (DESIGN §3.3).
+fn etag_header() -> ResponseHeaderSpec {
+    ResponseHeaderSpec::new(
+        "ETag",
+        "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on \
+         PATCH and DELETE.",
+        ResponseHeaderType::String,
+    )
+}
+
+fn location_header() -> ResponseHeaderSpec {
+    ResponseHeaderSpec::new(
+        "Location",
+        "URL of the created entry",
+        ResponseHeaderType::String,
+    )
+}
+
+/// The `limit` and `cursor` query parameters of the list routes.
+trait PageParams {
+    fn page_params(self) -> Self;
+}
+
+impl<H, R, S, A, L> PageParams for OperationBuilder<H, R, S, A, L>
+where
+    H: HandlerSlot<S>,
+    A: AuthState,
+    L: LicenseState,
+{
+    fn page_params(self) -> Self {
+        self.query_param_typed(
+            "limit",
+            false,
+            "Page size; absent means the configured default page size (20 unless configured), \
+             larger values are lowered to the configured maximum (100 unless configured); \
+             alias `$top`",
+            "integer",
+        )
+        .query_param(
+            "cursor",
+            false,
+            "`page_info.next_cursor` of the previous page; not combined with `$orderby`; alias \
+             `$skiptoken`",
+        )
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn register_routes(
     mut router: Router,
@@ -60,6 +116,10 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .path_param(
+            "canonical_id",
+            "Canonical id `provider_slug::name`, percent-encoded as one path segment",
+        )
         .handler(handlers::resolve_model)
         .json_response_with_schema::<dto::RegistryModelDto>(openapi, StatusCode::OK, "The model")
         .standard_errors(openapi)
@@ -82,6 +142,7 @@ pub fn register_routes(
         .with_odata_filter::<ModelFilterField>()
         .with_odata_orderby::<ModelFilterField>()
         .with_odata_select()
+        .page_params()
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -105,6 +166,8 @@ pub fn register_routes(
             StatusCode::CREATED,
             "Provider created",
         )
+        .response_header(location_header())
+        .response_header(etag_header())
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -115,8 +178,10 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .param(id_param("Provider id"))
         .handler(handlers::get_provider)
         .json_response_with_schema::<dto::ProviderEntryDto>(openapi, StatusCode::OK, "The provider")
+        .response_header(etag_header())
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -136,6 +201,7 @@ pub fn register_routes(
         .with_odata_filter::<ProviderFilterField>()
         .with_odata_orderby::<ProviderFilterField>()
         .with_odata_select()
+        .page_params()
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -151,6 +217,7 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .param(id_param("Provider id"))
         .param(if_match_param(true))
         .json_request::<dto::UpdateProviderRequestDto>(openapi, "Fields to change")
         .handler(handlers::update_provider)
@@ -159,6 +226,7 @@ pub fn register_routes(
             StatusCode::OK,
             "Provider updated",
         )
+        .response_header(etag_header())
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -169,6 +237,7 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .param(id_param("Provider id"))
         .param(if_match_param(false))
         .handler(handlers::delete_provider)
         .no_content_response(StatusCode::NO_CONTENT, "Provider deleted")
@@ -191,6 +260,8 @@ pub fn register_routes(
         .json_request::<dto::CreateModelRequestDto>(openapi, "Model to create")
         .handler(handlers::create_model)
         .json_response_with_schema::<dto::ModelEntryDto>(openapi, StatusCode::CREATED, "Model created")
+        .response_header(location_header())
+        .response_header(etag_header())
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -201,8 +272,10 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .param(id_param("Model id"))
         .handler(handlers::get_model)
         .json_response_with_schema::<dto::ModelEntryDto>(openapi, StatusCode::OK, "The model")
+        .response_header(etag_header())
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -222,6 +295,7 @@ pub fn register_routes(
         .with_odata_filter::<ModelFilterField>()
         .with_odata_orderby::<ModelFilterField>()
         .with_odata_select()
+        .page_params()
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -237,10 +311,12 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .param(id_param("Model id"))
         .param(if_match_param(true))
         .json_request::<dto::UpdateModelRequestDto>(openapi, "Fields to change")
         .handler(handlers::update_model)
         .json_response_with_schema::<dto::ModelEntryDto>(openapi, StatusCode::OK, "Model updated")
+        .response_header(etag_header())
         .standard_errors(openapi)
         .error_503(openapi)
         .register(router, openapi);
@@ -251,6 +327,7 @@ pub fn register_routes(
         .tag("Model Registry")
         .authenticated()
         .require_license_features::<License>([])
+        .param(id_param("Model id"))
         .param(if_match_param(false))
         .handler(handlers::delete_model)
         .no_content_response(StatusCode::NO_CONTENT, "Model deleted")

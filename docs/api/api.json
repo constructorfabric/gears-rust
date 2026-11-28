@@ -3289,13 +3289,9 @@
         "description": "`CreateModelRequestV1` on the wire: every Model Info field except\n`gts_type`, plus `provider_id`, `name`, `sharing_mode`, and\n`approval_state`.",
         "properties": {
           "additional_info": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
+            "type": [
+              "object",
+              "null"
             ]
           },
           "allow_extra_params": {
@@ -3332,17 +3328,13 @@
             ]
           },
           "capabilities": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
+            "type": [
+              "object",
+              "null"
             ]
           },
           "context_window": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "cost": {
             "oneOf": [
@@ -3350,18 +3342,14 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/Value"
+                "$ref": "#/components/schemas/ModelCostDto"
               }
             ]
           },
           "default_parameters": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
+            "type": [
+              "object",
+              "null"
             ]
           },
           "description": {
@@ -3371,13 +3359,9 @@
             ]
           },
           "disabled_capabilities": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
+            "type": [
+              "object",
+              "null"
             ]
           },
           "display_name": {
@@ -3437,13 +3421,9 @@
             "type": "string"
           },
           "performance": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
+            "type": [
+              "object",
+              "null"
             ]
           },
           "provider_id": {
@@ -3454,13 +3434,9 @@
             "type": "string"
           },
           "provider_settings": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
+            "type": [
+              "object",
+              "null"
             ]
           },
           "reasoning_level": {
@@ -3569,16 +3545,7 @@
               "null"
             ]
           },
-          "metadata": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
-          },
+          "metadata": {},
           "name": {
             "type": "string"
           },
@@ -9120,6 +9087,58 @@
         ],
         "type": "object"
       },
+      "ModelCostDto": {
+        "additionalProperties": false,
+        "description": "`ModelCostV1` on the wire: rates in micro-credits; an absent rate means\nthe model does not price that kind of usage.",
+        "properties": {
+          "cache_read_per_1m_micro": {
+            "description": "Per 1,000,000 input tokens read from the provider's prompt cache.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_write_per_1m_micro": {
+            "description": "Per 1,000,000 input tokens written to the provider's prompt cache.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_per_1m_micro": {
+            "description": "Per 1,000,000 input tokens.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "output_per_1m_micro": {
+            "description": "Per 1,000,000 output tokens.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "web_search_per_1k_calls_micro": {
+            "description": "Per 1,000 web search calls.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ModelDto": {
         "description": "Response DTO for a single model.",
         "properties": {
@@ -9252,7 +9271,7 @@
         "description": "`ModelInfoV1` on the wire. Nested objects keep the SDK JSON shape.",
         "properties": {
           "additional_info": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "allow_extra_params": {
             "items": {
@@ -9276,17 +9295,17 @@
             ]
           },
           "capabilities": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "context_window": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "cost": {
-            "$ref": "#/components/schemas/Value",
+            "$ref": "#/components/schemas/ModelCostDto",
             "description": "Cost in micro-credits; absent rates are omitted."
           },
           "default_parameters": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "description": {
             "type": [
@@ -9295,7 +9314,7 @@
             ]
           },
           "disabled_capabilities": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "display_name": {
             "type": "string"
@@ -9351,13 +9370,13 @@
             ]
           },
           "performance": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "provider_model_id": {
             "type": "string"
           },
           "provider_settings": {
-            "$ref": "#/components/schemas/Value"
+            "type": "object"
           },
           "reasoning_level": {
             "type": [
@@ -16661,16 +16680,7 @@
           "managed": {
             "type": "boolean"
           },
-          "metadata": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
-          },
+          "metadata": {},
           "name": {
             "type": "string"
           },
@@ -23141,35 +23151,19 @@
         "description": "`UpdateModelRequestV1` on the wire. Nullable fields accept `null` to\nclear. The precondition comes from the `If-Match` header, not the body.",
         "properties": {
           "additional_info": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "allow_extra_params": {
             "items": {
               "type": "string"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "allow_parameter_override": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": "boolean"
           },
           "approval_state": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "architecture": {
             "type": [
@@ -23184,44 +23178,16 @@
             ]
           },
           "capabilities": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "context_window": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "cost": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "$ref": "#/components/schemas/ModelCostDto"
           },
           "default_parameters": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "description": {
             "type": [
@@ -23230,20 +23196,10 @@
             ]
           },
           "disabled_capabilities": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "display_name": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "family": {
             "type": [
@@ -23277,10 +23233,7 @@
             ]
           },
           "managed": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": "boolean"
           },
           "model_version": {
             "type": [
@@ -23295,30 +23248,13 @@
             ]
           },
           "performance": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "provider_model_id": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "provider_settings": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value"
-              }
-            ]
+            "type": "object"
           },
           "reasoning_level": {
             "type": [
@@ -23339,10 +23275,7 @@
             ]
           },
           "sharing_mode": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "size_bytes": {
             "format": "int64",
@@ -23354,19 +23287,13 @@
           },
           "sort_order": {
             "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
+            "type": "integer"
           },
           "supported_api": {
             "items": {
               "type": "string"
             },
-            "type": [
-              "array",
-              "null"
-            ]
+            "type": "array"
           },
           "vendor": {
             "type": [
@@ -23382,46 +23309,23 @@
         "description": "`UpdateProviderRequestV1` on the wire. The precondition comes from the\n`If-Match` header, not the body.",
         "properties": {
           "enabled": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": "boolean"
           },
           "gts_type": {
             "description": "A value different from the stored one is a type migration of the\nprovider and all its models.",
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "managed": {
-            "type": [
-              "boolean",
-              "null"
-            ]
+            "type": "boolean"
           },
           "metadata": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Value",
-                "description": "`null` clears the metadata."
-              }
-            ]
+            "description": "`null` clears the metadata."
           },
           "name": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           },
           "sharing_mode": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           }
         },
         "type": "object"
@@ -24268,7 +24172,6 @@
         ],
         "type": "object"
       },
-      "Value": {},
       "VersionDto": {
         "description": "One content version (`GET /files/{id}/versions`).",
         "properties": {
@@ -58018,6 +57921,24 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Page size; absent means the configured default page size (20 unless configured), larger values are lowered to the configured maximum (100 unless configured); alias `$top`",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`page_info.next_cursor` of the previous page; not combined with `$orderby`; alias `$skiptoken`",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -58445,6 +58366,17 @@
       "get": {
         "description": "Resolve a canonical id (`provider_slug::name`, percent-encoded as one path segment) in the caller's effective catalog. Succeeds only when the model is visible, its provider is enabled, it is approved, and the caller may evaluate it. Returns the full record, `provider_settings`, `base_url`, and `secret_ref` included.",
         "operationId": "model_registry.resolve_model",
+        "parameters": [
+          {
+            "description": "Canonical id `provider_slug::name`, percent-encoded as one path segment",
+            "in": "path",
+            "name": "canonical_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -58574,6 +58506,24 @@
             "description": "OData v4 select expression",
             "in": "query",
             "name": "$select",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size; absent means the configured default page size (20 unless configured), larger values are lowered to the configured maximum (100 unless configured); alias `$top`",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`page_info.next_cursor` of the previous page; not combined with `$orderby`; alias `$skiptoken`",
+            "in": "query",
+            "name": "cursor",
             "required": false,
             "schema": {
               "type": "string"
@@ -59023,7 +58973,21 @@
                 }
               }
             },
-            "description": "Model created"
+            "description": "Model created",
+            "headers": {
+              "ETag": {
+                "description": "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on PATCH and DELETE.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "URL of the created entry",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -59121,6 +59085,16 @@
       "delete": {
         "operationId": "model_registry.delete_model",
         "parameters": [
+          {
+            "description": "Model id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
           {
             "description": "The ETag of the entry (`\"<version>\"`); when present, the delete applies only to that version.",
             "in": "header",
@@ -59228,6 +59202,18 @@
       },
       "get": {
         "operationId": "model_registry.get_model",
+        "parameters": [
+          {
+            "description": "Model id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -59237,7 +59223,15 @@
                 }
               }
             },
-            "description": "The model"
+            "description": "The model",
+            "headers": {
+              "ETag": {
+                "description": "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on PATCH and DELETE.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -59335,6 +59329,16 @@
         "operationId": "model_registry.update_model",
         "parameters": [
           {
+            "description": "Model id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "description": "The ETag of the entry (`\"<version>\"`), or `*` for an unconditional update. A missing header is rejected with `IF_MATCH_REQUIRED`; a stale one with `aborted` and reason `OPTIMISTIC_LOCK_FAILURE`.",
             "in": "header",
             "name": "If-Match",
@@ -59364,7 +59368,15 @@
                 }
               }
             },
-            "description": "Model updated"
+            "description": "Model updated",
+            "headers": {
+              "ETag": {
+                "description": "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on PATCH and DELETE.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -59484,6 +59496,24 @@
             "description": "OData v4 select expression",
             "in": "query",
             "name": "$select",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size; absent means the configured default page size (20 unless configured), larger values are lowered to the configured maximum (100 unless configured); alias `$top`",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`page_info.next_cursor` of the previous page; not combined with `$orderby`; alias `$skiptoken`",
+            "in": "query",
+            "name": "cursor",
             "required": false,
             "schema": {
               "type": "string"
@@ -59711,7 +59741,21 @@
                 }
               }
             },
-            "description": "Provider created"
+            "description": "Provider created",
+            "headers": {
+              "ETag": {
+                "description": "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on PATCH and DELETE.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Location": {
+                "description": "URL of the created entry",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -59809,6 +59853,16 @@
       "delete": {
         "operationId": "model_registry.delete_provider",
         "parameters": [
+          {
+            "description": "Provider id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
           {
             "description": "The ETag of the entry (`\"<version>\"`); when present, the delete applies only to that version.",
             "in": "header",
@@ -59916,6 +59970,18 @@
       },
       "get": {
         "operationId": "model_registry.get_provider",
+        "parameters": [
+          {
+            "description": "Provider id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -59925,7 +59991,15 @@
                 }
               }
             },
-            "description": "The provider"
+            "description": "The provider",
+            "headers": {
+              "ETag": {
+                "description": "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on PATCH and DELETE.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -60023,6 +60097,16 @@
         "operationId": "model_registry.update_provider",
         "parameters": [
           {
+            "description": "Provider id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
             "description": "The ETag of the entry (`\"<version>\"`), or `*` for an unconditional update. A missing header is rejected with `IF_MATCH_REQUIRED`; a stale one with `aborted` and reason `OPTIMISTIC_LOCK_FAILURE`.",
             "in": "header",
             "name": "If-Match",
@@ -60052,7 +60136,15 @@
                 }
               }
             },
-            "description": "Provider updated"
+            "description": "Provider updated",
+            "headers": {
+              "ETag": {
+                "description": "The row version of the entry, quoted (`\"<version>\"`); send it as `If-Match` on PATCH and DELETE.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
