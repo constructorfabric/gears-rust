@@ -14,6 +14,7 @@
   - [List Children (Paginated, Status-Filterable)](#list-children-paginated-status-filterable)
   - [Update Tenant Mutable Fields](#update-tenant-mutable-fields)
   - [Soft-Delete Tenant](#soft-delete-tenant)
+  - [Erase Tenant](#erase-tenant)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
   - [Create-Tenant Saga](#create-tenant-saga)
   - [Closure-Table Maintenance](#closure-table-maintenance)
@@ -41,6 +42,7 @@
   - [Hierarchy-Integrity Diagnostics](#hierarchy-integrity-diagnostics)
   - [Data Remediation Telemetry + Documented Path](#data-remediation-telemetry--documented-path)
   - [Data Lifecycle — Soft/Hard Delete + IdP Deprovision](#data-lifecycle--softhard-delete--idp-deprovision)
+  - [Tenant Erasure](#tenant-erasure)
   - [Production Scale Envelope](#production-scale-envelope)
   - [Concurrency Serializability](#concurrency-serializability)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
@@ -64,13 +66,13 @@
 
 ### 1.1 Overview
 
-Full lifecycle of tenants inside the canonical tree owned by Account Management — create child tenants, read and list children, enforce a configurable advisory depth threshold (with an opt-in strict mode), transition status between `active` and `suspended`, soft-delete (leaf-first, with retention window) and hard-delete, and transactionally maintain the platform-canonical `tenant_closure` table so every downstream reader observes tree and closure as one consistent state. Tenant-side IdP operations (provision on create, deprovision on hard-delete, and provision-failure reconciliation) are first-class side effects of this feature's CRUD paths.
+Full lifecycle of tenants inside the canonical tree owned by Account Management — create child tenants, read and list children, enforce a configurable advisory depth threshold (with an opt-in strict mode), transition status between `active` and `suspended`, soft-delete (leaf-first, with retention window) and hard-delete, erase a soft-deleted tenant's name, and transactionally maintain the platform-canonical `tenant_closure` table so every downstream reader observes tree and closure as one consistent state. Tenant-side IdP operations (provision on create, deprovision on hard-delete, and provision-failure reconciliation) are first-class side effects of this feature's CRUD paths.
 
 ### 1.2 Purpose
 
 Provides the core tenant CRUD surface the platform is built around: the hierarchy the root bootstrap establishes, the sub-tree every other feature reasons over (mode conversions, metadata, user operations, tenant-resolver plugin), and the canonical transitive-ancestry storage that lets barrier-aware readers answer subtree and ancestor queries in a single indexed lookup. Soft-delete plus retention + leaf-first hard-delete keep the tree referentially sound through tenant end-of-life.
 
-**Requirements**: `cpt-cf-account-management-fr-create-child-tenant`, `cpt-cf-account-management-fr-hierarchy-depth-limit`, `cpt-cf-account-management-fr-tenant-status-change`, `cpt-cf-account-management-fr-tenant-soft-delete`, `cpt-cf-account-management-fr-children-query`, `cpt-cf-account-management-fr-tenant-read`, `cpt-cf-account-management-fr-tenant-update`, `cpt-cf-account-management-fr-tenant-closure`, `cpt-cf-account-management-fr-idp-tenant-provision`, `cpt-cf-account-management-fr-idp-tenant-provision-failure`, `cpt-cf-account-management-fr-idp-tenant-deprovision`, `cpt-cf-account-management-nfr-production-scale`, `cpt-cf-account-management-nfr-data-lifecycle`, `cpt-cf-account-management-nfr-data-quality`, `cpt-cf-account-management-nfr-data-integrity-diagnostics`, `cpt-cf-account-management-nfr-data-remediation`
+**Requirements**: `cpt-cf-account-management-fr-create-child-tenant`, `cpt-cf-account-management-fr-hierarchy-depth-limit`, `cpt-cf-account-management-fr-tenant-status-change`, `cpt-cf-account-management-fr-tenant-soft-delete`, `cpt-cf-account-management-fr-tenant-erasure`, `cpt-cf-account-management-fr-children-query`, `cpt-cf-account-management-fr-tenant-read`, `cpt-cf-account-management-fr-tenant-update`, `cpt-cf-account-management-fr-tenant-closure`, `cpt-cf-account-management-fr-idp-tenant-provision`, `cpt-cf-account-management-fr-idp-tenant-provision-failure`, `cpt-cf-account-management-fr-idp-tenant-deprovision`, `cpt-cf-account-management-nfr-production-scale`, `cpt-cf-account-management-nfr-data-lifecycle`, `cpt-cf-account-management-nfr-data-quality`, `cpt-cf-account-management-nfr-data-integrity-diagnostics`, `cpt-cf-account-management-nfr-data-remediation`
 
 **Principles**: `cpt-cf-account-management-principle-source-of-truth`, `cpt-cf-account-management-principle-tree-invariant`
 
@@ -79,7 +81,7 @@ Provides the core tenant CRUD surface the platform is built around: the hierarch
 | Actor | Role in Feature |
 |-------|-----------------|
 | `cpt-cf-account-management-actor-tenant-admin` | Primary lifecycle caller — creates child tenants, reads/lists, updates mutable fields, changes status, initiates soft-delete. |
-| `cpt-cf-account-management-actor-platform-admin` | Cross-tenant operator for deletion, retention oversight, and root-scoped reads not reachable by tenant-admin scope. |
+| `cpt-cf-account-management-actor-platform-admin` | Cross-tenant operator for deletion, erasure under account deletion, retention oversight, and root-scoped reads not reachable by tenant-admin scope. |
 | `cpt-cf-account-management-actor-idp` | Downstream provider invoked by the create saga (`provision_tenant`), by the provisioning reaper (`deprovision_tenant` on compensation), and by hard-delete (`deprovision_tenant`). |
 | `cpt-cf-account-management-actor-tenant-resolver` | Read-only consumer of the `tenant_closure` output — reads via a dedicated database role, not through this feature's algorithms; referenced to anchor the data-publication contract. |
 | `cpt-cf-account-management-actor-authz-resolver` | Read-only consumer of barrier and status columns in `tenant_closure` for policy evaluation; referenced to anchor the publication contract. |
@@ -236,6 +238,34 @@ Provides the core tenant CRUD surface the platform is built around: the hierarch
 4. [ ] - `p1` - Begin transaction; set `tenants.status = deleted`; rewrite `tenant_closure.descendant_status = deleted` for every row where `descendant_id = {tenant_id}` via `algo-closure-maintenance` status-change branch; commit - `inst-flow-sdel-tx`
 5. [ ] - `p1` - Schedule the tenant for hard-delete via `algo-hard-delete-leaf-first-scheduler` - `inst-flow-sdel-schedule-hard-delete`
 6. [ ] - `p1` - **RETURN** `200` (or `204`) acknowledging the soft-delete - `inst-flow-sdel-return-ok`
+
+### Erase Tenant
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-flow-tenant-hierarchy-management-erase-tenant`
+
+**Actor**: `cpt-cf-account-management-actor-platform-admin`
+
+**Success Scenarios**:
+
+- A soft-deleted tenant's `name` is replaced by its id; `status`, `deleted_at` and the retention timer are unchanged, and every later read carries the id where the name was.
+- Every registered principal-lifecycle hook receives `TenantErased { tenant_id }` after the write; the caller gets `200` with the post-erasure projection only once every hook has succeeded.
+- A repeated call writes nothing and delivers `TenantErased` again.
+
+**Error Scenarios**:
+
+- Tenant not `deleted` (including the root, which can never be deleted) → `FailedPrecondition` (HTTP 400); nothing is written or delivered.
+- Tenant missing, outside the caller's scope, or internal `provisioning` → `NotFound` (HTTP 404).
+- PDP denies `erase` → `PermissionDenied` (HTTP 403, `cross_tenant_denied`).
+- A hook fails retryably → `ServiceUnavailable` (HTTP 503); terminally → `Internal` (HTTP 500). The name stays erased and the retry delivers the event again.
+
+**Steps**:
+
+1. [ ] - `p1` - Authorize `erase` on the tenant with `OWNER_TENANT_ID = RESOURCE_ID = {tenant_id}` - `inst-flow-erase-authorize`
+2. [ ] - `p1` - Read the tenant under the caller's scope; **IF** missing or `provisioning` **RETURN** `NotFound` - `inst-flow-erase-read`
+3. [ ] - `p1` - **IF** `status != deleted` **RETURN** `FailedPrecondition` - `inst-flow-erase-not-deleted`
+4. [ ] - `p1` - Under SERIALIZABLE retry, re-check `status = deleted` and set `tenants.name = {tenant_id}` unless it already is - `inst-flow-erase-tx`
+5. [ ] - `p1` - Deliver `TenantErased { tenant_id }` to every principal-lifecycle hook; **IF** any failed **RETURN** the mapped `503` / `500` - `inst-flow-erase-notify`
+6. [ ] - `p1` - **RETURN** `200` with the erased tenant - `inst-flow-erase-return-ok`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -446,6 +476,8 @@ Provides the core tenant CRUD surface the platform is built around: the hierarch
 - `deleted → active` / `deleted → suspended` — deletion is terminal for the SDK surface until hard-delete removes the row; resurrection is not in v1.
 - `* → provisioning` — `provisioning` is the initial state only.
 - Any status change to/from `deleted` via PATCH — deletion is reached only through the DELETE flow (`flow-soft-delete-tenant`).
+
+Erasure (`flow-erase-tenant`) is not a status transition: an erased tenant stays `deleted` and follows transition 7 at the end of its retention window.
 
 ## 5. Definitions of Done
 
@@ -717,6 +749,22 @@ Tenant end-of-life **MUST** flow soft-delete → retention window → leaf-first
 - DB: `cpt-cf-account-management-dbtable-tenants`, `cpt-cf-account-management-dbtable-tenant-closure`, `dbtable-tenant-metadata` (cascade)
 - IdP contract: `IdpPluginClient::deprovision_tenant`
 
+### Tenant Erasure
+
+- [x] `p1` - **ID**: `cpt-cf-account-management-dod-tenant-hierarchy-management-tenant-erasure`
+
+`POST /tenants/{tenant_id}/erase` **MUST** accept only a `deleted` tenant and reject any other with `CanonicalError::FailedPrecondition` (HTTP 400) without writing or delivering anything. On a `deleted` tenant it **MUST** replace `tenants.name` with the tenant id under SERIALIZABLE retry, re-checking the status on every retry, and **MUST NOT** change `status`, `deleted_at`, the retention columns or `tenant_closure`. After the write it **MUST** deliver `PrincipalLifecycleEvent::TenantErased` to every registered principal-lifecycle hook and report success only when all succeeded; a hook failure **MUST** surface as HTTP 503 (retryable) or HTTP 500 (terminal) while the erased name stays, so that the idempotent retry delivers the event again. The PEP action is `erase`, declared as its own grantable permission. Neither the soft-delete flow nor the hard-delete scheduler **MUST** ever deliver `TenantErased`.
+
+**Implements**:
+
+- `cpt-cf-account-management-flow-tenant-hierarchy-management-erase-tenant`
+
+**Touches**:
+
+- API: `POST /api/account-management/v1/tenants/{tenant_id}/erase` (`eraseTenant`)
+- DB: `cpt-cf-account-management-dbtable-tenants` (`name` only)
+- SDK: `PrincipalLifecycleEvent::TenantErased`, delivered through the principal-lifecycle hook dispatcher
+
 ### Production Scale Envelope
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-dod-tenant-hierarchy-management-production-scale`
@@ -766,6 +814,8 @@ Hierarchy-mutating operations on overlapping scopes **MUST** resolve with determ
 - [ ] GET `/tenants/{id}/children` returns direct children only by default (no transitive descendants) and, with `recursive=true`, every visible descendant with its `ancestors` chain; both modes are paginated with a next-cursor, filtered by the optional `status` filter, and never surface `provisioning` rows.
 - [ ] After retention expiry, the hard-delete background job processes due tenants in `depth DESC` order; a parent is not hard-deleted while any `tenants` child still exists; `IdpPluginClient::deprovision_tenant` is invoked exactly once per tenant before its `tenants` row is removed; closure rows where `descendant_id = tenant_id` are deleted in the same transaction as the `tenants` row delete.
 - [ ] A synthetic IdP `deprovision_tenant` terminal failure during hard-delete leaves the `tenants` row intact, emits a `dependency_health` metric increment labeled `target=idp, op=deprovision_tenant`, emits an `actor=system` audit via `errors-observability`, and retries on the next scheduler tick.
+- [ ] `POST /tenants/{id}/erase` on a soft-deleted tenant returns `200` with `name` equal to the tenant id and `status=deleted`, leaves `deleted_at` and the retention timer unchanged, and delivers exactly one `TenantErased` per call to each registered principal-lifecycle hook, after the name is replaced; on an `active` or `suspended` tenant it returns `CanonicalError::FailedPrecondition` (HTTP 400) and changes nothing; a hook failure returns 503 or 500 with the name already erased, and the retry succeeds and delivers again.
+- [ ] A soft delete and a hard delete of a tenant that was never erased deliver no `TenantErased`; an erased tenant is still hard-deleted at the end of its retention window, with `TenantHardDelete` delivered as for any other tenant.
 - [ ] A retention tick where a due child is deferred because `deprovision_tenant` failed and the parent is also due keeps the parent `tenants` row intact because the in-transaction child-existence guard observes the remaining child; the parent emits deferred-cleanup telemetry and is retried on a later tick.
 - [ ] A synthetic IdP `deprovision_tenant` retryable or terminal failure during provisioning-reaper compensation retains the `status=provisioning` row, emits `dependency_health` and `tenant_retention` telemetry, and retries or requires operator remediation without deleting AM's compensating state. The full `actor=system` audit via `errors-observability` is **deferred to a follow-up** pending the platform append-only audit sink; the v1 stand-in is the structured `am.events` log emitted from the defer path (see `inst-algo-reap-defer`).
 - [ ] `TenantService::check_hierarchy_integrity()` returns a structured report with non-empty per-category arrays on a deliberately seeded dataset covering each anomaly category, and clean (`[]`) arrays on a known-good hierarchy; the report is produced by 8 pure-Rust classifiers over a `(tenants, tenant_closure)` snapshot loaded once via SecureSelect inside a `REPEATABLE READ` read-only transaction; the `integrity_check_runs` single-flight gate is acquired and released in **separate** committed transactions outside the snapshot tx (`lock::acquire_committed` → snapshot/classify → `lock::release_committed`) so contenders observe the gate immediately; the `am.hierarchy_integrity_violations` gauge carries the `category` label for every one of the 10 fixed-shape categories (zero-valued on a clean run).

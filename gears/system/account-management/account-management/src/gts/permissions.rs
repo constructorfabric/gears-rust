@@ -64,6 +64,14 @@ gts_instance! {
 }
 gts_instance! {
     AuthzPermissionV1 {
+        id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_erase.v1"),
+        resource_type: TENANT_RESOURCE_TYPE.to_owned(),
+        action: tenant_actions::ERASE.to_owned(),
+        display_name: "Erase tenant".to_owned(),
+    }
+}
+gts_instance! {
+    AuthzPermissionV1 {
         id: gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_list_children.v1"),
         resource_type: TENANT_RESOURCE_TYPE.to_owned(),
         action: tenant_actions::LIST_CHILDREN.to_owned(),
@@ -259,6 +267,7 @@ mod tests {
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_read.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_update.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_delete.v1"),
+        gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_erase.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_list_children.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_metadata_read.v1"),
         gts_id!("cf.toolkit.authz.permission.v1~cf.core.am.tenant_metadata_write.v1"),

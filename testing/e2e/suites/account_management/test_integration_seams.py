@@ -1,7 +1,7 @@
 # Created: 2026-05-16 by Constructor Tech
 """E2E integration seam tests for the account-management gear.
 
-12 tests. One file. Targets cross-process seams ONLY -- points where
+13 tests. One file. Targets cross-process seams ONLY -- points where
 two independently correct components break when connected. Pure
 status-code / OData / envelope-shape coverage lives in the Rust
 in-process REST tests; those seams are NOT repeated here.
@@ -12,6 +12,9 @@ Seams pinned (one per test):
         mounted (not 404/405) for the families not exercised by S2-S12.
 * S2  -- tenant_crud_round_trip_via_gateway: POST/GET/PATCH/DELETE
         traversal through the gateway -> AM gear path.
+* S2b -- tenant_erasure_replaces_the_name_of_a_deleted_tenant_via_gateway:
+        POST /erase refuses a live tenant and replaces a deleted one's
+        name with its id.
 * S3  -- create_tenant_validates_tenant_type_via_types_registry: the
         cross-gear ``tenant_type`` lookup rejects a missing catalog
         entry with a 400 envelope.
@@ -259,6 +262,45 @@ async def test_tenant_crud_round_trip_via_gateway(
         assert deleted.get("deleted_at") is not None, (
             "Soft-delete must surface deleted_at on the wire"
         )
+
+
+# ── S2b: erasure of a deleted tenant via the gateway ───────────────────
+
+
+async def test_tenant_erasure_replaces_the_name_of_a_deleted_tenant_via_gateway(
+    am_base_url, am_headers, create_tenant,
+):
+    """Seam: Gateway -> AM erase handler -> DB, on a soft-deleted tenant.
+
+    Only a deleted tenant can be erased; the erasure replaces its name with
+    its id, keeps it deleted, and is idempotent.
+    """
+    created = await create_tenant("s2erase")
+    tenant_id = created["id"]
+    erase_url = f"{_tenant(am_base_url, tenant_id)}/erase"
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        r = await c.post(erase_url, headers=am_headers)
+        assert r.status_code == 400, (
+            f"erasing an active tenant must fail: {r.status_code} {r.text}"
+        )
+
+        r = await c.delete(_tenant(am_base_url, tenant_id), headers=am_headers)
+        assert r.status_code == 204, f"DELETE tenant: {r.status_code} {r.text}"
+
+        for attempt in ("first", "repeated"):
+            r = await c.post(erase_url, headers=am_headers)
+            assert r.status_code == 200, (
+                f"{attempt} erase: {r.status_code} {r.text}"
+            )
+            erased = r.json()
+            assert erased["name"] == tenant_id
+            assert erased["status"] == "deleted"
+            assert erased.get("deleted_at") is not None
+
+        r = await c.get(_tenant(am_base_url, tenant_id), headers=am_headers)
+        assert r.status_code == 200, f"GET erased tenant: {r.status_code} {r.text}"
+        assert r.json()["name"] == tenant_id, "later reads carry the id as name"
 
 
 # ── S3: tenant_type validated against the real types-registry ──────────

@@ -26814,6 +26814,124 @@
         ]
       }
     },
+    "/account-management/v1/tenants/{tenant_id}/erase": {
+      "post": {
+        "description": "Erase a soft-deleted tenant's name under its account's deletion: AM replaces `name` with the tenant id, then tells the gears that keep a copy of the name to drop it. `status`, `deleted_at` and the retention timer are unchanged; the tenant is hard-deleted when its retention window ends, as without the erasure. Only a `deleted` tenant can be erased (`failed_precondition` otherwise; delete it first). A deletion alone never erases. Idempotent: a second call writes nothing and tells the other gears again, so a 503 is retried with the same call. Sub-resource fallback for the AIP-136 colon-method -- same axum/matchit constraint as the `suspend` endpoint.",
+        "operationId": "account_management.erase_tenant",
+        "parameters": [
+          {
+            "description": "Tenant UUID",
+            "in": "path",
+            "name": "tenant_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TenantDto"
+                }
+              }
+            },
+            "description": "Erased tenant"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "PDP / DB transport failure, or a gear that keeps the name could not drop it yet"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Erase the name of a deleted tenant",
+        "tags": [
+          "Tenants"
+        ]
+      }
+    },
     "/account-management/v1/tenants/{tenant_id}/metadata": {
       "get": {
         "description": "List the metadata entries written directly on a tenant. Direct-only -- inherited values are not included; clients reading effective values use the `/resolved` endpoint.",

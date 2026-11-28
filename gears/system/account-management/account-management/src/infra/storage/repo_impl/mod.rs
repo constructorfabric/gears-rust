@@ -186,6 +186,15 @@ impl TenantRepo for TenantRepoImpl {
         updates::set_status(self, scope, tenant_id, new_status, now).await
     }
 
+    async fn erase_tenant_name(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<TenantModel, DomainError> {
+        updates::erase_tenant_name(self, scope, tenant_id, now).await
+    }
+
     async fn load_ancestor_chain_through_parent(
         &self,
         scope: &AccessScope,

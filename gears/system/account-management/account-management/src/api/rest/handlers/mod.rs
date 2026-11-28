@@ -21,7 +21,7 @@ pub(crate) use service_accounts::{
     rotate_service_account_secret,
 };
 pub(crate) use tenants::{
-    create_tenant, delete_tenant, get_tenant, list_tenant_children, suspend_tenant,
+    create_tenant, delete_tenant, erase_tenant, get_tenant, list_tenant_children, suspend_tenant,
     unsuspend_tenant, update_tenant,
 };
 pub(crate) use users::{create_user, delete_user, list_users, update_user};

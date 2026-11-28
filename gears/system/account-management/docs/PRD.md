@@ -294,6 +294,7 @@ AM coordinates user lifecycle operations but **does not own user identity data**
 - Managed tenant model: parent eligible for delegated child administration with no barrier, subject to platform authorization policy (p1).
 - Self-managed tenant model: strict isolation via barrier; metadata inheritance stops at self-managed boundaries (p1).
 - Tenant CRUD operations: create, read, update, soft-delete with configurable retention (p1).
+- Tenant erasure: erase a soft-deleted tenant's name under its account's deletion and tell the gears that keep a copy of it (p1).
 - IdP user operations contract: pluggable contract for user provisioning, update, deprovisioning, and query (p1).
 - Service accounts: tenant-scoped machine identities over the same pluggable IdP contract — provision, list, rotate-secret, revoke — with one-time secret disclosure and four independently grantable permissions on a resource type distinct from `User` (p1).
 - User groups management (via Resource Group): create groups, manage membership, nested groups with cycle detection delegated to Resource Group (p1).
@@ -432,6 +433,16 @@ The system **MUST** allow an administrator to change a tenant's status between `
 The system **MUST** allow deletion of a **non-root** tenant only when it has no non-deleted child tenants and no remaining tenant-owned resource associations in the Resource Group ownership graph, transitioning the tenant to `deleted` status (soft delete). Attempts to delete the root tenant **MUST** be rejected as `InvalidArgument` (HTTP 400) with `reason=ROOT_TENANT_CANNOT_DELETE`. If non-deleted children exist, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_CHILDREN`. If resource associations remain under the tenant's ownership scope, deletion **MUST** be rejected as `FailedPrecondition` (HTTP 400) with `reason=TENANT_HAS_RESOURCES`. Hard deletion **MUST** occur after a configurable retention period (default: 90 days). The hard-deletion process **MUST NOT** leave orphaned child tenant records. When a parent and child tenant share the same retention window, the hard-deletion background job **MUST** process leaf tenants before their parents (leaf-first ordering).
 
 - **Rationale**: Preventing deletion of tenants with active children or remaining resource ownership links protects organizational integrity and prevents orphaned ownership mappings. The root tenant is undeletable so the deployment always retains exactly one hierarchy root. Soft delete with retention enables recovery and compliance. Ensuring no orphaned child records prevents referential integrity violations during retention cleanup.
+
+#### Tenant Erasure
+
+- [ ] `p1` - **ID**: `cpt-cf-account-management-fr-tenant-erasure`
+
+**Actors**: `cpt-cf-account-management-actor-platform-admin`, `cpt-cf-account-management-actor-tenant-admin`
+
+The system **MUST** allow an authorized administrator to erase a soft-deleted tenant under its account's deletion: the tenant's `name` is replaced by the tenant's identifier, and every gear that registered a principal-lifecycle hook is told through a `TenantErased` event. Erasure **MUST** be its own operation and its own authorization action (`erase`), distinct from deletion: a soft delete or a hard delete **MUST NOT** erase the name or deliver `TenantErased`, and an erasure **MUST NOT** change the tenant's status, deletion instant or retention timer. Erasing a tenant that is not `deleted` **MUST** be rejected as `FailedPrecondition` (HTTP 400). The operation **MUST** be idempotent, and **MUST** report success only once every hook has handled the event; a hook failure **MUST** fail the request as retryable (HTTP 503) or terminal (HTTP 500) while keeping the erased name, so that a retry delivers the event again.
+
+- **Rationale**: Gears that report on past periods (usage and billing reports, for example) keep a deleted tenant's name after the deletion, because a deleted tenant still has to appear under its name on the periods it existed in; tenant names can be the names of natural persons. When personal data is erased under the account's deletion, those copies have to go as well, and only AM knows that the erasure happened. A deletion cannot stand in for it: a soft delete is the start of retention, and a hard delete is the end of AM's own record, not a statement that the name must disappear everywhere. Replacing the name in AM first means a gear that reads the tenant back after the event never re-copies the erased name.
 
 #### Children Query with Pagination
 
@@ -2004,6 +2015,7 @@ IdP implementations may align with standards such as SCIM 2.0 and OIDC where app
 - [ ] Resolved conversion requests (`approved`/`cancelled`/`rejected`/`expired`) are retained for the configured window (default 30 days) and then soft-deleted; default queries exclude soft-deleted rows.
 - [ ] Metadata resolution returns the correct value when multiple self-managed boundaries exist in the ancestor chain.
 - [ ] Hard-deletion background job correctly processes leaf-first ordering when parent and child share the same retention window.
+- [ ] Erasing a soft-deleted tenant replaces its name with its identifier in every later read and delivers one `TenantErased` event to each registered principal-lifecycle hook; erasing a tenant that is not `deleted` fails with `CanonicalError::FailedPrecondition` (HTTP 400) and changes nothing; a soft or hard delete without an erasure never delivers `TenantErased`.
 - [ ] IdP timeout during user provisioning results in deterministic rollback with `CanonicalError::ServiceUnavailable` (HTTP 503).
 - [ ] Parent Tenant Administrator can list conversion requests for direct children through the dedicated parent-scope discovery capability without barrier bypass; only conversion-request metadata needed for review and resolution is exposed.
 - [ ] Initiator can withdraw a pending conversion request from their own scope, counterparty can decline it from their own scope, and neither side can drive the other's transition.

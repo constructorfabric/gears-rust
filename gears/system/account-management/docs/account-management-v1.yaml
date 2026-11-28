@@ -245,6 +245,39 @@ paths:
         default:
           $ref: '#/components/responses/Problem'
 
+  /account-management/v1/tenants/{tenant_id}/erase:
+    parameters:
+      - $ref: '#/components/parameters/TenantId'
+    post:
+      operationId: eraseTenant
+      tags: [tenants]
+      summary: Erase the name of a deleted tenant
+      description: |
+        Erase a soft-deleted tenant's name under its account's deletion:
+        AM replaces `name` with the tenant id, then delivers the
+        principal-lifecycle event `TenantErased` to every gear that
+        registered a hook, so copies of the name kept elsewhere are
+        dropped too. `status`, `deleted_at` and the retention timer are
+        unchanged; the tenant is hard-deleted when its retention window
+        ends, as without the erasure. A deletion, soft or hard, never
+        erases. Authorized by the `erase` action, separate from
+        `delete`. Only a `deleted` tenant can be erased
+        (`failed_precondition` otherwise). Idempotent: a second call
+        writes nothing and delivers the event again. 200 is returned
+        only once every hook has handled the event; a 503 (or 500) from
+        a hook leaves the name erased, and the client retries the same
+        call. Sub-resource fallback for the AIP-136 colon-method — same
+        axum/matchit constraint as the `suspend` endpoint.
+      responses:
+        '200':
+          description: Erased tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tenant'
+        default:
+          $ref: '#/components/responses/Problem'
+
   /account-management/v1/tenants/{tenant_id}/children:
     parameters:
       - $ref: '#/components/parameters/TenantId'

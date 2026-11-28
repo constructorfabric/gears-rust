@@ -31,10 +31,12 @@ const SUSPEND_PATH: &str = "/account-management/v1/tenants/{tenant_id}/suspend";
 /// Unsuspend sub-resource path. Same fallback rationale as
 /// [`SUSPEND_PATH`].
 const UNSUSPEND_PATH: &str = "/account-management/v1/tenants/{tenant_id}/unsuspend";
+/// Erase sub-resource path. Same fallback rationale as [`SUSPEND_PATH`].
+const ERASE_PATH: &str = "/account-management/v1/tenants/{tenant_id}/erase";
 
 #[allow(
     clippy::too_many_lines,
-    reason = "seven OperationBuilder chains in linear sequence"
+    reason = "eight OperationBuilder chains in linear sequence"
 )]
 pub(super) fn register_tenants_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     // POST /account-management/v1/tenants
@@ -226,6 +228,35 @@ pub(super) fn register_tenants_routes(mut router: Router, openapi: &dyn OpenApiR
             openapi,
             http::StatusCode::SERVICE_UNAVAILABLE,
             "PDP / DB transport failure",
+        )
+        .register(router, openapi);
+
+    // POST /account-management/v1/tenants/{tenant_id}/erase
+    router = OperationBuilder::post(ERASE_PATH)
+        .operation_id("account_management.erase_tenant")
+        .summary("Erase the name of a deleted tenant")
+        .description(
+            "Erase a soft-deleted tenant's name under its account's deletion: AM replaces \
+             `name` with the tenant id, then tells the gears that keep a copy of the name to \
+             drop it. `status`, `deleted_at` and the retention timer are unchanged; the \
+             tenant is hard-deleted when its retention window ends, as without the erasure. \
+             Only a `deleted` tenant can be erased (`failed_precondition` otherwise; delete \
+             it first). A deletion alone never erases. Idempotent: a second call writes \
+             nothing and tells the other gears again, so a 503 is retried with the same \
+             call. Sub-resource fallback for the AIP-136 colon-method -- same axum/matchit \
+             constraint as the `suspend` endpoint.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .no_license_required()
+        .path_param("tenant_id", "Tenant UUID")
+        .handler(handlers::erase_tenant)
+        .json_response_with_schema::<dto::TenantDto>(openapi, http::StatusCode::OK, "Erased tenant")
+        .standard_errors(openapi)
+        .problem_response(
+            openapi,
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "PDP / DB transport failure, or a gear that keeps the name could not drop it yet",
         )
         .register(router, openapi);
 
