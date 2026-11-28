@@ -16,7 +16,6 @@
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `reason` | `String` | Machine-readable reason code (e.g., `OPTIMISTIC_LOCK_FAILURE`) |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 ## Constructor Example
 
@@ -62,10 +61,6 @@ let err = UpstreamResourceError::aborted("Operation aborted due to concurrency c
             "reason": {
               "type": "string",
               "description": "Machine-readable reason code (e.g., OPTIMISTIC_LOCK_FAILURE)"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

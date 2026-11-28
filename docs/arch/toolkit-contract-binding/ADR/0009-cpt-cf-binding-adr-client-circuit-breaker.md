@@ -1,9 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-06
 ---
 
 # Client-Side Circuit Breaker in Generated Contract Clients
+
+> **Implementation:** `libs/toolkit-contract/src/runtime/breaker.rs`, `grpc/mod.rs` (`GrpcEndpointFailure`) and the `circuit_breaker` client setting in `wiring.rs`, on top of `libs/toolkit-resilience`.
 
 **ID**: `cpt-cf-binding-adr-client-circuit-breaker`
 

@@ -185,7 +185,7 @@ The consumer continues to depend on `Arc<dyn NotificationBackend>`; it cannot te
 
 ### Confirmation
 
-The PoC at `~/projects/toolkit-binding-poc/` validates the narrow-but-honest approach on the `notification-sdk` crate: `NotificationBackend` with POST+JSON and SSE streaming, a generated OpenAPI spec, and a manual-implementation path exercised by a secondary fixture. Anything more complex (multipart upload, header-driven response variants) falls to a hand-written client in the PoC. The evidence report `~/projects/toolkit-binding-poc/docs/research/rest-grpc-unification-evidence.html` (referenced from the PoC README) documents the reasoning for keeping the generator narrow rather than attempting to model the full REST surface in Rust attributes.
+The PoC ([striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc), outside this repository) validates the narrow-but-honest approach on the `notification-sdk` crate: `NotificationBackend` with POST+JSON and SSE streaming, a generated OpenAPI spec, and a manual-implementation path exercised by a secondary fixture. Anything more complex (multipart upload, header-driven response variants) falls to a hand-written client in the PoC. The [evidence report](https://github.com/striped-zebra-dev/toolkit-binding-poc/blob/main/docs/research/rest-grpc-unification-evidence.html) in that repository documents the reasoning for keeping the generator narrow rather than attempting to model the full REST surface in Rust attributes.
 
 ## Pros and Cons of the Options
 

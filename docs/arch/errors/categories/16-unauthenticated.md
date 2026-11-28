@@ -11,12 +11,11 @@
 
 ## Context Schema
 
-GTS schema ID: `gts.cf.core.errors.error_info.v1~`
+Rust type: `UnauthenticatedV1`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `reason` | `String` | Machine-readable reason code (e.g., `TOKEN_EXPIRED`, `MISSING_CREDENTIALS`) |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 ## Constructor Example
 
@@ -51,10 +50,6 @@ let err = CanonicalError::unauthenticated()
             "reason": {
               "type": "string",
               "description": "Machine-readable reason code (e.g., TOKEN_EXPIRED, MISSING_CREDENTIALS)"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

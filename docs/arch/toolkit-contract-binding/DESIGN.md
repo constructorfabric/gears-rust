@@ -160,7 +160,7 @@ The four-type segregation encodes this asymmetry in the type system. A migration
 | `cpt-cf-binding-fr-contract-error` | `#[derive(ContractError)]` generates Problem Details conversion with `error_code` (UPPER_SNAKE_CASE from variant name) and `error_domain` (from attribute). Round-trip serialization preserves the original variant **only where the contract method's declared error type is the `ContractError` enum itself** (with a `#[contract_error(fallback)]` variant, which is what generates the total `From<TransportError>`). Declaring `CanonicalError` and relying on the `Problem` round-trip does **not** work: `CanonicalError` has no field for `error_code`, `error_domain` or `context["data"]`, so the domain identity is stripped in both directions — and for the categories whose context type has required fields (`FailedPrecondition`, `ResourceExhausted`, `InvalidArgument`, `Aborted`) the *category* is lost too, a `400` arriving as `Internal` / `500`. Branch on a typed payload ⇒ declare the enum. |
 | `cpt-cf-binding-fr-problem-details` | Runtime provides the `Problem` struct (`toolkit_canonical_errors`) for the RFC 9457 wire format with `error_code` and `error_domain` extension fields. |
 | `cpt-cf-binding-fr-client-config` | Runtime provides `ClientConfig` carrying base URL, timeout, and retry policy. Generated clients accept `ClientConfig` for construction. |
-| `cpt-cf-binding-fr-feature-gated` | REST client and its dependencies (`reqwest`, `schemars`) are behind a `rest-client` feature flag. SDK crates without the feature compile with no HTTP dependencies. |
+| `cpt-cf-binding-fr-feature-gated` | REST client and its dependencies (`toolkit-http` through `toolkit-contract/runtime-client`) are behind a `rest-client` feature flag. SDK crates without the feature compile with no HTTP dependencies. |
 | `cpt-cf-binding-fr-directory-contract` | Service directory trait defined for GTS ID resolution and OpenAPI validation at registration. Implementation out of scope (cluster work). |
 | `cpt-cf-binding-fr-openapi-validation` | Directory fetches `/.well-known/openapi.json` from remote services and validates endpoint presence, HTTP methods, and content types before registration. |
 | `cpt-cf-binding-fr-clienthub-fallback` | ClientHub supports fallback resolution: compile-time registration takes priority, REST proxy instantiated from directory when no compile-time plugin exists. |
@@ -316,7 +316,7 @@ If the projection's parameter types or return type diverge from the base, the wi
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-constraint-feature-gated-http`
 
-All HTTP dependencies (`reqwest`, `schemars`) are behind a `rest-client` Cargo feature flag. SDK crates without the feature compile with zero network dependencies. This ensures that compile-time-only consumers do not pay for transport they do not use.
+All HTTP dependencies (`toolkit-http`, enabled through `toolkit-contract/rest-client`) are behind a `rest-client` Cargo feature flag. SDK crates without the feature compile with zero network dependencies. This ensures that compile-time-only consumers do not pay for transport they do not use.
 
 #### RFC 9457 Error Wire Format
 
@@ -483,7 +483,7 @@ pub trait NotificationBackendRest: NotificationBackend {
 // The generated REST client struct carries config + HTTP client.
 pub struct NotificationBackendRestClient {
     config: ClientConfig,   // base_url, timeout, retry policy
-    http: reqwest::Client,
+    http: toolkit_http::HttpClient,
 }
 
 // Single source of actual HTTP dispatch — on the BASE trait.
@@ -518,7 +518,7 @@ The three diagrams below each answer a different question. They share a common v
             │   dynamic dispatch through Arc<dyn NotificationBackend>
             v
   impl NotificationBackend for NotificationBackendRestClient
-      reqwest POST /v1/deliver → response → deserialize → error mapping
+      HTTP POST /v1/deliver → response → deserialize → error mapping
       (this is the only place HTTP actually happens)
 ```
 
@@ -554,8 +554,8 @@ Perspective: **code that uses the protocol-specific surface** (projection-only m
 **Scenario 3: A compile-time plugin.** *Shows that in-process plugins depend only on the base trait and know nothing about REST.*
 
 ```
-  // Plugin crate — does NOT depend on reqwest, toolkit-contract-runtime, or the
-  // projection trait. Depends only on the SDK crate's base trait.
+  // Plugin crate — does NOT depend on toolkit-http, the toolkit-contract runtime,
+  // or the projection trait. Depends only on the SDK crate's base trait.
   struct InProcEmailPlugin { /* SMTP client, whatever */ }
 
   impl NotificationBackend for InProcEmailPlugin {
@@ -584,26 +584,26 @@ Perspective: **plugin author**. Point: the plugin implements the base trait like
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-decision-contract-error`
 
-**Decision**: `#[derive(ContractError)]` on an error enum generates RFC 9457 Problem Details conversion with `error_code` (UPPER_SNAKE_CASE from variant name) and `error_domain` (from `#[contract_error(domain = "...")]` attribute). The generated code supports round-trip serialization: `to_problem_details()` and `from_problem_details()` preserve the original variant including all structured context fields.
+**Decision**: `#[derive(ContractError)]` on an error enum generates RFC 9457 Problem Details conversion onto the canonical `toolkit_canonical_errors::Problem`: `From<MyError> for Problem` on the server side and `TryFrom<Problem> for MyError` on the client side. Each variant declares `#[error_code("…")]` and a `#[canonical(<ProblemCategory>)]` category (which sets HTTP status, problem `type` and title); `#[error_domain("…")]` is set on the enum or per variant. The round trip preserves the variant and its structured context fields.
 
-**Rationale**: Machine-readable error reconstruction across gear boundaries. The `error_code` + `error_domain` pair uniquely identifies the error variant. Unknown codes or domains fall back to an `Internal` variant, ensuring the system never panics on unrecognized errors.
+**Rationale**: Machine-readable error reconstruction across gear boundaries. The `error_code` + `error_domain` pair uniquely identifies the error variant; duplicate pairs are a compile error. An unknown code or domain makes `TryFrom` return the original `Problem`, so nothing is lost and nothing panics.
 
 ```rust
-#[derive(Debug, Clone, ContractError)]
-#[contract_error(domain = "cf.notification")]
+#[derive(Debug, Clone, Serialize, Deserialize, ContractError)]
+#[error_domain("cf.notification")]
+#[non_exhaustive]
 pub enum NotificationError {
-    #[error(status = 404, problem_type = "not-found")]
+    #[error_code("NOTIFICATION_NOT_FOUND")]
+    #[canonical(NotFound)]
     NotificationNotFound { notification_id: String },
 
-    #[error(status = 503, problem_type = "service-unavailable")]
+    #[error_code("DELIVERY_UNAVAILABLE")]
+    #[canonical(ServiceUnavailable)]
     DeliveryUnavailable { channel: String, retry_after_seconds: Option<u64> },
-
-    #[error(status = 500, problem_type = "internal")]
-    Internal { description: String },
 }
 ```
 
-Generated `error_code` values: `NOTIFICATION_NOT_FOUND`, `DELIVERY_UNAVAILABLE`, `INTERNAL`.
+See `libs/toolkit-contract-macros/src/contract_error.rs` and `libs/toolkit-contract/tests/contract_error_derive.rs`.
 
 ### D5: OpenAPI at /.well-known/openapi.json
 
@@ -698,21 +698,21 @@ impl RestApiCapability for MyGear {
 - **Per-method opt-out**: a projection method marked `#[server_manual]` is skipped by the generator (but stays in the client + IR). The author registers it by hand and chains it onto the generated router. This is the escape hatch for routes the macro cannot (yet) express.
 - OpenAPI spec is assembled via a single `OpenApiRegistry` (utoipa) as routes are registered — generated and manual routes contribute to the same registry.
 - Handler generation is synchronized with the IR — parameter binding order (`SecurityContext` → path → body → query) and error mapping (`CanonicalError: IntoResponse` → RFC 9457 `Problem`) follow from the binding metadata.
-- Current scope (PoC): unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[delete]`) with path/query/body parameters and default `authenticated()` auth. **Streaming (`#[streaming]`) server generation is deferred, under every framing** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). The hand-written side has a first-class runtime for both framings: `OperationBuilder::sse_json` + `toolkit::http::sse` for SSE, `OperationBuilder::multipart_json` + `toolkit::http::multipart::MultipartJsonStream` for `multipart/mixed`. Complex authentication (license, OData, multipart *uploads*) and base↔projection parity enforcement are follow-up work.
+- Current scope: unary HTTP verbs (`#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]`) with path/query/body parameters; tenant-plane `authenticated()` by default, with `#[anonymous]` and platform-plane (`PlatformSecurityContext`) methods also generated. **Streaming (`#[streaming]`) server generation is deferred, under every framing** — such methods must be marked `#[server_manual]` and registered by hand (a non-opted-out streaming method raises a `compile_error!`). The hand-written side has a first-class runtime for both framings: `OperationBuilder::sse_json` + `toolkit::http::sse` for SSE, `OperationBuilder::multipart_json` + `toolkit::http::multipart::MultipartJsonStream` for `multipart/mixed`. Base↔projection parity is enforced (ADR-0003: delegating default methods at `cargo check`, `require_full_coverage` as a generated test). License scopes, OData and multipart *uploads* are not generated; such routes stay hand-written.
 
 **Trade-offs:**
 
 - The macro's responsibility grows — now generating both client and server paths. Debugging becomes more complex.
 - Server route generation is synchronous; async patterns in routes require manual composition with the generated function.
-- For routes that cannot be expressed by the macro (streaming of any framing in the PoC, complex authentication, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
+- For routes that cannot be expressed by the macro (streaming of any framing, license scopes, OData, custom response shapes, multipart uploads), `#[server_manual]` + manual `OperationBuilder` calls compose alongside the generated function on the same router.
 
 ## 4. Crate Structure
 
 | Crate | Type | Responsibility |
 |-------|------|----------------|
-| `cf-toolkit-contract-macros` | proc-macro | `#[toolkit::rest_contract]` -- generates REST client struct, server route registration function (`register_<name>_routes()`), HTTP binding IR, OpenAPI spec function, SSE streaming, retryable methods. `#[derive(ContractError)]` -- generates Problem Details conversion with `error_code` + `error_domain`. Method annotations: `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[patch]`, `#[streaming]`, `#[retryable]`. |
-| `cf-toolkit-contract-runtime` | lib | `Problem` struct (RFC 9457 with `error_code` / `error_domain` extension fields). SSE stream parser (byte stream to typed events). `ClientConfig` (base URL, timeout, retry policy). `RetryConfig` and `with_retry()` helper for exponential backoff. |
-| Gear SDK crates (e.g., `notification-sdk`) | lib | Base traits (no transport annotations; they do carry `#[toolkit::contract]`). Transport projection traits (behind `rest-client` feature). Feature-gated: `rest-client` enables `reqwest`, `schemars`, and the generated REST client. `rest-server` feature enables server route registration function (`register_<name>_routes()`) and `OperationBuilder`, `axum`, `utoipa` dependencies. Without features, only the base trait is available. |
+| `cf-gears-toolkit-contract-macros` | proc-macro | `#[toolkit::rest_contract]` -- generates REST client struct, server route registration function (`register_<name>_routes()`), HTTP binding IR, OpenAPI spec function, SSE streaming, retryable methods. `#[derive(ContractError)]` -- generates Problem Details conversion with `error_code` + `error_domain`. Method annotations: `#[get]`, `#[post]`, `#[put]`, `#[delete]`, `#[patch]`, `#[streaming]`, `#[retryable]`. |
+| `toolkit-contract` (package `cf-gears-toolkit-contract`), `runtime` module | lib | No separate runtime crate. `libs/toolkit-contract/src/runtime/`, behind the `runtime-client` feature (which `rest-client` enables): `ClientConfig` (base URL, timeout, retry policy) and `RetryConfig` in `runtime::config`, `retry_with_backoff` (exponential backoff) in `runtime::retry`, the SSE stream parser (byte stream to typed events) in `runtime::sse`. HTTP goes through `toolkit-http`. The crate root re-exports `Problem` from `toolkit_canonical_errors` (feature `canonical-errors`, `libs/toolkit-contract/src/lib.rs`). |
+| Gear SDK crates (e.g., `notification-sdk`) | lib | Base traits (no transport annotations; they do carry `#[toolkit::contract]`). Transport projection traits (behind `rest-client` feature). Feature-gated: `rest-client` enables `toolkit-contract/rest-client` (HTTP via `toolkit-http`) and the generated REST client. `rest-server` feature enables server route registration function (`register_<name>_routes()`) and `OperationBuilder`, `axum`, `utoipa` dependencies. Without features, only the base trait is available. |
 | `cf-toolkit` (modified) | lib | ClientHub: fallback resolution (compile-time first, then REST proxy from directory). Gear lifecycle: new proxy wiring phase after plugin discovery, before post-init. |
 | `cf-toolkit-macros` (modified) | proc-macro | Alignment with ADR-0004 (PR #1380) gear/plugin declaration macros. |
 
@@ -729,8 +729,8 @@ notification-sdk/
     extension.rs        -- NotificationFormatterExtension (base only, no projection)
   Cargo.toml
     [features]
-    rest-client = ["reqwest", "schemars", "cf-toolkit-contract-macros", "cf-toolkit-contract-runtime"]
-    rest-server = ["toolkit", "axum", "utoipa", "cf-toolkit-contract-macros"]
+    rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http", "dep:secrecy"]
+    rest-server = ["toolkit", "axum", "utoipa", "toolkit-contract-macros"]
 ```
 
 ## 5. Contract Enforcement
@@ -772,17 +772,17 @@ Developers must choose the correct suffix for every trait. This adds cognitive o
 
 **Justification**: Intentional friction. The name IS the operational contract. The alternative -- implicit semantics where you must trace the implementation to know if a call can timeout -- is worse for every subsequent reader of the code. The ceremony pays for itself on the first code review.
 
-### [Trade-off] No Server Generation
+### [Trade-off] Server Generation Is Additive, Not Mandatory
 
-Only the client is generated. Remote services must implement their REST endpoints manually.
+The REST projection generates `register_<trait>_routes()` for the methods it can express (D7, [ADR-0003](./ADR/0003-cpt-cf-binding-adr-projection-server-gen.md)); `#[server_manual]` methods and streaming methods are registered by hand with `OperationBuilder` on the same router. The gRPC projection generates the client only; its `tonic` server is hand-written ([ADR-0008](./ADR/0008-cpt-cf-binding-adr-grpc-projection.md)).
 
-**Justification**: Preserves server flexibility. Remote services may be written in any language, use any HTTP framework, support multiple API versions, and extend the API surface beyond what the contract specifies. The generated OpenAPI spec serves as a minimum conformance contract, not a straitjacket.
+**Justification**: Preserves server flexibility. Remote services may still be written in any language, use any HTTP framework, support multiple API versions, and extend the API surface beyond what the contract specifies. The generated OpenAPI spec serves as a minimum conformance contract, not a straitjacket.
 
-### [Trade-off] No gRPC in Phase 1
+### [Trade-off] gRPC Projection Is Client-Only
 
-Only REST transport projections are supported. gRPC follows the same pattern but is deferred.
+REST and gRPC projections are both supported. `#[toolkit::grpc_contract]` ([ADR-0008](./ADR/0008-cpt-cf-binding-adr-grpc-projection.md), `libs/toolkit-contract-macros/src/grpc_contract.rs`) generates the gRPC client and resolving client; the server side is hand-written.
 
-**Justification**: REST covers the immediate need (out-of-process plugins, third-party integrations). The two-layer architecture is transport-agnostic by design -- adding `#[toolkit::grpc_contract]` later requires no changes to base traits, consumers, or the contract type system.
+**Justification**: The two-layer architecture is transport-agnostic by design: the gRPC projection was added without changes to base traits, consumers, or the contract type system.
 
 ### [Constraint] Observability Hooks
 

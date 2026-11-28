@@ -83,6 +83,10 @@ application gears run out-of-process. The architecture is built on four pillars:
 | `cpt-cf-adr-rest-first-oop`         | REST as primary OoP protocol; each gear runs its own HTTP server                                     |
 | `cpt-cf-adr-gateway-abstraction`    | GatewayProvider trait abstracts built-in and external gateways                                         |
 | `cpt-cf-adr-instance-addressable-discovery` | Target a specific gear instance (role/shard) via additive directory metadata + targeted resolve; RR stays the default |
+| `cpt-cf-adr-eventual-readiness`     | Runtime-managed self-registration and probes; dependencies gate `/readyz` instead of blocking startup   |
+| `cpt-cf-adr-edge-architecture`      | Two named edge modes (embedded api-gateway, external gateway) with a vendor-independent internal contract |
+| `cpt-cf-adr-optional-service-discovery` | Directory registration optional at runtime; static `clients.consumes.<dep>.endpoint` as the fallback (not implemented yet) |
+| `cpt-cf-adr-directory-persistence-and-replication` | Instance leases and drain reporting (built); shared storage backends and replicated Flight Control (not built) |
 
 ### 1.3 Architecture Layers
 
@@ -274,14 +278,13 @@ standalone HTTP-serving process.
 
 ##### Current state
 
-The existing implementation (`libs/toolkit/src/bootstrap/oop.rs`, `OopRunOptions` / `run_oop_with_options`) already
-handles:
+The implementation (`libs/toolkit/src/bootstrap/oop.rs`, `OopRunOptions` / `run_oop_with_options` /
+`run_oop_serving`) handles:
 
 - Configuration loading and merging (master-rendered config via `TOOLKIT_MODULE_CONFIG` env var, merged with local config
   field-by-field for DB, key-by-key for logging).
 - Logging initialization with OpenTelemetry support (tracing config from master).
-- gRPC connection to DirectoryService (via `DirectoryGrpcClient::connect`).
-- Heartbeat loop using a child `CancellationToken`.
+- A lazily connecting gRPC client to DirectoryService (`DirectoryGrpcClient::connect_lazy`).
 - Gear lifecycle execution via `run(RunOptions { ... })`.
 - Graceful shutdown driven by a root `CancellationToken` hooked to OS signals.
 
@@ -289,20 +292,12 @@ The host side (`libs/toolkit/src/runtime/host_runtime.rs`, `run_oop_spawn_phase`
 `OopBackend.spawn(OopSpawnConfig)` after grpc-hub is ready, passing `TOOLKIT_DIRECTORY_ENDPOINT` and
 `TOOLKIT_MODULE_CONFIG` env vars.
 
-What is **missing** and needs to be added:
-
-- Starting an Axum HTTP server from the gear's OperationBuilder routes.
-- Framework-managed `/healthz` (liveness), `/readyz` (readiness), and `/health` (diagnostics) probe endpoints.
-- Background self-registration with Flight Control (DirectoryService) — retry with exponential backoff, re-register on
-  connection loss.
-- Background dependency resolution — poll DirectoryService for each `deps` entry, wire REST clients into ClientHub as
-  they become available, gate readiness on all critical deps resolved.
-- Registering REST endpoint and OpenAPI spec with DirectoryService (currently only `grpc_services` are registered via
-  `RegisterInstanceInfo`).
-- SecurityContext reconstruction middleware on the HTTP server.
-- Deregistration from DirectoryService on shutdown (the doc comment says it happens, but the code does not call
-  `deregister_instance` after `run()` returns).
-- GatewayProvider integration (register/deregister public routes).
+Implemented in: the Axum server and the `/healthz` / `/readyz` / `/health` probes (`libs/toolkit/src/runtime/oop_serve.rs`,
+`readiness.rs`); self-registration of the REST endpoint and OpenAPI hash with backoff, lease renewal, drain reporting and
+deregistration on shutdown (`oop_registration.rs`, `presence_manager.rs`); dependency wiring with readiness gating (the
+proxy-wiring phase, `host_runtime.rs`); tenant-plane `security_context_middleware` (`libs/toolkit-http-middleware/src/auth.rs`).
+Public routes reach the edge through the directory, not through the bootstrap: the api-gateway polls `ListAllInstances`
+and drives `GatewayProvider` (`gears/system/api-gateway/src/proxy.rs`).
 
 ##### Responsibility scope
 
@@ -439,19 +434,9 @@ endpoints, and callers need to resolve them.
 
 ##### Current state
 
-The existing `DirectoryClient` trait (`libs/system-sdks/sdks/directory/src/api.rs`) defines:
-
-- `resolve_grpc_service(service_name) -> Result<ServiceEndpoint>` — gRPC only
-- `register_instance(RegisterInstanceInfo) -> Result<()>` — registration
-- `deregister_instance(gear, instance_id) -> Result<()>` — deregistration
-- `send_heartbeat(gear, instance_id) -> Result<()>` — health
-
-`RegisterInstanceInfo` currently has:
-
-- `gear: String`, `instance_id: String`, `version: Option<String>`
-- `grpc_services: Vec<(String, ServiceEndpoint)>` — **gRPC services only, no REST**
-
-`ServiceEndpoint` has `uri: String` with constructors for `http()`, `https()`, `uds()`.
+Implemented in: `DirectoryClient::resolve_rest_service` and `RegisterInstanceInfo::rest_endpoint` / `openapi_spec_hash`
+(`libs/system-sdks/sdks/directory/src/api.rs`), served by `LocalDirectoryClient` (`libs/toolkit/src/directory.rs`) and
+the gRPC client (`libs/system-sdks/sdks/directory/src/grpc/client.rs`).
 
 ##### Responsibility scope
 
@@ -494,8 +479,8 @@ The existing `api-gateway` gear (`gears/system/api-gateway/src/gear.rs`) impleme
 - The `OperationSpec` already has `exposed: bool` which can drive which routes are registered in the gateway for
   external access.
 
-**No reverse-proxy capability exists.** All routes are served directly from the shared in-process router. For OoP
-gears, the gateway needs to reverse-proxy requests to remote OoP gears.
+Reverse proxy implemented in: `gears/system/api-gateway/src/proxy.rs` (directory-driven route sync) and
+`libs/toolkit-gateway` (`GatewayProvider`, `ToolKitGatewayProvider`, `ProxyRegistry`, `Forwarder` in `forward.rs`).
 
 ##### Responsibility scope
 
@@ -698,10 +683,9 @@ rebuilds the full context (including the bearer token) from it.
   metadata using the key `"x-secctx-bin"`. This works because gRPC binary metadata (keys ending in `-bin`) carries raw
   bytes.
 - For HTTP, raw binary cannot be used in headers — base64 encoding is required.
-- `toolkit-http` (`libs/toolkit-http/src/security.rs`) currently contains only `ERROR_BODY_PREVIEW_LIMIT` — no
-  SecurityContext propagation helpers.
-- The `api-gateway` auth middleware (`authn_middleware`) validates the JWT and inserts SecurityContext into Axum
-  extensions, but does NOT propagate SecurityContext or the original token to downstream calls.
+- Implemented in: `attach_bearer_http` and `attach_internal_token_http` (`libs/toolkit-http/src/security.rs`);
+  `security_context_middleware` (`libs/toolkit-http-middleware/src/auth.rs`); the edge forwards the original
+  `Authorization` header as-is (`libs/toolkit-gateway/src/forward.rs`).
 
 ##### Responsibility scope
 
@@ -1329,6 +1313,9 @@ deployment ordering — all pods can be scheduled simultaneously.
 
 **Actors**: `cpt-cf-actor-oop-worker`
 
+> **Planned (P2), not implemented:** `RemoteAuthNPluginClient` and the `#[toolkit::plugin]` macro do not exist yet;
+> plugins are resolved in-process only.
+
 ```mermaid
 sequenceDiagram
     participant Host as Plugin Host Gear<br/>(authn-resolver)
@@ -1350,14 +1337,15 @@ sequenceDiagram
 ```
 
 **Description**: The plugin host gear discovers plugins via types-registry (GTS). For OoP plugins, the GTS instance
-record contains an `endpoint` field. The bootstrap wires a generated remote client (`RemoteAuthNPluginClient`) into
-ClientHub scoped by GTS instance ID. At runtime, `try_get_scoped` returns the remote client, which is indistinguishable
+record contains an `endpoint` field. The bootstrap wires a generated remote client (`RemoteAuthNPluginClient`, planned)
+into ClientHub scoped by GTS instance ID. At runtime, `try_get_scoped` returns the remote client, which is indistinguishable
 from an in-process implementation — the host gear code is unchanged.
 
 ### 3.7 Database schemas & tables
 
 No new database tables. Flight Control's `service-discovery` uses DirectoryService (gRPC, in-memory registry) for
-service discovery state. Persistent state (if needed for multi-host P2) will be addressed in a future ADR.
+service discovery state. Persistence and replication are decided in
+[ADR-0011](ADR/0011-cpt-cf-adr-directory-persistence-and-replication.md) (shared backends not built yet).
 
 ### 3.8 Deployment Topology
 
@@ -1407,7 +1395,7 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 └────────────┘  └────────────┘
 ```
 
-- Flight Control runs selected core gears: gears in the system gear group and its application AuthN resolver/plugin. Core gears are all gears under `gears/system/` (possibly `gears/core/` in the future); only the `system` capability selects the early startup group.
+- Flight Control runs selected core gears: gears in the system gear group and its application AuthN resolver/plugin. Core gears are all gears under `gears/system/`; only the `system` capability selects the early startup group.
 - OoP gears are separate processes on the same host (UDS) or remote hosts (TCP, P2: mTLS).
 - api-gateway reverse-proxies public OoP routes via `ToolKitGatewayProvider`.
 - DirectoryService tracks all gear endpoints.

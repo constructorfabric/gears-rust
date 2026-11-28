@@ -5,6 +5,8 @@ date: 2026-11-10
 
 # Directory Persistence, Replication and Instance Liveness
 
+> **Implementation:** partial — the memory-mode lease model (`InstanceState` derived from the lease and `ReportedState` in `libs/toolkit/src/runtime/gear_manager.rs`, the `lease` setting and sweeper in `gears/system/service-discovery`), `NOT_FOUND` on heartbeat for an unknown instance (`LocalDirectoryClient::heartbeat`), `PresenceManager`, the proto changes and the edge's hash-verified OpenAPI fetch (`gears/system/api-gateway/src/proxy.rs`, `prefer_serving_per_gear`) are built. The shared backends (`storage` setting), `DirectoryBackend`, `gears/system/service-discovery/src/infra/storage/`, claim keys, the janitor and replicated Flight Control are not. The Context section describes the directory before this ADR.
+
 **ID**: `cpt-cf-adr-directory-persistence-and-replication`
 
 ## Table of Contents
@@ -18,12 +20,12 @@ date: 2026-11-10
 That has three consequences.
 
 **The registry does not survive a restart.** After a Flight Control restart the directory is empty until every worker
-re-registers. Workers re-register on a 30 s timer (`RE_REGISTER_INTERVAL`,
-`libs/toolkit/src/runtime/oop_registration.rs:36`). Before this decision, a heartbeat for an unknown instance
-returned `Ok`, so heartbeat failure did not trigger re-registration. This decision changes that behavior: an
-unknown heartbeat returns `NOT_FOUND`, which the service-discovery adapter surfaces as `DirectoryNotFound`, so the
-worker re-registers on its next heartbeat. Until the record is restored, the edge serves 404 for those gears and
-dependents stay at `503 starting`. DESIGN.md §3.7 defers persistence to "a future ADR".
+re-registers. Before this ADR, workers re-registered on a 30 s timer (`RE_REGISTER_INTERVAL` in
+`libs/toolkit/src/runtime/oop_registration.rs`, since removed), and a heartbeat for an unknown instance returned
+`Ok`, so heartbeat failure did not trigger re-registration. This decision changes that behavior: an unknown
+heartbeat returns `NOT_FOUND` (`libs/toolkit/src/directory.rs`), which the service-discovery adapter surfaces as
+`DirectoryNotFound`, so the worker re-registers on its next heartbeat. Until the record is restored, the edge
+serves 404 for those gears and dependents stay at `503 starting`. DESIGN.md §3.7 defers persistence to "a future ADR".
 
 **Flight Control cannot run more than one pod.** Each replica would own a separate map. DESIGN.md §"One directory per
 installation" lists what goes wrong (partial edge snapshots that prune live routes, readiness that never arrives,

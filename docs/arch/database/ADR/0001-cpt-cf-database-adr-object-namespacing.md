@@ -6,6 +6,8 @@ decision-makers: Constructor Fabric steering committee
 
 # Namespace Gear-Owned Database Objects with Stable Portable Prefixes
 
+> **Implementation:** not implemented yet — the gear macro has no `db_namespace` attribute, the runtime has no duplicate-namespace check, `toolkit-db` has no public name helpers (only the outbox takes a validated caller prefix, through `table_prefix` and `outbox_migrations_with_prefix`, which derive names in the `pub(crate)` `OutboxTables` in `libs/toolkit-db/src/outbox/tables.rs`) and there is no Dylint prefix rule. Some gears already use `<namespace>__<table>` names by hand (for example the `bss_orders__*` tables such as `bss_orders__order_version` in `gears/bss/orders/orders/src/infra/storage/entity/`).
+
 
 <!-- toc -->
 

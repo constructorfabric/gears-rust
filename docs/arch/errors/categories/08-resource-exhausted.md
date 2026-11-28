@@ -18,7 +18,6 @@ Quota failure:
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `violations` | `Vec<QuotaViolation>` | List of quota violations |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 Quota violation:
 
@@ -82,10 +81,6 @@ let err = UserResourceError::resource_exhausted("Quota exceeded")
             "violations": {
               "type": "array",
               "items": { "$ref": "#/$defs/QuotaViolation" }
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

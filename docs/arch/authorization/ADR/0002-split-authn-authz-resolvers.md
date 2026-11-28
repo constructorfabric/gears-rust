@@ -144,7 +144,7 @@ Two independent gears with separate plugin interfaces.
 - Vendors with unified API need unified plugin wrapper or cache coordination
 - Version coordination when vendor updates API
 
-**Mitigation strategies:**
+**Mitigation strategies** (illustrative sketches: the unified `auth: {authn, authz}` config block, `UnifiedAuthPlugin`, `AuthNProvider` and `AuthZProvider` do not exist in the code; each resolver gear has its own config and plugin trait):
 
 1. **Unified configuration pattern:**
 

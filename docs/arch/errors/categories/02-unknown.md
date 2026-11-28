@@ -15,7 +15,6 @@
 |-------|------|-------------|
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 ## Constructor Example
 
@@ -55,10 +54,6 @@ let err = UserResourceError::unknown("Unexpected response from payment provider"
             "resource_name": {
               "type": "string",
               "description": "Identifier of the associated resource (set via with_resource())"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

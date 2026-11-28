@@ -70,7 +70,7 @@ No gear-specific environment constraints. The canonical error system runs within
 ### 4.1 In Scope
 
 - Canonical error categories and their structured context types
-- Transport-agnostic error model (REST first, gRPC future)
+- Transport-agnostic error model (REST; the same `Problem` envelope over gRPC trailers and SSE error frames)
 - REST wire format based on an existing standard
 - Resource-scoped error construction via attribute macro
 - Contract enforcement via compile-time checks, snapshot tests, and CI gates
@@ -82,9 +82,8 @@ No gear-specific environment constraints. The canonical error system runs within
 
 ### 4.2 Out of Scope
 
-- gRPC transport mapping — future work
-- SSE error event format — future work
-- W3C trace ID extraction — separate workstream
+- A shared `CanonicalError` → gRPC status-code mapping on the server side (gears attach the `Problem` trailer themselves; see DESIGN §1.4)
+- A shared server-side emitter for SSE error frames (the client parser exists; see DESIGN §1.4)
 - Error extensibility rules (custom gear-specific error types beyond the 16 categories) — future work
 
 ## 5. Functional Requirements

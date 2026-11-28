@@ -6,6 +6,8 @@ decision-makers: Constructor Fabric Steering Committee
 
 # Verified Principal as a Request Extension
 
+> **Implementation:** not implemented yet — `VerifiedPrincipal` does not exist, and `AuthenticationResult` (`authn-resolver-sdk`, `models.rs`) carries only `security_context`.
+
 ## Context and Problem Statement
 
 Some handlers need verified profile claims about the caller — email, email-verification status,

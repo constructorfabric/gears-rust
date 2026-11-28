@@ -20,7 +20,6 @@ InvalidArgument:
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `field_violations` | `Vec<FieldViolation>` | List of per-field validation errors |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 Field violation:
 
@@ -37,7 +36,6 @@ Field violation:
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `format` | `String` | Human-readable format error message |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 **Variant: Constraint**
 
@@ -46,7 +44,6 @@ Field violation:
 | `resource_type` | `String` | GTS type identifier of the associated resource |
 | `resource_name` | `Option<String>` | Identifier of the associated resource |
 | `constraint` | `String` | Human-readable constraint violation message |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 ## Constructor Examples
 
@@ -107,8 +104,7 @@ let err = UserResourceError::invalid_argument()
                 "field_violations": {
                   "type": "array",
                   "items": { "$ref": "#/$defs/FieldViolation" }
-                },
-                "extra": { "type": ["object", "null"] }
+                }
               },
               "additionalProperties": false
             },
@@ -118,8 +114,7 @@ let err = UserResourceError::invalid_argument()
               "properties": {
                 "resource_type": { "type": "string" },
                 "resource_name": { "type": "string" },
-                "format": { "type": "string" },
-                "extra": { "type": ["object", "null"] }
+                "format": { "type": "string" }
               },
               "additionalProperties": false
             },
@@ -129,8 +124,7 @@ let err = UserResourceError::invalid_argument()
               "properties": {
                 "resource_type": { "type": "string" },
                 "resource_name": { "type": "string" },
-                "constraint": { "type": "string" },
-                "extra": { "type": ["object", "null"] }
+                "constraint": { "type": "string" }
               },
               "additionalProperties": false
             }

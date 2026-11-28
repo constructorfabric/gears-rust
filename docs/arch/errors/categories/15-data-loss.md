@@ -15,7 +15,6 @@
 |-------|------|-------------|
 | `resource_type` | `String` | GTS type identifier of the affected resource |
 | `resource_name` | `String` | Identifier of the affected resource |
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
 
 ## Constructor Example
 
@@ -57,10 +56,6 @@ let err = FileResourceError::data_loss("Data loss detected")
             "resource_name": {
               "type": "string",
               "description": "Identifier of the affected resource"
-            },
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
             }
           },
           "additionalProperties": false

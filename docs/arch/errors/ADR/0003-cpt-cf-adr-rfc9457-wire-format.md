@@ -16,7 +16,7 @@ The canonical error model needs a REST wire format — a JSON structure that eve
 * Standards alignment — prefer established formats that external consumers already know
 * Extensibility — the format must support platform-specific fields (GTS type, structured context, trace ID) alongside standard fields
 * Tooling ecosystem — existing libraries, validators, and documentation for the format
-* Transport specificity — the REST format is for HTTP only; gRPC will use its own format (future work)
+* Transport specificity — the format is defined for HTTP; gRPC uses native status codes and carries the same `Problem` JSON in the `x-toolkit-problem-bin` trailer (`toolkit_transport_grpc::attach_problem`)
 
 ## Considered Options
 
@@ -33,13 +33,13 @@ Chosen option: **Option A — RFC 9457 Problem Details**, because it is an IETF 
 * The error library must define a `Problem` struct with the five standard RFC 9457 members (`type`, `title`, `status`, `detail`, `instance`) plus Gears extension members (`trace_id`, `context`)
 * All REST error responses must use `Content-Type: application/problem+json` — middleware must set this header
 * The `type` field carries a GTS URI (not a dereferenceable URL), which deviates from RFC 9457's intent but is valid per spec — this must be documented as a known deviation
-* gRPC and SSE transports will need their own wire format mappings in the future — RFC 9457 only covers REST
+* gRPC and SSE transports need their own wire format mappings — RFC 9457 only covers REST. Since resolved: both carry the same `Problem` JSON, gRPC in the `x-toolkit-problem-bin` trailer and SSE in the `data:` line of an `event: error` frame (see [DESIGN.md](../DESIGN.md) §1.4 Architecture Layers)
 * Round-trip deserialization (SDK side) must parse the `Problem` JSON and reconstruct `CanonicalError` from the `type` field — the `TryFrom<Problem>` implementation is required
 * Extension members (`context`, `trace_id`) must be defined and versioned alongside the core Problem structure
 
 ### Confirmation
 
-The PoC implementation produces valid `application/problem+json` responses with all five standard members plus `trace_id` and `context` extensions.
+`libs/toolkit-canonical-errors` renders `application/problem+json`: `Problem::from_error` emits `type`, `title`, `status`, `detail` and `context`, and `canonical_error_middleware` (`libs/toolkit/src/api/canonical_error_layer.rs`) adds `instance` and `trace_id`. `tests/showcase.rs` asserts the JSON for every category.
 
 ## Pros and Cons of the Options
 

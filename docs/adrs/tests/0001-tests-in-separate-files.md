@@ -5,14 +5,9 @@ decision-makers: Constructor Fabric Steering Committee
 ---
 <!-- Created: 2026-04-15 by Constructor Tech -->
 
-# Enforce test code in separate files vian architecture lint DE1101
+# Enforce test code in separate files via architecture lint DE1101
 
 **ID**: `cpt-cf-adr-tests-in-separate-files`
-
-## Table of Contents
-
-<!-- toc -->
-<!-- /toc -->
 
 ## Context and Problem Statement
 

@@ -574,7 +574,7 @@ The AuthN Resolver plugin bridges Gears to the vendor's IdP. Plugin responsibili
 
 ### Rationale: Minimalist Interface
 
-For the rationale behind this single-method interface design, see [ADR 0003: AuthN Resolver Minimalist Interface](./ADR/0003-authn-resolver-minimalist-interface.md).
+For the rationale behind keeping token validation behind one `authenticate` method, see [ADR 0003: AuthN Resolver Minimalist Interface](./ADR/0003-authn-resolver-minimalist-interface.md). The interface has a second method, `exchange_client_credentials`, for service-to-service credential exchange (`AuthNResolverClient` and `AuthNResolverPluginClient` in `authn-resolver-sdk`).
 
 ### Implementation Reference
 

@@ -11,9 +11,7 @@
 
 ## Context Schema
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `extra` | `Option<Object>` | Reserved for derived GTS type extensions (p3+); absent in p1 |
+Empty object (`{}`); `InternalV1::description` is `#[serde(skip)]` (`libs/toolkit-canonical-errors/src/context.rs`).
 
 ## Constructor Example
 
@@ -42,10 +40,6 @@ let err = CanonicalError::internal("An internal error occurred. Please retry lat
         "context": {
           "type": "object",
           "properties": {
-            "extra": {
-              "type": ["object", "null"],
-              "description": "Reserved for derived GTS type extensions (p3+); absent in p1"
-            }
           },
           "additionalProperties": false
         }

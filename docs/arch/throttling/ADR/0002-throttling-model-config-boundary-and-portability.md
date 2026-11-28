@@ -1,10 +1,12 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-21
 decision-makers: API Gateway maintainers, Toolkit maintainers
 ---
 
 # ADR-0002: Throttling model — config/code boundary, declarative keys, and group-level zones
+
+> **Implementation:** partial — the `axum` closure is gone from the contract (`ThrottlingSpec` in `libs/toolkit/src/api/operation_builder.rs` is plain data), per [DESIGN.md](../DESIGN.md) W1. Decision points 1–3 are not implemented: `dry_run` and the zone binding are still set in code, and there is no `enum Key`, `tower::Layer` backend or group-level binding.
 
 **ID**: `cpt-api-gateway-adr-throttling-model`
 

@@ -1,6 +1,6 @@
 # Technical Design — Throttling Follow-Up: Config-Owned Keys, a Real `max_keys` Bound, and OpenAPI Extension Recovery
 
-Status: draft, pending review
+Status: implemented (W1–W3). The three defects described below are fixed: `ThrottlingSpec` has no closure field (W1), `RateZone::admit` and `InFlightZone::gate` in `gears/system/api-gateway/src/middleware/throttling.rs` enforce `max_keys` (W2), and `x-throttling-*-zone` (`libs/toolkit/src/api/openapi_registry.rs`) plus `enrich_openapi_with_zone_limits` (`gears/system/api-gateway/src/gear.rs`) restore the `x-rate-limit-*` extensions (W3). The text keeps the pre-fix analysis.
 Authorizing decisions: [ADR-0002](ADR/0002-throttling-model-config-boundary-and-portability.md), [ADR-0001](ADR/0001-distributed-throttling-cluster-cache.md)
 Supersedes nothing. Scoped follow-up to the zone-based throttling middleware.
 
@@ -23,8 +23,8 @@ PRD/DESIGN", `PRD.md` is `required = true` at that scope, and `traceability` is
 ADR-0002 chose Option A — a declarative, config-owned throttling policy with a
 runtime-agnostic contract. That ADR deliberately records intent only and defers
 concrete types, config schema, and migration to a follow-up design. This is that
-follow-up, narrowed to the three items that are defects in the shipped code
-rather than shape improvements:
+follow-up, narrowed to the three items that were defects in the shipped code
+rather than shape improvements (all three are now fixed):
 
 1. **The contract layer must not depend on a runtime.** `ThrottlingSpec` stores
    `IdentityKeyFn = Arc<dyn Fn(&axum::extract::Request) -> String>`, which pulls
