@@ -35,3 +35,5 @@ What this version of CredStore does not handle. The service handles, with no bac
 - **CC-16.** Instances of the old and new service versions run at the same time on the same DB and Vault. They use different protocols and do not see each other's state; a mixed rollout is not supported, and the migration expects the old version to be stopped. The outcome is undefined: untracked write intents, cleanup debts and versions are possible in the DB and Vault.
 
 - **CC-17.** Write intents and cleanup debts pile up in the DB and the operator cannot see how many: counting rows is forbidden, and the metrics count events, not what is outstanding (the intent of a crashed writer raises no metric at all).
+
+- **CC-18.** A request is cancelled (gateway timeout, client disconnect) between the commit of a secret write and the publication of its audit event, or the process stops in that window: the write stands and its event is lost, with no log line and no metric. The window is one event publication; the cleanup after the commit runs after the event is published, so a request cancelled during the cleanup keeps its event.

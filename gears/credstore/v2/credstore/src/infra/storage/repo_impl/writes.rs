@@ -16,7 +16,7 @@ use credstore_sdk::{SharingMode, StoreKey, TenantId, ValueVersion};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveValue, ColumnTrait, Condition, DbBackend, DbErr, EntityTrait, ExprTrait, QueryFilter,
-    QuerySelect,
+    QuerySelect, UpdateMany,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -28,7 +28,8 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::secret::cleanup::{DeadContent, cleanup_tasks};
 use crate::domain::secret::model::{
-    CleanupDebt, Fallback, IntentCommit, NewDeclaredSecret, NewSecret, SecretRow, WriteAttempt,
+    CleanupDebt, Fallback, IntentCommit, MetadataWrite, NewDeclaredSecret, NewSecret, SecretRow,
+    WriteAttempt,
 };
 use crate::infra::storage::entity;
 use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
@@ -329,6 +330,30 @@ pub(super) async fn switch_value_tx(
     })
 }
 
+/// Adds a `SET` for each metadata column `meta` names; the others stay out of
+/// the statement, so a concurrent change to them is not overwritten.
+fn with_metadata_columns(
+    mut update: UpdateMany<entity::secrets::Entity>,
+    meta: MetadataWrite,
+) -> UpdateMany<entity::secrets::Entity> {
+    if let Some(sharing) = meta.sharing {
+        update = update.col_expr(
+            entity::secrets::Column::Sharing,
+            Expr::value(DbSharing::from(sharing)),
+        );
+    }
+    if let Some(fallback) = meta.fallback {
+        update = update.col_expr(
+            entity::secrets::Column::Fallback,
+            Expr::value(DbFallback::from(fallback)),
+        );
+    }
+    if let Some(expires_at) = meta.expires_at {
+        update = update.col_expr(entity::secrets::Column::ExpiresAt, Expr::value(expires_at));
+    }
+    update
+}
+
 /// Metadata-only update (ADR-0007, "PATCH: merge, never creates", no `secret` key): never
 /// touches `value_version`/`status`. One transaction: the compare-and-set
 /// (on `expected_version` when given) and the read of the post-write row.
@@ -337,41 +362,23 @@ pub(super) async fn update_metadata(
     scope: &AccessScope,
     id: Uuid,
     expected_version: Option<i64>,
-    sharing: SharingMode,
-    fallback: Fallback,
-    expires_at: Option<OffsetDateTime>,
+    meta: MetadataWrite,
 ) -> Result<Option<SecretRow>, DomainError> {
     let scope = scope.clone();
     repo.run_tx(move |tx: &DbTx<'_>| {
         let scope = scope.clone();
-        Box::pin(async move {
-            update_metadata_tx(
-                tx,
-                &scope,
-                id,
-                expected_version,
-                sharing,
-                fallback,
-                expires_at,
-            )
-            .await
-        }) as TxFuture<'_, Option<SecretRow>>
+        Box::pin(async move { update_metadata_tx(tx, &scope, id, expected_version, meta).await })
+            as TxFuture<'_, Option<SecretRow>>
     })
     .await
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one CAS with every field it may update"
-)]
 async fn update_metadata_tx(
     tx: &DbTx<'_>,
     scope: &AccessScope,
     id: Uuid,
     expected_version: Option<i64>,
-    sharing: SharingMode,
-    fallback: Fallback,
-    expires_at: Option<OffsetDateTime>,
+    meta: MetadataWrite,
 ) -> Result<Option<SecretRow>, DomainError> {
     let now = OffsetDateTime::now_utc();
 
@@ -380,16 +387,7 @@ async fn update_metadata_tx(
         filter = filter.add(entity::secrets::Column::Version.eq(expected));
     }
 
-    let rows_affected = entity::secrets::Entity::update_many()
-        .col_expr(
-            entity::secrets::Column::Sharing,
-            Expr::value(DbSharing::from(sharing)),
-        )
-        .col_expr(
-            entity::secrets::Column::Fallback,
-            Expr::value(DbFallback::from(fallback)),
-        )
-        .col_expr(entity::secrets::Column::ExpiresAt, Expr::value(expires_at))
+    let rows_affected = with_metadata_columns(entity::secrets::Entity::update_many(), meta)
         .col_expr(
             entity::secrets::Column::Version,
             Expr::col(entity::secrets::Column::Version).add(1_i64),
@@ -421,55 +419,33 @@ async fn update_metadata_tx(
 
 /// Secret removal (ADR-0007, "PATCH: merge, never creates", `{"secret": null}`): ONE transaction - the
 /// compare-and-set that nulls the pointer and moves the row to `declared`
-/// (applying the merged metadata), plus the debts `destroy(Below(old))` and
+/// (setting the metadata columns `meta` names), plus the debts `destroy(Below(old))` and
 /// `destroy(Exactly(old))` for the value version the row held. Never touches
 /// the store.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one CAS with every field it may update, plus the plugin's destroy capability"
-)]
 pub(super) async fn remove_value(
     repo: &SecretRepoImpl,
     scope: &AccessScope,
     id: Uuid,
     expected_version: Option<i64>,
-    sharing: SharingMode,
-    fallback: Fallback,
-    expires_at: Option<OffsetDateTime>,
+    meta: MetadataWrite,
     destroy_supported: bool,
 ) -> Result<Option<(SecretRow, Vec<CleanupDebt>)>, DomainError> {
     let scope = scope.clone();
     repo.run_tx(move |tx: &DbTx<'_>| {
         let scope = scope.clone();
         Box::pin(async move {
-            remove_value_tx(
-                tx,
-                &scope,
-                id,
-                expected_version,
-                sharing,
-                fallback,
-                expires_at,
-                destroy_supported,
-            )
-            .await
+            remove_value_tx(tx, &scope, id, expected_version, meta, destroy_supported).await
         }) as TxFuture<'_, Option<(SecretRow, Vec<CleanupDebt>)>>
     })
     .await
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one CAS with every field it may update, plus the plugin's destroy capability"
-)]
 async fn remove_value_tx(
     tx: &DbTx<'_>,
     scope: &AccessScope,
     id: Uuid,
     expected_version: Option<i64>,
-    sharing: SharingMode,
-    fallback: Fallback,
-    expires_at: Option<OffsetDateTime>,
+    meta: MetadataWrite,
     destroy_supported: bool,
 ) -> Result<Option<(SecretRow, Vec<CleanupDebt>)>, DomainError> {
     let now = OffsetDateTime::now_utc();
@@ -496,7 +472,7 @@ async fn remove_value_tx(
     let key = StoreKey::new(TenantId(current.tenant_id), current.id);
     let locked_version = current.version;
 
-    let rows_affected = entity::secrets::Entity::update_many()
+    let rows_affected = with_metadata_columns(entity::secrets::Entity::update_many(), meta)
         .col_expr(
             entity::secrets::Column::ValueVersion,
             Expr::value::<Option<String>>(None),
@@ -505,15 +481,6 @@ async fn remove_value_tx(
             entity::secrets::Column::Status,
             Expr::value(DbStatus::Declared),
         )
-        .col_expr(
-            entity::secrets::Column::Sharing,
-            Expr::value(DbSharing::from(sharing)),
-        )
-        .col_expr(
-            entity::secrets::Column::Fallback,
-            Expr::value(DbFallback::from(fallback)),
-        )
-        .col_expr(entity::secrets::Column::ExpiresAt, Expr::value(expires_at))
         .col_expr(
             entity::secrets::Column::Version,
             Expr::col(entity::secrets::Column::Version).add(1_i64),

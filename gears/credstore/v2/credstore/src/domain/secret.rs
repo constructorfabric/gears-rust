@@ -5,5 +5,13 @@
 //! lookup, crash-safe writes (immutable value versions) and expiry.
 
 pub mod cleanup;
+pub mod etag;
+pub mod list_filter;
 pub mod model;
+pub mod reduce;
 pub mod repo;
+pub mod service;
+#[cfg(test)]
+pub mod test_support;
+pub mod type_resolver;
+pub mod typing;

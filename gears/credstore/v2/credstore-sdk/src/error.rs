@@ -76,6 +76,8 @@
 //!   [`reason::aborted::TYPE_MISMATCH_WITH_DESCENDANT`]
 //! * [`CredStoreError::SecretExpired`] comes from `FailedPrecondition` with
 //!   [`reason::failed_precondition::SECRET_EXPIRED`]
+//! * [`CredStoreError::OwnerAboveBound`] comes from `FailedPrecondition` with
+//!   [`reason::failed_precondition::OWNER_ABOVE_BOUND`]
 //! * [`CredStoreError::UnsupportedTransition`] comes from `FailedPrecondition` with
 //!   [`reason::failed_precondition::UNSUPPORTED_TRANSITION`]
 //! * [`CredStoreError::Invalid`] comes from `InvalidArgument`; the first field violation
@@ -141,6 +143,11 @@ pub enum CredStoreError {
     /// restores it.
     #[error("secret expired")]
     SecretExpired,
+
+    /// A bounded read found a value, but the row it comes from belongs to a
+    /// tenant above the named bound. The value is not read.
+    #[error("secret owner above the bound")]
+    OwnerAboveBound,
 
     /// A `sharing` change would move the record across the private /
     /// tenant-shared boundary.
@@ -210,6 +217,7 @@ fn project(err: &CanonicalError) -> Option<CredStoreError> {
             let violation = ctx.violations.first()?;
             match violation.type_.as_str() {
                 failed_precondition::SECRET_EXPIRED => CredStoreError::SecretExpired,
+                failed_precondition::OWNER_ABOVE_BOUND => CredStoreError::OwnerAboveBound,
                 failed_precondition::UNSUPPORTED_TRANSITION => {
                     CredStoreError::UnsupportedTransition {
                         detail: violation.description.clone(),
@@ -403,6 +411,20 @@ mod tests {
         ));
 
         let (json, back) = wire(precondition(
+            "secret",
+            "the value belongs to a tenant above the bound",
+            reason::failed_precondition::OWNER_ABOVE_BOUND,
+        ));
+        assert_eq!(
+            json["context"]["violations"][0]["type"],
+            reason::failed_precondition::OWNER_ABOVE_BOUND
+        );
+        assert!(matches!(
+            CredStoreError::from(back),
+            CredStoreError::OwnerAboveBound
+        ));
+
+        let (json, back) = wire(precondition(
             "sharing",
             "private to shared",
             reason::failed_precondition::UNSUPPORTED_TRANSITION,
@@ -463,6 +485,7 @@ mod tests {
     fn gear_field_names_survive_the_round_trip() {
         for (name, code) in [
             ("reference", field::INVALID_SECRET_REF),
+            ("bound", field::BOUND_NOT_ON_CHAIN),
             ("If-Match", field::INVALID_IF_MATCH),
             ("If-Match", field::IF_MATCH_REQUIRED),
             ("$orderby", field::ORDER_WITH_CURSOR),
@@ -589,6 +612,10 @@ mod tests {
             "write precondition failed"
         );
         assert_eq!(CredStoreError::SecretExpired.to_string(), "secret expired");
+        assert_eq!(
+            CredStoreError::OwnerAboveBound.to_string(),
+            "secret owner above the bound"
+        );
         assert_eq!(
             CredStoreError::PermissionDenied.to_string(),
             "access denied"

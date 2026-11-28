@@ -11,9 +11,10 @@ SDK crate for the `CredStore` gear, providing public API contracts for credentia
 This crate defines the transport-agnostic interface for the `CredStore` gear:
 
 - **`CredStoreClientV2`** — consumer-facing trait
-  (`get_record`/`get_secret`/`put`/`patch`/`list`/`delete`); `get_record`
-  returns the record's metadata (`Credential`, never the value) and
-  `get_secret` the value with its usage envelope (`Secret`)
+  (`get_record`/`get_secret`/`get_secret_within`/`put`/`patch`/`list`/`delete`);
+  `get_record` returns the record's metadata (`Credential`, never the value),
+  `get_secret` the value with its usage envelope (`Secret`) and
+  `get_secret_within` the same with an upper bound on the value's owner
 - **`CredStorePluginClientV2`** — backend trait: a versioned value store keyed
   by `StoreKey { tenant_id, record_id }`. Required: `put` (returns the
   provider's `ValueVersion`), `get` (by version), `delete_key`. Optional:
@@ -30,7 +31,7 @@ This crate defines the transport-agnostic interface for the `CredStore` gear:
 
 ## `CredStoreClientV2`
 
-The consumer trait has six methods over one item shape shared by the record
+The consumer trait has seven methods over one item shape shared by the record
 and its optional secret (ADR-0004, ADR-0007):
 
 - `get_record` — point read of one credential's metadata (`Credential`, never the
@@ -41,7 +42,22 @@ and its optional secret (ADR-0004, ADR-0007):
 - `get_secret` — the secret with its usage envelope (`Secret`: reference,
   type, expiry, secret; `read_secret`). Over REST both are one item shape at
   `/credentials/{ref}`, where `$select=secret` decides whether the secret is
-  included; the in-process trait keeps two typed methods instead
+  included; the in-process trait keeps two typed methods instead. The
+  `Secret` also carries a `validator` (`SecretValidator`) equal to the REST
+  `ETag` of the same read: `Strong` (the caller's own row's validator, usable
+  in `WritePrecondition::Matches`) when the caller's tenant holds a row under
+  the reference, otherwise `Weak`, an opaque text that changes when the
+  winning row changes and never carries another tenant's row id or version
+  (ADR-0009)
+- `get_secret_within`: `get_secret` with a `bound: TenantId`: the value is
+  served only when its row belongs to `bound` or to a tenant below it on the
+  caller's chain (`read_secret`). In-process only, no REST counterpart. The
+  answer names no tenant: a value from above the bound is
+  `FailedPrecondition` (`OWNER_ABOVE_BOUND`), a `bound` that is not on the
+  caller's chain as seen with isolation barriers respected is
+  `InvalidArgument` (`BOUND_NOT_ON_CHAIN`, field `bound`), checked after the
+  PDP decision. Both are checked before the expiry test (ADR-0009, "Bounded
+  read")
 - `put` — precondition-guarded create-or-replace of the record together with a
   **tri-state** `secret` (`SecretWrite`): `Set` writes it, `Null` creates the
   record without one or removes the stored value on a replace. Under the create-only precondition it is how
@@ -79,7 +95,7 @@ reason or field code where there is one.
 dispatch. The conversion `From<CanonicalError>` is infallible; its variants are
 `NotFound`, `AlreadyExists`, `PreconditionFailed` (an `Aborted` with
 `OPTIMISTIC_LOCK_FAILURE`), `TypeConflict` (an `Aborted` with one of the three
-`TYPE_*` codes), `SecretExpired`, `UnsupportedTransition`, `Invalid` (the first
+`TYPE_*` codes), `SecretExpired`, `OwnerAboveBound`, `UnsupportedTransition`, `Invalid` (the first
 field violation: `field`, a typed `field::Reason`, `detail`), `PermissionDenied`,
 `Unavailable` (with an optional `retry_after`; also "no storage plugin
 registered" and "the store refused the plugin's credentials"), `Internal` and
@@ -149,6 +165,98 @@ with `CredStorePluginError::unavailable(detail, retry_after)`,
 `detail` and `source` stay in the process (logs and diagnostics), but they must
 never carry secret bytes or the plugin's own credentials: the plugin redacts
 whatever text the store returned before it goes into either.
+
+### Plugin conformance suite
+
+Any `CredStorePluginClientV2` implementation, in-tree or out-of-tree (a
+customer's `PostgreSQL` plugin, say), can prove it meets the backend contract
+with the suite in `credstore_v2_sdk::conformance`, behind the `conformance`
+feature. Add the feature to the plugin's dev-dependencies (the generated tests
+also need `tokio` with `rt` and `macros`):
+
+```toml
+[dev-dependencies]
+cf-gears-credstore-v2-sdk = { version = "0.1", features = ["conformance"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+```
+
+One macro line then generates one `#[tokio::test]` per check, each against a
+fresh plugin built by the expression (it may `.await`):
+
+```no_run
+# #[cfg(feature = "conformance")]
+# mod conformance_tests {
+# use async_trait::async_trait;
+# use credstore_v2_sdk::{
+#     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
+# };
+# use toolkit_security::SecurityContext;
+# #[derive(Default)]
+# struct MyPlugin;
+# #[async_trait]
+# impl CredStorePluginClientV2 for MyPlugin {
+#     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
+#         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
+#     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
+#         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
+#     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
+#         -> Result<(), CredStorePluginError> { unimplemented!() }
+# }
+use credstore_v2_sdk::credstore_plugin_conformance;
+
+credstore_plugin_conformance!(MyPlugin::default());
+# }
+# fn main() {}
+```
+
+Outer attributes written before the expression are applied to every generated
+test. A plugin whose backend needs Docker keeps the suite out of a default
+`cargo test` with the `ignore` attribute:
+
+```no_run
+# #[cfg(feature = "conformance")]
+# mod conformance_tests {
+# use async_trait::async_trait;
+# use credstore_v2_sdk::{
+#     CredStorePluginClientV2, CredStorePluginError, SecretValue, StoreKey, ValueVersion,
+# };
+# use toolkit_security::SecurityContext;
+# struct MyPlugin;
+# impl MyPlugin {
+#     async fn connect_to_docker_backend() -> Self {
+#         Self
+#     }
+# }
+# #[async_trait]
+# impl CredStorePluginClientV2 for MyPlugin {
+#     async fn put(&self, _: &SecurityContext, _: &StoreKey, _: SecretValue)
+#         -> Result<ValueVersion, CredStorePluginError> { unimplemented!() }
+#     async fn get(&self, _: &SecurityContext, _: &StoreKey, _: &ValueVersion)
+#         -> Result<Option<SecretValue>, CredStorePluginError> { unimplemented!() }
+#     async fn delete_key(&self, _: &SecurityContext, _: &StoreKey)
+#         -> Result<(), CredStorePluginError> { unimplemented!() }
+# }
+use credstore_v2_sdk::credstore_plugin_conformance;
+
+credstore_plugin_conformance!(
+    #[ignore = "needs Docker; run with `-- --ignored`"]
+    MyPlugin::connect_to_docker_backend().await
+);
+# }
+# fn main() {}
+```
+
+The checks cover exact bytes (text, binary with NUL and invalid UTF-8, empty,
+64 KiB), a new immutable version per `put`, absence (`None` for a never-written
+key or a never-issued version), key isolation across tenants and records,
+`delete_key` (removes every version, idempotent), concurrent puts, and, when
+`destroyer()` is `Some`, `destroy` (`Below`, `Exactly`, idempotency) and
+ordered versions, observed through `destroy(Below(..))` because versions are
+opaque. A plugin whose `destroyer()` is `None` skips those checks and is
+never asked to destroy. Every check uses fresh random ids, so checks can share
+one backend. See the module docs for the full list and what the suite leaves
+to the plugin (`Internal` for an unreadable version, `Unavailable`, `CredentialsRejected`,
+durability across a restart).
 
 ## Usage
 

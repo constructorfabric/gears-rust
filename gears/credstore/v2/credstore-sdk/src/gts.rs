@@ -7,8 +7,10 @@
 //! `gts.cf.toolkit.plugins.plugin.v1~cf.core.credstore.<spec>.v2~` (the platform
 //! plugin base stays `v1`; the credstore plugin contract is `v2`).
 //!
-//! Each `#[gts_type_schema(...)]`-annotated struct submits its schema to the
-//! link-time inventory the types-registry loads at boot. Registration is what
+//! Each `#[gts_type_schema(...)]`-annotated struct submits its schema to this
+//! crate's declaration collector (`toolkit_gts::local`), which the `credstore-v2`
+//! gear publishes to the types-registry before its `init`; the declaration also
+//! enters the process-wide inventory. Registration is what
 //! makes a resource type authorizable: RBAC validates a role's `target_type`
 //! against the registry and the PDP compiles a tenant-scoped grant into
 //! tenant constraints on `owner_tenant_id`. The same string is the
@@ -24,7 +26,8 @@
 //! for the payload (`secret`).
 
 use toolkit::gts::PluginV1;
-use toolkit_gts::{gts_id, gts_type_schema};
+use toolkit_gts::gts_id;
+use toolkit_gts::local::gts_type_schema;
 
 /// GTS resource-type id for the credstore **credential** base type — the
 /// single source of truth for this string. Mirrored by [`CredentialV1`]'s

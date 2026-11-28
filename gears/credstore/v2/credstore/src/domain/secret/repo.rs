@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
-    CleanupDebt, DeleteVerification, Fallback, HealedCreates, IntentCommit, NewDeclaredSecret,
-    NewSecret, SecretRow, WriteAttempt, WriteVerification,
+    CleanupDebt, DeleteVerification, Fallback, HealedCreates, IntentCommit, MetadataWrite,
+    NewDeclaredSecret, NewSecret, SecretRow, WriteAttempt, WriteVerification,
 };
 
 #[async_trait]
@@ -305,40 +305,34 @@ pub trait SecretRepo: Send + Sync {
     async fn delete_debt(&self, id: Uuid) -> Result<(), DomainError>;
 
     /// Metadata-only update (ADR-0007, "PATCH: merge, never creates", with no `value` key): ONE
-    /// transaction — `UPDATE … SET sharing, fallback, expires_at, version =
-    /// version + 1, updated_at = now() WHERE id = ? [AND version = ?]`;
-    /// never touches `value_version` or `status`. 0 rows affected →
+    /// transaction — `UPDATE … SET <named columns>, version = version + 1,
+    /// updated_at = now() WHERE id = ? [AND version = ?]`, where the named
+    /// columns are the ones `meta` sets; a column `meta` leaves `None` keeps
+    /// its stored value (a concurrent write to it is not reverted); never
+    /// touches `value_version` or `status`. 0 rows affected →
     /// `Ok(None)` (version mismatch or the row vanished).
     async fn update_metadata(
         &self,
         scope: &AccessScope,
         id: Uuid,
         expected_version: Option<i64>,
-        sharing: SharingMode,
-        fallback: Fallback,
-        expires_at: Option<OffsetDateTime>,
+        meta: MetadataWrite,
     ) -> Result<Option<SecretRow>, DomainError>;
 
     /// Secret removal (ADR-0007, "PATCH: merge, never creates", `{"secret": null}`): ONE transaction —
     /// the compare-and-set `UPDATE … SET value_version = NULL, status =
-    /// declared, sharing, fallback, expires_at, version = version + 1,
+    /// declared, <named columns>, version = version + 1,
     /// updated_at = now() WHERE id = ? [AND version = ?]` plus, when the row
     /// held a value version `old`, the tasks [`cleanup_tasks`] selects for
     /// `DeadContent::Removed { old, .. }` (with `destroy_supported`). 0 rows affected → `Ok(None)`. Returns the
     /// post-write (now `declared`) row and the debts it recorded. No intent
     /// (there is no `put`) and never a store call.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one CAS with every field it may update, plus the plugin's destroy capability"
-    )]
     async fn remove_value(
         &self,
         scope: &AccessScope,
         id: Uuid,
         expected_version: Option<i64>,
-        sharing: SharingMode,
-        fallback: Fallback,
-        expires_at: Option<OffsetDateTime>,
+        meta: MetadataWrite,
         destroy_supported: bool,
     ) -> Result<Option<(SecretRow, Vec<CleanupDebt>)>, DomainError>;
 

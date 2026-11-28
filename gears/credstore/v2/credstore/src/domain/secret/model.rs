@@ -69,6 +69,34 @@ impl From<Fallback> for credstore_sdk::Fallback {
     }
 }
 
+/// The metadata columns a write sets. `None` leaves a column as stored:
+/// `PATCH` names only the fields of its body; `PUT` names all three.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataWrite {
+    pub sharing: Option<SharingMode>,
+    pub fallback: Option<Fallback>,
+    /// `Some(None)` clears the expiry.
+    #[allow(clippy::option_option)]
+    pub expires_at: Option<Option<OffsetDateTime>>,
+}
+
+impl MetadataWrite {
+    /// Every column named, as `PUT` writes them.
+    #[must_use]
+    pub fn all(
+        sharing: SharingMode,
+        fallback: Fallback,
+        expires_at: Option<OffsetDateTime>,
+    ) -> Self {
+        Self {
+            sharing: Some(sharing),
+            fallback: Some(fallback),
+            expires_at: Some(expires_at),
+        }
+    }
+}
+
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct SecretRow {

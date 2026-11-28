@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{
-    CleanupDebt, CleanupTask, DeleteVerification, Fallback, HealFlags, IntentCommit,
+    CleanupDebt, CleanupTask, DeleteVerification, Fallback, HealFlags, IntentCommit, MetadataWrite,
     NewDeclaredSecret, NewSecret, SecretRow, SecretStatus, WriteAttempt, WriteVerification,
 };
 use crate::domain::secret::repo::SecretRepo;
@@ -2332,9 +2332,7 @@ async fn update_metadata_bumps_version_and_leaves_value_untouched() {
             &scope,
             id,
             Some(1),
-            SharingMode::Shared,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Shared, Fallback::None, None),
         )
         .await
         .expect("update_metadata")
@@ -2359,13 +2357,190 @@ async fn update_metadata_version_mismatch_returns_none() {
             &scope,
             id,
             Some(99),
-            SharingMode::Shared,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Shared, Fallback::None, None),
         )
         .await
         .expect("update_metadata");
     assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn update_metadata_writes_only_the_named_columns() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    let t0 = fixed_expiry();
+    let t1 = t0 + time::Duration::hours(1);
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite::all(SharingMode::Shared, Fallback::None, Some(t0)),
+    )
+    .await
+    .expect("seed metadata")
+    .expect("row updated");
+
+    // Two writers that each name one column and check no version (`If-Match:
+    // *`): the second must not put back what the first changed.
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite {
+            sharing: Some(SharingMode::Tenant),
+            fallback: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("sharing write")
+    .expect("row updated");
+    let row = repo
+        .update_metadata(
+            &scope,
+            id,
+            None,
+            MetadataWrite {
+                sharing: None,
+                fallback: None,
+                expires_at: Some(Some(t1)),
+            },
+        )
+        .await
+        .expect("expiry write")
+        .expect("row updated");
+
+    assert_eq!(row.version, 4);
+    let stored = stored(&repo, tenant, id).await;
+    assert_eq!(stored.sharing, SharingMode::Tenant, "not reverted");
+    assert_eq!(stored.expires_at, Some(t1));
+    assert_eq!(stored.fallback, Fallback::None, "never named");
+}
+
+#[tokio::test]
+async fn update_metadata_clears_the_expiry_only_when_it_names_none() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, _) = seed_active(&repo, tenant, Uuid::new_v4(), "k", SharingMode::Tenant).await;
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::Inherit, Some(fixed_expiry())),
+    )
+    .await
+    .expect("set expiry")
+    .expect("row updated");
+
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite {
+            sharing: Some(SharingMode::Shared),
+            fallback: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("unnamed expiry")
+    .expect("row updated");
+    assert_eq!(
+        stored(&repo, tenant, id).await.expires_at,
+        Some(fixed_expiry())
+    );
+
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite {
+            sharing: None,
+            fallback: None,
+            expires_at: Some(None),
+        },
+    )
+    .await
+    .expect("named null expiry")
+    .expect("row updated");
+    assert_eq!(stored(&repo, tenant, id).await.expires_at, None);
+}
+
+#[tokio::test]
+async fn remove_value_writes_only_the_named_columns_and_still_records_the_debts() {
+    let repo = setup().await;
+    let tenant = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let (id, value_version) = seed_active(
+        &repo,
+        tenant,
+        Uuid::new_v4(),
+        "rm-named",
+        SharingMode::Tenant,
+    )
+    .await;
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite::all(SharingMode::Shared, Fallback::None, Some(fixed_expiry())),
+    )
+    .await
+    .expect("seed metadata")
+    .expect("row updated");
+    // A concurrent narrowing lands after the remover read the row.
+    repo.update_metadata(
+        &scope,
+        id,
+        None,
+        MetadataWrite {
+            sharing: Some(SharingMode::Tenant),
+            fallback: None,
+            expires_at: None,
+        },
+    )
+    .await
+    .expect("sharing write")
+    .expect("row updated");
+
+    let (row, tasks) = repo
+        .remove_value(
+            &scope,
+            id,
+            None,
+            MetadataWrite {
+                sharing: None,
+                fallback: None,
+                expires_at: None,
+            },
+            true,
+        )
+        .await
+        .expect("remove_value")
+        .expect("row updated");
+
+    assert_eq!(row.status, SecretStatus::Declared);
+    assert_eq!(row.value_version, None);
+    assert_eq!(row.sharing, SharingMode::Tenant, "not reverted");
+    assert_eq!(row.fallback, Fallback::None);
+    assert_eq!(row.expires_at, Some(fixed_expiry()));
+    assert_eq!(row.version, 4);
+    let key = StoreKey::new(TenantId(tenant), id);
+    let expected = vec![
+        CleanupTask::Destroy {
+            key: key.clone(),
+            selector: DestroySelector::Below(value_version.clone()),
+        },
+        CleanupTask::Destroy {
+            key,
+            selector: DestroySelector::Exactly(value_version),
+        },
+    ];
+    assert_eq!(tasks_of(tasks), expected);
+    assert_eq!(debt_tasks(&repo).await, expected);
 }
 
 #[tokio::test]
@@ -2381,9 +2556,7 @@ async fn remove_value_declares_row_and_records_destroy_below_and_exactly_the_old
             &scope,
             id,
             Some(1),
-            SharingMode::Tenant,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
             true,
         )
         .await
@@ -2425,9 +2598,7 @@ async fn remove_value_without_destroy_support_records_nothing() {
             &scope,
             id,
             Some(1),
-            SharingMode::Tenant,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
             false,
         )
         .await
@@ -2451,9 +2622,7 @@ async fn remove_value_on_already_declared_row_enqueues_nothing() {
             &scope,
             id,
             Some(1),
-            SharingMode::Tenant,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
             true,
         )
         .await
@@ -2468,9 +2637,7 @@ async fn remove_value_on_already_declared_row_enqueues_nothing() {
             &scope,
             id,
             Some(2),
-            SharingMode::Tenant,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
             true,
         )
         .await
@@ -2498,9 +2665,7 @@ async fn remove_value_version_mismatch_returns_none() {
             &scope,
             id,
             Some(99),
-            SharingMode::Tenant,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
             true,
         )
         .await
@@ -2519,9 +2684,7 @@ async fn switch_value_accepts_a_declared_row_and_reactivates_it() {
         &scope,
         id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::None,
-        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
         true,
     )
     .await
@@ -2549,9 +2712,7 @@ async fn find_own_and_find_for_write_see_a_declared_row() {
         &scope,
         id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::Inherit,
-        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::Inherit, None),
         true,
     )
     .await
@@ -2598,9 +2759,7 @@ async fn resolve_for_get_suppressed_row_blocks_the_walk() {
         &scope,
         child_id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::None,
-        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
         true,
     )
     .await
@@ -2637,9 +2796,7 @@ async fn resolve_for_get_declared_inherit_row_never_competes() {
         &scope,
         child_id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::Inherit,
-        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::Inherit, None),
         true,
     )
     .await
@@ -2674,9 +2831,7 @@ async fn resolve_candidates_includes_own_declared_row_and_ancestor_shared_row() 
         &scope,
         child_id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::Inherit,
-        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::Inherit, None),
         true,
     )
     .await
@@ -2725,9 +2880,7 @@ async fn resolve_candidates_excludes_ancestor_declared_inherit_row() {
         &parent_scope,
         parent_id,
         Some(1),
-        SharingMode::Shared,
-        Fallback::Inherit,
-        None,
+        MetadataWrite::all(SharingMode::Shared, Fallback::Inherit, None),
         true,
     )
     .await
@@ -2971,9 +3124,7 @@ async fn list_candidate_references_type_scope_matches_the_collection_reads_visib
         &AccessScope::for_tenant(child),
         own_declared_id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::Inherit,
-        None,
+        MetadataWrite::all(SharingMode::Tenant, Fallback::Inherit, None),
         true,
     )
     .await
@@ -3039,9 +3190,7 @@ async fn list_candidate_references_type_scope_matches_the_collection_reads_visib
         &AccessScope::for_tenant(parent),
         parent_declared_id,
         Some(1),
-        SharingMode::Shared,
-        Fallback::Inherit,
-        None,
+        MetadataWrite::all(SharingMode::Shared, Fallback::Inherit, None),
         true,
     )
     .await
@@ -3243,9 +3392,7 @@ async fn type_property_scope_also_clamps_updates_and_deletes() {
             &only_generic,
             api_key_id,
             None,
-            SharingMode::Shared,
-            Fallback::Inherit,
-            None,
+            MetadataWrite::all(SharingMode::Shared, Fallback::Inherit, None),
         )
         .await
         .expect("update");
@@ -3761,9 +3908,7 @@ async fn remove_value_under_another_tenants_scope_returns_none_and_changes_nothi
             &AccessScope::for_tenant(Uuid::new_v4()),
             id,
             Some(1),
-            SharingMode::Tenant,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Tenant, Fallback::None, None),
             true,
         )
         .await
@@ -3788,9 +3933,7 @@ async fn update_metadata_under_another_tenants_scope_returns_none_and_changes_no
             &AccessScope::for_tenant(Uuid::new_v4()),
             id,
             Some(1),
-            SharingMode::Shared,
-            Fallback::None,
-            None,
+            MetadataWrite::all(SharingMode::Shared, Fallback::None, None),
         )
         .await
         .expect("update_metadata");
@@ -4020,9 +4163,7 @@ async fn update_metadata_stores_the_expiry_and_refreshes_updated_at() {
         &AccessScope::for_tenant(tenant),
         id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::Inherit,
-        Some(fixed_expiry()),
+        MetadataWrite::all(SharingMode::Tenant, Fallback::Inherit, Some(fixed_expiry())),
     )
     .await
     .expect("update_metadata")
@@ -4044,9 +4185,7 @@ async fn remove_value_stores_the_expiry_and_refreshes_updated_at() {
         &AccessScope::for_tenant(tenant),
         id,
         Some(1),
-        SharingMode::Tenant,
-        Fallback::None,
-        Some(fixed_expiry()),
+        MetadataWrite::all(SharingMode::Tenant, Fallback::None, Some(fixed_expiry())),
         true,
     )
     .await

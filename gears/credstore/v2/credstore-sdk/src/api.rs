@@ -9,7 +9,7 @@
 
 use crate::models::{
     Credential, CredentialListItem, CredentialPatch, CredentialWrite, PutOutcome, PutPrecondition,
-    Secret, SecretRef, Validator, WritePrecondition,
+    Secret, SecretRef, TenantId, Validator, WritePrecondition,
 };
 use async_trait::async_trait;
 use toolkit_canonical_errors::CanonicalError;
@@ -55,6 +55,29 @@ pub trait CredStoreClientV2: Send + Sync {
         &self,
         ctx: &SecurityContext,
         key: &SecretRef,
+    ) -> Result<Option<Secret>, CanonicalError>;
+
+    /// Like [`Self::get_secret`], but the value is served only when the row
+    /// it comes from belongs to `bound` or to a tenant below `bound` in the
+    /// caller's chain. The answer never names a tenant. In-process only: it
+    /// has no REST counterpart. Requires `read_secret`.
+    ///
+    /// # Errors
+    ///
+    /// Projected by [`crate::CredStoreError`]:
+    /// * `PermissionDenied`: `read_secret` is denied, whatever `bound` is.
+    /// * `InvalidArgument` (`BOUND_NOT_ON_CHAIN`): `bound` is not on the caller's
+    ///   chain as the caller sees it (isolation barriers respected).
+    /// * `FailedPrecondition` (`OWNER_ABOVE_BOUND`): a value exists, but its row
+    ///   belongs to a tenant above `bound`; the value is not read.
+    /// * `FailedPrecondition` (`SECRET_EXPIRED`): the winning record is within
+    ///   the bound and past `expires_at`.
+    /// * `ServiceUnavailable`, `Internal`: a dependency is unreachable or failed.
+    async fn get_secret_within(
+        &self,
+        ctx: &SecurityContext,
+        key: &SecretRef,
+        bound: TenantId,
     ) -> Result<Option<Secret>, CanonicalError>;
 
     /// Creates or replaces the whole credential, record and value together.
