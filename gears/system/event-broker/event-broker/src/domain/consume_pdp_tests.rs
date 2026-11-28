@@ -1762,6 +1762,14 @@ impl AuthZResolverApi for Recording {
             .push(serde_json::to_value(&request).unwrap());
         self.pdp.evaluate(ctx, request).await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// `U` JOINs its own group under `authz` with no interests, so the group check

@@ -23,8 +23,8 @@ pub use error_layer::{IntoCanonical, error_mapping_middleware, map_error_to_cano
 pub use openapi_registry::{OpenApiInfo, OpenApiRegistry, OpenApiRegistryImpl, ensure_schema};
 pub use operation_builder::{
     INTERNAL_TOKEN_SECURITY_SCHEME, Missing, OperationBuilder, OperationSpec, ParamLocation,
-    ParamSpec, Present, ResponseHeaderSpec, ResponseHeaderType, ResponseSpec, RouteAuth,
-    RouteTimeout, ThrottlingSpec, state,
+    ParamSpec, Present, ResponseHeaderSpec, ResponseHeaderType, ResponseSpec, RestRouteOptions,
+    RouteAuth, RouteTimeout, ThrottlingSpec, UnknownOperations, state,
 };
 pub use select::{apply_select, page_to_projected_json, project_json};
 pub use toolkit_trace_context::{

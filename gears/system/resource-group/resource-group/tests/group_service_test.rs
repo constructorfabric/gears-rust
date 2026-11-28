@@ -3901,6 +3901,17 @@ impl authz_resolver_sdk::AuthZResolverApi for OwnerCheckingAuthZ {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 fn owner_checking_service(

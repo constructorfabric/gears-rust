@@ -13,7 +13,7 @@ This crate defines the transport-agnostic interface for the AuthZ Resolver gear:
 - **Constraint types** — `Constraint`, `Predicate`, `EqPredicate`, `InPredicate`, `InGroupPredicate`, `InGroupSubtreePredicate`, `InTenantSubtreePredicate`
 - **PEP compiler** — `compile_to_access_scope()` converts PDP constraints to SecureORM `AccessScope`
 
-Batch evaluation is designed but not implemented; see [Batch evaluation](#batch-evaluation).
+To evaluate many checks in one call, see [Batch evaluation](#batch-evaluation).
 
 ## Usage
 
@@ -159,10 +159,12 @@ let scope = compile_to_access_scope_with_options(
 
 ## Batch evaluation
 
-> **Designed, not implemented** ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)). The contract is specified in [Batch Evaluation](../../../../docs/arch/authorization/DESIGN.md#batch-evaluation-access-evaluations-api).
+> The contract ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)) is specified in [Batch Evaluation](../../../../docs/arch/authorization/DESIGN.md#batch-evaluation-access-evaluations-api).
 
 - `AuthZResolverApi::evaluate_batch` sends many evaluations in one call (`POST /authz-resolver/v1/evaluations` over REST). Convert its response with `EvaluationBatchResponse::into_results`. Every entry is a PDP decision; a technical failure fails the whole call.
-- `PolicyEnforcer::access_scope_batch` / `access_scope_batch_with` are the batch counterparts of `access_scope_with` for one `SecurityContext`.
+- `PolicyEnforcer::access_scope_execute_all` and `access_scope_deny_on_first_deny` are the batch counterparts of `access_scope_with` for one `SecurityContext`, one per semantic:
+  - `access_scope_execute_all` answers every check (per-row flags). It returns `Result<Vec<Result<AccessScope, AccessCheckError>>, CanonicalError>`: the outer error is a failed PDP call, an inner error is that check's denial or compile failure.
+  - `access_scope_deny_on_first_deny` gates a bulk operation ("all of these"). It returns `Result<Vec<AccessScope>, EnforcerError>`: one scope per check, or the first refusal.
 - `AuthZResolverPluginClient::evaluate_batch` is required. Local plugins can call the SDK's fan-out helper explicitly; a plugin backed by a remote PDP should use the PDP's batch API.
 - **Item limit:** a batch may hold at most **100** items by default (the resolver's `batch.max_items`, see [AuthZ Resolver README — Limits](../README.md#limits)). A batch needs at least one item. Empty or larger batches fail as a whole with `400` InvalidArgument; split large ones before calling.
 
@@ -170,133 +172,6 @@ let scope = compile_to_access_scope_with_options(
 
 - `evaluate_batch` has no default body on `AuthZResolverApi` or `AuthZResolverPluginClient`, so adding it breaks every existing implementor. The REST client and the local client implement it for real; test doubles and the shared SDK mock implement it too.
 - The SDK provides two explicit helpers: a sequential one that resolves defaults, calls `evaluate` for each item in order, stops as the semantic requires and fails the whole call on the first error (suited to test doubles), and a bounded, order-preserving fan-out over `evaluate` for local plugins. Neither is applied implicitly.
-
-### Planned API
-
-Request types: each absent key of an item is taken from the request's top-level default.
-
-```rust
-pub struct EvaluationBatchRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject: Option<Subject>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<Action>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Resource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<EvaluationRequestContext>,
-    /// At least one item (OpenAPI `minItems: 1`); an empty list is rejected with `400`.
-    pub evaluations: Vec<EvaluationBatchItem>,
-    /// Omitted from the wire when it equals the default (`execute_all`).
-    #[serde(default, skip_serializing_if = "EvaluationBatchOptions::is_default")]
-    pub options: EvaluationBatchOptions,
-}
-
-/// One evaluation; each absent key is taken from the request's default.
-pub struct EvaluationBatchItem {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject: Option<Subject>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<Action>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resource: Option<Resource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<EvaluationRequestContext>,
-}
-
-pub struct EvaluationBatchOptions {
-    #[serde(default)]
-    pub evaluations_semantic: EvaluationsSemantic,
-}
-
-#[non_exhaustive]
-#[serde(rename_all = "snake_case")]
-pub enum EvaluationsSemantic {
-    #[default]
-    ExecuteAll,
-    DenyOnFirstDeny,
-    // `permit_on_first_permit` is deferred (see DESIGN.md, Evaluation semantics).
-}
-
-impl EvaluationBatchRequest {
-    /// Applies the default values and checks the request. Returns one complete
-    /// `EvaluationRequest` per item, in order.
-    pub fn resolve(self, max_items: Option<usize>)
-        -> Result<(Vec<EvaluationRequest>, EvaluationsSemantic), CanonicalError>;
-}
-```
-
-Response types and the fail-closed conversion every consumer uses. Each entry is an ordinary `EvaluationResponse`; a denial must carry `deny_reason.error_code`:
-
-```rust
-pub struct EvaluationBatchResponse {
-    pub evaluations: Vec<EvaluationResponse>,
-}
-
-impl EvaluationBatchResponse {
-    /// Fail-closed conversion used by every SDK consumer of batch results.
-    /// Returns `expected` entries; `None` marks an item the semantic did not evaluate.
-    /// Fails when the shape does not match the semantic or a denial lacks an error code.
-    pub fn into_results(self, expected: usize, semantic: EvaluationsSemantic)
-        -> Result<Vec<Option<EvaluationResponse>>, CanonicalError>;
-}
-```
-
-PEP helper:
-
-```rust
-pub struct AccessCheck<'a> {
-    pub resource: &'a ResourceType,
-    pub action: &'a str,
-    pub resource_id: Option<Uuid>,
-    pub request: AccessRequest,
-}
-
-/// Batch-wide options, separate from each check's `AccessRequest`.
-/// Fields are private so options can be added without changing callers.
-#[derive(Default)]
-pub struct AccessBatchOptions { /* semantic: EvaluationsSemantic (default `ExecuteAll`) */ }
-
-impl AccessBatchOptions {
-    pub fn with_semantic(self, semantic: EvaluationsSemantic) -> Self;
-}
-
-impl PolicyEnforcer {
-    /// `execute_all`: one result per check.
-    pub async fn access_scope_batch(
-        &self,
-        ctx: &SecurityContext,
-        checks: &[AccessCheck<'_>],
-    ) -> Result<Vec<Result<AccessScope, EnforcerError>>, EnforcerError>;
-
-    /// One entry per check, `None` for checks skipped after a denial.
-    pub async fn access_scope_batch_with(
-        &self,
-        ctx: &SecurityContext,
-        checks: &[AccessCheck<'_>],
-        options: &AccessBatchOptions,
-    ) -> Result<Vec<Option<Result<AccessScope, EnforcerError>>>, EnforcerError>;
-}
-```
-
-Plugin trait (`evaluate_batch` is required; local plugins may call the SDK's fan-out helper):
-
-```rust
-#[async_trait]
-pub trait AuthZResolverPluginClient: Send + Sync {
-    async fn evaluate(&self, request: EvaluationRequest)
-        -> Result<EvaluationResponse, AuthZResolverError>;
-
-    /// Decisions for the evaluated prefix of `requests`, in request order (all of
-    /// them for `ExecuteAll`). An error for any item is an error for the batch.
-    async fn evaluate_batch(
-        &self,
-        requests: Vec<EvaluationRequest>,
-        semantic: EvaluationsSemantic,
-        max_concurrency: NonZeroUsize,
-    ) -> Result<Vec<EvaluationResponse>, AuthZResolverError>;
-}
-```
 
 ## Models
 

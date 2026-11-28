@@ -241,6 +241,14 @@ impl AuthZResolverApi for CountingTenantPermitResolver {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(permit_scoped_to_request_tenant(&request))
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Counting PDP fake that always permits with a fixed string-equality
@@ -285,6 +293,14 @@ impl AuthZResolverApi for CountingPermitResolver {
             self.value.clone(),
         ))
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Counting PDP fake that always permits with NO constraints (an
@@ -328,6 +344,14 @@ impl AuthZResolverApi for CountingAllowAllResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP fake that captures the most-recent [`EvaluationRequest`] it received
@@ -369,6 +393,14 @@ impl AuthZResolverApi for CapturingTenantPermitResolver {
         *self.last_request.lock().expect("mutex") = Some(request);
         Ok(response)
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP fake that permits but returns an EMPTY constraint set. With
@@ -392,6 +424,14 @@ impl AuthZResolverApi for PermitEmptyConstraintsResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP fake that denies every evaluation (`decision: false`), surfacing as
@@ -414,6 +454,14 @@ impl AuthZResolverApi for DenyAllResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP fake whose transport is unreachable: every evaluation returns
@@ -434,6 +482,14 @@ impl AuthZResolverApi for UnreachableResolver {
                 "usage-collector test fake: simulated authz-resolver transport failure".to_owned(),
             )
             .create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -472,6 +528,14 @@ impl AuthZResolverApi for CountingUnreachableResolver {
                 "usage-collector test fake: simulated authz-resolver transport failure".to_owned(),
             )
             .create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

@@ -38,6 +38,14 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyingResolver {
     ) -> Result<authz_resolver_sdk::EvaluationResponse, CanonicalError> {
         Err(CanonicalError::service_unavailable().create())
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A PDP that grants every request, scoped to the owner tenant `tenant`.
@@ -66,6 +74,14 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowingResolver {
                 deny_reason: None,
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

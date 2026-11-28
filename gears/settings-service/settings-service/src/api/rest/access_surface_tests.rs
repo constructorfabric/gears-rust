@@ -661,6 +661,17 @@ async fn clearing_a_restriction_does_not_probe_pii_entitlement() {
                 context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
             })
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationBatchResponse,
+            toolkit::api::canonical_prelude::CanonicalError,
+        > {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
 
     let pdp = Arc::new(RecordingPdp {

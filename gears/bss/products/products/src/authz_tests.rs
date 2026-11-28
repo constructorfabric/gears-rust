@@ -226,6 +226,14 @@ impl AuthZResolverApi for FailingResolver {
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err(CanonicalError::internal("pdp unreachable".to_owned()).create())
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP fake that explicitly denies (`decision = false`).
@@ -245,6 +253,14 @@ impl AuthZResolverApi for DenyingResolver {
                 deny_reason: None,
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -314,6 +330,14 @@ impl AuthZResolverApi for UncompilableResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// RS-08: constraints that do not compile are a denial whose reason is a fixed token; the
@@ -362,6 +386,14 @@ impl AuthZResolverApi for RecordingResolver {
                 deny_reason: None,
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

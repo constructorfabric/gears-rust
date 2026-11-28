@@ -96,6 +96,35 @@ pub struct DenyReason {
     pub details: Option<String>,
 }
 
+impl DenyReason {
+    /// The subject lacks permission for the action on the resource.
+    pub const INSUFFICIENT_PERMISSIONS: &'static str =
+        toolkit_gts::gts_id!("cf.core.errors.err.v1~x.authz.errors.insufficient_permissions.v1");
+    /// The request lacks, or carries malformed, input the policy needs.
+    pub const INVALID_REQUEST: &'static str =
+        toolkit_gts::gts_id!("cf.core.errors.err.v1~x.authz.errors.invalid_request.v1");
+
+    /// A denial reason with `error_code` and no details.
+    ///
+    /// A batch denial must carry an error code (see
+    /// [`check_batch_results`](crate::batch::check_batch_results)); plugins use
+    /// the well-known codes above unless they define vendor-specific ones.
+    #[must_use]
+    pub fn new(error_code: impl Into<String>) -> Self {
+        Self {
+            error_code: error_code.into(),
+            details: None,
+        }
+    }
+
+    /// Adds human-readable details.
+    #[must_use]
+    pub fn with_details(mut self, details: impl Into<String>) -> Self {
+        self.details = Some(details.into());
+        self
+    }
+}
+
 /// Authorization evaluation request.
 ///
 /// Follows the `AuthZEN` 1.0 model: Subject + Action + Resource + Context.
@@ -226,6 +255,21 @@ pub struct EvaluationResponse {
     /// Response context with constraints or deny reason.
     #[serde(default)]
     pub context: EvaluationResponseContext,
+}
+
+impl EvaluationResponse {
+    /// A denial carrying `reason`. Every denial in a batch must carry an
+    /// error code, so plugins build denials through this.
+    #[must_use]
+    pub fn deny(reason: DenyReason) -> Self {
+        Self {
+            decision: false,
+            context: EvaluationResponseContext {
+                constraints: Vec::new(),
+                deny_reason: Some(reason),
+            },
+        }
+    }
 }
 
 // Marker impls so these DTOs are accepted by `toolkit::OperationBuilder` /

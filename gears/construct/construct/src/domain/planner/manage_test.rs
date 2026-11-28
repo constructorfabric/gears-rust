@@ -102,6 +102,14 @@ impl AuthZResolverApi for TenantWideResolver {
         }
         Ok(response)
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Allows like [`AllowResolver`] but narrows the grant to another subject.
@@ -117,6 +125,14 @@ impl AuthZResolverApi for AnotherSubjectResolver {
         request.resource.id = Some(Uuid::new_v4());
         AllowResolver.evaluate(ctx, request).await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Never answers.
@@ -130,6 +146,14 @@ impl AuthZResolverApi for HangingResolver {
         _request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         std::future::pending().await
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -147,6 +171,14 @@ impl AuthZResolverApi for UnconstrainedResolver {
             decision: true,
             context: EvaluationResponseContext::default(),
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

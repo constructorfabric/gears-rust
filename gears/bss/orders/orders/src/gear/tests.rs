@@ -99,6 +99,15 @@ impl authz_resolver_sdk::AuthZResolverApi for Resolver {
     {
         panic!("the lifecycle tests never evaluate business authorization")
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, toolkit_canonical_errors::CanonicalError>
+    {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 fn dependencies(mode: &'static str) -> Arc<toolkit::ClientHub> {
     let hub = Arc::new(toolkit::ClientHub::new());

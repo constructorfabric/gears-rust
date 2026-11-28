@@ -85,6 +85,14 @@ impl<A: AuthZResolverApi> AuthZResolverApi for Recording<A> {
             .push(serde_json::to_value(&request).unwrap());
         self.inner.evaluate(ctx, request).await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 fn recording(inner: impl AuthZResolverApi + 'static) -> (PolicyEnforcer, Recorded) {
@@ -148,6 +156,14 @@ impl AuthZResolverApi for Scripted {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A PDP that counts the calls in flight at once, parks each call for
@@ -179,6 +195,14 @@ impl AuthZResolverApi for InFlightPdp {
             context: EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Records the `x-request-id` each call's task holds and logs one line in the
@@ -201,6 +225,14 @@ impl<A: AuthZResolverApi> AuthZResolverApi for Correlating<A> {
             .push(toolkit::api::current_request_id());
         tracing::info!("the policy double answers a metadata check");
         self.inner.evaluate(ctx, request).await
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

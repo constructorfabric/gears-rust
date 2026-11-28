@@ -75,6 +75,14 @@ impl AuthZResolverApi for TenantScopingAuthZ {
             }),
         }
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Always denies access.
@@ -98,6 +106,14 @@ impl AuthZResolverApi for DenyAllAuthZ {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Always allows with no constraints (unconstrained access).
@@ -117,6 +133,14 @@ impl AuthZResolverApi for AllowAllAuthZ {
                 deny_reason: None,
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -292,6 +316,14 @@ async fn enforcer_passes_resource_id_to_pdp() {
                 },
             })
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
 
     let mock = Arc::new(CapturingAuthZ {
@@ -387,6 +419,14 @@ async fn full_chain_list_groups_calls_enforcer_with_correct_params() {
                     deny_reason: None,
                 },
             })
+        }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
         }
     }
 

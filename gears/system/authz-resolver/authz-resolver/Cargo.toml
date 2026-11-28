@@ -33,11 +33,13 @@ toolkit = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-contract = { workspace = true, features = ["runtime-client", "rest-server"] }
 toolkit-security = { workspace = true }
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
 
 # Async runtime
 async-trait = { workspace = true }
-# Bounds a cold plugin selection (`DISCOVERY_BUDGET`).
-tokio = { workspace = true, features = ["time"] }
+# Bounds a cold plugin selection (`DISCOVERY_BUDGET`) and batch evaluation
+# (deadline, process-wide in-flight semaphore).
+tokio = { workspace = true, features = ["time", "sync"] }
 
 # Error handling and serialization
 anyhow = { workspace = true }
@@ -63,3 +65,5 @@ uuid = { workspace = true }
 toolkit-gts = { workspace = true }
 # The in-memory platform registry the selection tests run against.
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+# Drives the mounted REST routes in gear tests.
+tower = { workspace = true, features = ["util"] }

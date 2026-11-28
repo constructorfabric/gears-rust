@@ -68,6 +68,14 @@ impl AuthZResolverApi for MockAuthZResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Allow-with-owner-constraints enforcer (integration happy path).
@@ -109,6 +117,14 @@ impl AuthZResolverApi for TenantOnlyAuthZResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Tenant-only enforcer — models the shipped policy plugins.
@@ -132,6 +148,14 @@ impl AuthZResolverApi for DenyAllAuthZResolver {
             decision: false,
             context: EvaluationResponseContext::default(),
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

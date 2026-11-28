@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverApi, EvaluationRequest, EvaluationResponse};
+use authz_resolver_sdk::{
+    AuthZResolverApi, EvaluationBatchRequest, EvaluationBatchResponse, EvaluationRequest,
+    EvaluationResponse,
+};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
 use toolkit_security::PlatformSecurityContext;
@@ -31,17 +34,33 @@ impl AuthZResolverLocalClient {
 /// callers can retry, while genuine bugs (malformed plugin content, internal
 /// invariants) map to `CanonicalError::internal()` (HTTP 500). Collapsing both
 /// into `internal` would hide a retryable outage behind a non-retryable 500.
+///
+/// An invalid batch is the caller's error: `InvalidArgument` (`400`), logged at
+/// debug. The batch deadline maps to `503`, matching the PEP's own evaluation
+/// deadline, and malformed plugin results to `500`.
 fn log_and_convert(op: &str, e: &DomainError) -> CanonicalError {
+    if let DomainError::InvalidBatch(invalid) = e {
+        tracing::debug!(operation = op, error = %e, "authz_resolver rejected an invalid batch");
+        return CanonicalError::from(invalid.clone());
+    }
     tracing::error!(operation = op, error = ?e, "authz_resolver call failed");
+    to_canonical(e)
+}
+
+/// The canonical error for an infrastructure `DomainError` (see
+/// [`log_and_convert`]).
+fn to_canonical(e: &DomainError) -> CanonicalError {
     match e {
+        DomainError::InvalidBatch(invalid) => CanonicalError::from(invalid.clone()),
         DomainError::TypesRegistryUnavailable(_)
         | DomainError::PluginNotFound { .. }
-        | DomainError::PluginUnavailable { .. } => CanonicalError::service_unavailable()
+        | DomainError::PluginUnavailable { .. }
+        | DomainError::BatchDeadlineExceeded(_) => CanonicalError::service_unavailable()
             .with_detail(e.to_string())
             .create(),
-        DomainError::InvalidPluginInstance { .. } | DomainError::Internal(_) => {
-            CanonicalError::internal(e.to_string()).create()
-        }
+        DomainError::InvalidPluginInstance { .. }
+        | DomainError::Internal(_)
+        | DomainError::MalformedBatchResults(_) => CanonicalError::internal(e.to_string()).create(),
     }
 }
 
@@ -62,6 +81,20 @@ impl AuthZResolverApi for AuthZResolverLocalClient {
             .evaluate(req)
             .await
             .map_err(|e| log_and_convert("evaluate", &e))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        _ctx: PlatformSecurityContext,
+        req: EvaluationBatchRequest,
+    ) -> Result<EvaluationBatchResponse, CanonicalError> {
+        // Same trust model as `evaluate`; the resolver's batch path applies the
+        // defaults, limits, semantic and shape checks for in-process and REST
+        // callers alike.
+        self.svc
+            .evaluate_batch(req)
+            .await
+            .map_err(|e| log_and_convert("evaluate_batch", &e))
     }
 }
 

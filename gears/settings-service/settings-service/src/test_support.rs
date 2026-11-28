@@ -1578,6 +1578,17 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowAll {
             context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A policy decision point that allows every action but the one that unmasks
@@ -1603,6 +1614,17 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowButMasked {
             decision: request.action.name != "read_unmasked",
             context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -1630,6 +1652,17 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowButValues {
             context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A policy decision point that allows every action but one: the per-action
@@ -1651,6 +1684,17 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyAction {
             context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A policy decision point that denies everything.
@@ -1671,6 +1715,17 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
             context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A policy decision point that cannot be reached: every evaluation fails.
@@ -1687,6 +1742,17 @@ impl authz_resolver_sdk::AuthZResolverApi for UnreachablePdp {
         toolkit::api::canonical_prelude::CanonicalError,
     > {
         Err(toolkit::api::canonical_prelude::CanonicalError::service_unavailable().create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -1718,6 +1784,17 @@ impl authz_resolver_sdk::AuthZResolverApi for UncompilablePdp {
                 ..Default::default()
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -1773,6 +1850,17 @@ impl authz_resolver_sdk::AuthZResolverApi for RecordingPdp {
             decision: true,
             context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: toolkit_security::PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<
+        authz_resolver_sdk::EvaluationBatchResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

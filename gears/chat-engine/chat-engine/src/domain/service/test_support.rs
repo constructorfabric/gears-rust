@@ -331,6 +331,14 @@ impl AuthZResolverApi for MockAuthZResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Allow resolver that constrains the TENANT only — a faithful model of the
@@ -367,6 +375,14 @@ impl AuthZResolverApi for TenantOnlyAuthZResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Allow resolver that returns `decision=true` with NO constraints — the
@@ -388,6 +404,14 @@ impl AuthZResolverApi for AllowUnconstrainedAuthZResolver {
             context: EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP that explicitly denies every request (`decision=false`) →
@@ -408,6 +432,14 @@ impl AuthZResolverApi for DenyAllAuthZResolver {
             context: EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// PDP that is unreachable — returns `AuthZResolverError::Internal` →
@@ -425,6 +457,14 @@ impl AuthZResolverApi for FailingAuthZResolver {
         _request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err(CanonicalError::internal("PDP unavailable".to_owned()).create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -446,5 +486,13 @@ impl AuthZResolverApi for CompileFailAuthZResolver {
             decision: true,
             context: EvaluationResponseContext::default(),
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }

@@ -18,8 +18,7 @@ The **authz_resolver** gear is an integration point for authorization policy eva
 The gear registers [`AuthZResolverApi`](authz-resolver-sdk/src/api.rs) in ClientHub:
 
 - `evaluate(ctx, request)` — Evaluate an authorization request and return a decision with constraints. `ctx` is a `PlatformSecurityContext` plane marker that carries no identity and is ignored by the resolver; the PDP trusts the subject in `request.subject`
-
-Batch evaluation (`evaluate_batch`, `POST /authz-resolver/v1/evaluations`) is designed but not implemented; see [Batch evaluation](#batch-evaluation) below for the resolver's limits and [Batch Evaluation](../../../docs/arch/authorization/DESIGN.md#batch-evaluation-access-evaluations-api) for the contract ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)).
+- `evaluate_batch(ctx, request)` — Evaluate many requests in one call (`POST /authz-resolver/v1/evaluations`). See [Batch evaluation](#batch-evaluation) below for the resolver's limits and [Batch Evaluation](../../../docs/arch/authorization/DESIGN.md#batch-evaluation-access-evaluations-api) for the contract ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)).
 
 ### Evaluation Model (AuthZEN-based)
 
@@ -160,11 +159,11 @@ gears:
 
 ## Batch evaluation
 
-> **Designed, not implemented** ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)). The contract, default values, evaluation semantics and error outcomes are specified in [Batch Evaluation](../../../docs/arch/authorization/DESIGN.md#batch-evaluation-access-evaluations-api); this section covers how the resolver bounds and executes a batch.
+> The contract ([#5522](https://github.com/constructorfabric/gears-rust/issues/5522)), default values, evaluation semantics and error outcomes are specified in [Batch Evaluation](../../../docs/arch/authorization/DESIGN.md#batch-evaluation-access-evaluations-api); this section covers how the resolver bounds and executes a batch.
 
 ### Limits
 
-The gear configuration gains a `batch` section:
+The gear configuration has a `batch` section:
 
 ```yaml
 gears:
@@ -176,7 +175,7 @@ gears:
         max_body_bytes: 1048576 # request body limit of the batch route
         max_concurrency: 8      # items in flight per batch (fallback execution), 1..=64
         max_in_flight: 64       # items in flight across all batches in the process
-        deadline: "20s"         # whole-batch deadline, measured from request arrival
+        deadline: "20s"         # whole-batch deadline, from when the resolver starts the batch
 ```
 
 | Limit | Default | When exceeded | Rationale |
@@ -185,10 +184,10 @@ gears:
 | `max_body_bytes` | 1 MiB | `413` | The REST batch guideline's default batch payload. Item `properties` maps are unbounded, so the item count alone does not bound the bytes deserialized. |
 | `max_concurrency` | 8 | Items wait | Bounds load that one batch puts on the plugin and its dependencies (for example Tenant Resolver); matches the PDP fan-out bound used by usage-collector. |
 | `max_in_flight` | 64 | Items wait | Process-wide semaphore shared by all batches, so concurrent batches cannot multiply plugin load without limit. Waiting for a permit counts against the deadline. |
-| `deadline` | 20s | `503` ServiceUnavailable | Covers plugin discovery, permit waits and plugin execution. |
+| `deadline` | 20s | `503` ServiceUnavailable | Covers plugin discovery, permit waits and plugin execution. Reading and decoding the request body come before it and are not counted. |
 
 - Keep `deadline` below the api-gateway's `request_timeout` (30s default) and the PEP's evaluation deadline (`PolicyEnforcer::with_deadline`, 30s default), so the resolver answers with a canonical `503` before an outer timeout fires. The resolver cannot read the gateway configuration.
-- `#[toolkit::rest_contract]` routes use the gateway-wide body limit (16 MiB default) and the plain `axum::Json` extractor. Enforcing `max_body_bytes` requires a per-route body limit in `OperationBuilder` and the REST contract macro, which the implementation adds.
+- `#[toolkit::rest_contract]` routes use the gateway-wide body limit (16 MiB default) unless the gear sets a per-route limit. The resolver sets `max_body_bytes` on the batch route only (`RestRouteOptions::body_limit`, applied by `OperationBuilder::body_limit`), so `/evaluate` keeps the gateway-wide limit.
 - The `batch` section is new configuration. Because the resolver configuration uses `deny_unknown_fields`, older configurations stay valid, and resolvers without batch support reject the new keys.
 
 ### Execution
@@ -196,12 +195,12 @@ gears:
 1. Start the deadline.
 2. Resolve and validate the request (`EvaluationBatchRequest::resolve`, including `max_items`); reject an empty batch with `400` before plugin lookup.
 3. Resolve the plugin once, exactly as for single evaluation.
-4. Call `plugin.evaluate_batch(items, semantic, max_concurrency)`; each item evaluation holds a `max_in_flight` permit.
+4. Call `plugin.evaluate_batch(items, semantic, max_concurrency, in_flight)`; each item holds one `max_in_flight` permit only while it is evaluated, so a freed permit goes to the next waiting item of any batch.
 5. Check the shape of the plugin's results against the semantic and that every denial carries `deny_reason.error_code`. Any plugin error, for the batch or for a single item, fails the whole batch; no partial results are returned.
 
 All work runs inside the request future: no tasks are spawned. When the caller disconnects, the deadline expires or a short-circuit semantic stops, outstanding item evaluations are dropped.
 
-The SDK's fan-out helper, which local plugins call explicitly from their required `AuthZResolverPluginClient::evaluate_batch`, fans out over `evaluate` with `futures::stream::iter(..).map(..).buffered(max_concurrency)`, which yields results in request order. For a short-circuit semantic it consumes results in order and stops after the stopping item; dropping the stream cancels later items still in flight. Up to `max_concurrency - 1` items past the stopping item may already have started and are discarded; evaluation is read-only, so this costs only work.
+The SDK's fan-out helper, which local plugins call explicitly from their required `AuthZResolverPluginClient::evaluate_batch`, fans out over `evaluate` with `futures::stream::iter(..).map(..).buffered(max_concurrency)`, which yields results in request order; each item waits for a `max_in_flight` permit and holds it only while it runs. For a short-circuit semantic it consumes results in order and stops after the stopping item; dropping the stream cancels later items still in flight. Up to `max_concurrency - 1` items past the stopping item may already have started and are discarded; evaluation is read-only, so this costs only work.
 
 ## Usage
 
@@ -234,6 +233,7 @@ let response = authz.evaluate(PlatformSecurityContext::outbound_marker(), Evalua
 
 - AuthZEN-based `evaluate` API
 - `PolicyEnforcer` with `access_scope` for one-step PEP flow
+- Batch evaluation: `evaluate_batch` (`POST /authz-resolver/v1/evaluations`) and the `PolicyEnforcer` batch methods (see [Batch evaluation](#batch-evaluation))
 - PEP compiler with fail-closed constraint compilation
 - Plugin discovery over the types-registry platform catalogue (see [Plugin catalogue](#plugin-catalogue))
 - Static dev plugin with tenant scoping (denies on nil/missing tenant)

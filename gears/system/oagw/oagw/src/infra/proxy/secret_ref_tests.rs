@@ -993,6 +993,14 @@ async fn hier_004_mode_switch_needs_override_auth() {
                 },
             })
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
     let t = Tree::new();
     let auth = |mode: &str| DAuth {

@@ -82,6 +82,14 @@ impl AuthZResolverApi for MockAuthZResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Permissive [`PolicyEnforcer`] for `Service` unit tests.
@@ -104,6 +112,14 @@ impl AuthZResolverApi for DenyAuthZResolver {
             decision: false,
             context: EvaluationResponseContext::default(),
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -140,6 +156,14 @@ impl AuthZResolverApi for TypeAwareAuthZResolver {
         }
         MockAuthZResolver.evaluate(ctx, request).await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Enforcer denying exactly the given resource-type ids; returns the
@@ -168,6 +192,14 @@ impl AuthZResolverApi for FailAuthZResolver {
         Err(CanonicalError::service_unavailable()
             .with_detail("failing_enforcer: simulated PDP transport failure".to_owned())
             .create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

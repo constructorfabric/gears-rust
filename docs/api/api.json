@@ -5753,6 +5753,148 @@
         ],
         "type": "object"
       },
+      "EvaluationBatchItem": {
+        "description": "One evaluation of a batch; each absent key is taken from the request's default.",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Action",
+                "description": "The action; replaces the default action as a whole."
+              }
+            ]
+          },
+          "context": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EvaluationRequestContext",
+                "description": "The context; replaces the default context as a whole (no field merging)."
+              }
+            ]
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Resource",
+                "description": "The resource; replaces the default resource as a whole."
+              }
+            ]
+          },
+          "subject": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Subject",
+                "description": "The subject; replaces the default subject as a whole."
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "EvaluationBatchOptions": {
+        "description": "Batch-wide options of an [`EvaluationBatchRequest`].",
+        "properties": {
+          "evaluations_semantic": {
+            "$ref": "#/components/schemas/EvaluationsSemantic",
+            "description": "Evaluation semantic; `execute_all` when absent."
+          }
+        },
+        "type": "object"
+      },
+      "EvaluationBatchRequest": {
+        "description": "Batch evaluation request (`AuthZEN` Access Evaluations API).",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Action",
+                "description": "Default action for items that omit `action`."
+              }
+            ]
+          },
+          "context": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/EvaluationRequestContext",
+                "description": "Default context for items that omit `context`."
+              }
+            ]
+          },
+          "evaluations": {
+            "description": "The evaluations, at least one; an empty list is rejected with `400`.\nDecoding stops past [`MAX_BATCH_ITEMS`], so an oversized array never\nallocates in full.",
+            "items": {
+              "$ref": "#/components/schemas/EvaluationBatchItem"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "type": "array"
+          },
+          "options": {
+            "$ref": "#/components/schemas/EvaluationBatchOptions",
+            "description": "Batch options; omitted from the wire when they equal the default."
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Resource",
+                "description": "Default resource for items that omit `resource`."
+              }
+            ]
+          },
+          "subject": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Subject",
+                "description": "Default subject for items that omit `subject`."
+              }
+            ]
+          }
+        },
+        "required": [
+          "evaluations"
+        ],
+        "type": "object"
+      },
+      "EvaluationBatchResponse": {
+        "description": "Batch evaluation response: one entry per evaluated item, in request order.",
+        "properties": {
+          "evaluations": {
+            "description": "PDP decisions for the evaluated prefix of the request items.",
+            "items": {
+              "$ref": "#/components/schemas/EvaluationResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "evaluations"
+        ],
+        "type": "object"
+      },
       "EvaluationRequest": {
         "description": "Authorization evaluation request.\n\nFollows the `AuthZEN` 1.0 model: Subject + Action + Resource + Context.",
         "properties": {
@@ -5863,6 +6005,14 @@
           }
         },
         "type": "object"
+      },
+      "EvaluationsSemantic": {
+        "description": "How many items of a batch the PDP evaluates (`AuthZEN` §7.1.2.1).",
+        "enum": [
+          "execute_all",
+          "deny_on_first_deny"
+        ],
+        "type": "string"
       },
       "EventLabelDto": {
         "description": "GitHub `{ \"name\": ... }` label reference inside an issue event.",
@@ -31385,6 +31535,119 @@
               }
             },
             "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ]
+      }
+    },
+    "/authz-resolver/v1/evaluations": {
+      "post": {
+        "operationId": "auth_z_resolver_api_rest_evaluate_batch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EvaluationBatchRequest"
+              }
+            }
+          },
+          "description": "",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EvaluationBatchResponse"
+                }
+              }
+            },
+            "description": ""
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
           },
           "429": {
             "content": {

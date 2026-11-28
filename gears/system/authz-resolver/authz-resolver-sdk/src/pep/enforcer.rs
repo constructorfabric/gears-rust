@@ -22,9 +22,12 @@ use toolkit::client_hub::ClientHub;
 use toolkit_canonical_errors::CanonicalError;
 
 use crate::api::AuthZResolverApi;
+use crate::batch::{
+    EvaluationBatchItem, EvaluationBatchOptions, EvaluationBatchRequest, EvaluationsSemantic,
+};
 use crate::models::{
-    Action, BarrierMode, Capability, EvaluationRequest, EvaluationRequestContext, Resource,
-    Subject, TenantContext, TenantMode,
+    Action, BarrierMode, Capability, EvaluationRequest, EvaluationRequestContext,
+    EvaluationResponse, Resource, Subject, TenantContext, TenantMode,
 };
 use crate::pep::compiler::{
     ConstraintCompileError, compile_to_access_scope_with_negotiated_capabilities,
@@ -95,20 +98,11 @@ pub enum EnforcerError {
     CompileFailed(#[source] ConstraintCompileError),
 }
 
-/// Classifies a compile result once for every caller of `?` and the enforcer:
-/// an empty permitted scope is a refusal, every other compile error stays a
-/// compile failure. The match is exhaustive so a new compiler variant must be
-/// classified here.
+/// Classified by [`AccessCheckError`]: an empty permitted scope is a refusal,
+/// every other compile error stays a compile failure.
 impl From<ConstraintCompileError> for EnforcerError {
     fn from(err: ConstraintCompileError) -> Self {
-        match err {
-            ConstraintCompileError::ScopeMatchesNothing => {
-                Self::AccessDenied(AccessDenial::ScopeMatchesNothing)
-            }
-            err @ (ConstraintCompileError::ConstraintsRequiredButAbsent
-            | ConstraintCompileError::AllConstraintsFailed { .. }
-            | ConstraintCompileError::UnadvertisedCapabilities { .. }) => Self::CompileFailed(err),
-        }
+        AccessCheckError::from(err).into()
     }
 }
 
@@ -715,20 +709,15 @@ impl PolicyEnforcer {
         resource_id: Option<Uuid>,
         request: &AccessRequest,
     ) -> Result<AccessScope, EnforcerError> {
-        let require = request.require_constraints.unwrap_or(true);
-        let eval_request =
-            self.build_request_with(ctx, resource, action, resource_id, require, request);
-        // Preserve the exact post-filter capability set sent to the PDP. The
-        // response compiler rejects native predicates that were not negotiated,
-        // preventing missing-table errors or stronger hierarchy predicates than
-        // the querying service advertised.
-        let negotiated_capabilities = eval_request.context.capabilities.clone();
-        // `build_request_with` retained GroupMembership only after validating
-        // the resource opt-in, canonical GTS type and `id` support. Reuse that
-        // decision instead of parsing the GTS name again after the PDP call.
-        let group_membership_type = negotiated_capabilities
-            .contains(&Capability::GroupMembership)
-            .then_some(resource.name());
+        let eval_request = self.build_request_with(
+            ctx,
+            resource,
+            action,
+            resource_id,
+            request.require_constraints.unwrap_or(true),
+            request,
+        );
+        let context = eval_request.context.clone();
         let authz = self.resolve_authz()?;
         // `evaluate` is a platform-plane method: the transport attaches this
         // gear's service-identity credential below the contract layer to
@@ -736,49 +725,195 @@ impl PolicyEnforcer {
         // `PlatformSecurityContext` (it is a tenant-plane actor), so it passes a
         // credential-free plane marker; the caller identity (`ctx`) is conveyed
         // to the PDP as `req.subject`, built above (`cpt-cf-adr-two-plane-auth`).
-        // Bound the PDP call: `evaluate` gates every request and is a network
-        // round-trip out-of-process, so a hung PDP must not block consumers
-        // indefinitely. `self.deadline` is a hang guard (see
-        // `DEFAULT_EVAL_DEADLINE`); on expiry the call fails with
-        // `ServiceUnavailable`.
-        let response = match tokio::time::timeout(
-            self.deadline,
-            authz.evaluate(PlatformSecurityContext::outbound_marker(), eval_request),
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                return Err(EnforcerError::EvaluationFailed(
-                    CanonicalError::service_unavailable()
-                        .with_detail(format!(
-                            "authz-resolver did not respond within {:?}",
-                            self.deadline
-                        ))
-                        .create(),
-                ));
-            }
-        };
+        let response = self
+            .within_deadline(
+                authz.evaluate(PlatformSecurityContext::outbound_marker(), eval_request),
+            )
+            .await?;
+        Self::finish(resource, action, request, &context, response).map_err(EnforcerError::from)
+    }
 
+    // ── Batch: many checks for one subject in one PDP call ──────────
+
+    /// Batch evaluation with the `execute_all` semantic: evaluate every check
+    /// for one [`SecurityContext`] in one PDP call. Use it for per-row answers,
+    /// for example edit and delete flags for the rows of a page.
+    ///
+    /// Returns one result per check, in order. Each result matches what
+    /// [`Self::access_scope_with`] returns for the same check and the same PDP
+    /// decision: an [`AccessScope`], or an [`AccessCheckError`] that converts
+    /// into the same [`EnforcerError`]. An empty `checks` slice returns an
+    /// empty result without calling the PDP.
+    ///
+    /// The subject is sent once as the batch default; `action` and `context`
+    /// are sent once when every check has the same value, and otherwise per
+    /// check. `resource` is always per check.
+    ///
+    /// Batch evaluation answers explicit point checks; it does not replace a
+    /// LIST, which sends one evaluation and applies the returned constraints to
+    /// the query.
+    ///
+    /// # Errors
+    ///
+    /// The whole call fails when the PDP call fails, the deadline expires, or
+    /// the response does not have the shape the request allows. No check is
+    /// answered then. `?` converts the error into
+    /// [`EnforcerError::EvaluationFailed`].
+    pub async fn access_scope_execute_all(
+        &self,
+        ctx: &SecurityContext,
+        checks: &[AccessCheck<'_>],
+    ) -> Result<Vec<Result<AccessScope, AccessCheckError>>, CanonicalError> {
+        // `into_results` guarantees one result per check under `execute_all`.
+        self.evaluate_checks(ctx, checks, EvaluationsSemantic::ExecuteAll)
+            .await
+    }
+
+    /// Batch evaluation with the `deny_on_first_deny` semantic: may the
+    /// subject do all of these? Use it to gate a bulk operation.
+    ///
+    /// The PDP evaluates the checks in order and stops after the first denial.
+    /// Returns one scope per check, in order, when every check is permitted
+    /// and compiles; apply each scope to the affected rows. An empty `checks`
+    /// slice returns an empty result without calling the PDP.
+    ///
+    /// Requests are assembled as for [`Self::access_scope_execute_all`].
+    ///
+    /// # Errors
+    ///
+    /// The first denial or compile failure, in check order, or a failure of
+    /// the whole call ([`EnforcerError::EvaluationFailed`]). Either way the
+    /// operation is refused.
+    pub async fn access_scope_deny_on_first_deny(
+        &self,
+        ctx: &SecurityContext,
+        checks: &[AccessCheck<'_>],
+    ) -> Result<Vec<AccessScope>, EnforcerError> {
+        let scopes = self
+            .evaluate_checks(ctx, checks, EvaluationsSemantic::DenyOnFirstDeny)
+            .await?
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        // `into_results` accepts a short prefix only when it ends in a denial,
+        // which `collect` has already returned as the error.
+        debug_assert_eq!(scopes.len(), checks.len());
+        Ok(scopes)
+    }
+
+    /// One batch call for `checks`; returns the compiled results for the
+    /// evaluated prefix, in order (all of them for `execute_all`).
+    async fn evaluate_checks(
+        &self,
+        ctx: &SecurityContext,
+        checks: &[AccessCheck<'_>],
+        semantic: EvaluationsSemantic,
+    ) -> Result<Vec<Result<AccessScope, AccessCheckError>>, CanonicalError> {
+        if checks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests: Vec<EvaluationRequest> = checks
+            .iter()
+            .map(|check| {
+                self.build_request_with(
+                    ctx,
+                    check.resource,
+                    check.action,
+                    check.resource_id,
+                    check.request.require_constraints.unwrap_or(true),
+                    &check.request,
+                )
+            })
+            .collect();
+        let contexts: Vec<EvaluationRequestContext> =
+            requests.iter().map(|r| r.context.clone()).collect();
+        let batch = assemble_batch(requests, semantic);
+        let authz = self.resolve_authz()?;
+        let response = self
+            .within_deadline(
+                authz.evaluate_batch(PlatformSecurityContext::outbound_marker(), batch),
+            )
+            .await?;
+        let results = response.into_results(checks.len(), semantic)?;
+        Ok(checks
+            .iter()
+            .zip(&contexts)
+            .zip(results)
+            .map(|((check, context), response)| {
+                Self::finish(
+                    check.resource,
+                    check.action,
+                    &check.request,
+                    context,
+                    response,
+                )
+            })
+            .collect())
+    }
+
+    // ── Shared steps of the single and batch flows ──────────────────
+
+    /// Bound a PDP call: it gates requests and is a network round-trip
+    /// out-of-process, so a hung PDP must not block consumers indefinitely.
+    /// `self.deadline` is a hang guard (see `DEFAULT_EVAL_DEADLINE`); on expiry
+    /// the call fails with `ServiceUnavailable`.
+    async fn within_deadline<T>(
+        &self,
+        call: impl Future<Output = Result<T, CanonicalError>>,
+    ) -> Result<T, CanonicalError> {
+        tokio::time::timeout(self.deadline, call)
+            .await
+            .unwrap_or_else(|_elapsed| {
+                Err(CanonicalError::service_unavailable()
+                    .with_detail(format!(
+                        "authz-resolver did not respond within {:?}",
+                        self.deadline
+                    ))
+                    .create())
+            })
+    }
+
+    /// Turn one PDP decision into the PEP outcome: a denial, or the scope
+    /// compiled against `context`, the request context sent to the PDP.
+    fn finish(
+        resource: &ResourceType,
+        action: &str,
+        request: &AccessRequest,
+        context: &EvaluationRequestContext,
+        response: EvaluationResponse,
+    ) -> Result<AccessScope, AccessCheckError> {
         // Check decision first: if denied, return error immediately
         // without attempting constraint compilation.
         if !response.decision {
-            return Err(EnforcerError::AccessDenied(AccessDenial::Pdp {
+            return Err(AccessCheckError::AccessDenied(AccessDenial::Pdp {
                 reason: response.context.deny_reason,
             }));
         }
 
+        // `build_request_with` retained GroupMembership only after validating
+        // the resource opt-in, canonical GTS type and `id` support. Reuse that
+        // decision instead of parsing the GTS name again after the PDP call.
+        let group_membership_type = context
+            .capabilities
+            .contains(&Capability::GroupMembership)
+            .then_some(resource.name());
+        // Compile against the exact post-filter capability set sent to the
+        // PDP. The compiler rejects native predicates that were not
+        // negotiated, preventing missing-table errors or stronger hierarchy
+        // predicates than the querying service advertised.
         compile_to_access_scope_with_negotiated_capabilities(
             &response,
-            require,
+            context.require_constraints,
             resource.supported_properties,
             group_membership_type,
-            &negotiated_capabilities,
+            &context.capabilities,
             request.allow_empty_scope,
         )
         .map_err(|err| {
-            let err = EnforcerError::from(err);
-            if matches!(err, EnforcerError::AccessDenied(AccessDenial::ScopeMatchesNothing)) {
+            let err = AccessCheckError::from(err);
+            if matches!(
+                err,
+                AccessCheckError::AccessDenied(AccessDenial::ScopeMatchesNothing)
+            ) {
                 tracing::debug!(
                     resource = resource.name(),
                     action,
@@ -787,6 +922,110 @@ impl PolicyEnforcer {
             }
             err
         })
+    }
+}
+
+/// Assemble the wire batch for requests built from one [`SecurityContext`].
+///
+/// The subject is the same for every request (one `SecurityContext`), so it is
+/// sent once as the default. `action` and `context` are sent once when every
+/// request has the same value. Contexts built from one `SecurityContext` carry
+/// the same `bearer_token`, which is not serialized, so comparing serialized
+/// contexts decides equality; the first context (with its token) becomes the
+/// default.
+fn assemble_batch(
+    requests: Vec<EvaluationRequest>,
+    semantic: EvaluationsSemantic,
+) -> EvaluationBatchRequest {
+    let shared_action = requests
+        .split_first()
+        .filter(|(first, rest)| rest.iter().all(|r| r.action.name == first.action.name))
+        .map(|(first, _)| first.action.clone());
+    let shared_context = requests.split_first().and_then(|(first, rest)| {
+        let first_wire = serde_json::to_value(&first.context).ok()?;
+        rest.iter()
+            .all(|r| serde_json::to_value(&r.context).ok().as_ref() == Some(&first_wire))
+            .then(|| first.context.clone())
+    });
+    let subject = requests.first().map(|r| r.subject.clone());
+    let evaluations = requests
+        .into_iter()
+        .map(|r| EvaluationBatchItem {
+            subject: None,
+            action: shared_action.is_none().then_some(r.action),
+            resource: Some(r.resource),
+            context: shared_context.is_none().then_some(r.context),
+        })
+        .collect();
+    EvaluationBatchRequest {
+        subject,
+        action: shared_action,
+        resource: None,
+        context: shared_context,
+        evaluations,
+        options: EvaluationBatchOptions::default().with_semantic(semantic),
+    }
+}
+
+/// One check of a batch call ([`PolicyEnforcer::access_scope_execute_all`],
+/// [`PolicyEnforcer::access_scope_deny_on_first_deny`]): the arguments of one
+/// [`PolicyEnforcer::access_scope_with`] call.
+#[derive(Debug, Clone)]
+pub struct AccessCheck<'a> {
+    /// The resource type descriptor.
+    pub resource: &'a ResourceType,
+    /// The action name.
+    pub action: &'a str,
+    /// The resource ID, for point operations.
+    pub resource_id: Option<Uuid>,
+    /// Per-check overrides.
+    pub request: AccessRequest,
+}
+
+/// Why one check of [`PolicyEnforcer::access_scope_execute_all`] was not
+/// granted.
+///
+/// Only per-check outcomes: a failed PDP call fails the whole batch call and
+/// is never an entry. Converts into the [`EnforcerError`] that
+/// [`PolicyEnforcer::access_scope_with`] returns for the same check, so
+/// existing error mappings apply.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AccessCheckError {
+    /// The PDP denied the check, or the PEP refused a permitted scope that
+    /// matches nothing. Map it as an access denial.
+    #[error(transparent)]
+    AccessDenied(AccessDenial),
+
+    /// The returned constraints could not be compiled: a technical fault, not
+    /// a denial.
+    #[error("constraint compilation failed: {0}")]
+    CompileFailed(#[source] ConstraintCompileError),
+}
+
+/// Classifies a compile result once for every caller of `?` and the enforcer:
+/// an empty permitted scope is a refusal, every other compile error stays a
+/// compile failure. The match is exhaustive so a new compiler variant must be
+/// classified here.
+impl From<ConstraintCompileError> for AccessCheckError {
+    fn from(err: ConstraintCompileError) -> Self {
+        match err {
+            ConstraintCompileError::ScopeMatchesNothing => {
+                Self::AccessDenied(AccessDenial::ScopeMatchesNothing)
+            }
+            err @ (ConstraintCompileError::ConstraintsRequiredButAbsent
+            | ConstraintCompileError::AllConstraintsFailed { .. }
+            | ConstraintCompileError::UnadvertisedCapabilities { .. }) => Self::CompileFailed(err),
+        }
+    }
+}
+
+impl From<AccessCheckError> for EnforcerError {
+    fn from(err: AccessCheckError) -> Self {
+        match err {
+            AccessCheckError::AccessDenied(denial) => Self::AccessDenied(denial),
+            AccessCheckError::CompileFailed(err) => Self::CompileFailed(err),
+        }
     }
 }
 
@@ -801,3 +1040,7 @@ impl std::fmt::Debug for PolicyEnforcer {
 #[cfg(test)]
 #[path = "enforcer_tests.rs"]
 mod enforcer_tests;
+
+#[cfg(test)]
+#[path = "enforcer_batch_tests.rs"]
+mod enforcer_batch_tests;

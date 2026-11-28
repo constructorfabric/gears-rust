@@ -123,6 +123,14 @@ impl AuthZResolverApi for MockAuthZResolver {
         );
         Ok(permit_with_subtree(root))
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Build a permissive [`PolicyEnforcer`] for tests. Pairs with
@@ -167,6 +175,14 @@ impl AuthZResolverApi for ConstraintBearingAuthZResolver {
         let _ = request;
         Ok(permit_with_subtree(self.root_tenant_id))
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Build a [`PolicyEnforcer`] backed by [`ConstraintBearingAuthZResolver`].
@@ -207,6 +223,14 @@ impl AuthZResolverApi for DenyAllAuthZResolver {
                 deny_reason: None,
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -294,6 +318,14 @@ impl AuthZResolverApi for SchemaSelectiveAuthZResolver {
             None => Ok(permit_with_subtree(root)),
         }
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Build a [`PolicyEnforcer`] backed by [`SchemaSelectiveAuthZResolver`].
@@ -345,6 +377,14 @@ impl AuthZResolverApi for SchemaUnavailableAuthZResolver {
                     .to_owned(),
             )
             .create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

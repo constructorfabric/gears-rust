@@ -10,6 +10,7 @@
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
+use crate::batch::{EvaluationBatchRequest, EvaluationBatchResponse};
 use crate::models::{EvaluationRequest, EvaluationResponse};
 
 /// Public API contract for the `AuthZ` resolver gateway (PDP).
@@ -47,4 +48,33 @@ pub trait AuthZResolverApi: Send + Sync {
         ctx: PlatformSecurityContext,
         req: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError>;
+
+    /// Evaluate many independent authorization requests in one call (`AuthZEN`
+    /// Access Evaluations API). Safe read (no side effects).
+    ///
+    /// Top-level `subject`, `action`, `resource` and `context` are defaults for
+    /// items that omit the same key; a key present in an item replaces the
+    /// default as a whole. Result `i` answers item `i`; `deny_on_first_deny`
+    /// returns the evaluated prefix. Every entry is a PDP decision and every
+    /// denial carries `deny_reason.error_code`.
+    ///
+    /// Required, with no default body: an adapter that inherited a loop over
+    /// [`evaluate`](Self::evaluate) would turn one batch into one request per
+    /// item. Test doubles may call
+    /// [`evaluate_batch_sequentially`](crate::batch::evaluate_batch_sequentially)
+    /// deliberately. Callers convert the response with
+    /// [`EvaluationBatchResponse::into_results`].
+    ///
+    /// # Errors
+    ///
+    /// Any failure fails the whole batch with one `CanonicalError`: an invalid
+    /// batch (empty, too many items, an unresolvable key), the deadline, plugin
+    /// discovery, or a plugin error for any item. No partial results are
+    /// returned.
+    #[idempotency(SafeRead)]
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: EvaluationBatchRequest,
+    ) -> Result<EvaluationBatchResponse, CanonicalError>;
 }

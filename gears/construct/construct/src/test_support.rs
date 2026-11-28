@@ -86,6 +86,14 @@ impl AuthZResolverApi for AllowResolver {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Allows every request like [`AllowResolver`] and adds an owner constraint for
@@ -109,6 +117,14 @@ impl AuthZResolverApi for OwnerOnlyResolver {
         }
         Ok(response)
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Denies every request: a subject without permission.
@@ -126,6 +142,14 @@ impl AuthZResolverApi for DenyResolver {
             context: EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Answers as [`AllowResolver`] once `delay` has passed: a stalled policy
@@ -141,6 +165,14 @@ impl AuthZResolverApi for SlowResolver {
     ) -> Result<EvaluationResponse, CanonicalError> {
         tokio::time::sleep(self.0).await;
         AllowResolver.evaluate(ctx, request).await
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -323,6 +355,14 @@ impl AuthZResolverApi for RecordingResolver {
         ));
         AllowResolver.evaluate(ctx, request).await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Allows every request but constrains it to the caller's own tenant,
@@ -339,6 +379,14 @@ impl AuthZResolverApi for OwnTenantOnlyResolver {
     ) -> Result<EvaluationResponse, CanonicalError> {
         request.context.tenant_context = None;
         AllowResolver.evaluate(ctx, request).await
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -534,6 +582,14 @@ impl AuthZResolverApi for ErroringResolver {
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err((self.0)())
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// The policy service never answers.
@@ -547,6 +603,14 @@ impl AuthZResolverApi for PendingResolver {
         _request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         std::future::pending().await
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -1099,6 +1163,14 @@ impl AuthZResolverApi for AllowInOwnTenant {
                 ..Default::default()
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

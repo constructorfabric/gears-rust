@@ -152,6 +152,14 @@ impl AuthZResolverApi for ElsewhereResolver {
         request.resource.id = Some(Uuid::new_v4());
         AllowResolver.evaluate(ctx, request).await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Settings that keep the key and the scope each read asked with.

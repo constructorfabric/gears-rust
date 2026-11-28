@@ -44,6 +44,14 @@ impl AuthZResolverApi for UnreachablePdp {
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err(CanonicalError::internal("the policy decision point is unreachable").create())
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 // scenario: errors/1.01-positive-problem-details-envelope.md

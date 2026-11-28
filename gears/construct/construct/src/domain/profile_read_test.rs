@@ -125,6 +125,14 @@ impl AuthZResolverApi for CategoryResolver {
             )),
         ]))
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Decides each request on its own: allows a request without a category, and
@@ -156,6 +164,14 @@ impl AuthZResolverApi for PerCategoryResolver {
             pep_properties::OWNER_TENANT_ID,
             [tenant_of(&request)],
         ))]))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -457,6 +473,14 @@ impl AuthZResolverApi for FixedScope {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 fn tenant_is(tenant: Uuid) -> Predicate {
@@ -606,6 +630,14 @@ impl AuthZResolverApi for FailsForCategory {
             .evaluate(ctx, request)
             .await
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 #[tokio::test]
@@ -675,6 +707,14 @@ impl AuthZResolverApi for TenantClampOnly {
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(allowed(vec![tenant_is(tenant_of(&request))]))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -857,6 +897,14 @@ impl AuthZResolverApi for UncompilableFor {
         }
         Ok(allowed(vec![tenant_is(tenant_of(&request))]))
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 #[tracing_test::traced_test]
@@ -904,6 +952,14 @@ impl AuthZResolverApi for DenyWithReason {
                 ..Default::default()
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -1029,6 +1085,14 @@ impl AuthZResolverApi for CategoriesElsewhere {
         } else {
             vec![tenant_is(tenant), subject_is(Uuid::new_v4())]
         }))
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

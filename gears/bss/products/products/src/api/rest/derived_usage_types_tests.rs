@@ -1036,6 +1036,17 @@ async fn writes_ask_derived_author_and_reads_ask_sku_read() {
                 },
             })
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: toolkit_security::PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> Result<
+            authz_resolver_sdk::EvaluationBatchResponse,
+            toolkit::api::canonical_prelude::CanonicalError,
+        > {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
     let tenant = Uuid::new_v4();
     let (db, _, _, _dsn) = test_db().await;

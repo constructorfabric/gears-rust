@@ -203,7 +203,7 @@ async fn tenant_subtree_resolved_to_in_predicate() {
     let t2 = Uuid::now_v7();
     let mock = MockTenantResolver::with_tenants(t1, vec![t2]);
     let svc = Service::new(Arc::new(mock));
-    let resp = svc.evaluate(&make_request(t1)).await;
+    let resp = svc.evaluate(&make_request(t1)).await.unwrap();
 
     assert!(resp.decision);
     assert_eq!(resp.context.constraints.len(), 1);
@@ -232,7 +232,7 @@ async fn barrier_handled_by_tr_only_visible_returned() {
     // Mock: TR already filtered out t_barrier + t_behind
     let mock = MockTenantResolver::with_tenants(t1, vec![t_normal]);
     let svc = Service::new(Arc::new(mock));
-    let resp = svc.evaluate(&make_request(t1)).await;
+    let resp = svc.evaluate(&make_request(t1)).await.unwrap();
 
     assert!(resp.decision);
     let preds = &resp.context.constraints[0].predicates;
@@ -260,7 +260,7 @@ async fn barrier_handled_by_tr_only_visible_returned() {
 async fn no_tenant_in_request_denies() {
     let mock = MockTenantResolver::empty();
     let svc = Service::new(Arc::new(mock));
-    let resp = svc.evaluate(&make_request_no_tenant()).await;
+    let resp = svc.evaluate(&make_request_no_tenant()).await.unwrap();
     assert!(!resp.decision, "no tenant -> deny");
 }
 
@@ -268,7 +268,7 @@ async fn no_tenant_in_request_denies() {
 async fn nil_tenant_denies() {
     let mock = MockTenantResolver::empty();
     let svc = Service::new(Arc::new(mock));
-    let resp = svc.evaluate(&make_request(Uuid::default())).await;
+    let resp = svc.evaluate(&make_request(Uuid::default())).await.unwrap();
     assert!(!resp.decision, "nil tenant -> deny");
 }
 
@@ -276,12 +276,12 @@ async fn nil_tenant_denies() {
 async fn tenant_not_found_denies() {
     let mock = MockTenantResolver::empty();
     let svc = Service::new(Arc::new(mock));
-    let resp = svc.evaluate(&make_request(Uuid::now_v7())).await;
+    let resp = svc.evaluate(&make_request(Uuid::now_v7())).await.unwrap();
     assert!(!resp.decision, "tenant not found -> deny (fail-closed)");
 }
 
 #[tokio::test]
-async fn tr_error_denies() {
+async fn tr_error_fails_the_evaluation() {
     struct FailingTr;
 
     #[async_trait]
@@ -340,8 +340,14 @@ async fn tr_error_denies() {
     }
 
     let svc = Service::new(Arc::new(FailingTr));
-    let resp = svc.evaluate(&make_request(Uuid::now_v7())).await;
-    assert!(!resp.decision, "TR error -> deny (fail-closed)");
+    let err = svc
+        .evaluate(&make_request(Uuid::now_v7()))
+        .await
+        .expect_err("a TR error fails the evaluation (fail-closed, never a decision)");
+    assert!(
+        matches!(err, authz_resolver_sdk::AuthZResolverError::Internal(_)),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
@@ -366,7 +372,7 @@ async fn group_predicates_from_request_properties() {
         serde_json::json!([g1.to_string()]),
     );
 
-    let resp = svc.evaluate(&req).await;
+    let resp = svc.evaluate(&req).await.unwrap();
     assert!(resp.decision);
 
     let preds = &resp.context.constraints[0].predicates;
@@ -393,7 +399,7 @@ async fn empty_group_selector_is_denied_instead_of_widened() {
             .properties
             .insert(property.to_owned(), serde_json::json!([]));
 
-        let response = svc.evaluate(&request).await;
+        let response = svc.evaluate(&request).await.unwrap();
         assert!(
             !response.decision,
             "an empty {property} selector must match nothing, not tenant-wide scope"
@@ -412,7 +418,7 @@ async fn unadvertised_group_predicate_is_denied() {
         serde_json::json!([Uuid::now_v7().to_string()]),
     );
 
-    let response = svc.evaluate(&request).await;
+    let response = svc.evaluate(&request).await.unwrap();
 
     assert!(
         !response.decision,
@@ -443,7 +449,7 @@ async fn unadvertised_group_predicate_is_denied() {
 // `with_hierarchy` / `failing_descendants` / `empty`.
 use crate::domain::test_support::{MockTr, setup_svc};
 
-/// Wrapper around `svc.evaluate(&build_r_request(...)).await` to collapse the
+/// Wrapper around `svc.evaluate(&build_r_request(...)).await.unwrap()` to collapse the
 /// 8-line call into a single line per test. Same arguments as `build_r_request`.
 async fn evaluate_r(
     svc: &Service,
@@ -463,6 +469,7 @@ async fn evaluate_r(
         mode,
     ))
     .await
+    .unwrap()
 }
 
 /// Generic request builder for R-rule tests.
@@ -749,11 +756,25 @@ async fn r8_partner_lists_own_subtree() {
 }
 
 #[tokio::test]
-async fn r8_deny_on_tr_error() {
-    // Dedicated R8 fail-path: `get_descendants(subject)` TR failure → deny.
+async fn r8_tr_error_fails_the_evaluation() {
+    // Dedicated R8 fail-path: a `get_descendants(subject)` TR failure is a
+    // technical failure, not a decision: the evaluation fails (never allows).
     let svc = Service::new(Arc::new(MockTr::failing_descendants()));
-    let resp = evaluate_r(&svc, Uuid::now_v7(), "list", None, None, None, None).await;
-    assert!(!resp.decision, "R8: TR error on get_descendants -> deny");
+    let err = svc
+        .evaluate(&build_r_request(
+            Uuid::now_v7(),
+            "list",
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, authz_resolver_sdk::AuthZResolverError::Internal(_)),
+        "{err:?}"
+    );
 }
 
 // ── Fail-closed: single-resource missing owner_tenant_id ───────────────
@@ -781,12 +802,12 @@ async fn unscoped_capability_check_does_not_emit_unsupported_owner_predicates() 
     request.action.name = "create".to_owned();
     request.context.require_constraints = false;
     request.context.supported_properties.clear();
-    let result = svc.evaluate(&request).await;
+    let result = svc.evaluate(&request).await.unwrap();
     assert!(result.decision);
     assert!(result.context.constraints.is_empty());
 
     request.action.name = "list".to_owned();
-    let list = svc.evaluate(&request).await;
+    let list = svc.evaluate(&request).await.unwrap();
     assert!(list.decision);
     assert!(
         !list.context.constraints.is_empty(),
@@ -795,7 +816,7 @@ async fn unscoped_capability_check_does_not_emit_unsupported_owner_predicates() 
 
     request.action.name = "create".to_owned();
     request.context.supported_properties = vec!["owner_tenant_id".to_owned()];
-    let scoped = svc.evaluate(&request).await;
+    let scoped = svc.evaluate(&request).await.unwrap();
     assert!(scoped.decision);
     assert!(
         !scoped.context.constraints.is_empty(),
@@ -817,7 +838,7 @@ async fn a_single_resource_request_keeps_its_constraints_on_an_unconstrained_che
     request.context.require_constraints = false;
     request.context.supported_properties.clear();
 
-    let response = svc.evaluate(&request).await;
+    let response = svc.evaluate(&request).await.unwrap();
     assert!(response.decision);
     assert!(
         !response.context.constraints.is_empty(),
@@ -845,7 +866,7 @@ async fn a_group_selector_keeps_its_constraints_on_an_unconstrained_check() {
             serde_json::json!([Uuid::now_v7().to_string()]),
         );
 
-        let response = svc.evaluate(&request).await;
+        let response = svc.evaluate(&request).await.unwrap();
         assert!(response.decision, "{property}: allowed");
         let predicates = &response
             .context
@@ -865,5 +886,5 @@ async fn unscoped_capability_check_still_denies_missing_tenant() {
     let svc = Service::new(Arc::new(MockTenantResolver::empty()));
     let mut request = make_request_no_tenant();
     request.context.require_constraints = false;
-    assert!(!svc.evaluate(&request).await.decision);
+    assert!(!svc.evaluate(&request).await.unwrap().decision);
 }

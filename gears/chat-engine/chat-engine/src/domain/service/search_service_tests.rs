@@ -789,6 +789,15 @@ async fn empty_pdp_scope_preserves_session_and_cross_session_search_results() {
                 },
             })
         }
+
+        async fn evaluate_batch(
+            &self,
+            ctx: PlatformSecurityContext,
+            req: authz_resolver_sdk::EvaluationBatchRequest,
+        ) -> std::result::Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError>
+        {
+            authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+        }
     }
 
     let sid = Uuid::from_u128(10);

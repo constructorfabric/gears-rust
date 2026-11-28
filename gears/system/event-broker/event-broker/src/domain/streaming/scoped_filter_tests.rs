@@ -275,6 +275,14 @@ impl AuthZResolverApi for TypePdp {
             Answer::AllowAfter(_) => unreachable!("answered as `Allow` above"),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// A specification manager that knows only the event types it was given.

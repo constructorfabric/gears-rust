@@ -200,6 +200,14 @@ impl AuthZResolverApi for MockAuthZResolver {
             })
         }
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 pub fn build_services(db: Db, config: ServiceConfig) -> Arc<ConcreteAppServices> {
@@ -251,6 +259,14 @@ impl AuthZResolverApi for DenyAllAuthZResolver {
             context: EvaluationResponseContext::default(),
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Mock `AuthZ` resolver that always fails with an internal error.
@@ -267,6 +283,14 @@ impl AuthZResolverApi for FailingAuthZResolver {
         _request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err(CanonicalError::internal("PDP unavailable").create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -355,5 +379,13 @@ impl AuthZResolverApi for OwnerCityAuthZResolver {
                 ..Default::default()
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: authz_resolver_sdk::EvaluationBatchRequest,
+    ) -> Result<authz_resolver_sdk::EvaluationBatchResponse, CanonicalError> {
+        authz_resolver_sdk::evaluate_batch_sequentially(self, ctx, req).await
     }
 }

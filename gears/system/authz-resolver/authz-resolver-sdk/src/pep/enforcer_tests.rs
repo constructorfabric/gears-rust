@@ -70,6 +70,14 @@ impl AuthZResolverApi for AllowAllMock {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Mock that always returns `decision=false` with an optional deny reason.
@@ -107,6 +115,14 @@ impl AuthZResolverApi for DenyMock {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Mock that always returns an RPC error.
@@ -120,6 +136,14 @@ impl AuthZResolverApi for FailMock {
         _req: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
         Err(CanonicalError::internal("boom").create())
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -135,6 +159,14 @@ impl AuthZResolverApi for SlowMock {
     ) -> Result<EvaluationResponse, CanonicalError> {
         std::future::pending::<()>().await;
         unreachable!("SlowMock should never complete before the PEP deadline");
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -185,6 +217,14 @@ impl AuthZResolverApi for CapturingMock {
             },
         })
     }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
+    }
 }
 
 /// Mock PDP response used to verify that the resource descriptor's canonical
@@ -216,6 +256,14 @@ impl AuthZResolverApi for GroupScopeMock {
                 ..Default::default()
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 
@@ -1146,6 +1194,14 @@ impl AuthZResolverApi for FixedResponse {
                 deny_reason: self.deny_reason.clone(),
             },
         })
+    }
+
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: crate::EvaluationBatchRequest,
+    ) -> Result<crate::EvaluationBatchResponse, CanonicalError> {
+        crate::evaluate_batch_sequentially(self, ctx, req).await
     }
 }
 

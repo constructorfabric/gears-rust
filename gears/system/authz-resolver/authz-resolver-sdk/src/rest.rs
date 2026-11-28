@@ -26,6 +26,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
 use crate::api::AuthZResolverApi;
+use crate::batch::{EvaluationBatchRequest, EvaluationBatchResponse};
 use crate::models::{EvaluationRequest, EvaluationResponse};
 
 /// HTTP projection of [`AuthZResolverApi`].
@@ -38,4 +39,13 @@ pub trait AuthZResolverApiRest: AuthZResolverApi {
         ctx: PlatformSecurityContext,
         req: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError>;
+
+    /// `POST /authz-resolver/v1/evaluations` — evaluate an `AuthZEN` Access
+    /// Evaluations batch. Not retryable: one call is exactly one HTTP request.
+    #[post("/evaluations")]
+    async fn evaluate_batch(
+        &self,
+        ctx: PlatformSecurityContext,
+        req: EvaluationBatchRequest,
+    ) -> Result<EvaluationBatchResponse, CanonicalError>;
 }

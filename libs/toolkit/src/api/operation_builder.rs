@@ -2277,6 +2277,81 @@ where
 }
 
 // -------------------------------------------------------------------------------------------------
+// Per-route request body limit — needs the handler (to layer) and the response stage (for 413)
+// -------------------------------------------------------------------------------------------------
+impl<S, A, L> OperationBuilder<Present, Present, S, A, L>
+where
+    S: Clone + Send + Sync + 'static,
+    A: AuthState,
+    L: LicenseState,
+{
+    /// Limit the request body of this route to `bytes` and document `413`.
+    ///
+    /// Applies [`axum::extract::DefaultBodyLimit`] to this route only, which
+    /// overrides the gateway-wide body limit for body extractors such as
+    /// `Json`; an over-limit body is rejected with `413 Payload Too Large`.
+    /// Call it after the handler is set.
+    pub fn body_limit(mut self, bytes: usize, registry: &dyn OpenApiRegistry) -> Self {
+        self.method_router = self
+            .method_router
+            .layer(axum::extract::DefaultBodyLimit::max(bytes));
+        self.error_413(registry)
+    }
+}
+
+/// Runtime options for the route registration that `#[toolkit::rest_contract]`
+/// generates (`register_<trait>_routes_with`).
+///
+/// Values usually come from gear configuration, so they cannot be macro
+/// attributes. Operations are named by their contract method (for example
+/// `"evaluate_batch"`).
+#[derive(Debug, Clone, Default)]
+pub struct RestRouteOptions {
+    body_limits: BTreeMap<String, usize>,
+}
+
+impl RestRouteOptions {
+    /// Limit the request body of `operation` to `bytes` (see
+    /// [`OperationBuilder::body_limit`]).
+    #[must_use]
+    pub fn body_limit(mut self, operation: &str, bytes: usize) -> Self {
+        self.body_limits.insert(operation.to_owned(), bytes);
+        self
+    }
+
+    /// The body limit configured for `operation`, if any.
+    #[must_use]
+    pub fn body_limit_for(&self, operation: &str) -> Option<usize> {
+        self.body_limits.get(operation).copied()
+    }
+
+    /// Check that every configured operation is in `known`: a typo would
+    /// otherwise silently leave a route without its limit.
+    ///
+    /// # Errors
+    ///
+    /// [`UnknownOperations`] naming every configured operation not in `known`.
+    pub fn check_operations(&self, known: &[&str]) -> Result<(), UnknownOperations> {
+        let unknown: Vec<String> = self
+            .body_limits
+            .keys()
+            .filter(|op| !known.contains(&op.as_str()))
+            .cloned()
+            .collect();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(UnknownOperations(unknown))
+        }
+    }
+}
+
+/// [`RestRouteOptions`] name operations the contract does not register.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("REST route options name operations the contract does not register: {0:?}")]
+pub struct UnknownOperations(pub Vec<String>);
+
+// -------------------------------------------------------------------------------------------------
 // Registration — only available when handler, response, AND auth are all set
 // -------------------------------------------------------------------------------------------------
 impl<S> OperationBuilder<Present, Present, S, AuthSet, LicenseSet>
