@@ -24,6 +24,7 @@ use crate::dto::{
 };
 use crate::error::ClusterError;
 use crate::leader::{ElectionConfig, LeaderElectionBackend, LeaderElectionFeatures, LeaderWatch};
+use crate::lease::LeaseToken;
 use crate::lock::{DistributedLockBackend, LockFeatures, LockGuard};
 
 const BOUND_PROFILE: &str = "orders";
@@ -118,6 +119,33 @@ impl DistributedLockBackend for StubLockBackend {
     ) -> Result<LockGuard, ClusterError> {
         Err(not_under_test())
     }
+
+    async fn acquire(
+        &self,
+        _name: &str,
+        _owner: &str,
+        _ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        Err(not_under_test())
+    }
+
+    async fn acquire_waiting(
+        &self,
+        _name: &str,
+        _owner: &str,
+        _ttl: Duration,
+        _timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        Err(not_under_test())
+    }
+
+    async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        Err(not_under_test())
+    }
+
+    async fn release(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
+        Err(not_under_test())
+    }
 }
 
 struct StubLeaderElectionBackend;
@@ -141,6 +169,23 @@ impl LeaderElectionBackend for StubLeaderElectionBackend {
         _name: &str,
         _config: ElectionConfig,
     ) -> Result<LeaderWatch, ClusterError> {
+        Err(not_under_test())
+    }
+
+    async fn join(
+        &self,
+        _name: &str,
+        _owner: &str,
+        _config: ElectionConfig,
+    ) -> Result<Option<LeaseToken>, ClusterError> {
+        Err(not_under_test())
+    }
+
+    async fn renew(&self, _token: &LeaseToken, _ttl: Duration) -> Result<(), ClusterError> {
+        Err(not_under_test())
+    }
+
+    async fn resign(&self, _token: &LeaseToken) -> Result<(), ClusterError> {
         Err(not_under_test())
     }
 }

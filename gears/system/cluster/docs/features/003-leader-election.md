@@ -94,7 +94,7 @@ Singleton patterns — worker-pool coordination, scheduler election, migration g
 **Actor**: `cpt-cf-clst-actor-platform-gear`
 
 **Success Scenarios**:
-- A planned shutdown releases the claim immediately so a successor is elected within a backend round-trip.
+- A planned shutdown releases the claim immediately so a successor is elected within one renewal interval (about a backend round-trip where followers watch the claim).
 
 **Steps**:
 1. [x] - `p1` - Consumer explicitly resigns from the election - `inst-sd-resign`
@@ -207,6 +207,6 @@ The system **MUST** document leader election as advisory coordination (which nod
 - [x] At most one participant observes itself as leader at any time under a linearizable backend; claims renew automatically.
 - [x] Consumers can observe transitions event-driven and check leadership synchronously inside loops.
 - [x] Leadership-loss is transient: the watch auto-reenrolls and resolves to leader or follower without re-enrollment code.
-- [x] Explicit resign releases the claim immediately so a successor is elected within a backend round-trip.
+- [x] Explicit resign releases the claim immediately so a successor is elected within one renewal interval (about a backend round-trip where followers watch the claim).
 - [x] Misconfigured timing is rejected at construction; transient backend errors do not surface as transitions.
 - [x] Advisory semantics are documented, directing correctness-critical exclusion to lock plus compare-and-swap.

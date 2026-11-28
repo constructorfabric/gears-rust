@@ -57,7 +57,7 @@ per-primitive file (linked under each section heading) using a fixed template:
 | SC-LEAD-001 | L2 | ☐ | a single candidate becomes `Leader` | — | `fr-leader-elect` |
 | SC-LEAD-002 | L2 | ☐ | with N candidates, at most one observes `Leader` at any time | `linearizable` | `nfr-leader-guarantee` |
 | SC-LEAD-003 | L2 | ☐ | the leader's claim auto-renews without consumer renewal code | — | `fr-leader-elect` |
-| SC-LEAD-004 | L2 | ☐ | `resign()` releases the claim; a successor is elected within a round-trip | — | `fr-leader-resign` |
+| SC-LEAD-004 | L2 | ☐ | `resign()` releases the claim; a successor is elected within one renewal interval | — | `fr-leader-resign` |
 | SC-LEAD-005 | L2 | ☐ | `is_leader()`/`status()` reflect the cached snapshot synchronously | — | `fr-leader-observability` |
 | SC-LEAD-006 | L2 | ☐ | `Status(Lost)` is transient — the watch auto-reenrolls to `Leader`/`Follower` | — | `fr-leader-observability` |
 | SC-LEAD-007 | L2 | ☐ | `ElectionConfig::new` rejects zero `ttl`/`max_missed_renewals` | — | `fr-leader-config` |
@@ -197,6 +197,24 @@ must honor. Authoritative catalog: [OBSERVABILITY.md](../OBSERVABILITY.md).
 | SC-OBS-005 | L3 | ☐ | every plugin emits every signal in the observability reference (cross-plugin completeness) | — | `nfr-observability` |
 
 **Details:** [observability.md](./observability.md)
+
+## 13. Lease Tokens (`SC-LTOK-*`)
+
+The token half of the lock and leader traits, which the serving gear calls for every
+Profile-3 consumer. Also run through the remote client (`cluster/tests/remote_backends.rs`).
+
+| ID | Layer | Status | Scenario | Capability gate | Traces to |
+|----|-------|--------|----------|-----------------|-----------|
+| SC-LTOK-LOCK-001 | L2 | ☑ | `acquire` / `renew` / `release` round trip; a held name is `LockContended` | — | ADR-012 |
+| SC-LTOK-LOCK-002 | L2 | ☑ | `release` is idempotent by absence; a released token's `renew` is `LockExpired` | — | ADR-012 |
+| SC-LTOK-LOCK-003 | L2 | ☑ | `renew` of a lapsed, unstolen lease is `LockExpired` | stored deadline (not k8s) | DESIGN §3.19.1 |
+| SC-LTOK-LOCK-004 | L2 | ☑ | after a steal the stale token is fenced: `renew` is `LockExpired`, `release` is a no-op | — | ADR-012 |
+| SC-LTOK-LOCK-005 | L2 | ☑ | the guard and token halves share one lease | — | ADR-012 |
+| SC-LTOK-LEAD-001 | L2 | ☑ | `join` / `renew` / `resign` round trip; `resign` is idempotent | — | ADR-012 |
+| SC-LTOK-LEAD-002 | L2 | ☑ | leader `renew` of a lapsed, unstolen claim is `LockExpired` | stored deadline (not k8s) | DESIGN §3.19.1 |
+| SC-LTOK-LEAD-003 | L2 | ☑ | after a takeover the stale leader token is fenced: `renew` is `LockExpired`, `resign` is a no-op | — | ADR-012 |
+
+**Details:** [lease-token.md](./lease-token.md)
 
 ---
 

@@ -137,3 +137,98 @@ async fn leader_conformance() {
     )
     .await;
 }
+
+// ── Lease-token scenarios, one test each so a deviation is reported per
+// scenario rather than stopping the run at the first.
+
+async fn token_lock() -> ScenarioBackend<dyn cluster_sdk::DistributedLockBackend> {
+    let ns = common::fresh_namespace("conf-ltok").await;
+    let client = ns.client.clone();
+    let handle = K8sLockPlugin::builder(ns.lock_config_with(json!({})))
+        .with_client(client)
+        .build_and_start()
+        .await
+        .expect("lock plugin starts against a fresh namespace");
+    let lock = handle.lock();
+    ScenarioBackend::with_teardown(lock, async move {
+        handle.stop().await;
+        drop(ns);
+    })
+}
+
+async fn token_leader() -> ScenarioBackend<dyn cluster_sdk::LeaderElectionBackend> {
+    let ns = common::fresh_namespace("conf-ltok-lead").await;
+    let client = ns.client.clone();
+    let handle = K8sLeaderElectionPlugin::builder(
+        ns.leader_config_with(json!({ "min_election_ttl_ms": 50 })),
+    )
+    .with_client(client)
+    .build_and_start()
+    .await
+    .expect("leader plugin starts against a fresh namespace");
+    let leader = handle.leader_election();
+    ScenarioBackend::with_teardown(leader, async move {
+        handle.stop().await;
+        drop(ns);
+    })
+}
+
+macro_rules! token_case {
+    ($test:ident, $make:ident, $scenario:path) => {
+        #[tokio::test]
+        async fn $test() {
+            let b = $make().await;
+            $scenario(std::sync::Arc::clone(&b.backend)).await;
+            b.teardown.await;
+        }
+    };
+    ($test:ident, $make:ident, $scenario:path, timed, ignore = $why:literal) => {
+        #[tokio::test]
+        #[ignore = $why]
+        async fn $test() {
+            let b = $make().await;
+            $scenario(std::sync::Arc::clone(&b.backend), TimeControl::Real).await;
+            b.teardown.await;
+        }
+    };
+    ($test:ident, $make:ident, $scenario:path, timed) => {
+        #[tokio::test]
+        async fn $test() {
+            let b = $make().await;
+            $scenario(std::sync::Arc::clone(&b.backend), TimeControl::Real).await;
+            b.teardown.await;
+        }
+    };
+}
+
+use cluster_conformance::lease_token as ltok;
+token_case!(ltok_lock_001, token_lock, ltok::scenario_ltok_lock_001);
+token_case!(ltok_lock_002, token_lock, ltok::scenario_ltok_lock_002);
+token_case!(
+    ltok_lock_003,
+    token_lock,
+    ltok::scenario_ltok_lock_003,
+    timed,
+    ignore = "DESIGN §3.19.1: the token renew fences on the holder only, so a lapsed unstolen lease renews"
+);
+token_case!(
+    ltok_lock_004,
+    token_lock,
+    ltok::scenario_ltok_lock_004,
+    timed
+);
+token_case!(ltok_lock_005, token_lock, ltok::scenario_ltok_lock_005);
+token_case!(ltok_lead_001, token_leader, ltok::scenario_ltok_lead_001);
+token_case!(
+    ltok_lead_002,
+    token_leader,
+    ltok::scenario_ltok_lead_002,
+    timed,
+    ignore = "DESIGN §3.19.1: the token renew fences on the holder only, so a lapsed unstolen claim renews"
+);
+token_case!(
+    ltok_lead_003,
+    token_leader,
+    ltok::scenario_ltok_lead_003,
+    timed
+);

@@ -420,3 +420,73 @@ async fn cas_leader_over_a_watchless_cache_elects_and_holds() {
     drop(watch);
     handle.stop().await;
 }
+
+/// The lease-token scenarios against the native standalone lock.
+#[tokio::test]
+async fn lock_token_conformance() {
+    use cluster_conformance::run_lock_token_conformance;
+
+    let (_container, base_config) = common::start_redis_lock_only().await;
+    let url = base_config.url;
+    let scenario_index = AtomicUsize::new(0);
+
+    Box::pin(run_lock_token_conformance(
+        || {
+            let url = url.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let config = common::lock_config_for_scenario(
+                    &url,
+                    "confltok",
+                    index,
+                    serde_json::json!({}),
+                );
+                let handle = RedisLockPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("a fresh per-scenario standalone lock instance starts");
+                let lock = handle.lock();
+                ScenarioBackend::with_teardown(lock, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    ))
+    .await;
+}
+
+/// The lease-token scenarios against the CAS leader over this cache.
+#[tokio::test]
+async fn leader_token_conformance() {
+    use cluster::defaults::CasBasedLeaderElectionBackend;
+    use cluster_conformance::run_leader_token_conformance;
+    use cluster_sdk::LeaderElectionBackend;
+
+    let (_container, base_config) = common::start_redis_durable().await;
+    let url = base_config.url;
+    let scenario_index = AtomicUsize::new(0);
+
+    Box::pin(run_leader_token_conformance(
+        || {
+            let url = url.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let config = common::cluster_config_for_scenario(
+                    &url,
+                    "confltokleader",
+                    index,
+                    serde_json::json!({}),
+                );
+                let handle = RedisClusterPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("a fresh per-scenario instance starts");
+                let leader = Arc::new(
+                    CasBasedLeaderElectionBackend::new(handle.cache()).expect("linearizable"),
+                ) as Arc<dyn LeaderElectionBackend>;
+                ScenarioBackend::with_teardown(leader, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    ))
+    .await;
+}

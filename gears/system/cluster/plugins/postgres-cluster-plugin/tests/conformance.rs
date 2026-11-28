@@ -211,3 +211,80 @@ async fn leader_conformance() {
     )
     .await;
 }
+
+/// The lease-token scenarios against the native lock.
+#[tokio::test]
+async fn lock_token_conformance() {
+    use cluster_conformance::run_lock_token_conformance;
+    use postgres_cluster_plugin::PostgresLockPlugin;
+
+    let (_container, base_config) = common::start_postgres_lock_only().await;
+    let base_connection_string = base_config.connection_string;
+    let scenario_index = AtomicUsize::new(0);
+
+    run_lock_token_conformance(
+        || {
+            let base_connection_string = base_connection_string.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let schema = format!("conformance_ltok_{index}");
+                let connection_string =
+                    common::isolated_schema_connection_string(&base_connection_string, &schema)
+                        .await;
+                let config = common::lock_config_for_schema_with(
+                    &connection_string,
+                    &schema,
+                    serde_json::json!({ "lock_reaper_interval_ms": 25 }),
+                );
+                let handle = PostgresLockPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("fresh per-scenario schema starts");
+                let lock = handle.lock();
+                ScenarioBackend::with_teardown(lock, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    )
+    .await;
+}
+
+/// The lease-token scenarios against the CAS default over this cache.
+#[tokio::test]
+async fn leader_token_conformance() {
+    use cluster::defaults::CasBasedLeaderElectionBackend;
+    use cluster_conformance::run_leader_token_conformance;
+    use cluster_sdk::LeaderElectionBackend;
+
+    let (_container, base_config) = common::start_postgres().await;
+    let base_connection_string = base_config.connection_string;
+    let scenario_index = AtomicUsize::new(0);
+
+    run_leader_token_conformance(
+        || {
+            let base_connection_string = base_connection_string.clone();
+            let index = scenario_index.fetch_add(1, Ordering::Relaxed);
+            async move {
+                let schema = format!("conformance_ltok_leader_{index}");
+                let connection_string =
+                    common::isolated_schema_connection_string(&base_connection_string, &schema)
+                        .await;
+                let config = common::cluster_config_for_schema_with(
+                    &connection_string,
+                    &schema,
+                    serde_json::json!({}),
+                );
+                let handle = PostgresClusterPlugin::builder(config)
+                    .build_and_start()
+                    .await
+                    .expect("fresh per-scenario schema starts");
+                let leader = Arc::new(
+                    CasBasedLeaderElectionBackend::new(handle.cache()).expect("linearizable"),
+                ) as Arc<dyn LeaderElectionBackend>;
+                ScenarioBackend::with_teardown(leader, async move { handle.stop().await })
+            }
+        },
+        TimeControl::Real,
+    )
+    .await;
+}

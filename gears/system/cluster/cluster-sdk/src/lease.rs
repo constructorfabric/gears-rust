@@ -116,13 +116,19 @@ pub fn validate_fence_retention(retention: Duration) -> Result<(), crate::error:
 /// directions live beside the DTO.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LeaseToken {
-    /// Lock name or election name — the lease's identity within the profile.
-    /// Unprefixed: the name the consumer used, not the backend's cache key.
+    /// Lock name or election name — the lease's identity within the profile, as
+    /// the minting backend recorded it. Through a `scoped()` view it carries the
+    /// view's prefix (`event-broker/ledger`), as a [`LockGuard`](crate::lock::LockGuard)
+    /// does; the scoped wrappers forward the token verbatim, never re-deriving it.
     pub name: String,
     /// The holder's identity. Two holders never share one.
     pub owner: String,
-    /// Bumped on every acquisition of `name`, including a steal-on-expiry, so a
-    /// stale holder's predicate can never match again.
+    /// Redrawn on every acquisition of `name` (including a steal-on-expiry) so a
+    /// *previous* holder's token can never match the successor's lease. With a
+    /// store counter (the Postgres lock, the cache-backed default) it is a monotonic
+    /// `fence + 1` and the non-match is certain; without one (the Redis `SET NX`
+    /// lock) it is a fresh random `u64` and the non-match is a 2⁻⁶⁴ probabilistic
+    /// bound. Never a globally monotonic third-party fencing token (ADR-002).
     pub fence: u64,
     /// When this claim's most recently written lease deadline falls, in the
     /// renewal task's own [`tokio::time::Instant`] domain — **not** on the wire

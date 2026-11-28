@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use cluster_sdk::{
-    CacheCapability, CacheWatchEvent, ClusterCacheV1, ClusterError, ClusterProfile,
+    CacheCapability, CacheWatchEvent, ClusterCacheV1, ClusterClient, ClusterError, ClusterProfile,
     DistributedLockBackend, DistributedLockV1, ElectionConfig, LeaderElectionBackend,
     LeaderElectionFeatures, LeaderElectionV1, LeaderStatus, LeaderWatch, LeaderWatchEvent,
-    LockFeatures, LockGuard,
+    LeaseToken, LockFeatures, LockGuard,
 };
 use standalone_cluster_plugin::StandaloneClusterPlugin;
 
@@ -215,6 +215,28 @@ impl LeaderElectionBackend for MarkerLeaderElectionBackend {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.elect_with_config(name, config).await
     }
+
+    // The token half counts like the `elect` half, so
+    // `explicit_backends_override_defaults` covers `Join`/`Renew`/`Resign` too.
+    async fn join(
+        &self,
+        name: &str,
+        owner: &str,
+        config: ElectionConfig,
+    ) -> Result<Option<LeaseToken>, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.join(name, owner, config).await
+    }
+
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.renew(token, ttl).await
+    }
+
+    async fn resign(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.resign(token).await
+    }
 }
 
 struct MarkerLockBackend {
@@ -242,6 +264,39 @@ impl DistributedLockBackend for MarkerLockBackend {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.lock(name, ttl, timeout).await
     }
+
+    // The token half counts like the guard half, so
+    // `explicit_backends_override_defaults` covers the over-the-wire methods too.
+    async fn acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire(name, owner, ttl).await
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        timeout: Duration,
+    ) -> Result<LeaseToken, ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.acquire_waiting(name, owner, ttl, timeout).await
+    }
+
+    async fn renew(&self, token: &LeaseToken, ttl: Duration) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.renew(token, ttl).await
+    }
+
+    async fn release(&self, token: &LeaseToken) -> Result<(), ClusterError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.release(token).await
+    }
 }
 
 /// Proves the explicitly-bound backends are the instances actually registered
@@ -250,6 +305,12 @@ impl DistributedLockBackend for MarkerLockBackend {
 /// default-flavored backend but increments its own call counter first; a
 /// resolve-and-invoke through the public facade that leaves a counter at zero
 /// would mean the explicit binding was silently dropped in favor of a default.
+///
+/// The guard/`elect` half is exercised through the public facade
+/// ([`DistributedLockV1`]/[`LeaderElectionV1`]); the store-owned-lease token half
+/// through the raw backends the gRPC services call
+/// ([`ClusterClient::lock_backend`]/[`ClusterClient::leader_election_backend`]).
+/// Both must land on the *bound* marker.
 #[tokio::test]
 async fn explicit_backends_override_defaults() {
     let hub = Arc::new(ClientHub::new());
@@ -311,6 +372,58 @@ async fn explicit_backends_override_defaults() {
         lock_calls.load(Ordering::SeqCst),
         1,
         "the explicitly-bound lock backend must receive the call, not an SDK default"
+    );
+
+    // The token path, resolved the way the gRPC services resolve it; the facade's
+    // `elect`/`try_lock` never reach these methods.
+    let client = hub
+        .get::<dyn ClusterClient>()
+        .expect("a wired process registers a ClusterClient");
+
+    // Leader token path on a name the held `elect("primary")` does not contend, so
+    // `join` wins and the token is renewable/resignable.
+    let leader_backend = client
+        .leader_election_backend(EventBroker::NAME)
+        .expect("the bound leader backend resolves");
+    let claim = leader_backend
+        .join("coordinator", "owner-lead", ElectionConfig::default())
+        .await
+        .expect("join over the linearizable cache succeeds")
+        .expect("an uncontended join wins the claim");
+    leader_backend
+        .renew(&claim, Duration::from_secs(30))
+        .await
+        .expect("renewing the fresh claim succeeds");
+    leader_backend
+        .resign(&claim)
+        .await
+        .expect("resigning the claim succeeds");
+    assert_eq!(
+        leader_calls.load(Ordering::SeqCst),
+        4,
+        "the bound leader backend must also serve the token path (elect + join + renew + resign)"
+    );
+
+    // Lock token path on a distinct name (the `try_lock("ledger")` guard aside).
+    let lock_backend = client
+        .lock_backend(EventBroker::NAME)
+        .expect("the bound lock backend resolves");
+    let token = lock_backend
+        .acquire("shard-token", "owner-lock", Duration::from_secs(30))
+        .await
+        .expect("acquiring the store-owned lease succeeds");
+    lock_backend
+        .renew(&token, Duration::from_secs(30))
+        .await
+        .expect("renewing the lease succeeds");
+    lock_backend
+        .release(&token)
+        .await
+        .expect("releasing the lease succeeds");
+    assert_eq!(
+        lock_calls.load(Ordering::SeqCst),
+        4,
+        "the bound lock backend must also serve the token path (try_lock + acquire + renew + release)"
     );
 
     handle.stop().await;

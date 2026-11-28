@@ -437,7 +437,10 @@ impl RedisSignals {
     /// Mirrors `cluster::defaults::lock::record_lock` deliberately: the SDK's
     /// CAS-based default lock and this native one must be indistinguishable on a
     /// dashboard, or an operator moving a profile from the default lock to the
-    /// Redis one would see their panels go blank.
+    /// Redis one would see their panels go blank. That includes the `op` label
+    /// set every lock backend shares: `try_lock`/`lock`/`renew`/`release` for the
+    /// guard path, `acquire`/`acquire_waiting`/`token_renew`/`token_release` for
+    /// the token path (OBSERVABILITY.md §5).
     pub fn record_lock<T>(
         &self,
         op: &'static str,
