@@ -26,6 +26,8 @@ impl ClusterProfile for EventBrokerProfile {
     const NAME: &'static str = "event-broker";
 }
 
+cluster_sdk::register_cluster_profile!(EventBrokerProfile);
+
 /// Resolved handle onto the platform `cluster` gear's three coordination
 /// primitives, scoped for the Event Broker. Both standalone and cluster modes
 /// resolve the same facade types (`DESIGN.md` "3.8 Deployment Topology":

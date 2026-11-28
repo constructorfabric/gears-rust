@@ -20,7 +20,7 @@
 //! the eviction a JOIN performs.
 
 use crate::domain::model::{Sequence, Subscription};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use toolkit::domain_model;
@@ -443,9 +443,8 @@ fn retire(member: &MemberEntry, version: i64) {
         .send_replace(Generation::new(version, Vec::new()));
 }
 
-/// Recomputes the split over the group's members under a new topology
-/// version, publishes it, and writes it back onto every member's
-/// subscription.
+/// Recomputes the split, stores it on every member's subscription, then
+/// publishes it under the new topology version.
 ///
 /// Every member's `topology_version` advances, including one whose partitions
 /// did not move: the version names the group's topology, and a SEEK is fenced
@@ -454,12 +453,18 @@ fn rebalance(group: &mut GroupState) -> HashMap<Uuid, Vec<Assignment>> {
     group.topology_version += 1;
     let version = group.topology_version;
     let new_assignments = compute_assignments(&group.members);
-    publish_generations(group, &new_assignments, version);
     for (id, member) in &mut group.members {
         if let Some(assigned) = new_assignments.get(id) {
             member.subscription.assigned.clone_from(assigned);
         }
         member.subscription.topology_version = version;
+    }
+    // The watch must retain the latest generation even before a stream opens.
+    for member in group.members.values() {
+        member.generations.send_replace(Generation::new(
+            version,
+            member.subscription.assigned.clone(),
+        ));
     }
     new_assignments
 }
@@ -536,59 +541,6 @@ impl std::fmt::Debug for MembershipHandle {
             .field("group_id", &self.group_id)
             .field("sub_id", &self.sub_id)
             .finish_non_exhaustive()
-    }
-}
-
-/// Publishes each changed member's new assignment on its own `watch`.
-///
-/// No classification and no frames. Whether a change is a gain, a loss, or only
-/// a version bump is `AssignmentDelta::classify`'s answer, and it is the
-/// session's to ask - it is the only party that knows where its readers
-/// actually are. The coordinator computes assignments; it does not decide
-/// frames.
-fn publish_generations(
-    group: &GroupState,
-    new_assignments: &HashMap<Uuid, Vec<Assignment>>,
-    version: i64,
-) {
-    // No member is skipped, including the one whose join or leave triggered
-    // this. The frame-push version skipped the caller, because it received its
-    // topology baseline in the response body and a pushed frame would have
-    // duplicated it. A `watch` is state rather than an event: every member's
-    // watch has to hold that member's *current* assignment, or a session opening
-    // later reads a stale baseline and classifies its first real change against
-    // it. Skipping the joiner left its watch on the empty seed, so the next
-    // sibling change looked like a gain and terminated a stream that had only
-    // lost partitions.
-    for (&member_id, new_assigned) in new_assignments {
-        let Some(member) = group.members.get(&member_id) else {
-            continue;
-        };
-
-        let old_set: HashSet<(GtsInstanceId, i32)> = member
-            .subscription
-            .assigned
-            .iter()
-            .map(|a| (a.topic.clone(), a.partition))
-            .collect();
-        let new_set: HashSet<(GtsInstanceId, i32)> = new_assigned
-            .iter()
-            .map(|a| (a.topic.clone(), a.partition))
-            .collect();
-        if new_set == old_set {
-            continue;
-        }
-
-        // `send_replace`, not `send`. `send` *fails and discards the value* when
-        // there are no receivers, and at join time there is none yet - the
-        // stream opens afterwards. That silently left a member's watch holding
-        // its empty seed, so its session's first real change classified against
-        // nothing and read as a gain, terminating a stream that had only lost
-        // partitions. A watch used as state has to be written whether or not
-        // anyone is currently listening.
-        member
-            .generations
-            .send_replace(Generation::new(version, new_assigned.clone()));
     }
 }
 

@@ -14,11 +14,14 @@ import pytest
 from .conftest import (
     EVENT_TYPE_STREAM,
     SUBJECT_TYPE,
+    TOKEN_PRINCIPAL_A,
+    TOKEN_PRINCIPAL_B,
     TOPIC_LONGPOLL,
     TOPIC_PREFILLED,
     TOPIC_STREAM,
     TOPIC_STRICT,
     TRACE_ID,
+    UNKNOWN_SEGMENTS_TOPIC,
 )
 
 
@@ -86,27 +89,63 @@ async def test_segments_of_an_empty_partition_report_an_empty_manifest(api):
     }
 
 
-async def test_segments_for_unknown_topic_returns_404(api):
+async def test_segments_for_unknown_topic_returns_404(_unknown_segments_api):
     """scenario: topics/1.03-negative-segments-unknown-topic.md"""
-    unknown = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.nonexistent.v1"
-    async with api() as client:
-        resp = await client.get(
-            f"/topics/segments?topic={unknown}&partition=0"
+    unknown = {"topic": UNKNOWN_SEGMENTS_TOPIC, "partition": 0}
+    async with (
+        _unknown_segments_api(TOKEN_PRINCIPAL_A) as owner,
+        _unknown_segments_api(TOKEN_PRINCIPAL_B) as peer,
+    ):
+        refused = await peer.get("/topics/segments", params=unknown)
+        assert (refused.status_code, refused.headers["content-type"]) == (
+            403, "application/problem+json",
         )
-    assert resp.status_code == 404
-    body = resp.json()
-    assert body == {
-        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
-        "title": "Not Found",
-        "status": 404,
-        "detail": body["detail"],
-        "instance": body["instance"],
-        "trace_id": TRACE_ID,
-        "context": {
-            "resource_type": "gts.cf.core.events.topic.v1~",
-            "resource_name": unknown,
-        },
-    }
+        assert refused.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~",
+            "title": "Permission Denied",
+            "status": 403,
+            "detail": "You do not have permission to perform this operation",
+            "instance": "/event-broker/v1/topics/segments",
+            "trace_id": TRACE_ID,
+            "context": {
+                "reason": "access denied by policy",
+                "resource_type": "gts.cf.core.events.topic.v1~",
+            },
+        }
+
+        control = await owner.get(
+            "/topics/segments", params={"topic": TOPIC_STRICT, "partition": 0},
+        )
+        assert (control.status_code, control.headers["content-type"]) == (200, "application/json")
+        manifest = control.json()
+        assert manifest == {
+            "topic": TOPIC_STRICT,
+            "partition": 0,
+            "start_sequence": 0,
+            "end_sequence": 0,
+            "start_time": None,
+            "end_time": None,
+            "segments": [],
+        }
+        for field in ("partition", "start_sequence", "end_sequence"):
+            assert type(manifest[field]) is int
+
+        missing = await owner.get("/topics/segments", params=unknown)
+        assert (missing.status_code, missing.headers["content-type"]) == (
+            404, "application/problem+json",
+        )
+        assert missing.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+            "title": "Not Found",
+            "status": 404,
+            "detail": f"topic '{UNKNOWN_SEGMENTS_TOPIC}' is not registered",
+            "instance": "/event-broker/v1/topics/segments",
+            "trace_id": TRACE_ID,
+            "context": {
+                "resource_type": "gts.cf.core.events.topic.v1~",
+                "resource_name": UNKNOWN_SEGMENTS_TOPIC,
+            },
+        }
 
 
 async def test_list_event_types_returns_paged_list(api):

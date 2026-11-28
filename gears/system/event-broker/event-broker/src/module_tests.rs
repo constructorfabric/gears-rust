@@ -1,24 +1,36 @@
 //! Per-mode service/route gating tests: which routes and services each
 //! `DeploymentMode` registers, and which it must not.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use cluster_sdk::cache::ClusterCacheBackend;
+use cluster_sdk::dto::{ProfileDescriptor, ProfileHealth};
+use cluster_sdk::leader::LeaderElectionBackend;
+use cluster_sdk::lock::DistributedLockBackend;
+use cluster_sdk::{ClusterClient, ClusterError};
 use http_body_util::BodyExt;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 use toolkit::api::operation_builder::OperationSpec;
-use toolkit::{ClientHub, Gear, GearCtx, RestApiCapability};
+use toolkit::client_hub::ClientHubError;
+use toolkit::directory::{
+    DirectoryClient, RegisterInstanceInfo, ServiceEndpoint, ServiceInstanceInfo,
+};
+use toolkit::{ClientHub, Gear, GearCtx, HealthcheckStatus, RestApiCapability};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::{BACKEND_STOP_GRACE, EventBrokerModule, start_backends, stop_backends};
-use crate::config::{DeploymentMode, EventBrokerConfig};
+use super::{BACKEND_STOP_GRACE, EventBrokerModule, Supervisor, start_backends, stop_backends};
+use crate::ExternallyManagedDirectoryPresence;
+use crate::config::{DeploymentMode, EventBrokerConfig, RegistrationConfig};
+use crate::domain::cluster::EventBrokerCluster;
 use crate::test_support::gear_db::ScratchSqlite;
 use crate::test_support::module_boot::StaticConfigProvider;
 use event_broker_sdk::backend::{
@@ -27,6 +39,43 @@ use event_broker_sdk::backend::{
 };
 use event_broker_sdk::models::Event;
 use event_broker_sdk::{PartitionRange, Position, Sequence, TopicSegment};
+
+#[test]
+fn the_broker_publishes_exactly_its_two_sdk_base_schemas() -> anyhow::Result<()> {
+    let descriptors: Vec<_> = toolkit::gts_publication::linked_descriptors()
+        .into_iter()
+        .filter(|descriptor| descriptor.gear == "event-broker")
+        .collect();
+    let [descriptor] = descriptors.as_slice() else {
+        anyhow::bail!("expected one event-broker publication descriptor, found {descriptors:?}");
+    };
+    let manifest = descriptor.build_gts_manifest(&StaticConfigProvider { root: json!({}) })?;
+    assert_eq!(manifest.publisher_name(), "event-broker");
+    assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
+    let documents: Vec<_> = manifest
+        .documents()
+        .iter()
+        .map(|(id, schema)| (id.id(), schema.clone()))
+        .collect();
+    assert_eq!(
+        documents,
+        [
+            (
+                "gts.cf.core.events.event.v1~",
+                serde_json::from_str(include_str!(
+                    "../../docs/schemas/gts.cf.core.events.event.v1~.schema.json"
+                ))?,
+            ),
+            (
+                "gts.cf.core.events.topic.v1~",
+                serde_json::from_str(include_str!(
+                    "../../docs/schemas/gts.cf.core.events.topic.v1~.schema.json"
+                ))?,
+            ),
+        ]
+    );
+    Ok(())
+}
 
 struct NoopOpenApiRegistry;
 
@@ -218,6 +267,548 @@ async fn init_fails_on_wildcard_bind_with_no_advertise_addr_in_cluster_mode() {
         format!("{err:#}").contains("wildcard address"),
         "error: {err:#}"
     );
+}
+
+fn directory_presence_context(config: &serde_json::Value, hub: Arc<ClientHub>) -> GearCtx {
+    GearCtx::new(
+        EventBrokerModule::MODULE_NAME,
+        Uuid::from_u128(1),
+        Arc::new(StaticConfigProvider {
+            root: json!({ "event-broker": { "config": config } }),
+        }),
+        hub,
+        CancellationToken::new(),
+    )
+}
+
+#[tokio::test]
+async fn a_managed_role_reaches_the_database_check_with_the_default_registration_address() {
+    let missing_database = "Database is not configured for gear 'event-broker'";
+    let wildcard_address = "cannot register with DirectoryService: bound to a wildcard address (0.0.0.0:0) with no `registration.advertise_addr` configured - set one to a routable host";
+
+    for (mode, embedded_data_role) in [
+        ("cluster_ingest", true),
+        ("cluster_delivery", true),
+        ("standalone", false),
+        ("cluster_dispatcher", false),
+    ] {
+        for (local_marker, proxy_marker, invalid_address) in [
+            (true, false, false),
+            (true, false, true),
+            (false, false, false),
+            (false, true, false),
+        ] {
+            let hub = Arc::new(ClientHub::new());
+            if local_marker {
+                hub.register(Arc::new(ExternallyManagedDirectoryPresence));
+            }
+            if proxy_marker {
+                hub.register_remote_proxy(Arc::new(ExternallyManagedDirectoryPresence));
+            }
+            let mut config = json!({
+                "mode": mode,
+                "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+                "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
+            });
+            if invalid_address {
+                config["registration"] = json!({ "listen_addr": "invalid-address" });
+            }
+            let ctx = directory_presence_context(&config, hub);
+            let error = EventBrokerModule::default()
+                .init(&ctx)
+                .await
+                .expect_err("init stops at the address preflight or the database check");
+            let expected = if embedded_data_role && !local_marker {
+                wildcard_address
+            } else {
+                missing_database
+            };
+            assert_eq!(
+                error.to_string(),
+                expected,
+                "{mode}, local marker: {local_marker}, proxy marker: {proxy_marker}, malformed address: {invalid_address}"
+            );
+        }
+    }
+
+    let hub = Arc::new(ClientHub::new());
+    hub.register(Arc::new(ExternallyManagedDirectoryPresence));
+    let ctx = directory_presence_context(
+        &json!({
+            "mode": "cluster_ingest",
+            "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+            "backend_routing": {},
+        }),
+        hub,
+    );
+    let error = EventBrokerModule::default()
+        .init(&ctx)
+        .await
+        .expect_err("C4 stops a managed role at startup");
+    assert_eq!(
+        error.to_string(),
+        "backend_routing: there is no route for `gts.cf.core.events.topic.v1~`; it is required so that every topic resolves to a registry entry (feature 0005 section 2.4, C4)"
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DirectoryCall {
+    Register {
+        gear: String,
+        instance_id: String,
+        grpc_services: Vec<(String, ServiceEndpoint)>,
+        version: Option<String>,
+        rest_endpoint: Option<ServiceEndpoint>,
+        labels: BTreeMap<String, String>,
+    },
+    Heartbeat(String, String),
+    Deregister(String, String),
+}
+
+#[derive(Default)]
+struct RecordingDirectory {
+    journal: Mutex<Vec<DirectoryCall>>,
+    heartbeat: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl DirectoryClient for RecordingDirectory {
+    async fn resolve_grpc_service(&self, _: &str) -> anyhow::Result<ServiceEndpoint> {
+        panic!("presence never resolves gRPC services")
+    }
+
+    async fn resolve_rest_service(&self, _: &str) -> anyhow::Result<ServiceEndpoint> {
+        panic!("presence never resolves REST services")
+    }
+
+    async fn list_instances(&self, _: &str) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+        panic!("presence never lists a gear's instances")
+    }
+
+    async fn list_all_instances(&self) -> anyhow::Result<Vec<ServiceInstanceInfo>> {
+        panic!("presence never lists all instances")
+    }
+
+    async fn register_instance(&self, info: RegisterInstanceInfo) -> anyhow::Result<()> {
+        self.journal
+            .lock()
+            .expect("directory journal")
+            .push(DirectoryCall::Register {
+                gear: info.gear,
+                instance_id: info.instance_id,
+                grpc_services: info.grpc_services,
+                version: info.version,
+                rest_endpoint: info.rest_endpoint,
+                labels: info.labels,
+            });
+        Ok(())
+    }
+
+    async fn send_heartbeat(&self, gear: &str, instance_id: &str) -> anyhow::Result<()> {
+        self.journal
+            .lock()
+            .expect("directory journal")
+            .push(DirectoryCall::Heartbeat(
+                gear.to_owned(),
+                instance_id.to_owned(),
+            ));
+        self.heartbeat.notify_one();
+        Ok(())
+    }
+
+    async fn deregister_instance(&self, gear: &str, instance_id: &str) -> anyhow::Result<()> {
+        self.journal
+            .lock()
+            .expect("directory journal")
+            .push(DirectoryCall::Deregister(
+                gear.to_owned(),
+                instance_id.to_owned(),
+            ));
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn embedded_roles_register_heartbeat_and_deregister_with_the_same_identity() {
+    let mut prior_instance_id = None;
+    for (mode, gear, proxy_marker) in [
+        (DeploymentMode::ClusterIngest, "event-broker-ingest", false),
+        (
+            DeploymentMode::ClusterDelivery,
+            "event-broker-delivery",
+            true,
+        ),
+    ] {
+        let directory = Arc::new(RecordingDirectory::default());
+        let hub = Arc::new(ClientHub::new());
+        hub.register::<dyn DirectoryClient>(directory.clone());
+        if proxy_marker {
+            hub.register_remote_proxy(Arc::new(ExternallyManagedDirectoryPresence));
+        }
+        let ctx = directory_presence_context(&json!({}), hub);
+        let module = EventBrokerModule {
+            client_hub: ctx.client_hub().into(),
+            registration: RegistrationConfig {
+                listen_addr: "127.0.0.1:8080".to_owned(),
+                advertise_addr: None,
+            }
+            .into(),
+            ..EventBrokerModule::default()
+        };
+        let cancel = CancellationToken::new();
+        let mut supervisor = Supervisor::new(cancel.child_token());
+        let epoch = tokio::time::Instant::now();
+
+        tokio::time::timeout(
+            BOUND,
+            module.start_directory_presence(&mut supervisor, mode),
+        )
+        .await
+        .expect("presence startup is bounded")
+        .expect("embedded registration succeeds");
+        let initial_calls = directory.journal.lock().expect("directory journal").clone();
+        let [DirectoryCall::Register { instance_id, .. }] = initial_calls.as_slice() else {
+            panic!("{mode:?} registers once on entry: {initial_calls:?}");
+        };
+        let id = Uuid::parse_str(instance_id).expect("the registration carries a UUID");
+        assert_eq!(id.get_version(), Some(uuid::Version::Random));
+        assert_ne!(Some(id), prior_instance_id);
+        prior_instance_id = Some(id);
+        let registration = DirectoryCall::Register {
+            gear: gear.to_owned(),
+            instance_id: instance_id.clone(),
+            grpc_services: vec![],
+            version: None,
+            rest_endpoint: Some(ServiceEndpoint {
+                uri: "http://127.0.0.1:8080".to_owned(),
+            }),
+            // Embedded registration omits the planned `evbk-affinity` label (#5552).
+            labels: BTreeMap::new(),
+        };
+        assert_eq!(
+            initial_calls,
+            std::slice::from_ref(&registration),
+            "{mode:?}"
+        );
+
+        // On the paused clock, time advances only after the worker has parked
+        // and the timer driver has serviced its immediate tick.
+        tokio::time::sleep(Duration::from_secs(14)).await;
+        assert_eq!(
+            *directory.journal.lock().expect("directory journal"),
+            std::slice::from_ref(&registration),
+            "{mode:?}"
+        );
+
+        let heartbeat_period = Duration::from_secs(15);
+        let observed = tokio::time::timeout_at(
+            epoch + heartbeat_period + BOUND,
+            directory.heartbeat.notified(),
+        )
+        .await;
+        let heartbeat = DirectoryCall::Heartbeat(gear.to_owned(), instance_id.clone());
+        assert_eq!(
+            *directory.journal.lock().expect("directory journal"),
+            [registration.clone(), heartbeat.clone()],
+            "{mode:?}"
+        );
+        observed.expect("the first heartbeat notifies its observer");
+        assert!(
+            (heartbeat_period..heartbeat_period + Duration::from_millis(1))
+                .contains(&epoch.elapsed())
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(BOUND, supervisor.supervise())
+            .await
+            .expect("presence shutdown is bounded")
+            .expect("presence shuts down cleanly");
+        assert_eq!(
+            *directory.journal.lock().expect("directory journal"),
+            [
+                registration,
+                heartbeat,
+                DirectoryCall::Deregister(gear.to_owned(), instance_id.clone())
+            ],
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn nonregistering_roles_keep_a_supervised_cancel_gate_and_make_no_directory_calls() {
+    for (mode, marked, with_directory) in [
+        (DeploymentMode::ClusterIngest, true, true),
+        (DeploymentMode::ClusterDelivery, true, true),
+        (DeploymentMode::Standalone, false, true),
+        (DeploymentMode::Standalone, true, true),
+        (DeploymentMode::ClusterDispatcher, false, true),
+        (DeploymentMode::ClusterDispatcher, true, true),
+        (DeploymentMode::ClusterIngest, true, false),
+    ] {
+        let directory = Arc::new(RecordingDirectory::default());
+        let hub = Arc::new(ClientHub::new());
+        if marked {
+            hub.register(Arc::new(ExternallyManagedDirectoryPresence));
+        }
+        if with_directory {
+            hub.register::<dyn DirectoryClient>(directory.clone());
+        }
+        let ctx = directory_presence_context(&json!({}), hub);
+        let mut registration = RegistrationConfig::default();
+        if with_directory {
+            registration.listen_addr = "127.0.0.1:8080".to_owned();
+        }
+        let module = EventBrokerModule {
+            client_hub: ctx.client_hub().into(),
+            registration: registration.into(),
+            ..EventBrokerModule::default()
+        };
+        let cancel = CancellationToken::new();
+        let mut supervisor = Supervisor::new(cancel.child_token());
+        tokio::time::timeout(
+            BOUND,
+            module.start_directory_presence(&mut supervisor, mode),
+        )
+        .await
+        .expect("presence startup is bounded")
+        .expect("the cancel gate needs no legacy address or directory");
+        assert_eq!(
+            *directory.journal.lock().expect("directory journal"),
+            [],
+            "{mode:?}, marker: {marked}"
+        );
+        let workers = supervisor.tasks.len();
+        let mut supervised = std::pin::pin!(supervisor.supervise());
+        tokio::select! {
+            biased;
+            result = &mut supervised => panic!("{mode:?}, marker: {marked}: supervisor completed before cancellation: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(16)) => {}
+        }
+        assert_eq!(workers, 1, "{mode:?}, marker: {marked}");
+        assert_eq!(
+            *directory.journal.lock().expect("directory journal"),
+            [],
+            "{mode:?}, marker: {marked}"
+        );
+
+        cancel.cancel();
+        tokio::time::timeout(BOUND, supervised)
+            .await
+            .expect("cancel gate shutdown is bounded")
+            .expect("cancel gate shuts down cleanly");
+        assert_eq!(
+            *directory.journal.lock().expect("directory journal"),
+            [],
+            "{mode:?}, marker: {marked}"
+        );
+    }
+}
+
+#[test]
+fn dispatcher_still_requires_its_directory_for_routes_when_presence_is_managed() {
+    let hub = Arc::new(ClientHub::new());
+    hub.register(Arc::new(ExternallyManagedDirectoryPresence));
+    let ctx = directory_presence_context(&json!({}), hub.clone());
+    let module = EventBrokerModule {
+        mode: DeploymentMode::ClusterDispatcher.into(),
+        ..EventBrokerModule::default()
+    };
+
+    let Err(error) = module.register_rest(&ctx, Router::new(), &NoopOpenApiRegistry) else {
+        panic!("dispatcher route registration requires a directory client");
+    };
+    let Some(ClientHubError::NotFound { type_key }) = error.downcast_ref::<ClientHubError>() else {
+        panic!("expected a missing ClientHub dependency, found {error:#}");
+    };
+    assert_eq!(
+        format!("{type_key:?}"),
+        std::any::type_name::<dyn DirectoryClient>()
+    );
+
+    let directory = Arc::new(RecordingDirectory::default());
+    hub.register::<dyn DirectoryClient>(directory.clone());
+    let _router = module
+        .register_rest(&ctx, Router::new(), &NoopOpenApiRegistry)
+        .expect("dispatcher routes build with a directory client");
+    assert_eq!(*directory.journal.lock().expect("directory journal"), []);
+}
+
+#[test]
+fn the_eb_profile_is_declared_for_cluster_wiring() {
+    let profiles = cluster_sdk::registered_profiles();
+    assert!(profiles.contains(&"event-broker"), "{profiles:?}");
+}
+
+#[tokio::test]
+async fn a_readiness_check_collected_before_init_reports_starting() {
+    let ctx = GearCtx::new(
+        EventBrokerModule::MODULE_NAME,
+        Uuid::from_u128(0x5eed),
+        Arc::new(StaticConfigProvider { root: json!({}) }),
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+    );
+    let module = EventBrokerModule::default();
+    let readiness = module
+        .healthcheck(&ctx)
+        .expect("the gear reports readiness");
+
+    let result = readiness.check().await;
+    assert_eq!(
+        (
+            readiness.name(),
+            result.status,
+            result.message.as_deref(),
+            result.code.as_deref()
+        ),
+        (
+            "event-broker-readiness",
+            HealthcheckStatus::Unhealthy,
+            Some("event-broker init has not run"),
+            Some("starting")
+        )
+    );
+}
+
+struct ReadinessCluster {
+    client: Arc<dyn ClusterClient>,
+    degraded: AtomicBool,
+    refreshes: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ClusterClient for ReadinessCluster {
+    fn cache_backend(&self, profile: &str) -> Result<Arc<dyn ClusterCacheBackend>, ClusterError> {
+        self.client.cache_backend(profile)
+    }
+
+    fn lock_backend(&self, profile: &str) -> Result<Arc<dyn DistributedLockBackend>, ClusterError> {
+        self.client.lock_backend(profile)
+    }
+
+    fn leader_election_backend(
+        &self,
+        profile: &str,
+    ) -> Result<Arc<dyn LeaderElectionBackend>, ClusterError> {
+        self.client.leader_election_backend(profile)
+    }
+
+    async fn descriptor(&self, profile: &str) -> Result<ProfileDescriptor, ClusterError> {
+        let mut descriptor = self.client.descriptor(profile).await?;
+        if self.degraded.load(Ordering::Relaxed) {
+            descriptor.health = ProfileHealth::Degraded;
+        }
+        Ok(descriptor)
+    }
+
+    async fn refresh_descriptors(&self) -> Result<(), ClusterError> {
+        self.refreshes.fetch_add(1, Ordering::Relaxed);
+        self.client.refresh_descriptors().await
+    }
+}
+
+#[tokio::test]
+async fn the_broker_preserves_storage_precedence_and_reports_cluster_health() {
+    let hub = Arc::new(ClientHub::new());
+    crate::test_support::register_standalone_cluster_stub(&hub).await;
+    let cluster = Arc::new(ReadinessCluster {
+        client: hub
+            .get::<dyn ClusterClient>()
+            .expect("the fixture binds the cluster"),
+        degraded: AtomicBool::new(false),
+        refreshes: AtomicUsize::new(0),
+    });
+    hub.register::<dyn ClusterClient>(cluster.clone());
+    let (ctx, _db) = make_ctx_with_hub("standalone", hub).await;
+    let standalone = EventBrokerModule::default();
+    standalone.init(&ctx).await.expect("standalone initializes");
+
+    // Cluster delivery requires a non-SQLite gear database. Reuse the initialized
+    // storage to exercise the delivery readiness path without starting a database server.
+    let delivery = EventBrokerModule {
+        mode: OnceLock::from(DeploymentMode::ClusterDelivery),
+        client_hub: OnceLock::from(ctx.client_hub()),
+        storage: standalone.storage.clone(),
+        ..EventBrokerModule::default()
+    };
+    let standalone_readiness = standalone
+        .healthcheck(&ctx)
+        .expect("standalone reports readiness");
+    let delivery_readiness = delivery
+        .healthcheck(&ctx)
+        .expect("delivery reports readiness");
+    EventBrokerCluster::resolve(&ctx.client_hub())
+        .await
+        .expect("the serving profile binds and records the broker requirements");
+    cluster.degraded.store(true, Ordering::Relaxed);
+
+    let result = standalone_readiness.check().await;
+    assert_eq!(
+        (
+            standalone_readiness.name(),
+            result.status,
+            result.message.as_deref(),
+            result.code.as_deref()
+        ),
+        (
+            "event-broker-readiness",
+            HealthcheckStatus::Unhealthy,
+            Some("ingest outbox pipeline not started"),
+            Some("starting")
+        )
+    );
+    let result = delivery_readiness.check().await;
+    assert_eq!(
+        (
+            delivery_readiness.name(),
+            result.status,
+            result.message.as_deref(),
+            result.code.as_deref()
+        ),
+        (
+            "event-broker-readiness",
+            HealthcheckStatus::Unhealthy,
+            Some("cluster cache not wired"),
+            Some("starting")
+        )
+    );
+    assert_eq!(cluster.refreshes.load(Ordering::Relaxed), 0);
+    delivery
+        .wire_cluster_cache()
+        .await
+        .expect("delivery wires its cache");
+
+    tokio::time::pause();
+    for _ in 0..2 {
+        let result = delivery_readiness.check().await;
+        assert_eq!(
+            (
+                result.status,
+                result.message.as_deref(),
+                result.code.as_deref()
+            ),
+            (
+                HealthcheckStatus::Unhealthy,
+                Some("profile `event-broker` is degraded server-side"),
+                Some("cluster-profile-degraded")
+            )
+        );
+        assert_eq!(cluster.refreshes.load(Ordering::Relaxed), 1);
+    }
+
+    cluster.degraded.store(false, Ordering::Relaxed);
+    tokio::time::advance(cluster_sdk::requirements::DESCRIPTOR_REFRESH_INTERVAL).await;
+    let result = delivery_readiness.check().await;
+    assert_eq!(
+        (
+            result.status,
+            result.message.as_deref(),
+            result.code.as_deref()
+        ),
+        (HealthcheckStatus::Healthy, None, None)
+    );
+    assert_eq!(cluster.refreshes.load(Ordering::Relaxed), 2);
 }
 
 /// The readiness `/readyz` reports: `Starting` until `serve()` has wired the

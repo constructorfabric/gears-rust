@@ -1,3 +1,4 @@
+mod client_cleanup;
 mod gear_manager;
 mod grpc_installers;
 mod host_runtime;
@@ -14,7 +15,11 @@ mod system_context;
 pub mod shutdown;
 
 #[cfg(test)]
+mod client_cleanup_tests;
+#[cfg(test)]
 mod tests;
+
+pub use client_cleanup::{ClientCleanup, ClientCleanupError, ClientCleanupFuture};
 
 pub use gear_manager::{
     Endpoint, GearInstance, GearManager, GrpcServiceNameConflict, InstanceState, ReportedState,
@@ -28,7 +33,9 @@ pub use host_runtime::{
 // here; they now live in `toolkit_security`, so consumers import them from
 // there rather than through this re-export.
 #[cfg(feature = "bootstrap")]
-pub use oop_serve::OopServeOptions;
+pub use oop_serve::{
+    OopRequestLimits, OopRequestLimitsError, OopServeOptions, inject_inbound_traceparent,
+};
 pub use presence_manager::{PresenceManager, ReportedStateSource};
 /// Stays unresolved until the application group's migrations, GTS admission,
 /// initialization and startup complete. The system group serves while it waits.

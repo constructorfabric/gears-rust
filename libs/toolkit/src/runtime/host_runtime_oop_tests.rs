@@ -198,6 +198,7 @@ async fn e2e_oop_gear_boots_serves_registers_and_shuts_down() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -404,6 +405,7 @@ async fn the_composed_router_enforces_each_routes_declared_auth() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: Some(toolkit_security::DynBearerAuthenticator::new(
             RejectingBearer,
@@ -501,6 +503,7 @@ async fn a_worker_without_a_tenant_authenticator_fails_before_it_is_advertised()
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -584,6 +587,7 @@ async fn a_worker_with_a_hub_tenant_authenticator_starts_and_checks_bearers() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -764,6 +768,7 @@ async fn an_oop_publishing_gear_is_neither_served_nor_advertised_before_admissio
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -902,6 +907,7 @@ async fn a_system_root_serves_and_is_present_while_the_application_group_waits()
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: Some(toolkit_security::DynInternalAuthenticator::new(
@@ -1110,6 +1116,7 @@ async fn dropping_the_oop_runtime_ends_a_pending_publication_and_the_listener() 
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::new(RecordingDirectory::default()) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -1158,6 +1165,7 @@ fn oop_options(
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: bearer,
         internal_authenticator: Some(toolkit_security::DynInternalAuthenticator::new(
@@ -1532,6 +1540,7 @@ async fn an_anonymous_system_route_stays_anonymous_before_the_application_group(
     );
     let options = OopServeOptions {
         auth_disabled: false,
+        request_limits: None,
         ..oop_options("tenant-axis", addr, &directory, None)
     };
     let server = tokio::spawn(host.run_oop_serving(options));
@@ -1752,4 +1761,166 @@ async fn the_oop_path_wires_a_consumed_client_between_init_and_post_init() {
         consumer.in_post_init.load(Ordering::SeqCst),
         "wired before post_init"
     );
+}
+
+struct UploadGear(Arc<AtomicUsize>);
+
+#[async_trait]
+impl Gear for UploadGear {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for UploadGear {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        let calls = Arc::clone(&self.0);
+        Ok(crate::api::OperationBuilder::post("/upload")
+            .operation_id("limits.upload")
+            .anonymous()
+            .handler(move |body: axum::body::Bytes| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            })
+            .json_response(axum::http::StatusCode::OK, "OK")
+            .register(router, openapi))
+    }
+}
+
+async fn post_upload(addr: SocketAddr, body: &str) -> (u16, String) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let request = format!(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n\
+         traceparent: 00-11111111111111111111111111111111-2222222222222222-01\r\n\r\n{body}",
+        body.len(),
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .expect("read response");
+    let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .expect("status")
+        .parse()
+        .expect("HTTP code");
+    (status, body.to_owned())
+}
+
+#[tokio::test]
+async fn the_host_serves_with_its_configured_request_limits() {
+    use crate::runtime::OopRequestLimits;
+    use futures_util::FutureExt as _;
+
+    const BOUND: Duration = Duration::from_secs(10);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let gear = Arc::new(UploadGear(Arc::clone(&calls)));
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("limits-gear", &[], gear.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("limits-gear", gear as Arc<dyn RestApiCapability>);
+    let registry = builder.build_topo_sorted().expect("gear registry");
+    let directory = Arc::new(RecordingDirectory::default());
+    let cancel = CancellationToken::new();
+    let instance = Uuid::from_u128(31);
+    let host = HostRuntime::new(
+        registry,
+        Arc::new(EmptyConfigProvider),
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+        instance,
+        None,
+    );
+    let options = OopServeOptions::new(
+        "limits-gear".to_owned(),
+        instance.to_string(),
+        "http://127.0.0.1:0".to_owned(),
+        "127.0.0.1:0".parse().expect("listen address"),
+        Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+    )
+    .with_request_limits(OopRequestLimits::new(4, Duration::from_secs(2)).expect("limits"));
+    let mut server = tokio::spawn(host.run_oop_serving(options));
+    let result = std::panic::AssertUnwindSafe(async {
+        let addr: SocketAddr = tokio::time::timeout(BOUND, async {
+            loop {
+                let endpoint = directory.registered_endpoint.lock().clone();
+                if let Some(endpoint) = endpoint {
+                    let endpoint = url::Url::parse(&endpoint).expect("registered HTTP endpoint");
+                    assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+                    break SocketAddr::from(([127, 0, 0, 1], endpoint.port().expect("bound port")));
+                }
+                assert!(!server.is_finished(), "host exited before registration");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("host registered");
+        assert!(
+            tokio::time::timeout(BOUND, poll_status(addr, "/readyz", 200, BOUND))
+                .await
+                .expect("readiness wait"),
+            "host must serve readiness"
+        );
+        assert!(!server.is_finished(), "fixture owns the ready listener");
+        let (status, body) = tokio::time::timeout(BOUND, post_upload(addr, "abcde"))
+            .await
+            .expect("oversize request");
+        assert_eq!(status, 413);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).expect("Problem JSON"),
+            serde_json::json!({
+                "type":"about:blank", "title":"Payload Too Large", "status":413,
+                "detail":"Payload Too Large", "instance":"/upload",
+                "trace_id":"11111111111111111111111111111111", "context":{}
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            tokio::time::timeout(BOUND, post_upload(addr, "abcd"))
+                .await
+                .expect("exact limit request"),
+            (200, "abcd".to_owned())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokio::time::timeout(BOUND, http_get(addr, "/healthz"))
+                .await
+                .expect("health probe"),
+            Some((200, "ok".to_owned()))
+        );
+        addr
+    })
+    .catch_unwind()
+    .await;
+
+    cancel.cancel();
+    let joined = tokio::time::timeout(BOUND, &mut server).await;
+    if joined.is_err() {
+        server.abort();
+        _ = tokio::time::timeout(BOUND, server).await;
+    }
+    let addr = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    joined
+        .expect("host shut down")
+        .expect("host task")
+        .expect("run host");
+    let error = tokio::time::timeout(BOUND, tokio::net::TcpStream::connect(addr))
+        .await
+        .expect("listener closure check")
+        .expect_err("listener must close");
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
 }

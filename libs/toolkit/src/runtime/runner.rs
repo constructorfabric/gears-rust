@@ -54,6 +54,18 @@ impl ClientRegistration {
         }
     }
 
+    /// Register a remote proxy without making it a local implementation.
+    ///
+    /// When applied to the runtime's root hub, the proxy is available to every
+    /// gear through the process-wide fallback. Local registrations take priority.
+    pub fn remote<T: ?Sized + Send + Sync + 'static>(client: Arc<T>) -> Self {
+        Self {
+            register_fn: Box::new(move |hub| {
+                hub.register_remote_proxy::<T>(client);
+            }),
+        }
+    }
+
     /// Execute the registration against the given hub.
     pub(crate) fn apply(self, hub: &ClientHub) {
         (self.register_fn)(hub);
@@ -316,34 +328,5 @@ pub async fn run_oop_serving(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct EmptyConfigProvider;
-    impl ConfigProvider for EmptyConfigProvider {
-        fn get_gear_config(&self, _gear_name: &str) -> Option<&serde_json::Value> {
-            None
-        }
-    }
-
-    fn opts() -> RunOptions {
-        RunOptions::new(
-            Arc::new(EmptyConfigProvider),
-            DbOptions::None,
-            ShutdownOptions::Token(CancellationToken::new()),
-            Uuid::new_v4(),
-        )
-    }
-
-    #[test]
-    fn build_host_runtime_applies_the_init_deadline() {
-        // `Some` must reach `HostRuntime::with_init_deadline`; `None` leaves the
-        // `DEFAULT_INIT_DEADLINE` in place.
-        let deadline = std::time::Duration::from_secs(7);
-        let host = build_host_runtime(opts().with_init_deadline(Some(deadline))).unwrap();
-        assert_eq!(host.init_deadline(), deadline);
-
-        let host = build_host_runtime(opts()).unwrap();
-        assert_eq!(host.init_deadline(), crate::runtime::DEFAULT_INIT_DEADLINE);
-    }
-}
+#[path = "runner_test.rs"]
+mod tests;

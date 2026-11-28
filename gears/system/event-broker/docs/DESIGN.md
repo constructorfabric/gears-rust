@@ -1586,7 +1586,7 @@ Behavior:
 2. Events are delivered as `event` frames, one event per frame, as they become readable on the assigned partitions.
 3. An idle stream carries `heartbeat` frames (see **Streaming connection** below). There is no request timeout and no empty response.
 4. A partition whose filter has rejected at least the configured drift threshold of events since it last reported gets its position, at the next progress check, in a non-terminal `control` frame with `code: "progress"` (see R57).
-5. A partition loss arrives as a `topology` frame, and a gain or lose-all ends the stream with a terminal `control` frame; see **Rebalance handling** below.
+5. A continuing stream sends a full `topology` snapshot for the latest observed streamable generation. Intermediate generations may coalesce. A gain or lose-all ends the stream with a terminal `control` frame. See **Rebalance handling** below.
 6. The broker also ends a stream with a terminal `control` frame, `reason: "teardown"`, when the member's consume scope is cleared or expires, when reads stay unanswerable for longer than the broker's tolerance, or when deciding a batch of events fails (for example, when the authorization decision cannot be made).
 
 A JOIN that would leave the new member with no partition is refused `429 GroupAtCapacity` (feature 0004) (not yet implemented, tracked in #5978); there are no zero-partition standby members.
@@ -1639,7 +1639,7 @@ Each built-in `OffsetManager` (`LocalDbOffsetManager`, `InMemoryOffsetManager`) 
 
 **`:stream` defensive backstop**: `GET /v1/events:stream` rejects with `409 PositionsNotSet` (one `positions_not_set` violation per unseeded partition; see Error Response Format) when any assigned partition has no committed cursor in the subscription's group. A well-behaved SDK seeds positions before opening the stream via `POST /v1/subscriptions/{id}:seek` and never observes this on the happy path; the SDK recovers from it by re-resolving via `position()` and re-SEEKing after a re-JOIN (sharing the `SubscriptionRecoveryExhausted` budget).
 
-**Rebalance handling** (see [`features/0004-consumption-transport.md`](features/0004-consumption-transport.md)): a partition **loss** arrives as a non-terminal `topology` frame and the stream keeps delivering its remaining partitions; a partition **gain** (or lose-all) ends the stream and terminates the subscription (not yet answered as terminated, tracked in #5977; today the member is only disconnected until `session_timeout` reaps it or a JOIN evicts it) - the broker emits a `control` frame with `code: "terminal"`, listing the final positions of every partition the stream was reading when it ended, as the last frame and closes gracefully, and an SDK consumer (transactional or not) re-JOINs (new `subscription_id`), SEEKs, and reopens. There is no mid-stream re-SEEK of a gained partition.
+**Rebalance handling** (see [`features/0004-consumption-transport.md`](features/0004-consumption-transport.md)). An observed strict partition **loss** or newer version with the same set sends a full non-terminal `topology` snapshot with the retained assignment and current positions. Intermediate generations may coalesce. An observed **gain** or **lose-all** sends a terminal `control` frame with reason `rebalanced` or `lose_all`, respectively, and all final positions, then the stream closes gracefully. Terminating the subscription is not yet implemented, tracked in #5977. While the member survives, a raw client can reopen under the same id if the current assignment has group cursors. The SDK, for both plain and transactional consumers, re-JOINs for a new `subscription_id`, SEEKs, and reopens. SEEK is available before a stream opens.
 
 **SEEK is pre-stream-only**: `POST /v1/subscriptions/{id}:seek` is valid only before a stream is open; it accepts any value in `[RF − 1, HWM]` (including backward, for replay - there is no forward-only rule). While `:stream` is open, its read position advances with delivery but is not stored (only SEEK writes the stored cursor); a SEEK against an open stream is rejected with `409 StreamingInProgress`.
 
@@ -1829,7 +1829,7 @@ The broker validates GTS format on every JOIN. Named identifiers must already be
 
 **State location**: The broker holds the assignment and the stored cursors. The stream request carries no offsets: the stream starts each assigned partition at its stored cursor, which only SEEK writes.
 
-**Topology change handling**: A topology change reaches an open stream as frames (see **Rebalance handling** above): a loss sends a `topology` frame carrying the new `topology_version` and the partitions the subscription still holds (`assigned`); a rebalance that leaves this member's partitions unchanged usually sends nothing, so the stream's last `topology_version` can be older than the subscription's (a consumer re-reads the subscription before a SEEK); a gain or lose-all ends the stream with a terminal `control` frame.
+**Topology change handling** (see **Rebalance handling** above). The session narrows its readers on an observed strict loss (retains at least one partition and gains none). On strict loss or a newer observed generation with the same partitions, the continuing stream sends a full `topology` snapshot with the new `topology_version` and the retained assignment with its current positions. Intermediate generations may coalesce. An observed gain or lose-all ends the stream with a terminal `control` frame.
 
 **Subscription termination on ownership change**: when the delivery shard owning a consumer group releases ownership (graceful shutdown, scale-down) (not yet implemented, tracked in #4438), the in-pod subscription state - `subscription_id`, in-flight partition assignments, open streams - is lost. The new owner runs a fresh rebalance and has no record of the old `subscription_id`. Consumers must re-JOIN to recover. The group's cursors are rows of the gear database (`event_broker_cursor`), written only by SEEK, so they survive the shard transition and a new subscription of the group resumes from them.
 
@@ -2357,10 +2357,21 @@ Publish is asynchronous (HTTP 202) by default. A caller that needs the events st
 
 **ID**: `cpt-cf-evbk-topology-deployment`
 
-The Event Broker supports two deployment topologies, both expressed as variants of the same module wiring:
+Event Broker runs either embedded in a Gears host or as the one-gear
+`cf-gears-event-broker-server` executable. An embedded host composes the broker
+with other gears. The separate executable runs the broker role in its own
+process and connects to platform services in another process. The
+[shipped standalone configuration](../../../../config/event-broker-standalone.yaml)
+contains the local two-process launch and authenticated demo commands.
 
-- **Standalone** - one process; all internal services (ingest, delivery, dispatcher) co-resident; in-process cluster provider; storage backends per `backend_routing` - typically one that needs no external service for dev and test, or a durable one for production.
-- **Cluster** - separate ingest, delivery, and dispatcher processes scaled independently; cluster system module provider backed by Redis (with disk persistence for cursor durability) (not yet implemented, tracked in #5669), K8s, or PostgreSQL; storage backend is operator-chosen per topic via `backend_routing` ([feature 0005 §2.2](features/0005-backend-registry-and-routing.md#22-backend-routing)).
+The `standalone` role runs ingest, delivery and their workers together.
+Distributed deployments scale ingest, delivery and dispatcher processes
+independently. Both deployments select the event log backend per topic via
+[`backend_routing`](features/0005-backend-registry-and-routing.md#22-backend-routing).
+
+The distributed topology's cluster provider options include K8s and
+PostgreSQL. Redis with disk persistence for cursor durability is not yet
+implemented, tracked in #5669.
 
 Within cluster mode, ingest routing has two further variants:
 
@@ -2375,14 +2386,42 @@ Detailed deployment-mode tables (services active per mode, cluster provider per 
 
 ### 4.1 Deployment Modes
 
-| Mode | Services Active | ClusterCapabilities Provider | Routing | Use Case |
+| Mode | Services Active | Cluster Mode for the Separate Executable | Routing | Use Case |
 |---|---|---|---|---|
-| `standalone` | All (ingest + delivery + workers) in one process | `standalone` (in-process channels, local locks) | None — direct calls | Single-node, dev, small deployments |
-| `cluster_ingest` | IngestService + workers | Any cluster provider (Postgres, Redis, K8s) | Hetero (default) or dedicated instances by `affinity` (a routing hint) (not yet implemented, tracked in #5552 and #5701) | Horizontally scaled ingest |
-| `cluster_delivery` | DeliveryService + workers | Any cluster provider | Cache-based: `consumer_group → instance` | Horizontally scaled delivery |
-| `cluster_dispatcher` | Dispatcher only (stateless) | Reads `DirectoryService` | Routing table from `DirectoryService` instances and their `evbk-affinity` label (not yet implemented, tracked in #5552 and #5701) | HTTP gateway (N instances behind LB) |
+| `standalone` | IngestService + DeliveryService + workers | `memory` or `remote` | Direct calls | Single-node, dev, small deployments |
+| `cluster_ingest` | IngestService + workers | `remote` | Hetero (default) or dedicated instances by `affinity` (a routing hint) (not yet implemented, tracked in #5552 and #5701) | Horizontally scaled ingest |
+| `cluster_delivery` | DeliveryService + workers | `remote` | Cache-based: `consumer_group → instance` | Horizontally scaled delivery |
+| `cluster_dispatcher` | Dispatcher only (stateless) | `remote` | Routing table from `DirectoryService` instances and their `evbk-affinity` label (not yet implemented, tracked in #5552 and #5701) | HTTP gateway (N instances behind LB) |
 
-In standalone mode, the module wires all services into a single process. The `standalone` ClusterCapabilities provider serves the cache from an in-process store, its watches on Tokio channels, and derives leader election and locks from the SDK's cache-based defaults - zero external dependencies. The outbox runs in-process.
+The separate executable requires `gears.event-broker.config.process.cluster.mode`.
+`memory` keeps cluster coordination in the worker process. `remote` uses the
+explicit `gears.cluster-sdk.clients.consumes.cluster.grpc_endpoint`. Shared
+cluster primitives are tracked in #6147.
+
+The standalone outbox runs in the broker process. Distributed roles refuse
+SQLite for the gear's metadata database. The shipped standalone configuration
+uses separate SQLite files for gear metadata and the event log.
+
+Run the broker's configuration check from the repository root with the
+executable on `PATH`.
+
+```bash
+cf-gears-event-broker-server --config config/event-broker-standalone.yaml check
+```
+
+`check` validates the effective configuration offline. It uses the local
+broker `config` and `clients` sections when present. Each omitted or null
+section falls back to its counterpart in `TOOLKIT_MODULE_CONFIG`. The active
+role determines which backend, routing, publish-wait and consume-scope TTL
+rules apply. For example, the standalone `publish.max_wait_secs` accepts 50
+and refuses 51. Exit 0 confirms configuration validation. Check runtime
+readiness separately once the process starts.
+
+The sample's `oop_http.request_limits` sets a positive body cap of 16777216
+bytes and a positive default response timeout of 30 seconds. HTTP method and
+path metadata can override the default. Standalone and ingest publish routes
+use 60 seconds, dispatcher publish routes use 75 seconds, and stream and SSE
+routes disable the response timer.
 
 In cluster mode:
 - **Dispatcher instances** (stateless, behind load balancer) route HTTP requests via cache lookup + per-mode logic (see §3.2 Dispatcher Routing):
@@ -2392,14 +2431,17 @@ In cluster mode:
   - Dispatchers rebuild their routing table from `DirectoryService` on every refresh (not yet implemented, tracked in #5701). All dispatcher instances converge on the same instance membership within one refresh.
 - **Partition heads** reach delivery from each backend's own `watch` ([feature 0007 §4.2](features/0007-storage-backend-api.md#42-head-watch)) - they do NOT pass through the dispatcher or the cluster. This means multiple dispatcher instances require no shared state for wake-ups.
 - **Worker leader election**: each delivery instance sweeps the members of its own coordinator, so the sweep needs no election; electing one node to run the `reaper` cluster-wide (`evbk.worker.reaper`, `LeaderElectionV1::elect`) is not yet implemented (tracked in #5979).
-- All instances share the same database, which holds the broker's metadata; events live in the storage backends the `backends` registry names. Beyond the database, the external dependencies are the ClusterCapabilities provider and those backends; the broker also needs `types-registry`'s platform API (§3.4).
+- Broker instances share the gear metadata database. Event logs live in the
+  configured storage backends. A separate broker uses the platform Directory,
+  `types-registry` and `authz-resolver` services. Distributed roles also
+  require the remote cluster service.
 
 #### Deployment Variants
 
 The affinity groups, tiers and dedicated instances in Variants B, C and D are not yet implemented (tracked in #5552 and #5701); today every variant's dispatcher forwards each ingest route to a registered ingest instance, round-robin, preferring ready ones.
 
 ```text
-Variant A — Standalone (single process)
+Variant A - Standalone broker role
 ─────────────────────────────────────────
   ┌─────────────────────────────────┐
   │       event_broker module       │
@@ -2411,7 +2453,7 @@ Variant A — Standalone (single process)
   │  │   Storage backend         │  │
   │  └───────────────────────────┘  │
   └─────────────────────────────────┘
-  ClusterCapabilities = standalone (in-process)
+  ClusterCapabilities = local or remote
   Use: dev, single-node, small deployments
 
 

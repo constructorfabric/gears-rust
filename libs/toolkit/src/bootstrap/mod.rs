@@ -30,8 +30,10 @@ pub use config::{
     render_effective_gears_config,
 };
 
-// Re-export host types for convenience
-pub use oop::{OopRunOptions, run_oop_with_options};
+pub use oop::{
+    OopComposition, OopCompositionContext, OopCompositionError, OopCompositionFactory,
+    OopCompositionRunError, OopRunOptions, run_oop_with_composition, run_oop_with_options,
+};
 
 mod run;
 pub use run::{PublishGtsOptions, run_migrate, run_publish_gts, run_server};

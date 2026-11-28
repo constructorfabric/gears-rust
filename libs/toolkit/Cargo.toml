@@ -74,8 +74,9 @@ bootstrap = [
     "dep:dsn",
     "dep:supports-color",
     "dep:enable-ansi-support",
-    # OoP HTTP server: two-plane auth middleware
+    # OoP HTTP server middleware
     "dep:toolkit-http-middleware",
+    "dep:tower-http",
     # OoP outbound platform-plane credential (InternalAuthInterceptor + SA reader)
     "dep:toolkit-transport-grpc",
     # Builds that credential from `internal_auth` config (host, OoP, publish-gts).
@@ -154,7 +155,9 @@ dashmap = { workspace = true }
 arc-swap = { workspace = true }
 # `util` provides `ServiceExt::oneshot`, used by the OoP probe-first serve path
 # to delegate to the gear router that is swapped in after `start()`.
-tower = { workspace = true, features = ["util"] }
+# `timeout` bounds response creation on gear routes with request limits.
+tower = { workspace = true, features = ["util", "timeout"] }
+tower-http = { workspace = true, optional = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 urlencoding = { workspace = true }

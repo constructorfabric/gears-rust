@@ -368,6 +368,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory),
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -398,7 +399,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
         .attach(
             gear_router,
             "{\"openapi\":\"3.1.0\"}".to_owned(),
-            RouteAuthPolicy::default(),
+            OopRoutePolicy::default(),
         )
         .expect("attach");
     server.start_presence();
@@ -459,6 +460,7 @@ async fn attach_forwards_configured_labels_to_directory_registration() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -475,7 +477,7 @@ async fn attach_forwards_configured_labels_to_directory_registration() {
         .attach(
             Router::new().route("/ping", get(|| async { "pong" })),
             "{}".to_owned(),
-            RouteAuthPolicy::default(),
+            OopRoutePolicy::default(),
         )
         .expect("attach");
     server.start_presence();
@@ -518,6 +520,7 @@ async fn ephemeral_listen_port_updates_advertise_uri() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -563,6 +566,7 @@ async fn user_advertise_uri_is_not_overwritten_by_ephemeral_bind_port() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -609,6 +613,7 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         drain_timeout: Duration::from_secs(5),
         heartbeat_interval: Duration::from_secs(30),
         healthcheck_timeout: Duration::from_millis(500),
+        request_limits: None,
         directory: Arc::new(E2eDirectory::default()),
         bearer_authenticator: None,
         internal_authenticator: None,
@@ -625,7 +630,7 @@ async fn gear_handler_receives_connect_info_through_fallback() {
         .attach(
             Router::new().route("/peer", get(peer)),
             "{}".to_owned(),
-            RouteAuthPolicy::default(),
+            OopRoutePolicy::default(),
         )
         .expect("attach");
     server.start_presence();
@@ -706,6 +711,103 @@ async fn trace_context_middleware_continues_inbound_w3c_trace() {
         Some(inbound_trace_id),
         "the gear request span must continue the inbound W3C trace"
     );
+}
+
+#[tokio::test]
+async fn the_private_fallback_forwards_only_the_current_requests_single_valid_traceparent() {
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use tokio::sync::Barrier;
+    use toolkit_trace_context::TRACEPARENT;
+
+    const FIRST: &str = "00-0123456789abcdef0123456789abcdef-1111111111111111-01";
+    const SECOND: &str = "00-1123456789abcdef0123456789abcdef-2222222222222222-00";
+    const ACTIVE: &str = "00-2123456789abcdef0123456789abcdef-3333333333333333-01";
+    const NAME: HeaderName = HeaderName::from_static(TRACEPARENT);
+
+    fn inspect(mut output: HeaderMap) -> axum::Extension<HeaderMap> {
+        inject_inbound_traceparent(&mut output);
+        axum::Extension(output)
+    }
+
+    async fn forwarded(router: Router, parents: &[&str]) -> HeaderMap {
+        let mut request = Request::builder().uri("/");
+        for parent in parents {
+            request = request.header(TRACEPARENT, *parent);
+        }
+        router
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .extensions_mut()
+            .remove::<HeaderMap>()
+            .expect("handler captured the complete outgoing headers")
+    }
+
+    assert_eq!(inspect(HeaderMap::new()).0, HeaderMap::new());
+
+    let barrier = Arc::new(Barrier::new(2));
+    let overlapping = Router::new()
+        .route(
+            "/",
+            get(move || {
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    barrier.wait().await;
+                    inspect(HeaderMap::new())
+                }
+            }),
+        )
+        .layer(from_fn(trace_context_middleware));
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            forwarded(overlapping.clone(), &[FIRST]),
+            forwarded(overlapping, &[SECOND])
+        )
+    })
+    .await
+    .expect("both request handlers reach the barrier");
+    assert_eq!(
+        first,
+        HeaderMap::from_iter([(NAME, HeaderValue::from_static(FIRST))])
+    );
+    assert_eq!(
+        second,
+        HeaderMap::from_iter([(NAME, HeaderValue::from_static(SECOND))])
+    );
+
+    let outer = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                let inner = Router::new()
+                    .route("/", get(|| async { inspect(HeaderMap::new()) }))
+                    .layer(from_fn(trace_context_middleware));
+                for parents in [
+                    &[][..],
+                    &["invalid"],
+                    &["00-0123456789abcdef0123456789abcdef-0000000000000000-01"],
+                    &["01-0123456789abcdef0123456789abcdef-1111111111111111-01"],
+                    &["00-0123456789abcdef0123456789abcdef-1111111111111111-0"],
+                    &["00-0123456789abcdef0123456789abcdef-1111111111111111-010"],
+                    &[FIRST, SECOND],
+                    &[FIRST, FIRST],
+                ] {
+                    assert_eq!(forwarded(inner.clone(), parents).await, HeaderMap::new());
+                }
+                let active = HeaderMap::from_iter([(NAME, HeaderValue::from_static(ACTIVE))]);
+                assert_eq!(
+                    inspect(active).0,
+                    HeaderMap::from_iter([(NAME, HeaderValue::from_static(ACTIVE))])
+                );
+                inspect(HeaderMap::new())
+            }),
+        )
+        .layer(from_fn(trace_context_middleware));
+    assert_eq!(
+        forwarded(outer, &[FIRST]).await,
+        HeaderMap::from_iter([(NAME, HeaderValue::from_static(FIRST))])
+    );
+    assert_eq!(inspect(HeaderMap::new()).0, HeaderMap::new());
 }
 
 /// A gateway-supplied `x-request-id` must be installed as the task-local
@@ -824,7 +926,7 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
     .with_auth_disabled(true);
     let app = layer_gear_router(
         Router::new().route("/boom", get(boom)),
-        RouteAuthPolicy::default(),
+        OopRoutePolicy::default(),
         options.tenant_plane(),
         DrainGuard::new(readiness),
         &options,
@@ -858,7 +960,7 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
     );
 }
 
-// Auth assembly: OperationBuilder → route_auth_policy → layer_gear_router.
+// Auth assembly from OperationBuilder specs through the listener policy.
 
 const AXIS_BEARER: &str = "Bearer tenant-token";
 const AXIS_SA: &str = "good-sa-token";
@@ -949,7 +1051,7 @@ fn axis_gear(bearer: bool, internal: bool) -> Router {
         options =
             options.with_internal_authenticator(Some(DynInternalAuthenticator::new(AxisInternal)));
     }
-    let policy = route_auth_policy(registry.operation_specs.iter());
+    let policy = OopRoutePolicy::from_specs(registry.operation_specs.iter());
     layer_gear_router(
         router,
         policy,
@@ -1153,7 +1255,7 @@ async fn an_installed_tenant_authenticator_wins_over_auth_disabled() {
         )
         .with_bearer_authenticator(Some(DynBearerAuthenticator::new(AxisBearer)))
         .with_auth_disabled(true);
-        let policy = route_auth_policy(registry.operation_specs.iter());
+        let policy = OopRoutePolicy::from_specs(registry.operation_specs.iter());
         layer_gear_router(
             router,
             policy,
@@ -1273,7 +1375,7 @@ async fn without_a_tenant_authenticator_an_unlisted_route_is_refused() {
     );
     let app = layer_gear_router(
         router,
-        route_auth_policy(registry.operation_specs.iter()),
+        OopRoutePolicy::from_specs(registry.operation_specs.iter()),
         options.tenant_plane(),
         DrainGuard::new(readiness(Vec::<String>::new())),
         &options,
@@ -1291,4 +1393,951 @@ async fn without_a_tenant_authenticator_an_unlisted_route_is_refused() {
 
     let (status, _) = axis_status(app, Method::GET, "/axis/v1/anon", None, None).await;
     assert_eq!(status, StatusCode::OK, "an anonymous route keeps its plane");
+}
+
+#[test]
+fn request_limits_require_positive_bytes_and_duration() {
+    use crate::runtime::{OopRequestLimits, OopRequestLimitsError};
+
+    let bytes = 16 * 1024 * 1024;
+    let timeout = Duration::from_secs(30);
+    let limits = OopRequestLimits::new(bytes, timeout).expect("valid limits");
+    assert_eq!(
+        (limits.body_limit_bytes(), limits.request_timeout()),
+        (16_777_216, Duration::from_secs(30))
+    );
+    assert_eq!(OopRequestLimits::new(bytes, timeout), Ok(limits));
+    assert_eq!(
+        OopRequestLimits::new(0, timeout),
+        Err(OopRequestLimitsError::BodyLimitZero)
+    );
+    assert_eq!(
+        OopRequestLimits::new(bytes, Duration::ZERO),
+        Err(OopRequestLimitsError::RequestTimeoutZero)
+    );
+    assert_eq!(
+        OopRequestLimits::new(0, Duration::ZERO),
+        Err(OopRequestLimitsError::BodyLimitZero)
+    );
+    let minimal = OopRequestLimits::new(1, Duration::from_nanos(1)).expect("positive minimum");
+    assert_eq!(
+        (minimal.body_limit_bytes(), minimal.request_timeout()),
+        (1, Duration::from_nanos(1))
+    );
+}
+
+mod request_limits {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
+    use axum::routing::post;
+    use futures_util::{StreamExt as _, stream};
+    use serde_json::json;
+    use std::convert::Infallible;
+    use std::future::Future;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::Notify;
+    use tokio::time::{Instant, advance, timeout};
+    use toolkit_gts::{gts_id, gts_uri};
+    use toolkit_security::RouteAuth;
+
+    const BOUND: Duration = Duration::from_secs(10);
+    const DEADLINE: Duration = Duration::from_secs(2);
+    const TRACE_ID: &str = "11111111111111111111111111111111";
+    const TRACEPARENT: &str = "00-11111111111111111111111111111111-2222222222222222-01";
+
+    async fn bounded<F: Future>(future: F) -> F::Output {
+        timeout(BOUND, future).await.expect("fixture deadline")
+    }
+
+    fn options() -> OopServeOptions {
+        OopServeOptions::new(
+            "limits-gear".to_owned(),
+            uuid::Uuid::from_u128(31).to_string(),
+            "http://127.0.0.1:0".to_owned(),
+            "127.0.0.1:0".parse().expect("listen address"),
+            Arc::new(E2eDirectory::default()),
+        )
+    }
+
+    fn drain() -> DrainGuard {
+        DrainGuard::new(readiness(Vec::<String>::new()))
+    }
+
+    fn request(method: Method, path: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .header("traceparent", TRACEPARENT)
+    }
+
+    fn upload(bytes: Bytes, declared: bool) -> Request<Body> {
+        let mut request = request(Method::POST, "/upload");
+        let body = if declared {
+            request = request.header(CONTENT_LENGTH, bytes.len());
+            Body::from(bytes)
+        } else {
+            Body::from_stream(stream::iter((0..bytes.len()).step_by(2).map(
+                move |start| Ok::<_, Infallible>(bytes.slice(start..(start + 2).min(bytes.len()))),
+            )))
+        };
+        request.body(body).expect("upload request")
+    }
+
+    fn upload_route(calls: Arc<AtomicUsize>) -> Router {
+        Router::new().route(
+            "/upload",
+            post(move |body: Bytes| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    body
+                }
+            }),
+        )
+    }
+
+    fn auth_only(routes: impl IntoIterator<Item = (Method, String, RouteAuth)>) -> OopRoutePolicy {
+        OopRoutePolicy {
+            auth: routes.into_iter().collect(),
+            ..OopRoutePolicy::default()
+        }
+    }
+
+    fn upload_app(calls: Arc<AtomicUsize>, options: &OopServeOptions) -> Router {
+        layer_gear_router(
+            upload_route(calls),
+            auth_only([(Method::POST, "/upload".to_owned(), RouteAuth::Anonymous)]),
+            options.tenant_plane(),
+            drain(),
+            options,
+        )
+    }
+
+    async fn send(router: Router, request: Request<Body>) -> Response {
+        bounded(router.oneshot(request))
+            .await
+            .expect("router response")
+    }
+
+    async fn read(response: Response) -> (StatusCode, Bytes) {
+        let status = response.status();
+        let bytes = bounded(to_bytes(response.into_body(), usize::MAX))
+            .await
+            .expect("response body");
+        (status, bytes)
+    }
+
+    async fn problem(response: Response) -> (StatusCode, axum::http::HeaderValue, Value) {
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .cloned()
+            .unwrap_or_else(|| axum::http::HeaderValue::from_static(""));
+        let (status, body) = read(response).await;
+        (
+            status,
+            content_type,
+            serde_json::from_slice(&body)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned())),
+        )
+    }
+
+    #[tokio::test]
+    async fn body_limits_accept_the_boundary_and_reject_the_next_byte() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = options().with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let router = upload_app(Arc::clone(&calls), &options);
+        for declared in [true, false] {
+            calls.store(0, Ordering::SeqCst);
+            let oversize = upload(Bytes::from_static(b"abcde"), declared);
+            if !declared {
+                use axum::body::HttpBody as _;
+                assert_eq!(
+                    (
+                        oversize.body().size_hint().upper(),
+                        oversize.headers().get(CONTENT_LENGTH)
+                    ),
+                    (None, None)
+                );
+            }
+            assert_eq!(
+                problem(send(router.clone(), oversize).await).await,
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "application/problem+json".parse().unwrap(),
+                    json!({
+                        "type":"about:blank", "title":"Payload Too Large", "status":413,
+                        "detail":"Payload Too Large", "instance":"/upload", "trace_id":TRACE_ID,
+                        "context":{}
+                    })
+                )
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let exact = upload(Bytes::from_static(b"abcd"), declared);
+            assert_eq!(
+                read(send(router.clone(), exact).await).await,
+                (StatusCode::OK, Bytes::from_static(b"abcd"))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    struct RecordingBearer(Arc<AtomicUsize>);
+
+    impl BearerAuthenticator for RecordingBearer {
+        async fn authenticate(&self, token: &str) -> Result<SecurityContext, AuthNError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            AxisBearer.authenticate(token).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_body_layer_refuses_declared_oversize_before_auth_or_handler() {
+        let auth_calls = Arc::new(AtomicUsize::new(0));
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let options = options()
+            .with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap())
+            .with_bearer_authenticator(Some(DynBearerAuthenticator::new(RecordingBearer(
+                Arc::clone(&auth_calls),
+            ))));
+        let router = layer_gear_router(
+            upload_route(Arc::clone(&handler_calls)),
+            auth_only([(Method::POST, "/upload".to_owned(), RouteAuth::Authenticated)]),
+            options.tenant_plane(),
+            drain(),
+            &options,
+        );
+        let mut incoming = upload(Bytes::from_static(b"abcde"), true);
+        incoming
+            .headers_mut()
+            .insert(AUTHORIZATION, AXIS_BEARER.parse().unwrap());
+        assert_eq!(
+            problem(send(router, incoming).await).await,
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "application/problem+json".parse().unwrap(),
+                json!({
+                    "type":"about:blank", "title":"Payload Too Large", "status":413,
+                    "detail":"Payload Too Large", "instance":"/upload", "trace_id":TRACE_ID,
+                    "context":{}
+                })
+            )
+        );
+        assert_eq!(
+            (
+                auth_calls.load(Ordering::SeqCst),
+                handler_calls.load(Ordering::SeqCst)
+            ),
+            (0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_opted_in_limit_replaces_the_default_extractor_limit() {
+        const CAP: usize = 16 * 1024 * 1024;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let options = options().with_request_limits(OopRequestLimits::new(CAP, DEADLINE).unwrap());
+        let router = upload_app(Arc::clone(&calls), &options);
+        let oversize = upload(Bytes::from(vec![b'x'; CAP + 1]), true);
+        assert_eq!(
+            problem(send(router.clone(), oversize).await).await,
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "application/problem+json".parse().unwrap(),
+                json!({
+                    "type":"about:blank", "title":"Payload Too Large", "status":413,
+                    "detail":"Payload Too Large", "instance":"/upload", "trace_id":TRACE_ID,
+                    "context":{}
+                })
+            )
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        for size in [2 * 1024 * 1024 + 1, CAP] {
+            let bytes = Bytes::from(vec![b'x'; size]);
+            let outgoing = send(router.clone(), upload(bytes.clone(), true)).await;
+            assert_eq!(read(outgoing).await, (StatusCode::OK, bytes));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Default)]
+    struct HeldRequest {
+        entered: Notify,
+        release: Notify,
+        dropped: AtomicBool,
+        completed: AtomicUsize,
+    }
+
+    struct DropSignal<'a>(&'a AtomicBool);
+
+    impl Drop for DropSignal<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl HeldRequest {
+        async fn respond(self: Arc<Self>) -> &'static str {
+            let _signal = DropSignal(&self.dropped);
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            "released"
+        }
+
+        fn route(self: &Arc<Self>) -> Router {
+            let held = Arc::clone(self);
+            Router::new().route("/slow", get(move || Arc::clone(&held).respond()))
+        }
+    }
+
+    fn slow_request() -> Request<Body> {
+        request(Method::GET, "/slow")
+            .body(Body::empty())
+            .expect("slow request")
+    }
+
+    fn slow_app(held: &Arc<HeldRequest>, drain: DrainGuard, options: &OopServeOptions) -> Router {
+        layer_gear_router(
+            held.route(),
+            auth_only([(Method::GET, "/slow".to_owned(), RouteAuth::Anonymous)]),
+            options.tenant_plane(),
+            drain,
+            options,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn omitted_limits_preserve_existing_body_and_wait_behavior() {
+        const DEFAULT: usize = 2 * 1024 * 1024;
+        let options = options();
+        assert_eq!(options.request_limits, None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = upload_app(Arc::clone(&calls), &options);
+        let oversize = upload(Bytes::from(vec![b'x'; DEFAULT + 1]), true);
+        assert_eq!(
+            problem(send(router.clone(), oversize).await).await,
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "application/problem+json".parse().unwrap(),
+                json!({
+                    "type":"about:blank", "title":"Payload Too Large", "status":413,
+                    "detail":"Payload Too Large", "instance":"/upload", "trace_id":TRACE_ID,
+                    "context":{}
+                })
+            )
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let exact = Bytes::from(vec![b'x'; DEFAULT]);
+        assert_eq!(
+            read(send(router, upload(exact.clone(), true)).await).await,
+            (StatusCode::OK, exact)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let held = std::array::from_fn(|_| Arc::new(HeldRequest::default()));
+        let (gear, policy) = deadline_routes(&held);
+        let router = layer_gear_router(gear, policy, options.tenant_plane(), drain(), &options);
+        let [custom, ..] = &held;
+        let incoming = request(Method::GET, "/limits/demo")
+            .body(Body::empty())
+            .unwrap();
+        let mut pending = Box::pin(router.oneshot(incoming));
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        bounded(custom.entered.notified()).await;
+        advance(Duration::from_millis(4_001)).await;
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        custom.release.notify_one();
+        assert_eq!(
+            read(bounded(pending).await.unwrap()).await,
+            (StatusCode::OK, Bytes::from_static(b"released")),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn request_timeout_returns_a_canonical_problem_and_releases_drain() {
+        let options = options().with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let guard = drain();
+        let held = Arc::new(HeldRequest::default());
+        let mut pending =
+            Box::pin(slow_app(&held, guard.clone(), &options).oneshot(slow_request()));
+        let armed = Instant::now();
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        bounded(held.entered.notified()).await;
+        assert_eq!(
+            (guard.in_flight(), held.dropped.load(Ordering::SeqCst)),
+            (1, false)
+        );
+        advance(Duration::from_millis(1_999)).await;
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        advance(Duration::from_millis(1)).await;
+        let response = timeout(DEADLINE + BOUND, pending)
+            .await
+            .expect("response deadline")
+            .unwrap();
+        assert_eq!(Instant::now() - armed, DEADLINE);
+        assert_eq!(
+            problem(response).await,
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                "application/problem+json".parse().unwrap(),
+                json!({
+                    "type":gts_uri!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~"),
+                    "title":"Deadline Exceeded", "status":504, "detail":"Request exceeded 2s timeout",
+                    "instance":"/slow", "trace_id":TRACE_ID,
+                    "context":{"resource_type":gts_id!("cf.core.http.request.v1~")}
+                })
+            )
+        );
+        assert_eq!(
+            (
+                guard.in_flight(),
+                held.dropped.load(Ordering::SeqCst),
+                held.completed.load(Ordering::SeqCst)
+            ),
+            (0, true, 0)
+        );
+
+        let held = Arc::new(HeldRequest::default());
+        let mut pending =
+            Box::pin(slow_app(&held, guard.clone(), &options).oneshot(slow_request()));
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        bounded(held.entered.notified()).await;
+        assert_eq!(
+            (guard.in_flight(), held.dropped.load(Ordering::SeqCst)),
+            (1, false)
+        );
+        drop(pending);
+        assert_eq!(
+            (
+                guard.in_flight(),
+                held.dropped.load(Ordering::SeqCst),
+                held.completed.load(Ordering::SeqCst)
+            ),
+            (0, true, 0)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_response_before_the_deadline_keeps_its_stream_alive() {
+        let second_chunk = Arc::new(Notify::new());
+        let router = Router::new().route(
+            "/stream",
+            get({
+                let second_chunk = Arc::clone(&second_chunk);
+                move || {
+                    let second_chunk = Arc::clone(&second_chunk);
+                    async move {
+                        let chunks = stream::once(std::future::ready(Ok::<_, Infallible>(
+                            Bytes::from_static(b"before"),
+                        )))
+                        .chain(stream::once(async move {
+                            second_chunk.notified().await;
+                            Ok(Bytes::from_static(b"after"))
+                        }));
+                        (
+                            [(CONTENT_TYPE, "application/octet-stream")],
+                            Body::from_stream(chunks),
+                        )
+                    }
+                }
+            }),
+        );
+        let options = options().with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let router = layer_gear_router(
+            router,
+            auth_only([(Method::GET, "/stream".to_owned(), RouteAuth::Anonymous)]),
+            options.tenant_plane(),
+            drain(),
+            &options,
+        );
+        let response = send(
+            router,
+            request(Method::GET, "/stream").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            (response.status(), &response.headers()[CONTENT_TYPE]),
+            (StatusCode::OK, &"application/octet-stream".parse().unwrap())
+        );
+        let mut chunks = response.into_body().into_data_stream();
+        let first = bounded(chunks.next()).await.expect("first chunk").unwrap();
+        assert_eq!(first, Bytes::from_static(b"before"));
+        advance(DEADLINE + Duration::from_millis(1)).await;
+        second_chunk.notify_one();
+        let second = bounded(chunks.next()).await.expect("second chunk").unwrap();
+        assert_eq!([first, second].concat(), b"beforeafter");
+        assert!(bounded(chunks.next()).await.is_none());
+    }
+
+    async fn start_server(options: OopServeOptions) -> (OopHttpServer, CancellationToken) {
+        let cancel = CancellationToken::new();
+        let server = bounded(OopHttpServer::start(
+            readiness(Vec::<String>::new()),
+            options,
+            cancel.clone(),
+        ))
+        .await
+        .expect("fixture listener");
+        (server, cancel)
+    }
+
+    fn deadline_routes(held: &[Arc<HeldRequest>; 6]) -> (Router, OopRoutePolicy) {
+        use crate::api::{OpenApiRegistryImpl, OperationBuilder};
+        use axum::routing::head;
+
+        let [
+            custom,
+            disabled,
+            inherited,
+            static_route,
+            explicit_head,
+            external,
+        ] = held.clone();
+        let registry = OpenApiRegistryImpl::new();
+        let router = OperationBuilder::get("/limits/{id}")
+            .anonymous()
+            .request_timeout(Duration::from_secs(4))
+            .handler(move || Arc::clone(&custom).respond())
+            .text_response(StatusCode::OK, "OK", "text/plain")
+            .register(Router::new(), &registry);
+        let router = OperationBuilder::post("/limits/{id}")
+            .anonymous()
+            .no_request_timeout()
+            .handler(move || Arc::clone(&disabled).respond())
+            .text_response(StatusCode::OK, "OK", "text/plain")
+            .register(router, &registry);
+        let router = OperationBuilder::put("/limits/{id}")
+            .anonymous()
+            .handler(move || Arc::clone(&inherited).respond())
+            .text_response(StatusCode::OK, "OK", "text/plain")
+            .register(router, &registry);
+        let router = OperationBuilder::get("/limits/static")
+            .anonymous()
+            .request_timeout(Duration::from_secs(1))
+            .handler(move || Arc::clone(&static_route).respond())
+            .text_response(StatusCode::OK, "OK", "text/plain")
+            .register(router, &registry);
+        let router = OperationBuilder::new(Method::HEAD, "/limits/explicit")
+            .anonymous()
+            .request_timeout(Duration::from_secs(3))
+            .method_router(head(move || Arc::clone(&explicit_head).respond()))
+            .no_content_response(StatusCode::OK, "OK")
+            .register(router, &registry)
+            .route(
+                "/limits-external",
+                get(move || Arc::clone(&external).respond()),
+            );
+        (
+            router,
+            OopRoutePolicy::from_specs(registry.operation_specs.iter()),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn published_routes_honor_their_declared_deadlines() {
+        let options = options()
+            .with_bearer_authenticator(Some(DynBearerAuthenticator::new(AxisBearer)))
+            .with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let (mut server, cancel) = start_server(options).await;
+
+        let verify = async {
+            for bootstrap in [true, false] {
+                let requests = std::array::from_fn(|_| Arc::new(HeldRequest::default()));
+                let (gear, policy) = deadline_routes(&requests);
+                let [custom, disabled, inherited, fixed, head, external] = &requests;
+                let openapi = r#"{"openapi":"3.1.0"}"#.to_owned();
+                if bootstrap {
+                    server.publish_bootstrap_routes(gear, openapi, policy);
+                } else {
+                    server
+                        .attach(gear, openapi, policy)
+                        .expect("final publication");
+                }
+                let router = build_outer_router(Arc::clone(&server.readiness), server.late.clone());
+                let expirations = [
+                    (Method::GET, "/limits/demo", custom, 4),
+                    (Method::GET, "/limits/static", fixed, 1),
+                    (Method::PUT, "/limits/demo", inherited, 2),
+                    (Method::HEAD, "/limits/demo", custom, 2),
+                    (Method::HEAD, "/limits/explicit", head, 3),
+                    (Method::GET, "/limits-external", external, 2),
+                ];
+                for (method, path, held, seconds) in expirations {
+                    held.dropped.store(false, Ordering::SeqCst);
+                    let expects_empty_body = method == Method::HEAD;
+                    let mut incoming = request(method, path);
+                    if path == "/limits-external" {
+                        if bootstrap {
+                            continue;
+                        }
+                        incoming = incoming.header(AUTHORIZATION, AXIS_BEARER);
+                    }
+                    let incoming = incoming.body(Body::empty()).unwrap();
+                    let mut pending = Box::pin(router.clone().oneshot(incoming));
+                    let armed = Instant::now();
+                    assert!(futures_util::poll!(&mut pending).is_pending());
+                    bounded(held.entered.notified()).await;
+                    assert_eq!(
+                        (
+                            server.drain_guard.in_flight(),
+                            held.dropped.load(Ordering::SeqCst)
+                        ),
+                        (1, false)
+                    );
+                    let deadline = Duration::from_secs(seconds);
+                    let before_expiry = deadline.checked_sub(Duration::from_millis(1)).unwrap();
+                    if seconds == 4 {
+                        let past_default = DEADLINE + Duration::from_millis(1);
+                        advance(past_default).await;
+                        assert!(
+                            futures_util::poll!(&mut pending).is_pending(),
+                            "GET {path} must outlive the listener default (bootstrap={bootstrap})"
+                        );
+                        advance(before_expiry.checked_sub(past_default).unwrap()).await;
+                    } else {
+                        advance(before_expiry).await;
+                    }
+                    assert!(
+                        futures_util::poll!(&mut pending).is_pending(),
+                        "{path} expired before {seconds}s (bootstrap={bootstrap})"
+                    );
+                    advance(Duration::from_millis(1)).await;
+                    let response = timeout(deadline + BOUND, pending)
+                        .await
+                        .expect("published deadline")
+                        .unwrap();
+                    assert_eq!(
+                        Instant::now() - armed,
+                        deadline,
+                        "{path} (bootstrap={bootstrap})"
+                    );
+                    if expects_empty_body {
+                        assert_eq!(
+                            response.headers().get(CONTENT_TYPE).unwrap(),
+                            "application/problem+json"
+                        );
+                        assert_eq!(
+                            read(response).await,
+                            (StatusCode::GATEWAY_TIMEOUT, Bytes::new())
+                        );
+                    } else {
+                        assert_eq!(
+                            problem(response).await,
+                            (
+                                StatusCode::GATEWAY_TIMEOUT,
+                                "application/problem+json".parse().unwrap(),
+                                json!({
+                                    "type":gts_uri!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~"),
+                                    "title":"Deadline Exceeded", "status":504,
+                                    "detail":format!("Request exceeded {seconds}s timeout"),
+                                    "instance":path, "trace_id":TRACE_ID,
+                                    "context":{"resource_type":gts_id!("cf.core.http.request.v1~")}
+                                })
+                            )
+                        );
+                    }
+                    assert_eq!(
+                        (
+                            server.drain_guard.in_flight(),
+                            held.dropped.load(Ordering::SeqCst),
+                            held.completed.load(Ordering::SeqCst)
+                        ),
+                        (0, true, 0)
+                    );
+                }
+
+                for (method, held, wait) in [
+                    (Method::GET, custom, Duration::from_secs(3)),
+                    (Method::POST, disabled, Duration::from_millis(4_001)),
+                ] {
+                    let incoming = request(method, "/limits/demo").body(Body::empty()).unwrap();
+                    let mut pending = Box::pin(router.clone().oneshot(incoming));
+                    assert!(futures_util::poll!(&mut pending).is_pending());
+                    bounded(held.entered.notified()).await;
+                    assert_eq!(server.drain_guard.in_flight(), 1);
+                    advance(wait).await;
+                    assert!(futures_util::poll!(&mut pending).is_pending());
+                    held.release.notify_one();
+                    assert_eq!(
+                        read(bounded(pending).await.unwrap()).await,
+                        (StatusCode::OK, Bytes::from_static(b"released"))
+                    );
+                    assert_eq!(
+                        (
+                            server.drain_guard.in_flight(),
+                            held.completed.load(Ordering::SeqCst)
+                        ),
+                        (0, 1)
+                    );
+                }
+
+                let oversize = request(Method::POST, "/limits/demo")
+                    .header(CONTENT_LENGTH, 5)
+                    .body(Body::from("abcde"))
+                    .unwrap();
+                assert_eq!(
+                    problem(send(router.clone(), oversize).await).await,
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "application/problem+json".parse().unwrap(),
+                        json!({
+                            "type":"about:blank", "title":"Payload Too Large", "status":413,
+                            "detail":"Payload Too Large", "instance":"/limits/demo", "trace_id":TRACE_ID, "context":{}
+                        })
+                    )
+                );
+                assert_eq!(disabled.completed.load(Ordering::SeqCst), 1);
+
+                for (path, bearer, final_status) in [
+                    ("/missing", None, Some(StatusCode::UNAUTHORIZED)),
+                    ("/missing", Some(AXIS_BEARER), Some(StatusCode::NOT_FOUND)),
+                    ("/limits-external", None, Some(StatusCode::UNAUTHORIZED)),
+                    ("/limits-external", Some(AXIS_BEARER), None),
+                ] {
+                    let bootstrap_status = bootstrap.then_some(StatusCode::SERVICE_UNAVAILABLE);
+                    let Some(status) = bootstrap_status.or(final_status) else {
+                        continue;
+                    };
+                    let mut incoming = request(Method::GET, path);
+                    if let Some(bearer) = bearer {
+                        incoming = incoming.header(AUTHORIZATION, bearer);
+                    }
+                    let response =
+                        send(router.clone(), incoming.body(Body::empty()).unwrap()).await;
+                    let retry_after = bootstrap.then_some(HeaderValue::from_static("1"));
+                    assert_eq!(response.headers().get(RETRY_AFTER), retry_after.as_ref());
+                    let body = match status {
+                        StatusCode::SERVICE_UNAVAILABLE => json!({
+                            "type":gts_uri!("cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~"),
+                            "title":"Service Unavailable", "status":503,
+                            "detail":"tenant-plane routes are served once the application group has started",
+                            "instance":path, "trace_id":TRACE_ID, "context":{"retry_after_seconds":1}
+                        }),
+                        StatusCode::UNAUTHORIZED => json!({
+                            "type":gts_uri!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~"),
+                            "title":"Unauthenticated", "status":401, "detail":"Authentication required",
+                            "instance":path, "trace_id":TRACE_ID, "context":{"reason":"MISSING_BEARER"}
+                        }),
+                        StatusCode::NOT_FOUND => json!({
+                            "type":"about:blank", "title":"Not Found", "status":404, "detail":"Not Found",
+                            "instance":path, "trace_id":TRACE_ID, "context":{}
+                        }),
+                        _ => unreachable!("unexpected rejection status in fixture"),
+                    };
+                    assert_eq!(
+                        problem(response).await,
+                        (status, "application/problem+json".parse().unwrap(), body)
+                    );
+                }
+                assert_eq!(external.completed.load(Ordering::SeqCst), 0);
+            }
+        };
+        let result = AssertUnwindSafe(verify).catch_unwind().await;
+        tokio::time::resume();
+        cancel.cancel();
+        bounded(server.join()).await.expect("listener joined");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_and_final_routes_both_receive_request_limits() {
+        let options = options().with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let (mut server, cancel) = start_server(options).await;
+        tokio::time::pause();
+        let result = AssertUnwindSafe(async {
+            for bootstrap in [true, false] {
+                let held = Arc::new(HeldRequest::default());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let gear = upload_route(Arc::clone(&calls)).merge(held.route());
+                let policy = auth_only([
+                    (Method::POST, "/upload".to_owned(), RouteAuth::Anonymous),
+                    (Method::GET, "/slow".to_owned(), RouteAuth::Anonymous),
+                ]);
+                let openapi = r#"{"openapi":"3.1.0"}"#.to_owned();
+                if bootstrap {
+                    server.publish_bootstrap_routes(gear, openapi, policy);
+                } else {
+                    server.attach(gear, openapi, policy).expect("final publication");
+                }
+                let router = server.late.gear().expect("published routes");
+                assert_eq!(
+                    problem(send(router.clone(), upload(Bytes::from_static(b"abcde"), false)).await).await,
+                    (StatusCode::PAYLOAD_TOO_LARGE, "application/problem+json".parse().unwrap(), json!({
+                        "type":"about:blank", "title":"Payload Too Large", "status":413,
+                        "detail":"Payload Too Large", "instance":"/upload", "trace_id":TRACE_ID,
+                        "context":{}
+                    })),
+                    "bootstrap={bootstrap}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                let mut pending = Box::pin(router.oneshot(slow_request()));
+                assert!(futures_util::poll!(&mut pending).is_pending());
+                bounded(held.entered.notified()).await;
+                advance(DEADLINE).await;
+                let response = timeout(DEADLINE + BOUND, pending).await.expect("published deadline").unwrap();
+                assert_eq!(
+                    problem(response).await,
+                    (StatusCode::GATEWAY_TIMEOUT, "application/problem+json".parse().unwrap(), json!({
+                        "type":gts_uri!("cf.core.errors.err.v1~cf.core.err.deadline_exceeded.v1~"),
+                        "title":"Deadline Exceeded", "status":504, "detail":"Request exceeded 2s timeout",
+                        "instance":"/slow", "trace_id":TRACE_ID,
+                        "context":{"resource_type":gts_id!("cf.core.http.request.v1~")}
+                    })),
+                    "bootstrap={bootstrap}"
+                );
+                assert_eq!((server.drain_guard.in_flight(), held.completed.load(Ordering::SeqCst)), (0, 0));
+            }
+        }).catch_unwind().await;
+        tokio::time::resume();
+        cancel.cancel();
+        bounded(server.join()).await.expect("listener joined");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
+    async fn framework_probes_remain_outside_the_gear_limits() {
+        let options = options().with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let (mut server, cancel) = start_server(options).await;
+        let openapi =
+            r#"{"openapi":"3.1.0","info":{"title":"Limits fixture","version":"1.0.0"},"paths":{}}"#;
+        let calls = Arc::new(AtomicUsize::new(0));
+        server
+            .attach(
+                upload_route(Arc::clone(&calls)),
+                openapi.to_owned(),
+                auth_only([(Method::POST, "/upload".to_owned(), RouteAuth::Anonymous)]),
+            )
+            .expect("publish routes");
+        let outer = build_outer_router(Arc::clone(&server.readiness), server.late.clone());
+        let result = AssertUnwindSafe(async {
+            for (path, expected) in [("/healthz", "ok"), ("/.well-known/openapi.json", openapi)] {
+                let probe = request(Method::GET, path)
+                    .header(CONTENT_LENGTH, 5)
+                    .body(Body::from("abcde"))
+                    .unwrap();
+                assert_eq!(
+                    read(send(outer.clone(), probe).await).await,
+                    (StatusCode::OK, Bytes::copy_from_slice(expected.as_bytes()))
+                );
+            }
+            assert_eq!(
+                problem(send(outer, upload(Bytes::from_static(b"abcde"), true)).await).await,
+                (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "application/problem+json".parse().unwrap(),
+                    json!({
+                        "type":"about:blank", "title":"Payload Too Large", "status":413,
+                        "detail":"Payload Too Large", "instance":"/upload", "trace_id":TRACE_ID,
+                        "context":{}
+                    })
+                )
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .catch_unwind()
+        .await;
+        cancel.cancel();
+        bounded(server.join()).await.expect("listener joined");
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_limits_preserve_auth_and_request_id_context() {
+        use crate::api::{OpenApiRegistryImpl, OperationBuilder};
+        use axum::Extension;
+
+        let auth_hits = Arc::new(AtomicUsize::new(0));
+        let handler_hits = Arc::clone(&auth_hits);
+        let registry = OpenApiRegistryImpl::new();
+        let router = OperationBuilder::get("/auth")
+            .operation_id("limits.auth")
+            .authenticated()
+            .no_license_required()
+            .handler(move |Extension(context): Extension<SecurityContext>| {
+                let calls = Arc::clone(&handler_hits);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({
+                        "subject_id":context.subject_id(),
+                        "request_id":toolkit_trace_context::current_request_id(),
+                    }))
+                }
+            })
+            .json_response(StatusCode::OK, "OK")
+            .register(Router::new(), &registry);
+        let router = OperationBuilder::post("/upload")
+            .operation_id("limits.upload")
+            .anonymous()
+            .handler(|bytes: Bytes| async { bytes })
+            .json_response(StatusCode::OK, "OK")
+            .register(router, &registry);
+        let options = options()
+            .with_bearer_authenticator(Some(DynBearerAuthenticator::new(AxisBearer)))
+            .with_request_limits(OopRequestLimits::new(4, DEADLINE).unwrap());
+        let router = layer_gear_router(
+            router,
+            OopRoutePolicy::from_specs(registry.operation_specs.iter()),
+            options.tenant_plane(),
+            drain(),
+            &options,
+        );
+        for (bearer, reason) in [
+            (None, "MISSING_BEARER"),
+            (Some("Bearer forged"), "AUTHN_FAILED"),
+        ] {
+            let mut incoming = request(Method::GET, "/auth");
+            if let Some(bearer) = bearer {
+                incoming = incoming.header(AUTHORIZATION, bearer);
+            }
+            assert_eq!(
+                problem(send(router.clone(), incoming.body(Body::empty()).unwrap()).await).await,
+                (
+                    StatusCode::UNAUTHORIZED,
+                    "application/problem+json".parse().unwrap(),
+                    json!({
+                        "type":gts_uri!("cf.core.errors.err.v1~cf.core.err.unauthenticated.v1~"),
+                        "title":"Unauthenticated", "status":401, "detail":"Authentication required",
+                        "instance":"/auth", "trace_id":TRACE_ID, "context":{"reason":reason}
+                    })
+                )
+            );
+            assert_eq!(auth_hits.load(Ordering::SeqCst), 0);
+        }
+        let incoming = request(Method::GET, "/auth")
+            .header(AUTHORIZATION, AXIS_BEARER)
+            .header("x-request-id", "limits-request")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            problem(send(router.clone(), incoming).await).await,
+            (
+                StatusCode::OK,
+                "application/json".parse().unwrap(),
+                json!({
+                    "subject_id":"00000000-0000-0000-0000-000000000001", "request_id":"limits-request"
+                })
+            )
+        );
+        assert_eq!(auth_hits.load(Ordering::SeqCst), 1);
+        for content_type in [None, Some("text/plain")] {
+            let mut incoming = upload(Bytes::from_static(b"abcd"), true);
+            if let Some(content_type) = content_type {
+                incoming
+                    .headers_mut()
+                    .insert(CONTENT_TYPE, content_type.parse().unwrap());
+            }
+            assert_eq!(
+                read(send(router.clone(), incoming).await).await,
+                (StatusCode::OK, Bytes::from_static(b"abcd"))
+            );
+        }
+    }
 }

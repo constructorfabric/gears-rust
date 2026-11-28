@@ -1,13 +1,5 @@
-//! Full-process integration tests (design.md D8, task group 10): boots the
-//! real, compiled `cf-gears-event-broker-server` binary as a subprocess
-//! (`tests/common`) and drives it over real HTTP - the platform's actual
-//! `pre_init`/`init`/`post_init`/start-phase lifecycle runs for real here,
-//! unlike `EventBrokerHarness` (`src/test_support/harness.rs`), which stubs
-//! the type registry and never boots that lifecycle at all. Every request
-//! body sent and response body asserted is inlined per test, matching this
-//! crate's established convention (`streaming_tests.rs`'s module doc
-//! comment) - no shared request/fixture builders hiding what's actually
-//! sent or checked.
+//! Standalone broker integration tests over HTTP with a separate flight-control Core.
+//! Each case supplies its own request bodies and response expectations.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::too_many_lines)]
 
@@ -18,11 +10,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use common::{EventLog, SseFrameReader, Streaming, TestServer};
+use common::{EventLog, OWNER_SUBJECT, OWNER_TENANT, SseFrameReader, Streaming, TestServer};
 
-/// The bound on each request a test makes, so a server that stops answering
-/// fails the test instead of hanging it.
-const REQUEST_BOUND: Duration = Duration::from_secs(10);
+const OCCURRED_AT: &str = "2026-01-01T00:00:00Z";
 
 #[tokio::test]
 async fn publish_then_consume_happy_path() {
@@ -39,25 +29,30 @@ async fn publish_then_consume_happy_path() {
         }),
     ])
     .await;
-    let client = reqwest::Client::new();
 
-    let group_resp = client
-        .post(server.url("/event-broker/v1/consumer-groups"))
+    let group_resp = server
+        .post("/event-broker/v1/consumer-groups")
         .send()
         .await
         .expect("create consumer group");
     assert_eq!(group_resp.status(), 201);
-    let group_id = group_resp
-        .json::<serde_json::Value>()
-        .await
-        .expect("group json")["id"]
-        .as_str()
-        .expect("group id")
-        .to_owned();
+    let group = group_resp.json::<Value>().await.expect("group json");
+    let group_id = group["id"].as_str().expect("group id").to_owned();
+    assert_eq!(
+        group,
+        json!({
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": OWNER_TENANT,
+            "owner_principal": OWNER_SUBJECT,
+            "description": null,
+            "created_at": group["created_at"].as_str().expect("created_at"),
+        })
+    );
 
-    let tenant_id = Uuid::new_v4();
-    let sub_resp = client
-        .post(server.url("/event-broker/v1/subscriptions"))
+    let tenant_id = OWNER_TENANT;
+    let sub_resp = server
+        .post("/event-broker/v1/subscriptions")
         .json(&json!({
             "consumer_group": group_id,
             "client_agent": "integration-test",
@@ -79,8 +74,8 @@ async fn publish_then_consume_happy_path() {
         .expect("sub id")
         .to_owned();
 
-    let seek_resp = client
-        .post(server.url(&format!("/event-broker/v1/subscriptions/{sub_id}:seek")))
+    let seek_resp = server
+        .post(&format!("/event-broker/v1/subscriptions/{sub_id}:seek"))
         .json(&json!({
             "topology_version": 1, "positions": { topic: [{ "partition": 0, "value": "earliest" }] }
         }))
@@ -89,13 +84,11 @@ async fn publish_then_consume_happy_path() {
         .expect("seek");
     assert_eq!(seek_resp.status(), 200);
 
-    let stream_resp = client
-        .get(server.url(&format!(
+    let stream_resp = server
+        .open_stream(&format!(
             "/event-broker/v1/events:sse?subscription={sub_id}"
-        )))
-        .send()
-        .await
-        .expect("open sse stream");
+        ))
+        .await;
     assert_eq!(stream_resp.status(), 200);
     let mut reader = SseFrameReader::new(stream_resp);
     let (topology_kind, topology_data) = reader.next_frame(Duration::from_secs(5)).await;
@@ -109,22 +102,18 @@ async fn publish_then_consume_happy_path() {
         })
     );
 
-    let event_id = Uuid::new_v4();
-    let occurred_at = chrono::Utc::now().to_rfc3339();
-    let publish_resp = common::publish_retrying_while_unavailable(
-        &client,
-        &server.url("/event-broker/v1/events"),
-        &json!({
+    let event_id = Uuid::from_u128(0xe001);
+    let publish_resp = server
+        .publish_retrying_while_unavailable(&json!({
             "id": event_id,
             "type": event_type,
             "subject_tenant": tenant_id,
             "source": "integration-test",
             "subject": "s1",
             "subject_type": subject_type,
-            "occurred_at": occurred_at,
-        }),
-    )
-    .await;
+            "occurred_at": OCCURRED_AT,
+        }))
+        .await;
     assert_eq!(publish_resp.status(), 202);
     assert_eq!(
         publish_resp.text().await.expect("publish body"),
@@ -134,15 +123,9 @@ async fn publish_then_consume_happy_path() {
 
     let (event_kind, event_data) = reader.next_frame(Duration::from_secs(5)).await;
     assert_eq!(event_kind, "event");
-    // `occurred_at`/`sequence_time` are round-tripped through the server
-    // rather than assumed byte-identical to what was sent - chrono's serde
-    // `DateTime<Utc>` serialization normalizes to a `Z`-suffixed RFC 3339
-    // string, which differs syntactically (same instant) from
-    // `to_rfc3339()`'s `+00:00` suffix; `sequence_time` is server-generated
-    // and has no caller-supplied value to compare against at all (matching
-    // `topics_tests.rs`'s established `created_at` convention).
-    let round_tripped_occurred_at = event_data["payload"]["occurred_at"].clone();
-    let sequence_time = event_data["payload"]["sequence_time"].clone();
+    let sequence_time = event_data["payload"]["sequence_time"]
+        .as_str()
+        .expect("server assigned sequence_time");
     assert_eq!(
         event_data,
         json!({
@@ -154,7 +137,7 @@ async fn publish_then_consume_happy_path() {
                 "source": "integration-test",
                 "subject": "s1",
                 "subject_type": subject_type,
-                "occurred_at": round_tripped_occurred_at,
+                "occurred_at": OCCURRED_AT,
                 "trace_parent": null,
                 "data": null,
                 "partition": 0,
@@ -163,6 +146,8 @@ async fn publish_then_consume_happy_path() {
             },
         })
     );
+    drop(reader);
+    server.finish().await;
 }
 
 /// The event log is on the `SQLite` backend plugin, so the events survive the
@@ -185,10 +170,9 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         EventLog::Sqlite,
     )
     .await;
-    let client = reqwest::Client::new();
 
-    let group_resp = client
-        .post(server.url("/event-broker/v1/consumer-groups"))
+    let group_resp = server
+        .post("/event-broker/v1/consumer-groups")
         .send()
         .await
         .expect("create consumer group");
@@ -201,10 +185,20 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         .as_str()
         .expect("group id")
         .to_owned();
+    assert_eq!(
+        group_body_before_restart,
+        json!({
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": OWNER_TENANT,
+            "owner_principal": OWNER_SUBJECT,
+            "description": null,
+            "created_at": group_body_before_restart["created_at"].as_str().expect("created_at"),
+        })
+    );
 
-    let tenant_id = Uuid::new_v4();
-    let sub1_resp = client
-        .post(server.url("/event-broker/v1/subscriptions"))
+    let tenant_id = OWNER_TENANT;
+    let sub1_resp = server.post("/event-broker/v1/subscriptions")
         .json(&json!({
             "consumer_group": group_id,
             "client_agent": "integration-test",
@@ -222,8 +216,8 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         .expect("sub1 id")
         .to_owned();
 
-    client
-        .post(server.url(&format!("/event-broker/v1/subscriptions/{sub1_id}:seek")))
+    server
+        .post(&format!("/event-broker/v1/subscriptions/{sub1_id}:seek"))
         .json(&json!({
             "topology_version": 1, "positions": { topic: [{ "partition": 0, "value": "earliest" }] }
         }))
@@ -233,38 +227,31 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         .error_for_status()
         .expect("seek sub1 must succeed");
 
-    let stream1_resp = client
-        .get(server.url(&format!(
+    let stream1_resp = server
+        .open_stream(&format!(
             "/event-broker/v1/events:sse?subscription={sub1_id}"
-        )))
-        .send()
-        .await
-        .expect("open sse stream 1");
+        ))
+        .await;
     assert_eq!(stream1_resp.status(), 200);
     let mut reader1 = SseFrameReader::new(stream1_resp);
     let (topology1_kind, _) = reader1.next_frame(Duration::from_secs(5)).await;
     assert_eq!(topology1_kind, "topology");
 
-    let event_id = Uuid::new_v4();
-    let publish_resp = common::publish_retrying_while_unavailable(
-        &client,
-        &server.url("/event-broker/v1/events"),
-        &json!({
+    let event_id = Uuid::from_u128(0xe002);
+    let publish_resp = server
+        .publish_retrying_while_unavailable(&json!({
             "id": event_id,
             "type": event_type,
             "subject_tenant": tenant_id,
             "source": "integration-test",
             "subject": "s1",
             "subject_type": subject_type,
-            "occurred_at": chrono::Utc::now().to_rfc3339(),
-        }),
-    )
-    .await;
+            "occurred_at": OCCURRED_AT,
+        }))
+        .await;
     assert_eq!(publish_resp.status(), 202);
 
-    // The SEEK above persisted the `Cursor` row for
-    // `(consumer_group, topic, partition)` - the fact this test cares about
-    // below; reading the event confirms the stream serves from it.
+    // SEEK leaves a durable cursor for the fresh subscription to reuse.
     let (event1_kind, event1_data) = reader1.next_frame(Duration::from_secs(5)).await;
     assert_eq!(event1_kind, "event");
     assert_eq!(event1_data["payload"]["id"], event_id.to_string());
@@ -273,10 +260,8 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
 
     server.restart().await;
 
-    // `ConsumerGroupRepo` is `SQLite`-backed (`Storage`'s durable
-    // namespaces) - the exact same group, unchanged, must still be there.
-    let group_resp_after = client
-        .get(server.url(&format!("/event-broker/v1/consumer-groups/{group_id}")))
+    let group_resp_after = server
+        .get(&format!("/event-broker/v1/consumer-groups/{group_id}"))
         .send()
         .await
         .expect("get consumer group after restart");
@@ -290,10 +275,9 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         "the consumer group must survive a restart unchanged"
     );
 
-    // A subscription is held in the memory of its group's coordinator, so it
-    // must NOT survive.
-    let sub1_resp_after = client
-        .get(server.url(&format!("/event-broker/v1/subscriptions/{sub1_id}")))
+    // The replacement loses the coordinator's in-memory subscription.
+    let sub1_resp_after = server
+        .get(&format!("/event-broker/v1/subscriptions/{sub1_id}"))
         .send()
         .await
         .expect("get subscription 1 after restart");
@@ -303,13 +287,8 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         "a subscription must not survive a restart (subscriptions live in the coordinator memory)"
     );
 
-    // A brand-new subscription under the SAME consumer group, deliberately
-    // NOT seeked: `stream()` only rejects an unseeded partition
-    // (`PositionsNotSet`, 409) when `find_cursor` finds nothing. Getting
-    // `200` here - not 409 - is the proof the `Cursor` row the SEEK
-    // persisted before the restart is still there.
-    let sub2_resp = client
-        .post(server.url("/event-broker/v1/subscriptions"))
+    // Opening without SEEK proves the first subscription's cursor survives.
+    let sub2_resp = server.post("/event-broker/v1/subscriptions")
         .json(&json!({
             "consumer_group": group_id,
             "client_agent": "integration-test",
@@ -327,13 +306,11 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
         .expect("sub2 id")
         .to_owned();
 
-    let stream2_resp = client
-        .get(server.url(&format!(
+    let stream2_resp = server
+        .open_stream(&format!(
             "/event-broker/v1/events:sse?subscription={sub2_id}"
-        )))
-        .send()
-        .await
-        .expect("open sse stream 2 without seeking");
+        ))
+        .await;
     assert_eq!(
         stream2_resp.status(),
         200,
@@ -343,15 +320,13 @@ async fn restart_preserves_events_and_consumer_groups_but_not_subscriptions() {
     let (topology2_kind, _) = reader2.next_frame(Duration::from_secs(5)).await;
     assert_eq!(topology2_kind, "topology");
 
-    // The event itself - not just the cursor row - is still in the durable
-    // storage backend: a fresh subscription's in-memory replay
-    // cursor starts from its own join-time `assigned.offset` (always `0`
-    // for a new JOIN, `domain/delivery.rs::join`), so it re-reads from the
-    // beginning and must see the same event again.
+    // The fresh subscription starts at offset zero, so it replays the retained event.
     let (event2_kind, event2_data) = reader2.next_frame(Duration::from_secs(5)).await;
     assert_eq!(event2_kind, "event");
     assert_eq!(event2_data["payload"]["id"], event_id.to_string());
     assert_eq!(event2_data["payload"]["sequence"], 1);
+    drop(reader2);
+    server.finish().await;
 }
 
 #[tokio::test]
@@ -369,10 +344,9 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
         }),
     ])
     .await;
-    let client = reqwest::Client::new();
 
-    let producer_resp = client
-        .post(server.url("/event-broker/v1/producers"))
+    let producer_resp = server
+        .post("/event-broker/v1/producers")
         .json(&json!({ "mode": "chained", "client_agent": "integration-test" }))
         .send()
         .await
@@ -387,44 +361,23 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
         .to_owned();
 
     let body = json!({
-        "id": Uuid::new_v4(),
+        "id": Uuid::from_u128(0xe003),
         "type": event_type,
-        "subject_tenant": Uuid::new_v4(),
+        "subject_tenant": OWNER_TENANT,
         "source": "integration-test",
         "subject": "s1",
         "subject_type": subject_type,
-        "occurred_at": chrono::Utc::now().to_rfc3339(),
+        "occurred_at": OCCURRED_AT,
         "meta": { "version": 1, "producer": producer_id, "previous": 0, "sequence": 1 },
     });
 
-    // Retried while unavailable, the way a real producer publishes: a `503`
-    // is ambiguous, not fatal. A retry after one still lands on `202` because
-    // nothing was enqueued - the guard that raises it runs before the write.
-    let first = common::publish_retrying_while_unavailable(
-        &client,
-        &server.url("/event-broker/v1/events"),
-        &body,
-    )
-    .await;
-    // Body in the message: a failure shows the whole Problem. A 503 carries
-    // the generic detail whatever its source (the ingest pipeline not yet
-    // wired, a scope error, a DB failure); the server log names which.
+    let first = server.publish_retrying_while_unavailable(&body).await;
     let first_status = first.status();
     let first_text = first.text().await.expect("first body");
     assert_eq!(first_status, 202, "body: {first_text}");
 
-    // The exact same chained event, resubmitted (a real producer retrying
-    // after e.g. a dropped response) - must be accepted (ignored), not
-    // rejected as a chain-sequence violation, and must not be persisted a
-    // second time.
-    let second = common::publish_retrying_while_unavailable(
-        &client,
-        &server.url("/event-broker/v1/events"),
-        &body,
-    )
-    .await;
-    // A deduped resubmission is 200 OK (no new event persisted), distinct from
-    // the 202 Accepted a fresh publish returns (ingest events.rs).
+    // A producer can resubmit the same chained event after losing its response.
+    let second = server.publish_retrying_while_unavailable(&body).await;
     assert_eq!(second.status(), 200);
     let second_text = second.text().await.expect("second body");
     assert_eq!(
@@ -433,21 +386,14 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
     );
     assert_eq!(first_text, "", "202 Accepted must carry no body");
 
-    // Publish is asynchronous (ingest outbox drains in the background,
-    // design.md D5) - poll briefly for `end_sequence` to settle, matching
-    // `topics_tests.rs::get_topic_segments_happy_path_reflects_published_events`'s
-    // established convention, rather than asserting on the very next
-    // request.
-    // Deadline rather than a fixed iteration count, matching this file's other
-    // waits (5s frame timeouts, 15s `wait_for_healthy`): a loaded CI runner can
-    // take seconds to drain the outbox, and that is not a failure.
+    // The outbox drains asynchronously, so wait for the event's sequence to appear.
     let mut segments = json!(null);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let resp = client
-            .get(server.url(&format!(
+        let resp = server
+            .get(&format!(
                 "/event-broker/v1/topics/segments?topic={topic}&partition=0"
-            )))
+            ))
             .send()
             .await
             .expect("get topic segments");
@@ -468,17 +414,17 @@ async fn producer_chain_sequence_resubmission_is_deduped_not_double_persisted() 
         json!([{ "start_sequence": 1, "end_sequence": 1, "event_count": 1 }]),
         "the duplicate submission must not have been persisted a second time: {segments}"
     );
+    server.finish().await;
 }
 
 #[tokio::test]
 async fn consumer_group_listing_paginates_against_the_real_sqlite_backend() {
     let server = TestServer::start(vec![]).await;
-    let client = reqwest::Client::new();
 
     let mut created = Vec::new();
     for _ in 0..3 {
-        let resp = client
-            .post(server.url("/event-broker/v1/consumer-groups"))
+        let resp = server
+            .post("/event-broker/v1/consumer-groups")
             .send()
             .await
             .expect("create consumer group");
@@ -491,8 +437,8 @@ async fn consumer_group_listing_paginates_against_the_real_sqlite_backend() {
         .collect();
     assert_eq!(expected_by_id.len(), 3);
 
-    let page1 = client
-        .get(server.url("/event-broker/v1/consumer-groups?limit=2"))
+    let page1 = server
+        .get("/event-broker/v1/consumer-groups?limit=2")
         .send()
         .await
         .expect("page 1");
@@ -511,10 +457,10 @@ async fn consumer_group_listing_paginates_against_the_real_sqlite_backend() {
         .expect("a third group remains, so page 1 must carry a next_cursor")
         .to_owned();
 
-    let page2 = client
-        .get(server.url(&format!(
+    let page2 = server
+        .get(&format!(
             "/event-broker/v1/consumer-groups?limit=2&cursor={next_cursor}"
-        )))
+        ))
         .send()
         .await
         .expect("page 2");
@@ -547,10 +493,10 @@ async fn consumer_group_listing_paginates_against_the_real_sqlite_backend() {
     }
     assert_eq!(seen, expected_by_id.keys().cloned().collect());
 
-    let back = client
-        .get(server.url(&format!(
+    let back = server
+        .get(&format!(
             "/event-broker/v1/consumer-groups?limit=2&cursor={prev_cursor}"
-        )))
+        ))
         .send()
         .await
         .expect("walk prev_cursor");
@@ -561,6 +507,7 @@ async fn consumer_group_listing_paginates_against_the_real_sqlite_backend() {
         "walking prev_cursor from page 2 must return exactly page 1"
     );
     assert!(body_back["page_info"]["prev_cursor"].is_null());
+    server.finish().await;
 }
 
 /// A consume scope window of 5s, and a stream held for 12s: it stays open and
@@ -610,28 +557,30 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
         },
     )
     .await;
-    // The whole request, body included, is bounded; the stream is opened with
-    // a client of its own, since its body never ends.
-    let client = reqwest::Client::builder()
-        .timeout(REQUEST_BOUND)
-        .build()
-        .expect("build client");
-    let stream_client = reqwest::Client::new();
 
-    let group_resp = client
-        .post(server.url("/event-broker/v1/consumer-groups"))
+    let group_resp = server
+        .post("/event-broker/v1/consumer-groups")
         .send()
         .await
         .expect("create consumer group");
     assert_eq!(group_resp.status(), 201);
-    let group_id = group_resp.json::<Value>().await.expect("group json")["id"]
-        .as_str()
-        .expect("group id")
-        .to_owned();
+    let group = group_resp.json::<Value>().await.expect("group json");
+    let group_id = group["id"].as_str().expect("group id").to_owned();
+    assert_eq!(
+        group,
+        json!({
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": OWNER_TENANT,
+            "owner_principal": OWNER_SUBJECT,
+            "description": null,
+            "created_at": group["created_at"].as_str().expect("created_at"),
+        })
+    );
 
-    let tenant_id = Uuid::new_v4();
-    let sub_resp = client
-        .post(server.url("/event-broker/v1/subscriptions"))
+    let tenant_id = OWNER_TENANT;
+    let sub_resp = server
+        .post("/event-broker/v1/subscriptions")
         .json(&json!({
             "consumer_group": group_id,
             "client_agent": "integration-test",
@@ -650,8 +599,8 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
         .expect("sub id")
         .to_owned();
 
-    let seek_resp = client
-        .post(server.url(&format!("/event-broker/v1/subscriptions/{sub_id}:seek")))
+    let seek_resp = server
+        .post(&format!("/event-broker/v1/subscriptions/{sub_id}:seek"))
         .json(&json!({
             "topology_version": 1, "positions": { topic: [{ "partition": 0, "value": "earliest" }] }
         }))
@@ -660,23 +609,15 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
         .expect("seek");
     assert_eq!(seek_resp.status(), 200);
 
-    let stream_resp = tokio::time::timeout(
-        REQUEST_BOUND,
-        stream_client
-            .get(server.url(&format!(
-                "/event-broker/v1/events:sse?subscription={sub_id}"
-            )))
-            .send(),
-    )
-    .await
-    .expect("stream opens within the bound")
-    .expect("open sse stream");
+    let stream_resp = server
+        .open_stream(&format!(
+            "/event-broker/v1/events:sse?subscription={sub_id}"
+        ))
+        .await;
     assert_eq!(stream_resp.status(), 200);
     let opened = tokio::time::Instant::now();
     let mut reader = SseFrameReader::new(stream_resp);
 
-    // Each frame and how long after the open it arrived, up to the first
-    // heartbeat past `HELD_FOR`, the end of the stream, or the read deadline.
     let mut frames: Vec<(Duration, String, Value)> = Vec::new();
     let read_deadline = opened + HELD_FOR + HEARTBEAT_WITHIN;
     let read = async {
@@ -700,23 +641,20 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
         .await;
     };
 
-    let event_id = Uuid::new_v4();
+    let event_id = Uuid::from_u128(0xe004);
     let publish = async {
         tokio::time::sleep_until(opened + PUBLISH_AFTER).await;
-        common::publish_retrying_while_unavailable(
-            &client,
-            &server.url("/event-broker/v1/events"),
-            &json!({
+        server
+            .publish_retrying_while_unavailable(&json!({
                 "id": event_id,
                 "type": event_type,
                 "subject_tenant": tenant_id,
                 "source": "integration-test",
                 "subject": "s1",
                 "subject_type": subject_type,
-                "occurred_at": chrono::Utc::now().to_rfc3339(),
-            }),
-        )
-        .await
+                "occurred_at": OCCURRED_AT,
+            }))
+            .await
     };
     let ((), publish_resp) = tokio::join!(read, publish);
     assert_eq!(publish_resp.status(), 202);
@@ -731,13 +669,10 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
         .filter(|(_, kind, _)| kind != "heartbeat")
         .map(|(_, kind, data)| (kind.clone(), data.clone()))
         .collect();
-    // `occurred_at` is normalized by the server and `sequence_time` is set by
-    // it, so both are taken from the frame (`Null` when no event arrived).
     let delivered = non_heartbeat
         .iter()
         .find(|(kind, _)| kind == "event")
         .map_or(Value::Null, |(_, data)| data.clone());
-    let round_tripped_occurred_at = delivered["payload"]["occurred_at"].clone();
     let sequence_time = delivered["payload"]["sequence_time"].clone();
     assert_eq!(
         non_heartbeat,
@@ -766,7 +701,7 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
                         "source": "integration-test",
                         "subject": "s1",
                         "subject_type": subject_type,
-                        "occurred_at": round_tripped_occurred_at,
+                        "occurred_at": OCCURRED_AT,
                         "trace_parent": null,
                         "data": null,
                         "partition": 0,
@@ -796,6 +731,8 @@ async fn a_stream_outlives_its_consume_scope_window_through_renewals() {
         .filter(|line| line.contains("consume scope expired"))
         .collect();
     assert_eq!(expired, Vec::<String>::new());
+    drop(reader);
+    server.finish().await;
 }
 
 /// The startup check refuses a consume scope TTL that does not outlast the
@@ -824,9 +761,5 @@ async fn a_server_whose_scope_ttl_is_too_short_refuses_to_start() {
         "the server's output must carry the check's message: {:#?}",
         refused.logs
     );
-    assert!(
-        refused.status.is_some_and(|status| !status.success()),
-        "the server must exit with a failure status: {:?}",
-        refused.status
-    );
+    assert_eq!(refused.status.code(), Some(1));
 }

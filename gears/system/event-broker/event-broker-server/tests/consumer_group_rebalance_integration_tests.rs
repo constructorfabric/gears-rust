@@ -2,9 +2,9 @@
 //! with 8 partitions, two steady-state subscribers (A, B) each holding 4
 //! partitions, then an incremental rollout where a third subscriber (C)
 //! JOINs the same group while A and B are both still streaming - the point
-//! at which the group briefly has 3 concurrent subscribers. Boots the real
-//! server subprocess and drives it over HTTP, same harness as
-//! `standalone_integration_tests.rs`.
+//! at which the group briefly has 3 concurrent subscribers. The same
+//! authenticated broker and flight-control pair as
+//! `standalone_integration_tests.rs` also serves the replacement and scale-down cases.
 //!
 //! Scope note: this test stops once C's JOIN and the resulting 2-way->3-way
 //! rebalance are asserted. It deliberately does NOT go on to have A (or
@@ -43,10 +43,11 @@ use event_broker::domain::consumer_group_coordinator::range_split;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use common::{SseFrameReader, TestServer};
+use common::{OWNER_SUBJECT, OWNER_TENANT, SseFrameReader, TestServer};
 
 const PARTITION_COUNT: u32 = 8;
 const EVENTS_PER_PARTITION: i64 = 10;
+const OCCURRED_AT: &str = "2026-01-01T00:00:00Z";
 
 /// Finds a payload value that hashes to `target_partition` under the same
 /// formula the server uses (`domain/ingest.rs::partition_for`) - lets the test
@@ -189,7 +190,6 @@ fn event_frame_json(
     steering: &str,
     partition: i32,
     sequence: i64,
-    occurred_at: &Value,
     sequence_time: &Value,
 ) -> Value {
     json!({
@@ -201,7 +201,7 @@ fn event_frame_json(
             "source": "integration-test",
             "subject": subject,
             "subject_type": subject_type,
-            "occurred_at": occurred_at,
+            "occurred_at": OCCURRED_AT,
             "trace_parent": null,
             "data": { "pk": steering },
             "partition": partition,
@@ -255,7 +255,6 @@ async fn next_meaningful_frame(
 
 #[allow(clippy::too_many_arguments)]
 async fn join(
-    client: &reqwest::Client,
     server: &TestServer,
     group_id: &str,
     client_agent: &str,
@@ -272,8 +271,8 @@ async fn join(
     if let Some(timeout) = session_timeout {
         body["session_timeout"] = json!(timeout);
     }
-    let resp = client
-        .post(server.url("/event-broker/v1/subscriptions"))
+    let resp = server
+        .post("/event-broker/v1/subscriptions")
         .json(&body)
         .send()
         .await
@@ -293,15 +292,14 @@ async fn join(
 }
 
 async fn seek_all(
-    client: &reqwest::Client,
     server: &TestServer,
     sub_id: Uuid,
     topic: &str,
     partitions: &[i32],
     topology_version: i64,
 ) {
-    let resp = client
-        .post(server.url(&format!("/event-broker/v1/subscriptions/{sub_id}:seek")))
+    let resp = server
+        .post(&format!("/event-broker/v1/subscriptions/{sub_id}:seek"))
         .json(&json!({
             "topology_version": topology_version,
             "positions": {
@@ -317,18 +315,12 @@ async fn seek_all(
     assert_eq!(resp.status(), 200, "seek must return 200");
 }
 
-async fn open_stream(
-    client: &reqwest::Client,
-    server: &TestServer,
-    sub_id: Uuid,
-) -> SseFrameReader {
-    let resp = client
-        .get(server.url(&format!(
+async fn open_stream(server: &TestServer, sub_id: Uuid) -> SseFrameReader {
+    let resp = server
+        .open_stream(&format!(
             "/event-broker/v1/events:sse?subscription={sub_id}"
-        )))
-        .send()
-        .await
-        .expect("open sse stream");
+        ))
+        .await;
     assert_eq!(resp.status(), 200, "stream open must return 200");
     SseFrameReader::new(resp)
 }
@@ -365,7 +357,6 @@ async fn drain_events(
             .unwrap_or_else(|| {
                 panic!("no published event recorded for partition {partition} sequence {sequence}")
             });
-        let occurred_at = data["payload"]["occurred_at"].clone();
         let sequence_time = data["payload"]["sequence_time"].clone();
         assert_eq!(
             data,
@@ -378,7 +369,6 @@ async fn drain_events(
                 &steering[usize::try_from(partition).expect("fits usize")],
                 partition,
                 sequence,
-                &occurred_at,
                 &sequence_time,
             ),
             "event frame body mismatch for partition {partition} sequence {sequence}"
@@ -409,38 +399,40 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
             "id": event_type,
             "topic_id": topic,
             "allowed_subject_types": [subject_type],
-            // The member the pointer below names has to be one this type
-            // declares: the broker checks that when it admits the type, so a
-            // pointer at an undeclared member would drop the type rather than
-            // fail on every publish of it.
+            // Type admission requires the partition pointer to select a declared member.
             "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
-            // Steering a publish to a partition means varying the member the
-            // type names, so this type names the payload member the test sets.
             "partition_key": "/data/pk",
         }),
     ])
     .await;
-    let client = reqwest::Client::new();
-    let tenant_id = Uuid::new_v4();
+    let tenant_id = OWNER_TENANT;
 
     let steering: Vec<String> = (0..i32::try_from(PARTITION_COUNT).expect("fits i32"))
         .map(|p| steering_value_for(p, PARTITION_COUNT))
         .collect();
 
-    let group_resp = client
-        .post(server.url("/event-broker/v1/consumer-groups"))
+    let group_resp = server
+        .post("/event-broker/v1/consumer-groups")
         .send()
         .await
         .expect("create consumer group");
     assert_eq!(group_resp.status(), 201);
-    let group_id = group_resp.json::<Value>().await.expect("group json")["id"]
-        .as_str()
-        .expect("group id")
-        .to_owned();
+    let group = group_resp.json::<Value>().await.expect("group json");
+    let group_id = group["id"].as_str().expect("group id").to_owned();
+    assert_eq!(
+        group,
+        json!({
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": OWNER_TENANT,
+            "owner_principal": OWNER_SUBJECT,
+            "description": null,
+            "created_at": group["created_at"].as_str().expect("created_at"),
+        })
+    );
 
     // --- Phase 1: A joins alone, gets every partition. ---
     let (a_id, a_v1, a_assigned_v1) = join(
-        &client,
         &server,
         &group_id,
         "consumer-a",
@@ -455,8 +447,8 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
         a_assigned_v1,
         (0..i32::try_from(PARTITION_COUNT).expect("fits i32")).collect::<Vec<_>>()
     );
-    seek_all(&client, &server, a_id, topic, &a_assigned_v1, a_v1).await;
-    let mut a_reader = open_stream(&client, &server, a_id).await;
+    seek_all(&server, a_id, topic, &a_assigned_v1, a_v1).await;
+    let mut a_reader = open_stream(&server, a_id).await;
     let (kind, data) = next_non_heartbeat(&mut a_reader, Duration::from_secs(5)).await;
     assert_eq!(kind, "topology");
     assert_eq!(data, topology_frame_json(topic, 1, &a_assigned_v1));
@@ -466,7 +458,6 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
     // pre-existing member: it already holds every partition, so nothing new
     // can appear). ---
     let (b_id, b_v, b_assigned_from_join) = join(
-        &client,
         &server,
         &group_id,
         "consumer-b",
@@ -495,8 +486,8 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
     );
     assert_eq!(data, topology_frame_json(topic, 2, &a_steady));
 
-    seek_all(&client, &server, b_id, topic, &b_steady, b_v).await;
-    let mut b_reader = open_stream(&client, &server, b_id).await;
+    seek_all(&server, b_id, topic, &b_steady, b_v).await;
+    let mut b_reader = open_stream(&server, b_id).await;
     let (kind, data) = next_non_heartbeat(&mut b_reader, Duration::from_secs(5)).await;
     assert_eq!(kind, "topology");
     assert_eq!(data, topology_frame_json(topic, 2, &b_steady));
@@ -507,10 +498,12 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
     let mut published: HashMap<i32, HashMap<i64, Uuid>> = HashMap::new();
     for seq in 1..=EVENTS_PER_PARTITION {
         for partition in 0..i32::try_from(PARTITION_COUNT).expect("fits i32") {
-            let event_id = Uuid::new_v4();
-            let occurred_at = chrono::Utc::now().to_rfc3339();
-            let publish_resp = client
-                .post(server.url("/event-broker/v1/events"))
+            let event_id = Uuid::from_u128(
+                (u128::try_from(seq).expect("positive sequence") << 32)
+                    | u128::try_from(partition).expect("nonnegative partition"),
+            );
+            let publish_resp = server
+                .post("/event-broker/v1/events")
                 .json(&json!({
                     "id": event_id,
                     "type": event_type,
@@ -519,7 +512,7 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
                     "subject": format!("s-{partition}-{seq}"),
                     "subject_type": subject_type,
                     "data": { "pk": steering[usize::try_from(partition).expect("fits usize")] },
-                    "occurred_at": occurred_at,
+                    "occurred_at": OCCURRED_AT,
                 }))
                 .send()
                 .await
@@ -617,7 +610,6 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
     // gaining (terminal control) - classify from the actual computed split
     // rather than assuming "existing members only ever lose". ---
     let (c_id, c_v, c_assigned_from_join) = join(
-        &client,
         &server,
         &group_id,
         "consumer-c",
@@ -686,15 +678,178 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
         }
     }
 
-    seek_all(&client, &server, c_id, topic, &three_way[&c_id], c_v).await;
-    let mut c_reader = open_stream(&client, &server, c_id).await;
+    seek_all(&server, c_id, topic, &three_way[&c_id], c_v).await;
+    let mut c_reader = open_stream(&server, c_id).await;
     let (kind, data) = next_non_heartbeat(&mut c_reader, Duration::from_secs(5)).await;
     assert_eq!(kind, "topology");
     assert_eq!(data, topology_frame_json(topic, 3, &three_way[&c_id]));
 
-    // At this point A, B, and C all hold an open, live SSE stream against
-    // the same consumer group at generation 3 - the incremental rollout's 3
-    // parallel subscribers.
+    drop((a_reader, b_reader, c_reader));
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn a_continuing_subscription_receives_the_latest_version_with_unchanged_partitions() {
+    const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+    let topic_a = "gts.cf.core.events.topic.v1~x.eb.t11.streama.v1";
+    let topic_b = "gts.cf.core.events.topic.v1~x.eb.t11.streamb.v1";
+    let event_a = "gts.cf.core.events.event.v1~x.eb.t11.eventa.v1~";
+    let event_b = "gts.cf.core.events.event.v1~x.eb.t11.eventb.v1~";
+    let subject_type = "gts.x.eb.t11.subject.v1~";
+
+    // A topic's split depends only on members interested in that topic.
+    let server = TestServer::start(vec![
+        json!({ "id": topic_a, "partitions": 1 }),
+        json!({ "id": topic_b, "partitions": 1 }),
+        json!({
+            "id": event_a,
+            "topic_id": topic_a,
+            "allowed_subject_types": [subject_type],
+            "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
+            "partition_key": "/data/pk",
+        }),
+        json!({
+            "id": event_b,
+            "topic_id": topic_b,
+            "allowed_subject_types": [subject_type],
+            "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
+            "partition_key": "/data/pk",
+        }),
+    ])
+    .await;
+
+    let response = server
+        .post("/event-broker/v1/consumer-groups")
+        .send()
+        .await
+        .expect("create consumer group");
+    assert_eq!(response.status(), 201);
+    let group = response.json::<Value>().await.expect("group JSON");
+    let group_id = group.get("id").and_then(Value::as_str).expect("group id");
+    assert_eq!(
+        group,
+        json!({
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": OWNER_TENANT,
+            "owner_principal": OWNER_SUBJECT,
+            "description": null,
+            "created_at": group.get("created_at").and_then(Value::as_str).expect("group creation time"),
+        })
+    );
+
+    let join = |client_agent, topic, event_type| {
+        server
+            .post("/event-broker/v1/subscriptions")
+            .json(&json!({
+                "consumer_group": group_id,
+                "client_agent": client_agent,
+                "interests": [{
+                    "topic": topic,
+                    "subject_tenant": OWNER_TENANT,
+                    "ownership_filter": "entire_tenant",
+                    "types": [event_type],
+                }],
+            }))
+            .send()
+    };
+    let response = join("consumer-a", topic_a, event_a).await.expect("join A");
+    assert_eq!(response.status(), 201);
+    let a = response.json::<Value>().await.expect("A's JOIN JSON");
+    let a_id: Uuid = a
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("A's subscription id")
+        .parse()
+        .expect("A's id is a UUID");
+    assert_eq!(
+        a,
+        json!({
+            "id": a_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-a",
+            "interests": [{
+                "topic": topic_a,
+                "subject_tenant": OWNER_TENANT,
+                "types": [event_a],
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "filter": null,
+                "unmatched_types": [],
+            }],
+            "assigned": [{"topic": topic_a, "partition": 0}],
+            "topology_version": 1,
+            "created_at": a.get("created_at").and_then(Value::as_str).expect("A's creation time"),
+        })
+    );
+    seek_all(&server, a_id, topic_a, &[0], 1).await;
+    let mut a_reader = open_stream(&server, a_id).await;
+    let (kind, opening) = next_non_heartbeat(&mut a_reader, FRAME_TIMEOUT).await;
+    assert_eq!(kind, "topology");
+    assert_eq!(
+        opening,
+        json!({
+            "kind": "topology",
+            "topology_version": 1,
+            "assigned": [{"topic": topic_a, "partition": 0, "offset": 0, "last_examined": 0}],
+        })
+    );
+    println!("A {a_id} SSE {kind}: {opening}");
+
+    let response = join("consumer-b", topic_b, event_b).await.expect("join B");
+    assert_eq!(response.status(), 201);
+    let b = response.json::<Value>().await.expect("B's JOIN JSON");
+    let b_id: Uuid = b
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("B's subscription id")
+        .parse()
+        .expect("B's id is a UUID");
+    assert_ne!(a_id, b_id);
+    assert_eq!(
+        b,
+        json!({
+            "id": b_id,
+            "consumer_group": group_id,
+            "client_agent": "consumer-b",
+            "interests": [{
+                "topic": topic_b,
+                "subject_tenant": OWNER_TENANT,
+                "types": [event_b],
+                "ownership_filter": "entire_tenant",
+                "barrier_mode": "respect",
+                "filter": null,
+                "unmatched_types": [],
+            }],
+            "assigned": [{"topic": topic_b, "partition": 0}],
+            "topology_version": 2,
+            "created_at": b.get("created_at").and_then(Value::as_str).expect("B's creation time"),
+        })
+    );
+    println!("B JOIN 201: {b}");
+    println!(
+        "Waiting up to {} s for topology v2 on A {a_id}'s original SSE stream",
+        FRAME_TIMEOUT.as_secs()
+    );
+
+    let started = tokio::time::Instant::now();
+    let (kind, update) = next_non_heartbeat(&mut a_reader, FRAME_TIMEOUT).await;
+    assert_eq!(kind, "topology");
+    assert_eq!(
+        update,
+        json!({
+            "kind": "topology",
+            "topology_version": 2,
+            "assigned": [{"topic": topic_a, "partition": 0, "offset": 0, "last_examined": 0}],
+        })
+    );
+    println!(
+        "A {a_id} SSE {kind} after {} ms: {update}",
+        started.elapsed().as_millis()
+    );
+
+    drop(a_reader);
+    server.finish().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +869,6 @@ async fn two_subscribers_baseline_then_third_joins_mid_stream() {
 
 struct TestFixture {
     server: TestServer,
-    client: reqwest::Client,
     group_id: String,
     tenant_id: Uuid,
     topic: String,
@@ -727,16 +881,8 @@ async fn setup(test_tag: &str) -> TestFixture {
     let topic = format!("gts.cf.core.events.topic.v1~x.eb.{test_tag}.rollout.v1");
     let event_type = format!("gts.cf.core.events.event.v1~x.eb.{test_tag}.foo.v1~");
     let subject_type = format!("gts.x.eb.{test_tag}.subject.v1~");
-    // A 1s heartbeat (vs the 5s default). The server has no proactive disconnect
-    // watcher, so it notices a member that departs by dropping its connection no
-    // later than the next frame it fails to write - a heartbeat, for an idle
-    // stream. These tests set `session_timeout = PT1S` to reap fast, so with the
-    // 5s default that detection alone could outlast `drive_to_quiescence`'s
-    // window - the race that flaked `*_via_disconnect` on slow CI (notably
-    // Windows, slower to observe a peer FIN on an idle response). 1s realigns
-    // detection with the 1s timeout. Production is unaffected: there
-    // `session_timeout` (30s) dwarfs the heartbeat, so the latency is immaterial.
-    // `*_via_delete` reaps synchronously and does not depend on this.
+    // A 1s heartbeat bounds when an idle stream detects a dropped connection.
+    // The session timeout starts after that detection, before the sweeper reaps it.
     let server = TestServer::start_with_heartbeat(
         vec![
             json!({ "id": topic, "partitions": PARTITION_COUNT, }),
@@ -744,39 +890,41 @@ async fn setup(test_tag: &str) -> TestFixture {
                 "id": event_type,
                 "topic_id": topic,
                 "allowed_subject_types": [subject_type],
-                // The member the pointer below names has to be one this type
-                // declares: the broker checks that when it admits the type, so a
-                // pointer at an undeclared member would drop the type rather than
-                // fail on every publish of it.
+                // Type admission requires the partition pointer to select a declared member.
                 "data_schema": { "type": "object", "properties": { "pk": { "type": "string" } } },
-                // Steering a publish to a partition means varying the member the
-                // type names, so this type names the payload member the test sets.
                 "partition_key": "/data/pk",
             }),
         ],
         1,
     )
     .await;
-    let client = reqwest::Client::new();
-    let tenant_id = Uuid::new_v4();
+    let tenant_id = OWNER_TENANT;
     let steering = (0..i32::try_from(PARTITION_COUNT).expect("fits i32"))
         .map(|p| steering_value_for(p, PARTITION_COUNT))
         .collect();
 
-    let group_resp = client
-        .post(server.url("/event-broker/v1/consumer-groups"))
+    let group_resp = server
+        .post("/event-broker/v1/consumer-groups")
         .send()
         .await
         .expect("create consumer group");
     assert_eq!(group_resp.status(), 201);
-    let group_id = group_resp.json::<Value>().await.expect("group json")["id"]
-        .as_str()
-        .expect("group id")
-        .to_owned();
+    let group = group_resp.json::<Value>().await.expect("group json");
+    let group_id = group["id"].as_str().expect("group id").to_owned();
+    assert_eq!(
+        group,
+        json!({
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": OWNER_TENANT,
+            "owner_principal": OWNER_SUBJECT,
+            "description": null,
+            "created_at": group["created_at"].as_str().expect("created_at"),
+        })
+    );
 
     TestFixture {
         server,
-        client,
         group_id,
         tenant_id,
         topic,
@@ -810,7 +958,6 @@ async fn join_member(
     session_timeout: Option<&'static str>,
 ) -> Member {
     let (id, topology_version, assigned) = join(
-        &f.client,
         &f.server,
         &f.group_id,
         client_agent,
@@ -820,16 +967,8 @@ async fn join_member(
         session_timeout,
     )
     .await;
-    seek_all(
-        &f.client,
-        &f.server,
-        id,
-        &f.topic,
-        &assigned,
-        topology_version,
-    )
-    .await;
-    let reader = open_stream(&f.client, &f.server, id).await;
+    seek_all(&f.server, id, &f.topic, &assigned, topology_version).await;
+    let reader = open_stream(&f.server, id).await;
     Member {
         client_agent,
         id,
@@ -852,11 +991,8 @@ async fn join_member(
 async fn depart(f: &TestFixture, members: &mut Vec<Member>, id: Uuid, via_delete: bool) {
     if via_delete {
         let resp = f
-            .client
-            .delete(
-                f.server
-                    .url(&format!("/event-broker/v1/subscriptions/{id}")),
-            )
+            .server
+            .delete(&format!("/event-broker/v1/subscriptions/{id}"))
             .send()
             .await
             .expect("delete subscription");
@@ -874,20 +1010,13 @@ async fn depart(f: &TestFixture, members: &mut Vec<Member>, id: Uuid, via_delete
 /// a well-behaved consumer would) whenever a `terminal` control frame closes a
 /// member out.
 ///
-/// Deliberately does NOT pre-compute "the" expected split from the CURRENT
-/// live membership and compare a `topology` frame's exact body against it:
-/// once a member's forced recovery is itself in flight, "current live
-/// membership" can already be one generation ahead of a `topology` frame
-/// that was queued (but not yet read) from the PRIOR generation, and
-/// asserting today's split against yesterday's frame is simply wrong, not a
-/// product bug - this bit a first draft of this helper directly. Instead,
-/// each `topology` frame is checked against the invariant that actually
-/// defines it (`event-broker-stream-lifecycle`'s "loss/version-change"
-/// case: version advances, the new assignment is a non-empty subset of the
-/// member's own last-known one), and each `terminal` frame's `positions` -
-/// which is self-referential to that member's own history and immune to
-/// this race - is still checked byte-for-byte. `verify_gap_free_and_final_state`
-/// below is what asserts the exact final split once everything has settled.
+/// Recovery JOINs can advance the group while an earlier snapshot is queued,
+/// and intermediate generations can coalesce. Compare each `topology` frame
+/// with the member's last observed generation. A newer snapshot retains a
+/// nonempty subset of that member's partitions, including the whole set when
+/// only the version changes. Terminal positions use the member's recorded
+/// assignment. `verify_gap_free_and_final_state` checks the exact final split
+/// after quiescence.
 async fn drive_to_quiescence(f: &TestFixture, members: &mut Vec<Member>) {
     // Quiescence = no member emits a topology/control frame for a whole
     // `quiet_window`. Heartbeats are ignored, so this is independent of the
@@ -937,11 +1066,9 @@ async fn drive_to_quiescence(f: &TestFixture, members: &mut Vec<Member>) {
                         members[i].topology_version
                     );
                     assert!(
-                        !new_assigned.is_empty()
-                            && new_assigned.is_subset(&old_assigned)
-                            && new_assigned != old_assigned,
-                        "{} received a non-terminal topology frame that isn't a pure, non-empty loss: \
-                         old={old_assigned:?} new={new_assigned:?} - {data}",
+                        !new_assigned.is_empty() && new_assigned.is_subset(&old_assigned),
+                        "{} non-terminal topology frame must retain a nonempty subset of its prior \
+                         assignment (old={old_assigned:?} new={new_assigned:?}): {data}",
                         members[i].client_agent
                     );
                     let mut new_assigned: Vec<i32> = new_assigned.into_iter().collect();
@@ -1022,11 +1149,13 @@ async fn verify_gap_free_and_final_state(
     let mut published: HashMap<i32, HashMap<i64, Uuid>> = HashMap::new();
     for seq in 1..=events_per_partition {
         for partition in 0..i32::try_from(PARTITION_COUNT).expect("fits i32") {
-            let event_id = Uuid::new_v4();
-            let occurred_at = chrono::Utc::now().to_rfc3339();
+            let event_id = Uuid::from_u128(
+                (u128::try_from(seq).expect("positive sequence") << 32)
+                    | u128::try_from(partition).expect("nonnegative partition"),
+            );
             let resp = f
-                .client
-                .post(f.server.url("/event-broker/v1/events"))
+                .server
+                .post("/event-broker/v1/events")
                 .json(&json!({
                     "id": event_id,
                     "type": f.event_type,
@@ -1035,7 +1164,7 @@ async fn verify_gap_free_and_final_state(
                     "subject": format!("s-{partition}-{seq}"),
                     "subject_type": f.subject_type,
                     "data": { "pk": f.steering[usize::try_from(partition).expect("fits usize")] },
-                    "occurred_at": occurred_at,
+                    "occurred_at": OCCURRED_AT,
                 }))
                 .send()
                 .await
@@ -1083,40 +1212,14 @@ async fn verify_gap_free_and_final_state(
 
     for m in members.iter() {
         let resp = f
-            .client
-            .get(
-                f.server
-                    .url(&format!("/event-broker/v1/subscriptions/{}", m.id)),
-            )
+            .server
+            .get(&format!("/event-broker/v1/subscriptions/{}", m.id))
             .send()
             .await
             .expect("get subscription");
         assert_eq!(resp.status(), 200);
         let body = resp.json::<Value>().await.expect("subscription json");
         let created_at = body["created_at"].clone();
-        // `notify_members` sends NO frame at all when a rebalance leaves a
-        // member's own assigned set unchanged (`if new_set == old_set {
-        // continue; }` in consumer_group_coordinator/mod.rs) - but
-        // every rebalance still bumps that member's stored `topology_version`
-        // to the new value regardless. So a member whose
-        // OWN assignment never changes across a LATER, unrelated rebalance
-        // ends up with a stored `topology_version` ahead of anything its own
-        // stream was ever told about via a frame - the spec's own
-        // "topology_version bumped, assigned set unchanged" case (which it
-        // says must still emit a non-terminal topology frame) isn't
-        // actually implemented. Tracking this in stored state only, silently, is
-        // why `topology_version` here is read from the response rather
-        // than asserted against what frames told this test - it's real
-        // server state this test cannot predict without also modeling
-        // every OTHER member's rebalances that never produced a frame here.
-        let actual_topology_version = body["topology_version"].as_i64().expect("topology_version");
-        assert!(
-            actual_topology_version >= m.topology_version,
-            "{}'s stored topology_version ({actual_topology_version}) must never be BEHIND what its own \
-             frames reported ({})",
-            m.client_agent,
-            m.topology_version
-        );
         let mut sorted_assigned = m.assigned.clone();
         sorted_assigned.sort_unstable();
         assert_eq!(
@@ -1137,7 +1240,7 @@ async fn verify_gap_free_and_final_state(
                     .iter()
                     .map(|p| json!({ "topic": f.topic, "partition": p }))
                     .collect::<Vec<_>>(),
-                "topology_version": actual_topology_version,
+                "topology_version": m.topology_version,
                 "created_at": created_at,
             }),
             "final subscription state mismatch for {}",
@@ -1160,7 +1263,6 @@ async fn two_way_steady_state(f: &TestFixture) -> (Member, Member) {
     assert_eq!(data, topology_frame_json(&f.topic, 1, &a.assigned));
 
     let (b_id, b_v, b_assigned) = join(
-        &f.client,
         &f.server,
         &f.group_id,
         "consumer-b",
@@ -1186,8 +1288,8 @@ async fn two_way_steady_state(f: &TestFixture) -> (Member, Member) {
     a.assigned = two_way[&a.id].clone();
     a.topology_version = 2;
 
-    seek_all(&f.client, &f.server, b_id, &f.topic, &two_way[&b_id], b_v).await;
-    let mut b_reader = open_stream(&f.client, &f.server, b_id).await;
+    seek_all(&f.server, b_id, &f.topic, &two_way[&b_id], b_v).await;
+    let mut b_reader = open_stream(&f.server, b_id).await;
     let (kind, data) = next_non_heartbeat(&mut b_reader, Duration::from_secs(5)).await;
     assert_eq!(kind, "topology");
     assert_eq!(data, topology_frame_json(&f.topic, 2, &two_way[&b_id]));
@@ -1220,6 +1322,8 @@ async fn scale_down_via_delete() {
         "sole survivor must end up holding every partition"
     );
     verify_gap_free_and_final_state(&f, &mut members, 2).await;
+    drop(members);
+    f.server.finish().await;
 }
 
 #[tokio::test]
@@ -1234,7 +1338,6 @@ async fn scale_down_via_disconnect() {
     assert_eq!(data, topology_frame_json(&f.topic, 1, &a.assigned));
 
     let (b_id, b_v, b_assigned) = join(
-        &f.client,
         &f.server,
         &f.group_id,
         "consumer-b",
@@ -1252,8 +1355,8 @@ async fn scale_down_via_disconnect() {
     assert_eq!(data, topology_frame_json(&f.topic, 2, &two_way[&a.id]));
     a.assigned = two_way[&a.id].clone();
     a.topology_version = 2;
-    seek_all(&f.client, &f.server, b_id, &f.topic, &two_way[&b_id], b_v).await;
-    let mut b_reader = open_stream(&f.client, &f.server, b_id).await;
+    seek_all(&f.server, b_id, &f.topic, &two_way[&b_id], b_v).await;
+    let mut b_reader = open_stream(&f.server, b_id).await;
     let (kind, data) = next_non_heartbeat(&mut b_reader, Duration::from_secs(5)).await;
     assert_eq!(kind, "topology");
     assert_eq!(data, topology_frame_json(&f.topic, 2, &two_way[&b_id]));
@@ -1279,6 +1382,8 @@ async fn scale_down_via_disconnect() {
         "sole survivor must end up holding every partition"
     );
     verify_gap_free_and_final_state(&f, &mut members, 2).await;
+    drop(members);
+    f.server.finish().await;
 }
 
 #[tokio::test]
@@ -1334,6 +1439,8 @@ async fn rolling_replacement_via_delete() {
         "the two survivors together must hold every partition exactly once"
     );
     verify_gap_free_and_final_state(&f, &mut members, 2).await;
+    drop(members);
+    f.server.finish().await;
 }
 
 #[tokio::test]
@@ -1348,7 +1455,6 @@ async fn rolling_replacement_via_disconnect() {
     assert_eq!(data, topology_frame_json(&f.topic, 1, &a.assigned));
 
     let (b_id, b_v, b_assigned) = join(
-        &f.client,
         &f.server,
         &f.group_id,
         "consumer-b",
@@ -1366,8 +1472,8 @@ async fn rolling_replacement_via_disconnect() {
     assert_eq!(data, topology_frame_json(&f.topic, 2, &two_way[&a.id]));
     a.assigned = two_way[&a.id].clone();
     a.topology_version = 2;
-    seek_all(&f.client, &f.server, b_id, &f.topic, &two_way[&b_id], b_v).await;
-    let mut b_reader = open_stream(&f.client, &f.server, b_id).await;
+    seek_all(&f.server, b_id, &f.topic, &two_way[&b_id], b_v).await;
+    let mut b_reader = open_stream(&f.server, b_id).await;
     let (kind, data) = next_non_heartbeat(&mut b_reader, Duration::from_secs(5)).await;
     assert_eq!(kind, "topology");
     assert_eq!(data, topology_frame_json(&f.topic, 2, &two_way[&b_id]));
@@ -1418,4 +1524,6 @@ async fn rolling_replacement_via_disconnect() {
         "the two survivors together must hold every partition exactly once"
     );
     verify_gap_free_and_final_state(&f, &mut members, 2).await;
+    drop(members);
+    f.server.finish().await;
 }

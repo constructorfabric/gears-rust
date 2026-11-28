@@ -1,141 +1,102 @@
-# Minimal working config for `cf-gears-event-broker-server` in standalone
-# mode (eb-single-process-implementation design.md D7) - one process, two
-# SQLite files (the gear's own database and the event log), no
-# cluster/network dependencies.
+# Standalone Event Broker worker configuration.
 #
-# Run it from the repo root:
-#   cargo run -p cf-gears-event-broker-server --bin cf-gears-event-broker-server \
-#     -- --config config/event-broker-standalone.yaml run
+# The ordinary cf-gears-event-broker-server run wires no tenant authenticator.
+# With a reachable Directory and auth enabled it exits 1 before serving tenant
+# routes, including a fixture-enabled build run without its opt-in flag.
+# Remote production tenant authentication is tracked in #5764.
 #
-# Then, e.g.:
-#   curl http://127.0.0.1:8080/event-broker/v1/topics       # seeded demo topic below
-#   curl http://127.0.0.1:8080/event-broker/v1/event-types  # seeded demo event type
-#   curl http://127.0.0.1:8080/docs        # Swagger UI (enable_docs: true)
+# For the local authenticated demo, run from the repository root with the
+# default Make target paths. The build enables e2e-flight-control on the
+# one-gear worker and the event-broker profile on the separate Core fixture.
+#   make e2e-event-broker-build
+# Start Core in one terminal. It serves HTTP on 8081 and Directory and private
+# bearer validation over gRPC on 9091.
+#   target/debug/test-flight-control --config config/event-broker-test-flight-control.yaml run
+# Start the worker in another terminal. It serves HTTP on 8080.
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:9091 \
+#   E2E_FLIGHT_CONTROL_ENDPOINT=http://127.0.0.1:9091 \
+#   target/eb-e2e/cf-gears-event-broker-server --config config/event-broker-standalone.yaml \
+#     --e2e-flight-control run
 #
-# Topics and event types are `types-registry` entities, seeded here via its
-# `entities:` startup config. They are entities of different *kinds*: a topic
-# is an instance, an event type is a derived type schema. `event-broker` reads
-# them during its start phase - after `types-registry` has committed them -
-# and re-reads them on the cadence
-# `workers.specification_refresh_interval_secs` sets. The platform route
-# `POST /types-registry/v2/platform/entities`, which requires the internal
-# token, admits asynchronously (202, with an operation to poll); an entity it
-# admits while the process runs becomes resolvable at the first refresh after
-# its admission, without a restart.
+# The public user bearer identifies the caller. The worker uses a separate
+# workload credential on the private validation service. An invalid user
+# bearer returns 401. A failed private RPC, including workload rejection,
+# returns 503 with Retry-After: 5.
+#
+# Wait for HTTP 200 from /readyz. /healthz reports liveness. The authenticated
+# catalogue requests below exercise tenant authentication.
+#   curl -fsS http://127.0.0.1:8080/readyz
+# The worker publishes the base schemas at startup. After readiness, run this
+# block in Bash with curl and jq to register the three dependent demo documents.
+#   (
+#     set -eu
+#     core=http://127.0.0.1:8081
+#     auth='x-toolkit-internal-token: eb-local-demo-workload-credential'
+#     location=$(curl -fsS --max-time 3 -D - -o /dev/null -H "$auth" \
+#       -H 'Idempotency-Key: eb-standalone-demo-v1' -H 'Content-Type: application/json' \
+#       --data-binary @testing/e2e/suites/event_broker/fixtures/demo_entities.json \
+#       "$core/types-registry/v2/platform/entities" |
+#       awk 'tolower($1) == "location:" { sub(/\r$/, "", $2); print $2 }')
+#     case "$location" in
+#       /types-registry/v2/platform/operations/*) ;;
+#       *) echo 'Missing registry operation Location' >&2; exit 1 ;;
+#     esac
+#     for attempt in $(seq 30); do
+#       operation=$(curl -fsS --max-time 3 -H "$auth" "$core$location")
+#       if jq -e '.status == "completed"' >/dev/null <<<"$operation"; then
+#         jq -e '(.items | length == 3) and all(.items[]; .error == null and
+#           (.status == "succeeded" or .status == "unchanged"))' <<<"$operation"
+#         exit
+#       fi
+#       sleep 1
+#     done
+#     echo 'Demo registry operation did not complete' >&2
+#     exit 1
+#   )
+#
+# Replaying the block with the same idempotency key checks the same operation.
+# After the worker's next specification refresh, use the checked-in demo user
+# bearer to read the topic and both event types.
+#   curl -fsS -H 'Authorization: Bearer eb-e2e-principal-a' \
+#     http://127.0.0.1:8080/event-broker/v1/topics
+#   curl -fsS -H 'Authorization: Bearer eb-e2e-principal-a' \
+#     http://127.0.0.1:8080/event-broker/v1/event-types
+# The worker publishes OpenAPI at /.well-known/openapi.json with /openapi.json
+# as an alias.
+#   curl -fsS http://127.0.0.1:8080/.well-known/openapi.json
 
 server:
   home_dir: "~/.cf-gears-event-broker"
 
-# The global `database:` section must be present (even empty) for ANY gear's
-# per-gear `database:` config below to be honored at all - `toolkit::
-# bootstrap::run::resolve_db_options` skips DB wiring entirely otherwise.
+logging:
+  default:
+    console_level: info
+    console_format: json
+
+oop_http:
+  listen_addr: "127.0.0.1:8080"
+  advertise_uri: "http://127.0.0.1:8080"
+  allow_loopback_advertise: true
+  auth_disabled: false
+  request_limits:
+    body_limit_bytes: 16777216
+    request_timeout: 30s
+  internal_auth:
+    provider: shared_secret
+    secret: "eb-local-demo-workload-credential"
+    peer_name: e2e-platform
+
 database:
   servers: {}
 
 gears:
-  types-registry:
-    # The platform API the event broker reads topics and event types through is
-    # published only with a registry database. It persists under `home_dir`, in
-    # `types-registry/types_registry.db`: a restart applies edits to the seeds
-    # below but never deletes an entry removed from them, and refuses to boot
-    # when a changed event type cannot be shown to be backward compatible with
-    # the stored one.
-    database:
-      engine: sqlite
-      file: "types_registry.db"
-      params:
-        busy_timeout: "5000"
-    config:
-      entities:
-        # A topic is an *instance* of the topic base type, carrying the stream's
-        # own data. How many partitions back it is `event-broker` configuration,
-        # below, not something the topic says.
-        - id: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
-          description: "Demo stream for the standalone quickstart."
-        # An event type is a *derived type schema* of the abstract event base:
-        # it narrows the base's `data` member into its own payload contract and
-        # fixes the traits that govern it. Nothing here is a field a publisher
-        # sends - a published event names only this type, and the broker
-        # resolves both the topic and the partition key from it.
-        - $id: "gts://gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~"
-          $schema: "http://json-schema.org/draft-07/schema#"
-          description: "Demo event type for the standalone quickstart."
-          x-gts-traits:
-            topic: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
-            allowed_subject_types: ["gts.cf.core.demo.subject.v1~"]
-            # The base defaults this to the tenant; stated here so the
-            # quickstart shows where routing is decided.
-            partition_key: "/subject_tenant"
-          type: object
-          allOf:
-            - $ref: "gts://gts.cf.core.events.event.v1~"
-            - type: object
-              properties:
-                # No constraints of its own, so it admits whatever the base
-                # allows. An empty schema here would be *wider* than the base,
-                # and registration refuses a derived type that widens.
-                data:
-                  type: ["object", "null"]
-
-        # A second demo type keyed on `/id` (the event's unique uuid) instead of
-        # `/subject_tenant`, so every published event hashes to a different partition
-        # - the standalone has 8, and a single producer fills them all. This is
-        # what makes a multi-consumer group visibly fan out (each member owns a
-        # subset of partitions); the tenant-keyed `greeting` type above would put
-        # every same-tenant event on one partition.
-        - $id: "gts://gts.cf.core.events.event.v1~cf.core.demo.spread.v1~"
-          $schema: "http://json-schema.org/draft-07/schema#"
-          description: "Demo event type partitioned by event id, for multi-partition fan-out."
-          x-gts-traits:
-            topic: "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
-            allowed_subject_types: ["gts.cf.core.demo.subject.v1~"]
-            partition_key: "/id"
-          type: object
-          allOf:
-            - $ref: "gts://gts.cf.core.events.event.v1~"
-            - type: object
-              properties:
-                data:
-                  type: ["object", "null"]
-
-  # Binds the "event-broker" cluster profile (`domain::cluster::
-  # EventBrokerCluster::resolve`'s profile name) to the zero-dependency
-  # standalone cache provider - no external cache/coordination service
-  # needed for single-process deployments.
-  cluster:
-    config:
-      profiles:
-        event-broker:
-          cache:
-            provider: standalone
-
-  # AuthN/AuthZ pipelines - required for `api-gateway`'s route registration
-  # even with `auth_disabled: true` below (permission checks still run
-  # against a default-tenant SecurityContext). See `config/quickstart.yaml`
-  # for the full multi-gear pattern this is a minimal slice of.
-  authn-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  authz-resolver:
-    config:
-      vendor: "constructorfabric"
-
-  static-authn-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-      # `accept_all`: no real bearer-token verification. Fine here since
-      # `api-gateway.auth_disabled: true` below means this plugin's actual
-      # token check is never reached anyway - dev/local only either way.
-      mode: accept_all
-
-  static-authz-plugin:
-    config:
-      vendor: "constructorfabric"
-      priority: 100
-
   event-broker:
+    clients:
+      consumes:
+        types-registry:
+          endpoint: "http://127.0.0.1:8081"
+        authz-resolver:
+          endpoint: "http://127.0.0.1:8081"
     database:
       # The gear's own database: ingest and delivery metadata only - cursors,
       # consumer groups, producers, the specification cache and the ingest
@@ -176,6 +137,11 @@ gears:
       #   dbname: "event_broker"
     config:
       mode: standalone
+      process:
+        cluster:
+          mode: memory
+      workers:
+        specification_refresh_interval_secs: 1
       # Every storage backend instance this deployment runs, keyed by registry
       # name. An entry is a GTS backend type and then that backend's own
       # settings beside it: everything beside `type` belongs to the named
@@ -207,12 +173,3 @@ gears:
       # entry for the topic type, and its built-in count is 8.
       topics:
         "gts.cf.core.events.topic.v1~": {}
-
-  api-gateway:
-    config:
-      bind_addr: "127.0.0.1:8080"
-      enable_docs: true
-      # Single-user/local only - see the warning `api-gateway` itself logs
-      # at startup with this set. Real deployments need a real IdP wired
-      # through `authn-resolver` instead.
-      auth_disabled: true

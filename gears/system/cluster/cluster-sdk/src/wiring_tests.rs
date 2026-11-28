@@ -1,19 +1,21 @@
-//! `K3`'s exit criteria over the real `ConsumerRegistration` and the real
-//! `ClientHub` (DESIGN.md).
+//! Direct tests of the SDK's client choice and a `HostRuntime` test of real
+//! inventory replay. The host fixture isolates addressing with a preinstalled
+//! client whose descriptor is unavailable.
 //!
-//! Two things are asserted here that no other test can reach. The `wire` closure
-//! is a private `fn` submitted to `inventory`, so this module calls it directly
-//! rather than through the framework's phase — `cluster/tests/oop_probe_ordering.rs`
-//! is where the *replay* is exercised end to end, because that needs a host
-//! runtime. And `derive_endpoint` reads `POD_NAMESPACE`, so every case that
-//! touches it goes through `temp_env`: `std::env::set_var` is `unsafe` in edition
-//! 2024 and the workspace forbids `unsafe_code`, which makes the hermetic helper
-//! the only available shape rather than a stylistic preference.
+//! Cases that set or clear `POD_NAMESPACE` use `temp_env` to isolate changes
+//! to the process environment.
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientHub;
+use toolkit::directory::test_support::ManagerDirectoryClient;
 use toolkit::discovery::{EndpointResolver, NullEndpointResolver, WireOutcome};
+use toolkit::registry::RegistryBuilder;
+use toolkit::runtime::{DbOptions, DependencyChecker, GearManager, HostRuntime};
+use toolkit::{ConfigProvider, DirectoryClient, Gear, GearCtx};
 use toolkit_contract::wiring::ClientTuning;
 
 use super::{
@@ -106,10 +108,8 @@ impl ClusterProfile for OrdersProfile {
     const NAME: &'static str = "orders";
 }
 
-/// The local-wins branch, which is the whole of the embedded/remote decision
-/// (§4.9.3 step 1). Note what is asserted: not merely the returned outcome, but
-/// that **no proxy was registered** — because registering one would poison
-/// `try_get_local` for the rest of the process.
+/// Local lookup has priority over the proxy map. The test checks that wiring
+/// returns `Local`, preserves the original local `Arc` and adds no proxy marker.
 #[test]
 fn a_local_client_wins_and_no_channel_is_built() {
     let hub = ClientHub::default();
@@ -142,9 +142,133 @@ fn a_local_client_wins_and_no_channel_is_built() {
     );
 }
 
-/// The remote branch. `connect_lazy` needs a reactor context (a `K2` finding), and
-/// the prefetch is spawned, so this is a `#[tokio::test]` — but nothing is awaited
-/// and no I/O happens: the endpoint points at a name that does not resolve.
+#[test]
+fn a_preinstalled_cluster_proxy_is_reused_from_the_root_and_an_owner_view() {
+    let root = ClientHub::new();
+    let proxy: Arc<dyn ClusterClient> =
+        Arc::new(StubClusterClient::for_profile(OrdersProfile::NAME));
+    root.register_remote_proxy(Arc::clone(&proxy));
+    let owner = root.for_gear("event-broker");
+
+    // A synchronous caller has no Tokio runtime for descriptor prefetch.
+    temp_env::with_var_unset(POD_NAMESPACE_ENV, || {
+        for (hub, has_proxy) in [(&root, true), (owner.as_ref(), false)] {
+            assert!(hub.try_get_local::<dyn ClusterClient>().is_none());
+            assert_eq!(hub.has_remote_proxy::<dyn ClusterClient>(), has_proxy);
+            let before = hub
+                .try_get::<dyn ClusterClient>()
+                .expect("injected cluster proxy");
+            assert!(Arc::ptr_eq(&before, &proxy));
+
+            assert_eq!(
+                wire(hub, resolver(), ClientTuning::default()).expect("wiring reuses the proxy"),
+                WireOutcome::RemoteGrpc {
+                    service: "cluster.profile.v1.ClusterProfileApi",
+                },
+                "hub owner: {:?}",
+                hub.owner(),
+            );
+
+            assert!(hub.try_get_local::<dyn ClusterClient>().is_none());
+            assert_eq!(hub.has_remote_proxy::<dyn ClusterClient>(), has_proxy);
+            let after = hub
+                .try_get::<dyn ClusterClient>()
+                .expect("retained cluster proxy");
+            assert!(Arc::ptr_eq(&after, &proxy));
+        }
+    });
+}
+
+struct ConfigByGear(Value);
+
+impl ConfigProvider for ConfigByGear {
+    fn get_gear_config(&self, gear_name: &str) -> Option<&Value> {
+        self.0.get(gear_name)
+    }
+}
+
+struct CancelAfterWiring(CancellationToken);
+
+#[async_trait::async_trait]
+impl Gear for CancelAfterWiring {
+    async fn init(&self, _ctx: &GearCtx) -> toolkit::Result<()> {
+        Ok(())
+    }
+
+    async fn post_init(&self, _ctx: &GearCtx) -> toolkit::Result<()> {
+        self.0.cancel();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cluster_addressing_uses_the_sdk_owners_static_grpc_endpoint() {
+    const HOST_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    for (override_owner, expected_unresolved) in
+        [("event-broker", &["cluster"][..]), ("cluster-sdk", &[])]
+    {
+        let root = Arc::new(ClientHub::new());
+        let proxy: Arc<dyn ClusterClient> =
+            Arc::new(StubClusterClient::for_profile(OrdersProfile::NAME).without_descriptor());
+        root.register_remote_proxy(Arc::clone(&proxy));
+        root.register::<dyn DirectoryClient>(Arc::new(ManagerDirectoryClient::new(Arc::new(
+            GearManager::new(),
+        ))));
+
+        let cancel = CancellationToken::new();
+        let mut registry = RegistryBuilder::default();
+        registry.register_core_with_meta(
+            "event-broker",
+            &[],
+            Arc::new(CancelAfterWiring(cancel.clone())),
+        );
+        let config = ConfigByGear(json!({
+            (override_owner): {
+                "clients": {
+                    "consumes": {
+                        "cluster": { "grpc_endpoint": "http://127.0.0.1:50051" }
+                    }
+                }
+            }
+        }));
+        let host = HostRuntime::new(
+            registry
+                .build_topo_sorted()
+                .expect("fixture registry builds"),
+            Arc::new(config),
+            DbOptions::None,
+            Arc::clone(&root),
+            cancel,
+            "00000000-0000-0000-0000-000000000000"
+                .parse()
+                .expect("nil instance ID"),
+            None,
+        );
+        let checker = root
+            .get::<DependencyChecker>()
+            .expect("host publishes a dependency checker");
+
+        tokio::time::timeout(HOST_LIFECYCLE_TIMEOUT, host.run_gear_phases())
+            .await
+            .expect("the host lifecycle completes within the timeout")
+            .expect("the host lifecycle completes successfully");
+
+        let found = root
+            .get::<dyn ClusterClient>()
+            .expect("injected cluster proxy");
+        assert!(Arc::ptr_eq(&found, &proxy));
+        assert_eq!(
+            checker.unresolved_deps(),
+            expected_unresolved,
+            "configuration owner: {override_owner}",
+        );
+    }
+}
+
+/// The DNS fallback needs a Tokio reactor for lazy channel construction. It
+/// schedules descriptor prefetch on the current-thread runtime. The test
+/// checks the outcome and registration without yielding to the prefetch task.
 #[tokio::test]
 async fn an_empty_hub_gets_a_remote_proxy_and_reports_remote() {
     let hub = ClientHub::default();
@@ -157,8 +281,7 @@ async fn an_empty_hub_gets_a_remote_proxy_and_reports_remote() {
     assert_eq!(outcome, WireOutcome::Remote);
     assert!(
         hub.has_remote_proxy::<dyn ClusterClient>(),
-        "the remote client must be recorded as a proxy, so a second consumer wiring the \
-         same contract reports Remote rather than mistaking it for a co-located impl"
+        "a registered remote proxy must remain distinguishable from a local implementation"
     );
     assert!(
         hub.try_get_local::<dyn ClusterClient>().is_none(),

@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package test_flight_control.v1;
+
+service BearerValidation {
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+}
+
+message AuthenticateRequest {
+  string bearer_token = 1;
+}
+
+message Identity {
+  string subject_id = 1;
+  optional string subject_type = 2;
+  string subject_tenant_id = 3;
+  repeated string token_scopes = 4;
+}
+
+enum Failure {
+  UNSPECIFIED = 0;
+  INVALID_TOKEN = 1;
+  UNAVAILABLE = 2;
+  INTERNAL = 3;
+}
+
+message AuthenticateResponse {
+  oneof outcome {
+    Identity identity = 1;
+    Failure failure = 2;
+  }
+}

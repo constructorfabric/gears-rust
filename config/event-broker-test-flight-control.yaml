@@ -1,0 +1,306 @@
+{
+  "server": {
+    "home_dir": "~/.cf-gears-event-broker-flight-control"
+  },
+  "logging": {
+    "default": {
+      "console_level": "debug",
+      "console_format": "json"
+    }
+  },
+  "database": {
+    "servers": {
+      "sqlite": {
+        "engine": "sqlite"
+      }
+    }
+  },
+  "gears": {
+    "api-gateway": {
+      "config": {
+        "bind_addr": "127.0.0.1:8081",
+        "enable_docs": true,
+        "auth_disabled": false,
+        "require_auth_by_default": true,
+        "internal_auth": {
+          "provider": "shared_secret",
+          "secret": "eb-local-demo-workload-credential",
+          "peer_name": "e2e-platform"
+        }
+      }
+    },
+    "grpc-hub": {
+      "config": {
+        "listen_addr": "127.0.0.1:9091",
+        "internal_auth": {
+          "provider": "shared_secret",
+          "secret": "eb-local-demo-workload-credential",
+          "peer_name": "e2e-platform"
+        },
+        "internal_auth_enforcement": "required"
+      }
+    },
+    "service-discovery": {
+      "config": {
+        "trusted_registrars": [
+          "e2e-platform"
+        ]
+      }
+    },
+    "types-registry": {
+      "database": {
+        "server": "sqlite",
+        "file": "registry.db",
+        "params": {
+          "busy_timeout": "5000"
+        }
+      },
+      "config": {
+        "registration_policy": {
+          "gts.cf.core.events.topic.v1~cf.core.demo.*": {
+            "allowed_vendors": [
+              "cf"
+            ]
+          },
+          "gts.cf.core.events.topic.v1~cf.e2e.event_broker.*": {
+            "allowed_vendors": [
+              "cf"
+            ]
+          },
+          "gts.cf.core.events.event.v1~cf.core.demo.*": {
+            "allowed_vendors": [
+              "cf"
+            ]
+          },
+          "gts.cf.core.events.event.v1~cf.e2e.event_broker.*": {
+            "allowed_vendors": [
+              "cf"
+            ]
+          }
+        }
+      }
+    },
+    "authn-resolver": {
+      "config": {
+        "vendor": "constructorfabric"
+      }
+    },
+    "static-authn-plugin": {
+      "config": {
+        "vendor": "constructorfabric",
+        "mode": "static_tokens",
+        "tokens": [
+          {
+            "token": "eb-e2e-principal-a",
+            "identity": {
+              "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000002",
+              "subject_type": "user",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-principal-b",
+            "identity": {
+              "subject_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000002",
+              "subject_type": "user",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-principal-c",
+            "identity": {
+              "subject_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000003",
+              "subject_type": "user",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-principal-a-in-tb",
+            "identity": {
+              "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000003",
+              "subject_type": "user",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-principal-a-service",
+            "identity": {
+              "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000002",
+              "subject_type": "service",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-nil-subject",
+            "identity": {
+              "subject_id": "00000000-0000-0000-0000-000000000000",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000002",
+              "subject_type": "user",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-nil-tenant",
+            "identity": {
+              "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000000",
+              "subject_type": "user",
+              "token_scopes": []
+            }
+          },
+          {
+            "token": "eb-e2e-barrier",
+            "identity": {
+              "subject_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+              "subject_tenant_id": "00000000-0000-0000-0000-000000000002",
+              "subject_type": "service",
+              "token_scopes": []
+            }
+          }
+        ]
+      }
+    },
+    "tenant-resolver": {
+      "config": {
+        "vendor": "fixture-tenants"
+      }
+    },
+    "static-tr-plugin": {
+      "config": {
+        "vendor": "fixture-tenants",
+        "tenants": [
+          {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "name": "T0"
+          },
+          {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "name": "TA",
+            "parent_id": "00000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "00000000-0000-0000-0000-000000000003",
+            "name": "TB",
+            "parent_id": "00000000-0000-0000-0000-000000000001"
+          },
+          {
+            "id": "00000000-0000-0000-0000-000000000004",
+            "name": "TC",
+            "parent_id": "00000000-0000-0000-0000-000000000002"
+          },
+          {
+            "id": "00000000-0000-0000-0000-000000000005",
+            "name": "TX",
+            "parent_id": "00000000-0000-0000-0000-000000000002",
+            "self_managed": true
+          }
+        ]
+      }
+    },
+    "authz-resolver": {
+      "config": {
+        "vendor": "fixture-shipped"
+      }
+    },
+    "tr-authz-plugin": {
+      "config": {
+        "vendor": "fixture-shipped",
+        "priority": 1
+      }
+    },
+    "eb-test-policy": {
+      "config": {
+        "grants": [
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "define",
+            "resource": "gts.cf.core.events.consumer_group.v1~"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "consume",
+            "resource": "gts.cf.core.events.consumer_group.v1~"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "consume",
+            "resource": "gts.cf.core.events.request.v1~"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "manage",
+            "resource": "gts.cf.core.events.request.v1~"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "produce",
+            "resource": "gts.cf.core.events.request.v1~"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "consume",
+            "resource": "gts.cf.core.events.topic.v1~cf.core.demo.topic.v1"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "produce",
+            "resource": "gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~"
+          },
+          {
+            "subject_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "action": "produce",
+            "resource": "gts.cf.core.events.event.v1~cf.core.demo.spread.v1~"
+          },
+          {
+            "subject_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "action": "consume",
+            "resource": "gts.cf.core.events.request.v1~"
+          },
+          {
+            "subject_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "action": "manage",
+            "resource": "gts.cf.core.events.request.v1~"
+          },
+          {
+            "subject_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "action": "define",
+            "resource": "gts.cf.core.events.consumer_group.v1~"
+          },
+          {
+            "subject_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "action": "consume",
+            "resource": "gts.cf.core.events.consumer_group.v1~"
+          },
+          {
+            "subject_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "action": "define",
+            "resource": "gts.cf.core.events.consumer_group.v1~"
+          },
+          {
+            "subject_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "action": "consume",
+            "resource": "gts.cf.core.events.topic.v1~cf.e2e.event_broker.stream.v1"
+          },
+          {
+            "subject_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "action": "define",
+            "resource": "gts.cf.core.events.consumer_group.v1~"
+          },
+          {
+            "subject_id": "dddddddd-dddd-dddd-dddd-dddddddddddd",
+            "action": "produce_ignore_barrier",
+            "resource": "gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~"
+          }
+        ]
+      }
+    },
+    "test-flight-control-authn": {
+      "config": {}
+    }
+  }
+}

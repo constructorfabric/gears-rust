@@ -5,7 +5,7 @@ Each test exercises one publish path:
 - 1.02: sync publish (Prefer: wait=N): 201 once the backend stores the event,
   202 when the wait elapses first, 200 when the event is a duplicate; a 201's
   event is readable through the consumer path
-- 1.03: schema validation failure → 400 (requires EVENT_TYPE_STRICT)
+- 1.03: schema validation failure returns 422 (requires EVENT_TYPE_STRICT)
 - 1.04: rate limiting → 429 (xfail: rate limiting not configured in standalone)
 - 1.05: read-only ``partition`` field rejected → 400
 - 1.06: malformed ``Prefer: wait`` value → 400, nothing enqueued
@@ -17,15 +17,17 @@ Each test exercises one publish path:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
 
-import httpx
 import pytest
 
 from .conftest import (
     API_BASE,
+    DEFAULT_SUBJECT_ID,
+    DEFAULT_TENANT_ID,
     EVENT_TYPE_KEYED,
     SKIP_LIMITS,
     EVENT_TYPE_STREAM,
@@ -36,27 +38,51 @@ from .conftest import (
     TRACE_ID,
     SseFrameReader,
 )
+from .test_consumer_subscriptions import _created_subscription_id
+from .test_publish_consume import _read_case_window, _stream_instant
 
 
-def _base_event(tenant_id: str, event_type: str = EVENT_TYPE_STREAM) -> dict:
+def _base_event(
+    tenant_id: str,
+    event_type: str = EVENT_TYPE_STREAM,
+    *,
+    event_id: str | None = None,
+    occurred_at: str | None = None,
+) -> dict:
     return {
-        "id": str(uuid.uuid4()),
+        "id": event_id or str(uuid.uuid4()),
         "type": event_type,
         "subject_tenant": tenant_id,
         "source": "e2e-test",
         "subject": "s1",
         "subject_type": SUBJECT_TYPE,
-        "occurred_at": datetime.now(timezone.utc).isoformat(),
+        "occurred_at": occurred_at or datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _owner_event(event_id: str, event_type: str = EVENT_TYPE_STREAM) -> dict:
+    return _base_event(
+        DEFAULT_TENANT_ID, event_type, event_id=event_id, occurred_at="2026-05-29T10:00:00Z",
+    )
 
 
 async def test_publish_single_async_returns_202(api):
     """scenario: producer/single/1.01-positive-publish-single-async.md"""
-    tenant_id = str(uuid.uuid4())
     async with api() as client:
-        resp = await client.post("/events", json=_base_event(tenant_id))
+        resp = await client.post(
+            "/events",
+            json={
+                "id": "a1b2c3d4-0000-0000-0000-000000000001",
+                "type": EVENT_TYPE_STREAM,
+                "subject_tenant": DEFAULT_TENANT_ID,
+                "source": "e2e-test",
+                "subject": "s1",
+                "subject_type": SUBJECT_TYPE,
+                "occurred_at": "2026-05-29T10:00:00Z",
+            },
+        )
     assert resp.status_code == 202
-    assert resp.text == "", "202 Accepted must carry no body"
+    assert resp.content == b"", "202 Accepted must carry no body"
 
 
 @pytest.mark.backend_sensitive
@@ -69,15 +95,14 @@ async def test_publish_prefer_wait_returns_201_once_stored(api):
     holds the response until the backend stores the event and answers
     ``201 Created`` - the backend persists the event well within the wait.
     """
-    tenant_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.post(
             "/events",
             headers={"Prefer": "wait=10"},
-            json=_base_event(tenant_id),
+            json=_owner_event("17269569-424b-5e40-a0da-b0206fc39f5a"),
         )
     assert resp.status_code == 201
-    assert resp.text == "", "201 Created must carry no body"
+    assert resp.content == b""
     # RFC 7240 §3: the broker reports the wait it applied (10s, within the cap),
     # so a client can tell a synchronous answer from an ignored preference.
     assert resp.headers.get("preference-applied") == "wait=10"
@@ -87,43 +112,94 @@ async def test_publish_prefer_wait_returns_201_once_stored(api):
 async def test_publish_prefer_wait_201_event_is_readable(api, test_env):
     """scenario: producer/single/1.02-positive-publish-sync-wait-persisted.md
 
-    Feature 0007 S2: once a synchronous publish is answered ``201`` the event is
-    stored and MUST be readable. Publish with ``Prefer: wait``, assert ``201``,
-    then read it back through the consumer path - proof the ingest outbox's
-    ``Flush::Sync`` append made the event's position visible, not merely durable.
+    The first manifest read after a stored publish exposes its sequence.
+    A consumer joining afterwards can replay the event at that sequence.
     """
-    tenant_id = str(uuid.uuid4())
-    event_id = str(uuid.uuid4())
-    occurred_at = datetime.now(timezone.utc).isoformat()
+    event = {
+        "id": "a1b2c3d4-0000-0000-0000-0000000000a2",
+        "type": EVENT_TYPE_STREAM,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "order-service",
+        "subject": "order-900",
+        "subject_type": SUBJECT_TYPE,
+        "occurred_at": "2026-05-29T10:05:00Z",
+        "data": {"order_id": "order-900", "total_cents": 200},
+    }
+    marker = {**event, "id": "e4bdf020-852d-580b-9ed8-9f5711279235"}
+    params = {"topic": TOPIC_STREAM, "partition": 0}
     async with api() as client:
-        published = await client.post(
-            "/events",
-            headers={"Prefer": "wait=10"},
-            json={
-                "id": event_id,
-                "type": EVENT_TYPE_STREAM,
-                "subject_tenant": tenant_id,
-                "source": "e2e-test",
-                "subject": "s1",
-                "subject_type": SUBJECT_TYPE,
-                "occurred_at": occurred_at,
-            },
+        fence = await client.post("/events", json=marker, headers={"Prefer": "wait=10"})
+        assert (fence.status_code, fence.content, fence.headers.get("preference-applied")) == (
+            201, b"", "wait=10",
         )
-        assert published.status_code == 201, "the event is stored within the wait"
+        before = await client.get("/topics/segments", params=params)
+        assert (before.status_code, before.headers.get("content-type")) == (200, "application/json")
+        before_body = before.json()
+        assert set(before_body) == {
+            "topic", "partition", "start_sequence", "end_sequence",
+            "start_time", "end_time", "segments",
+        }
+        assert (before_body["topic"], before_body["partition"]) == (TOPIC_STREAM, 0)
+        high_water = before_body["end_sequence"]
+        assert type(high_water) is int, before_body
+        assert high_water > 0, before_body
 
-        group_id = (await client.post("/consumer-groups")).json()["id"]
-        sub = await client.post(
+        published = await client.post("/events", json=event, headers={"Prefer": "wait=10"})
+        assert (
+            published.status_code, published.content, published.headers.get("preference-applied")
+        ) == (201, b"", "wait=10")
+        after = await client.get("/topics/segments", params=params)
+        assert (after.status_code, after.headers.get("content-type")) == (200, "application/json")
+        after_body = after.json()
+        assert set(after_body) == set(before_body)
+        assert (after_body["topic"], after_body["partition"]) == (TOPIC_STREAM, 0)
+        stored_end = after_body["end_sequence"]
+        assert type(stored_end) is int, after_body
+        assert stored_end > high_water, (before_body, after_body)
+
+        group = await client.post("/consumer-groups")
+        assert (group.status_code, group.headers.get("content-type")) == (201, "application/json")
+        location = group.headers["location"]
+        group_id = location.removeprefix(f"{API_BASE}/consumer-groups/")
+        prefix = "gts.cf.core.events.consumer_group.v1~"
+        assert group_id == f"{prefix}{uuid.UUID(group_id.removeprefix(prefix))}"
+        assert location == f"{API_BASE}/consumer-groups/{group_id}"
+        group_body = group.json()
+        _stream_instant(group_body.get("created_at"))
+        assert group_body == {
+            "id": group_id,
+            "kind": "anonymous",
+            "tenant": DEFAULT_TENANT_ID,
+            "owner_principal": DEFAULT_SUBJECT_ID,
+            "description": None,
+            "created_at": group_body["created_at"],
+        }
+
+        interest = {
+            "topic": TOPIC_STREAM,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "ownership_filter": "entire_tenant",
+            "types": [EVENT_TYPE_STREAM],
+        }
+        joined = await client.post(
             "/subscriptions",
-            json={
-                "consumer_group": group_id,
-                "client_agent": "e2e-test",
-                "interests": [
-                    {"topic": TOPIC_STREAM, "subject_tenant": tenant_id, "ownership_filter": "entire_tenant", "types": [EVENT_TYPE_STREAM]}
-                ],
-            },
+            json={"consumer_group": group_id, "client_agent": "e2e-test", "interests": [interest]},
         )
-        assert sub.status_code == 201
-        sub_id = sub.json()["id"]
+        assert (joined.status_code, joined.headers.get("content-type")) == (201, "application/json")
+        sub_id = _created_subscription_id(joined)
+        member = joined.json()
+        _stream_instant(member.get("created_at"))
+        assert member == {
+            "id": sub_id,
+            "consumer_group": group_id,
+            "client_agent": "e2e-test",
+            "interests": [{
+                **interest, "barrier_mode": "respect", "filter": None, "unmatched_types": [],
+            }],
+            "assigned": [{"topic": TOPIC_STREAM, "partition": 0}],
+            "topology_version": 1,
+            "created_at": member["created_at"],
+        }
         seek = await client.post(
             f"/subscriptions/{sub_id}:seek",
             json={
@@ -131,23 +207,73 @@ async def test_publish_prefer_wait_201_event_is_readable(api, test_env):
                 "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]},
             },
         )
-        assert seek.status_code == 200
+        assert (seek.status_code, seek.headers.get("content-type")) == (200, "application/json")
+        seek_body = seek.json()
+        match seek_body:
+            case {"positions": dict(resolved)}:
+                match resolved.get(TOPIC_STREAM):
+                    case [{"value": earliest}]:
+                        assert type(earliest) is int, seek_body
+                    case _:
+                        raise AssertionError(seek_body)
+            case _:
+                raise AssertionError(seek_body)
+        assert earliest >= 0, seek_body
+        assert earliest < high_water, (seek_body, before_body)
+        assert seek_body == {"positions": {TOPIC_STREAM: [{"partition": 0, "value": earliest}]}}
 
-    # Read from earliest: the event answered 201 before the consumer joined, so
-    # it must already be on the backend and delivered here.
-    async with httpx.AsyncClient(
-        base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
-    ) as stream_client:
-        async with stream_client.stream(
-            "GET", f"/events:sse?subscription={sub_id}"
-        ) as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            topology_kind, _ = await reader.next_frame(timeout=5)
-            assert topology_kind == "topology"
-            event_kind, event_data = await reader.next_frame(timeout=15)
-    assert event_kind == "event"
-    assert event_data["payload"]["id"] == event_id
+        deadline = asyncio.get_running_loop().time() + 7
+        async with asyncio.timeout_at(deadline), client.stream(
+            "GET", "/events:sse", params={"subscription": sub_id},
+            headers={"Accept": "text/event-stream"},
+        ) as stream:
+            assert (stream.status_code, stream.headers.get("content-type")) == (
+                200, "text/event-stream",
+            )
+            reader = SseFrameReader(stream)
+            topology = await reader.next_frame(timeout=deadline - asyncio.get_running_loop().time())
+            match topology:
+                case ("topology", {"assigned": [{
+                    "offset": offset, "last_examined": last_examined,
+                }]}):
+                    assert type(offset) is int, topology
+                    assert type(last_examined) is int, topology
+                case _:
+                    raise AssertionError(topology)
+            assert topology == (
+                "topology",
+                {
+                    "kind": "topology",
+                    "topology_version": 1,
+                    "assigned": [{
+                        "topic": TOPIC_STREAM, "partition": 0,
+                        "offset": earliest, "last_examined": earliest,
+                    }],
+                },
+            )
+            history, delivered = await _read_case_window(reader, high_water, event["id"], deadline)
+
+    previous = earliest
+    for frame in history:
+        payload = frame["payload"]
+        assert payload["id"] != event["id"], frame
+        assert payload["sequence"] > previous, (frame, previous)
+        previous = payload["sequence"]
+    assert history, "earliest replay must include the durable marker"
+    last = history[-1]["payload"]
+    assert (last["id"], last["sequence"]) == (marker["id"], high_water)
+
+    assert len(delivered) == 1, delivered
+    payload = delivered[0]["payload"]
+    assert _stream_instant(payload.get("occurred_at")) == _stream_instant(event["occurred_at"])
+    _stream_instant(payload.get("sequence_time"))
+    assert delivered == [{
+        "kind": "event",
+        "payload": {
+            **event, "occurred_at": payload["occurred_at"], "trace_parent": None,
+            "partition": 0, "sequence": stored_end, "sequence_time": payload["sequence_time"],
+        },
+    }]
 
 
 @pytest.mark.backend_sensitive
@@ -162,15 +288,15 @@ async def test_publish_prefer_wait_zero_is_201_or_202(api):
     case (backend unreachable) is
     ``test_backend_outage.py::test_sync_publish_times_out_to_202_when_the_backend_is_down``.
     """
-    tenant_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.post(
             "/events",
             headers={"Prefer": "wait=0"},
-            json=_base_event(tenant_id),
+            json=_owner_event("9e1a73ef-11ac-524d-b0cc-2cb928a91050"),
         )
     assert resp.status_code in (201, 202)
-    assert resp.text == "", "a 201/202 for a sync publish carries no body"
+    assert resp.content == b""
+    assert resp.headers.get("preference-applied") == "wait=0"
 
 
 @pytest.mark.backend_sensitive
@@ -181,32 +307,35 @@ async def test_publish_prefer_wait_duplicate_returns_200(api):
     producer chain's head) is answered ``200 OK`` at once: nothing is written,
     so there is nothing to wait on.
     """
-    tenant_id = str(uuid.uuid4())
-    event_id = str(uuid.uuid4())
-    meta = {"version": 1, "producer": None, "previous": 0, "sequence": 1}
     async with api() as client:
         reg = await client.post(
             "/producers",
             json={"mode": "chained", "client_agent": "e2e-test/1.0"},
         )
         assert reg.status_code == 201
-        meta["producer"] = reg.json()["id"]
+        producer_id = reg.json()["id"]
+        event = {
+            **_owner_event("df757b70-168b-5d68-8973-83ee48a9e777"),
+            "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
+        }
 
         first = await client.post(
             "/events",
             headers={"Prefer": "wait=10"},
-            json={**_base_event(tenant_id), "id": event_id, "meta": meta},
+            json=event,
         )
         assert first.status_code == 201, "the first publish is stored within the wait"
+        assert first.content == b""
+        assert first.headers.get("preference-applied") == "wait=10"
 
-        # Lost-ack resend of the chain head: a duplicate, answered 200 without waiting.
         resend = await client.post(
             "/events",
             headers={"Prefer": "wait=10"},
-            json={**_base_event(tenant_id), "id": event_id, "meta": meta},
+            json=event,
         )
     assert resend.status_code == 200
-    assert resend.text == "", "200 OK must carry no body"
+    assert resend.content == b""
+    assert resend.headers.get("preference-applied") == "wait=10"
 
 
 async def test_schema_validation_failure_returns_422(api):
@@ -217,16 +346,16 @@ async def test_schema_validation_failure_returns_422(api):
     body parsed, its ``data`` does not satisfy the type's schema, so the
     answer is 422 ``SchemaViolation`` (``docs/openapi.yaml``).
     """
-    tenant_id = str(uuid.uuid4())
     async with api() as client:
         resp = await client.post(
             "/events",
             json={
-                **_base_event(tenant_id, event_type=EVENT_TYPE_STRICT),
+                **_owner_event("6ab57cbf-2034-5fae-8967-271de490d04d", EVENT_TYPE_STRICT),
                 "data": {"missing_the_required_field": True},
             },
         )
     assert resp.status_code == 422
+    assert resp.headers["content-type"] == "application/problem+json"
     assert resp.json() == {
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
         "title": "Invalid Argument",
@@ -301,65 +430,139 @@ async def test_readonly_partition_rejected_returns_400(api):
 
 
 async def test_prefer_wait_malformed_returns_400(api):
-    """scenario: producer/single/1.06-negative-prefer-wait-malformed.md
+    """scenario: producer/single/1.06-negative-prefer-wait-malformed.md"""
 
-    A ``Prefer: wait`` value that is not a non-negative whole number of seconds
-    is a malformed preference: the broker answers ``400``, it does not fall back
-    to async or to the cap. (A numeric value above the cap is not malformed - it
-    clamps - so only a non-numeric token is rejected here.)
-    """
-    tenant_id = str(uuid.uuid4())
     async with api() as client:
-        resp = await client.post(
-            "/events",
-            headers={"Prefer": "wait=soon"},
-            json=_base_event(tenant_id),
+        reg = await client.post(
+            "/producers", json={"mode": "chained", "client_agent": "e2e-test/1.0"}
         )
-    assert resp.status_code == 400
-    assert resp.json()["type"] == (
-        "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~"
-    )
+        assert reg.status_code == 201
+        assert reg.headers["content-type"] == "application/json"
+        registration = reg.json()
+        assert set(registration) == {"id", "mode", "client_agent"}
+        producer_id = registration["id"]
+        assert str(uuid.UUID(producer_id)) == producer_id
+        assert reg.headers["location"] == f"{API_BASE}/producers/{producer_id}"
+        assert registration == {
+            "id": producer_id, "mode": "chained",
+            "client_agent": "e2e-test/1.0",
+        }
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [],
+        }
+
+        event = {
+            **_owner_event("15a00159-813c-4b62-952f-000000000001"),
+            "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
+        }
+        resp = await client.post("/events", headers={"Prefer": "wait=soon"}, json=event)
+        detail = "InvalidHeader: Prefer: wait expects a non-negative whole number of seconds"
+        assert resp.status_code == 400
+        assert resp.headers["content-type"] == "application/problem+json"
+        assert resp.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": detail,
+            "instance": f"{API_BASE}/events",
+            "trace_id": TRACE_ID,
+            "context": {
+                "format": detail,
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        }
+
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [],
+        }
+        retried = await client.post("/events", json=event)
+        assert retried.status_code == 202
+        assert retried.content == b""
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [{"topic": TOPIC_STREAM, "last_sequence": 1}],
+        }
 
 
 async def test_malformed_trace_parent_returns_400(api):
-    """scenario: producer/single/1.07-negative-invalid-trace-parent.md
+    """scenario: producer/single/1.07-negative-invalid-trace-parent.md"""
 
-    A ``trace_parent`` that is not a W3C traceparent (here, uppercase hex) is
-    rejected with 400. The violation names the field and the rule, never the
-    value.
-    """
-    tenant_id = str(uuid.uuid4())
     async with api() as client:
-        resp = await client.post(
-            "/events",
-            json={
-                **_base_event(tenant_id),
-                "trace_parent": "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01",
-            },
+        reg = await client.post(
+            "/producers", json={"mode": "chained", "client_agent": "e2e-test/1.0"}
         )
-    assert resp.status_code == 400
-    body = resp.json()
-    assert body == {
-        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
-        "title": "Invalid Argument",
-        "status": 400,
-        "detail": "Request validation failed",
-        "instance": body["instance"],
-        "trace_id": TRACE_ID,
-        "context": {
-            "field_violations": [
-                {
-                    "field": "trace_parent",
-                    "description": (
+        assert reg.status_code == 201
+        assert reg.headers["content-type"] == "application/json"
+        registration = reg.json()
+        assert set(registration) == {"id", "mode", "client_agent"}
+        producer_id = registration["id"]
+        assert str(uuid.UUID(producer_id)) == producer_id
+        assert reg.headers["location"] == f"{API_BASE}/producers/{producer_id}"
+        assert registration == {
+            "id": producer_id, "mode": "chained",
+            "client_agent": "e2e-test/1.0",
+        }
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [],
+        }
+
+        event = {
+            **_owner_event("15a00160-813c-4b62-952f-000000000001"),
+            "trace_parent": "00-0AF7651916CD43DD8448EB211C80319C-B7AD6B7169203331-01",
+            "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
+        }
+        resp = await client.post("/events", json=event)
+        assert resp.status_code == 400
+        assert resp.headers["content-type"] == "application/problem+json"
+        assert resp.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": f"{API_BASE}/events",
+            "trace_id": TRACE_ID,
+            "context": {
+                "field_violations": [
+                    {
+                        "field": "trace_parent",
+                        "description": (
                         "must be a W3C traceparent: four lowercase hex groups"
                         " of 2, 32, 16 and 2 digits joined by '-'"
                     ),
-                    "reason": "invalid_event_field",
-                }
-            ],
-            "resource_type": "gts.cf.core.events.request.v1~",
-        },
-    }
+                        "reason": "invalid_event_field",
+                    },
+                ],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        }
+
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [],
+        }
 
 
 # The per-event limit and the partition-key cap, as `EventV1` states them.
@@ -391,34 +594,99 @@ def _encoded_len(event: dict) -> int:
 
 
 async def test_an_event_over_the_size_limit_returns_413(api):
-    """scenario: producer/single/1.08-negative-event-too-large.md
+    """scenario: producer/single/1.08-negative-event-too-large.md"""
 
-    An event whose encoding is over 60 KiB is refused 413, naming its size and
-    the limit, never its content.
-    """
-    event = _sized_event(str(uuid.uuid4()), MAX_ENCODED_BYTES)
-    size = _encoded_len(event)
-    async with api() as client:
-        resp = await client.post("/events", json=event)
-    assert resp.status_code == 413
-    assert resp.json() == {
-        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
-        "title": "Invalid Argument",
-        "status": 413,
-        "detail": "Request validation failed",
-        "instance": f"{API_BASE}/events",
-        "trace_id": TRACE_ID,
-        "context": {
-            "field_violations": [
-                {
-                    "field": "events[0]",
-                    "description": f"{size} bytes encoded, over the limit of {MAX_ENCODED_BYTES}",
-                    "reason": "event_too_large",
-                }
-            ],
-            "resource_type": "gts.cf.core.events.request.v1~",
-        },
+    event = {
+        **_owner_event("15a00161-813c-4b62-952f-000000000002"),
+        "data": {"pad": "x" * MAX_ENCODED_BYTES},
     }
+    size = _encoded_len(event)
+    assert size > MAX_ENCODED_BYTES
+
+    async with api() as client:
+        first_marker = await client.post(
+            "/events", headers={"Prefer": "wait=10"},
+            json=_owner_event("15a00161-813c-4b62-952f-000000000001"),
+        )
+        assert first_marker.status_code == 201
+        assert first_marker.content == b""
+        assert first_marker.headers["preference-applied"] == "wait=10"
+        before_resp = await client.get(
+            "/topics/segments", params={"topic": TOPIC_STREAM, "partition": 0}
+        )
+        assert before_resp.status_code == 200
+        assert before_resp.headers["content-type"] == "application/json"
+        before = before_resp.json()
+        assert set(before) == {
+            "topic",
+            "partition",
+            "start_sequence",
+            "end_sequence",
+            "start_time",
+            "end_time",
+            "segments",
+        }
+        assert before == {
+            "topic": TOPIC_STREAM,
+            "partition": 0,
+            "start_sequence": before["start_sequence"],
+            "end_sequence": before["end_sequence"],
+            "start_time": before["start_time"],
+            "end_time": before["end_time"],
+            "segments": before["segments"],
+        }
+        assert 0 < before["start_sequence"] <= before["end_sequence"]
+        assert isinstance(before["start_time"], str)
+        assert isinstance(before["end_time"], str)
+        assert isinstance(before["segments"], list)
+
+        resp = await client.post("/events", json=event)
+        assert resp.status_code == 413
+        assert resp.headers["content-type"] == "application/problem+json"
+        assert resp.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 413,
+            "detail": "Request validation failed",
+            "instance": f"{API_BASE}/events",
+            "trace_id": TRACE_ID,
+            "context": {
+                "field_violations": [
+                    {
+                        "field": "events[0]",
+                        "description": f"{size} bytes encoded, over the limit of 61440",
+                        "reason": "event_too_large",
+                    },
+                ],
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        }
+
+        last_marker = await client.post(
+            "/events", headers={"Prefer": "wait=10"},
+            json=_owner_event("15a00161-813c-4b62-952f-000000000003"),
+        )
+        assert last_marker.status_code == 201
+        assert last_marker.content == b""
+        assert last_marker.headers["preference-applied"] == "wait=10"
+        after_resp = await client.get(
+            "/topics/segments", params={"topic": TOPIC_STREAM, "partition": 0}
+        )
+        assert after_resp.status_code == 200
+        assert after_resp.headers["content-type"] == "application/json"
+        after = after_resp.json()
+        assert after.keys() == before.keys()
+        assert after == {
+            "topic": TOPIC_STREAM,
+            "partition": 0,
+            "start_sequence": before["start_sequence"],
+            "end_sequence": before["end_sequence"] + 1,
+            "start_time": before["start_time"],
+            "end_time": after["end_time"],
+            "segments": after["segments"],
+        }
+        assert isinstance(after["end_time"], str)
+        assert isinstance(after["segments"], list)
 
 
 async def test_a_partition_key_over_its_cap_returns_400(api):
@@ -428,12 +696,13 @@ async def test_a_partition_key_over_its_cap_returns_400(api):
     bytes is refused 400, naming the key's size and the cap, never the key.
     """
     event = {
-        **_base_event(str(uuid.uuid4()), EVENT_TYPE_KEYED),
+        **_owner_event("f5e7b372-73c6-5a8b-b031-3e2e0f1ca785", EVENT_TYPE_KEYED),
         "data": {"k": "k" * (MAX_PARTITION_KEY_BYTES + 1)},
     }
     async with api() as client:
         resp = await client.post("/events", json=event)
     assert resp.status_code == 400
+    assert resp.headers["content-type"] == "application/problem+json"
     assert resp.json() == {
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
         "title": "Invalid Argument",
@@ -455,24 +724,58 @@ async def test_a_partition_key_over_its_cap_returns_400(api):
 
 
 async def test_publish_with_a_nil_tenant_returns_400(api):
-    """scenario: producer/single/1.13-negative-publish-nil-tenant.md
+    """scenario: producer/single/1.13-negative-publish-nil-tenant.md"""
 
-    An event whose ``subject_tenant`` is the nil UUID is refused 400 before any
-    authorization call; the event is not admitted.
-    """
-    event = _base_event("00000000-0000-0000-0000-000000000000")
     async with api() as client:
+        reg = await client.post(
+            "/producers", json={"mode": "chained", "client_agent": "e2e-test/1.0"}
+        )
+        assert reg.status_code == 201
+        assert reg.headers["content-type"] == "application/json"
+        registration = reg.json()
+        assert set(registration) == {"id", "mode", "client_agent"}
+        producer_id = registration["id"]
+        assert str(uuid.UUID(producer_id)) == producer_id
+        assert reg.headers["location"] == f"{API_BASE}/producers/{producer_id}"
+        assert registration == {
+            "id": producer_id, "mode": "chained",
+            "client_agent": "e2e-test/1.0",
+        }
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [],
+        }
+
+        event = {
+            **_owner_event("15a00163-813c-4b62-952f-000000000001"),
+            "subject_tenant": "00000000-0000-0000-0000-000000000000",
+            "meta": {"version": 1, "producer": producer_id, "previous": 0, "sequence": 1},
+        }
         resp = await client.post("/events", json=event)
-    assert resp.status_code == 400
-    assert resp.json() == {
-        "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
-        "title": "Invalid Argument",
-        "status": 400,
-        "detail": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
-        "instance": f"{API_BASE}/events",
-        "trace_id": TRACE_ID,
-        "context": {
-            "format": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
-            "resource_type": "gts.cf.core.events.request.v1~",
-        },
-    }
+        assert resp.status_code == 400
+        assert resp.headers["content-type"] == "application/problem+json"
+        assert resp.json() == {
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
+            "instance": f"{API_BASE}/events",
+            "trace_id": TRACE_ID,
+            "context": {
+                "format": "InvalidTenant: event 0: the event's tenant must not be the nil UUID",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        }
+
+        cursors = await client.get(f"/producers/{producer_id}/cursors")
+        assert cursors.status_code == 200
+        assert cursors.headers["content-type"] == "application/json"
+        assert cursors.json() == {
+            "id": producer_id,
+            "client_agent": "e2e-test/1.0",
+            "topics": [],
+        }

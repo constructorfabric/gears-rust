@@ -1333,3 +1333,908 @@ mod publication_config_tests {
         );
     }
 }
+
+mod composition_finalization {
+    use super::*;
+    use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::advance;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("fixture bootstrap failure")]
+    struct BootstrapFailure;
+
+    #[tokio::test]
+    async fn finalization_preserves_each_runtime_and_cleanup_result() {
+        for (host_fails, cleanup_fails) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let cleanup = ClientCleanup::new(
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    if cleanup_fails {
+                        Err(ClientCleanupError::WorkerFailed)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                CancellationToken::new(),
+            );
+            let host = async {
+                if host_fails {
+                    Err(BootstrapFailure.into())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = finalize_composition(
+                host,
+                cleanup,
+                &CancellationToken::new(),
+                &ServerConfig::default(),
+            )
+            .await;
+            match (host_fails, cleanup_fails, result) {
+                (false, false, Ok(()))
+                | (
+                    false,
+                    true,
+                    Err(OopCompositionRunError::Cleanup(ClientCleanupError::WorkerFailed)),
+                ) => {}
+                (true, false, Err(OopCompositionRunError::Bootstrap { source }))
+                | (
+                    true,
+                    true,
+                    Err(OopCompositionRunError::BootstrapAndCleanup {
+                        source,
+                        cleanup: ClientCleanupError::WorkerFailed,
+                    }),
+                ) => {
+                    assert!(source.downcast_ref::<BootstrapFailure>().is_some());
+                    assert_eq!(source.to_string(), "fixture bootstrap failure");
+                }
+                other => panic!("wrong result pair: {other:?}"),
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    struct HeldCleanup {
+        entered: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+        release: CancellationToken,
+        abort: CancellationToken,
+    }
+
+    impl HeldCleanup {
+        fn new() -> Self {
+            Self {
+                entered: Arc::default(),
+                completed: Arc::default(),
+                release: CancellationToken::new(),
+                abort: CancellationToken::new(),
+            }
+        }
+        fn owner(&self) -> ClientCleanup {
+            let entered = self.entered.clone();
+            let completed = self.completed.clone();
+            let release = self.release.clone();
+            ClientCleanup::new(
+                Box::pin(async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    release.cancelled().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+                self.abort.clone(),
+            )
+        }
+        fn state(&self) -> (usize, usize, bool) {
+            (
+                self.entered.load(Ordering::SeqCst),
+                self.completed.load(Ordering::SeqCst),
+                self.abort.is_cancelled(),
+            )
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_uses_the_configured_shutdown_deadline() {
+        for host_failed in [false, true] {
+            let held = HeldCleanup::new();
+            let cancel = CancellationToken::new();
+            let server = ServerConfig {
+                shutdown_deadline_secs: Some(2),
+                ..Default::default()
+            };
+            let host = async {
+                if host_failed {
+                    Err(BootstrapFailure.into())
+                } else {
+                    Ok(())
+                }
+            };
+            let mut run = Box::pin(finalize_composition(host, held.owner(), &cancel, &server));
+            assert!(run.as_mut().now_or_never().is_none());
+            advance(Duration::from_millis(1999)).await;
+            assert!(run.as_mut().now_or_never().is_none());
+            assert_eq!(held.state(), (1, 0, false));
+            advance(Duration::from_millis(1)).await;
+            match (host_failed, run.now_or_never()) {
+                (
+                    false,
+                    Some(Err(OopCompositionRunError::Cleanup(
+                        ClientCleanupError::DeadlineExceeded,
+                    ))),
+                ) => {}
+                (
+                    true,
+                    Some(Err(OopCompositionRunError::BootstrapAndCleanup {
+                        source,
+                        cleanup: ClientCleanupError::DeadlineExceeded,
+                    })),
+                ) => {
+                    assert!(source.downcast_ref::<BootstrapFailure>().is_some());
+                    assert_eq!(source.to_string(), "fixture bootstrap failure");
+                }
+                other => panic!("expected configured deadline: {other:?}"),
+            }
+            assert_eq!(held.state(), (1, 0, true));
+        }
+        let held = HeldCleanup::new();
+        let server = ServerConfig {
+            shutdown_deadline_secs: Some(0),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            finalize_composition(
+                async { Ok(()) },
+                held.owner(),
+                &CancellationToken::new(),
+                &server,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(OopCompositionRunError::Cleanup(
+                ClientCleanupError::DeadlineExceeded
+            ))
+        ));
+        assert_eq!(held.state(), (1, 0, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_uses_the_toolkit_default_shutdown_deadline() {
+        assert_eq!(
+            crate::runtime::DEFAULT_SHUTDOWN_DEADLINE,
+            Duration::from_secs(35)
+        );
+        let held = HeldCleanup::new();
+        let cancel = CancellationToken::new();
+        let server = ServerConfig::default();
+        let mut run = Box::pin(finalize_composition(
+            async { Ok(()) },
+            held.owner(),
+            &cancel,
+            &server,
+        ));
+        assert!(run.as_mut().now_or_never().is_none());
+        advance(Duration::from_millis(34999)).await;
+        assert!(run.as_mut().now_or_never().is_none());
+        assert_eq!(held.state(), (1, 0, false));
+        advance(Duration::from_millis(1)).await;
+        assert!(matches!(
+            run.now_or_never(),
+            Some(Err(OopCompositionRunError::Cleanup(
+                ClientCleanupError::DeadlineExceeded
+            )))
+        ));
+        assert_eq!(held.state(), (1, 0, true));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_cleanup_before_the_deadline_is_not_aborted() {
+        let held = HeldCleanup::new();
+        let cancel = CancellationToken::new();
+        let server = ServerConfig {
+            shutdown_deadline_secs: Some(2),
+            ..Default::default()
+        };
+        let mut run = Box::pin(finalize_composition(
+            async { Ok(()) },
+            held.owner(),
+            &cancel,
+            &server,
+        ));
+        assert!(run.as_mut().now_or_never().is_none());
+        advance(Duration::from_secs(1)).await;
+        held.release.cancel();
+        assert!(matches!(run.now_or_never(), Some(Ok(()))));
+        advance(Duration::from_secs(2)).await;
+        assert_eq!(held.state(), (1, 1, false));
+    }
+
+    #[tokio::test]
+    async fn dropping_pending_preparation_aborts_owned_clients() {
+        let held = HeldCleanup::new();
+        let cancel = CancellationToken::new();
+        let server = ServerConfig::default();
+        let mut run = Box::pin(finalize_composition(
+            std::future::pending(),
+            held.owner(),
+            &cancel,
+            &server,
+        ));
+        assert!(run.as_mut().now_or_never().is_none());
+        assert_eq!(held.state(), (0, 0, false));
+        drop(run);
+        assert_eq!(held.state(), (0, 0, true));
+    }
+
+    #[tokio::test]
+    async fn the_runner_receives_the_bootstrap_directory_client() {
+        let ready = Prepared {
+            config: Arc::new(minimal_app_config()),
+            db: DbOptions::None,
+            cancel: CancellationToken::new(),
+            instance_id: Uuid::from_u128(0x31),
+        };
+        let connected = ready.connect("http://127.0.0.1:9").await.unwrap();
+        let [directory] = connected
+            .run_options
+            .clients
+            .try_into()
+            .unwrap_or_else(|_| panic!("one directory registration"));
+        let hub = crate::client_hub::ClientHub::default();
+        directory.apply(&hub);
+        assert!(Arc::ptr_eq(
+            &hub.get::<dyn DirectoryClient>().unwrap(),
+            &connected.directory
+        ));
+    }
+}
+
+mod signal_readiness {
+    use super::*;
+    use parking_lot::Mutex;
+    use std::{
+        future::Future,
+        io::{self, Write},
+        pin::Pin,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::{Context, Poll},
+    };
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    const BOUND: Duration = Duration::from_secs(10);
+
+    #[derive(Default)]
+    struct Observations {
+        polls: AtomicUsize,
+        drops: AtomicUsize,
+        dropped: CancellationToken,
+    }
+
+    struct Waiter<T> {
+        observations: Arc<Observations>,
+        gate: oneshot::Receiver<T>,
+    }
+
+    impl<T> Waiter<T> {
+        fn new(observations: &Arc<Observations>) -> (Self, oneshot::Sender<T>) {
+            let (release, gate) = oneshot::channel();
+            (
+                Self {
+                    observations: observations.clone(),
+                    gate,
+                },
+                release,
+            )
+        }
+    }
+
+    impl<T> Future for Waiter<T> {
+        type Output = T;
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+            assert!(!self.gate.is_terminated(), "waiter polled after completion");
+            self.observations.polls.fetch_add(1, Ordering::SeqCst);
+            Pin::new(&mut self.gate)
+                .poll(cx)
+                .map(|result| result.expect("waiter gate"))
+        }
+    }
+
+    impl<T> Drop for Waiter<T> {
+        fn drop(&mut self) {
+            self.observations.drops.fetch_add(1, Ordering::SeqCst);
+            self.observations.dropped.cancel();
+        }
+    }
+
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct DiagnosticObservation {
+        polls_at_first_write: Option<usize>,
+        bytes: Vec<u8>,
+    }
+
+    struct Diagnostic {
+        fallback: Arc<Observations>,
+        observation: Arc<Mutex<DiagnosticObservation>>,
+        fail: bool,
+    }
+
+    impl Diagnostic {
+        fn new(fallback: &Arc<Observations>) -> (Self, Arc<Mutex<DiagnosticObservation>>) {
+            let observation = Arc::new(Mutex::new(DiagnosticObservation::default()));
+            (
+                Self {
+                    fallback: fallback.clone(),
+                    observation: observation.clone(),
+                    fail: false,
+                },
+                observation,
+            )
+        }
+    }
+
+    impl Write for Diagnostic {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut observation = self.observation.lock();
+            observation
+                .polls_at_first_write
+                .get_or_insert_with(|| self.fallback.polls.load(Ordering::SeqCst));
+            if self.fail {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            observation.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_immediate_shutdown_cancels_before_preparation() {
+        let seen = Arc::new(Observations::default());
+        let (wait, release) = Waiter::new(&seen);
+        release.send(()).unwrap();
+        let process = arm_shutdown_wait(wait);
+        assert_eq!(
+            (
+                seen.polls.load(Ordering::SeqCst),
+                process.is_cancelled(),
+                seen.drops.load(Ordering::SeqCst)
+            ),
+            (1, true, 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_primed_waiter_survives_until_shutdown() {
+        let seen = Arc::new(Observations::default());
+        let (wait, release) = Waiter::new(&seen);
+        let process = arm_shutdown_wait(wait);
+        assert_eq!(
+            (
+                seen.polls.load(Ordering::SeqCst),
+                process.is_cancelled(),
+                seen.drops.load(Ordering::SeqCst)
+            ),
+            (1, false, 0)
+        );
+
+        release.send(()).unwrap();
+        timeout(BOUND, process.cancelled())
+            .await
+            .expect("shutdown signal cancels process");
+        assert_eq!(seen.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_process_releases_its_pending_waiter() {
+        let seen = Arc::new(Observations::default());
+        let (wait, _release) = Waiter::new(&seen);
+        let process = arm_shutdown_wait(wait);
+        assert_eq!(
+            (
+                seen.polls.load(Ordering::SeqCst),
+                process.is_cancelled(),
+                seen.drops.load(Ordering::SeqCst)
+            ),
+            (1, false, 0)
+        );
+
+        process.cancel();
+        timeout(BOUND, seen.dropped.cancelled())
+            .await
+            .expect("process cancellation drops waiter");
+        assert_eq!(seen.drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_registration_failure_is_reported_after_the_fallback_is_armed() {
+        let seen = Arc::new(Observations::default());
+        let (fallback, release) = Waiter::new(&seen);
+        let (diagnostic, captured) = Diagnostic::new(&seen);
+        let process = arm_shutdown_wait(wait_for_shutdown_or_fallback(
+            std::future::ready(Err(anyhow::anyhow!("fixture primary registration failed"))),
+            fallback,
+            diagnostic,
+        ));
+
+        assert_eq!(
+            *captured.lock(),
+            DiagnosticObservation {
+                polls_at_first_write: Some(1),
+                bytes: b"OoP signal waiter failed, falling back to ctrl_c(): \
+                         fixture primary registration failed\n"
+                    .to_vec(),
+            }
+        );
+        assert_eq!(
+            (process.is_cancelled(), seen.drops.load(Ordering::SeqCst)),
+            (false, 0)
+        );
+
+        release.send(Ok(())).unwrap();
+        timeout(BOUND, process.cancelled())
+            .await
+            .expect("fallback signal cancels process");
+        assert_eq!(
+            (process.is_cancelled(), seen.drops.load(Ordering::SeqCst)),
+            (true, 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_ready_fallback_is_not_polled_twice() {
+        for outcome in [Ok(()), Err(io::Error::other("fixture fallback failed"))] {
+            let seen = Arc::new(Observations::default());
+            let (fallback, release) = Waiter::new(&seen);
+            release.send(outcome).unwrap();
+            let (diagnostic, captured) = Diagnostic::new(&seen);
+            let process = arm_shutdown_wait(wait_for_shutdown_or_fallback(
+                std::future::ready(Err(anyhow::anyhow!("fixture primary registration failed"))),
+                fallback,
+                diagnostic,
+            ));
+
+            assert_eq!(
+                (
+                    seen.polls.load(Ordering::SeqCst),
+                    process.is_cancelled(),
+                    seen.drops.load(Ordering::SeqCst)
+                ),
+                (1, true, 1)
+            );
+            assert_eq!(
+                *captured.lock(),
+                DiagnosticObservation {
+                    polls_at_first_write: Some(1),
+                    bytes: b"OoP signal waiter failed, falling back to ctrl_c(): \
+                             fixture primary registration failed\n"
+                        .to_vec(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_diagnostic_write_failure_does_not_end_the_fallback_wait() {
+        let seen = Arc::new(Observations::default());
+        let (fallback, release) = Waiter::new(&seen);
+        let (mut diagnostic, captured) = Diagnostic::new(&seen);
+        diagnostic.fail = true;
+        let process = arm_shutdown_wait(wait_for_shutdown_or_fallback(
+            std::future::ready(Err(anyhow::anyhow!("fixture primary registration failed"))),
+            fallback,
+            diagnostic,
+        ));
+
+        assert_eq!(
+            *captured.lock(),
+            DiagnosticObservation {
+                polls_at_first_write: Some(1),
+                bytes: vec![],
+            }
+        );
+        assert_eq!(
+            (process.is_cancelled(), seen.drops.load(Ordering::SeqCst)),
+            (false, 0)
+        );
+
+        release.send(Ok(())).unwrap();
+        timeout(BOUND, process.cancelled())
+            .await
+            .expect("fallback signal cancels process despite a diagnostic I/O error");
+        assert_eq!(
+            (process.is_cancelled(), seen.drops.load(Ordering::SeqCst)),
+            (true, 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_primary_signal_does_not_poll_the_fallback() {
+        let primary_seen = Arc::new(Observations::default());
+        let (primary, release) = Waiter::new(&primary_seen);
+        release.send(Ok(())).unwrap();
+        let fallback_seen = Arc::new(Observations::default());
+        let (fallback, _held) = Waiter::new(&fallback_seen);
+        let (diagnostic, captured) = Diagnostic::new(&fallback_seen);
+        let process =
+            arm_shutdown_wait(wait_for_shutdown_or_fallback(primary, fallback, diagnostic));
+
+        assert_eq!(
+            (
+                primary_seen.polls.load(Ordering::SeqCst),
+                primary_seen.drops.load(Ordering::SeqCst),
+                fallback_seen.polls.load(Ordering::SeqCst),
+                fallback_seen.drops.load(Ordering::SeqCst),
+                process.is_cancelled()
+            ),
+            (1, 1, 0, 1, true)
+        );
+        assert_eq!(
+            *captured.lock(),
+            DiagnosticObservation {
+                polls_at_first_write: None,
+                bytes: vec![],
+            }
+        );
+    }
+}
+
+mod request_limits {
+    use super::*;
+    use crate::bootstrap::config::OopHttpConfig;
+    use crate::directory::test_support::ManagerDirectoryClient;
+    use crate::runtime::{GearManager, OopRequestLimits};
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const BOUND: Duration = Duration::from_secs(10);
+    const INSTANCE: Uuid = uuid::uuid!("00000000-0000-0000-0000-000000000031");
+    const BYTES: usize = 16_777_216;
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const CHILD_HOME: &str = "TOOLKIT_OOP_REQUEST_LIMITS_TEST_HOME";
+    static FACTORY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn config(raw_limits: Value) -> OopHttpConfig {
+        serde_json::from_value(raw_limits).expect("valid OoP HTTP config")
+    }
+
+    #[test]
+    fn request_limits_round_trip_and_reject_invalid_configuration() {
+        let without_limits = json!({"listen_addr":"127.0.0.1:0"});
+        let mut with_null = without_limits.clone();
+        with_null["request_limits"] = Value::Null;
+        for raw in [without_limits.clone(), with_null] {
+            let config = config(raw);
+            assert_eq!(config.request_limits, None);
+            assert_eq!(
+                serde_json::to_value(config).expect("serialize config"),
+                json!({
+                    "listen_addr":"127.0.0.1:0",
+                    "probe_bind_addr":null,
+                    "drain_timeout_secs":30,
+                    "healthcheck_timeout_ms":500,
+                    "advertise_uri":null,
+                    "allow_loopback_advertise":false,
+                    "auth_disabled":false,
+                    "internal_auth":null,
+                    "labels":{}
+                })
+            );
+        }
+
+        let valid = json!({"body_limit_bytes":BYTES,"request_timeout":"30s"});
+        let mut raw = without_limits.clone();
+        raw["request_limits"] = valid.clone();
+        let parsed = config(raw);
+        assert_eq!(
+            parsed.request_limits,
+            Some(OopRequestLimits::new(BYTES, TIMEOUT).expect("valid policy"))
+        );
+        assert_eq!(
+            serde_json::to_value(parsed.request_limits).expect("serialize policy"),
+            valid
+        );
+
+        let mut raw = without_limits.clone();
+        raw["request_limits"] = json!({"body_limit_bytes":1,"request_timeout":"1ns"});
+        assert_eq!(
+            config(raw).request_limits,
+            Some(OopRequestLimits::new(1, Duration::from_nanos(1)).expect("positive minimum"))
+        );
+
+        for (input, expected) in [
+            (
+                json!({"body_limit_bytes":0,"request_timeout":"30s"}),
+                "body_limit_bytes must be positive",
+            ),
+            (
+                json!({"body_limit_bytes":4,"request_timeout":"0s"}),
+                "request_timeout must be positive",
+            ),
+            (
+                json!({"request_timeout":"30s"}),
+                "missing field `body_limit_bytes`",
+            ),
+            (
+                json!({"body_limit_bytes":4}),
+                "missing field `request_timeout`",
+            ),
+            (
+                json!({"body_limit_bytes":4,"request_timeout":30}),
+                "invalid type: integer `30`, expected a duration",
+            ),
+            (
+                json!({"body_limit_bytes":-1,"request_timeout":"30s"}),
+                "invalid value: integer `-1`, expected usize",
+            ),
+            (
+                json!({"body_limit_bytes":4,"request_timeout":"30s","extra":true}),
+                "unknown field `extra`, expected `body_limit_bytes` or `request_timeout`",
+            ),
+        ] {
+            let mut raw = without_limits.clone();
+            raw["request_limits"] = input;
+            assert_eq!(
+                serde_json::from_value::<OopHttpConfig>(raw)
+                    .expect_err("invalid policy")
+                    .to_string(),
+                expected
+            );
+        }
+    }
+
+    fn factory_sentinel(
+        _config: &AppConfig,
+        _context: &OopCompositionContext,
+    ) -> Result<OopComposition, OopCompositionError> {
+        FACTORY_CALLS.fetch_add(1, Ordering::SeqCst);
+        Err(OopCompositionError::ClientConstruction {
+            component: "factory_sentinel",
+        })
+    }
+
+    async fn check_composition_controls(home: &std::path::Path) {
+        let base = json!({
+            "server":{"home_dir":home},
+            "oop_http":{"listen_addr":"127.0.0.1:0","allow_loopback_advertise":true}
+        });
+        let mut zero_bytes = base.clone();
+        zero_bytes["oop_http"]["request_limits"] =
+            json!({"body_limit_bytes":0,"request_timeout":"30s"});
+        let mut zero_timeout = base.clone();
+        zero_timeout["oop_http"]["request_limits"] =
+            json!({"body_limit_bytes":4,"request_timeout":"0s"});
+        let mut null = base.clone();
+        null["oop_http"]["request_limits"] = Value::Null;
+        for (config, reason) in [
+            (zero_bytes, Some("body_limit_bytes must be positive")),
+            (zero_timeout, Some("request_timeout must be positive")),
+            (base, None),
+            (null, None),
+        ] {
+            FACTORY_CALLS.store(0, Ordering::SeqCst);
+            let config_path = home.join("config.yaml");
+            std::fs::write(
+                &config_path,
+                serde_saphyr::to_string(&config).expect("fixture YAML"),
+            )
+            .expect("write config");
+            let options = OopRunOptions {
+                gear_name: "limits-gear".to_owned(),
+                config_gear_name: None,
+                instance_id: Some(INSTANCE),
+                directory_endpoint: "http://127.0.0.1:9".to_owned(),
+                config_path: Some(config_path),
+                verbose: 0,
+                print_config: false,
+                heartbeat_interval_secs: 5,
+                version: Some("1.2.3".to_owned()),
+            };
+            let result =
+                tokio::time::timeout(BOUND, run_oop_with_composition(options, factory_sentinel))
+                    .await
+                    .expect("bootstrap result");
+            let factory_calls = FACTORY_CALLS.load(Ordering::SeqCst);
+            if let Some(reason) = reason {
+                let Err(OopCompositionRunError::Bootstrap { source }) = result else {
+                    panic!(
+                        "expected bootstrap validation with 0 factory calls, got {factory_calls}: {result:?}"
+                    );
+                };
+                assert_eq!(source.to_string(), "Failed to extract config from figment");
+                let detail = source
+                    .source()
+                    .and_then(|error| error.downcast_ref::<figment::Error>())
+                    .expect("Figment config extraction error");
+                assert_eq!(
+                    (detail.kind.clone(), detail.path.clone(), detail.count()),
+                    (
+                        figment::error::Kind::Message(reason.to_owned()),
+                        vec!["oop_http".to_owned(), "request_limits".to_owned()],
+                        1,
+                    )
+                );
+                assert_eq!(factory_calls, 0);
+            } else {
+                let Err(OopCompositionRunError::Composition(error)) = result else {
+                    panic!("expected factory control: {result:?}");
+                };
+                assert_eq!(
+                    error,
+                    OopCompositionError::ClientConstruction {
+                        component: "factory_sentinel"
+                    }
+                );
+                assert_eq!(factory_calls, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_limits_fail_before_composition_runs() {
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            temp_env::with_var(TOOLKIT_MODULE_CONFIG_ENV, None::<&str>, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("child runtime")
+                    .block_on(check_composition_controls(std::path::Path::new(&home)));
+            });
+            return;
+        }
+
+        // A successful prepare installs the process-wide logger and panic hook.
+        let home = tempfile::tempdir().expect("child home");
+        let (_, module) = module_path!().split_once("::").expect("test module path");
+        let test = format!("{module}::invalid_limits_fail_before_composition_runs");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("parent runtime")
+            .block_on(check_bootstrap_child(&test, home.path()));
+    }
+
+    async fn check_bootstrap_child(test: &str, home: &std::path::Path) {
+        let stdout = tempfile::NamedTempFile::new_in(home).expect("child stdout");
+        let stderr = tempfile::NamedTempFile::new_in(home).expect("child stderr");
+        // Concurrent config tests can set Figment overrides while this child starts.
+        let child_env = std::env::vars_os().filter(|(key, _)| {
+            !key.to_string_lossy()
+                .trim()
+                .to_ascii_uppercase()
+                .starts_with("APP__")
+        });
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", test, "--nocapture"])
+            .env_clear()
+            .envs(child_env)
+            .env(CHILD_HOME, home)
+            .stdout(stdout.reopen().expect("child stdout file"))
+            .stderr(stderr.reopen().expect("child stderr file"))
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn bootstrap child");
+        let wait = tokio::time::timeout(BOUND, child.wait()).await;
+        let cleanup = if matches!(wait, Ok(Ok(_))) {
+            None
+        } else {
+            Some(tokio::time::timeout(BOUND, child.kill()).await)
+        };
+        let out = std::fs::read_to_string(stdout.path()).expect("read child stdout");
+        let err = std::fs::read_to_string(stderr.path()).expect("read child stderr");
+        let Ok(Ok(status)) = wait else {
+            panic!(
+                "bootstrap child wait={wait:?}, kill/reap={cleanup:?}\nstdout={out}\nstderr={err}"
+            );
+        };
+        assert!(
+            status.success() && out.contains("test result: ok. 1 passed; 0 failed"),
+            "bootstrap child status={status}\nstdout={out}\nstderr={err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_forwards_request_limits_without_changing_other_options() {
+        let policy = OopRequestLimits::new(BYTES, TIMEOUT).expect("valid policy");
+        let base = json!({
+            "listen_addr":"127.0.0.1:8080",
+            "probe_bind_addr":"127.0.0.1:8081",
+            "drain_timeout_secs":17,
+            "healthcheck_timeout_ms":777,
+            "advertise_uri":"http://127.0.0.1:8000",
+            "allow_loopback_advertise":true
+        });
+        let mut limited = base.clone();
+        limited["request_limits"] = json!({"body_limit_bytes":BYTES,"request_timeout":"30s"});
+        let directory: Arc<dyn DirectoryClient> =
+            Arc::new(ManagerDirectoryClient::new(Arc::new(GearManager::new())));
+        for (raw, expected_limits) in [(base, None), (limited, Some(policy))] {
+            let cfg = config(raw);
+            let OopServeOptions {
+                gear_name,
+                instance_id,
+                version,
+                advertise_uri,
+                listen_addr,
+                probe_bind_addr,
+                drain_timeout,
+                heartbeat_interval,
+                healthcheck_timeout,
+                request_limits,
+                directory: actual_directory,
+                bearer_authenticator,
+                internal_authenticator,
+                auth_disabled,
+                labels,
+            } = tokio::time::timeout(
+                BOUND,
+                build_oop_serve_options(
+                    &cfg,
+                    "limits-gear",
+                    INSTANCE,
+                    Some("1.2.3".to_owned()),
+                    Duration::from_secs(5),
+                    Arc::clone(&directory),
+                ),
+            )
+            .await
+            .expect("options deadline")
+            .expect("options build");
+            assert_eq!(
+                (
+                    (
+                        gear_name,
+                        instance_id,
+                        version,
+                        advertise_uri,
+                        listen_addr,
+                        probe_bind_addr
+                    ),
+                    (
+                        drain_timeout,
+                        heartbeat_interval,
+                        healthcheck_timeout,
+                        request_limits
+                    ),
+                    (
+                        auth_disabled,
+                        bearer_authenticator.is_some(),
+                        internal_authenticator.is_some(),
+                        labels
+                    ),
+                ),
+                (
+                    (
+                        "limits-gear".to_owned(),
+                        INSTANCE.to_string(),
+                        Some("1.2.3".to_owned()),
+                        "http://127.0.0.1:8000".to_owned(),
+                        "127.0.0.1:8080".parse().expect("listen address"),
+                        Some("127.0.0.1:8081".parse().expect("probe address"))
+                    ),
+                    (
+                        Duration::from_secs(17),
+                        Duration::from_secs(5),
+                        Duration::from_millis(777),
+                        expected_limits
+                    ),
+                    (false, false, false, std::collections::BTreeMap::new()),
+                )
+            );
+            assert!(Arc::ptr_eq(&actual_directory, &directory));
+        }
+    }
+}

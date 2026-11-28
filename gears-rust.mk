@@ -1155,51 +1155,116 @@ e2e-orders: py-env
 	$(call print_target_banner)
 	$(PYTHON) tools/scripts/run_e2e.py --suite bss-orders -- $(E2E_TARGET)
 
-## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
-e2e-event-broker: py-env
+# Keep literal path characters out of Make and shell expansion.
+export EB_E2E_TARGET_DIR := $(if $(filter @/%,$(firstword @$(value CARGO_TARGET_DIR))),,$(CURDIR)/)$(or $(value CARGO_TARGET_DIR),target)
+# Separate Cargo outputs by feature role while sharing intermediate artifacts.
+# Cargo treats braces in an explicit build-dir as templates, so use its defaults for literal brace paths.
+EB_E2E_BUILD_DIR := $(if $(or $(findstring {,$(EB_E2E_TARGET_DIR)),$(findstring },$(EB_E2E_TARGET_DIR))),,CARGO_BUILD_BUILD_DIR="$${CARGO_BUILD_BUILD_DIR:-$$EB_E2E_TARGET_DIR}")
+EB_E2E_BROKER := "$$EB_E2E_TARGET_DIR/eb-e2e/cf-gears-event-broker-server"
+EB_E2E_EXECUTABLES := E2E_BINARY=$(EB_E2E_BROKER) \
+	E2E_FLIGHT_CONTROL_BINARY="$$EB_E2E_TARGET_DIR/debug/test-flight-control"
+EB_E2E_REMOTE_CORE := "$$EB_E2E_TARGET_DIR/eb-e2e/remote-core/debug/test-flight-control"
+
+.PHONY: e2e-event-broker-build
+e2e-event-broker-build:
+	$(EB_E2E_BUILD_DIR) cargo build --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e" \
+		-p cf-gears-event-broker-server --bin cf-gears-event-broker-server --features e2e-flight-control
+	cargo build --locked --target-dir "$$EB_E2E_TARGET_DIR" \
+		-p test-flight-control --bin test-flight-control --features event-broker
+	# Keep the launcher path stable across Cargo builds.
+	set -e; \
+		dir="$$EB_E2E_TARGET_DIR/eb-e2e"; \
+		broker="$$dir/cf-gears-event-broker-server"; \
+		mkdir -p "$$dir"; \
+		if [ -d "$$broker" ]; then \
+			printf 'Event Broker executable path is a directory: %s\n' "$$broker" >&2; \
+			exit 1; \
+		fi; \
+		staged=$$(mktemp "$$dir/.cf-gears-event-broker-server.XXXXXX"); \
+		trap 'rm -f "$$staged"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		cp -p "$$dir/debug/cf-gears-event-broker-server" "$$staged"; \
+		mv -f "$$staged" "$$broker"; \
+		trap - EXIT
+
+## Run Event Broker split-process Rust integration tests
+.PHONY: test-event-broker-cutover
+test-event-broker-cutover: e2e-event-broker-build
+	$(EB_E2E_EXECUTABLES) $(EB_E2E_BUILD_DIR) \
+		cargo test --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e" -p cf-gears-event-broker-server \
+		--features e2e-flight-control --test standalone_integration_tests \
+		--test consumer_group_rebalance_integration_tests -- --test-threads=1
+	env -u E2E_BINARY E2E_FLIGHT_CONTROL_BINARY="$$EB_E2E_TARGET_DIR/debug/test-flight-control" \
+		cargo test --locked --target-dir "$$EB_E2E_TARGET_DIR" -p cf-gears-event-broker-server \
+		--no-default-features --features process-tests --test process_cutover \
+		the_default_broker_refuses_tenant_serving_with_a_reachable_directory -- --exact
+
+## Run the current-source cutover matrix and the remote Cluster JOIN smoke test
+.PHONY: test-event-broker-cutover-current
+test-event-broker-cutover-current: py-env e2e-event-broker-build
+	$(EB_E2E_BUILD_DIR) cargo build --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e/core-only" \
+		-p test-flight-control --bin test-flight-control --no-default-features --features core
+	$(EB_E2E_BUILD_DIR) cargo build --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e/remote-core" \
+		-p test-flight-control --bin test-flight-control --features event-broker-remote-cluster
+	# The historical MIME comparator needs a gateway from outside this checkout.
+	env -u E2E_LEGACY_GATEWAY_BINARY $(EB_E2E_EXECUTABLES) $(EB_E2E_BUILD_DIR) \
+		E2E_REMOTE_FLIGHT_CONTROL_BINARY=$(EB_E2E_REMOTE_CORE) \
+		cargo test --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e" -p cf-gears-event-broker-server \
+		--features e2e-flight-control --test process_cutover -- --test-threads=1 --exact \
+		--skip ingress::the_gateway_and_worker_apply_the_route_specific_mime_and_credential_policy
+	TEST_FLIGHT_CONTROL_TEST_BINARY="$$EB_E2E_TARGET_DIR/eb-e2e/core-only/debug/test-flight-control" \
+		$(EB_E2E_BUILD_DIR) cargo test --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e/core-only" \
+		-p test-flight-control --no-default-features --features core --test core_process_tests
+	TEST_FLIGHT_CONTROL_TEST_BINARY="$$EB_E2E_TARGET_DIR/debug/test-flight-control" \
+		cargo test --locked --target-dir "$$EB_E2E_TARGET_DIR" \
+		-p test-flight-control --features event-broker --test policy_process_tests --bin test-flight-control
+	TEST_FLIGHT_CONTROL_TEST_BINARY=$(EB_E2E_REMOTE_CORE) $(EB_E2E_BUILD_DIR) \
+		cargo test --locked --target-dir "$$EB_E2E_TARGET_DIR/eb-e2e/remote-core" \
+		-p test-flight-control --features event-broker-remote-cluster --test policy_process_tests \
+		--bin test-flight-control
+	E2E_BINARY=$(EB_E2E_BROKER) E2E_FLIGHT_CONTROL_BINARY=$(EB_E2E_REMOTE_CORE) \
+		E2E_CLUSTER_MODE=remote EB_E2E_BACKEND=memory $(PYTHON) -m pytest \
+		testing/e2e/suites/event_broker/test_consumer_subscriptions.py::test_cold_join_fresh_group_returns_201 -vv
+
+## Run the full Event Broker E2E suite on the default memory backend
+e2e-event-broker: py-env e2e-event-broker-build
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
-	E2E_BINARY=target/debug/cf-gears-event-broker-server \
+	$(EB_E2E_EXECUTABLES) \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
 ## Run event-broker E2E tests on the PostgreSQL storage backend (Docker required)
 ## The backend-sensitive tests of e2e-event-broker, with a PostgreSQL sidecar.
-e2e-event-broker-pg: py-env
+e2e-event-broker-pg: py-env e2e-event-broker-build
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
-	EB_E2E_BACKEND=postgres E2E_BINARY=target/debug/cf-gears-event-broker-server \
+	EB_E2E_BACKEND=postgres $(EB_E2E_EXECUTABLES) \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
 ## Run event-broker E2E tests on the SQLite storage backend
 ## The backend-sensitive tests of e2e-event-broker, the events in a file under the server's home.
-e2e-event-broker-sqlite: py-env
+e2e-event-broker-sqlite: py-env e2e-event-broker-build
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
-	EB_E2E_BACKEND=sqlite E2E_BINARY=target/debug/cf-gears-event-broker-server \
+	EB_E2E_BACKEND=sqlite $(EB_E2E_EXECUTABLES) \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
 ## Run event-broker E2E tests on the MySQL storage backend (Docker required)
 ## The backend-sensitive tests of e2e-event-broker, with a MySQL sidecar.
-e2e-event-broker-mysql: py-env
+e2e-event-broker-mysql: py-env e2e-event-broker-build
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
-	EB_E2E_BACKEND=mysql E2E_BINARY=target/debug/cf-gears-event-broker-server \
+	EB_E2E_BACKEND=mysql $(EB_E2E_EXECUTABLES) \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
 ## Run event-broker E2E tests on the MySQL storage backend on MariaDB (Docker required)
 ## The backend-sensitive tests of e2e-event-broker, with a MariaDB sidecar.
-e2e-event-broker-mariadb: py-env
+e2e-event-broker-mariadb: py-env e2e-event-broker-build
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
-	EB_E2E_BACKEND=mariadb E2E_BINARY=target/debug/cf-gears-event-broker-server \
+	EB_E2E_BACKEND=mariadb $(EB_E2E_EXECUTABLES) \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
 ## Run event-broker E2E tests on the Kafka storage backend (Docker required)
 ## The backend-sensitive tests of e2e-event-broker, with a single-node Kafka sidecar.
-e2e-event-broker-kafka: py-env
+e2e-event-broker-kafka: py-env e2e-event-broker-build
 	$(call print_target_banner)
-	cargo build -p cf-gears-event-broker-server --bin cf-gears-event-broker-server
-	EB_E2E_BACKEND=kafka E2E_BINARY=target/debug/cf-gears-event-broker-server \
+	EB_E2E_BACKEND=kafka $(EB_E2E_EXECUTABLES) \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
 
 ## Run the out-of-process (loopback, no-k8s) E2E suite

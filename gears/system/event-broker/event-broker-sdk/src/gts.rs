@@ -3,17 +3,15 @@
 //! Two base types are declared here, and the broker declares nothing else. A
 //! concrete topic is a well-known **instance** of [`TopicV1`]; a concrete event
 //! type is a **derived type schema** under [`EventV1`], and a published event is
-//! an instance of that derived type. Each is registered in `types-registry` by
-//! whichever gear owns it, at that gear's init - never by the broker. An event's
-//! `subject_type` is any GTS type id the producer chooses, typically its own
-//! domain type (`gts.acme.crm.accounts.tenant.v1~`); the broker declares no
-//! subject type.
+//! an instance of that derived type. The gear that owns a concrete topic or
+//! event type registers it in `types-registry`. The producer chooses the
+//! event's `subject_type`, typically its own domain type such as
+//! `gts.acme.crm.accounts.tenant.v1~`.
 //!
-//! These declarations are the source of truth for the base schemas: the
-//! process-wide `toolkit-gts` inventory seeds `types-registry` from what the
-//! macro emits here, not from `docs/schemas/`. The base files under
-//! `docs/schemas/` are generated from this module and held to it by
-//! `gts_tests`, so per-field keywords live in the schemars attributes below.
+//! The broker publishes these base schemas from the SDK's crate-local
+//! inventory. Embedded registries also see them through the process-wide
+//! inventory. The base files under `docs/schemas/` are generated from this
+//! module and compared with its emitted schemas by `gts_tests`.
 //! Gears declare event types with `#[gts_type_schema(base = EventV1, ..)]`;
 //! the derived struct's fields define the event's `data` contract.
 
@@ -21,7 +19,8 @@ use chrono::{DateTime, Utc};
 use gts::{GtsInstanceId, GtsSchema, GtsTypeId, SELF_ID_REF};
 use schemars::JsonSchema;
 use serde::Serialize;
-use toolkit_gts::{GtsTraitsSchema, gts_id, gts_type_schema};
+use toolkit_gts::local::gts_type_schema;
+use toolkit_gts::{GtsTraitsSchema, gts_id};
 use toolkit_utils::iso8601_duration::Iso8601Duration;
 use uuid::Uuid;
 

@@ -1,30 +1,10 @@
-"""E2E fixtures for the event-broker gear (design.md D8, task group 11).
-
-event-broker has its OWN standalone binary (`cf-gears-event-broker-server`),
-not a feature flag on `cf-gears-example-server` - gated on `E2E_BINARY`
-exactly like mini-chat/usage-collector, so running the shared `make
-e2e-local` suite never boots a second server for routes it doesn't serve.
-
-Run it with: make e2e-event-broker
-
-`types-registry` seeds the config's `entities:` into its database catalogue
-at boot, and the broker reads that catalogue at start and then once per
-`workers.specification_refresh_interval_secs` (see
-`config/event-broker-standalone.yaml`'s header comment). A topic admitted at
-runtime through `POST /types-registry/v2/platform/entities` (internal token)
-resolves at the first refresh after its admission, while
-`POST /types-registry/v1/entities` writes only the legacy catalogue, which
-the broker does not read. So every test that shares the session-scoped
-`test_env` server gets its own PRE-PROVISIONED topic baked into the config at
-session-setup time (below), rather than waiting out a refresh per test.
-"""
+"""Event Broker fixtures for the worker and its separate Flight Control host."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -34,16 +14,20 @@ from pathlib import Path
 import httpx
 import pytest
 
-from lib.orchestrator import GearTestEnv, _log_path
 from lib.sidecars import KafkaSidecar, MariaDbSidecar, MySqlSidecar, PostgresSidecar
+
+from .topology import (
+    OWNER_SUBJECT,
+    OWNER_TENANT,
+    OWNER_TOKEN,
+    FlightControlBrokerEnv,
+    own_sidecars,
+    replace_once,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
 HERE = Path(__file__).resolve().parent
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
-CONFIG = PROJECT_ROOT / "config" / "event-broker-standalone.yaml"
-
-SERVER_PORT = 8089
 API_BASE = "/event-broker/v1"
 REQUEST_TIMEOUT = 5.0
 
@@ -109,7 +93,7 @@ EVENT_TYPE_STRICT = "gts.cf.core.events.event.v1~cf.e2e.event_broker.strict.v1~"
 # "latest" is the last seeded event's sequence, which the fixture records.
 TOPIC_PREFILLED = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.prefilled.v1"
 EVENT_TYPE_PREFILLED = "gts.cf.core.events.event.v1~cf.e2e.event_broker.prefilled.v1~"
-PREFILLED_TENANT_ID = "e2e00000-0000-0000-0000-000000000000"
+PREFILLED_TENANT_ID = OWNER_TENANT
 PREFILLED_COUNT = 100
 # How long the prefill fixture waits for its batch to become durable.
 PREFILL_INGEST_TIMEOUT = 30.0
@@ -227,14 +211,11 @@ EVENT_TYPE_OWNERSHIP = "gts.cf.core.events.event.v1~cf.e2e.event_broker.ownershi
 TOPIC_SUBTREE = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.subtree.v1"
 EVENT_TYPE_SUBTREE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.subtree.v1~"
 
-# The identity the api-gateway injects under `auth_disabled: true`
-# (toolkit_security::constants, libs/toolkit-security/src/constants.rs).
-DEFAULT_TENANT_ID = "00000000-df51-5b42-9538-d2b56b7ee953"
-DEFAULT_SUBJECT_ID = "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+# Shared names for scenarios that reference the session actor's identity.
+DEFAULT_TENANT_ID = OWNER_TENANT
+DEFAULT_SUBJECT_ID = OWNER_SUBJECT
 
-# Shared xfail marker for tests that require real auth enforcement.
-# The standalone config sets ``auth_disabled: true``; these tests document the
-# expected behaviour and will pass once a multi-tenant config is wired.
+# Shared markers for scenarios carried forward from the co-hosted fixture.
 XFAIL_AUTH_DISABLED = pytest.mark.xfail(
     reason="standalone config sets auth_disabled: true; tenant isolation is not enforced",
     strict=True,
@@ -247,12 +228,12 @@ XFAIL_NO_ACTION_AWARE_PDP = pytest.mark.xfail(
     strict=True,
 )
 
-# Static-token identities for a static-tokens config of this suite. Each token
-# is bound in that config's `static-authn-plugin` token list:
+# Flight Control maps these bearers through the shipped static AuthN plugin.
 # Principal A: a fixed non-nil subject in the shared e2e tenant.
-TOKEN_PRINCIPAL_A = "eb-e2e-principal-a"
+TOKEN_PRINCIPAL_A = OWNER_TOKEN
 # Principal B: a second fixed non-nil subject in the same tenant as A.
 TOKEN_PRINCIPAL_B = "eb-e2e-principal-b"
+TOKEN_BARRIER = "eb-e2e-barrier"
 # The nil-subject identity: subject id is the nil UUID, tenant the shared one.
 TOKEN_NIL_SUBJECT = "eb-e2e-nil-subject"
 # The nil-tenant identity: a fixed non-nil subject whose tenant id is the nil
@@ -260,30 +241,7 @@ TOKEN_NIL_SUBJECT = "eb-e2e-nil-subject"
 TOKEN_NIL_TENANT = "eb-e2e-nil-tenant"
 
 
-def _api_gateway_auth_disabled(config_text: str) -> bool:
-    """Whether the config's ``api-gateway`` module sets ``auth_disabled: true``.
-
-    Reads the module block (the ``  api-gateway:`` line and every line indented
-    deeper below it); the session config patch (``_patch_config``) never
-    touches that block, so the file decides it.
-    """
-    lines = config_text.splitlines()
-    try:
-        start = lines.index("  api-gateway:")
-    except ValueError:
-        return False
-    for line in lines[start + 1 :]:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and len(line) - len(line.lstrip()) <= 2:
-            break
-        if stripped.split("#", 1)[0].strip() == "auth_disabled: true":
-            return True
-    return False
-
-
-# Read once at import from CONFIG, the config `gear_test_env` boots: its
-# ``api-gateway.config.auth_disabled`` (config/event-broker-standalone.yaml:218).
-API_GATEWAY_AUTH_DISABLED = _api_gateway_auth_disabled(CONFIG.read_text(encoding="utf-8"))
+API_GATEWAY_AUTH_DISABLED = False
 
 # For tests that send a static token: under an auth-disabled config the gateway
 # ignores the token and injects its own default identity, so the test is a
@@ -351,18 +309,15 @@ def group_seek_positions(entries) -> dict:
     return out
 
 
-def _await_log_line(env: GearTestEnv, text: str, offset: int = 0) -> None:
-    """Waits for `text` in the server log written after byte `offset`: a 503
-    body names no cause, so the log line is what tells which one fired."""
+def _await_log_line(env: FlightControlBrokerEnv, text: str) -> None:
     deadline = time.monotonic() + 10
     while True:
-        with open(_log_path(env), encoding="utf-8", errors="replace") as fh:
-            fh.seek(offset)
-            log = fh.read()
+        log = env.log()
         if text in log:
             return
-        assert time.monotonic() < deadline, f"{text!r} not in the server log: {log[-2000:]}"
-        time.sleep(0.2)
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, f"{text!r} not in the worker log: {log[-2000:]}"
+        time.sleep(min(0.2, remaining))
 
 
 def _topic_instance(topic_id: str) -> dict:
@@ -531,8 +486,6 @@ _EXTRA_ENTITIES = [
     _derived_event_type(EVENT_TYPE_SUBTREE, TOPIC_SUBTREE),
 ]
 
-_TEMP_HOME = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-")
-
 # ── Storage backend ───────────────────────────────────────────────────────
 #
 # The suite runs against any linked storage backend, chosen by `EB_E2E_BACKEND`:
@@ -578,15 +531,14 @@ def backend_sidecars() -> list:
     return [named()]
 
 
-def _backend_block(sidecars, namespace: str, home_dir: str) -> tuple[str, str]:
+def _backend_block(sidecars: dict, namespace: str, home_dir: Path) -> tuple[str, str]:
     """`(type, settings lines)` of the `backends.main` entry for `BACKEND`.
 
     `namespace` keeps one server's events apart from another's on a shared
     medium: the PostgreSQL schema, the MySQL database, the Kafka topic prefix,
     the SQLite file name in `home_dir`.
     """
-    sidecars = list(sidecars.values() if isinstance(sidecars, dict) else sidecars)
-    server = next((sc for sc in sidecars if sc.name == BACKEND), None)
+    server = sidecars.get(BACKEND)
     indent = "          "
     if BACKEND == "memory":
         return MEMORY_BACKEND, ""
@@ -635,21 +587,12 @@ _COMMITTED_ENTRY = (
 )
 
 
-def patch_backend(config_text: str, sidecars, namespace: str, home_dir: str) -> str:
-    """Point the committed config's one registry entry, `backends.main`, at `BACKEND`.
-
-    Always replaces the entry, memory included. `sidecars` is whatever the
-    caller holds - `GearTestEnv.sidecars` (a list) or `RunningTestEnv.sidecars`
-    (a dict); `namespace` and `home_dir` are the server's own (see
-    `_backend_block`).
-    """
-    assert config_text.count(_COMMITTED_ENTRY) == 1, (
-        "the committed config no longer names the sqlite backend entry the "
-        "backend switch replaces"
-    )
+def patch_backend(config_text: str, sidecars: dict, namespace: str, home_dir: Path) -> str:
+    """Point the worker's main entry at its own storage namespace."""
     backend_type, settings = _backend_block(sidecars, namespace, home_dir)
-    return config_text.replace(
-        _COMMITTED_ENTRY, f'        main:\n          type: "{backend_type}"\n' + settings
+    return replace_once(
+        config_text, _COMMITTED_ENTRY, f'        main:\n          type: "{backend_type}"\n'
+        + settings,
     )
 
 
@@ -669,17 +612,6 @@ def pytest_configure(config):
     )
 
 
-# ── Environment gate ──────────────────────────────────────────────────────
-
-@pytest.fixture(scope="session", autouse=True)
-def _require_dedicated_binary():
-    if not os.environ.get("E2E_BINARY"):
-        pytest.skip(
-            "E2E_BINARY not set - run these tests via: make e2e-event-broker",
-            allow_module_level=True,
-        )
-
-
 def pytest_collection_modifyitems(items):
     """Exclude this suite's own session-fixture (server boot) startup cost
     from pytest.ini's global 10s per-test timeout - matches
@@ -696,16 +628,8 @@ def pytest_collection_modifyitems(items):
 
 # ── Test environment ──────────────────────────────────────────────────────
 
-def _patch_config(config_text: str, env: GearTestEnv) -> str:
-    config_text = patch_backend(config_text, env.sidecars, "evbk_e2e", _TEMP_HOME)
-    config_text = config_text.replace(
-        'home_dir: "~/.cf-gears-event-broker"',
-        f'home_dir: "{Path(_TEMP_HOME).as_posix()}"',
-    )
-    config_text = config_text.replace(
-        'bind_addr: "127.0.0.1:8080"',
-        f'bind_addr: "127.0.0.1:{SERVER_PORT}"',
-    )
+def _patch_config(config_text: str, home_dir: Path, sidecars: dict, namespace: str) -> str:
+    config_text = patch_backend(config_text, sidecars, namespace, home_dir)
     # Each topic's partition count is configuration, not part of the entity.
     settings = "".join(
         f'        "{topic}":\n          partitions: {count}\n'
@@ -717,7 +641,7 @@ def _patch_config(config_text: str, env: GearTestEnv) -> str:
         )
         for topic, count in _TOPIC_PARTITIONS.items()
     )
-    config_text = config_text.replace("      topics:\n", "      topics:\n" + settings, 1)
+    config_text = replace_once(config_text, "      topics:\n", "      topics:\n" + settings)
     # The block is read whole, so the other settings restate their defaults.
     streaming = (
         "      streaming:\n"
@@ -729,74 +653,183 @@ def _patch_config(config_text: str, env: GearTestEnv) -> str:
     )
     anchor = "      backends:"
     assert config_text.count(anchor) == 1 and "      streaming:" not in config_text
-    config_text = config_text.replace(anchor, streaming + anchor, 1)
-    extra = "".join(f"        - {json.dumps(e)}\n" for e in _EXTRA_ENTITIES)
-    return config_text.replace("entities:\n", "entities:\n" + extra)
+    return replace_once(config_text, anchor, streaming + anchor)
 
 
 @pytest.fixture(scope="session")
-def gear_test_env() -> GearTestEnv:
-    return GearTestEnv(
-        binary="cf-gears-event-broker-server",
-        config_path=CONFIG,
-        config_patch=_patch_config,
-        port=SERVER_PORT,
-        health_path="/readyz",
-        env={"RUST_LOG": os.environ.get("RUST_LOG", "info,event_broker=debug")},
-        sidecars=backend_sidecars(),
-        log_suffix="event-broker",
+def test_env(tmp_path_factory):
+    root = tmp_path_factory.mktemp("event-broker-session")
+    namespace = f"evbk_e2e_{uuid.uuid4().hex[:8]}"
+    pair = FlightControlBrokerEnv(
+        root,
+        broker_config=lambda text, home, sidecars: _patch_config(
+            text, home, sidecars, namespace,
+        ),
+        documents=_EXTRA_ENTITIES,
     )
+    with own_sidecars(backend_sidecars(), redact=pair.redact) as sidecars:
+        pair.sidecars = sidecars
+        with pair:
+            yield pair
 
 
-# How long a fresh server may take to provision its topics on the backend.
+@pytest.fixture(scope="session")
+def _scoped_env(tmp_path_factory, test_env):
+    root = tmp_path_factory.mktemp("event-broker-scoped-session")
+    namespace = f"evbk_e2e_{uuid.uuid4().hex[:8]}"
+    subject = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    with FlightControlBrokerEnv(
+        root,
+        broker_config=lambda text, home, sidecars: _patch_config(
+            text, home, sidecars, namespace,
+        ),
+        documents=_EXTRA_ENTITIES,
+        narrowing_policy=True,
+        additional_grants=(
+            {
+                "subject_id": subject,
+                "action": "consume",
+                "resource": TOPIC_SEL_EXACT,
+                "event_types": [EVENT_TYPE_SEL_EXACT_SIBLING],
+            },
+            {
+                "subject_id": subject,
+                "action": "consume",
+                "resource": TOPIC_SUBJECT_SELECTOR,
+                "subject_types": [SUBJECT_TYPE_OTHER],
+            },
+            {
+                "subject_id": subject,
+                "action": "consume",
+                "resource": TOPIC_SEL_FAMILY,
+                "event_types": [EVENT_TYPE_SEL_BASE, EVENT_TYPE_SEL_RUSH],
+            },
+        ),
+        sidecars=test_env.sidecars,
+    ) as pair:
+        wait_provisioned(
+            f"{pair.base_url}{API_BASE}",
+            {
+                TOPIC_SEL_EXACT: EVENT_TYPE_SEL_EXACT,
+                TOPIC_SUBJECT_SELECTOR: EVENT_TYPE_SUBJECT_SELECTOR,
+                TOPIC_SEL_FAMILY: EVENT_TYPE_SEL_BASE,
+            },
+        )
+        yield pair
+
+
+def public_headers(token: str | None = OWNER_TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"} if token is not None else {}
+
+
 PROVISION_TIMEOUT = 60.0
+PROBE_EVENT_ID = "00000000-0000-0000-0000-000000000101"
+PROBE_PRODUCER_ID = "00000000-0000-0000-0000-000000000102"
 
 
 def wait_provisioned(base_url: str, event_types: dict[str, str]) -> None:
-    """Block until every topic of `event_types` (topic -> an event type of
-    it) is provisioned on the storage backend.
-
-    The server is already ready (`/readyz`), but provisioning goes on past the
-    start phase: a backend may answer `Pending` first, and a remote one takes
-    a round trip per topic, so a test could otherwise get a 503 publishing.
-    The probe has no side effect: a publish naming an unregistered producer is
-    refused 404 only after the topic's provisioning check, which answers 503
-    before.
-    """
-    import time
-
+    """Verify each admitted topic is readable and reaches producer lookup."""
     deadline = time.monotonic() + PROVISION_TIMEOUT
 
-    def settle(probe, what: str) -> None:
-        while True:
-            resp = probe()
-            if resp.status_code == 404:
-                return
-            assert resp.status_code == 503, resp.text
-            assert time.monotonic() < deadline, (
-                f"{what} not ready within {PROVISION_TIMEOUT}s: {resp.text}"
-            )
-            time.sleep(0.2)
+    def remaining() -> float:
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise AssertionError(
+                f"topic {topic!r} for event type {event_type!r} did not provision within "
+                f"{PROVISION_TIMEOUT}s (last observation: {last_observation})"
+            ) from None
+        return min(REQUEST_TIMEOUT, budget)
 
-    with httpx.Client(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
+    def request(send, path, **kwargs) -> httpx.Response:
+        try:
+            return send(path, timeout=remaining(), **kwargs)
+        except httpx.TimeoutException:
+            remaining()
+            raise
+
+    with httpx.Client(
+        base_url=base_url,
+        headers={**public_headers(), "traceparent": TRACEPARENT},
+        trust_env=False,
+    ) as client:
         for topic, event_type in event_types.items():
-            settle(
-                lambda: client.post(
+            last_observation = "no probe response"
+            while True:
+                response = request(
+                    client.post,
                     "/events",
                     json={
-                        "id": str(uuid.uuid4()),
+                        "id": PROBE_EVENT_ID,
                         "type": event_type,
-                        "subject_tenant": str(uuid.uuid4()),
+                        "subject_tenant": OWNER_TENANT,
                         "source": "e2e-probe",
                         "subject": "probe",
                         "subject_type": SUBJECT_TYPE,
-                        "occurred_at": datetime.now(timezone.utc).isoformat(),
-                        "data": {"strict_field": "probe"},
-                        "meta": {"version": 1, "producer": str(uuid.uuid4()), "previous": 0, "sequence": 1},
+                        "occurred_at": "2026-01-01T00:00:00Z",
+                        "data": {"strict_field": "probe", "k": "probe"},
+                        "meta": {
+                            "version": 1,
+                            "producer": PROBE_PRODUCER_ID,
+                            "previous": 0,
+                            "sequence": 1,
+                        },
                     },
-                ),
-                f"topic {topic}",
+                )
+                if response.status_code == 503:
+                    last_observation = "HTTP 503 (unavailable)"
+                else:
+                    reply = (
+                        response.status_code,
+                        response.headers.get("content-type"),
+                        response.json(),
+                    )
+                    if reply != (
+                        404,
+                        "application/problem+json",
+                        {
+                            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+                            "title": "Not Found",
+                            "status": 404,
+                            "detail": f"event type '{event_type}' is not registered",
+                            "instance": "/event-broker/v1/events",
+                            "trace_id": TRACE_ID,
+                            "context": {
+                                "resource_type": "gts.cf.core.events.event_type.v1~",
+                                "resource_name": event_type,
+                            },
+                        },
+                    ):
+                        break
+                    last_observation = "HTTP 404 (event type is not registered)"
+                time.sleep(min(0.2, remaining()))
+            assert reply == (
+                404,
+                "application/problem+json",
+                {
+                    "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~",
+                    "title": "Not Found",
+                    "status": 404,
+                    "detail": "the producer is not registered or its registration has expired",
+                    "instance": "/event-broker/v1/events",
+                    "trace_id": TRACE_ID,
+                    "context": {
+                        "resource_type": "gts.cf.core.events.producer.v1~",
+                        "resource_name": PROBE_PRODUCER_ID,
+                    },
+                },
             )
+            last_observation = "HTTP 404 (unknown producer)"
+            admitted = request(
+                client.get,
+                "/topics/segments",
+                params={"topic": topic, "partition": 0},
+            )
+            last_observation = f"topic read returned HTTP {admitted.status_code}"
+            remaining()
+            assert admitted.status_code == 200, admitted.text
+            manifest = admitted.json()
+            assert isinstance(manifest, dict), manifest
+            assert (manifest.get("topic"), manifest.get("partition")) == (topic, 0)
 
 
 # Every suite topic, with one event type of it for the provisioning probe.
@@ -826,25 +859,107 @@ _TOPIC_EVENT_TYPES = {
 }
 
 
+@pytest.fixture(scope="session")
+def _action_grants_env(tmp_path_factory, test_env):
+    root = tmp_path_factory.mktemp("event-broker-action-grants")
+    namespace = f"evbk_e2e_{uuid.uuid4().hex[:8]}"
+    with FlightControlBrokerEnv(
+        root,
+        broker_config=lambda text, home, sidecars: _patch_config(
+            text, home, sidecars, namespace,
+        ),
+        documents=_EXTRA_ENTITIES,
+        narrowing_policy=True,
+        sidecars=test_env.sidecars,
+    ) as pair:
+        wait_provisioned(f"{pair.base_url}{API_BASE}", _TOPIC_EVENT_TYPES)
+        yield pair
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _topics_provisioned(_require_dedicated_binary, test_env):
+def _topics_provisioned(test_env):
     wait_provisioned(f"{test_env.base_url}{API_BASE}", _TOPIC_EVENT_TYPES)
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────
 
-@pytest.fixture
-def api(test_env):
+def _api_for_env(test_env):
     """Async client factory bound to the running server's event-broker API."""
 
-    def _client() -> httpx.AsyncClient:
+    def _client(token: str | None = OWNER_TOKEN) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             base_url=f"{test_env.base_url}{API_BASE}",
             timeout=REQUEST_TIMEOUT,
-            headers={"traceparent": TRACEPARENT},
+            headers={**public_headers(token), "traceparent": TRACEPARENT},
+            trust_env=False,
         )
 
     return _client
+
+
+@pytest.fixture
+def api(test_env):
+    return _api_for_env(test_env)
+
+
+@pytest.fixture
+def _action_grants_api(_action_grants_env):
+    return _api_for_env(_action_grants_env)
+
+
+@pytest.fixture
+def _scoped_api(_scoped_env):
+    return _api_for_env(_scoped_env)
+
+
+EVENT_TYPE_DEMO_GREETING = "gts.cf.core.events.event.v1~cf.core.demo.greeting.v1~"
+UNKNOWN_SEGMENTS_TOPIC = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.nonexistent.v1"
+
+
+def _private_policy_api(test_env, tmp_path, grants, topic, event_type):
+    namespace = f"evbk_e2e_policy_{uuid.uuid4().hex[:8]}"
+    with FlightControlBrokerEnv(
+        tmp_path,
+        broker_config=lambda text, home, sidecars: _patch_config(
+            text, home, sidecars, namespace,
+        ),
+        documents=_EXTRA_ENTITIES,
+        narrowing_policy=True,
+        additional_grants=grants,
+        sidecars=test_env.sidecars,
+    ) as pair:
+        wait_provisioned(f"{pair.base_url}{API_BASE}", {topic: event_type})
+        yield _api_for_env(pair)
+
+
+@pytest.fixture
+def _barrier_publish_api(test_env, tmp_path):
+    principal = "dddddddd-dddd-dddd-dddd-dddddddddddd"
+    yield from _private_policy_api(
+        test_env, tmp_path,
+        (
+            {
+                "subject_id": principal,
+                "action": "produce",
+                "resource": "gts.cf.core.events.request.v1~",
+            },
+            {
+                "subject_id": principal,
+                "action": "produce",
+                "resource": EVENT_TYPE_DEMO_GREETING,
+            },
+        ),
+        TOPIC_STREAM, EVENT_TYPE_STREAM,
+    )
+
+
+@pytest.fixture
+def _unknown_segments_api(test_env, tmp_path):
+    yield from _private_policy_api(
+        test_env, tmp_path,
+        ({"subject_id": OWNER_SUBJECT, "action": "consume", "resource": UNKNOWN_SEGMENTS_TOPIC},),
+        TOPIC_STRICT, EVENT_TYPE_STRICT,
+    )
 
 
 @dataclass(frozen=True)
@@ -886,7 +1001,9 @@ async def prefilled_topic(test_env) -> Prefilled:
         }
         for _ in range(PREFILLED_COUNT)
     ]
-    async with httpx.AsyncClient(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=REQUEST_TIMEOUT, headers=public_headers(), trust_env=False,
+    ) as client:
         pub_resp = await client.post("/events:batch", json={"events": published})
         assert pub_resp.status_code == 202
 
@@ -921,7 +1038,9 @@ async def prefilled_topic(test_env) -> Prefilled:
     # publish that acks only once durable removes the wait, but is not
     # implemented yet.
     delivered: list[dict] = []
-    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=None, headers=public_headers(), trust_env=False,
+    ) as stream_client:
         async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
             assert resp.status_code == 200
             reader = SseFrameReader(resp)
@@ -934,7 +1053,9 @@ async def prefilled_topic(test_env) -> Prefilled:
                     f"delivered within {PREFILL_INGEST_TIMEOUT}s"
                 )
                 delivered.append((await reader.await_kind("event", timeout=remaining))["payload"])
-    async with httpx.AsyncClient(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
+    async with httpx.AsyncClient(
+        base_url=base_url, timeout=REQUEST_TIMEOUT, headers=public_headers(), trust_env=False,
+    ) as client:
         assert (await client.delete(f"/subscriptions/{sub_id}")).status_code == 204
 
     assert [e["id"] for e in delivered] == [e["id"] for e in published]

@@ -53,6 +53,14 @@ const MEMORY_BACKEND: &str =
 #[schemars(extend("additionalProperties" = true))]
 struct FixtureEventV1;
 
+/// Supplies a fresh registry so a test host can publish its own schemas.
+#[must_use]
+pub fn empty_platform_registry_registration() -> toolkit::runtime::ClientRegistration {
+    toolkit::runtime::ClientRegistration::new::<dyn types_registry_sdk::PlatformTypesRegistryApi>(
+        Arc::new(MockTypesRegistry::new()),
+    )
+}
+
 /// A registry holding the broker's two base types (`TOPIC_BASE` and
 /// `EVENT_BASE`, as `event-broker-sdk` declares them), the `topics` instance
 /// documents (keyed by their `id`) and the `event_types` schema documents (keyed

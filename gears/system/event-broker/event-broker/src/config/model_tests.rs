@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::config::{EventBrokerConfig, RetentionSize, StreamingConfig};
+use crate::config::{
+    EventBrokerConfig, ProcessClusterConfig, ProcessConfig, RetentionSize, StreamingConfig,
+};
 use crate::domain::model::BarrierMode;
 
 /// The backend types the fixtures name. Written out rather than imported from
@@ -29,6 +31,558 @@ fn config_with_topics(topics: &serde_json::Value) -> EventBrokerConfig {
         "topics": topics.clone(),
     }))
     .expect("test configuration deserializes")
+}
+
+#[test]
+fn process_cluster_options_preserve_the_selected_mode_and_memory_settings() {
+    let read = |source| {
+        serde_json::from_value::<EventBrokerConfig>(source)
+            .expect("valid process options deserialize")
+            .process
+    };
+
+    assert_eq!(read(json!({"mode": "standalone"})), None);
+    assert_eq!(read(json!({"mode": "standalone", "process": null})), None);
+    assert_eq!(
+        read(json!({
+            "mode": "standalone",
+            "process": {"cluster": {"mode": "memory"}},
+        })),
+        Some(ProcessConfig {
+            cluster: ProcessClusterConfig::Memory {
+                profiles: vec!["event-broker".to_owned()],
+                sweep_interval: Duration::from_secs(1),
+            },
+        })
+    );
+    assert_eq!(
+        read(json!({
+            "mode": "standalone",
+            "process": {
+                "cluster": {
+                    "mode": "memory",
+                    "profiles": ["secondary", "MiX_9-a"],
+                    "sweep_interval": "250ms",
+                },
+            },
+        })),
+        Some(ProcessConfig {
+            cluster: ProcessClusterConfig::Memory {
+                profiles: vec!["secondary".to_owned(), "MiX_9-a".to_owned()],
+                sweep_interval: Duration::from_millis(250),
+            },
+        })
+    );
+    assert_eq!(
+        read(json!({
+            "mode": "standalone",
+            "process": {"cluster": {"mode": "memory", "profiles": []}},
+        })),
+        Some(ProcessConfig {
+            cluster: ProcessClusterConfig::Memory {
+                profiles: Vec::new(),
+                sweep_interval: Duration::from_secs(1),
+            },
+        })
+    );
+    assert_eq!(
+        read(json!({
+            "mode": "standalone",
+            "process": {"cluster": {"sweep_interval": "250ms", "mode": "memory"}},
+        })),
+        Some(ProcessConfig {
+            cluster: ProcessClusterConfig::Memory {
+                profiles: vec!["event-broker".to_owned()],
+                sweep_interval: Duration::from_millis(250),
+            },
+        })
+    );
+    assert_eq!(
+        read(json!({
+            "mode": "standalone",
+            "process": {"cluster": {"mode": "remote"}},
+        })),
+        Some(ProcessConfig {
+            cluster: ProcessClusterConfig::Remote {},
+        })
+    );
+}
+
+#[test]
+fn process_cluster_options_reject_unknown_or_misplaced_fields() {
+    let outcomes = [
+        ("array process", json!([{"mode": "remote"}])),
+        ("array cluster", json!({"cluster": ["remote"]})),
+        ("scalar process", json!(true)),
+        ("scalar cluster", json!({"cluster": "remote"})),
+        ("null cluster", json!({"cluster": null})),
+        (
+            "null memory profiles",
+            json!({"cluster": {"mode": "memory", "profiles": null}}),
+        ),
+        (
+            "null memory interval",
+            json!({"cluster": {"mode": "memory", "sweep_interval": null}}),
+        ),
+        ("missing cluster", json!({})),
+        ("missing mode", json!({"cluster": {}})),
+        ("unknown mode", json!({"cluster": {"mode": "unknown"}})),
+        (
+            "remote profiles",
+            json!({"cluster": {"mode": "remote", "profiles": ["secondary"]}}),
+        ),
+        (
+            "remote sweep interval",
+            json!({"cluster": {"mode": "remote", "sweep_interval": "1s"}}),
+        ),
+        (
+            "remote endpoint",
+            json!({"cluster": {"mode": "remote", "endpoint": "http://127.0.0.1:50051"}}),
+        ),
+        (
+            "unknown process field",
+            json!({"cluster": {"mode": "memory"}, "extra": true}),
+        ),
+        (
+            "unknown memory field",
+            json!({
+                "cluster": {
+                    "mode": "memory",
+                    "profiles": ["secondary"],
+                    "sweep_interval": "250ms",
+                    "extra": true,
+                }
+            }),
+        ),
+    ]
+    .map(|(case, process)| {
+        let accepted = serde_json::from_value::<EventBrokerConfig>(json!({
+            "mode": "standalone",
+            "process": process,
+        }))
+        .is_ok();
+        (case, accepted)
+    });
+
+    let public_entries = [
+        serde_json::from_value::<ProcessConfig>(json!([{"mode": "remote"}])).is_ok(),
+        serde_json::from_value::<ProcessClusterConfig>(json!(["remote"])).is_ok(),
+    ];
+    let duplicates = [
+        r#"{"cluster":{"mode":"remote"},"cluster":{"mode":"remote"}}"#,
+        r#"{"cluster":{"mode":"remote","mode":"memory"}}"#,
+        r#"{"cluster":{"mode":"memory","profiles":[],"profiles":[]}}"#,
+        r#"{"cluster":{"mode":"memory","sweep_interval":"1s","sweep_interval":"2s"}}"#,
+    ]
+    .map(|input| serde_json::from_str::<ProcessConfig>(input).is_ok());
+    assert_eq!(
+        (outcomes, public_entries, duplicates),
+        (
+            [
+                ("array process", false),
+                ("array cluster", false),
+                ("scalar process", false),
+                ("scalar cluster", false),
+                ("null cluster", false),
+                ("null memory profiles", false),
+                ("null memory interval", false),
+                ("missing cluster", false),
+                ("missing mode", false),
+                ("unknown mode", false),
+                ("remote profiles", false),
+                ("remote sweep interval", false),
+                ("remote endpoint", false),
+                ("unknown process field", false),
+                ("unknown memory field", false),
+            ],
+            [false, false],
+            [false; 4]
+        )
+    );
+
+    let data =
+        serde_json::from_str::<ProcessClusterConfig>("{}").expect_err("missing mode is invalid");
+    assert_eq!(
+        (data.classify(), data.to_string()),
+        (
+            serde_json::error::Category::Data,
+            "process.cluster.mode is required at line 1 column 2".to_owned(),
+        )
+    );
+    let syntax = serde_json::from_str::<ProcessConfig>(r#"{"cluster":#}"#)
+        .expect_err("syntax-damaged JSON is invalid");
+    assert_eq!(
+        (syntax.classify(), syntax.to_string()),
+        (
+            serde_json::error::Category::Syntax,
+            "expected value at line 1 column 12".to_owned(),
+        )
+    );
+}
+
+#[test]
+fn invalid_process_mode_and_sweep_interval_errors_name_the_field_without_its_value() {
+    use crate::test_support::module_boot::StaticConfigProvider;
+
+    let mode = "process.cluster.mode must be memory or remote";
+    let profiles = "process.cluster.profiles must be a list of strings";
+    let interval = "process.cluster.sweep_interval must be a duration";
+    let outcomes = [
+        (
+            "unknown mode",
+            json!({"cluster": {"mode": "qa-mode-marker"}}),
+            mode,
+        ),
+        (
+            "object mode",
+            json!({"cluster": {"mode": {"invalid": true}}}),
+            mode,
+        ),
+        (
+            "missing mode",
+            json!({"cluster": {}}),
+            "process.cluster.mode is required",
+        ),
+        (
+            "bad duration",
+            json!({"cluster": {"mode": "memory", "sweep_interval": "qa-interval-marker"}}),
+            interval,
+        ),
+        (
+            "integer duration",
+            json!({"cluster": {"mode": "memory", "sweep_interval": 17}}),
+            interval,
+        ),
+        (
+            "scalar profiles",
+            json!({"cluster": {"mode": "memory", "profiles": "qa-secret-profile"}}),
+            profiles,
+        ),
+        (
+            "numeric profile",
+            json!({"cluster": {"mode": "memory", "profiles": [31]}}),
+            profiles,
+        ),
+        (
+            "boolean profile",
+            json!({"cluster": {"mode": "memory", "profiles": [true]}}),
+            profiles,
+        ),
+        (
+            "unknown process property",
+            json!({"cluster": {"mode": "remote"}, "qa-secret-property": profiles}),
+            "process only supports the cluster field",
+        ),
+        (
+            "unknown cluster property",
+            json!({"cluster": {"mode": "memory", "qa-secret-property": profiles}}),
+            "process.cluster only supports mode, profiles and sweep_interval",
+        ),
+        ("missing cluster", json!({}), "process.cluster is required"),
+        (
+            "nonmapping process",
+            json!("qa-secret-property"),
+            "process must be a mapping",
+        ),
+        (
+            "nonmapping cluster",
+            json!({"cluster": "qa-secret-property"}),
+            "process.cluster must be a mapping",
+        ),
+        (
+            "both remote keys",
+            json!({"cluster": {"mode": "remote", "profiles": null, "sweep_interval": null}}),
+            "process.cluster.profiles is only supported in memory mode",
+        ),
+        (
+            "null remote sweep interval",
+            json!({"cluster": {"mode": "remote", "sweep_interval": null}}),
+            "process.cluster.sweep_interval is only supported in memory mode",
+        ),
+    ]
+    .map(|(case, process, expected)| {
+        let config = json!({
+            "mode": "standalone",
+            "backends": {"main": {"type": MEMORY_BACKEND}},
+            "backend_routing": {TOPIC_TYPE: "main"},
+            "process": process,
+        });
+        let direct = serde_json::from_value::<EventBrokerConfig>(config.clone())
+            .expect_err("invalid process configuration");
+        let provider = StaticConfigProvider {
+            root: json!({"event-broker": {"config": config}}),
+        };
+        let loaded =
+            toolkit::config::gear_config_required::<EventBrokerConfig>(&provider, "event-broker")
+                .expect_err("invalid effective gear config");
+        (
+            (case, direct.to_string(), loaded.to_string()),
+            (
+                case,
+                expected.to_owned(),
+                format!("invalid config for gear 'event-broker': {expected}"),
+            ),
+        )
+    });
+    assert_eq!(
+        outcomes.each_ref().map(|(actual, _)| actual),
+        outcomes.each_ref().map(|(_, expected)| expected)
+    );
+}
+
+fn cluster_field_sources(mode: &str, payload: &str) -> [String; 2] {
+    let mode = format!(r#""mode":"{mode}""#);
+    [format!("{mode},{payload}"), format!("{payload},{mode}")].map(|fields| {
+        format!(
+            r#"{{
+                "mode": "standalone",
+                "backends": {{"main": {{"type": "{MEMORY_BACKEND}"}}}},
+                "backend_routing": {{"{TOPIC_TYPE}": "main"}},
+                "process": {{"cluster": {{{fields}}}}}
+            }}"#
+        )
+    })
+}
+
+fn cluster_field_errors(mode: &str, payload: &str) -> ([serde_json::Error; 2], String) {
+    use crate::test_support::module_boot::StaticConfigProvider;
+
+    let sources = cluster_field_sources(mode, payload);
+    let [effective, _] = &sources;
+    let config: serde_json::Value = serde_json::from_str(effective).expect("valid JSON fixture");
+    let provider = StaticConfigProvider {
+        root: json!({"event-broker": {"config": config}}),
+    };
+    let loaded =
+        toolkit::config::gear_config_required::<EventBrokerConfig>(&provider, "event-broker")
+            .expect_err("invalid effective cluster config");
+    let raw = sources.map(|source| {
+        serde_json::from_str::<EventBrokerConfig>(&source).expect_err("invalid cluster config")
+    });
+    (raw, loaded.to_string())
+}
+
+fn serde_location(error: &serde_json::Error) -> String {
+    if error.line() == 0 {
+        String::new()
+    } else {
+        format!(" at line {} column {}", error.line(), error.column())
+    }
+}
+
+#[test]
+fn remote_cluster_keys_are_rejected_before_their_values_are_decoded() {
+    let outcomes = [
+        (
+            r#""profiles":"qa-remote-profiles-marker""#,
+            "process.cluster.profiles is only supported in memory mode",
+        ),
+        (
+            r#""profiles":[31]"#,
+            "process.cluster.profiles is only supported in memory mode",
+        ),
+        (
+            r#""sweep_interval":"qa-remote-interval-marker""#,
+            "process.cluster.sweep_interval is only supported in memory mode",
+        ),
+    ]
+    .map(|(payload, reason)| {
+        let (raw, loaded) = cluster_field_errors("remote", payload);
+        let expected = raw
+            .each_ref()
+            .map(|error| format!("{reason}{}", serde_location(error)));
+        (
+            (raw.map(|error| error.to_string()), loaded),
+            (
+                expected,
+                format!("invalid config for gear 'event-broker': {reason}"),
+            ),
+        )
+    });
+    assert_eq!(
+        outcomes.each_ref().map(|(actual, _)| actual),
+        outcomes.each_ref().map(|(_, expected)| expected)
+    );
+}
+
+#[test]
+fn invalid_cluster_mode_takes_precedence_over_malformed_memory_fields() {
+    let (raw, loaded) =
+        cluster_field_errors("qa-mode-marker", r#""profiles":"qa-mixed-profiles-marker""#);
+    let reason = "process.cluster.mode must be memory or remote";
+    let expected = raw
+        .each_ref()
+        .map(|error| format!("{reason}{}", serde_location(error)));
+    assert_eq!(
+        (raw.map(|error| error.to_string()), loaded),
+        (
+            expected,
+            format!("invalid config for gear 'event-broker': {reason}")
+        )
+    );
+}
+
+fn cluster_field_outcomes(
+    mode: &str,
+    field: &str,
+    value: &serde_json::Value,
+) -> ([String; 3], [String; 2]) {
+    use crate::test_support::module_boot::StaticConfigProvider;
+
+    let sources = cluster_field_sources(mode, &format!(r#""{field}":{value}"#));
+    let raw = sources.map(|source| {
+        serde_json::from_str::<EventBrokerConfig>(&source).map_or_else(
+            |error| (error.to_string(), serde_location(&error)),
+            |cfg| (format!("{:?}", cfg.process), String::new()),
+        )
+    });
+    let [(first, first_location), (last, last_location)] = raw;
+    let mut provider = StaticConfigProvider {
+        root: json!({"event-broker": {"config": {
+            "mode": "standalone",
+            "backends": {"main": {"type": MEMORY_BACKEND}},
+            "backend_routing": {TOPIC_TYPE: "main"},
+            "process": {"cluster": {"mode": mode}},
+        }}}),
+    };
+    let cluster = &mut provider.root["event-broker"]["config"]["process"]["cluster"];
+    cluster[field] = value.clone();
+    assert_eq!(cluster.get(field), Some(value));
+    let loaded =
+        toolkit::config::gear_config_required::<EventBrokerConfig>(&provider, "event-broker")
+            .map_or_else(
+                |error| error.to_string(),
+                |cfg| format!("{:?}", cfg.process),
+            );
+    ([first, last, loaded], [first_location, last_location])
+}
+
+#[test]
+fn object_payloads_are_rejected_by_the_selected_cluster_mode() {
+    let key = "$serde_json::private::RawValue";
+    let outcomes = [
+        (
+            "memory",
+            "profiles",
+            json!({key: r#"["example"]"#}),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "sweep_interval",
+            json!({key: r#""2s""#}),
+            "process.cluster.sweep_interval must be a duration",
+        ),
+        (
+            "remote",
+            "profiles",
+            json!({key: 31}),
+            "process.cluster.profiles is only supported in memory mode",
+        ),
+        (
+            "remote",
+            "sweep_interval",
+            json!({key: 31}),
+            "process.cluster.sweep_interval is only supported in memory mode",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!([{key: r#""example""#}]),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!(true),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!(-3),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!(31),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!(0.5),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!(null),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!("qa-memory-profiles-marker"),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!([["example"]]),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!([31]),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!([true]),
+            "process.cluster.profiles must be a list of strings",
+        ),
+        (
+            "memory",
+            "profiles",
+            json!({"qa-secret-property": "qa-secret-profile"}),
+            "process.cluster.profiles must be a list of strings",
+        ),
+    ]
+    .map(|(mode, field, value, reason)| {
+        let (actual, [first, last]) = cluster_field_outcomes(mode, field, &value);
+        (
+            actual,
+            [
+                format!("{reason}{first}"),
+                format!("{reason}{last}"),
+                format!("invalid config for gear 'event-broker': {reason}"),
+            ],
+        )
+    });
+    assert_eq!(
+        outcomes.each_ref().map(|row| &row.0),
+        outcomes.each_ref().map(|row| &row.1)
+    );
+}
+
+#[test]
+fn an_invalid_cluster_mode_precedes_object_payload_errors() {
+    let value = json!({"$serde_json::private::RawValue": 31});
+    let outcomes = ["profiles", "sweep_interval"]
+        .map(|field| cluster_field_outcomes("qa-mode-marker", field, &value));
+    let reason = "process.cluster.mode must be memory or remote";
+    assert_eq!(
+        outcomes.each_ref().map(|(actual, _)| actual.clone()),
+        outcomes.each_ref().map(|(_, [first, last])| [
+            format!("{reason}{first}"),
+            format!("{reason}{last}"),
+            format!("invalid config for gear 'event-broker': {reason}"),
+        ])
+    );
 }
 
 #[test]
@@ -241,7 +795,7 @@ fn the_removed_default_storage_backend_key_is_refused() {
     .expect_err("the key no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `default_storage_backend`, expected one of `mode`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `default_storage_backend`, expected one of `mode`, `process`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
     );
 }
 
@@ -257,7 +811,7 @@ fn the_removed_producer_key_is_refused() {
     .expect_err("the key no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `producer`, expected one of `mode`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `producer`, expected one of `mode`, `process`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
     );
 }
 
@@ -273,7 +827,7 @@ fn the_removed_polling_section_is_refused() {
     .expect_err("the section no longer exists");
     assert_eq!(
         err.to_string(),
-        "unknown field `polling`, expected one of `mode`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
+        "unknown field `polling`, expected one of `mode`, `process`, `batch`, `publish`, `subscription`, `streaming`, `loader`, `workers`, `registration`, `provisioning`, `topics`, `backends`, `backend_routing`, `outbox_groups`"
     );
 }
 

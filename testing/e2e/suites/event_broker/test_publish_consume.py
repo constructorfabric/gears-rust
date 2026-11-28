@@ -7,224 +7,457 @@ no shared helper hides a request shape (unlike `gears/oagw/helpers.py`'s
 
 from __future__ import annotations
 
+import asyncio
+import re
 import uuid
-from datetime import datetime, timezone
+from contextlib import AsyncExitStack
+from datetime import datetime
 
-import httpx
 import pytest
 
 from .conftest import (
     ALL_EVENT_TYPES_PATTERN,
+    API_BASE,
+    DEFAULT_SUBJECT_ID,
+    DEFAULT_TENANT_ID,
     EVENT_TYPE_STREAM,
     SUBJECT_TYPE,
     TOPIC_STREAM,
     SseFrameReader,
 )
+from .test_consumer_subscriptions import _created_subscription_id
+
+
+def _stream_instant(value: str) -> tuple[datetime, int]:
+    assert isinstance(value, str), value
+    assert re.fullmatch(
+        r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",
+        value,
+    ), value
+    clock = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(microsecond=0)
+    return clock, int(value[:-1].partition(".")[2].ljust(9, "0"))
+
+
+async def _read_sse_event(reader: SseFrameReader, deadline: float) -> dict:
+    clock = asyncio.get_running_loop().time
+    while True:
+        remaining = deadline - clock()
+        assert remaining > 0, "no SSE event before the deadline"
+        name, frame = await reader.next_frame(timeout=remaining)
+        assert name == frame["kind"], (name, frame)
+        if name == "event":
+            return frame
+        assert name == "heartbeat", frame
+
+
+async def _read_case_window(
+    reader: SseFrameReader, high_water: int, sentinel: str, deadline: float,
+) -> tuple[list[dict], list[dict]]:
+    history: list[dict] = []
+    delivered: list[dict] = []
+    while True:
+        frame = await _read_sse_event(reader, deadline)
+        assert set(frame) == {"kind", "payload"}, frame
+        match frame:
+            case {"kind": "event", "payload": {"sequence": int(sequence), "id": str(event_id)}}:
+                assert type(sequence) is int and sequence > 0
+            case unexpected:
+                pytest.fail(f"unexpected event frame: {unexpected}")
+        if sequence <= high_water:
+            assert not delivered, frame
+            history.append(frame)
+            continue
+        delivered.append(frame)
+        if event_id == sentinel:
+            return history, delivered
 
 
 @pytest.mark.backend_sensitive
 async def test_publish_then_consume_happy_path(api, test_env):
     """scenario: consumer/stream/1.09-positive-sse-event-stream.md"""
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
+    topic = TOPIC_STREAM
+    target_interests = [
+        {
+            "topic": topic,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "ownership_filter": "entire_tenant",
+            "types": [EVENT_TYPE_STREAM],
+        },
+    ]
+    broad_interests = [
+        {
+            "topic": topic,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "ownership_filter": "entire_tenant",
+            "types": [ALL_EVENT_TYPES_PATTERN],
+        },
+    ]
+    event = {
+        "id": "16e20000-0000-4000-8000-000001640001",
+        "type": EVENT_TYPE_STREAM,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "e2e-test",
+        "subject": "s1",
+        "subject_type": SUBJECT_TYPE,
+        "occurred_at": "2026-01-19T10:20:30Z",
+    }
+    events = [event]
 
-        tenant_id = str(uuid.uuid4())
-        sub_resp = await client.post(
-            "/subscriptions",
+    async with api() as client, api() as stream_client, AsyncExitStack() as stack:
+        # Earlier STREAM cases can leave async writes pending in the full suite.
+        # The durable marker uses the same tenant key as the stream events.
+        fence = await client.post(
+            "/events",
             json={
+                **event,
+                "id": "16e20000-0000-4000-8000-000001640000",
+                "subject": "stream-head-fence",
+            },
+            headers={"Prefer": "wait=10"},
+            timeout=12,
+        )
+        assert (fence.status_code, fence.content, fence.headers.get("preference-applied")) == (
+            201, b"", "wait=10",
+        )
+        groups = []
+        cursors = []
+        readers = []
+        for position, interests, unmatched_types in (
+            ("earliest", target_interests, [[]]),
+            ("latest", broad_interests, [[]]),
+        ):
+            group = await client.post("/consumer-groups")
+            assert (group.status_code, group.headers.get("content-type")) == (
+                201, "application/json",
+            )
+            group_prefix = f"{API_BASE}/consumer-groups/"
+            group_id = group.headers["location"].removeprefix(group_prefix)
+            assert group.headers["location"] == f"{group_prefix}{group_id}"
+            gts_prefix = "gts.cf.core.events.consumer_group.v1~"
+            assert group_id.startswith(gts_prefix)
+            group_uuid = group_id.removeprefix(gts_prefix)
+            assert str(uuid.UUID(group_uuid)) == group_uuid
+            group_read = await client.get(f"/consumer-groups/{group_id}")
+            assert (group_read.status_code, group_read.headers.get("content-type")) == (
+                200, "application/json",
+            )
+            group_body = group_read.json()
+            _stream_instant(group_body["created_at"])
+            expected_group = {
+                "id": group_id,
+                "kind": "anonymous",
+                "tenant": DEFAULT_TENANT_ID,
+                "owner_principal": DEFAULT_SUBJECT_ID,
+                "description": None,
+                "created_at": group_body["created_at"],
+            }
+            assert group_body == group.json() == expected_group
+            join = await client.post(
+                "/subscriptions",
+                json={
+                    "consumer_group": group_id,
+                    "client_agent": "e2e-test",
+                    "interests": interests,
+                },
+            )
+            assert (join.status_code, join.headers.get("content-type")) == (201, "application/json")
+            sub_id = _created_subscription_id(join)
+            sub_read = await client.get(f"/subscriptions/{sub_id}")
+            assert (sub_read.status_code, sub_read.headers.get("content-type")) == (
+                200, "application/json",
+            )
+            sub_body = sub_read.json()
+            _stream_instant(sub_body["created_at"])
+            expected_interests = [
+                {**interest, "barrier_mode": "respect", "filter": None} for interest in interests
+            ]
+            expected_sub = {
+                "id": sub_id,
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
-                "interests": [
-                    {
-                        "topic": TOPIC_STREAM,
-                        "subject_tenant": tenant_id,
-                        "ownership_filter": "entire_tenant",
-                        "types": [EVENT_TYPE_STREAM],
-                    }
-                ],
-            },
-        )
-        assert sub_resp.status_code == 201
-        sub_id = sub_resp.json()["id"]
-
-        seek_resp = await client.post(
-            f"/subscriptions/{sub_id}:seek",
-            json={
-                "topology_version": 1, "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]}
-            },
-        )
-        assert seek_resp.status_code == 200
-
-    async with httpx.AsyncClient(
-        base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
-    ) as stream_client:
-        async with stream_client.stream(
-            "GET", f"/events:sse?subscription={sub_id}"
-        ) as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            topology_kind, topology_data = await reader.next_frame(timeout=5)
-            assert topology_kind == "topology"
-            assert topology_data == {
-                "kind": "topology",
-                # One join has happened, so the group is at version 1, not 0:
-                # the version increments on every membership change, and
-                # `scenarios/consumer/stream/1.03` has a second joiner take it
-                # from 1 to 2.
+                "interests": expected_interests,
+                "assigned": [{"topic": topic, "partition": 0}],
                 "topology_version": 1,
-                "assigned": [
-                    {"topic": TOPIC_STREAM, "partition": 0, "offset": 0, "last_examined": 0}
+                "created_at": sub_body["created_at"],
+            }
+            assert sub_body == expected_sub
+            assert join.json() == {
+                **expected_sub,
+                "interests": [
+                    {**interest, "unmatched_types": unmatched}
+                    for interest, unmatched in zip(expected_interests, unmatched_types, strict=True)
                 ],
             }
-
-            event_id = str(uuid.uuid4())
-            occurred_at = datetime.now(timezone.utc).isoformat()
-            async with api() as publish_client:
-                publish_resp = await publish_client.post(
-                    "/events",
-                    json={
-                        "id": event_id,
-                        "type": EVENT_TYPE_STREAM,
-                        "subject_tenant": tenant_id,
-                        "source": "e2e-test",
-                        "subject": "s1",
-                        "subject_type": SUBJECT_TYPE,
-                        "occurred_at": occurred_at,
-                    },
+            seek = await client.post(
+                f"/subscriptions/{sub_id}:seek",
+                json={
+                    "topology_version": 1,
+                    "positions": {topic: [{"partition": 0, "value": position}]},
+                },
+            )
+            assert (seek.status_code, seek.headers.get("content-type")) == (200, "application/json")
+            seek_body = seek.json()
+            positions = seek_body["positions"]
+            assert set(positions) == {topic}
+            match positions[topic]:
+                case [{"partition": 0, "value": int(start)}]:
+                    assert type(start) is int
+                    assert start >= 0
+                case unexpected:
+                    pytest.fail(f"unexpected seek positions: {unexpected}")
+            if position == "earliest":
+                assert start == 0
+            assert seek_body == {"positions": {topic: [{"partition": 0, "value": start}]}}
+            response = await stack.enter_async_context(
+                stream_client.stream(
+                    "GET", "/events:sse", params={"subscription": sub_id},
+                    headers={"Accept": "text/event-stream"},
                 )
-            assert publish_resp.status_code == 202
-            assert publish_resp.text == "", "202 Accepted must carry no body"
+            )
+            assert (response.status_code, response.headers.get("content-type")) == (
+                200, "text/event-stream",
+            )
+            reader = SseFrameReader(response)
+            name, topology = await reader.next_frame(timeout=5)
+            assert name == "topology"
+            assert topology == {
+                "kind": "topology",
+                "topology_version": 1,
+                "assigned": [
+                    {"topic": topic, "partition": 0, "offset": start, "last_examined": start}
+                ],
+            }
+            groups.append(group_id)
+            cursors.append((sub_id, start))
+            readers.append(reader)
 
-            event_kind, event_data = await reader.next_frame(timeout=5)
-            assert event_kind == "event"
-            # `occurred_at`/`sequence_time` are round-tripped through the
-            # server rather than assumed byte-identical to what was sent -
-            # `occurred_at` normalizes to a different (but equivalent)
-            # RFC 3339 rendering, and `sequence_time` is server-generated
-            # with no caller-supplied value to compare against at all.
-            #
-            # `sequence` is server-assigned per `(topic, partition)`, and the
-            # partition is derived by hashing `subject_tenant`. TOPIC_STREAM has one
-            # partition, so every test publishing here shares a single counter
-            # and no test can predict its own absolute value - a unique
-            # `subject_tenant` isolates which events are delivered, not how they are
-            # numbered.
-            payload = event_data["payload"]
-            assert payload == {
-                "id": event_id,
-                "type": EVENT_TYPE_STREAM,
-                "subject_tenant": tenant_id,
-                "source": "e2e-test",
-                "subject": "s1",
-                "subject_type": SUBJECT_TYPE,
+        assert groups[0] != groups[1]
+        (target_id, target_start), (broad_id, high_water) = cursors
+        assert target_id != broad_id
+        target, broad = readers
+        for event in events:
+            publish = await client.post("/events", json=event)
+            assert (publish.status_code, publish.content) == (202, b"")
+
+        deadline = asyncio.get_running_loop().time() + 5
+        sentinel = events[-1]["id"]
+        history, delivered = await _read_case_window(target, high_water, sentinel, deadline)
+        broad_history, stored = await _read_case_window(broad, high_water, sentinel, deadline)
+
+    assert broad_history == []
+    case_ids = {event["id"] for event in events}
+    assert all(frame["payload"]["id"] not in case_ids for frame in history)
+    for start, frames in ((target_start, history + delivered), (high_water, stored)):
+        sequences = [frame["payload"]["sequence"] for frame in frames]
+        assert all(type(sequence) is int for sequence in sequences), sequences
+        assert sequences == sorted(set(sequences)), sequences
+        assert all(sequence > start for sequence in sequences), sequences
+
+    assert [frame["payload"]["id"] for frame in stored] == [event["id"] for event in events]
+    for frame, event in zip(stored, events, strict=True):
+        payload = frame["payload"]
+        assert type(payload["sequence"]) is int
+        assert payload["sequence"] > 0
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert frame == {
+            "kind": "event",
+            "payload": {
+                **event,
                 "occurred_at": payload["occurred_at"],
                 "trace_parent": None,
-                "data": None,
+                "data": event.get("data"),
                 "partition": 0,
                 "sequence": payload["sequence"],
                 "sequence_time": payload["sequence_time"],
-            }
+            },
+        }
+    assert delivered == [stored[0]]
 
 
 @pytest.mark.backend_sensitive
 async def test_wildcard_interest_delivers_every_event_type(api, test_env):
-    """scenario: consumer/stream/1.15-positive-wildcard-event-type-stream.md
+    """scenario: consumer/stream/1.15-positive-wildcard-event-type-stream.md"""
+    topic = TOPIC_STREAM
+    target_interests = [
+        {
+            "topic": topic,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "ownership_filter": "entire_tenant",
+            "types": [ALL_EVENT_TYPES_PATTERN],
+        },
+    ]
+    broad_interests = [
+        {
+            "topic": topic,
+            "subject_tenant": DEFAULT_TENANT_ID,
+            "ownership_filter": "entire_tenant",
+            "types": [ALL_EVENT_TYPES_PATTERN],
+        },
+    ]
+    event = {
+        "id": "16e20000-0000-4000-8000-000001650001",
+        "type": EVENT_TYPE_STREAM,
+        "subject_tenant": DEFAULT_TENANT_ID,
+        "source": "e2e-test",
+        "subject": "s1",
+        "subject_type": SUBJECT_TYPE,
+        "occurred_at": "2026-01-19T10:20:30Z",
+    }
+    events = [event]
 
-    A subscription whose interest names the all-event-types wildcard - the shape
-    the SDK emits for a topic-only subscription - must still receive an event of
-    a concrete type published on that topic. This is the exact interest whose
-    delivery was silently dropped before the gear matched with GTS pattern
-    semantics; explicit-type interests (every other stream test) never exercised
-    it, so it gets its own black-box scenario.
-    """
-    async with api() as client:
-        group_resp = await client.post("/consumer-groups")
-        assert group_resp.status_code == 201
-        group_id = group_resp.json()["id"]
-
-        tenant_id = str(uuid.uuid4())
-        sub_resp = await client.post(
-            "/subscriptions",
-            json={
+    async with api() as client, api() as stream_client, AsyncExitStack() as stack:
+        groups = []
+        cursors = []
+        readers = []
+        for position, interests, unmatched_types in (
+            ("earliest", target_interests, [[]]),
+            ("latest", broad_interests, [[]]),
+        ):
+            group = await client.post("/consumer-groups")
+            assert (group.status_code, group.headers.get("content-type")) == (
+                201, "application/json",
+            )
+            group_prefix = f"{API_BASE}/consumer-groups/"
+            group_id = group.headers["location"].removeprefix(group_prefix)
+            assert group.headers["location"] == f"{group_prefix}{group_id}"
+            gts_prefix = "gts.cf.core.events.consumer_group.v1~"
+            assert group_id.startswith(gts_prefix)
+            group_uuid = group_id.removeprefix(gts_prefix)
+            assert str(uuid.UUID(group_uuid)) == group_uuid
+            group_read = await client.get(f"/consumer-groups/{group_id}")
+            assert (group_read.status_code, group_read.headers.get("content-type")) == (
+                200, "application/json",
+            )
+            group_body = group_read.json()
+            _stream_instant(group_body["created_at"])
+            expected_group = {
+                "id": group_id,
+                "kind": "anonymous",
+                "tenant": DEFAULT_TENANT_ID,
+                "owner_principal": DEFAULT_SUBJECT_ID,
+                "description": None,
+                "created_at": group_body["created_at"],
+            }
+            assert group_body == group.json() == expected_group
+            join = await client.post(
+                "/subscriptions",
+                json={
+                    "consumer_group": group_id,
+                    "client_agent": "e2e-test",
+                    "interests": interests,
+                },
+            )
+            assert (join.status_code, join.headers.get("content-type")) == (201, "application/json")
+            sub_id = _created_subscription_id(join)
+            sub_read = await client.get(f"/subscriptions/{sub_id}")
+            assert (sub_read.status_code, sub_read.headers.get("content-type")) == (
+                200, "application/json",
+            )
+            sub_body = sub_read.json()
+            _stream_instant(sub_body["created_at"])
+            expected_interests = [
+                {**interest, "barrier_mode": "respect", "filter": None} for interest in interests
+            ]
+            expected_sub = {
+                "id": sub_id,
                 "consumer_group": group_id,
                 "client_agent": "e2e-test",
-                "interests": [
-                    {
-                        "topic": TOPIC_STREAM,
-                        "subject_tenant": tenant_id,
-                        "ownership_filter": "entire_tenant",
-                        "types": [ALL_EVENT_TYPES_PATTERN],
-                    }
-                ],
-            },
-        )
-        assert sub_resp.status_code == 201
-        sub_id = sub_resp.json()["id"]
-
-        seek_resp = await client.post(
-            f"/subscriptions/{sub_id}:seek",
-            json={
+                "interests": expected_interests,
+                "assigned": [{"topic": topic, "partition": 0}],
                 "topology_version": 1,
-                "positions": {TOPIC_STREAM: [{"partition": 0, "value": "earliest"}]},
-            },
-        )
-        assert seek_resp.status_code == 200
-
-    async with httpx.AsyncClient(
-        base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
-    ) as stream_client:
-        async with stream_client.stream(
-            "GET", f"/events:sse?subscription={sub_id}"
-        ) as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            topology_kind, topology_data = await reader.next_frame(timeout=5)
-            assert topology_kind == "topology"
-            assert topology_data == {
+                "created_at": sub_body["created_at"],
+            }
+            assert sub_body == expected_sub
+            assert join.json() == {
+                **expected_sub,
+                "interests": [
+                    {**interest, "unmatched_types": unmatched}
+                    for interest, unmatched in zip(expected_interests, unmatched_types, strict=True)
+                ],
+            }
+            seek = await client.post(
+                f"/subscriptions/{sub_id}:seek",
+                json={
+                    "topology_version": 1,
+                    "positions": {topic: [{"partition": 0, "value": position}]},
+                },
+            )
+            assert (seek.status_code, seek.headers.get("content-type")) == (200, "application/json")
+            seek_body = seek.json()
+            positions = seek_body["positions"]
+            assert set(positions) == {topic}
+            match positions[topic]:
+                case [{"partition": 0, "value": int(start)}]:
+                    assert type(start) is int
+                    assert start >= 0
+                case unexpected:
+                    pytest.fail(f"unexpected seek positions: {unexpected}")
+            if position == "earliest":
+                assert start == 0
+            assert seek_body == {"positions": {topic: [{"partition": 0, "value": start}]}}
+            response = await stack.enter_async_context(
+                stream_client.stream(
+                    "GET", "/events:sse", params={"subscription": sub_id},
+                    headers={"Accept": "text/event-stream"},
+                )
+            )
+            assert (response.status_code, response.headers.get("content-type")) == (
+                200, "text/event-stream",
+            )
+            reader = SseFrameReader(response)
+            name, topology = await reader.next_frame(timeout=5)
+            assert name == "topology"
+            assert topology == {
                 "kind": "topology",
                 "topology_version": 1,
                 "assigned": [
-                    {"topic": TOPIC_STREAM, "partition": 0, "offset": 0, "last_examined": 0}
+                    {"topic": topic, "partition": 0, "offset": start, "last_examined": start}
                 ],
             }
+            groups.append(group_id)
+            cursors.append((sub_id, start))
+            readers.append(reader)
 
-            event_id = str(uuid.uuid4())
-            occurred_at = datetime.now(timezone.utc).isoformat()
-            async with api() as publish_client:
-                publish_resp = await publish_client.post(
-                    "/events",
-                    json={
-                        "id": event_id,
-                        "type": EVENT_TYPE_STREAM,
-                        "subject_tenant": tenant_id,
-                        "source": "e2e-test",
-                        "subject": "s1",
-                        "subject_type": SUBJECT_TYPE,
-                        "occurred_at": occurred_at,
-                    },
-                )
-            assert publish_resp.status_code == 202
-            assert publish_resp.text == "", "202 Accepted must carry no body"
+        assert groups[0] != groups[1]
+        (target_id, target_start), (broad_id, high_water) = cursors
+        assert target_id != broad_id
+        target, broad = readers
+        for event in events:
+            publish = await client.post("/events", json=event)
+            assert (publish.status_code, publish.content) == (202, b"")
 
-            # The event was published as a concrete type; the wildcard interest
-            # must match it and deliver it in full - proving the topic-only /
-            # all-types path reaches the consumer, not just explicit-type ones.
-            event_kind, event_data = await reader.next_frame(timeout=5)
-            assert event_kind == "event"
-            payload = event_data["payload"]
-            assert payload == {
-                "id": event_id,
-                "type": EVENT_TYPE_STREAM,
-                "subject_tenant": tenant_id,
-                "source": "e2e-test",
-                "subject": "s1",
-                "subject_type": SUBJECT_TYPE,
+        deadline = asyncio.get_running_loop().time() + 5
+        sentinel = events[-1]["id"]
+        history, delivered = await _read_case_window(target, high_water, sentinel, deadline)
+        broad_history, stored = await _read_case_window(broad, high_water, sentinel, deadline)
+
+    assert broad_history == []
+    case_ids = {event["id"] for event in events}
+    assert all(frame["payload"]["id"] not in case_ids for frame in history)
+    for start, frames in ((target_start, history + delivered), (high_water, stored)):
+        sequences = [frame["payload"]["sequence"] for frame in frames]
+        assert all(type(sequence) is int for sequence in sequences), sequences
+        assert sequences == sorted(set(sequences)), sequences
+        assert all(sequence > start for sequence in sequences), sequences
+
+    assert [frame["payload"]["id"] for frame in stored] == [event["id"] for event in events]
+    for frame, event in zip(stored, events, strict=True):
+        payload = frame["payload"]
+        assert type(payload["sequence"]) is int
+        assert payload["sequence"] > 0
+        assert _stream_instant(payload["occurred_at"]) == _stream_instant(event["occurred_at"])
+        _stream_instant(payload["sequence_time"])
+        assert frame == {
+            "kind": "event",
+            "payload": {
+                **event,
                 "occurred_at": payload["occurred_at"],
                 "trace_parent": None,
-                "data": None,
+                "data": event.get("data"),
                 "partition": 0,
                 "sequence": payload["sequence"],
                 "sequence_time": payload["sequence_time"],
-            }
+            },
+        }
+    assert delivered == [stored[0]]

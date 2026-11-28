@@ -1,23 +1,8 @@
-"""Restart/durability e2e test at the process level (design.md D8, task 11.4).
-
-Boots its OWN private server on a dedicated port, bypassing the shared
-`test_env` session fixture entirely, so it can stop and restart the binary
-mid-test without disrupting the other tests in this suite that depend on
-the shared server for the rest of their run - matches
-`gears/file_storage/lifecycle/conftest.py`'s established precedent for
-bespoke process control, reusing `lib.orchestrator`'s private
-`_prepare_config`/`_wait_healthy`/`_log_path` helpers directly rather than
-duplicating their logic, and never touching the orchestrator's own
-module-global `_server_proc`.
-"""
+"""Restart the worker against its original stores and the same Flight Control host."""
 
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import subprocess
-import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,97 +10,39 @@ from pathlib import Path
 import httpx
 import pytest
 
-from lib.orchestrator import GearTestEnv, _log_path, _prepare_config, _wait_healthy
-
 from .conftest import (
-    CONFIG,
+    API_BASE,
     DURABLE,
-    PROJECT_ROOT,
     SUBJECT_TYPE,
     SseFrameReader,
     patch_backend,
+    public_headers,
     wait_provisioned,
     _derived_event_type,
     _topic_instance,
 )
-
-RESTART_PORT = 8090
+from .topology import OWNER_TENANT, FlightControlBrokerEnv, replace_once
 TOPIC = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.restart.v1"
 EVENT_TYPE = "gts.cf.core.events.event.v1~cf.e2e.event_broker.restart.v1~"
 
 
-def _patch_restart_config(config_text: str, home_dir: str, sidecars, namespace: str) -> str:
-    config_text = config_text.replace(
-        'home_dir: "~/.cf-gears-event-broker"', f'home_dir: "{Path(home_dir).as_posix()}"'
+def _restart_env(root: Path, sidecars: dict) -> FlightControlBrokerEnv:
+    namespace = f"evbk_e2e_restart_{uuid.uuid4().hex[:8]}"
+
+    def config(text, home, handles):
+        text = patch_backend(text, handles, namespace, home)
+        return replace_once(
+            text,
+            "      topics:\n",
+            f'      topics:\n        "{TOPIC}":\n          partitions: 1\n',
+        )
+
+    return FlightControlBrokerEnv(
+        root,
+        broker_config=config,
+        documents=[_topic_instance(TOPIC), _derived_event_type(EVENT_TYPE, TOPIC)],
+        sidecars=sidecars,
     )
-    # Two stores, and the premise of this test is that they behave differently
-    # across a restart. Consumer groups and cursors survive because they live in
-    # the gear database the platform provisions under `home_dir`; the events
-    # survive because the storage backend is durable - a medium of this test's
-    # own (a database schema, a file under `home_dir`, a topic prefix), which
-    # the restarted server re-opens.
-    config_text = patch_backend(config_text, sidecars, namespace, home_dir)
-    config_text = config_text.replace(
-        'bind_addr: "127.0.0.1:8080"', f'bind_addr: "127.0.0.1:{RESTART_PORT}"'
-    )
-    entities = [
-        _topic_instance(TOPIC),
-        _derived_event_type(EVENT_TYPE, TOPIC),
-    ]
-    # The partition count is configuration, not part of the topic entity.
-    config_text = config_text.replace(
-        "      topics:\n",
-        f'      topics:\n        "{TOPIC}":\n          partitions: 1\n',
-        1,
-    )
-    extra = "".join(f"        - {json.dumps(e)}\n" for e in entities)
-    return config_text.replace("entities:\n", "entities:\n" + extra)
-
-
-def _resolve_binary() -> Path:
-    binary_str = os.environ.get("E2E_BINARY")
-    if not binary_str:
-        pytest.fail("E2E_BINARY not set - run these tests via: make e2e-event-broker")
-    p = Path(binary_str)
-    if not p.exists():
-        pytest.fail(f"E2E_BINARY={binary_str!r} does not exist")
-    return p
-
-
-def _start(home_dir: str, sidecars, namespace: str) -> subprocess.Popen:
-    env = GearTestEnv(
-        config_path=CONFIG,
-        config_patch=lambda text, _env: _patch_restart_config(text, home_dir, sidecars, namespace),
-        port=RESTART_PORT,
-        health_path="/readyz",
-        log_suffix="event-broker-restart",
-    )
-    config_path = _prepare_config(env)
-    binary = _resolve_binary()
-    log_fh = open(_log_path(env), "a")
-    proc = subprocess.Popen(
-        [str(binary), "--config", str(config_path), "run"],
-        cwd=str(PROJECT_ROOT),
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        env={**os.environ},
-    )
-    try:
-        _wait_healthy(env)
-        wait_provisioned(f"http://localhost:{RESTART_PORT}/event-broker/v1", {TOPIC: EVENT_TYPE})
-    except BaseException:
-        _stop(proc)
-        raise
-    return proc
-
-
-def _stop(proc: subprocess.Popen) -> None:
-    proc.terminate()
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=3)
 
 
 @pytest.mark.skipif(
@@ -125,21 +52,21 @@ def _stop(proc: subprocess.Popen) -> None:
 )
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
-async def test_restart_preserves_events_and_consumer_groups_but_not_subscriptions(test_env):
-    # `_require_dedicated_binary` (conftest.py, autouse) already guarantees
-    # E2E_BINARY is set for every test in this directory.
-    home_dir = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-restart-")
-    base_url = f"http://localhost:{RESTART_PORT}/event-broker/v1"
-
-    proc = _start(home_dir, test_env.sidecars, "evbk_e2e_restart")
-    try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
+async def test_restart_preserves_events_and_consumer_groups_but_not_subscriptions(
+    test_env, tmp_path,
+):
+    with _restart_env(tmp_path, test_env.sidecars) as env:
+        base_url = f"{env.base_url}{API_BASE}"
+        wait_provisioned(base_url, {TOPIC: EVENT_TYPE})
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=5.0, headers=public_headers(),
+        ) as client:
             group_resp = await client.post("/consumer-groups")
             assert group_resp.status_code == 201
             group_body_before = group_resp.json()
             group_id = group_body_before["id"]
 
-            tenant_id = str(uuid.uuid4())
+            tenant_id = OWNER_TENANT
             sub1_resp = await client.post(
                 "/subscriptions",
                 json={
@@ -162,7 +89,9 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
             assert seek1.status_code == 200
 
         event_id = str(uuid.uuid4())
-        async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=None, headers=public_headers(),
+        ) as stream_client:
             async with stream_client.stream(
                 "GET", f"/events:sse?subscription={sub1_id}"
             ) as stream1_resp:
@@ -171,7 +100,9 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
                 kind, _ = await reader1.next_frame(timeout=5)
                 assert kind == "topology"
 
-                async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as pub_client:
+                async with httpx.AsyncClient(
+                    base_url=base_url, timeout=5.0, headers=public_headers(),
+                ) as pub_client:
                     publish_resp = await pub_client.post(
                         "/events",
                         json={
@@ -195,13 +126,13 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
                 before = data["payload"]
                 assert before["id"] == event_id
                 assert before["sequence"] == 1
-    finally:
-        _stop(proc)
 
-    # Restart against the SAME home_dir and PostgreSQL schema, on the same port.
-    proc = _start(home_dir, test_env.sidecars, "evbk_e2e_restart")
-    try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
+        env.restart_broker()
+        base_url = f"{env.base_url}{API_BASE}"
+        wait_provisioned(base_url, {TOPIC: EVENT_TYPE})
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=5.0, headers=public_headers(),
+        ) as client:
             # ConsumerGroupRepo is SQLite-backed - unchanged, must still exist.
             group_resp_after = await client.get(f"/consumer-groups/{group_id}")
             assert group_resp_after.status_code == 200
@@ -230,7 +161,9 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
             assert sub2_resp.status_code == 201
             sub2_id = sub2_resp.json()["id"]
 
-        async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=None, headers=public_headers(),
+        ) as stream_client:
             async with stream_client.stream(
                 "GET", f"/events:sse?subscription={sub2_id}"
             ) as stream2_resp:
@@ -247,8 +180,6 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
                 kind, data = await reader2.next_frame(timeout=5)
                 assert kind == "event"
                 assert data["payload"] == before
-    finally:
-        _stop(proc)
 
 
 @pytest.mark.skipif(
@@ -258,7 +189,7 @@ async def test_restart_preserves_events_and_consumer_groups_but_not_subscription
 )
 @pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
-async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
+async def test_a_publish_replayed_after_restart_is_stored_once(test_env, tmp_path):
     """feature 0007 AC-9 - a retry of an applied message stores nothing, after a
     restart too.
 
@@ -269,9 +200,7 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
     from the start gets each event once: the first exactly as it was stored
     before the restart, then the second above it.
     """
-    home_dir = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-restart-dedup-")
-    base_url = f"http://localhost:{RESTART_PORT}/event-broker/v1"
-    tenant_id = str(uuid.uuid4())
+    tenant_id = OWNER_TENANT
 
     def chained(event_id: str, producer_id: str, previous: int, sequence: int) -> dict:
         return {
@@ -303,7 +232,9 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
             json={"topology_version": 1, "positions": {TOPIC: [{"partition": 0, "value": "earliest"}]}},
         )
         assert seek.status_code == 200
-        async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=None, headers=public_headers(),
+        ) as stream_client:
             async with stream_client.stream("GET", f"/events:sse?subscription={sub_id}") as resp:
                 assert resp.status_code == 200
                 reader = SseFrameReader(resp)
@@ -317,9 +248,12 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
         return payloads
 
     first = str(uuid.uuid4())
-    proc = _start(home_dir, test_env.sidecars, "evbk_e2e_restart_dedup")
-    try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
+    with _restart_env(tmp_path, test_env.sidecars) as env:
+        base_url = f"{env.base_url}{API_BASE}"
+        wait_provisioned(base_url, {TOPIC: EVENT_TYPE})
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=5.0, headers=public_headers(),
+        ) as client:
             reg = await client.post("/producers", json={"mode": "chained", "client_agent": "e2e-test/1.0"})
             assert reg.status_code == 201
             producer_id = reg.json()["id"]
@@ -328,12 +262,13 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
             assert published.status_code == 202
             [stored] = await read_from_start(client, 1)
             assert stored["id"] == first
-    finally:
-        _stop(proc)
 
-    proc = _start(home_dir, test_env.sidecars, "evbk_e2e_restart_dedup")
-    try:
-        async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
+        env.restart_broker()
+        base_url = f"{env.base_url}{API_BASE}"
+        wait_provisioned(base_url, {TOPIC: EVENT_TYPE})
+        async with httpx.AsyncClient(
+            base_url=base_url, timeout=5.0, headers=public_headers(),
+        ) as client:
             replay = await client.post("/events", json=first_event)
             assert replay.status_code == 200
             assert replay.text == ""
@@ -346,5 +281,3 @@ async def test_a_publish_replayed_after_restart_is_stored_once(test_env):
             assert after[0] == stored
             assert after[1]["id"] == second
             assert after[1]["sequence"] > stored["sequence"]
-    finally:
-        _stop(proc)
