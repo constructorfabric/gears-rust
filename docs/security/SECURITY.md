@@ -624,7 +624,7 @@ Multiple automated scanners run on every pull request and/or on schedule:
 
 | Scanner | What It Checks | Trigger |
 |---|---|---|
-| **[CodeQL](https://codeql.github.com/)** | Static analysis for security vulnerabilities (Actions, Python, Rust) | PRs to `main` + weekly schedule |
+| **[CodeQL](https://codeql.github.com/)** | Static analysis for security vulnerabilities (Actions, Python, Rust) | Nightly schedule, manual dispatch, release-plz PRs; gates crate publishing |
 | **[OpenSSF Scorecard](https://scorecard.dev/)** | Supply-chain security posture (branch protection, dependency pinning, CI/CD hardness) | Weekly + branch protection changes |
 | **[cargo-deny](https://embarkstudios.github.io/cargo-deny/)** | RustSec advisories, license compliance, source restrictions | Every CI run |
 | **[ClusterFuzzLite](https://google.github.io/clusterfuzzlite/)** | Crash/panic/complexity bugs via fuzzing with address sanitizer | PRs to `main`/`develop` |

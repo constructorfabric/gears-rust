@@ -25,6 +25,82 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # Publishing waits for CodeQL, but only when there is something to publish: a workspace
+  # crate whose manifest version is not on crates.io yet. That covers a release PR merge, a
+  # manual dispatch, and an interrupted release finished by a later push alike. Every other
+  # push to main skips the ~1h scan and publishes nothing. The check also covers `git_only`
+  # packages (publish = false, git_only = true in release-plz.toml: Docker image + Helm chart
+  # artifacts), which count as pending until their `<name>-v<version>` tag exists on origin.
+  # The check is fail-closed (an unreadable index or tag list counts as pending), and a failed
+  # check blocks `release`. It needs no extra permissions: the repository is public, so
+  # `git ls-remote --tags origin` works with the plain checkout.
+  pending:
+    name: Release pending?
+    if: >-
+      ${{
+        github.repository == 'constructorfabric/gears-rust'
+        && (
+          github.event_name == 'push'
+          || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
+        )
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare manifest versions with crates.io
+        id: check
+        env:
+          # `cargo metadata --no-deps` needs no toolchain; keep rustup from installing the
+          # one pinned in rust-toolchain.toml.
+          RUSTUP_TOOLCHAIN: stable
+        run: python3 -I tools/scripts/release_pending.py
+
+  # CodeQL failing, or open unaccepted high/critical CodeQL alerts (job below), block
+  # `release`: no crate is published.
+  codeql:
+    name: CodeQL gate
+    needs: pending
+    if: needs.pending.outputs.release == 'true'
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+      packages: read
+    uses: ./.github/workflows/codeql.yml
+    with:
+      gate: true
+
+  # After a successful CodeQL run: block on open high/critical CodeQL alerts of this ref
+  # that are not accepted in .github/codeql-allowlist.toml (fix the code, dismiss the alert
+  # in the Security tab, or add an allowlist entry in a PR).
+  codeql-alerts:
+    name: CodeQL alerts gate
+    needs: codeql
+    if: needs.codeql.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check open CodeQL alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I tools/scripts/codeql_gate.py
+
   # `release-plz release` publishes only versions present in the manifests and absent
   # from crates.io, so running it on every push is safe and makes an interrupted release
   # self-healing: a retry within the job, or the next push to main, finishes it. That
@@ -33,9 +109,16 @@ jobs:
   release:
     name: Publish crates
     runs-on: ubuntu-latest
+    # `!cancelled()` plus an explicit result check: the gate is skipped on most pushes
+    # (then publishing proceeds as before), but a failed or cancelled gate blocks it.
+    needs: [pending, codeql, codeql-alerts]
     if: >-
       ${{
-        github.repository == 'constructorfabric/gears-rust'
+        !cancelled()
+        && (needs.pending.result == 'success' || needs.pending.result == 'skipped')
+        && (needs.codeql.result == 'success' || needs.codeql.result == 'skipped')
+        && (needs.codeql-alerts.result == 'success' || needs.codeql-alerts.result == 'skipped')
+        && github.repository == 'constructorfabric/gears-rust'
         && (
           github.event_name == 'push'
           || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'release')
