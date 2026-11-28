@@ -3,9 +3,11 @@
 Converts various document formats into a unified structured representation. Extracts text, formatting, and metadata from files and returns them as document blocks with inline elements.
 
 **Supported formats:**
-- Documents: PDF, DOCX, plain text, Markdown, HTML
-- Images: PNG, JPG, JPEG, WebP, GIF (OCR-capable)
-- Legacy formats: DOC, RTF, ODT, XLS, XLSX, PPT, PPTX (basic support)
+- Documents: PDF, DOCX, HTML, plain text, Markdown, log files
+- Spreadsheets: XLSX, XLSM, XLSB, XLS
+- Presentations: PPTX
+- Images: PNG, JPG, JPEG, WebP, GIF (returned as a base64 data URI; no OCR)
+- DOC, RTF, ODT, PPT: stub only; the result is a placeholder with a short text or base64 preview
 
 **Input methods:**
 - Upload files directly
@@ -25,7 +27,13 @@ gears:
     config:
       max_file_size_mb: 100
       allowed_local_base_dir: /data/documents
+      # Optional: tighter limits for untrusted uploads.
+      limits:
+        max_pdf_pages: 500
+        pdf_timeout: 30s
 ```
+
+Every key under `limits` is optional; the defaults and the full list are in the crate README.
 
 Only files under this directory (after symlink resolution) are accessible via the `parse-local` endpoints. Paths containing `..` are always rejected regardless of where they point.
 
@@ -42,13 +50,18 @@ curl -s http://127.0.0.1:8087/cf/file-parser/v1/info | python3 -m json.tool
 {
     "supported_extensions": {
         "plain_text": ["txt", "log", "md"],
-        "kreuzberg": ["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"],
+        "spreadsheet": ["xlsx", "xls", "xlsm", "xlsb"],
+        "html": ["html", "htm"],
+        "pptx": ["pptx"],
+        "pdf": ["pdf"],
         "docx": ["docx"],
         "image": ["png", "jpg", "jpeg", "webp", "gif"],
         "generic_stub": ["doc", "rtf", "odt", "xls", "xlsx", "ppt", "pptx"]
     }
 }
 ```
+
+The keys are parser ids; their order in the response is not fixed. When two parsers list the same extension, the one registered first handles it, so `xls`, `xlsx` and `pptx` go to `spreadsheet` and `pptx`, not to `generic_stub`.
 
 ### Upload and Parse a File
 
@@ -71,8 +84,9 @@ curl -s -X POST "http://127.0.0.1:8087/cf/file-parser/v1/upload?filename=test.tx
         },
         "blocks": [
             {
-                "type": "paragraph",
-                "inlines": [{"type": "text", "text": "Hello, Gears!", "style": {}}]
+                "type": "code_block",
+                "language": null,
+                "code": "Hello, Gears!\n"
             }
         ]
     }
@@ -101,12 +115,13 @@ curl -s -X POST "http://127.0.0.1:8087/cf/file-parser/v1/parse-local?render_mark
         },
         "blocks": [
             {
-                "type": "paragraph",
-                "inlines": [{"type": "text", "text": "Report content here.", "style": {}}]
+                "type": "code_block",
+                "language": null,
+                "code": "Report content here.\n"
             }
         ]
     },
-    "markdown": "Report content here.\n"
+    "markdown": "# report.txt\n\n---\nfilename: report.txt\ncontent-type: text/plain\n---\n\n```\nReport content here.\n```\n\n"
 }
 ```
 

@@ -5,11 +5,10 @@ filename: test_file_1table_multilingual.docx
 content-type: application/vnd.openxmlformats-officedocument.wordprocessingml.document
 ---
 
-Multilingual Table Example
+# Multilingual Table Example
 
 | Language | Text | Direction |
 | --- | --- | --- |
-| Language | Text | Direction |
 | English | The quick brown fox jumps over the lazy dog. | LTR |
 | Français | Le renard brun rapide saute par-dessus le chien paresseux. | LTR |
 | Deutsch | Der schnelle braune Fuchs springt über den faulen Hund. | LTR |

@@ -24,9 +24,8 @@ WORKDIR /build
 #
 # Enumerating is what rotted the previous version of this file: it silently
 # lost `tools/` (whose gts-analyze and xtask are declared workspace members, so
-# Cargo could not load the workspace at all), `.cargo/config.toml` (which pins
-# PDFIUM_VERSION — load-bearing, an upstream PDFIUM release has broken
-# golden-markdown tests before) and `Gears.toml`.
+# Cargo could not load the workspace at all), `.cargo/config.toml` and
+# `Gears.toml`.
 #
 # .dockerignore already keeps target/, .git, .github, .venv, data and logs out.
 COPY . .

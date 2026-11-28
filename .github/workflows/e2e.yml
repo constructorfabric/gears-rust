@@ -85,7 +85,7 @@ jobs:
               - '.github/workflows/e2e.yml'
               # Workspace-level pins. The in-image build is a full `cargo
               # build` of the workspace, so a member list, a lockfile bump, a
-              # toolchain bump or the PDFIUM pin in .cargo/config.toml can
+              # toolchain bump or a change to .cargo/config.toml can
               # break it without any Dockerfile changing — which is exactly
               # how #4798 happened. Root files only: '**/Cargo.toml' would
               # fire the 60-minute job on nearly every Rust PR.

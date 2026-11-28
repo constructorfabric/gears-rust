@@ -4,32 +4,30 @@
 //! (`domain::service::FileParserService`) and every parser backend that
 //! needs to derive one from the other. It replaces three separately
 //! maintained tables that had already drifted (the gateway's own table, and
-//! the `KreuzbergParser`/`ImageParser` copies).
+//! the office backend's and `ImageParser`'s copies). Parser backends take
+//! their content type from the constants below.
+
+pub const PDF: &str = "application/pdf";
+pub const HTML: &str = "text/html";
+pub const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+pub const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+pub const XLS: &str = "application/vnd.ms-excel";
+pub const XLSM: &str = "application/vnd.ms-excel.sheet.macroEnabled.12";
+pub const XLSB: &str = "application/vnd.ms-excel.sheet.binary.macroEnabled.12";
+pub const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
 /// `(extension, MIME type)` pairs. Extensions are lowercase, without the leading dot.
 const EXTENSION_MIME_TABLE: &[(&str, &str)] = &[
-    ("pdf", "application/pdf"),
-    ("html", "text/html"),
-    ("htm", "text/html"),
+    ("pdf", PDF),
+    ("html", HTML),
+    ("htm", HTML),
     ("txt", "text/plain"),
-    (
-        "docx",
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ),
-    (
-        "xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    ),
-    ("xls", "application/vnd.ms-excel"),
-    ("xlsm", "application/vnd.ms-excel.sheet.macroEnabled.12"),
-    (
-        "xlsb",
-        "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
-    ),
-    (
-        "pptx",
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    ),
+    ("docx", DOCX),
+    ("xlsx", XLSX),
+    ("xls", XLS),
+    ("xlsm", XLSM),
+    ("xlsb", XLSB),
+    ("pptx", PPTX),
     ("png", "image/png"),
     ("jpg", "image/jpeg"),
     ("jpeg", "image/jpeg"),

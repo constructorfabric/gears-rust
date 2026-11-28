@@ -30,7 +30,7 @@
 
 File Parser is a stateless toolkit service gear that acts as a **parsing gateway**: it accepts document uploads (or local file paths), routes each request to the first registered parser plugin that claims the file's extension, and returns structured content. All format-specific extraction logic lives in individual plugin implementations of the `FileParserBackend` trait — the gateway itself has no knowledge of any file format.
 
-Five plugins are shipped with this version, covering PDFs, HTML, spreadsheets, presentations, Word documents, plain text, and common image formats. Additional plugins (e.g. Tika, LibreOffice, IBM Document Understanding) can be added in future without changing the gateway or the REST API.
+Eight plugins are shipped with this version, covering PDFs, HTML, spreadsheets, presentations, Word documents, plain text, common image formats, and a stub for legacy formats. Spreadsheets, HTML, PPTX and DOCX are read by the crate's own code; PDF is read through libpdfium, which the build embeds. Additional plugins (e.g. Tika, LibreOffice, IBM Document Understanding) can be added in future without changing the gateway or the REST API.
 
 ### 1.2 Architecture Drivers
 
@@ -44,11 +44,15 @@ Five plugins are shipped with this version, covering PDFs, HTML, spreadsheets, p
 
 #### Third-party Library Constraints
 
-`kreuzberg` 4.8.0–4.9.x used Elastic License 2.0 (EL-2.0); 4.10.x is MIT again. The dependency is pinned at `=4.10.4` (MIT) and `deny.toml` has no exception for it. The exact pin stays because upstream has changed license before; any upgrade requires re-checking the license, and a non-allow-listed license fails `cargo deny check`. Each bump must also re-check kreuzberg's own exact pins on transitive crates: 4.10.4 pins `quick-xml =0.41.0`, so a quick-xml advisory cannot be fixed by `cargo update` until kreuzberg moves.
+Every input document is attacker-controlled. The parsers must not size anything from counts or dimensions the file declares, and their work must stay linear in the input. General-purpose libraries were tried and dropped for this reason: calamine allocates from declared sizes and decodes every formula, and html5ever has spec algorithms that are super-linear on hostile input. Spreadsheets, HTML, PPTX and DOCX are therefore read with small dependencies only (`zip`, `quick-xml`, `cfb`, `encoding_rs`).
+
+PDF is the exception: it is read through libpdfium, a native library that `build.rs` downloads from bblanchon/pdfium-binaries at a pinned build, verifies by SHA-256 and embeds into the binary. libpdfium is BSD-3-Clause and contains third-party components under their own licences; binaries built with the crate must carry `file-parser/THIRD_PARTY_NOTICES.md`. libpdfium is not a Rust crate, so `cargo deny` does not check it.
 
 #### Architecture Decisions
 
 - `cpt-cf-file-parser-adr-content-based-type-detection` — [ADR-0001](./ADR/0001-cpt-cf-file-parser-adr-content-based-type-detection.md): routing may be driven by *content* rather than by the caller-supplied filename extension / `Content-Type`, behind the optional `magika` feature. Records the confidence threshold and fallback policy, why detection failure is a startup failure rather than a silent degradation, and the ONNX Runtime constraints that shape the implementation.
+- `cpt-cf-file-parser-adr-own-document-parsers` — [ADR-0002](./ADR/0002-cpt-cf-file-parser-adr-own-document-parsers.md): file-parser reads spreadsheets, HTML, PPTX and DOCX with its own parsers on zip, quick-xml, cfb and encoding_rs, and PDF through a directly bound, checksum-pinned libpdfium, instead of kreuzberg and docx-rust. Records why xberg, calamine and html5ever were rejected and the PDF engine's timeout limitation.
+- `cpt-cf-file-parser-adr-own-html-parser` — [ADR-0003](./ADR/0003-cpt-cf-file-parser-adr-own-html-parser.md): why HTML is read by the crate's own linear tokenizer and tree builder, not html5ever, with timings of both on hostile inputs from html5ever's issue tracker.
 
 ### 1.3 Architecture Layers
 
@@ -60,17 +64,22 @@ Parser Gateway       (src/domain/service.rs — FileParserService)
 ┌─────────────────────────────────────────────────────────────────────┐
 │  FileParserBackend plugins  (src/infra/parsers/)                    │
 │                                                                     │
-│  PlainTextParser   txt, log, md          (internal)                 │
-│  KreuzbergParser   pdf, html, xlsx, pptx (kreuzberg =4.10.4)       │
-│  DocxParser        docx                  (docx-rust)                │
-│  ImageParser       png, jpg, webp, gif   (internal / base64)        │
-│  StubParser        doc, rtf, odt, …      (fallback stub)            │
+│  PlainTextParser    txt, log, md             (internal)             │
+│  SpreadsheetParser  xlsx, xls, xlsm, xlsb    (own readers, cfb)     │
+│  HtmlParser         html, htm                (own tokenizer)        │
+│  PptxParser         pptx                     (ooxml)                │
+│  PdfParser          pdf                      (libpdfium)            │
+│  DocxParser         docx                     (ooxml)                │
+│  ImageParser        png, jpg, webp, gif      (internal / base64)    │
+│  StubParser         doc, rtf, odt, …         (fallback stub)        │
+│                                                                     │
+│  shared: ooxml (ZIP package reader), inlines, limits, bounded_read  │
 └─────────────────────────────────────────────────────────────────────┘
         ↓  each plugin returns ParsedDocument (platform IR)
 Markdown renderer    (src/domain/markdown.rs)
 ```
 
-> **Note**: `KreuzbergParser` additionally uses `src/infra/parsers/ir_convert.rs` to convert kreuzberg's `ExtractionResult` into the platform IR. Other plugins produce `ParsedDocument` directly.
+> **Note**: Every plugin produces `ParsedDocument` directly. The shared modules in `src/infra/parsers/` are: `ooxml` (ZIP package reader for DOCX, PPTX and XLSB/XLSX parts, with `ParseLimits` on every part it reads), `inlines` (inline runs and link targets), `limits` (`ParseLimits` and the document-wide text, table-cell and nesting budgets), and `bounded_read` (bounded read of a local file).
 
 ## 2. Principles & Constraints
 
@@ -128,21 +137,61 @@ Supported extensions are determined by the registered plugins. Requests for exte
 
 Currently supported:
 - `PlainTextParser`: `txt`, `log`, `md`
-- `KreuzbergParser`: `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx`
+- `SpreadsheetParser`: `xlsx`, `xls`, `xlsm`, `xlsb`
+- `HtmlParser`: `html`, `htm`
+- `PptxParser`: `pptx`
+- `PdfParser`: `pdf`
 - `DocxParser`: `docx`
 - `ImageParser`: `png`, `jpg`, `jpeg`, `webp`, `gif`
-- `StubParser` (fallback): `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx`
+- `StubParser` (fallback): `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` (`xls`, `xlsx` and `pptx` are handled by the earlier parsers)
 
-**Known limitations of `KreuzbergParser` (kreuzberg 4.9.4 through 4.10.4)**:
-- PPTX multi-slide presentations: slides are emitted as `##` headings rather than distinct nodes; `PageBreak` blocks between slides are not produced.
-- PPTX tables: structured `Table` blocks are not produced; table cell content is extracted as plain paragraphs.
+**Current limitations**:
+- No OCR. Image-only (scanned) PDFs produce no text. Invisible text layers that OCR tools add to PDFs are read.
+- PDF structure (headings, lists, paragraphs, columns) is found heuristically from glyph size and position, and can be wrong.
+- Tables are not reconstructed from PDFs; table text comes out as lines.
+- PDF superscripts (footnote markers, exponents) split their paragraph: the raised text becomes a paragraph of its own between the two halves.
+- PDF running headers and footers are only recognised on upright text; on pages whose text is drawn rotated they are kept on every page.
+- PDF text tilted about 3-10° from the rest of its page (a stamp, say) may break into fragments that mix with the lines around it.
+- PPTX SmartArt text comes out in the order of the diagram's data part, which can differ from the order the diagram shows it in.
+- DOCX and PPTX notes and comments, DOCX headers and footers, and PPTX footer, date and slide-number placeholders are not extracted.
 <!-- fdd-id-content -->
 
-#### kreuzberg Version Pin
+#### libpdfium Version Pin
 
 - [ ] `p1` - **ID**: `cpt-cf-file-parser-constraint-version-pin`
 
-`kreuzberg` is declared as `=4.10.4` (MIT) in `Cargo.toml`. This prevents `cargo update` from silently upgrading to a newer release with a different or changed license. `deny.toml` has no exception for this crate, so a non-allow-listed license fails `cargo deny check`. Any upgrade is a deliberate, reviewed action.
+libpdfium is pinned to one build of bblanchon/pdfium-binaries (`PDFIUM_BUILD = "7961"` in `build.rs`), with a SHA-256 digest per target archive. `build.rs` refuses an archive whose digest does not match. `pdfium-render` is pinned at `=0.9.5` with the `pdfium_7881` feature, the highest feature not above the pinned build; a newer feature asks for symbols the build lacks and binding fails. Moving to another pdfium build means changing `PDFIUM_BUILD` and the digest table in `build.rs`, the `pdfium_NNNN` feature in the workspace `Cargo.toml`, and regenerating the e2e goldens (`testing/e2e/suites/file_parser/generate_file_parser_golden.py`) in the same change.
+
+Targets without a pinned archive (musl included: a static binary cannot `dlopen` the shared library) build without a bundled library and need `FILE_PARSER_PDFIUM_RUNTIME_LIB` at runtime.
+
+#### Parse Limits
+
+- [ ] `p1` - **ID**: `cpt-cf-file-parser-constraint-parse-limits`
+
+The spreadsheet, HTML, PPTX, PDF and DOCX parsers enforce `ParseLimits`, and the plain-text parser its `max_text_bytes` (`src/infra/parsers/limits.rs`, public, `#[non_exhaustive]`). A document over a limit fails with a parse error that names the limit. The gear reads them from `limits` in its configuration (see Configuration); each key defaults as below.
+
+| Field | Default | Bounds |
+|---|---|---|
+| `max_zip_entries` | 10 000 | Entries in a ZIP container |
+| `max_entry_bytes` | 64 MiB | Inflated size of one ZIP entry |
+| `max_total_uncompressed_bytes` | 500 MiB | Inflated size of all entries of one container, declared and read |
+| `max_compression_ratio` | 100 | Inflated / compressed ratio above which an entry is treated as a ZIP bomb |
+| `ratio_check_floor_bytes` | 1 MiB | Entries smaller than this skip the ratio check |
+| `max_nesting_depth` | 1024 | Element nesting in XML parts (HTML keeps its own, smaller caps and flattens deeper content) |
+| `max_table_cells` | 100 000 | Table cells in the whole document; each table is charged rows x columns |
+| `max_table_columns` | 16 384 | Columns in one table |
+| `max_sheets` | 1 000 | Sheets in a workbook, or slides in a presentation |
+| `max_html_nodes` | 500 000 | Elements and text nodes of one HTML document |
+| `max_pdf_pages` | 2 000 | Pages of one PDF |
+| `max_pdf_chars_per_page` | 200 000 | Characters pdfium reports on one PDF page |
+| `pdf_timeout` | 60 s | Wall-clock time for one PDF once the PDF engine is taken; also the longest wait for the engine |
+| `max_text_bytes` | 100 MiB | Text extracted from one document, plus 64 bytes for each block, inline run and PDF line, so a document of millions of tiny pieces is bounded too |
+
+A table (or a whole sheet) that does not fit the remaining cell budget is replaced by a note paragraph instead of failing the document; the note is charged to `max_text_bytes` like any paragraph, its full text included. A nested table counts the cells its enclosing tables have built so far. The paragraphs that fill table cells (each spreadsheet cell, and the empty cells padded into a grid) are charged their text but not the per-block cost: their number is bounded by `max_table_cells`.
+
+The `ooxml` package reader applies the ZIP limits to every part it reads; parts that are never read (media, embedded objects) are not checked. Relationship targets that escape the package root are dropped. XML is read without DTD entity expansion: only the predefined entities and numeric references are resolved.
+
+pdfium is not thread-safe across documents, so all PDF work runs on one dedicated thread that owns the pdfium binding. Documents queue for it and their callers wait asynchronously. At most `pdf.max_queued` documents wait (64 by default); further ones, and documents that wait longer than `pdf_timeout`, are rejected as busy (429 with `Retry-After`). `pdf_timeout` is checked between pdfium calls only; a single call cannot be interrupted, so a hostile PDF can keep the engine busy past the timeout. The engine's part of the answer still comes within `pdf_timeout` of waiting plus `pdf_timeout` and 2 s of reading (122 s with the defaults); arranging the lines into headings, lists and paragraphs then runs on the blocking pool, bounded by the page, character and text limits. The thread is not one of Tokio's blocking-pool threads, so runtime shutdown does not wait for it.
 
 ## 3. Technical Architecture
 
@@ -202,17 +251,27 @@ The gateway also enforces file size limits and path-traversal protection. It has
 <!-- fdd-id-content -->
 Each plugin implements `FileParserBackend` (`src/domain/parser.rs`) and is registered at gear startup in `src/gear.rs`. Registration order determines priority (first match wins). Plugins currently shipped, in registration order:
 
-| # | Plugin | Handled extensions | Backend library |
-|---|---|---|---|
-| 1 | `PlainTextParser` | `txt`, `log`, `md` | internal |
-| 2 | `KreuzbergParser` | `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` | `kreuzberg =4.10.4` (MIT) |
-| 3 | `DocxParser` | `docx` | `docx-rust` |
-| 4 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` | internal (base64 encoding) |
-| 5 | `StubParser` | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` | stub fallback |
+| # | Plugin | Id | Handled extensions | Backend |
+|---|---|---|---|---|
+| 1 | `PlainTextParser` | `plain_text` | `txt`, `log`, `md` | internal |
+| 2 | `SpreadsheetParser` | `spreadsheet` | `xlsx`, `xls`, `xlsm`, `xlsb` | own readers: XLSX/XLSM XML, XLSB binary records, BIFF8/BIFF5 `.xls` via `cfb` |
+| 3 | `HtmlParser` | `html` | `html`, `htm` | own linear tokenizer and small tree builder |
+| 4 | `PptxParser` | `pptx` | `pptx` | `ooxml` package reader |
+| 5 | `PdfParser` | `pdf` | `pdf` | libpdfium through `pdfium-render` |
+| 6 | `DocxParser` | `docx` | `docx` | `ooxml` package reader |
+| 7 | `ImageParser` | `image` | `png`, `jpg`, `jpeg`, `webp`, `gif` | internal (base64 encoding) |
+| 8 | `StubParser` | `generic_stub` | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` | stub fallback |
 
 Future plugins implement `FileParserBackend` and are added to the `vec![]` in `gear.rs` — no changes to the gateway or REST API are required.
 
-Each plugin produces a `ParsedDocument` using the platform IR (`src/domain/ir.rs`). `KreuzbergParser` additionally uses `result_to_blocks` (`src/infra/parsers/ir_convert.rs`) to convert kreuzberg's `ExtractionResult` into that IR.
+Each plugin produces a `ParsedDocument` using the platform IR (`src/domain/ir.rs`). Output per format:
+
+- **Plain text** (`.txt`, `.log`, `.md`): the text as verbatim code blocks, so nothing in it is read as Markdown or HTML; `.md` blocks get the `markdown` language, others none. `\r\n` becomes `\n`; everything else, blank lines and indentation included, is kept. Text up to 16 KiB (`CODE_BLOCK_BYTES`) is one block. Longer text is cut at the last blank line that keeps the block within 16 KiB; a stretch without one is cut at the last line break within 16 KiB, a longer line is kept whole up to 64 KiB and cut at a character boundary past that. The blank lines at a cut stay at the end of the block before it, past the 16 KiB, so the blocks put together give back the text with `\r\n` turned into `\n`. Only the first 64 KiB of the remaining text are looked at for each cut, so a long line costs no more than its length. The text is decoded and split on the blocking pool, like the other formats. Each block is charged its text plus the per-block cost to `max_text_bytes`. Whitespace-only text gives no blocks.
+- **Spreadsheets**: one level-2 heading per sheet (the sheet name) and one table over the bounding box of its non-empty cells; the first row is the header. Hidden and very hidden sheets are read too, and their heading says so: `Name (hidden)`, `Name (very hidden)`. Cells show values as Excel displays them; formulas contribute their cached result.
+- **HTML**: headings, paragraphs, styled runs, links (`http`, `https`, `mailto`, `ftp`, `tel` and relative targets), lists, tables, quotes, preformatted text as code, rules and images. Scripts, styles, form controls, embedded media and hidden elements are skipped. The IR has only block images, so an `<img>` inside a paragraph splits it and an image inside a link loses the link. The encoding is taken from a byte order mark, the `Content-Type` charset or a `<meta>` declaration, else UTF-8 or Windows-1252.
+- **PPTX**: slides in presentation order. Each slide becomes a level-2 heading (its title placeholder, or "Slide N"), then its shapes: paragraphs, list items where a bullet is set on the paragraph or inherited from the layout and master, tables, pictures with their description, and SmartArt text. Slides are separated by page breaks. Speaker notes, comments, charts and slide furniture (footer, date and slide-number placeholders) are left out.
+- **PDF**: characters are read one by one with position, size, direction and font style. Lines are built per baseline direction, so rotated text and rotated pages read upright, and slightly skewed lines stay together; right-to-left runs are put back into logical order. Headings come from font size (up to three levels), plus list items, horizontal rules and paragraphs; words hyphenated across lines are joined. Running headers and footers are kept only at their first occurrence and page numbers are dropped; two-column text is read column by column. Pages are separated by page breaks. The title comes from the Info dictionary.
+- **DOCX**: headings from outline levels or heading styles, list items from numbering, code blocks and quotes from styles, styled runs and external links. Tracked changes read as accepted. Tables keep their grid (spans padded, merged cells empty); a table nested in a cell is flattened into the cell's paragraphs. Pictures with a description become images; text boxes follow their paragraph. Notes, comments, headers and footers are not extracted.
 <!-- fdd-id-content -->
 
 #### Markdown Renderer
@@ -223,6 +282,33 @@ Each plugin produces a `ParsedDocument` using the platform IR (`src/domain/ir.rs
 
 <!-- fdd-id-content -->
 `src/domain/markdown.rs` — converts any `ParsedDocument` to Markdown, preserving headings, lists, tables, code blocks, quotes, and inline formatting. Both eager (`render`) and streaming (`render_iter`) modes are supported.
+
+Where Markdown has no syntax of its own, the output uses inline HTML or a fixed convention:
+
+- Underlined text is wrapped in `<u>…</u>`.
+- Line breaks inside a table cell become `<br/>`; `|` in cells is written as `\|`, inside code too (GFM removes that backslash before it reads the cell). Readers agree on that only when the pipe follows an odd number of backslashes: `\\|` is kept whole by comrak and loses a backslash in pulldown-cmark. So a pipe after an even run of backslashes (none, or escaped backslashes of text or code) gets one more, and a pipe after an odd run is left alone, since a table nested in the cell already escaped it. Backslashes are not doubled otherwise (inside code a doubled one would show doubled), so a `\|` in code in a cell shows as `|`.
+- Every line of a list item after the first is indented to the item's content (the marker's width), and a nested item starts at its parent's content, so a code block in an item stays inside it. Leading blank lines of the item's content are dropped, since a blank line right after the marker would end the item. A table, a nested item or a quote in a list item is followed by a blank line, so the next block is not read as a row or as their continuation, and so are a paragraph or image followed by another one, which would otherwise join into one paragraph; such a list becomes loose. A rule or page break in a list item is written as `***`: `- ---` would be a rule in place of the item, and `---` under a paragraph line a heading underline. In a quote, every line gets `> `, also after a lone `\r`.
+- A table without a header row gets an empty header row; its first row stays a data row.
+- Link and image destinations that contain whitespace, parentheses, angle brackets, backslashes or control characters are written in angle brackets, with `<`, `>` and control characters percent-encoded and `\` written as `&#92;` (before the `&amp;` written for a `&`, a backslash would escape it). `&` is written as `&amp;` in every destination, so a renderer that decodes entity references gets the target back unchanged. Image titles use `&quot;`, `&#92;` and `&amp;` the same way. An image without a source but with a title gets `<>` as its destination; otherwise the title would be read as the destination and the rest of it as Markdown.
+
+Document text (text runs, link text, image alt, the title and the metadata values) is escaped just enough that it cannot form a link, an image, raw HTML or code, with CommonMark backslash escapes, which leave the text readable as it is (the output is mostly read raw, by language models): `[` is written as `\[` and a backtick as `` \` ``, and `<` as `\<` where it could start raw HTML or an autolink: before an ASCII letter or digit, before ASCII punctuation other than `<>()[]\,;:@"` (which covers `/`, `!`, `?` and the characters an email address can start with), and at the end of the text, where the next run follows. `a < b` stays as is.
+
+- `]` is escaped (`\]`) only in link text and image alt, where it would close the brackets early. Elsewhere it has no `[` to close: every `[` of the text is escaped, so text cannot open a link, an image, a reference definition or a footnote. The renderer's own `[` is closed by its own `](`, except that a `]` inside a code span in link text would end the label of a link reference definition (`` [`a]: b`](…) `` at the start of a line would vanish): link text in code style that contains `]` or starts with `^` is written as escaped text, without the code style. A `^` at the start of link text or image alt is escaped too: comrak reads `[^x\]: y` at the start of a line as a footnote definition, ignoring the escape before `]`.
+- `\` is doubled only where it would escape or break what follows: before ASCII punctuation (including another backslash and the escapes above, so `\[` in the document becomes `\\\[`), before a line ending (a hard line break) and at the end of the text, where the renderer's own markers follow. `C:\Users` stays as is.
+- `~` is escaped (`\~`) in every run of three or more, wherever it is, and in a run at either end of the text, so no line can start with `~~~` and open a code block, even after a list or quote marker or next to the renderer's own `~~` strikethrough markers. The whole run is escaped, not just its first `~`: pulldown-cmark reads `~~\~~x~~` as no strikethrough at all.
+- `!` at the end of the text is escaped (`\!`) when a link follows directly, since `![` would make the link an image. Other `!` stay as is.
+- `>` at the end of underlined text is escaped (`\>`): followed by the renderer's `</u>` after a line break it would be a quote holding an HTML block, where escapes are not read.
+- `&` is written as `&amp;` when it would start a character reference (`&name;`, `&#digits;`, `&#xhex;`) or ends the text, where the next run could complete one (`AT&` then `lt;T`), so `AT&T` stays as is and `&lt;` in the document reads back as `&lt;`. It keeps the entity, the form destinations and image titles use as well.
+
+Spaces and tabs at the start of each line of a paragraph or heading are dropped (not in code): renderers do not show them, and four columns of them at the start of a block or after a blank line would make an indented code block. A run of `#` that ends the first line of a heading or the title, alone or after a space, gets its first `#` escaped (`# Issue \#`); Markdown would take it for the closing sequence and drop it.
+
+Line breaks in link text and image alt are written as spaces: inside the brackets they could end the paragraph or start a block, and the destination and title would then be read as Markdown. Other emphasis characters (`*`, `_`, `#` and so on) are not escaped, so document text can still produce emphasis or, at the start of a line, a block marker; an escaped character is punctuation like the one it stands for, so it does not change where emphasis starts or ends. GFM extended autolinks are not prevented either: `www.…`, `http://…`, `https://…` and email addresses in text still become links, but only to http, https or mailto targets and with the visible text equal to the target.
+
+Code is written unescaped, inside delimiters chosen so that it cannot end early: a code span uses one backtick more than the longest run of backticks in its text, with a space inside the delimiters when the text starts or ends with a backtick, and with line breaks written as spaces; code that directly follows code (an inline code run, or text in code style, with nothing in between) joins the same span, because two spans side by side would touch as one longer run of backticks that closes neither; a code block uses a backtick fence at least three long and longer than any run of backticks in the code. A code block language is written only when it consists of `[A-Za-z0-9_+.#-]`; otherwise the fence has no info string.
+
+The plain-text parser emits code blocks, so a `.md`, `.log` or `.txt` file is rendered as its source inside a fence its content cannot close, with no escaping; its Markdown syntax (links, code fences, HTML) shows as literal characters, not as formatting. Eager and streaming rendering give the same output.
+
+The output is untrusted: a consumer that renders it to HTML must sanitise the result, as it would for any user-supplied Markdown.
 <!-- fdd-id-content -->
 
 ### 3.3 API Contracts
@@ -245,13 +331,18 @@ Example `/info` response:
 {
   "supported_extensions": {
     "plain_text": ["txt", "log", "md"],
-    "kreuzberg": ["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"],
+    "spreadsheet": ["xlsx", "xls", "xlsm", "xlsb"],
+    "html": ["html", "htm"],
+    "pptx": ["pptx"],
+    "pdf": ["pdf"],
     "docx": ["docx"],
     "image": ["png", "jpg", "jpeg", "webp", "gif"],
     "generic_stub": ["doc", "rtf", "odt", "xls", "xlsx", "ppt", "pptx"]
   }
 }
 ```
+
+The map is built from each registered parser's `id()` and `supported_extensions()`; key order is not fixed.
 
 #### FileParserBackend Trait (Plugin Contract)
 
@@ -290,9 +381,27 @@ Plugin registration is done at gear startup in `src/gear.rs`. The gateway select
 
 | Dependency | Version | License | Role |
 |---|---|---|---|
-| `kreuzberg` | `=4.10.4` | MIT (no `deny.toml` exception) | Document extraction for PDF, HTML, XLSX, PPTX (used by `KreuzbergParser`) |
-| `pdfium` | bundled via kreuzberg | BSD-3 | PDF rendering (bundled, no separate install) |
-| `docx-rust` | workspace | MIT | DOCX parsing (used by `DocxParser`) |
+| `zip` | 9 (deflate via `flate2` / `zlib-rs`) | MIT | ZIP containers: DOCX, PPTX, XLSX, XLSM, XLSB |
+| `quick-xml` | 0.42 (`escape-html`) | MIT | XML parts; HTML5 named character references |
+| `cfb` | 0.16 | MIT | OLE compound files (legacy `.xls`) |
+| `encoding_rs` | 0.8 | (Apache-2.0 OR MIT) AND BSD-3-Clause | HTML and legacy `.xls` text encodings |
+| `pdfium-render` | `=0.9.5` (`pdfium_7881`, `thread_safe`) | MIT OR Apache-2.0 | Bindings to libpdfium |
+| `tempfile` | 3 | MIT OR Apache-2.0 | Private directory the embedded libpdfium is written to |
+| libpdfium | `chromium/7961`, embedded | BSD-3-Clause, plus bundled third-party components | PDF engine; see `file-parser/THIRD_PARTY_NOTICES.md` |
+| `flate2` (build) | 1 | MIT OR Apache-2.0 | Unpacks the pdfium archive |
+| `tar` (build) | 0.4 | MIT OR Apache-2.0 | Unpacks the pdfium archive |
+| `cf-gears-toolkit-security` (build) | workspace | Apache-2.0 | SHA-256 of the pdfium archive, through the crypto facade |
+
+`build.rs` downloads the pdfium archive with `curl` from `https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/7961/`, verifies it, and extracts only the library file, which is embedded with `include_bytes!`. At runtime the library is written to a private temporary directory and bound once per process. Build inputs: `FILE_PARSER_PDFIUM_ARCHIVE` (local archive, still verified), `FILE_PARSER_PDFIUM_LIB` (prebuilt library, not verified), `FILE_PARSER_PDFIUM_CACHE_DIR` (archive cache), `CARGO_NET_OFFLINE=true` (no download), `DOCS_RS` (nothing bundled). At runtime `FILE_PARSER_PDFIUM_RUNTIME_LIB` loads a library from a path instead of the embedded one. Digests per target:
+
+| Target | Archive | SHA-256 |
+|---|---|---|
+| Linux x86_64 (gnu) | `pdfium-linux-x64.tgz` | `019665c8877d46fe65f625f80fd714ab07aac68554b0636acf2a2adf9288adb2` |
+| Linux aarch64 (gnu) | `pdfium-linux-arm64.tgz` | `974107999784a438149605024475d42d80dd306799d90e1af5f6fa63f976455f` |
+| macOS aarch64 | `pdfium-mac-arm64.tgz` | `1193a771e0bd934530afa3df73a0d44551d8f4078442e290054e6dd38ded960f` |
+| macOS x86_64 | `pdfium-mac-x64.tgz` | `17f069d7012ab83898ad5eddebd139b240f05d7411c220775d507a0e3e285536` |
+| Windows x86_64 | `pdfium-win-x64.tgz` | `88276459349b291c41f10422dad0210f007c04d919c8fa56472b6b7c6406adf4` |
+| Windows aarch64 | `pdfium-win-arm64.tgz` | `9d8c50c65f129c3774b972cde09d3bea44478075f72faadfe9fc0c152e65d509` |
 
 ### 3.5 Interactions & Sequences
 
@@ -331,29 +440,46 @@ File Parser is stateless and does not own any database tables or persistent stor
 ### Configuration
 
 ```yaml
-# config/server.yaml (relevant keys)
-file_parser:
-  max_file_size_mb: 100              # optional; default 100 MB
-  allowed_local_base_dir: /data/uploads   # required; gear fails to start if absent
-  detection_confidence_threshold: 0.90  # optional; default 0.90. Minimum detector confidence, in
-                                      # [0.0, 1.0], at which content detection may override the
-                                      # caller's filename / Content-Type hint. Below it the hint
-                                      # wins. Configurable because ADR-0001 records 0.90 as an
-                                      # initial value rather than a tuned one; the gear fails to
-                                      # start on a value outside [0.0, 1.0] instead of clamping.
-                                      # Only has effect when a detector is registered.
-  magika_intra_op_threads: 2         # optional; leave unset (recommended). Only used with the
-                                      # `magika` feature — ONNX Runtime intra-op thread count for
-                                      # the detector's single magika::Session. Unset leaves ONNX
-                                      # Runtime's own default: measured ~6 threads and ~3.5 ms per
-                                      # detection on a 10-core host. Lower it only when detection
-                                      # must not contend with other CPU-bound work, and note the
-                                      # latency cost: ~5.6 ms at 2, ~9.3 ms at 1. There is no
-                                      # session-count setting: magika::Session needs &mut self per
-                                      # inference and each session brings its own thread pool and
-                                      # model copy, so detection is serialized through one session
-                                      # and tuned here.
+gears:
+  file-parser:
+    config:
+      max_file_size_mb: 100              # optional; default 100 MB
+      max_image_size_mb: 50              # optional; largest image read. Default 50 MB, or max_file_size_mb if smaller.
+      allowed_local_base_dir: /data/uploads   # required; gear fails to start if absent
+      detection_confidence_threshold: 0.90  # optional; default 0.90. Minimum detector confidence, in
+                                          # [0.0, 1.0], at which content detection may override the
+                                          # caller's filename / Content-Type hint. Below it the hint
+                                          # wins. Configurable because ADR-0001 records 0.90 as an
+                                          # initial value rather than a tuned one; the gear fails to
+                                          # start on a value outside [0.0, 1.0] instead of clamping.
+                                          # Only has effect when a detector is registered.
+      magika_intra_op_threads: 2         # optional; leave unset (recommended). Only used with the
+                                          # `magika` feature — ONNX Runtime intra-op thread count for
+                                          # the detector's single magika::Session. Unset leaves ONNX
+                                          # Runtime's own default: measured ~6 threads and ~3.5 ms per
+                                          # detection on a 10-core host. Lower it only when detection
+                                          # must not contend with other CPU-bound work, and note the
+                                          # latency cost: ~5.6 ms at 2, ~9.3 ms at 1. There is no
+                                          # session-count setting: magika::Session needs &mut self per
+                                          # inference and each session brings its own thread pool and
+                                          # model copy, so detection is serialized through one session
+                                          # and tuned here.
+      limits:                        # optional; every key optional, defaults as listed under Parse limits
+        max_pdf_pages: 2000
+        pdf_timeout: 60s             # humantime; from 1s to 1h
+        # ... any ParseLimits field: max_zip_entries, max_entry_bytes,
+        # max_total_uncompressed_bytes, max_compression_ratio, ratio_check_floor_bytes,
+        # max_nesting_depth, max_table_cells, max_table_columns, max_sheets,
+        # max_html_nodes, max_pdf_chars_per_page, max_text_bytes
+      pdf:
+        max_queued: 64               # optional; 1..=4096. PDFs that may wait for the engine; more get 429.
+        check_on_startup: true       # optional; bind libpdfium during init (a failure only warns)
+      parse_route_timeout: 5m        # optional; humantime, from 1s to 4h. Default: twice pdf_timeout plus 12 s.
 ```
+
+The gear validates the configuration at startup and refuses to start on a count of 0, `max_entry_bytes` above `max_total_uncompressed_bytes`, a `pdf_timeout` outside 1 s to 1 h, a `parse_route_timeout` outside 1 s to 4 h, or `pdf.max_queued` outside 1 to 4096. The engine queue is process-wide; its size is fixed when the engine starts. An explicit `max_image_size_mb` may not exceed `max_file_size_mb`, which applies first.
+
+The parse routes declare their own request deadline, `parse_route_timeout`. By default it is twice `pdf_timeout` plus 12 s (132 s with the defaults), so a PDF that waits for the engine and then reads is not cut off by the gateway's default request timeout. It replaces the gateway's default for these routes even when that default is longer, so a deployment that raised the default (for large uploads over slow links, say) sets `parse_route_timeout` as well; the deadline also covers reading the upload. The gateway's `defaults.max_request_timeout`, when set, caps it.
 
 ### Error Mapping
 
@@ -364,7 +490,9 @@ file_parser:
 | File too large (> configured limit) | 413 Payload Too Large |
 | Path traversal attempt | 403 Forbidden |
 | Local file not found | 404 Not Found |
-| Parser extraction failure | 500 Internal Server Error |
+| Malformed document, or a `ParseLimits` limit exceeded | 400 Bad Request |
+| PDF engine busy | 429 Too Many Requests, `Retry-After: 1` |
+| PDF engine unavailable; parser panic; I/O failure | 500 Internal Server Error |
 
 ## Appendix
 
@@ -378,3 +506,4 @@ file_parser:
 | 2026-04-29 | 0.4.0 | Engineering | Restructured to match cypilot SDLC DESIGN template. Consolidated four format-specific parsers (`HtmlParser`, `PdfParser`, `XlsxParser`, `PptxParser`) into `KreuzbergParser` backed by `kreuzberg =4.9.4` (Elastic-2.0). Retained `DocxParser`, `ImageParser`, `PlainTextParser`, `StubParser` plugins. Documented domain model, component model, API contracts, and interaction sequences. |
 | 2026-04-30 | 0.5.0 | Engineering | Rewrote to be accurate to the full gateway+plugin architecture. Corrected domain model (actual `ParsedBlock` variants, `ParsedDocument` fields, `ParsedSource`). Fixed `FileParserBackend` trait signature. Fixed `/info` response key. Added plugin registration order table. Corrected file size limit (100 MB default). Removed kreuzberg-specific wording from gateway-level descriptions. |
 | 2026-11-03 | 0.6.0 | Engineering | Bumped `kreuzberg` `=4.9.8` → `=4.10.4` (MIT again; `deny.toml` Elastic-2.0 exception removed). Re-verified the PPTX multi-slide / table known limitations: still present at 4.10.4. Parser tests now require their fixtures instead of silently skipping (issue #5649). |
+| 2026-11-22 | 0.7.0 | Engineering | Replaced `KreuzbergParser` and the `docx-rust` DOCX backend with the crate's own spreadsheet, HTML, PPTX and DOCX parsers and a PDF parser on an embedded, SHA-256-verified libpdfium, and documented `ParseLimits`. |

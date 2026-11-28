@@ -187,7 +187,8 @@ Fix it by upgrading the dependency. Until that is possible, give the crate an en
 `semver_check = false` under "Semver check opt-outs" in `release-plz.toml`, with a comment
 saying when to remove it. Its version bumps then come from commit messages alone.
 
-`cf-gears-file-parser` has such an entry today because of `kreuzberg`.
+`cf-gears-file-parser` has such an entry until a release without `kreuzberg` is published:
+its last published version still depends on it.
 
 ### Notes for the very first publish (bootstrap)
 

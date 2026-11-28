@@ -285,11 +285,10 @@ git_release_enable = false
 # the check, and its version bump comes from commit messages alone.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# kreuzberg 4.x accepts any `zip >= 7` (still true of 4.10.4), and zip 9 broke the
-# 4.9.x build; 4.10.4 is unverified against zip 9. Our Cargo.lock keeps working
-# versions, but the check ignores it. kreuzberg-lts main caps zip at 8 (15c0102d);
-# remove this entry once file-parser is on a kreuzberg release that caps zip and
-# that file-parser version is published.
+# The last published cf-gears-file-parser depends on kreuzberg 4.x, which accepts
+# any `zip >= 7`, and zip 9 breaks it; the check builds that published version
+# without Cargo.lock. file-parser no longer uses kreuzberg: remove this entry once
+# a file-parser release without it is published.
 [[package]]
 name = "cf-gears-file-parser"
 semver_check = false

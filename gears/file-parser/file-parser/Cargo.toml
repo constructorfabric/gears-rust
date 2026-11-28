@@ -75,7 +75,12 @@ base64 = { workspace = true }
 tempfile = { workspace = true }
 
 # Document parsing libraries
-kreuzberg = { workspace = true }
+pdfium-render = { workspace = true }
+zip = { workspace = true }
+# `escape-html`: the HTML5 named character reference table.
+quick-xml = { workspace = true, features = ["escape-html"] }
+cfb = { workspace = true }
+encoding_rs = { workspace = true }
 
 # Content-based file type detection (optional, behind the `magika` feature)
 magika = { workspace = true, optional = true }
@@ -85,10 +90,18 @@ tokio-util = { workspace = true, optional = true }
 # MIME type parsing
 mime = { workspace = true }
 
-docx-rust = { workspace = true }
 
 # Local dependencies
 toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
+toolkit-utils = { workspace = true, features = ["humantime-serde"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[build-dependencies]
+flate2 = { workspace = true }
+tar = { workspace = true }
+toolkit-security = { workspace = true }

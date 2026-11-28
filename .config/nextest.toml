@@ -14,6 +14,14 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'package(cf-gears-quota-enforcement-storage-plugin)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# File parser: per-test kill. Several tests guard against super-linear parsing
+# (hostile HTML, deep nesting, long number formats, quadratic DOCX styles) by
+# finishing at all; they take well under a second, and a regression takes
+# minutes, so two minutes turns it into a TIMEOUT instead of a slow pass.
+[[profile.default.overrides]]
+filter = 'package(cf-gears-file-parser)'
+slow-timeout = { period = "60s", terminate-after = 2 }
+
 # Event broker gear-DB contention suites: no retries, ever. These tests catch a
 # race between a chained publish's head read and its write; a race that shows
 # once is the defect, so a retry that passes would hide exactly what they exist

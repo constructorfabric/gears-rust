@@ -24,6 +24,27 @@ async fn test_image_parser_basic_info() {
 }
 
 #[tokio::test]
+async fn images_over_the_configured_size_are_refused() {
+    let parser = ImageParser::new().with_max_bytes(8);
+    let err = parser
+        .parse_bytes(Some("a.png"), Some("image/png"), vec![0_u8; 9].into())
+        .await
+        .expect_err("over the cap");
+    assert!(
+        matches!(
+            err,
+            file_parser::domain::error::DomainError::InvalidRequest { .. }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("max 8 bytes"), "{err}");
+    let fits = parser
+        .parse_bytes(Some("a.png"), Some("image/png"), vec![0_u8; 8].into())
+        .await;
+    assert!(fits.is_ok(), "{fits:?}");
+}
+
+#[tokio::test]
 async fn test_image_parser_png() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.png");

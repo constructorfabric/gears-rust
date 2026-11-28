@@ -26,21 +26,38 @@ use crate::domain::parser::FileParserBackend;
 /// Animated GIFs are generally unsuitable for LLM consumption (they contain multiple frames,
 /// but only the first frame would typically be useful). Future implementations may add validation
 /// to reject animated GIFs or extract only the first frame.
-pub struct ImageParser;
+pub struct ImageParser {
+    max_bytes: u64,
+}
 
 /// Supported file extensions for image formats
 const SUPPORTED_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "gif"];
 
-/// Maximum allowed size for individual image files in MB (for display)
-const MAX_IMAGE_SIZE_MB: u64 = 50;
-
-/// Maximum allowed size for individual image files in bytes
-const MAX_IMAGE_SIZE_BYTES: u64 = MAX_IMAGE_SIZE_MB * 1024 * 1024;
+/// Largest image read by default, in MiB; `Gear::init` passes
+/// `max_image_size_mb`.
+pub const DEFAULT_MAX_IMAGE_MB: u64 = 50;
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = DEFAULT_MAX_IMAGE_MB * super::backend::MIB;
 
 impl ImageParser {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            max_bytes: DEFAULT_MAX_IMAGE_BYTES,
+        }
+    }
+
+    /// Caps the size of an image, local or uploaded.
+    #[must_use]
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    fn too_large(&self, size: u64) -> DomainError {
+        DomainError::invalid_request(format!(
+            "Image file too large: {size} bytes (max {} bytes)",
+            self.max_bytes
+        ))
     }
 
     /// Determine MIME type from file extension, restricted to the formats
@@ -113,17 +130,13 @@ impl FileParserBackend for ImageParser {
             .await
             .map_err(|e| DomainError::io_error(format!("Failed to read file metadata: {e}")))?;
 
-        if metadata.len() > MAX_IMAGE_SIZE_BYTES {
-            return Err(DomainError::invalid_request(format!(
-                "Image file too large: {} bytes (max {} MB)",
-                metadata.len(),
-                MAX_IMAGE_SIZE_MB
-            )));
+        if metadata.len() > self.max_bytes {
+            return Err(self.too_large(metadata.len()));
         }
 
         // The check above gives the precise "too large" message; this is what
         // bounds the allocation, since metadata-then-read is not atomic.
-        let bytes = super::bounded_read::read_bounded(path, MAX_IMAGE_SIZE_BYTES).await?;
+        let bytes = super::bounded_read::read_bounded(path, self.max_bytes).await?;
 
         // Prefer the resolved MIME, but require it to be an image type — the
         // same guard `determine_mime_type` applies on the `parse_bytes` path. It
@@ -169,14 +182,9 @@ impl FileParserBackend for ImageParser {
         content_type: Option<&str>,
         bytes: bytes::Bytes,
     ) -> Result<crate::domain::ir::ParsedDocument, DomainError> {
-        // Check file size
-        #[allow(clippy::cast_possible_truncation)]
-        if bytes.len() > MAX_IMAGE_SIZE_BYTES as usize {
-            return Err(DomainError::invalid_request(format!(
-                "Image file too large: {} bytes (max {} MB)",
-                bytes.len(),
-                MAX_IMAGE_SIZE_MB
-            )));
+        let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if size > self.max_bytes {
+            return Err(self.too_large(size));
         }
 
         // Determine MIME type

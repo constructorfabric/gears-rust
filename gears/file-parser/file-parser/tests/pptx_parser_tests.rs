@@ -1,104 +1,113 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::use_debug)]
 
+use file_parser::domain::ir::{Inline, ParsedBlock, ParsedDocument, ParsedSource};
 use file_parser::domain::parser::FileParserBackend;
-use file_parser::infra::parsers::kreuzberg_parser::KreuzbergParser;
+use file_parser::infra::parsers::PptxParser;
 use std::path::PathBuf;
 
 mod common;
+
+const PPTX_MIME: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
 fn get_test_file_path(filename: &str) -> PathBuf {
     common::fixture_path("pptx", filename)
 }
 
+async fn parse_fixture(filename: &str) -> ParsedDocument {
+    let path = get_test_file_path(filename);
+    assert!(path.exists(), "test fixture missing: {}", path.display());
+    PptxParser::new()
+        .parse_local_path(&path, None)
+        .await
+        .unwrap_or_else(|e| panic!("failed to parse {filename}: {e}"))
+}
+
+fn text_of(inlines: &[Inline]) -> String {
+    inlines
+        .iter()
+        .map(|i| match i {
+            Inline::Text { text, .. } | Inline::Link { text, .. } | Inline::Code { text, .. } => {
+                text.as_str()
+            }
+        })
+        .collect()
+}
+
+fn block_text(block: &ParsedBlock) -> String {
+    match block {
+        ParsedBlock::Heading { inlines, .. } | ParsedBlock::Paragraph { inlines } => {
+            text_of(inlines)
+        }
+        ParsedBlock::ListItem { blocks, .. } | ParsedBlock::Quote { blocks } => {
+            blocks.iter().map(block_text).collect::<Vec<_>>().join(" ")
+        }
+        _ => String::new(),
+    }
+}
+
+fn headings(doc: &ParsedDocument) -> Vec<String> {
+    doc.blocks
+        .iter()
+        .filter(|b| matches!(b, ParsedBlock::Heading { level: 2, .. }))
+        .map(block_text)
+        .collect()
+}
+
 #[tokio::test]
 async fn test_pptx_parser_basic_info() {
-    let parser = KreuzbergParser::new();
-
-    assert_eq!(parser.id(), "kreuzberg");
-    assert!(
-        parser.supported_extensions().contains(&"pptx"),
-        "KreuzbergParser should support pptx extension"
-    );
+    let parser = PptxParser::new();
+    assert_eq!(parser.id(), "pptx");
+    assert_eq!(parser.supported_extensions(), ["pptx"]);
 }
 
 #[tokio::test]
 async fn test_pptx_parser_with_simple_file() {
-    let parser = KreuzbergParser::new();
-    let test_file = get_test_file_path("simple_presentation.pptx");
+    let document = parse_fixture("simple_presentation.pptx").await;
 
-    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
-
-    let result = parser.parse_local_path(&test_file, None).await;
-
-    assert!(
-        result.is_ok(),
-        "Failed to parse PPTX file: {:?}",
-        result.err()
-    );
-
-    let document = result.unwrap();
-    assert!(!document.blocks.is_empty(), "Document should have blocks");
-
-    // Verify document metadata
-    assert!(document.meta.original_filename.is_some());
     assert_eq!(
         document.meta.original_filename.as_deref(),
         Some("simple_presentation.pptx")
     );
-    assert_eq!(
-        document.meta.content_type.as_deref(),
-        Some("application/vnd.openxmlformats-officedocument.presentationml.presentation")
+    assert_eq!(document.meta.content_type.as_deref(), Some(PPTX_MIME));
+    assert_eq!(headings(&document), ["Welcome to the Presentation"]);
+    assert!(
+        document
+            .blocks
+            .iter()
+            .any(|b| matches!(b, ParsedBlock::Paragraph { .. })
+                && block_text(b) == "This is a simple test presentation for file parser testing."),
+        "body text missing: {:?}",
+        document.blocks
     );
 }
 
 #[tokio::test]
-#[ignore = "kreuzberg (still as of 4.10.4) emits slides as `##` headings with no per-slide \
-separation — all slide content is flattened; heading_count == 1 regardless of slide count. \
-Re-enable when upgrading to a kreuzberg version that emits one Slide node per slide \
-and produces PageBreak between consecutive Slide root nodes."]
 async fn test_pptx_parser_with_multislide_file() {
-    let parser = KreuzbergParser::new();
-    let test_file = get_test_file_path("multi_slide.pptx");
+    let document = parse_fixture("multi_slide.pptx").await;
 
-    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
-
-    let result = parser.parse_local_path(&test_file, None).await;
-
-    assert!(
-        result.is_ok(),
-        "Failed to parse multi-slide PPTX file: {:?}",
-        result.err()
+    assert_eq!(
+        headings(&document),
+        [
+            "Multi-Slide Presentation",
+            "Slide 2: Content",
+            "Slide 3: More Content"
+        ]
     );
-
-    let document = result.unwrap();
-    assert!(!document.blocks.is_empty(), "Document should have blocks");
-
-    let heading_count = document
+    let page_breaks = document
         .blocks
         .iter()
-        .filter(|b| matches!(b, file_parser::domain::ir::ParsedBlock::Heading { .. }))
+        .filter(|b| matches!(b, ParsedBlock::PageBreak))
         .count();
-
+    assert_eq!(page_breaks, 2, "one page break between consecutive slides");
     assert!(
-        heading_count >= 2,
-        "Multi-slide file should have at least one heading per slide, found {heading_count}"
-    );
-
-    let page_break_count = document
-        .blocks
-        .iter()
-        .filter(|b| matches!(b, file_parser::domain::ir::ParsedBlock::PageBreak))
-        .count();
-
-    assert!(
-        page_break_count >= 1,
-        "Multi-slide file should have page breaks between slides, found {page_break_count}"
+        !matches!(document.blocks.last(), Some(ParsedBlock::PageBreak)),
+        "no page break after the last slide"
     );
 }
 
 #[tokio::test]
 async fn test_pptx_parser_nonexistent_file() {
-    let parser = KreuzbergParser::new();
+    let parser = PptxParser::new();
     let test_file = PathBuf::from("/nonexistent/path/to/file.pptx");
 
     let result = parser.parse_local_path(&test_file, None).await;
@@ -108,131 +117,109 @@ async fn test_pptx_parser_nonexistent_file() {
 
 #[tokio::test]
 async fn test_pptx_parser_invalid_pptx_bytes() {
-    let parser = KreuzbergParser::new();
+    let parser = PptxParser::new();
     let invalid_bytes = bytes::Bytes::from_static(b"This is not a valid PPTX file content");
 
-    let result = parser
+    let err = parser
         .parse_bytes(Some("invalid.pptx"), None, invalid_bytes)
-        .await;
+        .await
+        .expect_err("Should fail for invalid PPTX bytes");
 
-    assert!(result.is_err(), "Should fail for invalid PPTX bytes");
+    assert!(err.to_string().contains("PPTX"), "{err}");
 }
 
 #[tokio::test]
 async fn test_pptx_parser_parse_bytes() {
-    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_presentation.pptx");
-
-    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
-
     let file_content = std::fs::read(&test_file).expect("Failed to read test file");
-    let bytes = bytes::Bytes::from(file_content);
 
-    let result = parser
-        .parse_bytes(Some("simple_presentation.pptx"), None, bytes)
-        .await;
+    let document = PptxParser::new()
+        .parse_bytes(
+            Some("simple_presentation.pptx"),
+            None,
+            bytes::Bytes::from(file_content),
+        )
+        .await
+        .expect("Failed to parse PPTX bytes");
 
-    assert!(
-        result.is_ok(),
-        "Failed to parse PPTX bytes: {:?}",
-        result.err()
+    assert_eq!(
+        document.meta.source,
+        ParsedSource::Uploaded {
+            original_name: "simple_presentation.pptx".to_owned()
+        }
     );
-
-    let document = result.unwrap();
-    assert!(!document.blocks.is_empty(), "Document should have blocks");
+    assert_eq!(headings(&document), ["Welcome to the Presentation"]);
 }
 
 #[tokio::test]
-async fn test_pptx_parser_extracts_text() {
-    let parser = KreuzbergParser::new();
+async fn test_pptx_parser_respects_max_bytes() {
+    let parser = PptxParser::new().with_max_bytes(16);
     let test_file = get_test_file_path("simple_presentation.pptx");
 
-    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
-
     let result = parser.parse_local_path(&test_file, None).await;
-    let document = result.expect("Failed to parse PPTX");
 
-    // Find paragraph blocks with text content
-    let paragraph_count = document
-        .blocks
-        .iter()
-        .filter(|b| matches!(b, file_parser::domain::ir::ParsedBlock::Paragraph { .. }))
-        .count();
-
-    assert!(
-        paragraph_count >= 1,
-        "PPTX should contain at least one paragraph block, found {paragraph_count}"
-    );
+    assert!(result.is_err(), "a file over max_bytes must be rejected");
 }
 
 #[tokio::test]
-#[ignore = "kreuzberg (still as of 4.10.4) PptxExtractor hardcodes include_structure: false and \
-rebuilds from plain text — table cells are not pipe-formatted so no Table nodes are produced. \
-result.tables is empty and result.document contains only Paragraph nodes with cell text. \
-Re-enable when upgrading to a kreuzberg version that emits NodeContent::Table for PPTX tables."]
 async fn test_pptx_parser_with_tables() {
-    let parser = KreuzbergParser::new();
-    let test_file = get_test_file_path("presentation_with_table.pptx");
+    let document = parse_fixture("presentation_with_table.pptx").await;
 
-    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
-
-    let result = parser.parse_local_path(&test_file, None).await;
-
-    assert!(
-        result.is_ok(),
-        "Failed to parse PPTX with tables: {:?}",
-        result.err()
-    );
-
-    let document = result.unwrap();
-    assert!(!document.blocks.is_empty(), "Document should have blocks");
-
-    let table_count = document
+    let tables: Vec<_> = document
         .blocks
         .iter()
-        .filter(|b| matches!(b, file_parser::domain::ir::ParsedBlock::Table(_)))
-        .count();
-
-    assert!(
-        table_count >= 1,
-        "PPTX with tables should contain at least one table block, found {table_count}"
+        .filter_map(|b| match b {
+            ParsedBlock::Table(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(tables.len(), 1, "blocks: {:?}", document.blocks);
+    let table = tables[0];
+    let cells: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|r| {
+            r.cells
+                .iter()
+                .map(|c| c.blocks.iter().map(block_text).collect())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        cells,
+        [
+            ["Name", "Role", "Department"],
+            ["Alice", "Engineer", "Engineering"],
+            ["Bob", "Manager", "Operations"],
+        ]
     );
+    assert!(table.rows[0].is_header);
+    assert!(table.rows[1..].iter().all(|r| !r.is_header));
+    // The table slide's title placeholder is empty.
+    assert_eq!(headings(&document), ["Slide 1"]);
 }
 
 #[tokio::test]
 async fn test_pptx_parser_with_lists() {
-    let parser = KreuzbergParser::new();
-    let test_file = get_test_file_path("presentation_with_list.pptx");
+    let document = parse_fixture("presentation_with_list.pptx").await;
 
-    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
-
-    let result = parser.parse_local_path(&test_file, None).await;
-
-    assert!(
-        result.is_ok(),
-        "Failed to parse PPTX with lists: {:?}",
-        result.err()
-    );
-
-    let document = result.unwrap();
-    assert!(!document.blocks.is_empty(), "Document should have blocks");
-
-    // Kreuzberg may represent list content as list items or paragraphs depending
-    // on the DocumentStructure it produces for PPTX. Check that content was extracted.
-    let content_block_count = document
+    assert_eq!(headings(&document), ["Key Points"]);
+    // The content placeholder's bullets come from the slide master.
+    let items: Vec<(u8, bool, String)> = document
         .blocks
         .iter()
-        .filter(|b| {
-            matches!(
-                b,
-                file_parser::domain::ir::ParsedBlock::ListItem { .. }
-                    | file_parser::domain::ir::ParsedBlock::Paragraph { .. }
-            )
+        .filter_map(|b| match b {
+            ParsedBlock::ListItem { level, ordered, .. } => Some((*level, *ordered, block_text(b))),
+            _ => None,
         })
-        .count();
-
-    assert!(
-        content_block_count >= 1,
-        "PPTX with lists should contain at least one content block, found {content_block_count}"
+        .collect();
+    assert_eq!(
+        items,
+        [
+            (0, false, "First important point".to_owned()),
+            (0, false, "Second important point".to_owned()),
+            (0, false, "Third important point".to_owned()),
+            (1, false, "Sub-point under third".to_owned()),
+        ]
     );
 }

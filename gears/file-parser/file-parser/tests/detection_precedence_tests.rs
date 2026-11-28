@@ -12,9 +12,10 @@ use bytes::Bytes;
 use file_parser::Detection;
 use file_parser::domain::detector::{Confidence, ContentTypeDetector, DetectedType};
 use file_parser::domain::error::DomainError;
+use file_parser::domain::ir::{Inline, ParsedBlock};
 use file_parser::domain::parser::FileParserBackend;
 use file_parser::domain::service::{FileParserService, ServiceConfig};
-use file_parser::infra::parsers::{ImageParser, KreuzbergParser, PlainTextParser, StubParser};
+use file_parser::infra::parsers::{HtmlParser, ImageParser, PlainTextParser, StubParser};
 
 /// Always returns the same canned detection result.
 struct FixedDetector(Option<DetectedType>);
@@ -412,10 +413,10 @@ async fn detected_type_is_passed_to_the_backend_not_the_stale_hint() {
 }
 
 #[tokio::test]
-async fn detected_html_overrides_a_wrong_extension_and_still_parses_via_kreuzberg() {
-    // Real KreuzbergParser, not the hint-agnostic backends the other tests use:
+async fn detected_html_overrides_a_wrong_extension_and_still_parses() {
+    // The real HtmlParser, not the hint-agnostic backends the other tests use:
     // detection must leave it able to extract, not just able to be selected.
-    let parsers: Vec<Arc<dyn FileParserBackend>> = vec![Arc::new(KreuzbergParser::new())];
+    let parsers: Vec<Arc<dyn FileParserBackend>> = vec![Arc::new(HtmlParser::new())];
     let config = ServiceConfig {
         max_file_size_bytes: 10 * 1024 * 1024,
         allowed_local_base_dir: std::env::temp_dir(),
@@ -431,9 +432,18 @@ async fn detected_html_overrides_a_wrong_extension_and_still_parses_via_kreuzber
             Detection::Auto,
         )
         .await
-        .expect("detection should route to KreuzbergParser and supply an extractable MIME");
+        .expect("detection should route to HtmlParser and supply an extractable MIME");
 
     assert_eq!(doc.meta.content_type.as_deref(), Some("text/html"));
+    assert!(
+        matches!(
+            doc.blocks.as_slice(),
+            [ParsedBlock::Paragraph { inlines }]
+                if matches!(inlines.as_slice(), [Inline::Text { text, .. }] if text == "hello")
+        ),
+        "the text is extracted: {:?}",
+        doc.blocks
+    );
 }
 
 #[tokio::test]

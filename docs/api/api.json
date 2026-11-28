@@ -53964,7 +53964,8 @@
         "summary": "Parse a file from a local path",
         "tags": [
           "File Parser"
-        ]
+        ],
+        "x-toolkit-request-timeout": "2m 12s"
       }
     },
     "/file-parser/v1/parse-local/markdown": {
@@ -54072,7 +54073,8 @@
         "summary": "Parse a local file and stream Markdown",
         "tags": [
           "File Parser"
-        ]
+        ],
+        "x-toolkit-request-timeout": "2m 12s"
       }
     },
     "/file-parser/v1/upload": {
@@ -54210,7 +54212,8 @@
         "summary": "Upload and parse a file",
         "tags": [
           "File Parser"
-        ]
+        ],
+        "x-toolkit-request-timeout": "2m 12s"
       }
     },
     "/file-parser/v1/upload/markdown": {
@@ -54337,7 +54340,8 @@
         "summary": "Upload and parse a file, streaming Markdown",
         "tags": [
           "File Parser"
-        ]
+        ],
+        "x-toolkit-request-timeout": "2m 12s"
       }
     },
     "/github-mirror/v1/cache": {
