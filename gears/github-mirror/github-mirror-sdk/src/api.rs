@@ -9,7 +9,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::SecurityContext;
 
-use crate::models::{MirrorStatus, Repo, SyncSummary};
+use crate::models::{MirrorStatus, Repo, SyncOptions, SyncSummary};
 
 /// Public API trait for the github-mirror gear (Version 1).
 ///
@@ -43,4 +43,33 @@ pub trait GithubMirrorClientV1: Send + Sync {
         owner: &str,
         name: &str,
     ) -> Result<SyncSummary, CanonicalError>;
+
+    /// [`Self::sync_repository`] on the caller's terms: `options.credential`
+    /// names the secret in the credential store the sync reads GitHub with.
+    ///
+    /// A sync never falls back to another token: a credential that cannot
+    /// read the repository fails the sync with GitHub's answer (not found, or
+    /// access refused) and writes no rows. A successful sync binds the
+    /// repository to the credential, and a later sync naming none keeps
+    /// using it.
+    ///
+    /// The default implementation serves a request without a credential
+    /// through [`Self::sync_repository`] and refuses one that names a
+    /// credential, so an implementation that cannot honour it never syncs
+    /// with a token the caller did not ask for.
+    async fn sync_repository_with(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        options: SyncOptions,
+    ) -> Result<SyncSummary, CanonicalError> {
+        if options.credential.is_some() {
+            return Err(CanonicalError::internal(
+                "this github-mirror client cannot sync with a named credential",
+            )
+            .create());
+        }
+        self.sync_repository(ctx, owner, name).await
+    }
 }

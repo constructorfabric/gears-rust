@@ -154,11 +154,15 @@ Unlike repotap, raw bodies are kept only as the HTTP cache. Reads are answered f
 
 The gear is started and stopped by the framework. `stop()` cancels the pool and waits for running syncs, then for the in-process syncs `LocalClient` started; when the framework's hard-stop deadline fires first, the pool task is aborted. A job cut short gives its claim back through a drop guard, and its session is closed out as `interrupted` by the next start-up sweep.
 
-#### One GitHub Token
+#### GitHub Credentials
 
 - [x] `p1` - **ID**: `cpt-cf-github-mirror-constraint-one-token`
 
-The gear is configured with one token: `github_token_secret` names its secret in the credential store, read on the gear's first request to GitHub and kept until a restart. All tenants' syncs share its rate limit, so a backoff pauses every request made with it. A token per tenant is future work. Unknown keys in the gear's config are refused at start-up, so the `github_token` key of earlier builds fails loudly instead of leaving the gear unauthenticated.
+The gear has one gear-wide token: `github_token_secret` names its secret in the credential store, read on the gear's first request to GitHub and kept until a restart. Unknown keys in the gear's config are refused at start-up, so the `github_token` key of earlier builds fails loudly instead of leaving the gear unauthenticated.
+
+A sync may name its own credential instead (gears-rust#5970): a credential-store reference, the caller's tenant and a key. The secret is read when the sync is requested, as the caller, so the credential store's access rules decide who may use it, and it is read again for every sync, so a rotated token reaches the next one. A reference to another tenant is refused before the store is asked. The sync reads GitHub with that token only: when GitHub does not show it the repository, the sync fails with GitHub's answer (`404` not found, or access refused) and no other token is tried. A sync whose Discovery read the repository binds the repository to its credential (`gm_repo_sync_status.credential_key`); a later sync or resume that names no credential reads with the bound one, so the gear-wide token never reads a repository a tenant bound to its own credential. A repository never bound syncs with the gear-wide token as before. Rows stay tenant-scoped, so each tenant reads only what its own syncs wrote. A gear without the credential store refuses a sync that names a credential.
+
+Each token has its own GitHub client and `RateLimitController` (ADR-0003), kept in a bounded map keyed by the token's SHA-256 (`max_credential_clients`; past it the client used longest ago is dropped), so two references to one token share one budget. All clients share the one `max_concurrent_requests` ceiling. A client of a named credential caches responses in the tenant's own partition only, never the shared public-repository partition, since what GitHub answers differs per token.
 
 #### Tenant Isolation in Storage
 
@@ -272,10 +276,10 @@ Response store with compression and a content hash, in `gm_http_cache` or, with 
 
 | Method and path | What it does |
 |---|---|
-| `POST /repos/{owner}/{name}/sync` | Queue a sync. Query: `force`, `force_full`, `include`, `actions_scope`, `reactions_scope`, `timeline_scope`, `since`. `202` with the session id; a repeat on the same terms joins the running sync; other terms get `409` |
+| `POST /repos/{owner}/{name}/sync` | Queue a sync. Query: `force`, `force_full`, `include`, `actions_scope`, `reactions_scope`, `timeline_scope`, `since`, `credential_key` and `credential_tenant_id` (the credential to read GitHub with, see [GitHub Credentials](#github-credentials); the tenant defaults to the caller's). `202` with the session id; a repeat on the same terms, credential included, joins the running sync; other terms get `409`; a credential the caller cannot read gets `400` before anything is queued |
 | `POST /sync/resume` | Re-queue repositories still `in_progress` (optionally one, `?repo=owner/name`) |
 | `GET /sessions`, `GET /sessions/{id}` | Session list and one session: status, progress, error, summary |
-| `GET /sync-status` | Per-repository run status; filter `status=in_progress\|complete` |
+| `GET /sync-status` | Per-repository run status and the key of the credential the repository is bound to; filter `status=in_progress\|complete` |
 | `DELETE /cache` | Clear the caller's cached responses for `?owner=` or `?repo=owner/name`; shared public-repository entries stay, and a sync with `force=true` re-fetches them |
 | `GET /repos` | Mirrored repositories |
 | `GET /repos/{owner}/{name}/commits/{sha}/files`, `GET /repos/{owner}/{name}/pulls/{number}/threads` | Data GitHub's REST paths do not serve in this shape |
@@ -283,19 +287,22 @@ Response store with compression and a content hash, in `gm_http_cache` or, with 
 
 Errors use the platform's canonical problem body; a validation error names the parameter in `context.field_violations`.
 
+With `rest.enabled: false` the gear registers none of these routes and none of the GitHub-compatible ones below, and serves only in process, through the SDK and the `Service` in the client hub.
+
 #### GitHub-Compatible API (root)
 
 `/user`, `/user/repos`, and under `/repos/{owner}/{name}`: the repository, issues (with comments, events, reactions, timeline), pull requests (with reviews, review comments, files, commits), commits (with comments, statuses, check runs), branches, tags, releases, labels, milestones, contributors, deployments, workflow runs and their jobs. Responses use GitHub's field names, paging (`page`, `per_page` up to 100) and error body.
 
 #### SDK
 
-`GithubMirrorClientV1` in `github-mirror-sdk`: `status`, `list_repos`, `sync_repository`. `LocalClient` serves it in process; `sync_repository` runs a sync on a task of its own, waits for it and returns its `SyncSummary` (see [In-Process Sync](#in-process-sync)).
+`GithubMirrorClientV1` in `github-mirror-sdk`: `status`, `list_repos`, `sync_repository`, and `sync_repository_with(ctx, owner, name, SyncOptions { credential })`, which names the `CredentialRef` (tenant and key) the sync reads GitHub with. `LocalClient` serves it in process; a sync runs on a task of its own, and the call waits for it and returns its `SyncSummary` (see [In-Process Sync](#in-process-sync)). The trait's default `sync_repository_with` refuses a named credential, so an implementation that cannot honour one never syncs with another token.
 
 #### Ports
 
 | Port | Used for |
 |---|---|
 | `GithubPort` | Every GitHub read the engine makes: listings, details, actions, the cache clear |
+| `GithubCredentials` | The `GithubPort` of a credential a sync names, read from the credential store as the caller (`infra/github/credentials.rs`) |
 | `SyncWriter` | Every write a sync makes, one transaction per call |
 | `*Repository` traits | Reads for the API and the few reads the engine needs (for example `open_head_shas`) |
 
@@ -406,6 +413,7 @@ Transitions: `queued` → `in_progress` when a worker (or `sync_now`) starts the
 | `status` | `in_progress` or `complete` |
 | `last_session_id` | The session that last touched it; used to tell whether its holder is still alive |
 | `last_synced_at` | When a run last completed |
+| `credential_key` | Credential-store key, in the row's tenant, of the credential that last read the repository; `NULL` for the gear-wide token. Later syncs naming no credential read with it |
 
 #### Table: gm_active_syncs
 
@@ -413,7 +421,7 @@ Transitions: `queued` → `in_progress` when a worker (or `sync_now`) starts the
 |---|---|
 | `tenant_id`, `repo_full_name` | Primary key: at most one queued or running sync per repository, across every process |
 | `session_id` | The session holding the repository |
-| `scope_json`, `since` | The terms it runs on; a request on the same terms joins it, others get `409` |
+| `scope_json`, `since`, `credential_key` | The terms it runs on, the credential among them; a request on the same terms joins it, others get `409` |
 | `owner_id`, `updated_at` | The process that holds it, which refreshes `updated_at` every minute |
 
 #### Table: gm_http_cache
@@ -465,7 +473,7 @@ Tasks have no table: the queue is in memory.
 
 #### Migrations
 
-The first migration, `m0001_initial`, creates the original `gm_*` tables and indexes; its SQL is in `migrations/m0001_initial/` (`postgres.sql`, `mysql.sql`, `sqlite.sql`), and `down()` drops the tables. The gear was never published, so the 48 migrations of its development were folded into this one; a database created by an earlier build must be dropped and recreated. The second, `m0002_artifacts`, adds `gm_artifacts` and `gm_workflows`, the `(tenant_id, repo_id, created_at)` and `(tenant_id, repo_id, updated_at)` indexes on `gm_comments`, and the `html_url` column on `gm_commits` and `gm_pull_request_commits`; its SQL is in `migrations/m0002_artifacts/`, with the `down()` SQL in the `down_*.sql` files beside it. From here on a change to a table that already holds rows is additive, and every migration has a `down()` (see the PRD's schema-change rule). A new migration takes the next number.
+The first migration, `m0001_initial`, creates the original `gm_*` tables and indexes; its SQL is in `migrations/m0001_initial/` (`postgres.sql`, `mysql.sql`, `sqlite.sql`), and `down()` drops the tables. The gear was never published, so the 48 migrations of its development were folded into this one; a database created by an earlier build must be dropped and recreated. The second, `m0002_artifacts`, adds `gm_artifacts` and `gm_workflows`, the `(tenant_id, repo_id, created_at)` and `(tenant_id, repo_id, updated_at)` indexes on `gm_comments`, and the `html_url` column on `gm_commits` and `gm_pull_request_commits`; its SQL is in `migrations/m0002_artifacts/`, with the `down()` SQL in the `down_*.sql` files beside it. From here on a change to a table that already holds rows is additive, and every migration has a `down()` (see the PRD's schema-change rule). The third, `m0003_credential_binding`, adds the nullable `credential_key` column to `gm_repo_sync_status` and `gm_active_syncs`; existing rows keep `NULL`, the gear-wide token. A new migration takes the next number.
 
 ### 3.8 Core Algorithms
 
@@ -530,7 +538,7 @@ A run races `sync_deadline_minutes`. When the deadline wins, the run's own cance
 
 | Behaviour | Value |
 |---|---|
-| Requests in flight | `max_concurrent_requests` (default 8), one semaphore for all syncs |
+| Requests in flight | `max_concurrent_requests` (default 8), one semaphore for all syncs and every token |
 | Rate limit | every request is admitted by the token's `RateLimitController` (ADR-0003) before it takes a shared permit: it waits while a backoff runs, while the core budget is down to its reserve (10% of the limit, at most 50), or while the in-flight count is at the soft cap. A `429` or `Retry-After` halves the soft cap and sets the backoff, and a later deadline is never shortened by an earlier one or by a healthy answer; healthy answers grow the cap back toward `max_concurrent_requests`. A GraphQL answer refused with `RATE_LIMITED` holds GraphQL calls only, since its point budget is separate from REST's. A rate-limited request is retried up to 30 times, each wait at most 5 minutes, enough to ride out an hourly window (the reference retries 4 times) |
 | Server errors and send failures | 3 retries, backing off from 2 seconds |
 | Timeouts | 10 s to connect, 60 s per request |
@@ -567,7 +575,7 @@ Each task commits on its own, so a reader can see a repository part way through 
 
 ### Security
 
-Every read and write passes the policy enforcer for its resource type and is scoped to the caller's tenant in storage. A read the caller may not make answers `404`, so it does not confirm that a repository exists. The token is kept as a secret, never logged, and never sent over plain HTTP except to loopback. Logged text is redacted, and the bodies of GitHub's GraphQL errors are logged rather than stored in a session's `error`.
+Every read and write passes the policy enforcer for its resource type and is scoped to the caller's tenant in storage. A read the caller may not make answers `404`, so it does not confirm that a repository exists. Every token, the gear-wide one and those syncs name, is kept as a secret, never logged, and never sent over plain HTTP except to loopback; the client map holds a token's SHA-256, not the token, and errors about a credential name its key, never its value. Logged text is redacted, and the bodies of GitHub's GraphQL errors are logged rather than stored in a session's `error`.
 
 ### Operations
 
@@ -577,6 +585,8 @@ Configuration (`config` of the gear):
 |---|---|
 | `api_base_url` | `https://api.github.com` |
 | `github_token_secret` | none (`tenant_id` and `key` of the token's secret in the credential store) |
+| `max_credential_clients` | 64; GitHub clients kept for credentials syncs name, one per token |
+| `rest.enabled` | `true`; `false` registers no REST route and leaves the SDK |
 | `scope` | every family except security; actions and reactions `open`, timeline `none` |
 | `cache_compression` | `gzip` |
 | `max_concurrent_syncs` | 4 |
@@ -612,7 +622,8 @@ Configuration is one TOML file (`--config`, default `./github-mirror.toml`) merg
 
 ### Future Work
 
-- A token per tenant, with its own rate-limit budget; shared public-repository entries would then need the token in the key, since GitHub's `permissions` field differs per token.
+- One stored copy of a repository several tenants sync, with access still decided per tenant credential; until then each tenant keeps its own rows.
+- Rate-limit state per credential through `rate_limit` and the host's meter; `rate_limit` reports the gear-wide token only.
 - An "as of" marker on read endpoints for readers that must not see a repository mid-sync.
 - Python bindings and write-back described in the PRD.
 

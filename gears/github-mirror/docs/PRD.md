@@ -266,8 +266,9 @@ so the unchecked boxes below read as "not yet", not "abandoned".
 
 **Deferred to tracked follow-ups**:
 
-- A GitHub token per tenant and token pools (`cpt-cf-github-mirror-fr-token-pool`):
-  not yet scheduled
+- Token pools (`cpt-cf-github-mirror-fr-token-pool`): not yet scheduled. A sync can
+  already name its own credential, and the repository stays bound to it
+  ([gears-rust#5970](https://github.com/constructorfabric/gears-rust/issues/5970))
 - Write-back operations, Python bindings, state-change events: later
   increments of this PRD, not yet scheduled
 - Annotated-tag metadata: tags are mirrored as list-tags returns them (`name` plus
@@ -309,10 +310,12 @@ so the unchecked boxes below read as "not yet", not "abandoned".
   Mirrored data is treated as shared within the tenant that configured the sync.
 - *`target_url`/`details_url` pass through verbatim.* The mirror is a faithful
   replica; redacting or allow-listing CI/status URLs is a consumer-side concern.
-- *One gear-wide `github_token` is an interim shortcut.* Until
-  [gears-rust#4534](https://github.com/constructorfabric/gears-rust/issues/4534)
-  lands, every tenant's sync authenticates to GitHub with the same credential; the
-  README documents the operational caveat.
+- *The gear-wide `github_token_secret` is the fallback, not the only credential.* A
+  sync that names no credential, of a repository no credential is bound to,
+  authenticates with it; a sync may name a tenant's own credential instead, and the
+  repository is then bound to that one
+  ([gears-rust#5970](https://github.com/constructorfabric/gears-rust/issues/5970)).
+  The README documents the operational caveat of the gear-wide token.
 - *The health endpoint is runtime infrastructure.* `/github-mirror/v1/health` reports
   gear liveness/version/configuration and sits outside this PRD's requirement
   tracking, like every other gear's health probe.

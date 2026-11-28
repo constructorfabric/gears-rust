@@ -132,6 +132,7 @@ fn job(telemetry_file: Option<&str>) -> SyncJob {
         telemetry_file: telemetry_file.map(ToOwned::to_owned),
         max_concurrent_tasks: None,
         access_scope: toolkit_security::AccessScope::default(),
+        credential: crate::domain::service::SyncCredential::default(),
         claim: None,
     }
 }

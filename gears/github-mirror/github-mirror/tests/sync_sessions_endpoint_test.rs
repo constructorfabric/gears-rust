@@ -461,6 +461,7 @@ async fn sessions_and_run_statuses_page_past_the_first_page() {
                     status: RepoRunStatus::Complete,
                     last_session_id: Some(id),
                     last_synced_at: None,
+                    credential_key: None,
                 },
             )
             .await

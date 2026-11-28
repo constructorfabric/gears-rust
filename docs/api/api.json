@@ -18924,6 +18924,13 @@
       "RepoSyncStatusDto": {
         "description": "Per-repository run status: the durable record resume works from.",
         "properties": {
+          "credential_key": {
+            "description": "Credential-store key of the credential that last read the repository; null for the gear-wide token.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "last_session_id": {
             "description": "The run that last wrote this row.",
             "type": [
@@ -54939,7 +54946,7 @@
     },
     "/github-mirror/v1/repos/{owner}/{name}/sync": {
       "post": {
-        "description": "Queues a sync of the repository and answers immediately with a session id. The background worker pages through the repository and every object type in scope, replays the `ETag` it stored last time so GitHub can answer `304` instead of resending a page, and waits out a rate limit before carrying on. What it fetches is upserted into the caller's tenant mirror; poll the session for the outcome. While a sync of the repository is queued or running, a request on the same terms joins it and one with a different scope or `since` is refused with `409`.",
+        "description": "Queues a sync of the repository and answers immediately with a session id. The background worker pages through the repository and every object type in scope, replays the `ETag` it stored last time so GitHub can answer `304` instead of resending a page, and waits out a rate limit before carrying on. What it fetches is upserted into the caller's tenant mirror; poll the session for the outcome. While a sync of the repository is queued or running, a request on the same terms joins it and one with a different scope, `since` or credential is refused with `409`. `credential_key` names the secret in the credential store the sync reads GitHub with, read as the caller; the sync never falls back to another token, and one that reads the repository binds it to that credential for later syncs.",
         "operationId": "github_mirror.v1.sync_repository",
         "parameters": [
           {
@@ -55018,6 +55025,24 @@
             "description": "RFC3339 instant; closed issues and pull requests older than this are not collected",
             "in": "query",
             "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Credential-store key of the GitHub token to sync with; omit to keep the repository's bound credential, or the gear-wide token",
+            "in": "query",
+            "name": "credential_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant of `credential_key`; defaults to the caller's own, and no other is accepted",
+            "in": "query",
+            "name": "credential_tenant_id",
             "required": false,
             "schema": {
               "type": "string"

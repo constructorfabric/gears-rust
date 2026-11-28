@@ -66,6 +66,44 @@ pub struct GithubMirrorConfig {
     pub tenants: HashMap<Uuid, TenantConfig>,
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
+    /// How many GitHub clients the gear keeps for credentials that sync
+    /// requests name, one per token (gears-rust#5970). Past the bound the
+    /// client used longest ago is dropped and built again when next needed.
+    #[serde(default = "default_max_credential_clients")]
+    pub max_credential_clients: NonZeroUsize,
+    /// The gear's REST surface.
+    #[serde(default)]
+    pub rest: RestConfig,
+}
+
+/// Whether the gear serves REST at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestConfig {
+    /// `false` registers none of the gear's routes, neither
+    /// `/github-mirror/v1/*` nor the GitHub-compatible `/repos/*` and
+    /// `/user*`; the gear is then reached only in process, through
+    /// `GithubMirrorClientV1` and the `Service` in the client hub.
+    #[serde(default = "default_rest_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for RestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_rest_enabled(),
+        }
+    }
+}
+
+fn default_rest_enabled() -> bool {
+    true
+}
+
+/// Clients kept for named credentials when the config says nothing: one per
+/// token a deployment's tenants are likely to sync with at once.
+fn default_max_credential_clients() -> NonZeroUsize {
+    NonZeroUsize::new(64).unwrap_or(NonZeroUsize::MIN)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -196,6 +234,8 @@ impl Default for GithubMirrorConfig {
             cache_max_age_days: None,
             tenants: HashMap::new(),
             cache_dir: None,
+            max_credential_clients: default_max_credential_clients(),
+            rest: RestConfig::default(),
         }
     }
 }
@@ -262,6 +302,24 @@ mod tests {
         assert!(
             matches!(err, crate::domain::error::DomainError::Validation { ref message, .. } if message.contains("http")),
             "expected the error to name the allowed schemes, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rest_is_on_unless_the_config_turns_it_off() {
+        let default: GithubMirrorConfig = serde_json::from_str("{}").unwrap();
+        assert!(default.rest.enabled);
+
+        let off: GithubMirrorConfig =
+            serde_json::from_str(r#"{"rest":{"enabled":false}}"#).unwrap();
+        assert!(!off.rest.enabled);
+    }
+
+    #[test]
+    fn an_unknown_rest_setting_fails_to_parse() {
+        assert!(
+            serde_json::from_str::<GithubMirrorConfig>(r#"{"rest":{"enable":false}}"#).is_err(),
+            "a misspelt switch must not leave the REST surface on silently"
         );
     }
 

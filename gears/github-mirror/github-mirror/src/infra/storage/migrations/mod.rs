@@ -3,6 +3,7 @@ use sea_orm_migration::sea_orm::{ConnectionTrait, DatabaseBackend};
 
 pub mod m0001_initial;
 pub mod m0002_artifacts;
+pub mod m0003_credential_binding;
 
 async fn run_schema(
     manager: &SchemaManager<'_>,
@@ -48,6 +49,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m0001_initial::Migration),
             Box::new(m0002_artifacts::Migration),
+            Box::new(m0003_credential_binding::Migration),
         ]
     }
 }

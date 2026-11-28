@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use async_trait::async_trait;
@@ -25,6 +26,7 @@ use crate::domain::service::{ACTIVE_SYNC_TOUCH_EVERY, SWEEP_AGAIN_AFTER, Service
 use crate::domain::sync::SyncPoolRunner;
 use crate::infra::github::cache::HttpCache;
 use crate::infra::github::client::{GithubClient, TokenSource};
+use crate::infra::github::credentials::{ClientSettings, CredentialClients};
 use crate::infra::storage::fs_cache::FilesystemHttpCache;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmActiveSyncRepository, SeaOrmArtifactRepository, SeaOrmBranchRepository,
@@ -116,6 +118,8 @@ async fn github_token(
 #[derive(Default)]
 pub struct GithubMirrorGear {
     service: OnceLock<Arc<ConcreteService>>,
+    /// `rest.enabled: false` from the config, read at init.
+    rest_disabled: AtomicBool,
     sync_cancel_token: Mutex<Option<CancellationToken>>,
     sync_handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -182,12 +186,40 @@ impl Gear for GithubMirrorGear {
             Some(dir) => Arc::new(FilesystemHttpCache::new(dir, cfg.cache_compression)),
             None => Arc::new(SeaOrmHttpCache::new(Arc::clone(&db), cfg.cache_compression)),
         };
-        let client = GithubClient::with_cache(cfg.api_base_url.clone(), None, http_cache)?
-            .with_max_concurrent_requests(cfg.max_concurrent_requests);
+        // One ceiling on requests in flight for every token the gear reads
+        // with: GitHub's secondary rate limit reacts to the gear's
+        // concurrency, whichever tokens it spreads over.
+        let permits = Arc::new(tokio::sync::Semaphore::new(
+            cfg.max_concurrent_requests.get(),
+        ));
+        let client =
+            GithubClient::with_cache(cfg.api_base_url.clone(), None, Arc::clone(&http_cache))?
+                .with_shared_permits(Arc::clone(&permits), cfg.max_concurrent_requests);
         if let Some(secret) = cfg.github_token_secret {
             client.set_token_source(Arc::new(CredstoreToken::new(ctx, secret)?))?;
         }
         let github: Arc<dyn GithubPort> = Arc::new(client);
+        // Credentials named per sync are read from the credential store when
+        // it is there; without it such a sync is refused, and the gear-wide
+        // token works as before.
+        let credentials = ctx
+            .client_hub()
+            .get::<dyn CredStoreClientV1>()
+            .ok()
+            .map(|credstore| {
+                Arc::new(CredentialClients::new(
+                    credstore,
+                    ClientSettings {
+                        api_base_url: cfg.api_base_url.clone(),
+                        cache: http_cache,
+                        permits,
+                        max_concurrent_requests: cfg.max_concurrent_requests,
+                    },
+                    cfg.max_credential_clients,
+                ))
+            });
+        self.rest_disabled
+            .store(!cfg.rest.enabled, Ordering::Relaxed);
 
         let authz = ctx
             .client_hub()
@@ -195,7 +227,7 @@ impl Gear for GithubMirrorGear {
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
         let policy_enforcer = PolicyEnforcer::new(authz);
 
-        let service = Arc::new(Service::new(
+        let service = Service::new(
             Arc::clone(&db),
             repo,
             issues,
@@ -253,7 +285,11 @@ impl Gear for GithubMirrorGear {
                     .collect(),
             },
             Arc::new(JsonlTelemetrySink::start()?),
-        ));
+        );
+        let service = Arc::new(match credentials {
+            Some(credentials) => service.with_credentials(credentials),
+            None => service,
+        });
 
         self.service
             .set(service.clone())
@@ -424,6 +460,13 @@ impl RestApiCapability for GithubMirrorGear {
             .ok_or_else(|| anyhow::anyhow!("Service not initialized"))?
             .clone();
 
+        if self.rest_disabled.load(Ordering::Relaxed) {
+            info!(
+                gear = Self::MODULE_NAME,
+                "REST surface turned off by `rest.enabled: false`; serving in process only"
+            );
+            return Ok(router);
+        }
         let router = routes::register_routes(router, openapi, service);
         info!(gear = Self::MODULE_NAME, "REST routes registered");
         Ok(router)
@@ -474,6 +517,6 @@ mod tests {
     fn gear_provides_all_migrations() {
         use toolkit::contracts::DatabaseCapability;
         let gear = GithubMirrorGear::default();
-        assert_eq!(gear.migrations().len(), 2);
+        assert_eq!(gear.migrations().len(), 3);
     }
 }
