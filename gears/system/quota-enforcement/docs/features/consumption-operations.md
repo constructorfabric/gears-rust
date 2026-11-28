@@ -266,7 +266,7 @@ counter mutation
 6. [x] - `p1` - **IF** the boundary surfaces a canonical error (timeout, cost cap, invariant violation, internal) - `inst-pipe-fail-if`
    1. [x] - `p1` - **RETURN** the canonical error and roll the transaction back; fail-closed, no counter mutation, no idempotency record - `inst-pipe-fail`
 7. [x] - `p1` - DB: `apply_debit_plan(applicable, plan, idem_scope, events)`: mutate every plan entry's counter, persist the idempotency record, append the operation-log entry, and enqueue the outbox events, all inside the same transaction (I1, I2, I11); a `Denied` Decision changes no counter and persists its idempotency record with an empty plan so an exact replay returns the original verdict (PRD §5.8), while the operation log records only successful mutating operations per the DESIGN `OperationLog` definition; a `NO_APPLICABLE_QUOTA` denial persists no idempotency record and no operation-log entry per the PRD §5.8 exception for that denial; concurrent multi-Quota mutations follow the deterministic lexicographic `quota_id` acquisition ordering of ADR-0002 - `inst-pipe-apply`
-8. [x] - `p1` - Forward the `AccessScope` unmodified into every storage read and write, where `SecureConn` compiles it into query filters (phase-2 defense-in-depth per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition`); the orchestrator never calls the PDP, holds no `TypesRegistryClient`, and performs no schema resolution, so registry latency cannot enter the transaction - `inst-pipe-scope`
+8. [x] - `p1` - Forward the `AccessScope` unmodified into every storage read and write, where `SecureConn` compiles it into query filters (phase-2 defense-in-depth per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition`); the orchestrator never calls the PDP, holds no `types-registry-sdk`, and performs no schema resolution, so registry latency cannot enter the transaction - `inst-pipe-scope`
 9. [x] - `p1` - Emit the `quota_enforcement.operations.debit` span with the admission phase and the evaluation as sibling spans and the storage call under the evaluation, per DESIGN §4.1 - `inst-pipe-spans`
 10. [x] - `p1` - **RETURN** the committed Decision; orchestrator instances are not singletons, join no cluster election, and delegate all synchronization between concurrent instances to the storage plugin's serialization of row mutations (I9) - `inst-pipe-return`
 
@@ -406,7 +406,7 @@ feature and invoke the Engine boundary of the resolution-policy-engine feature w
 **MUST** capture `EvaluationContext` metadata at the locked-read step (ADR-0003), apply Debit Plans through
 `apply_debit_plan` under the ADR-0002 lexicographic acquisition ordering, forward the `AccessScope` unmodified into
 every storage call for `SecureConn` compilation, and emit the DESIGN §4.1 stage spans. The orchestrator **MUST NOT**
-call the PDP, hold a `TypesRegistryClient`, or join a cluster election; synchronization between concurrent
+call the PDP, hold a `types-registry-sdk`, or join a cluster election; synchronization between concurrent
 instances is delegated to the storage plugin (I9).
 
 **Implements**:

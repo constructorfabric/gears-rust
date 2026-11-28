@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use license_resolver_sdk::field;
 use toolkit_macros::domain_model;
-use types_registry_sdk::GtsTypeSchema;
+use types_registry_sdk::TypeSchema;
 
 use super::error::DomainError;
 
@@ -36,15 +36,17 @@ pub enum ContractRegistryError {
 /// registry failures into [`ContractRegistryError`].
 #[async_trait]
 pub trait ContractRegistry: Send + Sync {
-    /// Resolve a contract type-schema with its derivation chain linked, so
-    /// `ancestors` / `effective_*` observe the whole chain.
+    /// Resolve an active contract type-schema with its authored `content`, its
+    /// `resolved_schema` (the whole chain inlined) and its `effective_traits`
+    /// selected. A registry answer without one of them is returned as is; the
+    /// validation reports such a contract unusable.
     ///
     /// # Errors
     ///
     /// - [`ContractRegistryError::Unregistered`] — nothing registered under `type_id`.
     /// - [`ContractRegistryError::MalformedTypeId`] — `type_id` is not a GTS type id.
     /// - [`ContractRegistryError::Unavailable`] — the registry could not answer.
-    async fn contract_schema(&self, type_id: &str) -> Result<GtsTypeSchema, ContractRegistryError>;
+    async fn contract_schema(&self, type_id: &str) -> Result<TypeSchema, ContractRegistryError>;
 }
 
 /// How a check ended. A bounded set, because it is a metric label.

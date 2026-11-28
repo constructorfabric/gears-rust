@@ -21,8 +21,7 @@ workspace = true
 # Local dependencies
 license-enforcement-sdk = { workspace = true, features = ["rest-server"] }
 license-resolver-sdk = { workspace = true }
-types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
@@ -69,6 +68,7 @@ integration = []
 
 [dev-dependencies]
 authz-resolver-sdk = { workspace = true, features = ["test-util"] }
+toolkit = { workspace = true, features = ["test-support"] }
 # Path-only: a versioned dev-dependency that is not a normal one fails
 # `tools/scripts/check_release_config.py`.
 le-default-evaluator = { package = "cf-gears-le-default-evaluator", path = "../plugins/default-evaluator" }

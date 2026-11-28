@@ -33,8 +33,7 @@ parking_lot = { workspace = true }
 quota-enforcement-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
-types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 # Sweeper leader election on the platform cluster gear (ADR-0006). The SDK only:
 # no `deps = [cluster]` edge and no cluster gear dependency.
 cluster-sdk = { workspace = true }
@@ -76,6 +75,9 @@ opentelemetry = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+# The real registry behind the managed-admission tests.
+types-registry = { workspace = true }
+toolkit = { workspace = true, features = ["test-support"] }
 criterion.workspace = true
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }

@@ -5,11 +5,12 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use license_resolver_sdk::{LicenseResolverPluginClient, LicenseResolverPluginSpecV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::GtsId;
 
 use crate::config::StaticLicensePluginConfig;
 use crate::domain::Service;
@@ -24,11 +25,12 @@ pub const INSTANCE_SUFFIX: &str = "cf.builtin.static_license_resolver.plugin.v1"
 
 /// Static license resolver plugin gear.
 ///
-/// The gateway's SDK publishes the plugin spec via link-time inventory; this gear
-/// registers its own instance (vendor + priority) and its scoped client.
+/// license-resolver publishes the plugin spec; the runtime publishes this gear's
+/// instance (vendor + priority, from the configuration) before `init`, and
+/// `init` binds the scoped client to the admitted instance.
 #[toolkit::gear(
     name = "static-license-plugin",
-    deps = [types_registry]
+    gts_publication(entities = Self::plugin_instance),
 )]
 pub struct StaticLicensePlugin {
     service: OnceLock<Arc<Service>>,
@@ -39,6 +41,24 @@ impl Default for StaticLicensePlugin {
         Self {
             service: OnceLock::new(),
         }
+    }
+}
+
+impl StaticLicensePlugin {
+    /// The publication's config-only document: the plugin instance, admitted
+    /// by the runtime before `init`.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: StaticLicensePluginConfig = inputs.config_or_default()?;
+        // An invalid rule set is never advertised as a backend.
+        Service::from_config(&cfg)?;
+        let (id, document) = PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
+            INSTANCE_SUFFIX,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
     }
 }
 
@@ -61,29 +81,19 @@ impl Gear for StaticLicensePlugin {
         // startup rather than advertise a backend that denies everything.
         let service = Arc::new(Service::from_config(&cfg)?);
 
-        let (instance_id, instance_json) =
-            PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
-                INSTANCE_SUFFIX,
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
-
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        let manifest = ctx.gts_publication_manifest()?;
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         let api: Arc<dyn LicenseResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn LicenseResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
+        bind_plugin_instances::<LicenseResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            manifest.documents(),
+            &api,
+        )?;
         Ok(())
     }
 }

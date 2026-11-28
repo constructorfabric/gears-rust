@@ -32,7 +32,7 @@ use crate::domain::admission::{Admission, AdmissionTarget, Admitted};
 use crate::domain::catalog::{ProjectionContractCatalog, check_projection_reference};
 use crate::domain::error::{DomainError, ResourceKind};
 use crate::domain::pep::{actions, resources};
-use crate::domain::ports::contracts::ContractRegistry;
+use crate::domain::ports::contracts::{ContractRegistry, RegistryCaller};
 use crate::domain::ports::metric_registry::{Classified, MetricMode, MetricRegistry};
 use crate::domain::ports::metrics::{DenialReason, QeMetrics, ValidationSurface};
 use crate::domain::tokens;
@@ -119,7 +119,7 @@ impl<'a> QuotaManagement<'a> {
             events,
             mode,
             kind,
-        } = self.prepare_create(draft).await?;
+        } = self.prepare_create(ctx, draft).await?;
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-outside-tx
         // Everything above ran without a storage call; the transaction below
@@ -167,10 +167,11 @@ impl<'a> QuotaManagement<'a> {
     /// violation, the metadata violation.
     pub(super) async fn prepare_create(
         &self,
+        ctx: &SecurityContext,
         draft: super::validation::ShapedDraft,
     ) -> Result<PreparedCreate, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-metric
-        let classified = self.describe_metric(&draft.metric).await?;
+        let classified = self.describe_metric(ctx, &draft.metric).await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-metric
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-create:p1:inst-qcr-membership
@@ -178,7 +179,7 @@ impl<'a> QuotaManagement<'a> {
         // registered one outside the catalogue; the catalogue alone cannot.
         let snapshot = self
             .registry
-            .type_schema(&draft.subject.projection_type)
+            .type_schema(RegistryCaller::Request(ctx), &draft.subject.projection_type)
             .await?;
         check_projection_reference(
             self.catalog,
@@ -335,7 +336,7 @@ impl<'a> QuotaManagement<'a> {
         }
         validate_patched_shape(&current, &patch).map_err(|e| self.shape_rejected(e))?;
         // Metric identity is revalidated at update time.
-        let classified = self.describe_metric(&current.metric).await?;
+        let classified = self.describe_metric(ctx, &current.metric).await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-validate
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-update:p1:inst-qup-meta-if
@@ -470,7 +471,9 @@ impl<'a> QuotaManagement<'a> {
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-deactivated
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-read
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-window
-        let kinds = self.kinds_of(std::slice::from_ref(&quota.metric)).await?;
+        let kinds = self
+            .kinds_of(ctx, std::slice::from_ref(&quota.metric))
+            .await?;
         let kind = kinds.get(&quota.metric).copied();
         // @cpt-end:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-window
         // @cpt-begin:cpt-cf-quota-enforcement-flow-quota-read:p1:inst-qrd-return
@@ -515,7 +518,7 @@ impl<'a> QuotaManagement<'a> {
             .read_quotas(ctx, &admitted.access_scope, filter, page)
             .await?;
         let metrics: Vec<MetricId> = page.items.iter().map(|q| q.metric.clone()).collect();
-        let kinds = self.kinds_of(&metrics).await?;
+        let kinds = self.kinds_of(ctx, &metrics).await?;
         Ok(view_page(page, &kinds, OffsetDateTime::now_utc()))
     }
 
@@ -543,18 +546,24 @@ impl<'a> QuotaManagement<'a> {
 
     /// The metric must be a registered, classified instance of the metric
     /// base; a stale classification is good enough to admit a write.
-    async fn describe_metric(&self, metric: &MetricId) -> Result<Classified, DomainError> {
-        self.metric_registry.describe(metric).await?.ok_or_else(|| {
-            DomainError::MetricNotRegistered {
+    async fn describe_metric(
+        &self,
+        ctx: &SecurityContext,
+        metric: &MetricId,
+    ) -> Result<Classified, DomainError> {
+        self.metric_registry
+            .describe(RegistryCaller::Request(ctx), metric)
+            .await?
+            .ok_or_else(|| DomainError::MetricNotRegistered {
                 metric: metric.as_str().to_owned(),
-            }
-        })
+            })
     }
 
     /// The kinds of the distinct metrics of a read. A metric the registry no
     /// longer knows is logged and left out; the Quota stays readable.
     async fn kinds_of(
         &self,
+        ctx: &SecurityContext,
         metrics: &[MetricId],
     ) -> Result<HashMap<MetricId, MetricKind>, DomainError> {
         let mut kinds = HashMap::new();
@@ -562,7 +571,11 @@ impl<'a> QuotaManagement<'a> {
             if kinds.contains_key(metric) {
                 continue;
             }
-            if let Some(classified) = self.metric_registry.describe(metric).await? {
+            if let Some(classified) = self
+                .metric_registry
+                .describe(RegistryCaller::Request(ctx), metric)
+                .await?
+            {
                 kinds.insert(metric.clone(), classified.descriptor.kind);
             } else {
                 tracing::warn!(

@@ -22,7 +22,7 @@ use super::model::{
     ResourceProjectionContract, SubjectProjectionContract, parse_metric_under_base,
 };
 use crate::domain::error::DomainError;
-use crate::domain::ports::contracts::{ContractRegistry, RegisteredType};
+use crate::domain::ports::contracts::{ContractRegistry, RegisteredType, RegistryCaller};
 use crate::domain::ports::metrics::{QeMetrics, ValidationReason, ValidationSurface};
 
 const LOG_TARGET: &str = "qe.bootstrap";
@@ -171,7 +171,7 @@ impl<'a> CatalogBuilder<'a> {
     ) -> Result<RegisteredType, DomainError> {
         let registered = self
             .registry
-            .type_schema(id)
+            .type_schema(RegistryCaller::Platform, id)
             .await?
             .ok_or_else(|| self.reject(ValidationReason::Unregistered, id.to_string()))?;
         if registered.is_abstract {
@@ -348,7 +348,7 @@ impl<'a> CatalogBuilder<'a> {
             })?;
         let constraint = self
             .registry
-            .type_schema(&constraint_id)
+            .type_schema(RegistryCaller::Platform, &constraint_id)
             .await?
             .ok_or_else(|| {
                 self.reject(

@@ -14,13 +14,14 @@ use quota_enforcement_sdk::{
     QuotaManagerApi, SubjectRef,
 };
 use quota_enforcement_storage_plugin::StoragePluginGear;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;
 use toolkit::config::ConfigProvider;
+use toolkit::gts_publication::GtsPublicationCapability;
 use toolkit::lifecycle::ReadySignal;
 use toolkit::{ClientHub, Gear, GearCtx, HealthcheckResult, RestApiCapability};
 use toolkit_canonical_errors::CanonicalError;
@@ -33,10 +34,9 @@ use crate::domain::notifications::DeliveryLifecycle;
 use crate::domain::{Dependency, DomainError, ReadinessState};
 use crate::test_support::{
     ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
-    OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, in_process_registry,
-    llm_gateway_documents, metric_base_documents, plugin_instance_document, register_pdp,
-    register_sink, register_storage, sink_instance, storage_instance, tenant, wire_cluster,
-    wire_cluster_with,
+    OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, llm_gateway_documents,
+    metric_base_documents, register_pdp, register_sink, register_storage, sink_instance,
+    storage_instance, tenant, wire_cluster, wire_cluster_with,
 };
 
 struct StaticConfigProvider {
@@ -73,13 +73,19 @@ fn make_ctx_wired(hub: Arc<ClientHub>, wiring: serde_json::Value) -> GearCtx {
     if !wiring.is_null() {
         cfg["quota-enforcement"]["clients"]["provides"] = wiring;
     }
+    let config = StaticConfigProvider { root: cfg };
+    let manifest = QuotaEnforcementGear::default()
+        .descriptor()
+        .build_gts_manifest(&config)
+        .expect("the QE manifest builds");
     GearCtx::new(
         QuotaEnforcementGear::MODULE_NAME,
         Uuid::from_u128(1),
-        Arc::new(StaticConfigProvider { root: cfg }),
+        Arc::new(config),
         hub,
         CancellationToken::new(),
     )
+    .with_gts_publication_manifest_for_test(Arc::new(manifest))
 }
 
 /// Which cluster profile the test binds.
@@ -115,8 +121,7 @@ fn environment_with_pdp(
     let storage_fixture = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    documents.push(plugin_instance_document(&storage_fixture));
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(&documents, &[storage_fixture.published()]);
     register_pdp(&hub, pdp);
     let storage = Arc::new(InMemoryStorage::new());
     if with_storage_client {
@@ -141,20 +146,82 @@ async fn init_fails_closed_without_an_authz_resolver_client() {
     assert!(gear.service().is_none());
 }
 
+/// The runtime publishes the QE-owned definitions before `init`: the
+/// manifest is the SDK collector, under the gear's name.
+#[test]
+fn the_manifest_is_the_sdk_collector() {
+    let manifest = QuotaEnforcementGear::default()
+        .descriptor()
+        .build_gts_manifest(&StaticConfigProvider {
+            root: serde_json::Value::Null,
+        })
+        .expect("manifest");
+    let ids: Vec<String> = manifest
+        .documents()
+        .iter()
+        .map(|(id, _)| id.as_ref().to_owned())
+        .collect();
+    let declared: Vec<String> = quota_enforcement_sdk::gts_declarations()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, declared);
+    assert_eq!(manifest.publisher_name(), "quota-enforcement");
+}
+
+/// Outside the runtime — without the admitted manifest — `init` fails before
+/// wiring anything.
 #[tokio::test]
-async fn init_fails_closed_without_a_types_registry_client() {
+async fn init_without_an_admitted_manifest_fails() {
+    let (hub, _storage, fixture) = environment(true, ClusterBinding::QuotaEnforcement);
+    let ctx = GearCtx::new(
+        QuotaEnforcementGear::MODULE_NAME,
+        Uuid::from_u128(1),
+        Arc::new(StaticConfigProvider {
+            root: serde_json::Value::Null,
+        }),
+        hub,
+        CancellationToken::new(),
+    );
+    let gear = QuotaEnforcementGear::default();
+
+    let err = gear.init(&ctx).await.expect_err("no admitted manifest");
+
+    assert!(
+        format!("{err:#}").contains("admitted GTS manifest"),
+        "{err:#}"
+    );
+    assert!(gear.service().is_none());
+    fixture.stop().await;
+}
+
+/// The registry clients are consumed contracts, wired after `init`: `init`
+/// does not need them, and without them the bootstrap fails closed and the
+/// gear never signals ready.
+#[tokio::test]
+async fn without_types_registry_clients_init_succeeds_and_serve_never_becomes_ready() {
     let hub = Arc::new(ClientHub::new());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
     );
-    let gear = QuotaEnforcementGear::default();
-    let err = gear
-        .init(&make_ctx(hub))
+    let gear = Arc::new(QuotaEnforcementGear::default());
+    gear.init(&make_ctx(hub))
         .await
-        .expect_err("no registry, no catalogue, no gear");
-    assert!(format!("{err:#}").contains("types-registry"), "{err:#}");
-    assert!(gear.service().is_none());
+        .expect("init needs no registry client");
+
+    let (tx, rx) = oneshot::channel();
+    let err = gear
+        .clone()
+        .serve(CancellationToken::new(), ReadySignal::from_sender(tx))
+        .await
+        .expect_err("no registry, no catalogue");
+    assert!(format!("{err:#}").contains("bootstrap"), "{err:#}");
+    assert!(rx.await.is_err(), "the ready signal is never sent");
+    assert!(
+        !gear.service().expect("service").readiness().is_ready(),
+        "not ready"
+    );
 }
 
 #[tokio::test]
@@ -327,20 +394,43 @@ async fn commit_one_event(
     event
 }
 
+fn sql_plugin_config() -> StaticConfigProvider {
+    StaticConfigProvider {
+        root: json!({ "quota-enforcement-storage-plugin": { "config": { "vendor": "acme" } } }),
+    }
+}
+
+/// The manifest the runtime admits for the SQL storage plugin.
+fn sql_plugin_manifest() -> toolkit::gts_publication::GtsManifest {
+    StoragePluginGear::default()
+        .descriptor()
+        .build_gts_manifest(&sql_plugin_config())
+        .expect("the plugin manifest builds")
+}
+
+/// The SQL storage plugin's published instance, as the platform registry lists it.
+fn sql_plugin_published() -> Vec<(String, Value)> {
+    sql_plugin_manifest()
+        .documents()
+        .iter()
+        .map(|(id, document)| (id.as_ref().to_owned(), document.clone()))
+        .collect()
+}
+
 /// The published SQL storage plugin's context: its config and an in-memory
 /// `SQLite` database with its migrations applied.
 async fn sql_plugin_ctx(hub: Arc<ClientHub>) -> GearCtx {
     use quota_enforcement_storage_plugin::infra::storage::Migrator;
     use sea_orm_migration::MigratorTrait as _;
 
-    let cfg = json!({ "quota-enforcement-storage-plugin": { "config": { "vendor": "acme" } } });
     let ctx = GearCtx::new(
         StoragePluginGear::MODULE_NAME,
         Uuid::from_u128(2),
-        Arc::new(StaticConfigProvider { root: cfg }),
+        Arc::new(sql_plugin_config()),
         hub,
         CancellationToken::new(),
-    );
+    )
+    .with_gts_publication_manifest_for_test(Arc::new(sql_plugin_manifest()));
     let opts = toolkit_db::ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),
@@ -360,8 +450,9 @@ async fn serve_delivers_what_the_published_sql_plugin_commits_to_a_registered_si
     let sink_fixture = sink_instance("cf.core._.qe_sink_audit.v1", "acme");
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    documents.push(plugin_instance_document(&sink_fixture));
-    let hub = hub_with_registry(in_process_registry(documents));
+    let mut plugins = sql_plugin_published();
+    plugins.push(sink_fixture.published());
+    let hub = hub_with_registry(&documents, &plugins);
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -674,7 +765,7 @@ impl AuthZResolverApi for NarrowingPdp {
 async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay_visible() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     let pdp = Arc::new(NarrowingPdp {
         narrowed: std::sync::atomic::AtomicBool::new(false),
     });
@@ -788,7 +879,7 @@ async fn a_bulk_envelope_over_the_sql_plugin_replays_only_while_its_targets_stay
 async fn a_debit_over_the_sql_plugin_traces_admission_and_evaluation_under_the_operation() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -1005,7 +1096,7 @@ async fn bulk_step_spans(
 async fn bulk_envelopes_over_the_sql_plugin_open_the_same_spans_for_one_item_and_for_ten() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),
@@ -1111,7 +1202,7 @@ where
 async fn span_overhead_over_the_sql_plugin() {
     let mut documents = llm_gateway_documents();
     documents.extend(metric_base_documents());
-    let hub = hub_with_registry(in_process_registry(documents));
+    let hub = hub_with_registry(&documents, &sql_plugin_published());
     register_pdp(
         &hub,
         Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()])),

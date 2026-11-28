@@ -20,8 +20,7 @@ workspace = true
 [dependencies]
 # Local dependencies
 license-resolver-sdk = { workspace = true, features = ["rest-client", "rest-server"] }
-types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 
 # ToolKit dependencies
 toolkit = { workspace = true }

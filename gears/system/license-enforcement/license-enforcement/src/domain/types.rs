@@ -15,7 +15,12 @@ use toolkit::client_hub::ClientHub;
 use toolkit_canonical_errors::{CanonicalError, FieldViolation};
 use toolkit_macros::domain_model;
 use toolkit_odata::filter::{FieldKind, FilterField};
-use types_registry_sdk::{GtsTypeSchema, TypesRegistryClient};
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use types_registry_sdk::{
+    EntityField, FieldSelection, LifecycleStatus, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions, TypeSchema, TypesRegistryApi,
+    TypesRegistryApiExt,
+};
 
 use super::error::DomainError;
 
@@ -77,15 +82,18 @@ pub fn filter_matches(f: &BindingFilter, subject: &SubjectRef) -> bool {
 ///
 /// `Internal` when the trait is not a list of strings: the registered contract
 /// is unusable, as license-resolver reports it.
-fn admits(resource: &GtsTypeSchema, subject_type: &GtsTypeId) -> Result<bool, DomainError> {
+fn admits(resource: &TypeSchema, subject_type: &GtsTypeId) -> Result<bool, DomainError> {
     let unusable = |why: &str| {
         DomainError::Internal(format!(
             "registered contract '{}' is unusable: trait `{ADMITTED_SUBJECTS_TRAIT}` {why}",
             resource.type_id
         ))
     };
-    let traits = resource.effective_traits();
-    let items = match traits.get(ADMITTED_SUBJECTS_TRAIT) {
+    let items = match resource
+        .effective_traits
+        .as_ref()
+        .and_then(|traits| traits.get(ADMITTED_SUBJECTS_TRAIT))
+    {
         None | Some(Value::Null) => return Ok(false),
         Some(Value::Array(items)) => items,
         Some(_) => return Err(unusable("is not an array")),
@@ -112,14 +120,17 @@ fn admits(resource: &GtsTypeSchema, subject_type: &GtsTypeId) -> Result<bool, Do
 /// serialize.
 fn conforms<T: serde::Serialize>(
     root: &str,
-    contract: &GtsTypeSchema,
+    contract: &TypeSchema,
     object: &T,
     violations: &mut Vec<FieldViolation>,
 ) -> Result<(), DomainError> {
     let id = &contract.type_id;
+    let schema = contract.resolved_schema.as_ref().ok_or_else(|| {
+        DomainError::Internal(format!("registered contract '{id}' has no resolved schema"))
+    })?;
     let validator = jsonschema::options()
         .with_draft(jsonschema::Draft::Draft7)
-        .build(&contract.effective_schema())
+        .build(schema)
         .map_err(|e| {
             DomainError::Internal(format!(
                 "registered contract '{id}' is unusable: not a valid JSON Schema: {e}"
@@ -140,9 +151,26 @@ fn conforms<T: serde::Serialize>(
     Ok(())
 }
 
+fn is_abstract(schema: &TypeSchema) -> bool {
+    schema
+        .content
+        .as_ref()
+        .and_then(|content| content.get(X_GTS_ABSTRACT))
+        == Some(&Value::Bool(true))
+}
+
+/// The chain without the type itself; a base is not its own derivation.
+fn derives_from(type_id: &GtsTypeId, base: &str) -> bool {
+    GtsId::try_new(type_id.as_ref()).is_ok_and(|id| {
+        let mut chain = id.chain_ids();
+        chain.pop();
+        chain.iter().any(|ancestor| ancestor == base)
+    })
+}
+
 /// What types-registry answers for a type id.
 enum Lookup {
-    Found(Box<GtsTypeSchema>),
+    Found(Box<TypeSchema>),
     Unregistered,
     Malformed(String),
 }
@@ -152,7 +180,7 @@ const MAX_REPORTED_VIOLATIONS: usize = 20;
 
 /// Schemas resolved during one request, so that a pack of a thousand grants on
 /// the same types asks types-registry once per type.
-pub type Schemas = HashMap<String, Option<GtsTypeSchema>>;
+pub type Schemas = HashMap<String, Option<TypeSchema>>;
 
 /// Schema of the object that conditions address: the subject and the resource
 /// of a check, each by its contract. `None` when a type did not resolve; its
@@ -165,13 +193,24 @@ pub fn conditions_schema(terms: &GrantTerms, seen: &Schemas) -> Option<Value> {
     Some(serde_json::json!({
         "type": "object",
         "properties": {
-            "subject": subject.effective_schema(),
-            "resource": resource.effective_schema(),
+            "subject": subject.resolved_schema,
+            "resource": resource.resolved_schema,
         },
     }))
 }
 
-/// Resolves type ids through types-registry at write time.
+/// Whose read of the types registry a lookup is: the gear's own at start, or a
+/// request's under the caller's context.
+#[derive(Clone, Copy)]
+enum Caller<'a> {
+    Platform,
+    Request(&'a SecurityContext),
+}
+
+/// Resolves type ids through types-registry at write time: a request's
+/// lookups through `TypesRegistryApi` under the caller's context, the start
+/// check through `PlatformTypesRegistryApi`. Both clients are consumed
+/// contracts, resolved from the hub per call.
 #[domain_model]
 pub struct TypeResolver {
     hub: Arc<ClientHub>,
@@ -185,38 +224,75 @@ impl TypeResolver {
 
     async fn schema(
         &self,
+        ctx: &SecurityContext,
         type_id: &str,
         seen: &mut Schemas,
-    ) -> Result<Option<GtsTypeSchema>, DomainError> {
+    ) -> Result<Option<TypeSchema>, DomainError> {
         if let Some(schema) = seen.get(type_id) {
             return Ok(schema.clone());
         }
-        let schema = self.fetch(type_id).await?;
+        let schema = self.fetch(Caller::Request(ctx), type_id).await?;
         seen.insert(type_id.to_owned(), schema.clone());
         Ok(schema)
     }
 
-    async fn fetch(&self, type_id: &str) -> Result<Option<GtsTypeSchema>, DomainError> {
-        Ok(match self.lookup(type_id).await? {
+    async fn fetch(
+        &self,
+        caller: Caller<'_>,
+        type_id: &str,
+    ) -> Result<Option<TypeSchema>, DomainError> {
+        Ok(match self.lookup(caller, type_id).await? {
             Lookup::Found(schema) => Some(*schema),
             Lookup::Unregistered | Lookup::Malformed(_) => None,
         })
     }
 
-    async fn lookup(&self, type_id: &str) -> Result<Lookup, DomainError> {
-        // Resolved per call: types-registry commits its catalog after the
-        // system-gear init phase.
-        let registry = self
-            .hub
-            .get::<dyn TypesRegistryClient>()
-            .map_err(|e| DomainError::DependencyUnavailable(format!("types-registry: {e}")))?;
-        match registry.get_type_schema(type_id).await {
-            Ok(schema) => Ok(Lookup::Found(Box::new(schema))),
+    async fn lookup(&self, caller: Caller<'_>, type_id: &str) -> Result<Lookup, DomainError> {
+        let unavailable = |e: &dyn std::fmt::Display| {
+            DomainError::DependencyUnavailable(format!("types-registry: {e}"))
+        };
+        let id = match GtsTypeId::try_new(type_id) {
+            Ok(id) => id,
+            Err(e) => return Ok(Lookup::Malformed(e.to_string())),
+        };
+        let options =
+            ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
+                EntityField::Content,
+                EntityField::ResolvedSchema,
+                EntityField::EffectiveTraits,
+            ])));
+        let read = match caller {
+            Caller::Platform => {
+                let registry = self
+                    .hub
+                    .get::<dyn PlatformTypesRegistryApi>()
+                    .map_err(|e| unavailable(&e))?;
+                registry
+                    .get_type_schema(&PlatformSecurityContext::outbound_marker(), &id, options)
+                    .await
+            }
+            Caller::Request(ctx) => {
+                let registry = self
+                    .hub
+                    .get::<dyn TypesRegistryApi>()
+                    .map_err(|e| unavailable(&e))?;
+                registry.get_type_schema(ctx, &id, options).await
+            }
+        };
+        match read {
+            Ok(schema) => found(type_id, schema),
             Err(CanonicalError::NotFound { .. }) => Ok(Lookup::Unregistered),
             Err(CanonicalError::InvalidArgument { detail, .. }) => Ok(Lookup::Malformed(detail)),
-            Err(e) => Err(DomainError::DependencyUnavailable(format!(
-                "types-registry: {e}"
-            ))),
+            // The registry refused a request's caller: its refusal, not an outage.
+            Err(CanonicalError::Unauthenticated { .. }) if matches!(caller, Caller::Request(_)) => {
+                Err(DomainError::Unauthenticated)
+            }
+            Err(CanonicalError::PermissionDenied { .. })
+                if matches!(caller, Caller::Request(_)) =>
+            {
+                Err(DomainError::PermissionDenied)
+            }
+            Err(e) => Err(unavailable(&e)),
         }
     }
 
@@ -227,7 +303,7 @@ impl TypeResolver {
     /// The first missing type, or a registry fault.
     pub async fn ensure_registered(&self, types: &[GtsTypeId]) -> Result<(), DomainError> {
         for t in types {
-            if self.fetch(t.as_ref()).await?.is_none() {
+            if self.fetch(Caller::Platform, t.as_ref()).await?.is_none() {
                 return Err(DomainError::Internal(format!(
                     "type '{t}' named by the evaluator is not registered"
                 )));
@@ -243,6 +319,7 @@ impl TypeResolver {
     /// A registry fault.
     pub async fn validate_terms(
         &self,
+        ctx: &SecurityContext,
         field: &str,
         terms: &GrantTerms,
         violations: &mut Vec<FieldViolation>,
@@ -252,6 +329,7 @@ impl TypeResolver {
         let subject_field = format!("{field}.subject_type");
         let resource = self
             .derived(
+                ctx,
                 &resource_field,
                 terms.resource.gts_type.as_ref(),
                 <LicenseResourceV1<()> as GtsSchema>::TYPE_ID,
@@ -261,6 +339,7 @@ impl TypeResolver {
             .await?;
         let subject = self
             .derived(
+                ctx,
                 &subject_field,
                 terms.subject_type.as_ref(),
                 <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID,
@@ -270,7 +349,7 @@ impl TypeResolver {
             .await?;
         // A check names a concrete resource type and matches it exactly.
         let resource = match resource {
-            Some(r) if r.raw_schema.get(X_GTS_ABSTRACT) == Some(&Value::Bool(true)) => {
+            Some(r) if is_abstract(&r) => {
                 violations.push(FieldViolation::new(
                     &resource_field,
                     format!("'{}' is abstract", terms.resource.gts_type),
@@ -303,13 +382,14 @@ impl TypeResolver {
     /// A registry fault.
     pub async fn validate_subject_of(
         &self,
+        ctx: &SecurityContext,
         field: &str,
         subject_type: &GtsTypeId,
         named: &GtsTypeId,
         violations: &mut Vec<FieldViolation>,
         seen: &mut Schemas,
     ) -> Result<(), DomainError> {
-        if self.schema(named.as_ref(), seen).await?.is_none() {
+        if self.schema(ctx, named.as_ref(), seen).await?.is_none() {
             violations.push(FieldViolation::new(
                 field,
                 format!("type '{named}' is not registered"),
@@ -336,12 +416,14 @@ impl TypeResolver {
     /// or an object that does not serialize.
     pub async fn validate_check(
         &self,
+        ctx: &SecurityContext,
         subject: &Subject,
         resource: &Resource,
         violations: &mut Vec<FieldViolation>,
     ) -> Result<(), DomainError> {
         let resource_contract = self
             .contract(
+                ctx,
                 field::RESOURCE_TYPE_FIELD,
                 resource.gts_type.as_ref(),
                 <LicenseResourceV1<()> as GtsSchema>::TYPE_ID,
@@ -350,6 +432,7 @@ impl TypeResolver {
             .await?;
         let subject_contract = self
             .contract(
+                ctx,
                 field::SUBJECT_TYPE_FIELD,
                 subject.gts_type.as_ref(),
                 <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID,
@@ -381,16 +464,17 @@ impl TypeResolver {
     /// violation.
     async fn contract(
         &self,
+        ctx: &SecurityContext,
         type_field: &str,
         type_id: &str,
         base: &str,
         violations: &mut Vec<FieldViolation>,
-    ) -> Result<Option<GtsTypeSchema>, DomainError> {
+    ) -> Result<Option<TypeSchema>, DomainError> {
         let mut violation = |description: String, reason: &str| {
             violations.push(FieldViolation::new(type_field, description, reason));
             Ok(None)
         };
-        let contract = match self.lookup(type_id).await? {
+        let contract = match self.lookup(Caller::Request(ctx), type_id).await? {
             Lookup::Found(contract) => *contract,
             Lookup::Unregistered => {
                 return violation(
@@ -405,17 +489,13 @@ impl TypeResolver {
                 );
             }
         };
-        if contract.raw_schema.get(X_GTS_ABSTRACT) == Some(&Value::Bool(true)) {
+        if is_abstract(&contract) {
             return violation(
                 format!("licensing contract '{type_id}' is abstract"),
                 field::CONTRACT_ABSTRACT,
             );
         }
-        if !contract
-            .ancestors()
-            .skip(1)
-            .any(|a| a.type_id.as_ref() == base)
-        {
+        if !derives_from(&contract.type_id, base) {
             return violation(
                 format!("licensing contract '{type_id}' does not derive from '{base}'"),
                 field::CONTRACT_NOT_DERIVED,
@@ -426,13 +506,14 @@ impl TypeResolver {
 
     async fn derived(
         &self,
+        ctx: &SecurityContext,
         field: &str,
         type_id: &str,
         base: &str,
         violations: &mut Vec<FieldViolation>,
         seen: &mut Schemas,
-    ) -> Result<Option<GtsTypeSchema>, DomainError> {
-        let Some(schema) = self.schema(type_id, seen).await? else {
+    ) -> Result<Option<TypeSchema>, DomainError> {
+        let Some(schema) = self.schema(ctx, type_id, seen).await? else {
             violations.push(FieldViolation::new(
                 field,
                 format!("type '{type_id}' is not registered"),
@@ -440,12 +521,7 @@ impl TypeResolver {
             ));
             return Ok(None);
         };
-        // `ancestors` yields the type itself first; a base is not its own derivation.
-        if !schema
-            .ancestors()
-            .skip(1)
-            .any(|a| a.type_id.as_ref() == base)
-        {
+        if !derives_from(&schema.type_id, base) {
             violations.push(FieldViolation::new(
                 field,
                 format!("type '{type_id}' does not derive from '{base}'"),
@@ -475,6 +551,28 @@ impl FilterField for PackOrderField {
     fn kind(&self) -> FieldKind {
         FieldKind::Uuid
     }
+}
+
+/// The lookup a registry answer is: a deleted type is no longer registered,
+/// and a registered one without the selected artifacts is unusable, an
+/// internal fault rather than an outage a retry cures.
+fn found(type_id: &str, schema: TypeSchema) -> Result<Lookup, DomainError> {
+    if schema.lifecycle_status != LifecycleStatus::Active {
+        return Ok(Lookup::Unregistered);
+    }
+    let missing = [
+        ("content", schema.content.is_none()),
+        ("resolved schema", schema.resolved_schema.is_none()),
+        ("effective traits", schema.effective_traits.is_none()),
+    ]
+    .into_iter()
+    .find_map(|(field, absent)| absent.then_some(field));
+    if let Some(field) = missing {
+        return Err(DomainError::Internal(format!(
+            "registered contract '{type_id}' is unusable: the registry returned no {field}"
+        )));
+    }
+    Ok(Lookup::Found(Box::new(schema)))
 }
 
 #[cfg(test)]

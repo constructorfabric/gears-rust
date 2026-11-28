@@ -6,7 +6,6 @@
 //! the four clients init resolves; the database, when there is one, is a
 //! migrated `SQLite` file, as the runtime's DB phase would leave it.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -16,14 +15,10 @@ use oagw_sdk::api::ServiceGatewayClientV1;
 use serde_json::{Value, json};
 use tenant_resolver_sdk::{TenantId, TenantResolverClient};
 use toolkit::{ClientHub, ConfigProvider, GearCtx};
-use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::{DBProvider, Db};
 use toolkit_security::SecurityContext;
 use tracing_test::traced_test;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use super::*;
@@ -52,6 +47,7 @@ use crate::domain::type_provisioning::{ProvisionedRoute, ProvisionedUpstream};
 use crate::infra::proxy_cache::testing::{ClusterFixture, ScriptedCache, facade, read_log, until};
 use crate::infra::storage::testing::SqliteFile;
 use toolkit::contracts::RunnableCapability;
+use toolkit::gts_publication::GtsPublicationCapability;
 
 const NO_HANDLE_MESSAGE: &str = "gears.oagw.database is configured but no database is available";
 const MEMORY_WARNING: &str = "upstreams and routes are kept in memory and lost on restart";
@@ -69,122 +65,39 @@ impl ConfigProvider for FixedConfig {
     }
 }
 
-/// Types registry that accepts every registration, which is all `init` asks
-/// of it. The SDK mock refuses non-empty registrations and ignores a listing's
-/// pattern; every other call goes to it.
-struct AcceptingTypesRegistry(MockTypesRegistryClient);
+/// The registry instance identifiers of [`one_upstream_registry`].
+const REGISTRY_UPSTREAM: &str =
+    toolkit_gts::gts_id!("cf.core.oagw.upstream.v1~cf.test.oagw.api.v1");
+const REGISTRY_ROUTE: &str = toolkit_gts::gts_id!("cf.core.oagw.route.v1~cf.test.oagw.api.v1");
 
-#[async_trait]
-impl TypesRegistryClient for AcceptingTypesRegistry {
-    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        Ok(entities
-            .iter()
-            .map(|e| RegisterResult::Ok {
-                gts_id: e["$id"].as_str().unwrap_or_default().to_owned(),
-            })
-            .collect())
-    }
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.0.register_type_schemas(type_schemas).await
-    }
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        self.0.get_type_schema(type_id).await
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        self.0.get_type_schema_by_uuid(type_uuid).await
-    }
-    async fn get_type_schemas(
-        &self,
-        type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        self.0.get_type_schemas(type_ids).await
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        self.0.get_type_schemas_by_uuid(type_uuids).await
-    }
-    async fn list_type_schemas(
-        &self,
-        query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        self.0.list_type_schemas(query).await
-    }
-    async fn register_instances(
-        &self,
-        instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.0.register_instances(instances).await
-    }
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
-        self.0.get_instance(id).await
-    }
-    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        self.0.get_instance_by_uuid(uuid).await
-    }
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        self.0.get_instances(ids).await
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        self.0.get_instances_by_uuid(uuids).await
-    }
-    async fn list_instances(
-        &self,
-        query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        // Only the trailing-`*` prefix patterns OAGW lists with.
-        let prefix = query
-            .pattern
-            .as_deref()
-            .map(|p| p.trim_end_matches('*').to_owned());
-        let mut instances = self.0.list_instances(query).await?;
-        if let Some(prefix) = prefix {
-            instances.retain(|i| i.id.as_ref().starts_with(&prefix));
-        }
-        Ok(instances)
-    }
+/// The row ids OAGW provisions [`REGISTRY_UPSTREAM`] and [`REGISTRY_ROUTE`]
+/// into: their registry UUIDs.
+fn registry_row_ids() -> (Uuid, Uuid) {
+    let uuid = |id| gts::GtsId::try_new(id).unwrap().to_uuid();
+    (uuid(REGISTRY_UPSTREAM), uuid(REGISTRY_ROUTE))
 }
 
 /// A fresh hub holding the clients init resolves.
 fn wired_hub() -> Arc<ClientHub> {
     hub_over(
         MockTenantResolverClient::single_tenant(),
-        MockTypesRegistryClient::new(),
+        MockTypesRegistry::new(),
     )
 }
 
 /// A fresh hub holding the clients init resolves, with these tenants and
 /// types-registry content.
-fn hub_over(
-    tenants: MockTenantResolverClient,
-    registry: MockTypesRegistryClient,
-) -> Arc<ClientHub> {
+fn hub_over(tenants: MockTenantResolverClient, registry: MockTypesRegistry) -> Arc<ClientHub> {
     hub_with(Arc::new(tenants), registry)
 }
 
 /// [`hub_over`] with any tenant resolver.
-fn hub_with(
-    tenants: Arc<dyn TenantResolverClient>,
-    registry: MockTypesRegistryClient,
-) -> Arc<ClientHub> {
+fn hub_with(tenants: Arc<dyn TenantResolverClient>, registry: MockTypesRegistry) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn TenantResolverClient>(tenants);
     hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
     hub.register::<dyn AuthZResolverApi>(Arc::new(CapturingAuthZResolverClient::new()));
-    hub.register::<dyn TypesRegistryClient>(Arc::new(AcceptingTypesRegistry(registry)));
+    Arc::new(registry).install(&hub);
     hub
 }
 
@@ -207,6 +120,25 @@ fn context(section: Value, db: Option<Db>, hub: Arc<ClientHub>) -> GearCtx {
 
 /// [`context`] with `root` as the runtime's root token.
 fn context_under(
+    section: Value,
+    db: Option<Db>,
+    hub: Arc<ClientHub>,
+    root: tokio_util::sync::CancellationToken,
+) -> GearCtx {
+    let manifest = Arc::new(manifest(&section));
+    unpublished_context(section, db, hub, root).with_gts_publication_manifest_for_test(manifest)
+}
+
+/// The publication manifest the runtime builds for `section`.
+fn manifest(section: &Value) -> toolkit::gts_publication::GtsManifest {
+    OutboundApiGatewayGear::default()
+        .descriptor()
+        .build_gts_manifest(&FixedConfig(section.clone()))
+        .expect("the OAGW manifest builds")
+}
+
+/// As [`context_under`], without the admitted manifest the runtime attaches.
+fn unpublished_context(
     section: Value,
     db: Option<Db>,
     hub: Arc<ClientHub>,
@@ -256,6 +188,52 @@ fn assert_warned_once_about_memory(lines: &[&str]) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// GTS publication
+// ---------------------------------------------------------------------------
+
+/// The runtime publishes the OAGW catalog before `init`: the manifest is the
+/// catalog, under the gear's name and version.
+#[test]
+fn the_manifest_is_the_oagw_catalog() {
+    let manifest = manifest(&json!({ "config": {} }));
+
+    let expected: Vec<(gts::GtsId, Value)> = crate::gts_declarations()
+        .into_iter()
+        .map(|(id, text)| {
+            (
+                gts::GtsId::try_new(&id).unwrap(),
+                serde_json::from_str(&text).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(manifest.documents(), expected.as_slice());
+    assert_eq!(expected.len(), 23, "7 Type Schemas and 16 Instances");
+    assert_eq!(manifest.publisher_name(), "oagw");
+    assert_eq!(manifest.publisher_version(), env!("CARGO_PKG_VERSION"));
+}
+
+/// Outside the runtime — without an admitted manifest — `init` fails before
+/// serving anything.
+#[tokio::test]
+async fn init_without_an_admitted_manifest_fails() {
+    let hub = wired_hub();
+    let ctx = unpublished_context(
+        json!({ "config": {} }),
+        None,
+        Arc::clone(&hub),
+        Default::default(),
+    );
+
+    let err = init(&ctx).await.err().expect("init refuses");
+
+    assert!(
+        format!("{err:#}").contains("admitted GTS manifest"),
+        "{err:#}"
+    );
+    assert!(hub.get::<dyn ServiceGatewayClientV1>().is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Storage selection
 // ---------------------------------------------------------------------------
 
@@ -275,9 +253,7 @@ async fn init_does_not_need_authz_in_the_hub() {
     let hub = Arc::new(ClientHub::new());
     hub.register::<dyn TenantResolverClient>(Arc::new(MockTenantResolverClient::single_tenant()));
     hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
-    hub.register::<dyn TypesRegistryClient>(Arc::new(AcceptingTypesRegistry(
-        MockTypesRegistryClient::new(),
-    )));
+    Arc::new(MockTypesRegistry::new()).install(&hub);
     init(&context(json!({ "config": {} }), None, hub))
         .await
         .expect("init without AuthZ in the hub");
@@ -315,31 +291,8 @@ async fn null_database_counts_as_absent() {
 #[tokio::test]
 async fn post_init_provisions_registry_instances_into_the_root_tenant() {
     let root = Uuid::new_v4();
-    let upstream_id = Uuid::new_v4();
-    let route_id = Uuid::new_v4();
-    let registry = MockTypesRegistryClient::new().with_instances([
-        make_test_instance(
-            &format!("{}{upstream_id}", oagw_sdk::gts::UPSTREAM_SCHEMA),
-            json!({
-                "server": {
-                    "endpoints": [{"host": "api.example.com", "port": 443, "scheme": "https"}]
-                },
-                "protocol": oagw_sdk::HTTP_PROTOCOL_ID,
-                "enabled": true,
-                "tags": [],
-            }),
-        ),
-        make_test_instance(
-            &format!("{}{route_id}", oagw_sdk::gts::ROUTE_SCHEMA),
-            json!({
-                "upstream_id": upstream_id,
-                "match": { "http": { "methods": ["GET"], "path": "/v1" } },
-                "enabled": true,
-                "tags": [],
-                "priority": 0,
-            }),
-        ),
-    ]);
+    let (upstream_id, route_id) = registry_row_ids();
+    let registry = one_upstream_registry();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
         registry,
@@ -369,31 +322,54 @@ async fn post_init_provisions_registry_instances_into_the_root_tenant() {
     );
 }
 
-/// A registry of one upstream with one route.
-fn one_upstream_registry(upstream_id: Uuid, route_id: Uuid) -> MockTypesRegistryClient {
-    MockTypesRegistryClient::new().with_instances([
-        make_test_instance(
-            &format!("{}{upstream_id}", oagw_sdk::gts::UPSTREAM_SCHEMA),
-            json!({
-                "server": {
-                    "endpoints": [{"host": "api.example.com", "port": 443, "scheme": "https"}]
-                },
-                "protocol": oagw_sdk::HTTP_PROTOCOL_ID,
-                "enabled": true,
-                "tags": [],
-            }),
-        ),
-        make_test_instance(
-            &format!("{}{route_id}", oagw_sdk::gts::ROUTE_SCHEMA),
-            json!({
-                "upstream_id": upstream_id,
-                "match": { "http": { "methods": ["GET"], "path": "/v1" } },
-                "enabled": true,
-                "tags": [],
-                "priority": 0,
-            }),
-        ),
-    ])
+/// A registry of one upstream with one route, named [`REGISTRY_UPSTREAM`]
+/// and [`REGISTRY_ROUTE`]; the route names the upstream by its identifier.
+fn one_upstream_registry() -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        REGISTRY_UPSTREAM,
+        json!({
+            "id": REGISTRY_UPSTREAM,
+            "server": {
+                "endpoints": [{"host": "api.example.com", "port": 443, "scheme": "https"}]
+            },
+            "protocol": oagw_sdk::HTTP_PROTOCOL_ID,
+            "enabled": true,
+            "tags": [],
+        }),
+    );
+    registry.seed(
+        REGISTRY_ROUTE,
+        json!({
+            "id": REGISTRY_ROUTE,
+            "upstream_id": REGISTRY_UPSTREAM,
+            "match": { "http": { "methods": ["GET"], "path": "/v1" } },
+            "enabled": true,
+            "tags": [],
+            "priority": 0,
+        }),
+    );
+    registry
+}
+
+/// The platform registry API is a consumed contract, wired after `init`:
+/// `init` does not need it, and `post_init` fails without it rather than
+/// provisioning from nothing.
+#[tokio::test]
+async fn post_init_needs_the_consumed_platform_registry_client() {
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn TenantResolverClient>(Arc::new(MockTenantResolverClient::single_tenant()));
+    hub.register::<dyn CredStoreClientV1>(Arc::new(MockCredStoreClient::empty()));
+    let gear = init(&context(json!({ "config": {} }), None, hub))
+        .await
+        .expect("init without the registry client");
+
+    let err = gear.post_init(&post_init_ctx()).await.unwrap_err();
+
+    assert!(
+        format!("{err:#}").contains("types-registry platform client unavailable"),
+        "{err:#}"
+    );
 }
 
 /// The context of `post_init`, which reads nothing from it.
@@ -431,10 +407,10 @@ async fn on_a_database_start_reconciles_in_the_background() {
 
     let file = SqliteFile::new();
     let root = Uuid::new_v4();
-    let (upstream_id, route_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let (upstream_id, route_id) = registry_row_ids();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-        one_upstream_registry(upstream_id, route_id),
+        one_upstream_registry(),
     );
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
@@ -505,10 +481,10 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
             .unwrap()
     );
     let root = Uuid::new_v4();
-    let upstream_id = Uuid::new_v4();
+    let (upstream_id, _) = registry_row_ids();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-        one_upstream_registry(upstream_id, Uuid::new_v4()),
+        one_upstream_registry(),
     );
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db), hub);
@@ -548,7 +524,7 @@ async fn a_held_lease_delays_neither_startup_nor_shutdown() {
 /// waits for the re-check interval (±20%) before its first run, runs once
 /// it has passed, and `stop` ends it.
 async fn assert_in_memory_start_rechecks_after_the_interval(
-    registry: MockTypesRegistryClient,
+    registry: MockTypesRegistry,
     after_post_init: toolkit::HealthcheckStatus,
 ) {
     const RECHECK: std::time::Duration = std::time::Duration::from_mins(1);
@@ -598,7 +574,7 @@ async fn assert_in_memory_start_rechecks_after_the_interval(
 #[tokio::test(start_paused = true)]
 async fn in_memory_post_init_reconciles_and_start_rechecks_in_the_background() {
     assert_in_memory_start_rechecks_after_the_interval(
-        one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
+        one_upstream_registry(),
         toolkit::HealthcheckStatus::Healthy,
     )
     .await;
@@ -610,17 +586,18 @@ async fn in_memory_post_init_reconciles_and_start_rechecks_in_the_background() {
 /// ADR-0018: PERS-LOOP-011.
 #[tokio::test(start_paused = true)]
 async fn in_memory_start_after_a_not_clean_run_waits_for_the_recheck() {
-    let route_id = Uuid::new_v4();
-    let registry = MockTypesRegistryClient::new().with_instances([make_test_instance(
-        &format!("{}{route_id}", oagw_sdk::gts::ROUTE_SCHEMA),
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        REGISTRY_ROUTE,
         json!({
-            "upstream_id": Uuid::new_v4(),
+            "id": REGISTRY_ROUTE,
+            "upstream_id": REGISTRY_UPSTREAM,
             "match": { "http": { "methods": ["GET"], "path": "/v1" } },
             "enabled": true,
             "tags": [],
             "priority": 0,
         }),
-    )]);
+    );
     assert_in_memory_start_rechecks_after_the_interval(
         registry,
         toolkit::HealthcheckStatus::Degraded,
@@ -732,12 +709,9 @@ async fn in_memory_startup_survives_a_missing_root_tenant_and_provisions_later()
     use toolkit::HealthcheckStatus;
 
     let root = Uuid::new_v4();
-    let (upstream_id, route_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let (upstream_id, route_id) = registry_row_ids();
     let tenants = Arc::new(LateRoot::new(root));
-    let hub = hub_with(
-        tenants.clone(),
-        one_upstream_registry(upstream_id, route_id),
-    );
+    let hub = hub_with(tenants.clone(), one_upstream_registry());
     let ctx = context(json!({ "config": {} }), None, hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&post_init_ctx())
@@ -813,7 +787,7 @@ async fn an_empty_registry_never_calls_the_tenant_resolver() {
     use toolkit::HealthcheckStatus;
 
     let tenants = Arc::new(LateRoot::new(Uuid::new_v4()));
-    let hub = hub_with(tenants.clone(), MockTypesRegistryClient::new());
+    let hub = hub_with(tenants.clone(), MockTypesRegistry::new());
     let ctx = context(json!({ "config": {} }), None, hub);
     let gear = init(&ctx).await.expect("init");
     gear.post_init(&post_init_ctx()).await.expect("post_init");
@@ -848,7 +822,7 @@ async fn assert_cut(mut stream: oagw_sdk::body::BodyStream, case: &str) {
 async fn initialized_gear(root: tokio_util::sync::CancellationToken) -> OutboundApiGatewayGear {
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(Uuid::new_v4()), vec![]),
-        one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
+        one_upstream_registry(),
     );
     let ctx = context_under(json!({ "config": {} }), None, hub, root);
     let gear = init(&ctx).await.expect("init");
@@ -1127,13 +1101,13 @@ async fn booting_twice_through_the_lifecycle_leaves_the_rows_unchanged() {
 
     let file = SqliteFile::new();
     let root = Uuid::new_v4();
-    let (upstream_id, route_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let (upstream_id, route_id) = registry_row_ids();
     let pctx = provisioning_ctx(root).unwrap();
     let all = ListQuery { top: 100, skip: 0 };
     let boot = async || {
         let hub = hub_over(
             MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-            one_upstream_registry(upstream_id, route_id),
+            one_upstream_registry(),
         );
         let cluster = ClusterFixture::standalone(&hub);
         let ctx = context(database_section(), Some(file.open().await), hub);
@@ -1297,10 +1271,10 @@ async fn a_second_start_after_stop_reconciles_again() {
     let file = SqliteFile::new();
     let db = file.open().await;
     let root = Uuid::new_v4();
-    let (upstream_id, route_id) = (Uuid::new_v4(), Uuid::new_v4());
+    let (_, route_id) = registry_row_ids();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-        one_upstream_registry(upstream_id, route_id),
+        one_upstream_registry(),
     );
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(db.clone()), hub);
@@ -1357,7 +1331,7 @@ async fn cancelling_the_start_token_ends_the_task() {
     let root = Uuid::new_v4();
     let hub = hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-        one_upstream_registry(Uuid::new_v4(), Uuid::new_v4()),
+        one_upstream_registry(),
     );
     let cluster = ClusterFixture::standalone(&hub);
     let ctx = context(database_section(), Some(file.open().await), hub);
@@ -1747,7 +1721,7 @@ fn database_section_with_cache(proxy_cache: Value) -> Value {
 fn settling_hub(root: Uuid) -> Arc<ClientHub> {
     hub_over(
         MockTenantResolverClient::with_siblings(TenantId(root), vec![]),
-        MockTypesRegistryClient::new(),
+        MockTypesRegistry::new(),
     )
 }
 

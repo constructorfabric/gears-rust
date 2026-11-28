@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from .helpers import Cleanup, seed_legacy_registry_fixtures
+from .helpers import Cleanup, publish_registry_fixtures
 from .mock_upstream import MockUpstreamServer
 
 
@@ -182,11 +182,12 @@ REGISTRY_WAIT_SECS = 60
 def registry_provisioned():
     """On the sqlite profile, publish fixtures and wait for registry-owned rows.
 
-    With a database, OAGW reconciles the types-registry instances in a
-    background task once it serves (ADR-0018), so ``/healthz`` can answer
-    before the first run has written them. Poll the Management API for every
-    registry instance in ``registry-fixtures.json``; fail with the last answer
-    after ``REGISTRY_WAIT_SECS``. Other profiles provision synchronously.
+    The fixtures are published through the types registry's platform API
+    after startup. With a database, OAGW reconciles the registry instances in
+    a background task (ADR-0018), so poll the Management API for every row
+    provisioned from ``registry_fixtures()``; fail with the last answer after
+    ``REGISTRY_WAIT_SECS``. Other profiles provision once, before serving,
+    and see no post-startup fixtures.
     """
     if os.getenv("OAGW_E2E_PROFILE") != "sqlite":
         return
@@ -201,8 +202,8 @@ def registry_provisioned():
     ]
     deadline = time.monotonic() + REGISTRY_WAIT_SECS
     last = "no response"
+    asyncio.run(publish_registry_fixtures(base_url))
     with httpx.Client(timeout=5.0) as client:
-        seed_legacy_registry_fixtures(client, base_url, headers)
         while True:
             pending = []
             for url in urls:

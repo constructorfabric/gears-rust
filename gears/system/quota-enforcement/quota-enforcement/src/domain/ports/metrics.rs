@@ -318,8 +318,6 @@ pub enum ValidationReason {
     RequestContractAmbiguous,
     /// A request contract's attached constraint contract is unusable.
     ConstraintInvalid,
-    /// A QE-owned definition exists in the registry with different content.
-    DefinitionConflict,
     /// A projection is registered but outside the configured catalogue.
     ProjectionNotResolvable,
     /// The configured catalogue is incompatible with an active Quota.
@@ -328,7 +326,7 @@ pub enum ValidationReason {
 
 impl ValidationReason {
     /// Every value, for conformance tests.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 18] = [
         Self::ShapeInvalid,
         Self::MetadataMissing,
         Self::KindUnknown,
@@ -345,7 +343,6 @@ impl ValidationReason {
         Self::RequestContractMissing,
         Self::RequestContractAmbiguous,
         Self::ConstraintInvalid,
-        Self::DefinitionConflict,
         Self::ProjectionNotResolvable,
         Self::IncompatibleState,
     ];
@@ -370,7 +367,6 @@ impl ValidationReason {
             Self::RequestContractMissing => "request_contract_missing",
             Self::RequestContractAmbiguous => "request_contract_ambiguous",
             Self::ConstraintInvalid => "constraint_invalid",
-            Self::DefinitionConflict => "definition_conflict",
             Self::ProjectionNotResolvable => "projection_not_resolvable",
             Self::IncompatibleState => "incompatible_state",
         }

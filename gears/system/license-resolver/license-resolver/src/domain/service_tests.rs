@@ -127,7 +127,7 @@ async fn plugin_selection_is_memoized_across_checks() {
             .expect("conforming check succeeds");
     }
     assert_eq!(
-        registry.list_instance_calls(),
+        registry.calls(types_registry_sdk::testing_platform::Call::List),
         1,
         "discovery must be memoized after the first resolution"
     );
@@ -237,6 +237,8 @@ async fn no_plugin_instance_fails_closed() {
     );
 }
 
+/// An advertised instance without a client bound in this process — a stale
+/// instance of an earlier deployment — is never selected: no answer.
 #[tokio::test]
 async fn an_advertised_plugin_without_a_client_fails_closed() {
     let metrics = Arc::new(RecordingMetrics::default());
@@ -245,9 +247,9 @@ async fn an_advertised_plugin_without_a_client_fails_closed() {
     let err = svc
         .is_licensed(conforming_request())
         .await
-        .expect_err("an unregistered plugin client means no answer");
+        .expect_err("an unbound plugin instance means no answer");
     assert!(
-        matches!(err, DomainError::PluginUnavailable { .. }),
+        matches!(err, DomainError::PluginNotFound { .. }),
         "got: {err:?}"
     );
 }

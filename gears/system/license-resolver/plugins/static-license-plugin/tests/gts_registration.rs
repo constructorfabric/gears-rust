@@ -1,12 +1,7 @@
-//! Reproduces the server's startup GTS commit in-process.
-//!
-//! At boot types-registry seeds every linked crate's link-time inventory, adds
-//! whatever gears register during `init()`, then commits the lot in one
-//! all-or-nothing pass. That pass is process-global: a licensing type or a
-//! plugin instance that fails it does not degrade licensing, it stops the whole
-//! server from binding. This test runs that same sequence over the licensing
-//! surface alone, so the failure shows up here rather than as an unexplained
-//! boot timeout in every E2E suite.
+//! The licensing surface through real managed admission: the toolkit plugin
+//! base, the declarations license-resolver publishes from its SDK, and the
+//! plugin instance this gear publishes all admit through the local registry's
+//! database/outbox path, and the registry serves what the resolver reads.
 
 #![allow(clippy::expect_used)]
 
@@ -15,112 +10,212 @@ use std::sync::Arc;
 use gts::GtsSchema;
 use license_resolver_sdk::LicenseResolverPluginSpecV1;
 use license_resolver_sdk::gts::{LicenseResourceV1, LicenseSubjectV1};
-use static_license_plugin::gear::INSTANCE_SUFFIX;
+use sea_orm_migration::MigratorTrait;
+use serde_json::Value;
+use static_license_plugin::gear::{INSTANCE_SUFFIX, StaticLicensePlugin};
+use toolkit::config::ConfigProvider;
 use toolkit::gts::PluginV1;
-use toolkit_gts::{all_inventory_instances, all_inventory_type_schemas};
+use toolkit::gts_publication::GtsPublicationCapability;
+use toolkit_db::migration_runner::run_migrations_for_testing;
+use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_security::PlatformSecurityContext;
 use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::service::TypesRegistryService;
-use types_registry::infra::InMemoryGtsRepository;
-use types_registry_sdk::RegisterResult;
+use types_registry::domain::admission::OperationDispatch;
+use types_registry::domain::local_client::LocalClient;
+use types_registry::domain::policy::RegistrationPolicy;
+use types_registry::domain::registry_service::RegistryService;
+use types_registry::infra::outbox::OutboxDispatch;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsId, GtsTypeId, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, PublisherContext, ReadOptions, ReconcileOptions,
+};
 
 const VENDOR: &str = "constructorfabric";
 const PRIORITY: i16 = 100;
 
-fn create_service() -> Arc<TypesRegistryService> {
-    let repo = Arc::new(InMemoryGtsRepository::new(
-        TypesRegistryConfig::default().to_gts_config(),
-    ));
-    Arc::new(TypesRegistryService::new(
-        repo,
-        TypesRegistryConfig::default(),
-    ))
+struct Harness {
+    client: LocalClient,
+    _outbox: Box<dyn std::any::Any + Send>,
 }
 
-fn plugin_instance() -> (gts::GtsInstanceId, serde_json::Value) {
-    PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
-        INSTANCE_SUFFIX,
-        VENDOR.to_owned(),
-        PRIORITY,
+async fn harness() -> Harness {
+    let dsn = format!(
+        "sqlite:file:license-managed-{}?mode=memory&cache=shared",
+        uuid::Uuid::new_v4()
+    );
+    let db = connect_db(
+        &dsn,
+        ConnectOpts {
+            max_conns: Some(4),
+            min_conns: Some(1),
+            ..Default::default()
+        },
     )
-    .expect("plugin registration payload builds")
+    .await
+    .expect("connect admission database");
+    let mut migrations = types_registry::infra::storage::Migrator::migrations();
+    migrations.extend(
+        toolkit_db::outbox::outbox_migrations_with_prefix(
+            types_registry::infra::outbox::TABLE_PREFIX,
+        )
+        .expect("registry outbox prefix"),
+    );
+    run_migrations_for_testing(&db, migrations)
+        .await
+        .expect("registry and outbox migrations");
+    let db: Arc<DBProvider<DbError>> = Arc::new(DBProvider::new(db));
+    let dispatch = Arc::new(OutboxDispatch::new());
+    let service = Arc::new(RegistryService::new(
+        db.db(),
+        Arc::new(types_registry::infra::storage::Repos),
+        RegistrationPolicy::default(),
+        TypesRegistryConfig::default(),
+        Arc::clone(&dispatch) as Arc<dyn OperationDispatch>,
+        Arc::new(types_registry::domain::ports::metrics::NoopMetrics),
+    ));
+    let outbox = types_registry::infra::outbox::start(db.db(), &service, &dispatch)
+        .await
+        .expect("start the admission outbox");
+    Harness {
+        client: LocalClient::new(service),
+        _outbox: Box::new(outbox),
+    }
 }
 
-#[test]
-fn the_licensing_surface_survives_the_startup_commit() {
-    let service = create_service();
+struct Config(Value);
 
-    let mut entities = all_inventory_type_schemas().expect("collect inventory type schemas");
-    entities.extend(all_inventory_instances().expect("collect inventory instances"));
-    let (instance_id, instance_json) = plugin_instance();
-    entities.push(instance_json);
+impl ConfigProvider for Config {
+    fn get_gear_config(&self, gear: &str) -> Option<&Value> {
+        self.0.get(gear)
+    }
+}
 
-    let results = service.register(entities);
-    RegisterResult::ensure_all_ok(&results).expect("every entity registers");
+fn config() -> Config {
+    Config(serde_json::json!({
+        "static-license-plugin": { "config": { "vendor": VENDOR, "priority": PRIORITY } }
+    }))
+}
 
-    service
-        .switch_to_ready()
-        .expect("the ready commit must succeed, or the server cannot boot");
+async fn admit(h: &Harness, publisher: &str, desired: &[(GtsId, Value)]) {
+    let api: &dyn PlatformTypesRegistryApi = &h.client;
+    api.reconcile_entities_and_await(
+        &PlatformSecurityContext::outbound_marker(),
+        &PublisherContext {
+            name: publisher.to_owned(),
+            version: "0.1.0".parse().expect("version"),
+        },
+        desired,
+        &ReconcileOptions::default(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{publisher} admits: {e:?}"));
+}
 
+/// The toolkit plugin base the plugin spec derives from, as the registry
+/// seeds it.
+fn plugin_base() -> (GtsId, Value) {
+    let id = "gts.cf.toolkit.plugins.plugin.v1~";
+    let schema = toolkit::gts::all_inventory_type_schemas()
+        .expect("inventory")
+        .into_iter()
+        .find(|schema| schema["$id"] == format!("gts://{id}"))
+        .expect("the toolkit plugin base is declared");
+    (GtsId::try_new(id).expect("id"), schema)
+}
+
+/// What license-resolver publishes: its SDK collector.
+fn resolver_declarations() -> Vec<(GtsId, Value)> {
+    license_resolver_sdk::gts_declarations()
+        .into_iter()
+        .map(|(id, text)| {
+            (
+                GtsId::try_new(&id).expect("id"),
+                serde_json::from_str(&text).expect("declared JSON"),
+            )
+        })
+        .collect()
+}
+
+/// The licensing bases, the plugin spec and this gear's instance all admit,
+/// and the instance advertises its vendor and priority.
+#[tokio::test]
+async fn the_licensing_surface_admits_through_managed_admission() {
+    let h = harness().await;
+    let manifest = StaticLicensePlugin::default()
+        .descriptor()
+        .build_gts_manifest(&config())
+        .expect("plugin manifest");
+
+    admit(&h, "toolkit", &[plugin_base()]).await;
+    admit(&h, "license-resolver", &resolver_declarations()).await;
+    admit(&h, "static-license-plugin", manifest.documents()).await;
+
+    let api: &dyn PlatformTypesRegistryApi = &h.client;
+    let ctx = PlatformSecurityContext::outbound_marker();
     for type_id in [
         <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID,
         <LicenseResourceV1<()> as GtsSchema>::TYPE_ID,
         LicenseResolverPluginSpecV1::TYPE_ID,
     ] {
-        assert!(
-            service.get(type_id).is_ok(),
-            "{type_id} must be registered after the commit"
-        );
+        api.get_type_schema(&ctx, &GtsTypeId::new(type_id), ReadOptions::default())
+            .await
+            .unwrap_or_else(|e| panic!("{type_id} is admitted: {e:?}"));
     }
-    assert!(
-        service.get(instance_id.as_ref()).is_ok(),
-        "the plugin instance {instance_id} must be registered after the commit"
-    );
+
+    let (instance_id, _) = PluginV1::<LicenseResolverPluginSpecV1>::build_registration(
+        INSTANCE_SUFFIX,
+        VENDOR.to_owned(),
+        PRIORITY,
+    )
+    .expect("plugin instance");
+    let instance = api
+        .get_instance(
+            &ctx,
+            &instance_id,
+            ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
+                EntityField::Content,
+            ]))),
+        )
+        .await
+        .expect("the plugin instance is admitted");
+    let content = instance.content.expect("content");
+    assert_eq!(content["vendor"], VENDOR);
+    assert_eq!(content["priority"], i64::from(PRIORITY));
 }
 
-/// The instance carries what the gateway selects on: without a matching vendor
-/// the gateway finds no backend and every check fails closed.
-#[test]
-fn the_plugin_instance_advertises_its_vendor_and_priority() {
-    let (instance_id, instance_json) = plugin_instance();
+/// The Resource base reaches the registry carrying its trait schema: the
+/// resolver reads `admitted_subjects` off the materialized traits.
+#[tokio::test]
+async fn the_admitted_resource_base_carries_the_admitted_subjects_trait() {
+    let h = harness().await;
+    admit(&h, "toolkit", &[plugin_base()]).await;
+    admit(&h, "license-resolver", &resolver_declarations()).await;
 
+    let api: &dyn PlatformTypesRegistryApi = &h.client;
+    let base = api
+        .get_type_schema(
+            &PlatformSecurityContext::outbound_marker(),
+            &GtsTypeId::new(<LicenseResourceV1<()> as GtsSchema>::TYPE_ID),
+            ReadOptions::default().with_projection(Projection::Select(FieldSelection::with(&[
+                EntityField::Content,
+                EntityField::EffectiveTraits,
+            ]))),
+        )
+        .await
+        .expect("the Resource licensing base is admitted");
+    let content = base.content.expect("content");
     assert!(
-        instance_id
-            .as_ref()
-            .starts_with(LicenseResolverPluginSpecV1::TYPE_ID),
-        "the instance must be declared from the license resolver plugin spec: {instance_id}"
-    );
-    assert_eq!(
-        instance_json.get("vendor").and_then(|v| v.as_str()),
-        Some(VENDOR)
-    );
-    assert_eq!(
-        instance_json
-            .get("priority")
-            .and_then(serde_json::Value::as_i64),
-        Some(i64::from(PRIORITY))
-    );
-}
-
-/// The Resource base must reach the registry carrying its trait schema — the
-/// gateway reads `admitted_subjects` off the resolved chain, so a base that
-/// commits without it would make every check inadmissible.
-#[test]
-fn the_registered_resource_base_carries_the_admitted_subjects_trait() {
-    let service = create_service();
-    let entities = all_inventory_type_schemas().expect("collect inventory type schemas");
-    RegisterResult::ensure_all_ok(&service.register(entities)).expect("every schema registers");
-    service
-        .switch_to_ready()
-        .expect("the ready commit succeeds");
-
-    let base = service
-        .get(<LicenseResourceV1<()> as GtsSchema>::TYPE_ID)
-        .expect("the Resource licensing base is registered");
-    assert!(
-        base.content
+        content
             .pointer("/x-gts-traits-schema/properties/admitted_subjects")
             .is_some(),
-        "the registered Resource base must declare admitted_subjects: {:#}",
-        base.content
+        "the Resource base must declare admitted_subjects: {content:#}"
+    );
+    // What the resolver reads: the materialized default, not the declaration.
+    let traits = base.effective_traits.expect("effective traits");
+    assert_eq!(
+        traits.get("admitted_subjects"),
+        Some(&serde_json::json!([])),
+        "{traits:#}"
     );
 }

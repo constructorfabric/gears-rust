@@ -2,12 +2,11 @@
 
 use gts::{GTS_ID_PREFIX, GTS_ID_URI_PREFIX, GtsRefValidation, GtsSchema, GtsStore};
 use serde_json::Value;
-use toolkit_gts::{InventoryInstance, InventoryTypeSchema};
 
 use super::{
-    CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, REQUEST_BASE,
-    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
+    CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, POLICY_RESOURCE,
+    QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1, QuotaNotificationSinkSpecV1, REQUEST_BASE,
+    RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE,
 };
 
 /// The reviewed owner examples of ADR-0007: one complete `llm_gateway` set.
@@ -60,8 +59,23 @@ fn parse(raw: &str) -> Value {
     serde_json::from_str(raw).expect("reviewed schema file is valid JSON")
 }
 
-fn definitions() -> Vec<OwnedDefinition> {
-    owned_definitions().expect("embedded documents parse")
+/// One declaration of this crate's collector.
+struct Definition {
+    id: String,
+    document: Value,
+}
+
+/// The projection-contract declarations of this crate's collector: the five
+/// QE types and the two scope instances (the plugin specs excluded).
+fn definitions() -> Vec<Definition> {
+    crate::gts_declarations()
+        .into_iter()
+        .filter(|(id, _)| id.starts_with(&format!("{GTS_ID_PREFIX}cf.core.qe.")))
+        .map(|(id, text)| Definition {
+            id,
+            document: parse(&text),
+        })
+        .collect()
 }
 
 #[test]
@@ -106,33 +120,30 @@ fn resource_ids_are_distinct_five_segment_type_ids() {
     assert_eq!(sorted.len(), all.len(), "resource ids must be unique");
 }
 
+/// The collector declares exactly the QE-owned definitions: the five types,
+/// the two scope instances and the two plugin specs; never the metric base.
 #[test]
-fn owned_definitions_are_the_seven_qe_definitions_in_registration_order() {
-    let defs = definitions();
-    let ids: Vec<&str> = defs.iter().map(|d| d.id).collect();
-    assert_eq!(
-        ids,
-        [
-            SUBJECT_BASE,
-            RESOURCE_BASE,
-            REQUEST_BASE,
-            CONSTRAINT_BASE,
-            SCOPE_TYPE,
-            SCOPE_USER,
-            SCOPE_TENANT
-        ]
-    );
-    let owned_prefix = format!("{GTS_ID_PREFIX}cf.core.qe.");
-    for def in &defs {
-        assert!(
-            def.id.starts_with(&owned_prefix),
-            "{} is not a QE-owned definition",
-            def.id
-        );
-    }
+fn the_collector_declares_the_nine_qe_definitions() {
+    let declared: Vec<String> = crate::gts_declarations()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let mut expected = vec![
+        SUBJECT_BASE,
+        RESOURCE_BASE,
+        REQUEST_BASE,
+        CONSTRAINT_BASE,
+        SCOPE_TYPE,
+        SCOPE_USER,
+        SCOPE_TENANT,
+        QuotaEnforcementStoragePluginSpecV1::TYPE_ID,
+        QuotaNotificationSinkSpecV1::TYPE_ID,
+    ];
+    expected.sort_unstable();
+    assert_eq!(declared, expected);
     assert!(
-        !ids.contains(&METRIC_BASE_TYPE),
-        "the metric base is registry-owned and never registered by QE"
+        !declared.iter().any(|id| id == METRIC_BASE_TYPE),
+        "the metric base is deployment-owned and never declared by QE"
     );
 }
 
@@ -148,7 +159,7 @@ fn every_embedded_document_carries_the_id_of_its_constant() {
                 def.id
             );
         } else {
-            assert_eq!(def.document["id"], def.id);
+            assert_eq!(def.document["id"], def.id.as_str());
             assert_eq!(def.document["type"], SCOPE_TYPE);
         }
     }
@@ -181,27 +192,6 @@ fn scope_instance_payloads_equal_the_documented_files() {
     assert_eq!(by_id(SCOPE_TENANT), tenant);
 }
 
-#[test]
-fn the_inventory_carries_the_same_seven_definitions() {
-    let defs = definitions();
-    for def in &defs {
-        if def.id.ends_with('~') {
-            let entry = inventory::iter::<InventoryTypeSchema>
-                .into_iter()
-                .find(|e| e.type_id == def.id)
-                .expect("type schema submitted to the inventory");
-            assert_eq!(parse(&(entry.schema_fn)()), def.document, "{}", def.id);
-        } else {
-            let entry = inventory::iter::<InventoryInstance>
-                .into_iter()
-                .find(|e| e.instance_id == def.id)
-                .expect("instance submitted to the inventory");
-            assert_eq!(entry.type_id, SCOPE_TYPE);
-            assert_eq!((entry.payload_fn)(), def.document, "{}", def.id);
-        }
-    }
-}
-
 /// A store holding the QE definitions and the `llm_gateway` examples: the
 /// repository's semantic check of the reviewed schema files. The registry
 /// validates with the same `gts` library and pattern-only entity-reference policy
@@ -210,7 +200,7 @@ fn store_with_examples() -> GtsStore {
     let mut store = GtsStore::new();
     for def in definitions().iter().filter(|d| d.id.ends_with('~')) {
         store
-            .register_schema(def.id, &def.document)
+            .register_schema(&def.id, &def.document)
             .expect("QE type schema registers");
     }
     for (id, raw) in EXAMPLES {
@@ -331,41 +321,117 @@ fn the_token_request_envelope_validates_against_its_resolved_contract() {
     );
 }
 
-/// The published crate cannot reach `docs/`, so it ships its own copies of
-/// the five base schemas. This holds the copies to the reviewed files.
+/// The reviewed contract in `docs/schemas/` stays the reference: every
+/// generated base schema means the same as its reviewed document. Prose
+/// (`description`, `title`) is not compared, and a property's single-member
+/// `allOf` wrapper is unwrapped; everything else, including dialect, closure,
+/// abstractness, the traits schema and every GTS reference, must match.
+/// `additionalProperties: true` equals its absence.
 #[test]
-fn the_shipped_base_schemas_are_byte_identical_to_the_reviewed_documents() {
-    const PAIRS: [(&str, &str, &str); 5] = [
+fn the_declared_base_schemas_match_the_reviewed_documents() {
+    const REVIEWED: [(&str, &str); 5] = [
         (
-            "gts.cf.core.qe.subj.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.subj.v1~.schema.json"),
+            SUBJECT_BASE,
             include_str!("../../docs/schemas/gts.cf.core.qe.subj.v1~.schema.json"),
         ),
         (
-            "gts.cf.core.qe.res.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.res.v1~.schema.json"),
+            RESOURCE_BASE,
             include_str!("../../docs/schemas/gts.cf.core.qe.res.v1~.schema.json"),
         ),
         (
-            "gts.cf.core.qe.request.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.request.v1~.schema.json"),
+            REQUEST_BASE,
             include_str!("../../docs/schemas/gts.cf.core.qe.request.v1~.schema.json"),
         ),
         (
-            "gts.cf.core.qe.constraint.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.constraint.v1~.schema.json"),
+            CONSTRAINT_BASE,
             include_str!("../../docs/schemas/gts.cf.core.qe.constraint.v1~.schema.json"),
         ),
         (
-            "gts.cf.core.qe.scope.v1~.schema.json",
-            include_str!("../schemas/gts.cf.core.qe.scope.v1~.schema.json"),
+            SCOPE_TYPE,
             include_str!("../../docs/schemas/gts.cf.core.qe.scope.v1~.schema.json"),
         ),
     ];
-    for (name, shipped, reviewed) in PAIRS {
+    let defs = definitions();
+    for (id, reviewed) in REVIEWED {
+        let declared = &defs
+            .iter()
+            .find(|d| d.id == id)
+            .expect("declared base")
+            .document;
         assert_eq!(
-            shipped, reviewed,
-            "quota-enforcement-sdk/schemas/{name} drifted from docs/schemas/{name}"
+            semantic(declared.clone()),
+            semantic(parse(reviewed)),
+            "{id} drifted from docs/schemas"
+        );
+    }
+}
+
+/// `schema` without prose, with single-member `allOf` wrappers unwrapped and
+/// `additionalProperties: true` dropped (the JSON Schema default).
+fn semantic(schema: Value) -> Value {
+    match schema {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if key == "description" || key == "title" {
+                    continue;
+                }
+                if key == "additionalProperties" && value == Value::Bool(true) {
+                    continue;
+                }
+                if key == "allOf"
+                    && let Value::Array(items) = &value
+                    && let [only] = items.as_slice()
+                    && let Value::Object(inner) = semantic(only.clone())
+                {
+                    out.extend(inner);
+                    continue;
+                }
+                out.insert(key, semantic(value));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(semantic).collect()),
+        other => other,
+    }
+}
+
+/// The trait values are typed GTS ids: a malformed one does not deserialize,
+/// and a well-formed one round-trips as the published string.
+#[test]
+fn trait_values_are_typed_gts_ids() {
+    use crate::{RequestTraitsV1, SubjectTraitsV1};
+
+    let subject = serde_json::json!({
+        "scope": crate::SCOPE_USER,
+        "admitted_metrics": ["gts.cf.core.qe.metric_type.v1~cf.test.qe.tokens.v1"],
+    });
+    let parsed: SubjectTraitsV1 = serde_json::from_value(subject.clone()).expect("well-formed");
+    assert_eq!(serde_json::to_value(&parsed).expect("json"), subject);
+    for (field, bad) in [
+        ("scope", serde_json::json!("not-an-id")),
+        ("admitted_metrics", serde_json::json!(["nope"])),
+    ] {
+        let mut malformed = subject.clone();
+        malformed[field] = bad;
+        assert!(
+            serde_json::from_value::<SubjectTraitsV1>(malformed).is_err(),
+            "{field}"
+        );
+    }
+
+    let request = serde_json::json!({
+        "metric": "gts.cf.core.qe.metric_type.v1~cf.test.qe.tokens.v1",
+        "constraint_contract": crate::CONSTRAINT_BASE,
+    });
+    let parsed: RequestTraitsV1 = serde_json::from_value(request.clone()).expect("well-formed");
+    assert_eq!(serde_json::to_value(&parsed).expect("json"), request);
+    for field in ["metric", "constraint_contract"] {
+        let mut malformed = request.clone();
+        malformed[field] = serde_json::json!("not-an-id");
+        assert!(
+            serde_json::from_value::<RequestTraitsV1>(malformed).is_err(),
+            "{field}"
         );
     }
 }

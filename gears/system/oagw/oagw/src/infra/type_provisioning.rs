@@ -1,15 +1,22 @@
-//! Infrastructure implementation of `TypeProvisioningService` backed by `TypesRegistryClient`.
+//! Infrastructure implementation of `TypeProvisioningService` over the
+//! platform registry API (`PlatformTypesRegistryApi`).
 //!
-//! Queries the types-registry for upstream and route GTS instances registered
-//! by other gears during `init()`, deserializes their content, and returns
-//! domain-level provisioned objects for the registry reconcile.
+//! Lists the active upstream and route GTS instances in the managed
+//! catalogue, deserializes their content, and returns domain-level
+//! provisioned objects for the registry reconcile. A row's identifier is the
+//! registry UUID of its instance (`GtsId::to_uuid`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use gts::GtsId;
 use serde::Deserialize;
-use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsIdPattern, Instance, ListEntitiesRequest, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt,
+};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -706,15 +713,13 @@ impl RoutePayload {
         gts_id: &str,
         gts_instance_id: Uuid,
     ) -> Result<ProvisionedRoute, DomainError> {
-        // Accept both full GTS identifier and bare UUID for upstream_id.
-        let upstream_id = extract_gts_instance_uuid(&self.upstream_id)
-            .or_else(|| Uuid::parse_str(&self.upstream_id).ok())
-            .ok_or_else(|| {
-                DomainError::validation(format!(
-                    "Route '{gts_id}': upstream_id '{}' is not a valid UUID or GTS identifier",
-                    self.upstream_id
-                ))
-            })?;
+        let upstream_id = resolve_upstream_reference(&self.upstream_id).ok_or_else(|| {
+            DomainError::validation(format!(
+                "Route '{gts_id}': upstream_id '{}' is neither an upstream instance identifier \
+                 nor a UUID",
+                self.upstream_id
+            ))
+        })?;
         Ok(ProvisionedRoute {
             tenant_id: self.tenant_id,
             request: domain::CreateRouteRequest {
@@ -732,114 +737,112 @@ impl RoutePayload {
     }
 }
 
-/// Extract the instance UUID from a GTS identifier string.
-///
-/// Given `gts.cf.core.oagw.upstream.v1~<hex-uuid>`, returns `Some(<Uuid>)`.
-fn extract_gts_instance_uuid(gts_id: &str) -> Option<Uuid> {
-    let instance = gts_id.rsplit('~').next()?;
-    Uuid::parse_str(instance).ok()
+/// The upstream row a route's `upstream_id` names: an upstream instance
+/// identifier (`gts.cf.core.oagw.upstream.v1~…`) names the row whose id is its
+/// registry UUID (`GtsId::to_uuid`) — for an OAGW resource identifier, whose
+/// last segment is a UUID, that is the row UUID itself; a bare UUID names the
+/// row with that id.
+fn resolve_upstream_reference(reference: &str) -> Option<Uuid> {
+    if reference.starts_with(UPSTREAM_SCHEMA) {
+        return GtsId::try_new(reference)
+            .ok()
+            .filter(|id| !id.is_type())
+            .map(|id| id.to_uuid());
+    }
+    Uuid::parse_str(reference).ok()
 }
 
-/// Like `extract_gts_instance_uuid` but returns an error suitable for
-/// failing startup when the instance segment is not a valid UUID.
-fn require_gts_instance_uuid(gts_id: &str) -> Result<Uuid, DomainError> {
-    extract_gts_instance_uuid(gts_id).ok_or_else(|| {
-        DomainError::validation(format!(
-            "GTS entity '{gts_id}' has a non-UUID instance segment; \
-             OAGW requires upstream and route $id values to end with a UUID \
-             (e.g. gts.cf.core.oagw.upstream.v1~<uuid>)"
-        ))
-    })
-}
+/// Page size of the listings: the registry's maximum.
+const PAGE_LIMIT: u32 = 100;
 
-/// `TypeProvisioningService` implementation that delegates to `TypesRegistryClient`.
+/// `TypeProvisioningService` over the platform registry API.
 pub struct TypeProvisioningServiceImpl {
-    registry: Arc<dyn TypesRegistryClient>,
+    registry: Arc<dyn PlatformTypesRegistryApi>,
 }
 
 impl TypeProvisioningServiceImpl {
-    /// Create the service reading instances from the given types-registry client.
-    pub fn new(registry: Arc<dyn TypesRegistryClient>) -> Self {
+    /// Create the service reading instances through the given platform registry client.
+    pub fn new(registry: Arc<dyn PlatformTypesRegistryApi>) -> Self {
         Self { registry }
     }
+
+    /// Every active instance under `type_id`, with its content. A failed page
+    /// fails the whole listing: absence authorizes removal, so a partial
+    /// listing must never reach the reconcile.
+    async fn list_active(&self, type_id: &str) -> Result<Vec<Instance>, DomainError> {
+        let pattern = GtsIdPattern::try_new(&format!("{type_id}*"))
+            .map_err(|e| DomainError::internal(format!("listing pattern for {type_id}: {e}")))?;
+        let query = ListEntitiesRequest::matching(pattern).with_limit(PAGE_LIMIT);
+        self.registry
+            .list_instances(&PlatformSecurityContext::outbound_marker(), query)
+            .await
+            .map_err(|e| DomainError::internal(e.to_string()))
+    }
+}
+
+/// The content of `instance`, deserialized as `T`; `what` names the kind in
+/// the error.
+fn payload<T: serde::de::DeserializeOwned>(
+    instance: &Instance,
+    what: &str,
+) -> Result<T, DomainError> {
+    let content = instance.content.clone().ok_or_else(|| {
+        DomainError::validation(format!(
+            "{what} '{}': the registry returned no content",
+            instance.id
+        ))
+    })?;
+    serde_json::from_value(content).map_err(|e| {
+        DomainError::validation(format!(
+            "{what} '{}': failed to deserialize GTS instance object: {e}",
+            instance.id
+        ))
+    })
 }
 
 #[async_trait]
 impl TypeProvisioningService for TypeProvisioningServiceImpl {
     async fn list_upstreams(&self) -> Result<Vec<ProvisionedUpstream>, DomainError> {
-        let query = InstanceQuery::new().with_pattern(format!("{UPSTREAM_SCHEMA}*"));
-
-        let instances = self
-            .registry
-            .list_instances(query)
-            .await
-            .map_err(|e| DomainError::internal(e.to_string()))?;
-
-        let mut result = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let gts_instance_id = require_gts_instance_uuid(instance.id.as_ref())?;
-            match serde_json::from_value::<UpstreamPayload>(instance.object.clone()) {
-                Ok(payload) => {
-                    result.push(payload.into_provisioned(Some(gts_instance_id)));
-                }
-                Err(e) => {
-                    return Err(DomainError::validation(format!(
-                        "Upstream '{}': failed to deserialize GTS instance object: {e}",
-                        instance.id
-                    )));
-                }
-            }
-        }
-
-        Ok(result)
+        self.list_active(UPSTREAM_SCHEMA)
+            .await?
+            .iter()
+            .map(|instance| {
+                let payload: UpstreamPayload = payload(instance, "Upstream")?;
+                Ok(payload.into_provisioned(Some(instance.uuid)))
+            })
+            .collect()
     }
 
     async fn list_routes(&self) -> Result<Vec<ProvisionedRoute>, DomainError> {
-        let query = InstanceQuery::new().with_pattern(format!("{ROUTE_SCHEMA}*"));
-
-        let instances = self
-            .registry
-            .list_instances(query)
-            .await
-            .map_err(|e| DomainError::internal(e.to_string()))?;
-
-        let mut result = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let gts_instance_id = require_gts_instance_uuid(instance.id.as_ref())?;
-            match serde_json::from_value::<RoutePayload>(instance.object.clone()) {
-                Ok(payload) => {
-                    result.push(payload.into_provisioned(instance.id.as_ref(), gts_instance_id)?);
-                }
-                Err(e) => {
-                    return Err(DomainError::validation(format!(
-                        "Route '{}': failed to deserialize GTS instance object: {e}",
-                        instance.id
-                    )));
-                }
-            }
-        }
-
-        Ok(result)
+        self.list_active(ROUTE_SCHEMA)
+            .await?
+            .iter()
+            .map(|instance| {
+                let payload: RoutePayload = payload(instance, "Route")?;
+                payload.into_provisioned(instance.id.as_ref(), instance.uuid)
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use oagw_sdk::HTTP_PROTOCOL_ID;
+    use toolkit_canonical_errors::CanonicalError;
     use toolkit_gts::gts_id;
-    use types_registry_sdk::{
-        GtsInstance,
-        testing::{MockTypesRegistryClient, internal, make_test_instance},
-    };
+    use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
     use super::*;
 
-    fn make_upstream_instance(gts_id: &str, object: serde_json::Value) -> GtsInstance {
-        make_test_instance(gts_id, object)
+    const UPSTREAM: &str = gts_id!("cf.core.oagw.upstream.v1~cf.test.oagw.models.v1");
+    const ROUTE: &str = gts_id!("cf.core.oagw.route.v1~cf.test.oagw.models.v1");
+
+    fn registry_uuid(id: &str) -> Uuid {
+        GtsId::try_new(id).unwrap().to_uuid()
     }
 
-    fn make_route_instance(gts_id: &str, object: serde_json::Value) -> GtsInstance {
-        make_test_instance(gts_id, object)
+    fn service(registry: &Arc<MockTypesRegistry>) -> TypeProvisioningServiceImpl {
+        TypeProvisioningServiceImpl::new(Arc::clone(registry) as Arc<dyn PlatformTypesRegistryApi>)
     }
 
     fn upstream_content(tenant_id: Uuid) -> serde_json::Value {
@@ -854,7 +857,7 @@ mod tests {
         })
     }
 
-    fn route_content(tenant_id: Uuid, upstream_id: Uuid) -> serde_json::Value {
+    fn route_content(tenant_id: Uuid, upstream_id: &str) -> serde_json::Value {
         serde_json::json!({
             "tenant_id": tenant_id,
             "upstream_id": upstream_id,
@@ -870,184 +873,216 @@ mod tests {
         })
     }
 
+    /// A row's id is the registry UUID of its named instance.
     #[tokio::test]
     async fn list_upstreams_returns_parsed_entities() {
         let tenant = Uuid::new_v4();
-        let instance_id = Uuid::new_v4();
-        let content = upstream_content(tenant);
-        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.upstream.v1~"), instance_id);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed(UPSTREAM, upstream_content(tenant));
 
-        let registry = Arc::new(
-            MockTypesRegistryClient::new()
-                .with_instances([make_upstream_instance(&gts_id, content)]),
-        );
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let upstreams = service(&registry).list_upstreams().await.unwrap();
 
-        let upstreams = svc.list_upstreams().await.unwrap();
         assert_eq!(upstreams.len(), 1);
         assert_eq!(upstreams[0].tenant_id, Some(tenant));
-        assert_eq!(upstreams[0].request.id, Some(instance_id));
+        assert_eq!(upstreams[0].request.id, Some(registry_uuid(UPSTREAM)));
         assert!(upstreams[0].request.enabled);
     }
 
-    /// ADR-0018: PERS-PROV-018.
     #[tokio::test]
-    async fn list_upstreams_rejects_non_uuid_instance_id() {
-        let registry =
-            Arc::new(
-                MockTypesRegistryClient::new().with_instances([make_upstream_instance(
-                    gts_id!("cf.core.oagw.upstream.v1~cf.core.oagw.test.v1"),
-                    upstream_content(Uuid::new_v4()),
-                )]),
-            );
-        let svc = TypeProvisioningServiceImpl::new(registry);
+    async fn list_upstreams_without_tenant_id_returns_none() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let mut content = upstream_content(Uuid::new_v4());
+        content.as_object_mut().unwrap().remove("tenant_id");
+        registry.seed(UPSTREAM, content);
 
-        let err = svc.list_upstreams().await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-UUID instance segment"),
-            "expected non-UUID error, got: {msg}"
+        let upstreams = service(&registry).list_upstreams().await.unwrap();
+
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].tenant_id, None);
+    }
+
+    /// Only instances under the upstream type are upstreams; the route and the
+    /// type itself are not listed.
+    #[tokio::test]
+    async fn list_upstreams_lists_only_upstream_instances() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed(UPSTREAM, upstream_content(Uuid::new_v4()));
+        registry.seed(ROUTE, route_content(Uuid::new_v4(), UPSTREAM));
+
+        let upstreams = service(&registry).list_upstreams().await.unwrap();
+        let routes = service(&registry).list_routes().await.unwrap();
+
+        let ids = |ids: Vec<Option<Uuid>>| ids;
+        assert_eq!(
+            ids(upstreams.iter().map(|u| u.request.id).collect()),
+            vec![Some(registry_uuid(UPSTREAM))]
+        );
+        assert_eq!(
+            ids(routes.iter().map(|r| r.request.id).collect()),
+            vec![Some(registry_uuid(ROUTE))]
         );
     }
 
+    /// ADR-0018: PERS-PROV-008. A deleted instance is not part of the desired
+    /// set, so the reconcile removes its row.
+    #[tokio::test]
+    async fn deleted_instances_are_not_listed() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed_entity(Seed::new(UPSTREAM, upstream_content(Uuid::new_v4())).deleted());
+        registry.seed_entity(Seed::new(ROUTE, route_content(Uuid::new_v4(), UPSTREAM)).deleted());
+
+        assert!(
+            service(&registry)
+                .list_upstreams()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(service(&registry).list_routes().await.unwrap().is_empty());
+    }
+
+    /// ADR-0018: PERS-PROV-018. Unreadable content fails the whole listing.
     #[tokio::test]
     async fn list_upstreams_rejects_invalid_content() {
-        let instance_id = Uuid::new_v4();
-        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.upstream.v1~"), instance_id);
-        let registry =
-            Arc::new(
-                MockTypesRegistryClient::new().with_instances([make_upstream_instance(
-                    &gts_id,
-                    serde_json::json!({"invalid": true}),
-                )]),
-            );
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed(UPSTREAM, serde_json::json!({"invalid": true}));
 
-        let err = svc.list_upstreams().await.unwrap_err();
+        let err = service(&registry).list_upstreams().await.unwrap_err();
+
         let msg = err.to_string();
-        assert!(
-            msg.contains("failed to deserialize"),
-            "expected deserialization error, got: {msg}"
-        );
+        assert!(msg.contains("failed to deserialize"), "got: {msg}");
     }
 
     #[tokio::test]
     async fn list_upstreams_returns_empty_when_none_registered() {
-        let registry = Arc::new(MockTypesRegistryClient::new());
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let registry = Arc::new(MockTypesRegistry::new());
 
-        let upstreams = svc.list_upstreams().await.unwrap();
-        assert!(upstreams.is_empty());
+        assert!(
+            service(&registry)
+                .list_upstreams()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
     async fn list_upstreams_propagates_registry_error() {
-        let registry =
-            Arc::new(MockTypesRegistryClient::new().with_list_error(internal("connection lost")));
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed(UPSTREAM, upstream_content(Uuid::new_v4()));
+        registry.inject(
+            Fault::on(Call::List).fail(CanonicalError::internal("connection lost").create()),
+        );
 
-        let result = svc.list_upstreams().await;
-        assert!(result.is_err());
+        assert!(service(&registry).list_upstreams().await.is_err());
+    }
+
+    /// The listing reads every page, and a failed later page fails it whole:
+    /// a prefix must never reach the reconcile, whose absence means removal.
+    #[tokio::test]
+    async fn listings_read_every_page_and_fail_whole_on_a_failed_page() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let count = usize::try_from(PAGE_LIMIT).unwrap() + 1;
+        for n in 0..count {
+            registry.seed(
+                &format!("{UPSTREAM_SCHEMA}cf.test.oagw.page_{n}.v1"),
+                upstream_content(Uuid::new_v4()),
+            );
+        }
+
+        let all = service(&registry).list_upstreams().await.unwrap();
+        assert_eq!(all.len(), count);
+        assert_eq!(registry.calls(Call::List), 2, "two pages");
+
+        registry.inject(
+            Fault::on(Call::List)
+                .nth(2)
+                .fail(CanonicalError::internal("page lost").create()),
+        );
+        assert!(service(&registry).list_upstreams().await.is_err());
     }
 
     #[tokio::test]
     async fn list_routes_returns_parsed_entities() {
         let tenant = Uuid::new_v4();
-        let upstream_id = Uuid::new_v4();
-        let route_instance_id = Uuid::new_v4();
-        let content = route_content(tenant, upstream_id);
-        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.route.v1~"), route_instance_id);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed(ROUTE, route_content(tenant, UPSTREAM));
 
-        let registry = Arc::new(
-            MockTypesRegistryClient::new().with_instances([make_route_instance(&gts_id, content)]),
-        );
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let routes = service(&registry).list_routes().await.unwrap();
 
-        let routes = svc.list_routes().await.unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].tenant_id, Some(tenant));
-        assert_eq!(routes[0].request.id, Some(route_instance_id));
-        assert_eq!(routes[0].request.upstream_id, upstream_id);
+        assert_eq!(routes[0].request.id, Some(registry_uuid(ROUTE)));
+        assert_eq!(routes[0].request.upstream_id, registry_uuid(UPSTREAM));
         assert!(routes[0].request.enabled);
     }
 
-    /// ADR-0018: PERS-PROV-018.
+    /// A route names its upstream by the upstream instance identifier, by an
+    /// OAGW resource identifier, or by a bare row UUID.
     #[tokio::test]
-    async fn list_routes_rejects_non_uuid_instance_id() {
-        let registry =
-            Arc::new(
-                MockTypesRegistryClient::new().with_instances([make_route_instance(
-                    gts_id!("cf.core.oagw.route.v1~cf.core.oagw.test.v1"),
-                    route_content(Uuid::new_v4(), Uuid::new_v4()),
-                )]),
-            );
-        let svc = TypeProvisioningServiceImpl::new(registry);
+    async fn route_upstream_references_resolve_to_the_upstream_row() {
+        let row = Uuid::new_v4();
+        for (reference, expected) in [
+            (UPSTREAM.to_owned(), registry_uuid(UPSTREAM)),
+            (format!("{UPSTREAM_SCHEMA}{row}"), row),
+            (row.to_string(), row),
+        ] {
+            let registry = Arc::new(MockTypesRegistry::new());
+            registry.seed(ROUTE, route_content(Uuid::new_v4(), &reference));
 
-        let err = svc.list_routes().await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("non-UUID instance segment"),
-            "expected non-UUID error, got: {msg}"
-        );
+            let routes = service(&registry).list_routes().await.unwrap();
+
+            assert_eq!(routes[0].request.upstream_id, expected, "{reference}");
+        }
+    }
+
+    /// A reference that is no upstream instance identifier nor a UUID fails
+    /// the listing.
+    #[tokio::test]
+    async fn route_with_an_unresolvable_upstream_reference_fails_the_listing() {
+        for reference in [
+            "not-an-id",
+            gts_id!("cf.core.oagw.route.v1~cf.test.oagw.models.v1"),
+            gts_id!("cf.core.oagw.upstream.v1~"),
+        ] {
+            let registry = Arc::new(MockTypesRegistry::new());
+            registry.seed(ROUTE, route_content(Uuid::new_v4(), reference));
+
+            let err = service(&registry).list_routes().await.unwrap_err();
+
+            assert!(
+                err.to_string().contains("upstream_id"),
+                "{reference}: {err}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn list_routes_rejects_invalid_content() {
-        let instance_id = Uuid::new_v4();
-        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.route.v1~"), instance_id);
-        let registry =
-            Arc::new(
-                MockTypesRegistryClient::new().with_instances([make_route_instance(
-                    &gts_id,
-                    serde_json::json!({"garbage": true}),
-                )]),
-            );
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.seed(ROUTE, serde_json::json!({"garbage": true}));
 
-        let err = svc.list_routes().await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("failed to deserialize"),
-            "expected deserialization error, got: {msg}"
-        );
+        let err = service(&registry).list_routes().await.unwrap_err();
+
+        assert!(err.to_string().contains("failed to deserialize"), "{err}");
     }
 
     #[tokio::test]
     async fn list_routes_propagates_registry_error() {
-        let registry =
-            Arc::new(MockTypesRegistryClient::new().with_list_error(internal("timeout")));
-        let svc = TypeProvisioningServiceImpl::new(registry);
+        let registry = Arc::new(MockTypesRegistry::new());
+        registry.inject(Fault::on(Call::List).fail(CanonicalError::internal("timeout").create()));
 
-        let result = svc.list_routes().await;
-        assert!(result.is_err());
+        assert!(service(&registry).list_routes().await.is_err());
     }
 
+    /// The listing is made with the platform's own outbound context.
     #[tokio::test]
-    async fn list_upstreams_uses_correct_pattern() {
-        let registry = Arc::new(MockTypesRegistryClient::new());
-        let svc = TypeProvisioningServiceImpl::new(registry.clone());
+    async fn listings_use_the_platform_context() {
+        let registry = Arc::new(MockTypesRegistry::new());
 
-        let _ = svc.list_upstreams().await;
-        let queries = registry.received_instance_queries();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(
-            queries[0].pattern.as_deref(),
-            Some(format!("{UPSTREAM_SCHEMA}*").as_str())
-        );
-    }
+        service(&registry).list_upstreams().await.unwrap();
 
-    #[tokio::test]
-    async fn list_routes_uses_correct_pattern() {
-        let registry = Arc::new(MockTypesRegistryClient::new());
-        let svc = TypeProvisioningServiceImpl::new(registry.clone());
-
-        let _ = svc.list_routes().await;
-        let queries = registry.received_instance_queries();
-        assert_eq!(queries.len(), 1);
-        assert_eq!(
-            queries[0].pattern.as_deref(),
-            Some(format!("{ROUTE_SCHEMA}*").as_str())
-        );
+        assert_eq!(registry.platform_calls(Call::List), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -1290,31 +1325,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provisioned.tenant_id, None);
-    }
-
-    #[tokio::test]
-    async fn list_upstreams_without_tenant_id_returns_none() {
-        let instance_id = Uuid::new_v4();
-        let content = serde_json::json!({
-            "server": {
-                "endpoints": [{"host": "127.0.0.1", "port": 8080, "scheme": "http"}]
-            },
-            "protocol": HTTP_PROTOCOL_ID,
-            "enabled": true,
-            "tags": []
-        });
-        let gts_id = format!("{}{}", gts_id!("cf.core.oagw.upstream.v1~"), instance_id);
-
-        let registry = Arc::new(
-            MockTypesRegistryClient::new()
-                .with_instances([make_upstream_instance(&gts_id, content)]),
-        );
-        let svc = TypeProvisioningServiceImpl::new(registry);
-
-        let upstreams = svc.list_upstreams().await.unwrap();
-        assert_eq!(upstreams.len(), 1);
-        assert_eq!(upstreams[0].tenant_id, None);
-        assert_eq!(upstreams[0].request.id, Some(instance_id));
     }
 
     #[test]

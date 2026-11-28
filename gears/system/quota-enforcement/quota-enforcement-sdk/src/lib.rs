@@ -27,6 +27,8 @@ pub mod bulk;
 pub mod client;
 pub mod engine;
 pub mod gts;
+
+toolkit_gts::declare_gts_inventory!();
 pub mod models;
 pub mod notifications;
 pub mod odata;
@@ -57,10 +59,11 @@ pub use engine::{
     QuotaScopeTier, ValidatedConfig, linked_engines,
 };
 pub use gts::{
-    CONSTRAINT_BASE, LEASE_RESOURCE, METRIC_BASE_TYPE, OPERATION_RESOURCE, OwnedDefinition,
-    POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
-    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER,
-    SUBJECT_BASE, owned_definitions,
+    CONSTRAINT_BASE, ConstraintContractV1, LEASE_RESOURCE, METRIC_BASE_TYPE, MetricInstanceRef,
+    OPERATION_RESOURCE, POLICY_RESOURCE, QUOTA_RESOURCE, QuotaEnforcementStoragePluginSpecV1,
+    QuotaNotificationSinkSpecV1, REQUEST_BASE, RESOURCE_BASE, RequestContractV1, RequestTraitsV1,
+    ResourceProjectionV1, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, ScopeV1,
+    SubjectProjectionV1, SubjectTraitsV1,
 };
 pub use models::{
     AcquireLeaseOutcome, AcquireLeaseRequest, ActiveQuotaCounts, ApplicableQuotas, AppliedMutation,

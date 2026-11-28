@@ -162,12 +162,12 @@ only; the Quota write itself is owned by the quota-lifecycle feature)
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-catalog-bootstrap`
 
-**Input**: deployment configuration naming the projections configured for evaluation, `TypesRegistryClient`
+**Input**: deployment configuration naming the projections configured for evaluation, `PlatformTypesRegistryApi`
 
 **Output**: the published immutable `ProjectionContractCatalog`, or failed gear bootstrap
 
 **Steps**:
-1. [x] - `p1` - API: register missing QE-owned definitions idempotently through `TypesRegistryClient`: the abstract bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`, `gts.cf.core.qe.request.v1~`, `gts.cf.core.qe.constraint.v1~`, the scope-discriminator type `gts.cf.core.qe.scope.v1~`, and its P1 well-known instances `gts.cf.core.qe.scope.v1~cf.core.qe.user.v1` and `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1`; registration touches only QE-owned definitions, and QE seeds no platform-wide subject instances - `inst-cat-bases`
+1. [x] - `p1` - API: require the QE-owned definitions admitted before `init`: the runtime publishes them from the SDK collector (`gts_publication(crates = [quota_enforcement_sdk])`) — the abstract bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`, `gts.cf.core.qe.request.v1~`, `gts.cf.core.qe.constraint.v1~`, the scope-discriminator type `gts.cf.core.qe.scope.v1~`, and its P1 well-known instances `gts.cf.core.qe.scope.v1~cf.core.qe.user.v1` and `gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1`; `init` refuses without the admitted manifest; the publication touches only QE-owned definitions, and QE seeds no platform-wide subject instances - `inst-cat-bases`
 2. [x] - `p1` - API: resolve every configured subject/resource projection and metric request contract from `types-registry` into a candidate catalogue; `types-registry` remains authoritative and the catalogue is only a validated local snapshot - `inst-cat-resolve`
 3. [x] - `p1` - Verify each configured projection/request contract is concrete and genuinely derived from its QE base - `inst-cat-concrete`
 4. [x] - `p1` - Verify every admitted metric reference resolves to a registered instance of the metric base; a narrowed `x-gts-instance-ref` is a pattern-level prefix match only, so QE owns both checks - `inst-cat-metric`
@@ -244,11 +244,13 @@ configured projection set means a new bootstrap of a new process. Individual con
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-base-registration`
 
-The system **MUST** register the abstract bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`,
+The system **MUST** declare the abstract bases `gts.cf.core.qe.subj.v1~`, `gts.cf.core.qe.res.v1~`,
 `gts.cf.core.qe.request.v1~`, and `gts.cf.core.qe.constraint.v1~`, the scope-discriminator type
 `gts.cf.core.qe.scope.v1~`, and its P1
-well-known instances `user` and `tenant` idempotently through `TypesRegistryClient` at bootstrap, touching only
+well-known instances `user` and `tenant` in the SDK's GTS collector and publish them with
+`gts_publication(crates = [quota_enforcement_sdk])`, admitted before the gear's `init`, touching only
 QE-owned definitions, seeding no platform-wide subject instances, and exposing no QE registration endpoint.
+`docs/schemas/` keeps the reviewed documents; the SDK tests hold the declarations to them.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-owner-projection-publication`
@@ -257,7 +259,7 @@ QE-owned definitions, seeding no platform-wide subject instances, and exposing n
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (platform `types-registry-sdk`, obtained from ClientHub)
+- API: `PlatformTypesRegistryApi` (`types-registry-sdk`, a consumed contract obtained from ClientHub)
 - Entities: `SubjectScope`
 
 ### Projection Contract Catalogue
@@ -279,7 +281,7 @@ no QE-side table exists.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (bootstrap only; never on the request path)
+- API: `PlatformTypesRegistryApi` (bootstrap only; never on the request path)
 - Entities: `ProjectionContractCatalog`, `SubjectProjectionContract`, `ResourceProjectionContract`,
   `MetricRequestContract`, `ConstraintContract`
 

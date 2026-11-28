@@ -267,6 +267,29 @@ async fn ac1_create_persists_an_active_row_and_enqueues_the_created_event() {
     );
 }
 
+/// Quota requests read the registry under the caller's context; the
+/// catalogue the harness built at bootstrap read it as the platform.
+#[tokio::test]
+async fn quota_requests_read_the_registry_as_the_caller() {
+    let h = Harness::new().await;
+    let bootstrap_reads = h.registry.type_schema_callers();
+    assert!(
+        !bootstrap_reads.is_empty() && bootstrap_reads.iter().all(|c| *c == "platform"),
+        "{bootstrap_reads:?}"
+    );
+
+    let view = h.quotas().create(&ctx(), request()).await.expect("create");
+    h.quotas().get(&ctx(), view.quota.id).await.expect("get");
+
+    let after_create = h.registry.type_schema_callers();
+    assert_eq!(after_create.last(), Some(&"request"), "membership read");
+    assert_eq!(
+        h.metric_registry.callers(),
+        ["request", "request"],
+        "create and get describe the metric as the caller"
+    );
+}
+
 #[tokio::test]
 async fn ac2_an_unregistered_metric_and_an_unreachable_registry_fail_closed_before_storage() {
     let h = Harness::new().await;

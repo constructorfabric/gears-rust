@@ -15,7 +15,7 @@ use super::{
 
 // Derived contract types, as a consuming Gear registers them.
 
-#[toolkit_gts::gts_type_schema(
+#[toolkit_gts::local::gts_type_schema(
     dir_path = "schemas",
     base = LicenseResourceV1,
     type_id = toolkit_gts::gts_id!("cf.core.lic.res.v1~cf.genai.llm_gateway.model_usage.v1~"),
@@ -28,7 +28,7 @@ struct ModelUsageResourceV1 {
     model_name: String,
 }
 
-#[toolkit_gts::gts_type_schema(
+#[toolkit_gts::local::gts_type_schema(
     dir_path = "schemas",
     base = LicenseSubjectV1,
     type_id = toolkit_gts::gts_id!("cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~"),

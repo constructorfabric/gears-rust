@@ -21,8 +21,8 @@ env:
   APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
 # Keep previous seed revisions and OAGW rows out of independent suite runs.
 clean_home: true
-# Keep the base types-registry database: migrated resolvers need its platform
-# API for pre-init publication. OAGW's legacy catalogue remains available too.
+# Keep the base types-registry database: gears publish through its platform
+# API before their init, and OAGW provisions from it.
 profiles:
   # OAGW on SQLite instead of in memory, with one upstream and two routes
   # provisioned from the types registry after host startup by the suite fixture.

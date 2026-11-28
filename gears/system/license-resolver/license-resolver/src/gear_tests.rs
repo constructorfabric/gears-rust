@@ -119,3 +119,43 @@ fn local_or_absent_wiring_is_accepted() {
         refuse_remote_wiring(&cfg, "license-resolver").unwrap();
     }
 }
+
+/// The gear publishes the SDK's declarations — the licensing bases, the
+/// tenant subject and the plugin spec — as `license-resolver`, before `init`.
+#[test]
+fn the_manifest_is_the_sdk_declarations() {
+    use gts::GtsSchema;
+    use license_resolver_sdk::{
+        LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1, LicenseTenantSubjectV1,
+    };
+    use toolkit::gts_publication::GtsPublicationCapability;
+
+    let manifest = LicenseResolver
+        .descriptor()
+        .build_gts_manifest(&StaticConfigProvider { root: json!({}) })
+        .expect("manifest");
+    assert_eq!(manifest.publisher_name(), "license-resolver");
+
+    let published: Vec<(String, serde_json::Value)> = manifest
+        .documents()
+        .iter()
+        .map(|(id, doc)| (id.as_ref().to_owned(), doc.clone()))
+        .collect();
+    let mut declared: Vec<(String, serde_json::Value)> = license_resolver_sdk::gts_declarations()
+        .into_iter()
+        .map(|(id, text)| (id, serde_json::from_str(&text).expect("declared JSON")))
+        .collect();
+    declared.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(published, declared);
+    for type_id in [
+        <LicenseSubjectV1<()> as GtsSchema>::TYPE_ID,
+        <LicenseResourceV1<()> as GtsSchema>::TYPE_ID,
+        <LicenseTenantSubjectV1 as GtsSchema>::TYPE_ID,
+        LicenseResolverPluginSpecV1::TYPE_ID,
+    ] {
+        assert!(
+            published.iter().any(|(id, _)| id == type_id),
+            "{type_id} is published"
+        );
+    }
+}

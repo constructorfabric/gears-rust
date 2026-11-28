@@ -3,25 +3,31 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use gts::{CompilePayloadValidatorError, GtsInstanceId, GtsTypeId};
-use quota_enforcement_sdk::{
-    METRIC_BASE_TYPE, REQUEST_BASE, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE, owned_definitions,
-};
-use serde_json::{Value, json};
+use gts::{GtsInstanceId, GtsTypeId};
+use quota_enforcement_sdk::{METRIC_BASE_TYPE, REQUEST_BASE, SCOPE_TYPE, SCOPE_USER, SUBJECT_BASE};
+use serde_json::json;
+use toolkit::ClientHub;
 use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::CompilePayloadValidatorError;
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 use super::TypesRegistryContracts;
-use crate::domain::error::DomainError;
-use crate::domain::ports::contracts::ContractRegistry;
-use crate::domain::ports::metrics::ValidationReason;
+use crate::domain::error::{CallerRefusal, DomainError};
+use crate::domain::ports::contracts::{ContractRegistry, RegistryCaller};
 use crate::test_support::{
     LLM_TOKEN_REQUEST, LLM_USER_PROJECTION, METRIC_OTHER, METRIC_TOKENS, MIXIN_REQUEST, MIXIN_TYPE,
-    in_process_registry, llm_gateway_documents, metric_base_documents, mixin_request_document,
-    mixin_type_document, mock_registry,
+    ManagedRegistry, ctx, hub_over, llm_gateway_documents, metric_base_documents,
+    mixin_request_document, mixin_type_document, mock_registry,
 };
 
-fn adapter(mock: types_registry_sdk::testing::MockTypesRegistryClient) -> TypesRegistryContracts {
-    TypesRegistryContracts::new(Arc::new(mock)).with_deadline(Duration::from_secs(2))
+const PLATFORM: RegistryCaller<'static> = RegistryCaller::Platform;
+
+fn adapter(hub: Arc<ClientHub>) -> TypesRegistryContracts {
+    TypesRegistryContracts::new(hub).with_deadline(Duration::from_secs(2))
+}
+
+fn over(registry: &Arc<MockTypesRegistry>) -> TypesRegistryContracts {
+    adapter(hub_over(registry))
 }
 
 fn type_id(raw: &str) -> GtsTypeId {
@@ -30,9 +36,9 @@ fn type_id(raw: &str) -> GtsTypeId {
 
 #[tokio::test]
 async fn a_derived_contract_resolves_with_its_traits_dialect_and_inlined_parent() {
-    let registry = adapter(mock_registry(&llm_gateway_documents(), &[]));
+    let registry = over(&mock_registry(&llm_gateway_documents(), &[]));
     let user = registry
-        .type_schema(&type_id(LLM_USER_PROJECTION))
+        .type_schema(PLATFORM, &type_id(LLM_USER_PROJECTION))
         .await
         .expect("registry answers")
         .expect("the projection is registered");
@@ -44,49 +50,57 @@ async fn a_derived_contract_resolves_with_its_traits_dialect_and_inlined_parent(
     assert_eq!(payload.type_id(), &type_id(LLM_USER_PROJECTION));
 
     let base = registry
-        .type_schema(&type_id(SUBJECT_BASE))
+        .type_schema(PLATFORM, &type_id(SUBJECT_BASE))
         .await
         .expect("registry answers")
         .expect("the base is registered");
     assert!(base.is_abstract);
     assert!(base.ancestors.is_empty());
     assert!(
-        matches!(base.payload, Err(CompilePayloadValidatorError::Abstract(_))),
+        matches!(
+            base.payload,
+            Err(CompilePayloadValidatorError::Upstream(
+                gts::CompilePayloadValidatorError::Abstract(_)
+            ))
+        ),
         "an abstract type has no payload validator"
     );
 }
 
+/// A request reads under the caller's context through the tenant contract;
+/// the gear's own reads go through the platform contract.
 #[tokio::test]
-async fn scope_reference_syntax_and_prefix_are_enforced() {
-    for scope in ["not-an-id", METRIC_TOKENS] {
-        let mut documents = llm_gateway_documents();
-        let projection = documents
-            .iter_mut()
-            .find(|doc| doc["$id"] == format!("gts://{LLM_USER_PROJECTION}"))
-            .expect("user projection");
-        projection["x-gts-traits"]["scope"] = json!(scope);
-        let registry = adapter(mock_registry(&documents, &[]));
+async fn a_request_resolves_under_the_callers_context() {
+    let mock = mock_registry(&llm_gateway_documents(), &[]);
+    let registry = over(&mock);
+    let caller = ctx();
 
-        let err = registry
-            .type_schema(&type_id(LLM_USER_PROJECTION))
-            .await
-            .expect_err("the scope must match its x-gts-instance-ref constraint");
-        match err {
-            DomainError::TypesRegistryUnavailable(reason) => {
-                assert!(reason.contains("trait"), "{scope}: {reason}");
-                assert!(reason.contains("scope"), "{scope}: {reason}");
-            }
-            other => panic!("expected drift for {scope}, got {other:?}"),
-        }
-    }
+    registry
+        .type_schema(
+            RegistryCaller::Request(&caller),
+            &type_id(LLM_USER_PROJECTION),
+        )
+        .await
+        .expect("answers")
+        .expect("registered");
+    let contexts = mock.caller_contexts(Call::BatchGet);
+    assert_eq!(contexts.len(), 1);
+    assert_eq!(contexts[0].subject_id(), caller.subject_id());
+    assert_eq!(mock.platform_calls(Call::BatchGet), 0);
+
+    registry
+        .type_schema(PLATFORM, &type_id(LLM_USER_PROJECTION))
+        .await
+        .expect("answers");
+    assert_eq!(mock.platform_calls(Call::BatchGet), 1);
 }
 
 #[tokio::test]
 async fn local_and_mixin_references_are_resolved_transitively() {
     let documents = vec![mixin_type_document(), mixin_request_document(METRIC_TOKENS)];
-    let registry = adapter(mock_registry(&documents, &[]));
+    let registry = over(&mock_registry(&documents, &[]));
     let contract = registry
-        .type_schema(&type_id(MIXIN_REQUEST))
+        .type_schema(PLATFORM, &type_id(MIXIN_REQUEST))
         .await
         .expect("registry answers")
         .expect("registered");
@@ -108,28 +122,82 @@ async fn local_and_mixin_references_are_resolved_transitively() {
     );
 }
 
+/// The registry's verdict on `subject` in a refused reconciliation: its kind
+/// and the registry's reason.
+fn verdict_on(refusal: &CanonicalError, subject: &str) -> (String, String) {
+    let CanonicalError::FailedPrecondition { ctx, .. } = refusal else {
+        panic!("a refused reconciliation fails its precondition: {refusal:?}");
+    };
+    let violation = ctx
+        .violations
+        .iter()
+        .find(|v| v.subject == subject)
+        .unwrap_or_else(|| panic!("no verdict on {subject}: {refusal:?}"));
+    (violation.type_.clone(), violation.description.clone())
+}
+
+/// The registry, not QE, validates traits and references at admission: a
+/// projection whose scope breaks its trait schema, or a contract whose mixin
+/// is not registered, is never admitted, so QE never sees it.
 #[tokio::test]
-async fn a_missing_mixin_target_is_catalogue_drift() {
-    let registry = adapter(mock_registry(&[mixin_request_document(METRIC_TOKENS)], &[]));
-    let err = registry
-        .type_schema(&type_id(MIXIN_REQUEST))
+async fn admission_refuses_contracts_that_do_not_resolve() {
+    let managed = ManagedRegistry::start(metric_base_documents()).await;
+    let hub = Arc::new(ClientHub::new());
+    managed.install(&hub);
+    let registry = adapter(hub);
+
+    let mut documents = llm_gateway_documents();
+    let projection = documents
+        .iter_mut()
+        .find(|doc| doc["$id"] == format!("gts://{LLM_USER_PROJECTION}"))
+        .expect("user projection");
+    projection["x-gts-traits"]["scope"] = json!("not-an-id");
+    let refusal = managed
+        .try_admit("llm-gateway", documents)
         .await
-        .expect_err("the mixin is not registered");
-    match err {
-        DomainError::TypesRegistryUnavailable(reason) => {
-            assert!(reason.contains(MIXIN_TYPE), "{reason}");
-        }
-        other => panic!("expected drift, got {other:?}"),
+        .expect_err("a scope outside its x-gts-instance-ref is refused");
+    let (verdict, why) = verdict_on(&refusal, LLM_USER_PROJECTION);
+    assert_eq!(verdict, "reconciliation.rejected");
+    assert!(why.contains("trait validation failed"), "{why}");
+    assert!(
+        registry
+            .type_schema(PLATFORM, &type_id(LLM_USER_PROJECTION))
+            .await
+            .expect("answers")
+            .is_none()
+    );
+
+    let refusal = managed
+        .try_admit("mixins", vec![mixin_request_document(METRIC_TOKENS)])
+        .await
+        .expect_err("a contract whose mixin is not registered is refused");
+    let (verdict, why) = verdict_on(&refusal, MIXIN_REQUEST);
+    assert_eq!(verdict, "reconciliation.pending.dependency");
+    assert!(
+        why.contains(&format!("'{MIXIN_TYPE}' is not registered")),
+        "{why}"
+    );
+    for absent in [MIXIN_REQUEST, MIXIN_TYPE] {
+        assert!(
+            registry
+                .type_schema(PLATFORM, &type_id(absent))
+                .await
+                .expect("answers")
+                .is_none(),
+            "{absent}"
+        );
     }
 }
 
+/// Discovery reads the listing (content and traits) and resolves no schema.
+/// A contract with a broken reference graph cannot be listed: admission
+/// refuses it ([`admission_refuses_contracts_that_do_not_resolve`]).
 #[tokio::test]
-async fn discovery_lists_derived_types_from_the_listing_and_follows_no_reference() {
-    // The mixin contract's target is absent: resolution would fail, discovery
-    // must not even try.
+async fn discovery_lists_derived_types_from_the_listing() {
     let mut documents = llm_gateway_documents();
+    documents.push(mixin_type_document());
     documents.push(mixin_request_document(METRIC_OTHER));
-    let registry = adapter(mock_registry(&documents, &[]));
+    let registry = over(&mock_registry(&documents, &[]));
     let discovered = registry
         .derived_types(&type_id(REQUEST_BASE))
         .await
@@ -143,7 +211,7 @@ async fn discovery_lists_derived_types_from_the_listing_and_follows_no_reference
     );
     assert!(
         !ids.iter().any(|id| id.starts_with(SUBJECT_BASE)),
-        "the mock ignores patterns; ancestry filtering keeps subjects out: {ids:?}"
+        "subjects are not request contracts: {ids:?}"
     );
     let mixin = discovered
         .iter()
@@ -154,16 +222,15 @@ async fn discovery_lists_derived_types_from_the_listing_and_follows_no_reference
 }
 
 #[tokio::test]
-async fn missing_types_and_instances_are_none_and_transport_failures_lift() {
-    let registry = adapter(mock_registry(
-        &llm_gateway_documents(),
-        &metric_base_documents()[1..],
-    ));
+async fn missing_and_deleted_types_and_instances_are_none_and_failures_lift() {
+    let mock = mock_registry(&llm_gateway_documents(), &metric_base_documents()[1..]);
+    let registry = over(&mock);
     assert!(
         registry
-            .type_schema(&type_id(
-                "gts.cf.core.qe.subj.v1~cf.nobody.nothing.absent.v1~"
-            ))
+            .type_schema(
+                PLATFORM,
+                &type_id("gts.cf.core.qe.subj.v1~cf.nobody.nothing.absent.v1~")
+            )
             .await
             .expect("answers")
             .is_none()
@@ -179,11 +246,23 @@ async fn missing_types_and_instances_are_none_and_transport_failures_lift() {
         None
     );
 
-    let failing = adapter(
-        types_registry_sdk::testing::MockTypesRegistryClient::new()
-            .with_list_error(CanonicalError::internal("registry down").create()),
+    // A deleted entity is absent.
+    let user = mock.content(LLM_USER_PROJECTION).expect("seeded");
+    mock.seed_entity(Seed::new(LLM_USER_PROJECTION, user).deleted());
+    assert!(
+        registry
+            .type_schema(PLATFORM, &type_id(LLM_USER_PROJECTION))
+            .await
+            .expect("answers")
+            .is_none()
     );
-    let err = failing
+    let scope = GtsInstanceId::try_new(SCOPE_USER).expect("instance id");
+    let scope_doc = mock.content(SCOPE_USER).expect("seeded");
+    mock.seed_entity(Seed::new(SCOPE_USER, scope_doc).deleted());
+    assert_eq!(registry.instance_type(&scope).await.expect("answers"), None);
+
+    mock.inject(Fault::on(Call::List).fail(CanonicalError::internal("registry down").create()));
+    let err = registry
         .derived_types(&type_id(REQUEST_BASE))
         .await
         .expect_err("listing fails");
@@ -194,44 +273,138 @@ async fn missing_types_and_instances_are_none_and_transport_failures_lift() {
 }
 
 #[tokio::test]
-async fn ensure_registered_is_idempotent_and_a_divergent_definition_is_a_conflict() {
-    let client = in_process_registry(Vec::new());
-    let registry = TypesRegistryContracts::new(client.clone());
-    let definitions = owned_definitions().expect("definitions");
-
-    // The inventory already seeded these; asserting them again is a no-op.
-    registry
-        .ensure_registered(&definitions)
-        .await
-        .expect("byte-identical definitions register idempotently");
-    registry
-        .ensure_registered(&definitions)
-        .await
-        .expect("and again");
-
-    let mut divergent = definitions
-        .iter()
-        .find(|d| d.id == SCOPE_TYPE)
-        .cloned()
-        .expect("scope type");
-    divergent.document["description"] = Value::String("changed".to_owned());
-    let err = registry
-        .ensure_registered(&[divergent])
-        .await
-        .expect_err("the same id with other content is a conflict");
-    assert_eq!(
-        err,
-        DomainError::CatalogInvalid {
-            reason: ValidationReason::DefinitionConflict,
-            subject: SCOPE_TYPE.to_owned(),
-        }
-    );
-
-    // The real registry resolves the QE bases it was seeded with.
+async fn the_real_registry_resolves_the_qe_bases_it_admitted() {
+    let managed = ManagedRegistry::start(Vec::new()).await;
+    let hub = Arc::new(ClientHub::new());
+    managed.install(&hub);
+    let registry = adapter(hub);
     let scope = registry
-        .type_schema(&type_id(SCOPE_TYPE))
+        .type_schema(PLATFORM, &type_id(SCOPE_TYPE))
         .await
         .expect("answers")
-        .expect("seeded");
+        .expect("admitted");
     assert!(!scope.is_abstract);
+}
+
+/// The registry's own `NotFound` answer, for fault injection.
+async fn not_found(mock: &Arc<MockTypesRegistry>) -> CanonicalError {
+    use types_registry_sdk::{PlatformTypesRegistryApiExt, ReadOptions};
+    let err = mock
+        .get_type_schema(
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            &type_id("gts.cf.test.qe.absent.v1~"),
+            ReadOptions::default(),
+        )
+        .await
+        .expect_err("absent");
+    assert!(matches!(err, CanonicalError::NotFound { .. }), "{err:?}");
+    err
+}
+
+/// A failed listing is a registry failure, never an empty catalogue — a
+/// `NotFound` answer on the first or a later page included.
+#[tokio::test]
+async fn a_failed_listing_is_never_an_empty_discovery() {
+    for (first, nth) in [(true, 1), (false, 2)] {
+        let mut documents = llm_gateway_documents();
+        if !first {
+            // Enough request contracts to need a second page.
+            for n in 0..60 {
+                let mut extra = mixin_request_document(METRIC_OTHER);
+                extra["$id"] = json!(format!(
+                    "gts://gts.cf.core.qe.request.v1~cf.test.qe.extra_{n:02}.v1~"
+                ));
+                documents.push(extra);
+            }
+            documents.push(mixin_type_document());
+        }
+        let mock = mock_registry(&documents, &[]);
+        let not_found = not_found(&mock).await;
+        mock.inject(Fault::on(Call::List).nth(nth).fail(not_found));
+        let err = over(&mock)
+            .derived_types(&type_id(REQUEST_BASE))
+            .await
+            .expect_err("a failed page is not an empty listing");
+        assert!(
+            matches!(err, DomainError::TypesRegistryUnavailable(_)),
+            "page {nth}: {err:?}"
+        );
+    }
+}
+
+/// A selected artifact the registry did not return is drift, never a
+/// default; a selected JSON null stays null.
+#[test]
+fn a_missing_selected_artifact_is_drift() {
+    use types_registry_sdk::{LifecycleStatus, TypeSchema};
+
+    let snapshot = || TypeSchema {
+        type_id: type_id(LLM_USER_PROJECTION),
+        type_uuid: uuid::Uuid::nil(),
+        lifecycle_status: LifecycleStatus::Active,
+        ownership: types_registry_sdk::Ownership::Global,
+        origin: None,
+        content: Some(json!({ "type": "object", "x-gts-abstract": true })),
+        resolved_schema: Some(json!({ "type": "object" })),
+        effective_traits: Some(json!({})),
+        effective_traits_schema: None,
+        provenance: None,
+    };
+    let complete = super::resolve(snapshot()).expect("complete");
+    assert!(complete.is_abstract, "read from the authored content");
+    for field in ["content", "resolved schema", "effective traits"] {
+        let mut drifted = snapshot();
+        match field {
+            "content" => drifted.content = None,
+            "resolved schema" => drifted.resolved_schema = None,
+            _ => drifted.effective_traits = None,
+        }
+        let err = super::resolve(drifted).expect_err(field);
+        assert!(
+            matches!(&err, DomainError::TypesRegistryUnavailable(d) if d.contains(field)),
+            "{field}: {err:?}"
+        );
+    }
+    let mut null = snapshot();
+    null.effective_traits = Some(serde_json::Value::Null);
+    let null = super::resolve(null).expect("a selected null");
+    assert_eq!(null.effective_traits, serde_json::Value::Null);
+}
+
+/// A registry that refuses a request's caller answered: the refusal is the
+/// caller's, not an outage. The gear's own read of the same type keeps the
+/// outage classification.
+#[tokio::test]
+async fn a_refused_request_is_the_callers_refusal_not_an_outage() {
+    let mock = mock_registry(&llm_gateway_documents(), &[]);
+    let registry = over(&mock);
+    let caller = ctx();
+    let id = type_id(LLM_USER_PROJECTION);
+    let denied = crate::infra::canonical_mapping::QuotaResource::permission_denied()
+        .with_reason("FORBIDDEN")
+        .create();
+    let unauthenticated = CanonicalError::unauthenticated()
+        .with_reason("TOKEN_EXPIRED")
+        .create();
+    for (refusal, expected) in [
+        (denied.clone(), CallerRefusal::PermissionDenied),
+        (unauthenticated, CallerRefusal::Unauthenticated),
+    ] {
+        mock.inject(Fault::on(Call::BatchGet).first(1).fail(refusal));
+        let err = registry
+            .type_schema(RegistryCaller::Request(&caller), &id)
+            .await
+            .expect_err("refused");
+        assert_eq!(err, DomainError::RegistryRefusedCaller(expected));
+    }
+
+    mock.inject(Fault::on(Call::BatchGet).first(1).fail(denied));
+    let err = registry
+        .type_schema(PLATFORM, &id)
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(err, DomainError::TypesRegistryUnavailable(_)),
+        "{err:?}"
+    );
 }

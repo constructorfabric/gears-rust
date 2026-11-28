@@ -4,7 +4,7 @@ use quota_enforcement_sdk::{
 use toolkit_canonical_errors::{CanonicalError, Problem};
 use uuid::Uuid;
 
-use crate::domain::error::{Dependency, DomainError, PluginKind, ResourceKind};
+use crate::domain::error::{CallerRefusal, Dependency, DomainError, PluginKind, ResourceKind};
 use crate::domain::ports::metrics::ValidationReason;
 use quota_enforcement_sdk::engine::DebitPlanInvariant;
 
@@ -109,6 +109,14 @@ fn every_variant_family_maps_to_its_documented_status() {
         (DomainError::PdpUnavailable("x".to_owned()), 503),
         (DomainError::BackendUnavailable("x".to_owned()), 503),
         (DomainError::TypesRegistryUnavailable("x".to_owned()), 503),
+        (
+            DomainError::RegistryRefusedCaller(CallerRefusal::Unauthenticated),
+            401,
+        ),
+        (
+            DomainError::RegistryRefusedCaller(CallerRefusal::PermissionDenied),
+            403,
+        ),
         (
             DomainError::PluginNotFound {
                 kind: PluginKind::Storage,
@@ -543,4 +551,28 @@ fn an_unknown_quota_or_operation_names_its_token_on_the_wire() {
         assert!(body.contains(token), "{body}");
         assert!(body.contains("k1"), "the identifier is still named: {body}");
     }
+}
+
+/// A registry's refusal of the caller keeps the 403 envelope a PDP denial
+/// has; a 401 carries the listener's token, never upstream text.
+#[test]
+fn a_registry_refusing_the_caller_keeps_the_denial_envelope() {
+    let denied = Problem::from(CanonicalError::from(DomainError::RegistryRefusedCaller(
+        CallerRefusal::PermissionDenied,
+    )));
+    let pdp = Problem::from(CanonicalError::from(DomainError::PdpDenied {
+        reason: None,
+    }));
+    assert_eq!(
+        serde_json::to_value(&denied).expect("json"),
+        serde_json::to_value(&pdp).expect("json")
+    );
+    let unauthenticated = CanonicalError::from(DomainError::RegistryRefusedCaller(
+        CallerRefusal::Unauthenticated,
+    ));
+    assert!(
+        matches!(&unauthenticated, CanonicalError::Unauthenticated { ctx, .. }
+            if ctx.reason.as_deref() == Some("AUTHN_FAILED")),
+        "{unauthenticated:?}"
+    );
 }

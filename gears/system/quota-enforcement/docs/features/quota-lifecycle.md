@@ -56,7 +56,7 @@ contract never reaches storage. It also guarantees that deactivation never stran
 resolves every active lease in the same transaction.
 
 **Scope**: `QuotaManagementService` with transactional CRUD via the storage plugin; metric existence, kind, and mode
-validation through `TypesRegistryClient` with an in-process LRU cache, fail-closed; cap semantics
+validation through `types-registry-sdk` with an in-process LRU cache, fail-closed; cap semantics
 (`CAP_MUST_BE_NON_NEGATIVE`, `cap = 0`, `cap = null`, commit-time `CAP_BELOW_CONSUMED`); Quota Metadata validation
 against the owner's constraint contract at write time only; validity-window storage and
 `currently_within_window` computation; the deactivation cascade marking leases resolved-by-deactivation; `rate`
@@ -246,12 +246,12 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-algo-metric-validation`
 
-**Input**: the draft's `metric_name`, `TypesRegistryClient` (platform `types-registry-sdk`, obtained from ClientHub)
+**Input**: the draft's `metric_name`, `TypesRegistryApi` (`types-registry-sdk`, under the caller's context, obtained from ClientHub)
 
 **Output**: confirmed metric identity with the registry-reported classifications, or an actionable error
 
 **Steps**:
-1. [ ] - `p1` - Consult the in-process LRU cache of metric-name lookups inside `QuotaManagementService`; on a miss, call `TypesRegistryClient`; this lookup runs outside the storage transaction - `inst-qmv-lookup`
+1. [ ] - `p1` - Consult the in-process LRU cache of metric-name lookups inside `QuotaManagementService`; on a miss, call `types-registry-sdk`; this lookup runs outside the storage transaction - `inst-qmv-lookup`
 2. [ ] - `p1` - **IF** the metric is not registered in `types-registry` - `inst-qmv-unknown-if`
    1. [ ] - `p1` - **RETURN** `METRIC_NOT_REGISTERED` (`DomainError::MetricNotRegistered`, HTTP 400), an actionable creation-time error (`cpt-cf-quota-enforcement-fr-metric-identity-validation`) - `inst-qmv-unknown`
 3. [ ] - `p1` - **IF** the registry is unreachable and the cache cannot answer - `inst-qmv-unreach-if`
@@ -352,7 +352,7 @@ time in-tx (I6). Updates preserve the quota ID and the subject reference; breaki
 - [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-metric-validation`
 
 The system **MUST** validate at Quota create and update time that the referenced metric exists in `types-registry`
-via `TypesRegistryClient` with an in-process LRU cache inside `QuotaManagementService`, reporting an unknown metric
+via `types-registry-sdk` with an in-process LRU cache inside `QuotaManagementService`, reporting an unknown metric
 as `METRIC_NOT_REGISTERED` and failing closed with an actionable error when the registry is unreachable. A `Direct`
 metric mode **MUST NOT** reject creation; the inert Quota is surfaced through `quota_for_direct_metric_total`. A
 persisted Quota whose metric is later removed **MUST** be flagged via operational telemetry and **MUST NOT** be
@@ -364,7 +364,7 @@ auto-deactivated.
 **Constraints**: `cpt-cf-quota-enforcement-constraint-types-registry-delegation`
 
 **Touches**:
-- API: `TypesRegistryClient` (platform `types-registry-sdk`, obtained from ClientHub; never called inside the
+- API: `TypesRegistryApi` (`types-registry-sdk`, under the caller's context, obtained from ClientHub; never called inside the
   storage transaction)
 - Entities: registry-reported classifications (kind, `QuotaGated`/`Direct` mode)
 

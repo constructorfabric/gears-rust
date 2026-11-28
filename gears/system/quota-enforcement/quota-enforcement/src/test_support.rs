@@ -37,9 +37,8 @@ use gts::{
 };
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use quota_enforcement_sdk::{
-    METRIC_BASE_TYPE, MetricId, MetricKind, OwnedDefinition, QuotaEnforcementStoragePluginSpecV1,
+    METRIC_BASE_TYPE, MetricId, MetricKind, QuotaEnforcementStoragePluginSpecV1,
     QuotaEnforcementStoragePluginV1, SCOPE_TENANT, SCOPE_TYPE, SCOPE_USER, TenantId,
-    owned_definitions,
 };
 use serde_json::{Value, json};
 use standalone_cluster_plugin::{StandaloneClusterHandle, StandaloneClusterPlugin};
@@ -49,17 +48,14 @@ use toolkit::gts::PluginV1;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
 use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::TypesRegistryService;
-use types_registry::domain::legacy_local_client::TypesRegistryLocalClient;
-use types_registry::infra::InMemoryGtsRepository;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
+use types_registry_sdk::{PlatformTypesRegistryApi, PlatformTypesRegistryApiExt, TypesRegistryApi};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
-use crate::domain::ports::contracts::{ContractRegistry, DiscoveredType, RegisteredType};
+use crate::domain::ports::contracts::{
+    ContractRegistry, DiscoveredType, RegisteredType, RegistryCaller,
+};
 use crate::domain::ports::coordination::{
     CoordinatorBinding, LeaderWork, SingletonCoordinator, SingletonScope,
 };
@@ -598,12 +594,20 @@ impl QeMetrics for RecordingMetrics {
 // Plugin fixtures
 // ---------------------------------------------------------------------------
 
-/// A registered plugin instance as the types registry would list it.
+/// A published plugin instance as the types registry would list it.
 pub struct PluginFixture {
     /// Full GTS instance id.
     pub instance_id: String,
-    /// Registry entity.
-    pub entity: GtsInstance,
+    /// The published document.
+    pub payload: Value,
+}
+
+impl PluginFixture {
+    /// `(id, document)`, as a publication manifest lists it.
+    #[must_use]
+    pub fn published(&self) -> (String, Value) {
+        (self.instance_id.clone(), self.payload.clone())
+    }
 }
 
 /// A storage plugin instance.
@@ -614,7 +618,7 @@ pub fn storage_instance(segment: &str, vendor: &str, priority: i16) -> PluginFix
     .expect("registration payload");
     PluginFixture {
         instance_id: id.to_string(),
-        entity: make_test_instance(id.as_ref(), payload),
+        payload,
     }
 }
 
@@ -627,7 +631,7 @@ pub fn sink_instance(segment: &str, vendor: &str) -> PluginFixture {
         .expect("registration payload");
     PluginFixture {
         instance_id: id.to_string(),
-        entity: make_test_instance(id.as_ref(), payload),
+        payload,
     }
 }
 
@@ -642,7 +646,7 @@ impl PluginFixture {
         let broken = json!({ "id": id.to_string(), "vendor": 7 });
         Self {
             instance_id: id.to_string(),
-            entity: make_test_instance(id.as_ref(), broken),
+            payload: broken,
         }
     }
 
@@ -654,27 +658,34 @@ impl PluginFixture {
         let broken = json!({ "id": id.to_string(), "priority": "not-a-number" });
         Self {
             instance_id: id.to_string(),
-            entity: make_test_instance(id.as_ref(), broken),
+            payload: broken,
         }
     }
 }
 
-/// A hub whose types registry lists `fixtures`.
+/// A platform registry listing the published `plugins`.
+pub fn platform_registry(plugins: &[(String, Value)]) -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    for (id, payload) in plugins {
+        registry.seed(id, payload.clone());
+    }
+    registry
+}
+
+/// A hub whose platform registry lists `fixtures`.
 pub fn hub_with(fixtures: &[&PluginFixture]) -> Arc<ClientHub> {
-    let registry =
-        MockTypesRegistryClient::new().with_instances(fixtures.iter().map(|f| f.entity.clone()));
+    let published: Vec<_> = fixtures.iter().map(|f| f.published()).collect();
     let hub = Arc::new(ClientHub::new());
-    let client: Arc<dyn TypesRegistryClient> = Arc::new(registry);
-    hub.register::<dyn TypesRegistryClient>(client);
+    platform_registry(&published).install(&hub);
     hub
 }
 
-/// A hub whose types registry fails every listing with `err`.
+/// A hub whose platform registry fails every listing with `err`.
 pub fn hub_with_failing_registry(err: CanonicalError) -> Arc<ClientHub> {
-    let registry = MockTypesRegistryClient::new().with_list_error(err);
+    let registry = platform_registry(&[]);
+    registry.inject(Fault::on(Call::List).fail(err));
     let hub = Arc::new(ClientHub::new());
-    let client: Arc<dyn TypesRegistryClient> = Arc::new(registry);
-    hub.register::<dyn TypesRegistryClient>(client);
+    registry.install(&hub);
     hub
 }
 
@@ -1076,81 +1087,202 @@ pub fn document_id(document: &Value) -> String {
         .expect("a GTS document carries $id or id")
 }
 
+/// The QE-owned Type Schemas of the SDK collector (the plugin specs excluded).
 fn owned_type_documents() -> Vec<Value> {
-    owned_definitions()
-        .expect("owned definitions parse")
+    quota_enforcement_sdk::gts_declarations()
         .into_iter()
-        .filter(|d| d.id.ends_with('~'))
-        .map(|d| d.document)
+        .filter(|(id, _)| id.starts_with("gts.cf.core.qe.") && id.ends_with('~'))
+        .map(|(_, text)| serde_json::from_str(&text).expect("declared JSON"))
         .collect()
 }
 
-/// `GtsTypeSchema` chains for `documents`, parents first. The QE bases are
-/// always included, so callers pass derived contracts and mixins only.
-pub fn schema_chain(documents: &[Value]) -> Vec<GtsTypeSchema> {
-    let mut all = owned_type_documents();
-    all.extend(documents.iter().cloned());
-    let mut ordered: Vec<(String, Value)> = all.into_iter().map(|d| (document_id(&d), d)).collect();
-    ordered.sort_by_key(|(id, _)| id.matches('~').count());
-    let mut built: HashMap<String, Arc<GtsTypeSchema>> = HashMap::new();
-    let mut out = Vec::new();
-    for (id, document) in ordered {
-        if built.contains_key(&id) {
-            continue;
-        }
-        let parent = GtsTypeSchema::derive_parent_type_id(&id)
-            .and_then(|pid| built.get(pid.as_ref()).cloned());
-        let schema = GtsTypeSchema::try_new(GtsTypeId::new(&id), document, None, parent)
-            .expect("fixture chain is well-formed");
-        built.insert(id, Arc::new(schema.clone()));
-        out.push(schema);
+/// A registry mock (both contracts) seeded with every QE declaration plus
+/// `documents` (types and instances, keyed by their `$id`/`id`). The mock
+/// materializes resolved schemas and traits with `gts-rust`; seeds bypass
+/// admission validation.
+pub fn mock_registry(documents: &[Value], instances: &[Value]) -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    for (id, text) in quota_enforcement_sdk::gts_declarations() {
+        registry.seed(&id, serde_json::from_str(&text).expect("declared JSON"));
     }
-    out
+    for document in documents.iter().chain(instances) {
+        registry.seed(&document_id(document), document.clone());
+    }
+    registry
 }
 
-/// A read-only SDK mock serving `documents` (types, chains built) and
-/// `instances` (instance documents). Its `register*` methods panic.
-pub fn mock_registry(documents: &[Value], instances: &[Value]) -> MockTypesRegistryClient {
-    MockTypesRegistryClient::new()
-        .with_type_schemas(schema_chain(documents))
-        .with_instances(
-            instances
-                .iter()
-                .map(|doc| make_test_instance(&document_id(doc), doc.clone())),
-        )
-}
-
-/// A real in-process `types-registry`, seeded in configuration phase with the
-/// process inventory (the QE definitions among it) plus `extra`, then switched
-/// to ready mode. Registration, inheritance, and ready-mode validation are the
-/// real thing; nothing is mocked.
-pub fn in_process_registry(extra: Vec<Value>) -> Arc<dyn TypesRegistryClient> {
-    let config = TypesRegistryConfig::default();
-    let repository = Arc::new(InMemoryGtsRepository::new(config.to_gts_config()));
-    let service = Arc::new(TypesRegistryService::new(repository, config));
-    let mut entries = toolkit::gts::all_inventory_type_schemas().expect("inventory type schemas");
-    entries.extend(toolkit::gts::all_inventory_instances().expect("inventory instances"));
-    entries.extend(extra);
-    let results = service.register(entries);
-    RegisterResult::ensure_all_ok(&results).expect("fixture entities register");
-    service
-        .switch_to_ready()
-        .expect("fixture registry switches to ready");
-    Arc::new(TypesRegistryLocalClient::new(service))
-}
-
-/// A hub whose types registry is `registry`, listing `fixtures` on top of
-/// whatever `registry` holds is not needed: plugin instances are registered
-/// through the same registry.
-pub fn hub_with_registry(registry: Arc<dyn TypesRegistryClient>) -> Arc<ClientHub> {
+/// A hub holding `registry` under both registry contracts.
+pub fn hub_over(registry: &Arc<MockTypesRegistry>) -> Arc<ClientHub> {
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(registry);
+    registry.install(&hub);
     hub
 }
 
-/// The plugin instance document of `fixture` as the registry accepts it.
-pub fn plugin_instance_document(fixture: &PluginFixture) -> Value {
-    fixture.entity.object.clone()
+/// A hub whose registry (both contracts) holds the QE declarations,
+/// `documents` and the published `plugins`.
+pub fn hub_with_registry(documents: &[Value], plugins: &[(String, Value)]) -> Arc<ClientHub> {
+    let registry = mock_registry(documents, &[]);
+    for (id, payload) in plugins {
+        registry.seed(id, payload.clone());
+    }
+    hub_over(&registry)
+}
+
+/// A real local `types-registry` over an in-memory database, its admission
+/// outbox running, with the toolkit plugin base, the QE manifest and
+/// `documents` admitted. Registration, admission validation and the
+/// materializations are the real thing.
+pub struct ManagedRegistry {
+    client: Arc<types_registry::domain::local_client::LocalClient>,
+    _outbox: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl ManagedRegistry {
+    /// Start the registry and admit the QE declarations and `documents`.
+    pub async fn start(documents: Vec<Value>) -> Self {
+        let registry = Self::empty().await;
+        let declared = quota_enforcement_sdk::gts_declarations()
+            .into_iter()
+            .map(|(_, text)| serde_json::from_str(&text).expect("declared JSON"))
+            .collect();
+        registry.admit("quota-enforcement", declared).await;
+        registry.admit("owners", documents).await;
+        registry
+    }
+
+    /// Start the registry with the toolkit plugin base admitted and nothing else.
+    pub async fn empty() -> Self {
+        use sea_orm_migration::MigratorTrait as _;
+        let dsn = format!(
+            "sqlite:file:qe-registry-{}?mode=memory&cache=shared",
+            Uuid::new_v4()
+        );
+        let db = toolkit_db::connect_db(
+            &dsn,
+            toolkit_db::ConnectOpts {
+                max_conns: Some(4),
+                min_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect the registry database");
+        let mut migrations = types_registry::infra::storage::Migrator::migrations();
+        migrations.extend(
+            toolkit_db::outbox::outbox_migrations_with_prefix(
+                types_registry::infra::outbox::TABLE_PREFIX,
+            )
+            .expect("registry outbox prefix"),
+        );
+        toolkit_db::migration_runner::run_migrations_for_testing(&db, migrations)
+            .await
+            .expect("registry migrations");
+        let db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>> =
+            Arc::new(toolkit_db::DBProvider::new(db));
+        let dispatch = Arc::new(types_registry::infra::outbox::OutboxDispatch::new());
+        let service = Arc::new(
+            types_registry::domain::registry_service::RegistryService::new(
+                db.db(),
+                Arc::new(types_registry::infra::storage::Repos),
+                types_registry::domain::policy::RegistrationPolicy::default(),
+                TypesRegistryConfig::default(),
+                Arc::clone(&dispatch)
+                    as Arc<dyn types_registry::domain::admission::OperationDispatch>,
+                Arc::new(types_registry::domain::ports::metrics::NoopMetrics),
+            ),
+        );
+        let outbox = types_registry::infra::outbox::start(db.db(), &service, &dispatch)
+            .await
+            .expect("start the admission outbox");
+        let registry = Self {
+            client: Arc::new(types_registry::domain::local_client::LocalClient::new(
+                service,
+            )),
+            _outbox: Box::new(outbox),
+        };
+        let plugin_base = toolkit::gts::all_inventory_type_schemas()
+            .expect("inventory")
+            .into_iter()
+            .find(|schema| document_id(schema) == "gts.cf.toolkit.plugins.plugin.v1~")
+            .expect("the toolkit plugin base is declared");
+        registry.admit("toolkit", vec![plugin_base]).await;
+        registry
+    }
+
+    /// Admit `documents` (keyed by their `$id`/`id`) under `publisher`.
+    ///
+    /// # Panics
+    /// If the registry refuses any of them.
+    pub async fn admit(&self, publisher: &str, documents: Vec<Value>) {
+        self.try_admit(publisher, documents)
+            .await
+            .unwrap_or_else(|e| panic!("{publisher}'s documents admit: {e:?}"));
+    }
+
+    /// Admit `documents` under `publisher`; the registry's refusal, if any.
+    pub async fn try_admit(
+        &self,
+        publisher: &str,
+        documents: Vec<Value>,
+    ) -> Result<types_registry_sdk::Reconciliation, CanonicalError> {
+        let desired: Vec<(types_registry_sdk::GtsId, Value)> = documents
+            .into_iter()
+            .map(|doc| {
+                (
+                    types_registry_sdk::GtsId::try_new(&document_id(&doc)).expect("id"),
+                    doc,
+                )
+            })
+            .collect();
+        self.try_admit_keyed(publisher, &desired).await
+    }
+
+    /// Admit `desired` under `publisher` as keyed, as the runtime publishes a
+    /// manifest.
+    ///
+    /// # Panics
+    /// If the registry refuses any of them.
+    pub async fn admit_keyed(
+        &self,
+        publisher: &str,
+        desired: &[(types_registry_sdk::GtsId, Value)],
+    ) {
+        self.try_admit_keyed(publisher, desired)
+            .await
+            .unwrap_or_else(|e| panic!("{publisher}'s documents admit: {e:?}"));
+    }
+
+    async fn try_admit_keyed(
+        &self,
+        publisher: &str,
+        desired: &[(types_registry_sdk::GtsId, Value)],
+    ) -> Result<types_registry_sdk::Reconciliation, CanonicalError> {
+        let api: &dyn PlatformTypesRegistryApi = self.client.as_ref();
+        api.reconcile_entities_and_await(
+            &toolkit_security::PlatformSecurityContext::outbound_marker(),
+            &types_registry_sdk::PublisherContext {
+                name: publisher.to_owned(),
+                version: "0.1.0".parse().expect("version"),
+            },
+            desired,
+            &types_registry_sdk::ReconcileOptions::default(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// The platform contract, for direct reads.
+    pub fn platform(&self) -> &dyn PlatformTypesRegistryApi {
+        self.client.as_ref()
+    }
+
+    /// Register this registry in `hub` under both contracts.
+    pub fn install(&self, hub: &ClientHub) {
+        hub.register::<dyn PlatformTypesRegistryApi>(
+            Arc::clone(&self.client) as Arc<dyn PlatformTypesRegistryApi>
+        );
+        hub.register::<dyn TypesRegistryApi>(Arc::clone(&self.client) as Arc<dyn TypesRegistryApi>);
+    }
 }
 
 /// Resolves `documents` the way the production adapter does: a local
@@ -1181,7 +1313,9 @@ pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
                 .map(|c| GtsTypeId::new(&c))
                 .collect();
             ancestors.reverse();
-            let payload = resolved.compile_payload_validator();
+            let payload = resolved
+                .compile_payload_validator()
+                .map_err(types_registry_sdk::CompilePayloadValidatorError::from);
             RegisteredType {
                 id: GtsTypeId::new(&id),
                 is_abstract: resolved.is_abstract,
@@ -1194,6 +1328,14 @@ pub fn resolve_documents(documents: &[Value]) -> Vec<RegisteredType> {
         .collect()
 }
 
+/// The label of a registry caller in the fakes' call records.
+fn caller_label(caller: RegistryCaller<'_>) -> &'static str {
+    match caller {
+        RegistryCaller::Platform => "platform",
+        RegistryCaller::Request(_) => "request",
+    }
+}
+
 /// An in-memory `ContractRegistry` for domain tests: resolved types, listed but
 /// unresolvable types, instances, and failure injection.
 #[derive(Default)]
@@ -1203,10 +1345,10 @@ pub struct FakeContractRegistry {
     /// reference graph is broken.
     broken: Mutex<HashMap<String, DiscoveredType>>,
     instances: Mutex<HashMap<String, GtsTypeId>>,
-    registered: Mutex<Vec<Vec<&'static str>>>,
     reads: AtomicUsize,
+    /// The caller of every `type_schema`, in order.
+    type_schema_callers: Mutex<Vec<&'static str>>,
     fail_all: AtomicBool,
-    registration_failure: Mutex<Option<DomainError>>,
 }
 
 impl FakeContractRegistry {
@@ -1274,19 +1416,9 @@ impl FakeContractRegistry {
         self.instances.lock().expect("lock").remove(id);
     }
 
-    /// Number of `ensure_registered` calls.
-    pub fn ensure_registered_calls(&self) -> usize {
-        self.registered.lock().expect("lock").len()
-    }
-
-    /// The ids of the last `ensure_registered` call.
-    pub fn last_registered(&self) -> Vec<&'static str> {
-        self.registered
-            .lock()
-            .expect("lock")
-            .last()
-            .cloned()
-            .unwrap_or_default()
+    /// The caller of every `type_schema`, in order: `platform` or `request`.
+    pub fn type_schema_callers(&self) -> Vec<&'static str> {
+        self.type_schema_callers.lock().expect("lock").clone()
     }
 
     /// Number of read calls (`type_schema`, `derived_types`, `instance_type`).
@@ -1297,11 +1429,6 @@ impl FakeContractRegistry {
     /// Every later call fails as unavailable.
     pub fn fail_all(&self) {
         self.fail_all.store(true, Ordering::SeqCst);
-    }
-
-    /// `ensure_registered` fails with `err`.
-    pub fn fail_registration_with(&self, err: DomainError) {
-        *self.registration_failure.lock().expect("lock") = Some(err);
     }
 
     fn read(&self) -> Result<(), DomainError> {
@@ -1317,23 +1444,15 @@ impl FakeContractRegistry {
 
 #[async_trait]
 impl ContractRegistry for FakeContractRegistry {
-    async fn ensure_registered(&self, definitions: &[OwnedDefinition]) -> Result<(), DomainError> {
-        if self.fail_all.load(Ordering::SeqCst) {
-            return Err(DomainError::TypesRegistryUnavailable(
-                "fake registry unavailable".to_owned(),
-            ));
-        }
-        if let Some(err) = self.registration_failure.lock().expect("lock").clone() {
-            return Err(err);
-        }
-        self.registered
+    async fn type_schema(
+        &self,
+        caller: RegistryCaller<'_>,
+        id: &GtsTypeId,
+    ) -> Result<Option<RegisteredType>, DomainError> {
+        self.type_schema_callers
             .lock()
             .expect("lock")
-            .push(definitions.iter().map(|d| d.id).collect());
-        Ok(())
-    }
-
-    async fn type_schema(&self, id: &GtsTypeId) -> Result<Option<RegisteredType>, DomainError> {
+            .push(caller_label(caller));
         self.read()?;
         if self.broken.lock().expect("lock").contains_key(id.as_ref()) {
             return Err(DomainError::TypesRegistryUnavailable(format!(
@@ -1411,6 +1530,8 @@ pub struct FakeMetricRegistry {
     calls: AtomicUsize,
     fail_all: AtomicBool,
     hang: AtomicBool,
+    /// The caller of every `describe`, in order: `platform` or `request`.
+    callers: Mutex<Vec<&'static str>>,
 }
 
 impl FakeMetricRegistry {
@@ -1482,12 +1603,25 @@ impl FakeMetricRegistry {
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// The caller of every `describe`, in order: `platform` or `request`.
+    pub fn callers(&self) -> Vec<&'static str> {
+        self.callers.lock().expect("lock").clone()
+    }
 }
 
 #[async_trait]
 impl MetricRegistry for FakeMetricRegistry {
-    async fn describe(&self, metric: &MetricId) -> Result<Option<Classified>, DomainError> {
+    async fn describe(
+        &self,
+        caller: RegistryCaller<'_>,
+        metric: &MetricId,
+    ) -> Result<Option<Classified>, DomainError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.callers
+            .lock()
+            .expect("lock")
+            .push(caller_label(caller));
         if self.hang.load(Ordering::SeqCst) {
             pending::<()>().await;
         }
@@ -1538,125 +1672,171 @@ impl LifecycleGaugeSink for RecordingGaugeSink {
     }
 }
 
-/// A `TypesRegistryClient` over a mock whose `get_instance` can be made to
-/// fail, for the cached adapter's unavailability paths. Every other method
-/// delegates.
-pub struct FailingInstanceRegistry {
-    inner: MockTypesRegistryClient,
-    fail_instances: AtomicBool,
-    instance_calls: AtomicUsize,
+/// Both registry contracts over a mock whose reads (`batch_get_entities`)
+/// can be made to fail, for the cached adapter's unavailability paths, and
+/// whose tenant-plane answers can be owned by the reader's tenant. Every other
+/// call delegates.
+pub struct FailingReads {
+    inner: Arc<MockTypesRegistry>,
+    fail_reads: AtomicBool,
+    tenant_owned: AtomicBool,
+    reads: AtomicUsize,
 }
 
-impl FailingInstanceRegistry {
-    pub fn new(inner: MockTypesRegistryClient) -> Self {
+impl FailingReads {
+    pub fn new(inner: Arc<MockTypesRegistry>) -> Self {
         Self {
             inner,
-            fail_instances: AtomicBool::new(false),
-            instance_calls: AtomicUsize::new(0),
+            fail_reads: AtomicBool::new(false),
+            tenant_owned: AtomicBool::new(false),
+            reads: AtomicUsize::new(0),
         }
     }
 
-    /// Every later `get_instance` fails as unavailable.
-    pub fn fail_instances(&self) {
-        self.fail_instances.store(true, Ordering::SeqCst);
+    /// Every later tenant-plane answer is owned by the reader's tenant.
+    pub fn answer_tenant_owned(&self) {
+        self.tenant_owned.store(true, Ordering::SeqCst);
     }
 
-    /// `get_instance` answers again.
+    /// Every later read fails as unavailable.
+    pub fn fail_reads(&self) {
+        self.fail_reads.store(true, Ordering::SeqCst);
+    }
+
+    /// Reads answer again.
     pub fn recover(&self) {
-        self.fail_instances.store(false, Ordering::SeqCst);
+        self.fail_reads.store(false, Ordering::SeqCst);
     }
 
-    /// Number of `get_instance` calls, failures included.
-    pub fn instance_calls(&self) -> usize {
-        self.instance_calls.load(Ordering::SeqCst)
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for FailingInstanceRegistry {
-    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register(entities).await
+    /// The wrapped mock, for its call records.
+    pub fn inner(&self) -> &Arc<MockTypesRegistry> {
+        &self.inner
     }
 
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_type_schemas(type_schemas).await
+    /// Number of reads, failures included.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
     }
 
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema(type_id).await
+    /// Register this registry in `hub` under both contracts.
+    pub fn install(self: &Arc<Self>, hub: &ClientHub) {
+        hub.register::<dyn PlatformTypesRegistryApi>(
+            Arc::clone(self) as Arc<dyn PlatformTypesRegistryApi>
+        );
+        hub.register::<dyn TypesRegistryApi>(Arc::clone(self) as Arc<dyn TypesRegistryApi>);
     }
 
-    async fn get_type_schema_by_uuid(
-        &self,
-        type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema_by_uuid(type_uuid).await
-    }
-
-    async fn get_type_schemas(
-        &self,
-        type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas(type_ids).await
-    }
-
-    async fn get_type_schemas_by_uuid(
-        &self,
-        type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas_by_uuid(type_uuids).await
-    }
-
-    async fn list_type_schemas(
-        &self,
-        query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        self.inner.list_type_schemas(query).await
-    }
-
-    async fn register_instances(
-        &self,
-        instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_instances(instances).await
-    }
-
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
-        self.instance_calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_instances.load(Ordering::SeqCst) {
+    fn read(&self) -> Result<(), CanonicalError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_reads.load(Ordering::SeqCst) {
             return Err(CanonicalError::service_unavailable()
                 .with_detail("registry down")
                 .create());
         }
-        self.inner.get_instance(id).await
+        Ok(())
     }
+}
 
-    async fn get_instance_by_uuid(&self, uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance_by_uuid(uuid).await
-    }
-
-    async fn get_instances(
+#[async_trait]
+impl PlatformTypesRegistryApi for FailingReads {
+    async fn batch_get_entities(
         &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances(ids).await
+        ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.read()?;
+        PlatformTypesRegistryApi::batch_get_entities(self.inner.as_ref(), ctx, request).await
     }
 
-    async fn get_instances_by_uuid(
+    async fn list_entities(
         &self,
-        uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances_by_uuid(uuids).await
+        ctx: &toolkit_security::PlatformSecurityContext,
+        request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        PlatformTypesRegistryApi::list_entities(self.inner.as_ref(), ctx, request).await
     }
 
-    async fn list_instances(
+    async fn register_entities(
         &self,
-        query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        self.inner.list_instances(query).await
+        ctx: &toolkit_security::PlatformSecurityContext,
+        key: types_registry_sdk::IdempotencyKey,
+        request: types_registry_sdk::RegisterEntitiesRequest,
+    ) -> Result<types_registry_sdk::RegistrationOperation, CanonicalError> {
+        self.inner.register_entities(ctx, key, request).await
+    }
+
+    async fn delete_entities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        key: types_registry_sdk::IdempotencyKey,
+        request: types_registry_sdk::DeleteEntitiesRequest,
+    ) -> Result<types_registry_sdk::DeletionOperation, CanonicalError> {
+        self.inner.delete_entities(ctx, key, request).await
+    }
+
+    async fn get_operation(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        operation_id: Uuid,
+    ) -> Result<types_registry_sdk::Operation, CanonicalError> {
+        self.inner.get_operation(ctx, operation_id).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &toolkit_security::PlatformSecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        CanonicalError,
+    > {
+        PlatformTypesRegistryApi::batch_resolve_identities(self.inner.as_ref(), ctx, keys).await
+    }
+}
+
+#[async_trait]
+impl TypesRegistryApi for FailingReads {
+    async fn batch_get_entities(
+        &self,
+        ctx: &SecurityContext,
+        request: types_registry_sdk::BatchGetEntitiesRequest,
+    ) -> Result<types_registry_sdk::BatchGetEntitiesResponse, CanonicalError> {
+        self.read()?;
+        let mut answer =
+            TypesRegistryApi::batch_get_entities(self.inner.as_ref(), ctx, request).await?;
+        if self.tenant_owned.load(Ordering::SeqCst) {
+            for lookup in answer.0.values_mut() {
+                if let types_registry_sdk::EntityLookup::Found { entity, .. } = lookup {
+                    entity.ownership = types_registry_sdk::Ownership::ContextTenant;
+                }
+            }
+        }
+        Ok(answer)
+    }
+
+    async fn list_entities(
+        &self,
+        ctx: &SecurityContext,
+        request: types_registry_sdk::ListEntitiesRequest,
+    ) -> Result<types_registry_sdk::ListEntitiesResponse, CanonicalError> {
+        TypesRegistryApi::list_entities(self.inner.as_ref(), ctx, request).await
+    }
+
+    async fn batch_resolve_identities(
+        &self,
+        ctx: &SecurityContext,
+        keys: Vec<types_registry_sdk::EntityKey>,
+    ) -> Result<
+        std::collections::HashMap<
+            types_registry_sdk::EntityKey,
+            Option<types_registry_sdk::EntityIdentity>,
+        >,
+        CanonicalError,
+    > {
+        TypesRegistryApi::batch_resolve_identities(self.inner.as_ref(), ctx, keys).await
     }
 }
 

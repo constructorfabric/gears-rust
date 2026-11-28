@@ -38,6 +38,25 @@ impl fmt::Display for PluginKind {
     }
 }
 
+/// How the types registry refused the caller of a request's read.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerRefusal {
+    /// The caller's credential was not accepted (401).
+    Unauthenticated,
+    /// The caller may not read the entity (403).
+    PermissionDenied,
+}
+
+impl fmt::Display for CallerRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unauthenticated => f.write_str("unauthenticated"),
+            Self::PermissionDenied => f.write_str("permission denied"),
+        }
+    }
+}
+
 /// A bootstrap dependency, as surfaced in the health endpoint.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +202,10 @@ pub enum DomainError {
     /// The types registry could not answer.
     #[error("types registry unavailable: {0}")]
     TypesRegistryUnavailable(String),
+    /// The types registry refused the caller of a request's read. Not an
+    /// outage: a retry does not cure it, and a cached answer never masks it.
+    #[error("types registry refused the caller: {0}")]
+    RegistryRefusedCaller(CallerRefusal),
     /// The configured projection contract catalogue failed a bootstrap
     /// consistency check. `subject` names the offending definition.
     #[error("projection contract catalogue rejected {subject}: {reason}")]
@@ -192,8 +215,10 @@ pub enum DomainError {
         /// The GTS id, metric, or pair the check failed on.
         subject: String,
     },
-    /// No plugin instance matched the configured vendor.
-    #[error("no {kind} plugin instance registered for vendor {vendor}")]
+    /// No plugin instance whose client this process bound matched the
+    /// configured vendor. An advertised instance without a bound client
+    /// never matches.
+    #[error("no bound {kind} plugin instance for vendor {vendor}")]
     PluginNotFound {
         /// Plugin family.
         kind: PluginKind,

@@ -27,3 +27,8 @@ pub use metrics::{
 };
 pub use pdp_probe::{PROBE_SUBJECT, PdpReachability};
 pub use types_registry::{DEFAULT_REGISTRY_DEADLINE, TypesRegistryContracts};
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "managed_admission_tests.rs"]
+mod managed_admission_tests;

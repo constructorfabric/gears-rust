@@ -5,13 +5,11 @@
 //! are external GTS types, not domain models, which is why they live outside the
 //! domain layer.
 
-use std::sync::Arc;
-
-use gts::{GtsSchema, GtsTypeId};
+use gts::{GtsRefValidation, GtsSchema, GtsStore, GtsTypeId};
 use license_resolver_sdk::gts::{LicenseResourceV1, LicenseSubjectV1};
 use serde_json::Value;
 use toolkit_gts::gts_id;
-use types_registry_sdk::GtsTypeSchema;
+use types_registry_sdk::{LifecycleStatus, TypeSchema};
 
 /// Subject contract: `metadata: { category: string }`.
 #[toolkit_gts::gts_type_schema(
@@ -93,72 +91,137 @@ pub const SEAT_SUBJECT: &str = <TestSeatSubjectV1 as GtsSchema>::TYPE_ID;
 pub const MODEL_USAGE_RESOURCE: &str = <TestModelUsageResourceV1 as GtsSchema>::TYPE_ID;
 pub const BARE_RESOURCE: &str = <TestBareResourceV1 as GtsSchema>::TYPE_ID;
 
-fn schema_of(type_id: &str, body: Value, parent: Option<Arc<GtsTypeSchema>>) -> GtsTypeSchema {
-    GtsTypeSchema::try_new(GtsTypeId::new(type_id), body, None, parent)
-        .expect("test contract type-schema is well formed")
+/// A contract as the registry serves it: its own document, the chain
+/// resolved (`resolved_schema`) and the merged traits (`effective_traits`),
+/// materialized with `gts-rust` over `chain` (parents first, `type_id` last).
+fn materialize(type_id: &str, chain: &[(&str, Value)]) -> TypeSchema {
+    let mut store = GtsStore::new();
+    for (id, body) in chain {
+        store
+            .register_schema(id, body)
+            .expect("test contract registers");
+    }
+    let resolved = store
+        .validate_schema_with(type_id, GtsRefValidation::None)
+        .expect("test contract resolves");
+    let own = chain
+        .iter()
+        .find(|(id, _)| *id == type_id)
+        .map(|(_, body)| body.clone())
+        .expect("the contract is in its chain");
+    TypeSchema {
+        type_id: GtsTypeId::new(type_id),
+        type_uuid: uuid::Uuid::nil(),
+        lifecycle_status: LifecycleStatus::Active,
+        ownership: types_registry_sdk::Ownership::Global,
+        origin: None,
+        content: Some(own),
+        resolved_schema: Some(resolved.schema),
+        effective_traits: Some(resolved.effective_traits),
+        effective_traits_schema: None,
+        provenance: None,
+    }
 }
 
-/// The abstract Subject licensing base, exactly as the SDK publishes it.
-#[must_use]
-pub fn subject_base_schema() -> GtsTypeSchema {
-    schema_of(
+fn subject_base() -> (&'static str, Value) {
+    (
         SUBJECT_BASE,
         <LicenseSubjectV1<()> as GtsSchema>::gts_schema_with_refs(),
-        None,
     )
 }
 
-/// The abstract Resource licensing base, exactly as the SDK publishes it.
-#[must_use]
-pub fn resource_base_schema() -> GtsTypeSchema {
-    schema_of(
+fn resource_base() -> (&'static str, Value) {
+    (
         RESOURCE_BASE,
         <LicenseResourceV1<()> as GtsSchema>::gts_schema_with_refs(),
-        None,
     )
 }
 
-/// A derived contract with its licensing base linked as parent, so `ancestors`
-/// and `effective_*` observe the whole chain the registry would resolve.
-fn derived_schema<T: GtsSchema>(base: GtsTypeSchema) -> GtsTypeSchema {
-    schema_of(T::TYPE_ID, T::gts_schema_with_refs(), Some(Arc::new(base)))
+#[must_use]
+pub fn subject_base_schema() -> TypeSchema {
+    materialize(SUBJECT_BASE, &[subject_base()])
 }
 
 #[must_use]
-pub fn user_subject_schema() -> GtsTypeSchema {
-    derived_schema::<TestUserSubjectV1>(subject_base_schema())
+pub fn resource_base_schema() -> TypeSchema {
+    materialize(RESOURCE_BASE, &[resource_base()])
 }
 
-/// A Subject contract derived from [`TestUserSubjectV1`], with the same shape.
+/// The resource contract `body` (registered as [`MODEL_USAGE_RESOURCE`]) over
+/// the resource base.
+#[must_use]
+pub fn model_usage_schema_with(body: Value) -> TypeSchema {
+    materialize(
+        MODEL_USAGE_RESOURCE,
+        &[resource_base(), (MODEL_USAGE_RESOURCE, body)],
+    )
+}
+
+#[must_use]
+pub fn user_subject_schema() -> TypeSchema {
+    materialize(
+        USER_SUBJECT,
+        &[
+            subject_base(),
+            (USER_SUBJECT, TestUserSubjectV1::gts_schema_with_refs()),
+        ],
+    )
+}
+
 pub const ADMIN_SUBJECT: &str =
     gts_id!("cf.core.lic.subj.v1~test.lic.gateway.user.v1~test.lic.gateway.admin.v1~");
 
 #[must_use]
-pub fn admin_subject_schema() -> GtsTypeSchema {
+pub fn admin_subject_schema() -> TypeSchema {
     let mut body = TestUserSubjectV1::gts_schema_with_refs();
     body["$id"] = Value::String(format!("gts://{ADMIN_SUBJECT}"));
     body["allOf"] = serde_json::json!([{ "$ref": format!("gts://{USER_SUBJECT}") }]);
-    schema_of(ADMIN_SUBJECT, body, Some(Arc::new(user_subject_schema())))
+    materialize(
+        ADMIN_SUBJECT,
+        &[
+            subject_base(),
+            (USER_SUBJECT, TestUserSubjectV1::gts_schema_with_refs()),
+            (ADMIN_SUBJECT, body),
+        ],
+    )
 }
 
 #[must_use]
-pub fn tenant_subject_schema() -> GtsTypeSchema {
-    derived_schema::<TestTenantSubjectV1>(subject_base_schema())
+pub fn tenant_subject_schema() -> TypeSchema {
+    materialize(
+        TENANT_SUBJECT,
+        &[
+            subject_base(),
+            (TENANT_SUBJECT, TestTenantSubjectV1::gts_schema_with_refs()),
+        ],
+    )
 }
 
 #[must_use]
-pub fn model_usage_schema() -> GtsTypeSchema {
-    derived_schema::<TestModelUsageResourceV1>(resource_base_schema())
+pub fn model_usage_schema() -> TypeSchema {
+    model_usage_schema_with(TestModelUsageResourceV1::gts_schema_with_refs())
 }
 
 #[must_use]
-pub fn bare_resource_schema() -> GtsTypeSchema {
-    derived_schema::<TestBareResourceV1>(resource_base_schema())
+pub fn bare_resource_schema() -> TypeSchema {
+    materialize(
+        BARE_RESOURCE,
+        &[
+            resource_base(),
+            (BARE_RESOURCE, TestBareResourceV1::gts_schema_with_refs()),
+        ],
+    )
 }
 
 #[must_use]
-pub fn seat_subject_schema() -> GtsTypeSchema {
-    derived_schema::<TestSeatSubjectV1>(subject_base_schema())
+pub fn seat_subject_schema() -> TypeSchema {
+    materialize(
+        SEAT_SUBJECT,
+        &[
+            subject_base(),
+            (SEAT_SUBJECT, TestSeatSubjectV1::gts_schema_with_refs()),
+        ],
+    )
 }
 
 /// Principal types: a base, a user type under it, an operator subtype of user.
@@ -167,20 +230,29 @@ pub const USER_PRINCIPAL: &str = gts_id!("cf.core.identity.principal.v1~cf.core.
 pub const OPERATOR_PRINCIPAL: &str =
     gts_id!("cf.core.identity.principal.v1~cf.core.identity.user.v1~test.op.identity.myuser.v1~");
 
-fn principal_schema(type_id: &str, parent: Option<GtsTypeSchema>) -> GtsTypeSchema {
-    let mut body = serde_json::json!({ "$id": format!("gts://{type_id}"), "type": "object" });
-    if let Some(parent) = &parent {
-        body["allOf"] =
-            serde_json::json!([{ "$ref": format!("gts://{}", parent.type_id.as_ref()) }]);
+fn principal_document(type_id: &'static str, parent: Option<&str>) -> (&'static str, Value) {
+    let mut body = serde_json::json!({
+        "$id": format!("gts://{type_id}"),
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object"
+    });
+    if let Some(parent) = parent {
+        body["allOf"] = serde_json::json!([{ "$ref": format!("gts://{parent}") }]);
     }
-    schema_of(type_id, body, parent.map(Arc::new))
+    (type_id, body)
 }
 
 /// The principal-type chains as the registry resolves them.
 #[must_use]
-pub fn principal_schemas() -> [GtsTypeSchema; 3] {
-    let base = principal_schema(PRINCIPAL_BASE, None);
-    let user = principal_schema(USER_PRINCIPAL, Some(base.clone()));
-    let operator = principal_schema(OPERATOR_PRINCIPAL, Some(user.clone()));
-    [base, user, operator]
+pub fn principal_schemas() -> [TypeSchema; 3] {
+    let chain = [
+        principal_document(PRINCIPAL_BASE, None),
+        principal_document(USER_PRINCIPAL, Some(PRINCIPAL_BASE)),
+        principal_document(OPERATOR_PRINCIPAL, Some(USER_PRINCIPAL)),
+    ];
+    [
+        materialize(PRINCIPAL_BASE, &chain[..1]),
+        materialize(USER_PRINCIPAL, &chain[..2]),
+        materialize(OPERATOR_PRINCIPAL, &chain),
+    ]
 }

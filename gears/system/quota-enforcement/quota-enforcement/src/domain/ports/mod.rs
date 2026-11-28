@@ -7,7 +7,7 @@ pub mod metric_registry;
 pub mod metrics;
 pub mod pdp;
 
-pub use contracts::{ContractRegistry, DiscoveredType, RegisteredType};
+pub use contracts::{ContractRegistry, DiscoveredType, RegisteredType, RegistryCaller};
 pub use coordination::{
     CoordinatorBinding, LeaderWork, LeaderWorkFuture, SingletonCoordinator, SingletonScope,
 };

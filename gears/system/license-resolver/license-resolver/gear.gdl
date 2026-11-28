@@ -4,12 +4,17 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the License Resolver.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (rest), colocated_deps
-# (types-registry). The same host shape as tenant-resolver: one `vendor`
-# selector choosing which registered plugin answers.
+# Projected from #[toolkit::gear]: id, runtime_caps (rest). The same host shape
+# as tenant-resolver: one `vendor` selector choosing which registered plugin
+# answers.
+
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["types-registry"],
+    deps = [],
+    # The types registry's platform API is consumed, not linked: local when
+    # co-located, REST with the platform token otherwise.
+    consumes = [consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK)],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/license-resolver/license-resolver"),
     maturity = "preview",
     implementation = "in-progress",

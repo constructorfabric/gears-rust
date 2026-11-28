@@ -1,15 +1,14 @@
 //! Unit tests for the licensing contract validation pipeline.
 
-use gts::GtsTypeId;
 use serde_json::json;
 
 use super::*;
 use crate::domain::test_support::{
     ADMIN_SUBJECT, BARE_RESOURCE, FailureKind, FakeContractRegistry, MODEL_USAGE_RESOURCE,
     RESOURCE_BASE, SUBJECT_BASE, TENANT_SUBJECT, TestModelUsageResourceV1, USER_SUBJECT,
-    admin_subject_schema, bare_resource_schema, conforming_request, model_usage_schema, request,
-    resource, resource_base_schema, subject, subject_base_schema, tenant_subject_schema,
-    user_subject_schema,
+    admin_subject_schema, bare_resource_schema, conforming_request, model_usage_schema,
+    model_usage_schema_with, request, resource, resource_base_schema, subject, subject_base_schema,
+    tenant_subject_schema, user_subject_schema,
 };
 
 fn validator(registry: FakeContractRegistry) -> ContractValidator {
@@ -269,15 +268,8 @@ async fn admissibility_is_silent_when_the_subject_contract_is_unknown() {
 /// never reported as the caller's fault.
 #[tokio::test]
 async fn malformed_admitted_subjects_trait_is_catalog_drift() {
-    let mut body = <TestModelUsageResourceV1 as GtsSchema>::gts_schema_with_refs();
-    body["x-gts-traits"]["admitted_subjects"] = json!("not-an-array");
-    let drifted = GtsTypeSchema::try_new(
-        GtsTypeId::new(MODEL_USAGE_RESOURCE),
-        body,
-        None,
-        Some(Arc::new(resource_base_schema())),
-    )
-    .expect("drifted contract is still a well-formed type-schema");
+    let mut drifted = model_usage_schema();
+    drifted.effective_traits = Some(json!({ "admitted_subjects": "not-an-array" }));
 
     let validator =
         validator(FakeContractRegistry::new().with_contracts([user_subject_schema(), drifted]));
@@ -366,13 +358,7 @@ async fn violations_are_capped_per_contract_object() {
     let metadata = &mut body["allOf"][1]["properties"]["metadata"];
     metadata["required"] = json!(properties.keys().collect::<Vec<_>>());
     metadata["properties"] = Value::Object(properties);
-    let wide = GtsTypeSchema::try_new(
-        GtsTypeId::new(MODEL_USAGE_RESOURCE),
-        body,
-        None,
-        Some(Arc::new(resource_base_schema())),
-    )
-    .expect("a contract with many required properties is well formed");
+    let wide = model_usage_schema_with(body);
 
     let validator =
         validator(FakeContractRegistry::new().with_contracts([user_subject_schema(), wide]));
@@ -391,15 +377,8 @@ async fn violations_are_capped_per_contract_object() {
 
 #[tokio::test]
 async fn uncompilable_contract_schema_is_catalog_drift() {
-    let mut body = <TestModelUsageResourceV1 as GtsSchema>::gts_schema_with_refs();
-    body["pattern"] = json!("[");
-    let drifted = GtsTypeSchema::try_new(
-        GtsTypeId::new(MODEL_USAGE_RESOURCE),
-        body,
-        None,
-        Some(Arc::new(resource_base_schema())),
-    )
-    .expect("an uncompilable schema is still a well-formed type-schema");
+    let mut drifted = model_usage_schema();
+    drifted.resolved_schema.as_mut().expect("resolved")["pattern"] = json!("[");
 
     let validator =
         validator(FakeContractRegistry::new().with_contracts([user_subject_schema(), drifted]));
@@ -415,15 +394,8 @@ async fn uncompilable_contract_schema_is_catalog_drift() {
 
 #[tokio::test]
 async fn null_admitted_subjects_admits_nobody() {
-    let mut body = <TestModelUsageResourceV1 as GtsSchema>::gts_schema_with_refs();
-    body["x-gts-traits"]["admitted_subjects"] = json!(null);
-    let drifted = GtsTypeSchema::try_new(
-        GtsTypeId::new(MODEL_USAGE_RESOURCE),
-        body,
-        None,
-        Some(Arc::new(resource_base_schema())),
-    )
-    .expect("a null trait is still a well-formed type-schema");
+    let mut drifted = model_usage_schema();
+    drifted.effective_traits = Some(json!({ "admitted_subjects": null }));
 
     let validator =
         validator(FakeContractRegistry::new().with_contracts([user_subject_schema(), drifted]));
@@ -433,15 +405,8 @@ async fn null_admitted_subjects_admits_nobody() {
 
 #[tokio::test]
 async fn non_string_admitted_subjects_entry_is_catalog_drift() {
-    let mut body = <TestModelUsageResourceV1 as GtsSchema>::gts_schema_with_refs();
-    body["x-gts-traits"]["admitted_subjects"] = json!([USER_SUBJECT, 42]);
-    let drifted = GtsTypeSchema::try_new(
-        GtsTypeId::new(MODEL_USAGE_RESOURCE),
-        body,
-        None,
-        Some(Arc::new(resource_base_schema())),
-    )
-    .expect("a drifted trait is still a well-formed type-schema");
+    let mut drifted = model_usage_schema();
+    drifted.effective_traits = Some(json!({ "admitted_subjects": [USER_SUBJECT, 42] }));
 
     let validator =
         validator(FakeContractRegistry::new().with_contracts([user_subject_schema(), drifted]));
@@ -453,4 +418,36 @@ async fn non_string_admitted_subjects_entry_is_catalog_drift() {
         matches!(err, DomainError::ContractUnusable { ref reason, .. } if reason.contains("non-string")),
         "expected ContractUnusable naming the non-string entry, got: {err:?}"
     );
+}
+
+/// A selected artifact the registry did not return is catalog drift, never a
+/// synthesized default.
+#[tokio::test]
+async fn a_missing_materialized_artifact_is_catalog_drift() {
+    for subject_drifts in [false, true] {
+        for strip in ["content", "resolved_schema", "effective_traits"] {
+            let (mut subject, mut resource) = (user_subject_schema(), model_usage_schema());
+            let drifted = if subject_drifts {
+                &mut subject
+            } else {
+                &mut resource
+            };
+            match strip {
+                "content" => drifted.content = None,
+                "resolved_schema" => drifted.resolved_schema = None,
+                _ => drifted.effective_traits = None,
+            }
+            let drifted_id = drifted.type_id.as_ref().to_owned();
+            let validator =
+                validator(FakeContractRegistry::new().with_contracts([subject, resource]));
+            let err = validator
+                .validate(&conforming_request())
+                .await
+                .expect_err("a missing artifact must not pass");
+            assert!(
+                matches!(&err, DomainError::ContractUnusable { type_id, .. } if *type_id == drifted_id),
+                "{drifted_id} without {strip}: expected ContractUnusable, got: {err:?}"
+            );
+        }
+    }
 }

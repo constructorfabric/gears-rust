@@ -784,6 +784,7 @@ impl<R: GrantRepo> GrantService<R> {
     /// request, so the size limits apply again.
     async fn validate_terms(
         &self,
+        ctx: &SecurityContext,
         grants: &[GrantTerms],
         as_pack: bool,
         names: TermsField,
@@ -821,11 +822,12 @@ impl<R: GrantRepo> GrantService<R> {
                 &mut violations,
             );
             self.types
-                .validate_terms(&field, terms, &mut violations, &mut seen)
+                .validate_terms(ctx, &field, terms, &mut violations, &mut seen)
                 .await?;
             if let Some(subject) = &terms.fixed_subject {
                 self.types
                     .validate_subject_of(
+                        ctx,
                         &format!("{field}.fixed_subject.type"),
                         &terms.subject_type,
                         &subject.gts_type,
@@ -1001,7 +1003,7 @@ impl<R: GrantRepo> GrantService<R> {
             .iter()
             .map(|r| r.fields.terms.clone())
             .collect();
-        self.validate_terms(&terms, as_pack, names).await?;
+        self.validate_terms(ctx, &terms, as_pack, names).await?;
 
         let evidence_id = EvidenceId(Uuid::now_v7());
         let pack_id = admission.as_pack.then(|| PackId(Uuid::now_v7()));
@@ -1077,6 +1079,7 @@ impl<R: GrantRepo> GrantService<R> {
             let mut violations = Vec::new();
             self.types
                 .validate_subject_of(
+                    ctx,
                     "subject.type",
                     &current.subject_type,
                     &subject.gts_type,
@@ -1350,7 +1353,7 @@ impl<R: GrantRepo> GrantService<R> {
         }
         let mut violations = Vec::new();
         self.types
-            .validate_check(&req.subject, &req.resource, &mut violations)
+            .validate_check(ctx, &req.subject, &req.resource, &mut violations)
             .await?;
         if !violations.is_empty() {
             return Err(DomainError::InvalidArgument(violations));

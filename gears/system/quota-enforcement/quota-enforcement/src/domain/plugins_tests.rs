@@ -3,6 +3,7 @@ use std::sync::Arc;
 use quota_enforcement_sdk::testing::InMemoryStorage;
 use toolkit::ClientHub;
 use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::testing_platform::{Call, Fault};
 
 use super::PluginBinding;
 use crate::domain::error::{DomainError, PluginKind};
@@ -53,28 +54,55 @@ async fn a_vendor_without_instances_is_plugin_not_found() {
     );
 }
 
+/// An instance without a scoped client in this process — a stale instance
+/// of an earlier deployment — is never selected, whatever its priority.
 #[tokio::test]
-async fn an_instance_without_a_scoped_client_is_reported_as_unregistered() {
-    let storage = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
-    let hub = hub_with(&[&storage]);
-    let err = binding(hub)
+async fn an_unbound_instance_is_never_selected() {
+    let stale = storage_instance("cf.core._.qe_stale.v1", "acme", 1);
+    let bound = storage_instance("cf.core._.qe_db_storage.v1", "acme", 100);
+    let hub = hub_with(&[&stale, &bound]);
+    let storage = Arc::new(InMemoryStorage::new());
+    register_storage(&hub, &bound, storage.clone());
+
+    let resolved = binding(Arc::clone(&hub))
+        .resolve_storage()
+        .await
+        .expect("the bound instance is selected");
+    resolved
+        .bootstrap(&quota_enforcement_sdk::BootstrapBundle::foundation())
+        .await
+        .expect("bootstrap");
+    assert_eq!(
+        storage.bootstrap_calls(),
+        1,
+        "the bound priority-100 instance won"
+    );
+
+    let only_stale = hub_with(&[&stale]);
+    let err = binding(only_stale)
         .resolve_storage()
         .await
         .err()
-        .expect("client missing");
+        .expect("nothing bound");
     assert_eq!(
         err,
-        DomainError::PluginClientNotRegistered {
+        DomainError::PluginNotFound {
             kind: PluginKind::Storage,
-            gts_id: storage.instance_id.clone(),
+            vendor: "acme".to_owned(),
         }
+    );
+    assert_eq!(
+        err.to_string(),
+        "no bound storage plugin instance for vendor acme",
+        "an advertised instance exists; none is bound"
     );
 }
 
 #[tokio::test]
-async fn a_malformed_instance_is_reported_with_its_id() {
+async fn a_malformed_bound_instance_is_reported_with_its_id() {
     let broken = PluginFixture::malformed_storage("cf.core._.qe_broken.v1");
     let hub = hub_with(&[&broken]);
+    register_storage(&hub, &broken, Arc::new(InMemoryStorage::new()));
     let err = binding(hub)
         .resolve_storage()
         .await
@@ -86,6 +114,43 @@ async fn a_malformed_instance_is_reported_with_its_id() {
             DomainError::InvalidPluginInstance { kind: PluginKind::Storage, gts_id, .. }
                 if gts_id == &broken.instance_id
         ),
+        "{err:?}"
+    );
+}
+
+/// Every page is read: the bound instance on a later page is selected, and a
+/// failed later page is an unavailable registry, not a smaller listing.
+#[tokio::test]
+async fn every_page_is_read_and_a_failed_page_is_unavailability() {
+    let mut fixtures: Vec<PluginFixture> = (0..60)
+        .map(|n| storage_instance(&format!("cf.core._.qe_stale_{n:02}.v1"), "acme", 1))
+        .collect();
+    fixtures.push(storage_instance("cf.core._.qe_zz_bound.v1", "acme", 100));
+    let published: Vec<_> = fixtures.iter().map(PluginFixture::published).collect();
+    let registry = crate::test_support::platform_registry(&published);
+    let hub = Arc::new(ClientHub::new());
+    registry.install(&hub);
+    let bound = fixtures.last().expect("bound");
+    register_storage(&hub, bound, Arc::new(InMemoryStorage::new()));
+
+    binding(Arc::clone(&hub))
+        .resolve_storage()
+        .await
+        .expect("the bound instance on the second page is selected");
+    assert_eq!(registry.calls(Call::List), 2, "two pages");
+
+    registry.inject(
+        Fault::on(Call::List)
+            .nth(2)
+            .fail(CanonicalError::service_unavailable().create()),
+    );
+    let err = binding(hub)
+        .resolve_storage()
+        .await
+        .err()
+        .expect("second page lost");
+    assert!(
+        matches!(err, DomainError::TypesRegistryUnavailable(_)),
         "{err:?}"
     );
 }

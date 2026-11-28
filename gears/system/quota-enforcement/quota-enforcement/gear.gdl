@@ -7,8 +7,18 @@ gdl_version = "1.0"
 # Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (rest,
 # stateful) and lifecycle; deps below is an exact checked mirror (GBX0214).
 
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
+
 gear(
-    deps = ["authz-resolver", "types-registry"],
+    deps = ["authz-resolver"],
+    # The types registry is consumed, not linked: local when co-located, REST
+    # otherwise. The platform API serves bootstrap, background refresh and
+    # plugin discovery; the tenant API serves Quota requests under the
+    # caller's context.
+    consumes = [
+        consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK),
+        consume(contract = "TypesRegistryApi", rust = "types_registry_sdk::TypesRegistryApi", sdk = TR_SDK),
+    ],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/quota-enforcement/quota-enforcement"),
     maturity = "experimental",
     implementation = "in-progress",

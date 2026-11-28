@@ -5,16 +5,21 @@ gdl_version = "1.0"
 # Gearbox product metadata for OAGW, the Outbound API Gateway.
 #
 # Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
-# colocated_deps (types-registry, authz-resolver, credstore, tenant-resolver).
+# colocated_deps (credstore, tenant-resolver).
 
 
 AUTHZ_SDK = cargo(crate_name = "cf-gears-authz-resolver-sdk", lib = "authz_resolver_sdk", path = "../../authz-resolver/authz-resolver-sdk", features = ["rest-client"])
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["credstore", "tenant-resolver", "types-registry"],
-    # The authorization resolver is consumed, not linked: local when co-located,
-    # REST with the platform token otherwise.
-    consumes = [consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK)],
+    deps = ["credstore", "tenant-resolver"],
+    # The authorization resolver and the types registry's platform API are
+    # consumed, not linked: local when co-located, REST with the platform
+    # token otherwise.
+    consumes = [
+        consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK),
+        consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK),
+    ],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/oagw/oagw"),
     maturity = "preview",
     implementation = "in-progress",
