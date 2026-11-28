@@ -1225,3 +1225,15 @@ async fn keys_are_absent_from_debug_errors_and_logs() {
         assert!(!logs_contain(bytes));
     }
 }
+
+#[test]
+fn only_unsigned_payload_with_a_length_keeps_a_body_streamed() {
+    let p = plugin();
+    let unsigned = config(&[("unsigned_payload", "true")]);
+    assert!(!p.signs_body(&unsigned, Some(7)));
+    // Chunked, S3 would want `x-amz-decoded-content-length`.
+    assert!(p.signs_body(&unsigned, None));
+    assert!(p.signs_body(&config(&[]), Some(7)));
+    // Invalid: buffered, and `sign` reports it.
+    assert!(p.signs_body(&config(&[("unsigned_payload", "yes")]), Some(7)));
+}

@@ -13,6 +13,8 @@ pub(crate) mod endpoint_selector;
 pub(crate) mod engine;
 /// Header filtering and internal header helpers.
 pub(crate) mod headers;
+/// Streamed request bodies: limits, declared length, read failures.
+pub(crate) mod request_body;
 /// Builder for outbound upstream requests.
 pub(crate) mod request_builder;
 /// Per-request secret references (ADR-0022).

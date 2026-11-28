@@ -15,6 +15,15 @@ pub struct OagwConfig {
     /// [`MAX_BODY_SIZE_BYTES`].
     #[serde(default = "default_max_body_size_bytes")]
     pub max_body_size_bytes: usize,
+    /// How much of a streamed request body is copied while it is sent, so
+    /// the request can be resent: after a stale keep-alive connection or a
+    /// graceful HTTP/2 `GOAWAY` (idempotent methods only), or an HTTP/2
+    /// `REFUSED_STREAM` or `HTTP_1_1_REQUIRED` (any method). A longer body
+    /// is not resendable; its copy is freed once it passes the limit. 0
+    /// disables the copy. Between 0 and [`MAX_REQUEST_RETRY_BUFFER_BYTES`].
+    /// Default: 1 MiB.
+    #[serde(default = "default_request_retry_buffer_bytes")]
+    pub request_retry_buffer_bytes: usize,
     /// Allow plaintext HTTP upstreams (and HTTP token endpoints). Default:
     /// `false`: an `http` endpoint is then rejected on write, and refused by
     /// the proxy for upstreams stored earlier.
@@ -224,6 +233,7 @@ impl Default for OagwConfig {
         Self {
             proxy_timeout_secs: default_proxy_timeout_secs(),
             max_body_size_bytes: default_max_body_size_bytes(),
+            request_retry_buffer_bytes: default_request_retry_buffer_bytes(),
             allow_http_upstream: false,
             token_cache_ttl_secs: default_token_cache_ttl_secs(),
             token_cache_capacity: default_token_cache_capacity(),
@@ -252,6 +262,14 @@ pub const MAX_PROXY_TIMEOUT_SECS: u64 = 24 * 60 * 60;
 /// Largest allowed `max_body_size_bytes`: the 100 MiB hard limit of DESIGN
 /// (resource exhaustion).
 pub const MAX_BODY_SIZE_BYTES: usize = 100 * 1024 * 1024;
+
+/// Largest allowed `request_retry_buffer_bytes`: the copy is held per
+/// in-flight request, so it stays well below the body limit.
+pub const MAX_REQUEST_RETRY_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+fn default_request_retry_buffer_bytes() -> usize {
+    1024 * 1024
+}
 
 fn default_proxy_timeout_secs() -> u64 {
     30
@@ -298,6 +316,11 @@ impl OagwConfig {
         if !(1..=MAX_BODY_SIZE_BYTES).contains(&self.max_body_size_bytes) {
             return Err(format!(
                 "max_body_size_bytes must be between 1 and {MAX_BODY_SIZE_BYTES}"
+            ));
+        }
+        if self.request_retry_buffer_bytes > MAX_REQUEST_RETRY_BUFFER_BYTES {
+            return Err(format!(
+                "request_retry_buffer_bytes must be at most {MAX_REQUEST_RETRY_BUFFER_BYTES}"
             ));
         }
         if self.token_cache_capacity == 0 {
@@ -413,6 +436,10 @@ impl fmt::Debug for OagwConfig {
         f.debug_struct("OagwConfig")
             .field("proxy_timeout_secs", &self.proxy_timeout_secs)
             .field("max_body_size_bytes", &self.max_body_size_bytes)
+            .field(
+                "request_retry_buffer_bytes",
+                &self.request_retry_buffer_bytes,
+            )
             .field("allow_http_upstream", &self.allow_http_upstream)
             .field("token_cache_ttl_secs", &self.token_cache_ttl_secs)
             .field("token_cache_capacity", &self.token_cache_capacity)
@@ -502,6 +529,23 @@ mod tests {
                 ..Default::default()
             },
         );
+        over(
+            "request_retry_buffer_bytes",
+            OagwConfig {
+                request_retry_buffer_bytes: MAX_REQUEST_RETRY_BUFFER_BYTES + 1,
+                ..Default::default()
+            },
+        );
+        for request_retry_buffer_bytes in [0, MAX_REQUEST_RETRY_BUFFER_BYTES] {
+            assert!(
+                OagwConfig {
+                    request_retry_buffer_bytes,
+                    ..Default::default()
+                }
+                .validate()
+                .is_ok()
+            );
+        }
         for value in [MAX_PROXY_TIMEOUT_SECS + 1, u64::MAX] {
             over(
                 "streaming_idle_timeout_secs",

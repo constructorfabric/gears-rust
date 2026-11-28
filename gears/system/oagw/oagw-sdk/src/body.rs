@@ -30,6 +30,20 @@ pub enum Body {
     /// Fully buffered body.
     Bytes(Bytes),
     /// Streaming body (SSE responses, WebSocket messages, chunked transfers).
+    ///
+    /// As a request body it is sent to the upstream as it is read. Its
+    /// length is the request's `Content-Length` header when one is set: the
+    /// upstream then gets that `Content-Length` instead of chunked framing,
+    /// and a stream that yields more or fewer bytes fails the request (400,
+    /// `INVALID_CONTENT_LENGTH`). A declared length over the gateway's body
+    /// limit is refused (413) before the stream is read. A stream error
+    /// fails the request (400, `BODY_READ_FAILED`), unless the upstream has
+    /// already answered: its response is returned then.
+    ///
+    /// End the stream right after its last byte. With a `Content-Length`
+    /// the request completes at that byte without waiting for the end, so
+    /// data the stream yields later is not seen; without one the request
+    /// waits for the end.
     Stream(BodyStream),
 }
 

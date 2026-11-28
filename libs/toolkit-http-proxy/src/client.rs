@@ -28,6 +28,7 @@ use crate::idle::IdleTimer;
 use crate::observe::{ConnectionInfo, NoopObserver, Observer};
 use crate::pool::{ConnHandle, H1Conn, H2Lease, Pool, PoolKey, reap_loop};
 use crate::protocol_cache::{CachedProtocol, ProtocolCache};
+use crate::replay::ReplayTee;
 use crate::sanitize::{self, RequestKind};
 use crate::target::{ProtocolPolicy, Target, Transport};
 use crate::timer::Timers;
@@ -102,6 +103,34 @@ enum Plan {
     PreferH2,
     /// Unknown host: offer `h2` and `http/1.1`.
     Negotiate,
+}
+
+/// Where a resend's body comes from.
+enum Replay {
+    /// The whole body (empty, or the caller's [`ReplayableBody`]).
+    Copy(Bytes),
+    /// What a [`crate::replay_tee`] body has copied so far, then its rest.
+    Tee(ReplayTee),
+}
+
+impl Replay {
+    /// The resend's body; `None` when the tee's copy is incomplete.
+    fn body(&self) -> Option<ProxyBody> {
+        match self {
+            Self::Copy(bytes) => Some(full_body(bytes.clone())),
+            Self::Tee(tee) => tee.resume(),
+        }
+    }
+}
+
+impl Drop for Replay {
+    /// `send` is done with the request: a response head arrived or it
+    /// failed for good. A tee's copy is no longer needed.
+    fn drop(&mut self) {
+        if let Self::Tee(tee) = self {
+            tee.release();
+        }
+    }
 }
 
 /// What a retry must avoid: the connection the first attempt failed on.
@@ -236,19 +265,29 @@ impl ProxyClient {
         if parts.headers.contains_key(header::TRAILER) {
             body = with_sanitized_trailers(body, hop.unwrap_or_default());
         }
-        // A body that can be sent again: an empty one, or the caller's copy.
-        // The copy holds the data only, so a request that declares trailers
-        // is not resent from it (see [`ReplayableBody`]).
-        let replay = if body.is_end_stream() {
-            Some(Bytes::new())
+        // A body that can be sent again: an empty one, the caller's copy, or
+        // a tee's copy if it is still complete when a resend is due. A copy
+        // holds the data only, so a request that declares trailers is not
+        // resent from it (see [`ReplayableBody`]).
+        let mut replay = if body.is_end_stream() {
+            Some(Replay::Copy(Bytes::new()))
         } else if declared_trailers {
             None
+        } else if let Some(copy) = parts.extensions.get::<ReplayableBody>() {
+            Some(Replay::Copy(copy.0.clone()))
         } else {
             parts
                 .extensions
-                .get::<ReplayableBody>()
-                .map(|copy| copy.0.clone())
+                .get::<ReplayTee>()
+                .cloned()
+                .map(Replay::Tee)
         };
+        if !matches!(replay, Some(Replay::Tee(_)))
+            && let Some(tee) = parts.extensions.get::<ReplayTee>()
+        {
+            // The tee's copy will never be resent: stop holding it.
+            tee.release();
+        }
         let mut req = Request::from_parts(parts, body);
         let key = PoolKey::of(target);
 
@@ -270,6 +309,10 @@ impl ProxyClient {
             })?;
             let reused = acquired.reused;
             let generation = acquired.conn.generation;
+            if replay.is_some() && !may_resend(&acquired, req.method(), retry) {
+                // Dropping a tee frees its copy before the upload starts.
+                replay = None;
+            }
             let failed_generation = Some(Retry {
                 failed_generation: generation,
                 http1: false,
@@ -290,11 +333,11 @@ impl ProxyClient {
                     http1,
                     may_have_been_processed: processed,
                 }) if retry.is_none() => {
-                    let Some(body) = replay.clone() else {
+                    let Some(body) = replay.as_ref().and_then(Replay::body) else {
                         return Err(err);
                     };
                     tracing::debug!(target = %target, error = %err, "upstream did not process the request, sending it again");
-                    req = Request::from_parts(*head, full_body(body));
+                    req = Request::from_parts(*head, body);
                     may_have_been_processed = processed;
                     retry = Some(Retry {
                         failed_generation: generation,
@@ -854,6 +897,19 @@ fn reused_h1(conn: H1Conn) -> Acquired {
         reused: true,
         connect_time: None,
     }
+}
+
+/// Whether this attempt may end in a [`DispatchError::Resend`], which needs
+/// the replayable body. Only the first attempt is resent. On HTTP/1.1 only a
+/// stale keep-alive connection resends, and only an idempotent request; any
+/// other retry there is [`DispatchError::Unsent`], which hands the unread
+/// body back.
+fn may_resend(acquired: &Acquired, method: &Method, retry: Option<Retry>) -> bool {
+    retry.is_none()
+        && match acquired.sender {
+            Sender::H1(_) => acquired.reused && is_idempotent(method),
+            Sender::H2(_) => true,
+        }
 }
 
 /// A copy of the request head (everything but the body).

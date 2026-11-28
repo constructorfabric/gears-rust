@@ -27,8 +27,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use toolkit_http_proxy::{
-    ErrorKind, ProtocolPolicy, ProxyBody, ProxyClient, ReplayableBody, Target, Transport,
-    empty_body, full_body, stream_body,
+    ErrorKind, ProtocolPolicy, ProxyBody, ProxyClient, ReplayTee, ReplayableBody, Target,
+    Transport, empty_body, full_body, replay_tee, sized_stream_body, stream_body,
 };
 
 // ---------------------------------------------------------------------------
@@ -1391,6 +1391,167 @@ async fn stale_keep_alive_connection_is_resent_for_idempotent_requests() {
     assert_eq!(conns.load(Ordering::SeqCst), 2);
 }
 
+/// A streamed body of `data`, sent with its length and teed with `limit`.
+fn teed(method: http::Method, data: &'static [u8], limit: usize) -> Request<ProxyBody> {
+    let chunks = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(data))]);
+    let (body, tee) = replay_tee(sized_stream_body(chunks, data.len() as u64), limit);
+    let mut req = Request::builder()
+        .method(method)
+        .uri("/")
+        .body(body)
+        .unwrap();
+    req.extensions_mut().insert(tee);
+    req
+}
+
+#[tokio::test]
+async fn stale_keep_alive_connection_resends_a_teed_put_within_its_limit() {
+    let c = client();
+    for (limit, resent) in [(1024, true), (2, false)] {
+        let (addr, conns) = stale_after_one().await;
+        let target = plain(addr);
+        let get = Request::get("/").body(empty_body()).unwrap();
+        send_ok(&c, &target, get).await;
+        let put = teed(http::Method::PUT, b"data", limit);
+        let res = within(Duration::from_secs(2), c.send(&target, put)).await;
+        assert_eq!(res.is_ok(), resent, "limit {limit}");
+        let expected = if resent { 2 } else { 1 };
+        assert_eq!(conns.load(Ordering::SeqCst), expected, "limit {limit}");
+    }
+}
+
+/// Request bodies an upstream read, in order.
+type Bodies = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+/// A teed request whose source is a single chunk, spent by the first
+/// attempt: a resend that carries the whole body came from the copy.
+fn counted_teed(method: http::Method, data: &'static [u8]) -> (Request<ProxyBody>, ReplayTee) {
+    let chunks = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(data))]);
+    let (body, tee) = replay_tee(sized_stream_body(chunks, data.len() as u64), 1024);
+    let mut req = Request::builder()
+        .method(method)
+        .uri("/")
+        .body(body)
+        .unwrap();
+    req.extensions_mut().insert(tee.clone());
+    (req, tee)
+}
+
+/// Like [`stale_after_one`], but the first connection reads the second
+/// request whole before it closes without answering, so the first attempt
+/// consumed the caller's body. Records every request body it reads.
+async fn stale_after_reading_one() -> (SocketAddr, Arc<AtomicUsize>, Bodies) {
+    let bodies = Bodies::default();
+    let seen = bodies.clone();
+    let (addr, conns) = raw(move |mut s, n| {
+        let bodies = bodies.clone();
+        async move {
+            let mut served = 0;
+            while let Some(head) = read_head(&mut s).await {
+                let mut body = vec![0u8; head_content_length(&head)];
+                if s.read_exact(&mut body).await.is_err() {
+                    return;
+                }
+                bodies.lock().unwrap().push(body);
+                if n == 1 && served == 1 {
+                    return;
+                }
+                if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                served += 1;
+            }
+        }
+    })
+    .await;
+    (addr, conns, seen)
+}
+
+/// A teed PUT on a reused keep-alive connection that the upstream closes
+/// after reading it is resent whole from the copy, on a new connection.
+#[tokio::test]
+async fn a_teed_put_on_a_stale_reused_connection_is_resent_whole_from_its_copy() {
+    let (addr, conns, bodies) = stale_after_reading_one().await;
+    let c = client();
+    let target = plain(addr);
+    let get = Request::get("/").body(empty_body()).unwrap();
+    assert_eq!(send_ok(&c, &target, get).await, "ok");
+    let (put, tee) = counted_teed(http::Method::PUT, b"payload");
+    assert_eq!(send_ok(&c, &target, put).await, "ok");
+    assert_eq!(
+        conns.load(Ordering::SeqCst),
+        2,
+        "resent on a new connection"
+    );
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies,
+        [&b""[..], b"payload", b"payload"].map(<[u8]>::to_vec),
+        "the stale connection read the body, and the resend carried it whole"
+    );
+    assert_eq!(tee.retained_bytes(), 0, "the copy is freed once answered");
+}
+
+/// A teed POST on a reused keep-alive connection is never resent: a POST
+/// is not idempotent. The copy is freed before the upload starts.
+#[tokio::test]
+async fn a_teed_post_on_a_stale_reused_connection_frees_its_copy_and_is_not_resent() {
+    let head_read = Arc::new(tokio::sync::Notify::new());
+    let close = Arc::new(tokio::sync::Notify::new());
+    let (read, closing) = (head_read.clone(), close.clone());
+    // The first connection answers one request; on the next it reports the
+    // head and closes when told to, the upload still open.
+    let (addr, conns) = raw(move |mut s, _| {
+        let (read, closing) = (read.clone(), closing.clone());
+        async move {
+            let Some(head) = read_head(&mut s).await else {
+                return;
+            };
+            let mut body = vec![0u8; head_content_length(&head)];
+            if s.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            if s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if read_head(&mut s).await.is_some() {
+                read.notify_one();
+                closing.notified().await;
+            }
+        }
+    })
+    .await;
+    let c = client();
+    let target = plain(addr);
+    let get = Request::get("/").body(empty_body()).unwrap();
+    assert_eq!(send_ok(&c, &target, get).await, "ok");
+
+    let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+    let rx = stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    });
+    let (body, tee) = replay_tee(sized_stream_body(rx, 7), 1024);
+    let mut post = Request::post("/").body(body).unwrap();
+    post.extensions_mut().insert(tee.clone());
+    tx.send(Ok(Bytes::from_static(b"pay"))).unwrap();
+    let sent = tokio::spawn(async move { c.send(&target, post).await });
+    within(Duration::from_secs(10), head_read.notified()).await;
+    // The upload is under way on the reused connection.
+    assert_eq!(tee.retained_bytes(), 0, "the copy is freed before sending");
+    assert!(!tee.is_replayable());
+    close.notify_one();
+    let res = within(Duration::from_secs(10), sent).await.unwrap();
+    assert!(res.is_err(), "a POST is not resent");
+    assert_eq!(conns.load(Ordering::SeqCst), 1);
+    drop(tx);
+}
+
 /// The upstream retires a keep-alive connection as it is reused and then
 /// refuses new connections: the resend of a GET fails to connect. The first
 /// attempt may have been processed, and the error says so.
@@ -1565,6 +1726,79 @@ async fn refused_h2_stream_is_resent_for_any_method() {
     let res = within(Duration::from_secs(2), c.send(&h2_target(addr), post)).await;
     assert!(res.is_err());
     assert_eq!(streams.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn refused_h2_stream_resends_a_teed_body_within_its_limit() {
+    let c = client();
+    for (limit, resent) in [(1024, true), (2, false)] {
+        // The upstream reads the body before refusing, so the copy has
+        // seen it (or passed its limit) when the refusal arrives.
+        let (addr, streams, _) = h2_refusing_after_reading().await;
+        let post = teed(http::Method::POST, b"data", limit);
+        let res = within(Duration::from_secs(2), c.send(&h2_target(addr), post)).await;
+        assert_eq!(res.is_ok(), resent, "limit {limit}");
+        let expected = if resent { 2 } else { 1 };
+        assert_eq!(streams.load(Ordering::SeqCst), expected, "limit {limit}");
+    }
+}
+
+/// Cleartext HTTP/2 upstream that reads the first stream's body whole and
+/// then refuses it (`REFUSED_STREAM`), and answers every later stream with
+/// `ok`. Records every request body it reads.
+async fn h2_refusing_after_reading() -> (SocketAddr, Arc<AtomicUsize>, Bodies) {
+    let streams = Arc::new(AtomicUsize::new(0));
+    let seen = streams.clone();
+    let bodies = Bodies::default();
+    let read = bodies.clone();
+    let (addr, _) = raw(move |s, _| {
+        let (streams, bodies) = (streams.clone(), bodies.clone());
+        async move {
+            let Ok(mut conn) = h2::server::handshake(s).await else {
+                return;
+            };
+            while let Some(Ok((req, mut respond))) = conn.accept().await {
+                let refuse = streams.fetch_add(1, Ordering::SeqCst) == 0;
+                let bodies = bodies.clone();
+                tokio::spawn(async move {
+                    let mut recv = req.into_body();
+                    let mut body = Vec::new();
+                    while let Some(Ok(chunk)) = recv.data().await {
+                        let _ = recv.flow_control().release_capacity(chunk.len());
+                        body.extend_from_slice(&chunk);
+                    }
+                    bodies.lock().unwrap().push(body);
+                    if refuse {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    } else if let Ok(mut out) =
+                        respond.send_response(http::Response::new(()), false)
+                    {
+                        let _ = out.send_data(Bytes::from_static(b"ok"), true);
+                    }
+                });
+            }
+        }
+    })
+    .await;
+    (addr, seen, read)
+}
+
+/// A teed POST whose HTTP/2 stream the upstream refuses after reading it
+/// is resent whole from the copy: a refused stream was not processed.
+#[tokio::test]
+async fn a_refused_h2_stream_resends_a_teed_post_whole_from_its_copy() {
+    let (addr, streams, bodies) = h2_refusing_after_reading().await;
+    let c = client();
+    let (post, tee) = counted_teed(http::Method::POST, b"payload");
+    assert_eq!(send_ok(&c, &h2_target(addr), post).await, "ok");
+    assert_eq!(streams.load(Ordering::SeqCst), 2);
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies,
+        [&b"payload"[..], b"payload"].map(<[u8]>::to_vec),
+        "the refused stream read the body, and the resend carried it whole"
+    );
+    assert_eq!(tee.retained_bytes(), 0, "the copy is freed once answered");
 }
 
 #[tokio::test]

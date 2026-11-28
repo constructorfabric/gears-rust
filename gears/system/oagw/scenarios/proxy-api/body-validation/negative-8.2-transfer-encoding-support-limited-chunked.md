@@ -14,10 +14,14 @@ Transfer-Encoding: gzip
 
 ## Expected response
 
-- `400 Bad Request`
-- `Content-Type: application/problem+json`
-- `X-OAGW-Error-Source: gateway`
-- `detail` mentions unsupported transfer encoding.
+Over REST hyper rejects the framing before OAGW runs:
+
+- `400 Bad Request` from hyper, with an empty body
+- No `Content-Type: application/problem+json`, no `X-OAGW-Error-Source`
+
+For an in-process SDK request with the same header: a gateway `400`
+`invalid_argument` on field `transfer-encoding`, reason `UNSUPPORTED_VALUE`,
+whose `detail` mentions the unsupported transfer encoding.
 
 ## Scenario: chunked supported
 
@@ -32,4 +36,5 @@ Transfer-Encoding: chunked
 ```
 
 Expected:
-- Request is accepted (if upstream supports) and forwarded.
+- Request is accepted and streamed to the upstream as it arrives, chunked
+  (HTTP/1.1) or as DATA frames (HTTP/2).

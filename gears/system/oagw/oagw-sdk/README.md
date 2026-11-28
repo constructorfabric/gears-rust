@@ -37,6 +37,24 @@ let resp = gw.proxy_request(ctx, req).await?;
 let bytes = resp.into_body().into_bytes().await?;
 ```
 
+### Streaming a request body
+
+A `Body::Stream` is sent as it is read. Set `Content-Length` when the length
+is known: the upstream gets it instead of chunked framing (many upstreams and
+signed requests need it), and a stream of another length fails the request
+with 400 `INVALID_CONTENT_LENGTH`. End the stream right after its last byte
+(drop a channel's sender, for example): without a `Content-Length` the
+request waits for the end, and with one, data yielded after the declared
+length is not seen.
+
+```rust
+let req = http::Request::builder()
+    .method("PUT")
+    .uri("/storage/v1/objects/report.bin")
+    .header(http::header::CONTENT_LENGTH, len)
+    .body(Body::Stream(stream))?;
+```
+
 ### Consuming an SSE stream
 
 ```rust

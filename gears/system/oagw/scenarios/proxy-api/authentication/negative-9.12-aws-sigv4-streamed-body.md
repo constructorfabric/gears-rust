@@ -1,14 +1,14 @@
 # Outbound auth: AWS SigV4 with a streamed request body
 
-A SigV4 signature covers the SHA-256 of the body, which is not known for a streamed body. Only in-process SDK callers can stream a request body; REST callers are always buffered. Upstream as in [positive-9.11](positive-9.11-aws-sigv4-signed-request.md).
+A SigV4 signature covers the SHA-256 of the body, which is not known while the body streams. Request bodies stream from REST and in-process SDK callers alike. Upstream as in [positive-9.11](positive-9.11-aws-sigv4-signed-request.md).
 
-## Scenario A: refused by default
+## Scenario A: read whole and signed by default
 
-An in-process caller sends `POST .../model/<id>/invoke` with `Body::Stream`.
+A caller sends `POST .../model/<id>/invoke` with a streamed body (REST, or `Body::Stream` in-process).
 
 Expected:
-- `400` `invalid_argument`, field violation `body`, reason `VALIDATION`, description naming `auth.config.unsigned_payload`.
-- Nothing is sent to the upstream and no credential is read.
+- The gateway reads the body whole (within `max_body_size_bytes` and the request timeout), hashes it and signs the hash.
+- The upstream gets the body with `Content-Length`, whether or not the caller declared one.
 
 ## Scenario B: `unsigned_payload` opt-in
 
@@ -28,8 +28,9 @@ Expected:
 ```
 
 Expected:
-- The request is signed with the payload hash `UNSIGNED-PAYLOAD`, sent as `X-Amz-Content-Sha256: UNSIGNED-PAYLOAD`, and the body is streamed to the upstream.
+- With a `Content-Length` the request is signed with the payload hash `UNSIGNED-PAYLOAD`, sent as `X-Amz-Content-Sha256: UNSIGNED-PAYLOAD`, and the body is streamed to the upstream with that length.
+- Without a `Content-Length` (a chunked client) the body is still read whole and hashed: sent chunked, S3 would refuse it without `x-amz-decoded-content-length`.
 - A buffered body on the same upstream is still hashed: `unsigned_payload` affects only a streamed body.
 - Only services that accept `UNSIGNED-PAYLOAD` (for example S3) take such a request.
 
-Covered by Rust tests (`infra/proxy/aws_sigv4_tests.rs`); the E2E suite has no in-process caller.
+Covered by Rust tests (`infra/proxy/aws_sigv4_tests.rs`).

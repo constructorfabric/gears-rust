@@ -247,6 +247,17 @@ pub trait AuthPlugin: Send + Sync {
         false
     }
 
+    /// Whether [`Self::sign`] needs the whole body under the upstream's auth
+    /// `config`, for a streamed body of `declared_len` bytes (`None`: no
+    /// `Content-Length`, so the body would go chunked). A streamed request
+    /// body is then read in full (within the body size limit) and signed as
+    /// [`SigningBody::Buffered`]; otherwise it stays streamed and `sign`
+    /// sees [`SigningBody::Streamed`]. Asked only when [`Self::signs`] is
+    /// true.
+    fn signs_body(&self, _config: &HashMap<String, String>, _declared_len: Option<u64>) -> bool {
+        true
+    }
+
     /// Sign the final outbound request (ADR-0023). Runs once per request,
     /// when [`Self::signs`] is true, after header rules, transforms,
     /// endpoint selection and the URL build, right before the request is

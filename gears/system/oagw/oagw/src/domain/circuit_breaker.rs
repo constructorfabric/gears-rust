@@ -44,6 +44,7 @@ use tokio::time::Instant;
 use toolkit_macros::domain_model;
 use toolkit_resilience::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig as BreakerConfig, CircuitBreakerObserver, Outcome, Permit,
+    State,
 };
 use uuid::Uuid;
 
@@ -153,6 +154,15 @@ impl CircuitBreakers {
     /// As [`admit`](Self::admit).
     pub fn check(&self, upstream: &Upstream, instance: &str) -> Result<(), DomainError> {
         self.admit(upstream, instance).map(drop)
+    }
+
+    /// Whether the breaker of `upstream` is closed (or there is none): a
+    /// request admitted now holds no probe slot. An open breaker whose
+    /// timeout has passed still counts as not closed, since the next
+    /// [`admit`](Self::admit) turns it half-open.
+    pub fn is_closed(&self, upstream: &Upstream) -> bool {
+        self.breaker_for(upstream)
+            .is_none_or(|breaker| breaker.state() == State::Closed)
     }
 
     /// The breaker for requests to `upstream`; `None` without an enabled

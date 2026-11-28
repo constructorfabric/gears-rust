@@ -682,32 +682,13 @@ fn streamed() -> Body {
     Body::Stream(Box::pin(chunks))
 }
 
-/// A streamed body from an in-process caller is refused (400) before
-/// anything is sent; with `unsigned_payload` it is sent as
-/// `UNSIGNED-PAYLOAD` and the rest of the request is signed.
+/// A streamed body is read whole and its hash signed, and the upstream
+/// gets it with its length; with `unsigned_payload` and a declared length it
+/// stays streamed, is sent as `UNSIGNED-PAYLOAD` and the rest of the request
+/// is signed.
 #[tokio::test]
-async fn streamed_body_is_refused_unless_unsigned_payload() {
+async fn streamed_body_is_hashed_unless_unsigned_payload() {
     let fx = Fx::new(&[], allowlist(&[])).await;
-    let err = fx
-        .send(fx.post(SIGN).body(streamed()).unwrap())
-        .await
-        .unwrap_err();
-    assert_eq!(err.status_code(), 400);
-    match ServiceGatewayError::from(err) {
-        ServiceGatewayError::Validation {
-            field,
-            reason,
-            detail,
-        } => {
-            assert_eq!(field, "body");
-            assert_eq!(reason, oagw_sdk::field::VALIDATION);
-            assert!(detail.contains("auth.config.unsigned_payload"), "{detail}");
-        }
-        other => panic!("{other:?}"),
-    }
-    assert!(fx.guard.recorded_requests().await.is_empty());
-
-    let fx = Fx::new(&[("unsigned_payload", "true")], allowlist(&[])).await;
     let (status, _) = fx
         .send(fx.post(SIGN).body(streamed()).unwrap())
         .await
@@ -718,9 +699,120 @@ async fn streamed_body_is_refused_unless_unsigned_payload() {
     assert_eq!(rec[0].body, br#"{"k":2}"#);
     assert_eq!(
         header_values(&rec[0], "x-amz-content-sha256"),
+        [sha256_hex(br#"{"k":2}"#).unwrap()]
+    );
+    assert_eq!(header_values(&rec[0], "content-length"), ["7"]);
+    verify(&rec[0], SECRET).unwrap();
+
+    let fx = Fx::new(&[("unsigned_payload", "true")], allowlist(&[])).await;
+    let (status, _) = fx
+        .send(
+            fx.post(SIGN)
+                .header("content-length", "7")
+                .body(streamed())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let rec = fx.guard.recorded_requests().await;
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0].body, br#"{"k":2}"#);
+    assert_eq!(
+        header_values(&rec[0], "x-amz-content-sha256"),
         ["UNSIGNED-PAYLOAD"]
     );
+    assert_eq!(header_values(&rec[0], "content-length"), ["7"]);
     verify(&rec[0], SECRET).unwrap();
+}
+
+/// With `unsigned_payload` a stream of unknown length is still read whole:
+/// sent chunked it would lack the `x-amz-decoded-content-length` S3 asks
+/// for. It goes with `Content-Length`, and a buffered body is hashed.
+#[tokio::test]
+async fn unsigned_payload_stream_without_a_length_is_buffered() {
+    let fx = Fx::new(&[("unsigned_payload", "true")], allowlist(&[])).await;
+    let (status, _) = fx
+        .send(fx.post(SIGN).body(streamed()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    let rec = fx.guard.recorded_requests().await;
+    assert_eq!(rec.len(), 1);
+    assert_eq!(rec[0].body, br#"{"k":2}"#);
+    assert_eq!(header_values(&rec[0], "content-length"), ["7"]);
+    assert!(header_values(&rec[0], "transfer-encoding").is_empty());
+    assert_eq!(
+        header_values(&rec[0], "x-amz-content-sha256"),
+        [sha256_hex(br#"{"k":2}"#).unwrap()]
+    );
+    verify(&rec[0], SECRET).unwrap();
+}
+
+/// Over REST the body streams in from the client. The signer hashes it, so
+/// it is read whole first: the upstream gets the signed hash and the
+/// length, with or without the client's `Content-Length`. With
+/// `unsigned_payload` a body with a `Content-Length` streams on with it;
+/// one without is read whole as well.
+#[tokio::test]
+async fn rest_body_is_read_whole_for_the_payload_hash() {
+    use tower::ServiceExt as _;
+
+    let payload = br#"{"prompt":"a streamed upload"}"#;
+    for unsigned in [false, true] {
+        let extra: &[(&str, &str)] = if unsigned {
+            &[("unsigned_payload", "true")]
+        } else {
+            &[]
+        };
+        let fx = Fx::new(extra, allowlist(&[])).await;
+        for content_length in [true, false] {
+            let chunks = payload
+                .chunks(7)
+                .map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c)))
+                .collect::<Vec<_>>();
+            let body = axum::body::Body::from_stream(futures_util::stream::iter(chunks));
+            let mut req = http::Request::post(format!(
+                "/oagw/v1/proxy/{}{}?q=a+b&q=c%2Bd&e=",
+                fx.alias,
+                fx.guard.path(SIGN)
+            ))
+            .header("content-type", "application/json");
+            if content_length {
+                req = req.header("content-length", payload.len());
+            }
+            let resp =
+                fx.h.router()
+                    .clone()
+                    .oneshot(req.body(body).unwrap())
+                    .await
+                    .unwrap();
+            let case = format!("unsigned={unsigned} content_length={content_length}");
+            assert_eq!(resp.status(), StatusCode::OK, "{case}");
+
+            let rec = fx.guard.recorded_requests().await;
+            let last = rec.last().unwrap();
+            assert_eq!(last.body, payload, "{case}");
+            let streamed = unsigned && content_length;
+            let hash = if streamed {
+                "UNSIGNED-PAYLOAD".to_owned()
+            } else {
+                sha256_hex(payload).unwrap()
+            };
+            assert_eq!(
+                header_values(last, "x-amz-content-sha256"),
+                [hash],
+                "{case}"
+            );
+            // Always a length: the client's, or the buffered body's.
+            assert_eq!(
+                header_values(last, "content-length"),
+                [payload.len().to_string()],
+                "{case}"
+            );
+            verify(last, SECRET).unwrap();
+        }
+    }
 }
 
 /// An upstream signing for `service`, with `PUT` routes on `/bucket`

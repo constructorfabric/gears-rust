@@ -6,13 +6,16 @@ use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use bytes::Bytes;
 use credstore_sdk::CredStoreClientV1;
-use futures_util::StreamExt;
+use futures_util::StreamExt as _;
 use http::{HeaderMap, HeaderValue};
 use oagw_sdk::body::{Body, BodyStream};
 use oagw_sdk::{field, reason};
 use tokio_util::sync::CancellationToken;
 use toolkit_http_proxy::sanitize::{self, RequestKind};
-use toolkit_http_proxy::{ReplayableBody, UpgradeOutcome, empty_body, full_body, stream_body};
+use toolkit_http_proxy::{
+    ReplayTee, ReplayableBody, UpgradeOutcome, empty_body, full_body, replay_tee,
+    sized_stream_body, stream_body,
+};
 use toolkit_security::SecurityContext;
 
 use crate::config::TokenCacheConfig;
@@ -46,12 +49,15 @@ use super::engine::{
     ProxyEngine, TargetError, into_body_stream, is_connect_failure, map_proxy_error,
 };
 use super::headers;
+use super::request_body::{StreamedBodyState, buffer_body_stream, limit_body_stream};
 use super::streaming::StreamShutdown;
 use super::{request_builder, secret_ref, signing, streaming};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default maximum request body size: 100 MB.
 const MAX_BODY_SIZE: usize = 100 * 1024 * 1024;
+/// Default copy of a streamed request body kept for a resend (1 MiB).
+const REQUEST_RETRY_BUFFER: usize = 1024 * 1024;
 /// Picks one endpoint of the upstream's (`custom-header-routing`).
 const TARGET_HOST_HEADER: &str = "x-oagw-target-host";
 /// How often idle rate-limit buckets and circuit breakers are evicted.
@@ -81,6 +87,8 @@ pub struct DataPlaneServiceImpl {
     allow_http_upstream: bool,
     /// Maximum request body size in bytes (applies to both buffered and streaming bodies).
     max_body_size: usize,
+    /// Bytes of a streamed request body copied for a resend.
+    request_retry_buffer: usize,
     /// Idle timeout for WebSocket connections (no data in either direction).
     websocket_idle_timeout: Duration,
     /// Bound on announcing Close 1001 and half-closing each leg at teardown.
@@ -129,6 +137,7 @@ impl DataPlaneServiceImpl {
             policy_enforcer,
             allow_http_upstream: false,
             max_body_size: MAX_BODY_SIZE,
+            request_retry_buffer: REQUEST_RETRY_BUFFER,
             websocket_idle_timeout: Duration::from_secs(300),
             websocket_close_timeout: Duration::from_secs(5),
             streaming_idle_timeout: Duration::from_secs(300),
@@ -160,6 +169,13 @@ impl DataPlaneServiceImpl {
     #[must_use]
     pub fn with_max_body_size(mut self, size: usize) -> Self {
         self.max_body_size = size;
+        self
+    }
+
+    /// Override how much of a streamed request body is copied for a resend.
+    #[must_use]
+    pub fn with_request_retry_buffer(mut self, bytes: usize) -> Self {
+        self.request_retry_buffer = bytes;
         self
     }
 
@@ -439,6 +455,10 @@ struct ParsedRequest {
     is_upgrade: bool,
     body_bytes: Bytes,
     body_stream: Option<BodyStream>,
+    /// The `Content-Length` the caller declared for `body_stream`: the
+    /// stream must yield exactly that many bytes, and the upstream gets it
+    /// as the length instead of chunked framing.
+    body_len: Option<u64>,
     /// Client address from the API gateway's `ClientIp` extension; `None`
     /// for requests that did not come through it (in-process SDK calls).
     client_ip: Option<std::net::IpAddr>,
@@ -567,22 +587,30 @@ fn parse_proxy_request(
     // reject CL/TE co-existence.
     headers::validate_smuggling_headers(&req_headers)?;
 
-    // Conditional body conversion — keep streams for streaming request bodies.
+    // A buffered body is sent with its own length, whatever the header says;
+    // a stream is bound to the declared one.
+    let too_large = |len: u64| DomainError::PayloadTooLarge {
+        detail: format!("request body of {len} bytes exceeds maximum of {max_body_size} bytes"),
+        instance: instance_uri.clone(),
+    };
+    let mut body_len = None;
     let (body_bytes, body_stream): (Bytes, Option<BodyStream>) = match body {
         Body::Empty => (Bytes::new(), None),
         Body::Bytes(b) => {
             if b.len() > max_body_size {
-                return Err(DomainError::PayloadTooLarge {
-                    detail: format!(
-                        "request body of {} bytes exceeds maximum of {max_body_size} bytes",
-                        b.len()
-                    ),
-                    instance: instance_uri,
-                });
+                return Err(too_large(b.len() as u64));
             }
             (b, None)
         }
-        Body::Stream(s) => (Bytes::new(), Some(s)),
+        Body::Stream(s) => {
+            body_len = declared_content_length(&req_headers);
+            if let Some(len) = body_len
+                && len > max_body_size as u64
+            {
+                return Err(too_large(len));
+            }
+            (Bytes::new(), Some(s))
+        }
     };
 
     Ok(ParsedRequest {
@@ -596,6 +624,7 @@ fn parse_proxy_request(
         is_upgrade,
         body_bytes,
         body_stream,
+        body_len,
         client_ip,
     })
 }
@@ -980,8 +1009,9 @@ impl DataPlaneServiceImpl {
         if let Authorization::Granted(grant) = &mut auth {
             // The guard counts the request from here on.
             grant.take_count();
-            // The REST path authorized before reading the body: count the
-            // check, as the SDK path does, but not the client's upload.
+            // The REST path authorized before the Data Plane ran: count the
+            // check, as the SDK path does. A streamed body uploads within
+            // `total`, up to the response head.
             guard.start = guard
                 .start
                 .checked_sub(grant.authorized_in())
@@ -989,6 +1019,7 @@ impl DataPlaneServiceImpl {
         }
         let mut host_label: String = metric_labels::UNKNOWN.to_owned();
         let mut path_label: String = metric_labels::UNKNOWN.to_owned();
+        let body_state = Arc::new(StreamedBodyState::default());
 
         let result: Result<http::Response<Body>, DomainError> = async {
             let grant = match auth {
@@ -1008,6 +1039,7 @@ impl DataPlaneServiceImpl {
                 is_upgrade,
                 body_bytes,
                 body_stream,
+                body_len,
                 client_ip,
             } = parse_proxy_request(req, self.max_body_size)?;
 
@@ -1428,6 +1460,50 @@ impl DataPlaneServiceImpl {
             query.outbound(query_transformed).as_deref(),
         )?;
 
+        // 8'. Read a streamed body whole when a stage needs its bytes: a
+        //     signer that hashes the payload (or, for `aws_sigv4` with
+        //     `unsigned_payload`, a body of unknown length, which S3 refuses
+        //     chunked), or a declared empty body (a non-empty one is refused
+        //     here, before anything is sent), or any body while the circuit
+        //     is not closed: a streamed upload runs inside the permit, and a
+        //     client holding its upload open would hold a half-open probe
+        //     slot, keeping the circuit from closing for every caller.
+        //     Before the breaker permit: the client's upload is not the
+        //     upstream's time. Under the request deadline.
+        let buffer = body_stream.is_some()
+            && !is_upgrade
+            && (body_len == Some(0)
+                || !self.circuit_breakers.is_closed(&upstream)
+                || signer.as_ref().is_some_and(|(plugin, auth)| {
+                    let config = auth.config.as_ref().unwrap_or_else(|| empty_config());
+                    plugin.signs_body(config, body_len)
+                }));
+        let (body_bytes, body_stream) = match body_stream {
+            Some(stream) if buffer => {
+                let read = tokio::time::timeout_at(
+                    deadline,
+                    buffer_body_stream(
+                        stream,
+                        max_body,
+                        body_len,
+                        Arc::clone(&body_state),
+                        &instance_uri,
+                    ),
+                )
+                .await
+                .map_err(|_| DomainError::RequestTimeout {
+                    detail: format!(
+                        "reading the request body timed out after {:?}",
+                        self.request_timeout
+                    ),
+                    instance: instance_uri.clone(),
+                    dispatch: Dispatch::NotSent,
+                })??;
+                (read, None)
+            }
+            stream => (body_bytes, stream),
+        };
+
         // 8a. Circuit breaker permit. It covers target resolution and the
         //     exchange only, so a half-open probe slot is not held through
         //     the gateway's own steps before it. Their time is not the
@@ -1620,7 +1696,9 @@ impl DataPlaneServiceImpl {
                 &outbound_headers,
                 body_bytes,
                 body_stream,
+                body_len,
                 max_body,
+                Arc::clone(&body_state),
                 &pipeline,
                 &instance_uri,
             )
@@ -1644,10 +1722,18 @@ impl DataPlaneServiceImpl {
         .await;
 
         match result {
+            // The REST client went away mid-upload (only the REST handler
+            // marks it): nobody gets the answer or the error. Counted as
+            // cancelled, as a client gone before the request reached the
+            // gateway; checked here, last, so a client gone after the
+            // upstream's response head counts too. An SDK caller's stream
+            // error is never this: that caller gets the response.
+            Ok(resp) if body_state.client_gone() => Ok(resp),
             Ok(resp) => {
                 guard.set_success(resp.status().as_u16());
                 Ok(guard.observe_body(resp, &routed))
             }
+            Err(err) if body_state.client_gone() => Err(err),
             Err(err) => {
                 guard.set_error(&err);
                 Err(err)
@@ -1821,59 +1907,119 @@ impl DataPlaneServiceImpl {
     /// Forward a request through the engine and run the response pipeline.
     ///
     /// Buffered bodies go out with `Content-Length`; streaming bodies are
-    /// forwarded chunk by chunk with `max_body` enforced on the fly. A body
-    /// that breaches the limit (413) or fails mid-stream aborts the upstream
-    /// request without completing its framing.
+    /// forwarded chunk by chunk with `max_body` enforced on the fly, with
+    /// `Content-Length` when `body_len` is known and chunked otherwise. A
+    /// body that breaches the limit (413), differs from `body_len` (400) or
+    /// fails mid-stream (400) aborts the upstream request without completing
+    /// its framing. Once the upstream's response head has arrived, that
+    /// response is relayed instead of the 413 or 400.
     #[allow(clippy::too_many_arguments)]
     async fn forward(
         &self,
         target: &toolkit_http_proxy::Target,
-        permit: UpstreamPermit,
+        mut permit: UpstreamPermit,
         deadline: tokio::time::Instant,
         method: &http::Method,
         url: &str,
         outbound_headers: &HeaderMap,
         body_bytes: Bytes,
         body_stream: Option<BodyStream>,
+        body_len: Option<u64>,
         max_body: usize,
+        body_state: Arc<StreamedBodyState>,
         pipeline: &ResponsePipelineCtx<'_>,
         instance_uri: &str,
     ) -> Result<http::Response<Body>, DomainError> {
-        let body_state = Arc::new(StreamedBodyState::default());
         let streamed = body_stream.is_some();
+        // A body can be sent again if the upstream provably did not process
+        // the request (the engine decides when): a buffered one from its
+        // bytes, a streamed one from the copy kept while it is sent, as long
+        // as the copy holds all of it that went out.
         let (body, replay) = match body_stream {
-            Some(stream) => (
-                stream_body(limit_body_stream(stream, max_body, Arc::clone(&body_state))),
-                None,
+            Some(stream) => {
+                let handed = Arc::clone(&body_state);
+                let limited =
+                    limit_body_stream(stream, max_body, body_len, Arc::clone(&body_state)).inspect(
+                        move |chunk| {
+                            if chunk.is_ok() {
+                                handed.handed_to_engine();
+                            }
+                        },
+                    );
+                // A known length goes out as `Content-Length`, not chunked:
+                // many upstreams refuse or buffer chunked uploads.
+                let body = match body_len {
+                    Some(len) => sized_stream_body(limited, len),
+                    None => stream_body(limited),
+                };
+                if self.request_retry_buffer == 0 {
+                    (body, None)
+                } else {
+                    let (body, tee) = replay_tee(body, self.request_retry_buffer);
+                    (body, Some(Replay::Tee(tee)))
+                }
+            }
+            None => (
+                full_body(body_bytes.clone()),
+                Some(Replay::Copy(ReplayableBody(body_bytes))),
             ),
-            // A buffered body can be sent again if the upstream provably did
-            // not process the request (the engine decides when).
-            None => (full_body(body_bytes.clone()), Some(body_bytes)),
         };
         let mut req =
             build_outbound_request(method, url, outbound_headers.clone(), body, instance_uri)?;
-        if let Some(bytes) = replay {
-            req.extensions_mut().insert(ReplayableBody(bytes));
+        match replay {
+            Some(Replay::Copy(copy)) => {
+                req.extensions_mut().insert(copy);
+            }
+            Some(Replay::Tee(tee)) => {
+                req.extensions_mut().insert(tee);
+            }
+            None => {}
         }
 
         let timeout = self.request_timeout;
         let outcome =
             tokio::time::timeout_at(deadline, self.engine.client().send(target, req)).await;
 
-        // A failure on our side of the body wins over whatever the upstream
-        // made of the aborted request, and says nothing about the upstream.
-        if let Some(err) = body_state.failure(max_body, instance_uri) {
+        // Without an answer, a failure on our side of the body wins over
+        // whatever the upstream made of the aborted request, and says
+        // nothing about the upstream.
+        if !matches!(outcome, Ok(Ok(_)))
+            && let Some(err) = body_state.failure(max_body, instance_uri)
+        {
             return Err(err);
         }
         // Until the client has sent its whole body the exchange runs at the
         // client's pace: a client trickling its upload would otherwise hit
         // the deadline or the engine's read timeout and open the circuit
         // for every tenant. Only failing to reach the upstream counts then.
-        let upload_done = !streamed || body_state.finished();
+        // Once it has, a deadline hit counts only if what was left of the
+        // deadline was the upstream's full budget.
+        let upload_done = if streamed {
+            match body_state.finished_at() {
+                Some(at) => {
+                    permit = permit
+                        .with_budget(deadline.saturating_duration_since(at), self.request_timeout);
+                    true
+                }
+                None => false,
+            }
+        } else {
+            true
+        };
         // Recorded at the response head: an SSE or long body that fails
         // later does not count.
         let resp = match outcome {
+            // The upstream answered: its response is the answer, even if
+            // the caller's body failed after it (or the failure made the
+            // upstream answer).
             Ok(Ok(resp)) => {
+                if let Some(err) = body_state.failure(max_body, instance_uri) {
+                    tracing::info!(
+                        status = resp.status().as_u16(),
+                        error = %err,
+                        "request body failed after the upstream answered; relaying its response"
+                    );
+                }
                 permit.answered(resp.status());
                 resp
             }
@@ -1949,85 +2095,17 @@ fn build_outbound_request(
     Ok(req)
 }
 
-/// What happened on our side of a streamed request body.
-#[derive(Default)]
-struct StreamedBodyState {
-    /// Total bytes when the limit was breached.
-    exceeded: std::sync::OnceLock<usize>,
-    /// Why the client's body stream failed.
-    failed: std::sync::OnceLock<String>,
-    /// The client's body stream ended cleanly.
-    finished: std::sync::atomic::AtomicBool,
+/// An empty auth config, for an upstream that sets none.
+fn empty_config() -> &'static std::collections::HashMap<String, String> {
+    static EMPTY: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+        std::sync::OnceLock::new();
+    EMPTY.get_or_init(std::collections::HashMap::new)
 }
 
-impl StreamedBodyState {
-    fn finished(&self) -> bool {
-        self.finished.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn failure(&self, max_body: usize, instance_uri: &str) -> Option<DomainError> {
-        if let Some(total) = self.exceeded.get() {
-            return Some(DomainError::PayloadTooLarge {
-                detail: format!(
-                    "streaming request body of {total} bytes exceeds maximum of {max_body} bytes"
-                ),
-                instance: instance_uri.to_string(),
-            });
-        }
-        self.failed
-            .get()
-            .map(|reason| DomainError::DownstreamError {
-                detail: format!("streaming request body failed mid-stream: {reason}"),
-                instance: instance_uri.to_string(),
-                dispatch: Dispatch::MaybeSent,
-            })
-    }
-}
-
-/// Enforce `max_body` on a streamed request body, recording failures and
-/// the clean end in `state`. Empty chunks are dropped. A breach or a stream
-/// error ends the stream with an error, which aborts the upstream request
-/// without a terminating chunk.
-fn limit_body_stream(
-    stream: BodyStream,
-    max_body: usize,
-    state: Arc<StreamedBodyState>,
-) -> impl futures_util::Stream<Item = Result<Bytes, oagw_sdk::body::BoxError>> + Send {
-    let mut total: usize = 0;
-    let end = Arc::clone(&state);
-    let limited = stream.filter_map(move |chunk| {
-        let item = match chunk {
-            Ok(bytes) if bytes.is_empty() => None,
-            Ok(bytes) => {
-                total = total.saturating_add(bytes.len());
-                if total > max_body {
-                    tracing::warn!(
-                        total_bytes = total,
-                        max_body,
-                        "streaming body exceeded max size, aborting"
-                    );
-                    let _ = state.exceeded.set(total);
-                    Some(Err("request body exceeds the configured limit".into()))
-                } else {
-                    Some(Ok(bytes))
-                }
-            }
-            Err(e) => {
-                tracing::debug!(error = %e, "body stream chunk error");
-                let _ = state.failed.set(format!("body stream read error: {e}"));
-                Some(Err(e))
-            }
-        };
-        std::future::ready(item)
-    });
-    // Polled only once the client's stream has ended. After an error item
-    // the body state reports the failure first, whatever this says.
-    let end = futures_util::stream::once(async move {
-        end.finished
-            .store(true, std::sync::atomic::Ordering::Release);
-    })
-    .filter_map(|()| std::future::ready(None));
-    limited.chain(end)
+/// The request extension that lets the engine resend a request.
+enum Replay {
+    Copy(ReplayableBody),
+    Tee(ReplayTee),
 }
 
 /// Execute the auth plugin for the upstream and set the headers it asks for
@@ -5695,6 +5773,138 @@ pub(crate) mod tests {
         );
         assert!(
             events.contains(&format!("error test {}", domain_error_type_name(&err))),
+            "{events:?}"
+        );
+    }
+
+    /// The events of a `POST /test/v1` whose body fails with `error`
+    /// (wrapped by `wrap`, as its caller would) as the upstream's response
+    /// head arrives, before the request's outcome.
+    ///
+    /// Until the head arrives the engine drives an HTTP/1.1 connection
+    /// from `send`, each pass reading before it writes. The body, polled
+    /// in a pass whose read found nothing, has the upstream (on its own
+    /// thread) write the head and waits for the bytes to land, then stays
+    /// pending until that poll of the connection is over. The head's
+    /// readiness wakes the next one, which reads the head before it gets
+    /// the body's error. One thread: the order is fixed. It relies on
+    /// hyper's h1 client dispatcher reading before writing in each pass
+    /// and on the current-thread runtime; a dependency bump that changes
+    /// either breaks this helper, not the code under test.
+    async fn body_failing_as_the_answer_arrives(
+        error: std::io::ErrorKind,
+        wrap: fn(oagw_sdk::body::BoxError) -> oagw_sdk::body::BoxError,
+    ) -> Vec<String> {
+        use crate::domain::model::HttpMethod;
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (head_read_tx, head_read_rx) = tokio::sync::oneshot::channel::<()>();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel::<()>();
+        let (answered_tx, answered_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let Ok((mut tcp, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                match tcp.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => head.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = head_read_tx.send(());
+            if answer_rx.recv().is_err() || tcp.write_all(CHUNKED_HEAD).is_err() {
+                return;
+            }
+            let _ = answered_tx.send(());
+            // Hold the connection until the gateway drops it.
+            while matches!(tcp.read(&mut buf), Ok(n) if n > 0) {}
+        });
+        let (target, mut route) = local_target(port);
+        route.match_rules.http.as_mut().unwrap().methods = vec![HttpMethod::Post];
+        let metrics = Arc::new(RequestRecorder::default());
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            metrics.clone(),
+            Some((target, route)),
+        )
+        .with_allow_http_upstream(true);
+
+        let body = futures_util::stream::once(async { Ok(Bytes::from_static(b"partial ")) }).chain(
+            futures_util::stream::once(async move {
+                let _ = head_read_rx.await;
+                // Blocks the runtime: nothing sees the head before this
+                // poll of the connection ends.
+                answer_tx.send(()).unwrap();
+                answered_rx.recv().unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                // Pending for the rest of this poll (hyper may poll the
+                // body again in it); the head's readiness wakes the next.
+                let next_poll = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = Arc::clone(&next_poll);
+                tokio::spawn(async move { flag.store(true, Ordering::SeqCst) });
+                std::future::poll_fn(|_| {
+                    if next_poll.load(Ordering::SeqCst) {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                Err(wrap(Box::new(std::io::Error::new(
+                    error,
+                    "body source failed",
+                ))))
+            }),
+        );
+        let req = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("/test/v1")
+            .body(Body::Stream(Box::pin(body)))
+            .unwrap();
+        let resp =
+            tokio::time::timeout(Duration::from_secs(10), svc.proxy_request(test_ctx(), req))
+                .await
+                .expect("no hang")
+                .expect("the upstream answered");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        drop(resp);
+        metrics.events()
+    }
+
+    /// An SDK caller whose own body source ends early (`UnexpectedEof`)
+    /// after the upstream answered still gets that answer: the request
+    /// counts with the upstream's status, not as `Cancelled`.
+    #[tokio::test]
+    async fn an_sdk_body_failing_after_the_answer_counts_the_answer() {
+        let events =
+            body_failing_as_the_answer_arrives(std::io::ErrorKind::UnexpectedEof, |e| e).await;
+        assert!(
+            events.contains(&"request test POST 200".to_owned()),
+            "{events:?}"
+        );
+        assert!(!events.iter().any(|e| e.starts_with("error")), "{events:?}");
+    }
+
+    /// A REST client whose connection resets mid-upload, after the
+    /// upstream answered, gets nothing: the request counts as `Cancelled`.
+    /// The body is marked as the REST handler marks its client's reads.
+    #[tokio::test]
+    async fn a_rest_client_gone_after_the_answer_is_cancelled() {
+        let events = body_failing_as_the_answer_arrives(
+            std::io::ErrorKind::ConnectionReset,
+            crate::infra::proxy::request_body::client_read_error,
+        )
+        .await;
+        assert!(
+            events.contains(&"error test Cancelled".to_owned()),
+            "{events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.starts_with("request ")),
             "{events:?}"
         );
     }
