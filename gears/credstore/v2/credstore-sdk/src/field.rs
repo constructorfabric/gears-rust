@@ -23,6 +23,15 @@ use core::fmt;
 pub const INVALID_SECRET_REF: &str = "INVALID_SECRET_REF";
 
 // -------------------------------------------------------------------------
+// Bounded read: `get_secret_within`
+// -------------------------------------------------------------------------
+
+/// The `bound` of a bounded read is not on the caller's chain as the caller
+/// sees it (isolation barriers respected). One answer for an unrelated id and
+/// for an ancestor above a barrier. Field `bound`.
+pub const BOUND_NOT_ON_CHAIN: &str = "BOUND_NOT_ON_CHAIN";
+
+// -------------------------------------------------------------------------
 // Type rules: Violations of the secret type's traits
 // -------------------------------------------------------------------------
 
@@ -128,6 +137,8 @@ pub const UNSUPPORTED_MEDIA_TYPE: &str = "UNSUPPORTED_MEDIA_TYPE";
 pub enum Reason {
     /// See [`INVALID_SECRET_REF`].
     InvalidSecretRef,
+    /// See [`BOUND_NOT_ON_CHAIN`].
+    BoundNotOnChain,
     /// See [`UNKNOWN_SECRET_TYPE`].
     UnknownSecretType,
     /// See [`SHARING_NOT_ALLOWED_FOR_TYPE`].
@@ -192,6 +203,7 @@ impl Reason {
     pub fn from_wire(s: &str) -> Self {
         match s {
             INVALID_SECRET_REF => Self::InvalidSecretRef,
+            BOUND_NOT_ON_CHAIN => Self::BoundNotOnChain,
             UNKNOWN_SECRET_TYPE => Self::UnknownSecretType,
             SHARING_NOT_ALLOWED_FOR_TYPE => Self::SharingNotAllowedForType,
             VALUE_TOO_LARGE => Self::ValueTooLarge,
@@ -228,6 +240,7 @@ impl Reason {
     pub fn as_wire(&self) -> &str {
         match self {
             Self::InvalidSecretRef => INVALID_SECRET_REF,
+            Self::BoundNotOnChain => BOUND_NOT_ON_CHAIN,
             Self::UnknownSecretType => UNKNOWN_SECRET_TYPE,
             Self::SharingNotAllowedForType => SHARING_NOT_ALLOWED_FOR_TYPE,
             Self::ValueTooLarge => VALUE_TOO_LARGE,
@@ -269,6 +282,7 @@ impl fmt::Display for Reason {
 #[cfg(test)]
 pub(crate) const ALL: &[&str] = &[
     INVALID_SECRET_REF,
+    BOUND_NOT_ON_CHAIN,
     UNKNOWN_SECRET_TYPE,
     SHARING_NOT_ALLOWED_FOR_TYPE,
     VALUE_TOO_LARGE,

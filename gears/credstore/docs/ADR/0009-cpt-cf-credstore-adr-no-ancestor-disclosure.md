@@ -15,6 +15,7 @@ Updated:  2026-09-18 by Constructor Tech
 - [Considered Options](#considered-options)
 - [Decision Outcome](#decision-outcome)
   - [What a response carries, and for which row](#what-a-response-carries-and-for-which-row)
+  - [Bounded read (in-process only)](#bounded-read-in-process-only)
   - [Consequences](#consequences)
   - [Confirmation](#confirmation)
 - [Pros and Cons of the Options](#pros-and-cons-of-the-options)
@@ -54,10 +55,22 @@ Today's metadata carries `owner_tenant_id` and `is_inherited`; for an inherited 
 
 `inheritance` and `status` may disagree on purpose: `status: declared` with `inheritance: inherited` means "you removed your own value here; today you get an ancestor's". The weak validator still changes when the ancestor writes, so change detection under `read` works, but RFC 9110 requires the strong comparison for `If-Match`, so it can never be used to write (D3).
 
+In-process, the `Secret` of `get_secret` carries the same validator the REST `ETag` carries for the same read: the strong validator of the caller's own row when it holds one, otherwise the opaque weak tag of the winning row. It never carries the id or the version of another tenant's row.
+
+### Bounded read (in-process only)
+
+A consumer that injects a credential on behalf of a tenant, such as the outbound gateway checking that a key belongs to the owner of an upstream's auth configuration or to a tenant below it, needs to know where a value comes from without being told which tenant that is. The SDK method `get_secret_within(ctx, key, bound)` answers exactly that question. The caller names a tenant, `bound`, from its own visible chain; the value is served only when it comes from `bound` or from a tenant below `bound` on that chain. The response names no tenant.
+
+The order is fixed. The PDP decision comes first, as for every read, so a denied caller gets `PermissionDenied` whatever `bound` is. Then `bound` is checked against the part of the caller's chain that is visible with isolation barriers respected: the caller's own tenant, and its ancestors up to and including the first self-managed one. A `bound` outside that part is `InvalidArgument` with `BOUND_NOT_ON_CHAIN`, one answer for an unrelated identifier and for an ancestor above a barrier, so the check discloses nothing about what lies beyond the barrier. Resolution and the PDP's type and reference constraints then run exactly as for `get_secret`, over the full chain, so inheritance still passes through barriers. If there is no value to serve (nothing resolves, a suppressing row, a decisive row of another type, a record without a value, a record the constraints exclude) the answer is the usual `Ok(None)` and `bound` plays no part. Otherwise the row the value comes from is compared with `bound`: a row above it is `FailedPrecondition` with `OWNER_ABOVE_BOUND`, the value is not read from the store, and the read is audited as a failed read, like `SECRET_EXPIRED`. Only after that comes the expiry test, so an expired winner above the bound is `OWNER_ABOVE_BOUND`, while an expired winner within the bound is `SECRET_EXPIRED`. The row that counts is the one the value comes from, not the caller's own row: a caller's own `declared` row that inherits a partner's value is judged by the partner.
+
+This weakens D1 in one narrow way, and the decision accepts it. A caller can probe the levels of its visible chain one by one and learn which of them holds the shared row a value comes from. That caller already reads this value without a bound, and `bound` can only name tenants it sees, so nothing is learned about an ancestor beyond a barrier. The method exists in the SDK only. It has no REST counterpart, because over HTTP the answer would confirm to an arbitrary caller that a tenant belongs to a chain.
+
 ### Consequences
 
 - The collection mixes items with and without `updated_at`, which is why [ADR-0005](0005-cpt-cf-credstore-adr-upward-collection-read.md) offers no ordering or filtering on it.
 - An operator investigating provenance walks the chain with their own rights.
+- The bounded read adds two codes to the vocabulary, `OWNER_ABOVE_BOUND` and `BOUND_NOT_ON_CHAIN`, and an in-process consumer that needs an ownership check no longer needs a tenant identifier in the response.
+- A caller can learn, by probing its visible chain with different bounds, which visible level holds the shared row a value comes from (see "Bounded read").
 - **Revisit trigger**: this rests on the ancestor chain staying unpublished — the Tenant Resolver has no HTTP API today. If one exposes `get_ancestors` to callers, re-adding `owner_tenant_id` costs nothing.
 
 ### Confirmation
@@ -65,6 +78,8 @@ Today's metadata carries `owner_tenant_id` and `is_inherited`; for an inherited 
 - Contract: a `Credential` for which the caller's tenant holds no row carries neither `version` nor `updated_at`, and a weak `ETag` that `If-Match` refuses.
 - E2E: a caller holding a `declared` row under a reference that resolves to an ancestor's secret sees `inheritance: inherited`, `status: declared`, its own `version`, and a strong `ETag` a guarded `PATCH` accepts.
 - Contract: no response, at any authorization level, carries an ancestor's tenant id.
+- Contract: the `Secret` of `get_secret` carries a strong validator when the caller holds an own row and otherwise a weak one whose text equals the REST `ETag` of the same read and contains no row id.
+- Bounded read: a value from a row above `bound` is `OWNER_ABOVE_BOUND` and nothing is read from the store; a `bound` that is not on the visible chain is `BOUND_NOT_ON_CHAIN`, identically for an unrelated id and for an ancestor above a barrier, and only after the PDP decision; an expired winner above `bound` is `OWNER_ABOVE_BOUND`, within it `SECRET_EXPIRED`; a read with no value to serve is `Ok(None)` whatever `bound` is.
 
 ## Pros and Cons of the Options
 
