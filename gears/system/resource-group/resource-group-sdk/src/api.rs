@@ -180,9 +180,12 @@ pub trait ResourceGroupClient: Send + Sync {
 }
 
 // @cpt-dod:cpt-cf-resource-group-dod-integration-auth-read-service:p1
-/// Narrow read-only trait for group data, used by in-process plugin consumers
-/// (`AuthZ` resolver plugin, tenant-resolver RG plugin, and an in-process
-/// `AuthZ` PDP).
+/// Narrow read-only trait for group data, used by in-process consumers that
+/// must see groups regardless of any caller's tenant scope: the `AuthZ`
+/// resolver plugin, the tenant-resolver RG plugin, an in-process `AuthZ` PDP,
+/// and account-management's tenant soft-delete ownership probe (`list_groups`
+/// filtered to one tenant, so the precondition's answer does not depend on
+/// who is deleting).
 ///
 /// Scope is deliberately "reads only": hierarchy walks anchored at a reference
 /// group (ancestors / descendants with depth), flat OData-filtered group
@@ -260,4 +263,58 @@ pub trait ResourceGroupReadHierarchy: Send + Sync {
         ctx: &SecurityContext,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, CanonicalError>;
+}
+
+/// Narrow, deliberately un-gated trait for tenant-lifecycle cleanup: removes
+/// the groups a tenant owns when that tenant is hard-deleted.
+///
+/// # Why this bypasses the `PolicyEnforcer`
+///
+/// The only caller is lifecycle machinery that runs after the owning tenant
+/// has been soft-deleted (account-management's hard-delete pipeline, and the
+/// tenant-ownership plugin it drives). A PEP-gated call cannot express that
+/// request: a system actor scoped to the deleted tenant resolves to an empty
+/// allow-set (a PDP excludes a non-active granted root from its own subtree),
+/// and a platform-scoped one forces the PDP to expand the whole tenant forest
+/// -- tombstones included -- into an explicit id list, which fails closed past
+/// the PDP's expansion limit on any large platform. Neither outcome is an
+/// access-control decision; both just leave the tenant's groups behind
+/// forever. The work is addressed by tenant id and group type, not by any
+/// caller's visibility, so there is nothing for an `AccessScope` to narrow.
+///
+/// It MUST NOT be exposed through REST, under any configuration: the only
+/// sanctioned callers are in-process lifecycle paths resolved from
+/// `ClientHub`. `ctx` is threaded through for audit correlation only and is
+/// never used to enforce anything, the same posture as
+/// [`ResourceGroupReadHierarchy`].
+///
+/// # Error envelope
+///
+/// Like [`ResourceGroupClient`], every fallible method returns
+/// `Result<_, CanonicalError>` per [ADR 0005].
+///
+/// [ADR 0005]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
+#[async_trait]
+pub trait ResourceGroupTenantCleanup: Send + Sync {
+    /// Delete every group of type `type_code` owned by `tenant_id`, together
+    /// with each group's subtree, memberships and closure rows, without
+    /// `AuthZ` enforcement.
+    ///
+    /// Only groups of the named type are addressed, so each gear removes the
+    /// groups it owns and never another gear's. Idempotent: a tenant with no
+    /// remaining groups of that type is a successful no-op.
+    ///
+    /// Returns the number of groups removed by this call (descendants removed
+    /// through a parent's subtree included).
+    ///
+    /// # Errors
+    ///
+    /// A `CanonicalError` when the storage operation fails or `type_code` is
+    /// not a registered group type.
+    async fn delete_tenant_groups(
+        &self,
+        ctx: &SecurityContext,
+        tenant_id: Uuid,
+        type_code: &str,
+    ) -> Result<u64, CanonicalError>;
 }

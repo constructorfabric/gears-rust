@@ -8,13 +8,13 @@
 
 use super::*;
 use resource_group_sdk::{
-    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupMembership,
-    ResourceGroupWithDepth, UpdateGroupRequest,
+    GroupHierarchy, ResourceGroup, ResourceGroupMembership, ResourceGroupWithDepth,
 };
 use std::sync::Mutex;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
 use toolkit_odata::Page;
+use toolkit_security::SecurityContext;
 
 #[allow(
     clippy::enum_variant_names,
@@ -82,20 +82,22 @@ fn sample_group(tenant_id: Uuid) -> ResourceGroup {
 }
 
 #[async_trait]
-impl ResourceGroupClient for FakeRgClient {
-    async fn create_group(
+impl ResourceGroupReadHierarchy for FakeRgClient {
+    async fn get_group_descendants(
         &self,
         _ctx: &SecurityContext,
-        _request: CreateGroupRequest,
-    ) -> Result<ResourceGroup, CanonicalError> {
-        unreachable!()
+        _group_id: Uuid,
+        _query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
+        unreachable!("not used by RgResourceOwnershipChecker")
     }
-    async fn get_group(
+    async fn get_group_ancestors(
         &self,
         _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<ResourceGroup, CanonicalError> {
-        unreachable!()
+        _group_id: Uuid,
+        _query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
+        unreachable!("not used by RgResourceOwnershipChecker")
     }
     async fn list_groups(
         &self,
@@ -122,50 +124,12 @@ impl ResourceGroupClient for FakeRgClient {
             }
         }
     }
-    async fn update_group(
+    async fn get_group(
         &self,
         _ctx: &SecurityContext,
         _id: Uuid,
-        _request: UpdateGroupRequest,
     ) -> Result<ResourceGroup, CanonicalError> {
-        unreachable!()
-    }
-    async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
-        unreachable!()
-    }
-    async fn get_group_descendants(
-        &self,
-        _ctx: &SecurityContext,
-        _group_id: Uuid,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_group_ancestors(
-        &self,
-        _ctx: &SecurityContext,
-        _group_id: Uuid,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, CanonicalError> {
-        unreachable!()
-    }
-    async fn add_membership(
-        &self,
-        _ctx: &SecurityContext,
-        _group_id: Uuid,
-        _resource_type: &str,
-        _resource_id: &str,
-    ) -> Result<ResourceGroupMembership, CanonicalError> {
-        unreachable!()
-    }
-    async fn remove_membership(
-        &self,
-        _ctx: &SecurityContext,
-        _group_id: Uuid,
-        _resource_type: &str,
-        _resource_id: &str,
-    ) -> Result<(), CanonicalError> {
-        unreachable!()
+        unreachable!("not used by RgResourceOwnershipChecker")
     }
     async fn list_memberships(
         &self,
@@ -181,7 +145,7 @@ async fn rg_checker_returns_zero_on_empty_page() {
     let client = Arc::new(FakeRgClient::empty());
     let checker = RgResourceOwnershipChecker::new(client.clone());
     let count = checker
-        .count_ownership_links(&SecurityContext::anonymous(), Uuid::from_u128(0xAB))
+        .count_ownership_links(Uuid::from_u128(0xAB))
         .await
         .expect("rg up => count");
     assert_eq!(count, 0);
@@ -194,7 +158,7 @@ async fn rg_checker_returns_one_on_non_empty_page() {
     let client = Arc::new(FakeRgClient::non_empty());
     let checker = RgResourceOwnershipChecker::new(client.clone());
     let count = checker
-        .count_ownership_links(&SecurityContext::anonymous(), Uuid::from_u128(0xAB))
+        .count_ownership_links(Uuid::from_u128(0xAB))
         .await
         .expect("rg up => count");
     // Probe is `$top=1`; delete_tenant only checks `> 0`, so reporting
@@ -234,7 +198,7 @@ async fn rg_checker_propagates_client_failure_as_service_unavailable() {
     let client = Arc::new(FakeRgClient::unavailable());
     let checker = RgResourceOwnershipChecker::new(client);
     let err = checker
-        .count_ownership_links(&SecurityContext::anonymous(), Uuid::from_u128(0xCD))
+        .count_ownership_links(Uuid::from_u128(0xCD))
         .await
         .expect_err("rg down => err");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));
@@ -247,7 +211,7 @@ async fn rg_checker_times_out_client_probe() {
     let client = Arc::new(FakeRgClient::slow(Duration::from_millis(50)));
     let checker = RgResourceOwnershipChecker::with_timeout(client.clone(), 10);
     let err = checker
-        .count_ownership_links(&SecurityContext::anonymous(), Uuid::from_u128(0xEF))
+        .count_ownership_links(Uuid::from_u128(0xEF))
         .await
         .expect_err("slow rg => timeout");
     assert!(matches!(err, DomainError::ServiceUnavailable { .. }));

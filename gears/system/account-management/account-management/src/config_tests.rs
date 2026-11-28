@@ -130,6 +130,37 @@ fn tr_plugin_vendor_default_matches_resolver_default() {
 }
 
 #[test]
+fn tenant_ownership_defaults_to_built_in_check() {
+    // No vendor means the built-in resource-group check stays in charge;
+    // a stock deploy must not start resolving a plugin nobody shipped.
+    let cfg = AccountManagementConfig::default();
+    assert!(cfg.tenant_ownership.vendor.is_none());
+    cfg.validate().expect("default config must validate");
+}
+
+#[test]
+fn rejects_blank_tenant_ownership_vendor() {
+    // A blank vendor can never match a plugin instance; reject it rather
+    // than failing every soft-delete with `service_unavailable` at runtime.
+    let cfg = AccountManagementConfig {
+        tenant_ownership: TenantOwnershipConfig {
+            vendor: Some("  ".to_owned()),
+        },
+        ..AccountManagementConfig::default()
+    };
+    let err = cfg.validate().expect_err("blank vendor must reject");
+    assert!(err.contains("tenant_ownership.vendor"), "{err}");
+}
+
+#[test]
+fn parses_tenant_ownership_vendor() {
+    let cfg: AccountManagementConfig =
+        serde_json::from_value(serde_json::json!({ "tenant_ownership": { "vendor": "acme" } }))
+            .expect("tenant_ownership section must parse");
+    assert_eq!(cfg.tenant_ownership.vendor.as_deref(), Some("acme"));
+}
+
+#[test]
 fn rejects_empty_tr_plugin_vendor() {
     // Empty vendor would let `enabled = true` register an instance
     // that the gateway can never select (`choose_plugin_instance`

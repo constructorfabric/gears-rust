@@ -11,7 +11,7 @@ The `cf-gears-resource-group` gear provides:
 - **Memberships** — `(resource_type, resource_id)` links to groups
 - **OData listing** — filterable, cursor-paginated reads for groups and memberships
 - **AuthZ enforcement** — every mutation and read goes through `PolicyEnforcer` from `cf-gears-authz-resolver-sdk`
-- **ClientHub integration** — registers `ResourceGroupClient` (full surface) and `ResourceGroupReadHierarchy` (narrow read-only) for in-process consumers
+- **ClientHub integration** — registers `ResourceGroupClient` (full surface), `ResourceGroupReadHierarchy` (narrow read-only) and `ResourceGroupTenantCleanup` (un-gated tenant hard-delete cleanup, never exposed via REST) for in-process consumers
 
 The gear owns its database schema via `DatabaseCapability` and exposes a REST surface via `RestApiCapability`.
 

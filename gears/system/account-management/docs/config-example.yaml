@@ -8,7 +8,7 @@
 #
 # Schema source of truth: cf-gears-account-management `crate::config::AccountManagementConfig`.
 # The struct is split into sub-sections (`listing`, `hierarchy`, `retention`,
-# `reaper`, `idp`) so related knobs travel together. Defaults below match
+# `reaper`, `idp`, `tenant_ownership`, ...) so related knobs travel together. Defaults below match
 # `Default::default()` and `validate()` rejects `0` / out-of-range values for
 # the load-bearing knobs (see inline notes).
 #
@@ -86,7 +86,8 @@ reaper:
 # `AuthZResolverClient`, `TypesRegistryClient`, `ResourceGroupClient` are
 # declared as hard `deps` in `#[toolkit::gear(...)]` and are ALWAYS
 # fail-closed on missing client — there is no config knob for them.
-# `IdpPluginClient` is the only optional plugin.
+# `IdpPluginClient` and `TenantOwnershipPluginClient` (below) are the
+# optional plugins.
 idp:
   # true  → init fails closed when no IdpPluginClient is registered
   #         in `ClientHub` (production posture for deployments that integrate
@@ -99,6 +100,24 @@ idp:
   # booting unchanged. Production deployments that need IdP integration MUST
   # set this to `true`.
   required: false
+
+# =============================================================================
+# Tenant ownership — who decides whether a tenant still owns anything
+# =============================================================================
+# Soft-delete is refused with `TENANT_HAS_RESOURCES` while the tenant still
+# owns something, and the hard-delete pipeline cleans up what is left. The
+# answer never depends on who is deleting the tenant.
+tenant_ownership:
+  # Unset (default) → built-in check: the tenant owns something while any
+  #   resource group in Resource Group names it as owner. No extra
+  #   hard-delete cleanup.
+  # Set → AM selects the `TenantOwnershipPluginSpecV1` instance of this
+  #   vendor (lowest `priority` wins) on first need, asks it instead, and
+  #   runs its cleanup during hard-delete. If no such plugin resolves,
+  #   soft-delete fails with a retryable 503 and hard-delete is deferred;
+  #   AM never falls back to the built-in check. An empty string is
+  #   rejected at init.
+  # vendor: "acme"
 
 # =============================================================================
 # Conversion — managed/self-managed mode-conversion lifecycle

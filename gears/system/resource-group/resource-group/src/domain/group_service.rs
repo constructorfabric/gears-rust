@@ -1041,6 +1041,118 @@ impl<GR: GroupRepositoryTrait> GroupService<GR> {
             .ok_or_else(|| DomainError::group_not_found(group_id))
     }
 
+    /// Delete every group of type `type_code` owned by `tenant_id` without
+    /// `AuthZ` enforcement, returning the number of group rows removed.
+    ///
+    /// **Internal API** — never expose this through a REST handler. Backs
+    /// `ResourceGroupTenantCleanup::delete_tenant_groups`, whose callers run
+    /// tenant hard-delete cleanup for a tenant that is already soft-deleted,
+    /// where a PEP-gated call cannot be admitted (see that trait's docs).
+    ///
+    /// The type is matched through RG's local `gts_type` dictionary, not the
+    /// types registry: the dictionary holds every type a stored group has ever
+    /// referenced, so cleanup works for a type the registry has since deleted,
+    /// and a type no group ever used matches nothing.
+    ///
+    /// Only the roots of the matching set are addressed — a matching group
+    /// whose parent is absent or not itself in the set. Each root is removed
+    /// with the same force cascade `delete_group(force = true)` uses (its
+    /// subtree, memberships and closure rows) in its own SERIALIZABLE
+    /// transaction, so a failure part-way leaves the already-removed roots
+    /// gone and a retry picks up the rest. A root that vanished concurrently
+    /// counts as already gone. The returned count covers every row removed,
+    /// descendants included.
+    ///
+    /// # Errors
+    ///
+    /// A database error when listing or deleting fails.
+    pub async fn delete_tenant_groups_unscoped(
+        &self,
+        tenant_id: Uuid,
+        type_code: &str,
+    ) -> Result<u64, DomainError> {
+        use sea_orm::sea_query::Query;
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use toolkit_db::secure::SecureEntityExt;
+
+        use crate::infra::storage::entity::gts_type;
+        use crate::infra::storage::entity::resource_group::{Column, Entity};
+
+        let started = std::time::Instant::now();
+        let conn = self.db.conn()?;
+
+        // Dictionary key of `type_code`, as a subquery so an unknown code
+        // simply selects no group.
+        let type_keys = Query::select()
+            .column(gts_type::Column::Id)
+            .from(gts_type::Entity)
+            .and_where(gts_type::Column::SchemaId.eq(type_code))
+            .to_owned();
+
+        // The whole matching set is read in one query: it is bounded by one
+        // tenant's groups of one type, and the root narrowing below needs
+        // every member's id at once.
+        let scope = AccessScope::allow_all();
+        let groups = Entity::find()
+            .filter(Column::TenantId.eq(tenant_id))
+            .filter(Column::GtsTypeId.in_subquery(type_keys))
+            .secure()
+            .scope_with(&scope)
+            .all(&conn)
+            .await
+            .map_err(|e| DomainError::database(e.to_string()))?;
+
+        // A member whose parent is also a member goes with that parent's
+        // cascade; deleting it separately would only find it gone.
+        let member_ids: std::collections::HashSet<Uuid> = groups.iter().map(|g| g.id).collect();
+        let roots: Vec<Uuid> = groups
+            .iter()
+            .filter(|g| g.parent_id.is_none_or(|p| !member_ids.contains(&p)))
+            .map(|g| g.id)
+            .collect();
+
+        let db = self.db.db();
+        let mut removed: u64 = 0;
+        for root_id in roots {
+            let group_repo = self.group_repo.clone();
+            let result = db
+                .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
+                    let group_repo = group_repo.clone();
+                    Box::pin(async move {
+                        Self::delete_group_inner(
+                            &*group_repo,
+                            tx,
+                            &AccessScope::allow_all(),
+                            root_id,
+                            true,
+                        )
+                        .await
+                    })
+                })
+                .await;
+            match result {
+                Ok(subtree_count) => {
+                    let subtree_count = subtree_count.unwrap_or(0);
+                    self.metrics
+                        .subtree_nodes(Operation::ForceDelete, subtree_count);
+                    removed = removed.saturating_add(subtree_count);
+                }
+                // Removed concurrently (another cleanup run, or a manual force
+                // delete) between the listing and this transaction.
+                Err(DomainError::GroupNotFound { .. }) => {}
+                Err(e) => {
+                    let failed = Err(e);
+                    self.record_op(Operation::ForceDelete, started, &failed);
+                    return failed;
+                }
+            }
+        }
+        debug!(%tenant_id, type_code, removed, "tenant groups deleted (unscoped)");
+        let done = Ok(removed);
+        self.record_op(Operation::ForceDelete, started, &done);
+        done
+    }
+
     // -- Transaction-inner implementations --
 
     /// Inner logic for `create_group`, runs inside a SERIALIZABLE transaction.

@@ -33,7 +33,7 @@ pub mod reason;
 pub mod odata;
 
 // Re-export main types at crate root for convenience
-pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy};
+pub use api::{ResourceGroupClient, ResourceGroupReadHierarchy, ResourceGroupTenantCleanup};
 pub use error::ResourceGroupError;
 pub use gts::{GROUP_MEMBERSHIP_TYPE_ID, GROUP_TYPE_ID, TENANT_GROUP_TYPE_ID};
 pub use models::{

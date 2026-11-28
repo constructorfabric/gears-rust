@@ -1177,11 +1177,7 @@ struct CountingChecker {
 }
 #[async_trait]
 impl ResourceOwnershipChecker for CountingChecker {
-    async fn count_ownership_links(
-        &self,
-        _ctx: &SecurityContext,
-        _id: Uuid,
-    ) -> Result<u64, DomainError> {
+    async fn count_ownership_links(&self, _id: Uuid) -> Result<u64, DomainError> {
         Ok(self.count)
     }
 }
@@ -1309,11 +1305,7 @@ async fn delete_tenant_is_idempotent_on_already_deleted_tenant() {
     }
     #[async_trait]
     impl ResourceOwnershipChecker for RecordingChecker {
-        async fn count_ownership_links(
-            &self,
-            _ctx: &SecurityContext,
-            _id: Uuid,
-        ) -> Result<u64, DomainError> {
+        async fn count_ownership_links(&self, _id: Uuid) -> Result<u64, DomainError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(0)
         }

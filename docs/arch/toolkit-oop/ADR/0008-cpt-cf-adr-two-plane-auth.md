@@ -89,7 +89,8 @@ genuinely non-tenant (platform-level) work is on the platform plane.
   factories in account-management, which mitigate exactly this risk by hand). A separate type makes "this call has no
   tenant" unrepresentable-as-a-tenant rather than encoded as `tenant_id = nil`.
 * `PlatformSecurityContext` is **never** evaluated by the tenant `PolicyEnforcer`; platform-level APIs that bypass tenant
-  AuthZ (e.g. resource-group's `ResourceGroupReadHierarchy` unscoped reads, account-management's `am.system` paths)
+  AuthZ (e.g. resource-group's `ResourceGroupReadHierarchy` unscoped reads and `ResourceGroupTenantCleanup` tenant-lifecycle
+  deletes, account-management's `am.system` paths)
   consume it directly. `PeerAuthenticated` and the platform identity are for **workload policy only** — they never
   substitute for tenant-plane JWT validation.
 * **The authentication method is decoupled from the context's structure.** The *context type* is stable from day one;
@@ -260,7 +261,10 @@ tenant-scoped-vs-non-tenant criterion splits them:
   tenant shim.
 * **resource-group** — `ResourceGroupReadHierarchy` unscoped reads (`read_service.rs`) use `AccessScope::allow_all()` and
   are explicitly "do NOT expose via REST"; consumed in-process by the AuthZ and tenant-resolver plugins (the PDP cannot
-  evaluate itself). Non-tenant infra read → `PlatformSecurityContext`.
+  evaluate itself) and by account-management's tenant soft-delete ownership probe (whose answer must not depend on the
+  caller). Non-tenant infra read → `PlatformSecurityContext`. `ResourceGroupTenantCleanup` (`tenant_cleanup_service.rs`)
+  is the write-side counterpart for tenant hard-delete cleanup: the tenant is already soft-deleted, so no tenant-plane
+  actor can be admitted for it → `PlatformSecurityContext`.
 
 ## Traceability
 
