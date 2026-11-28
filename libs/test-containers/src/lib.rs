@@ -522,9 +522,9 @@ mod tests {
         }
     }
 
-    /// The env-var names are a published contract — module docs, `docs/TESTING.md`
-    /// and CI invocations all spell them out. A rename that compiles would leave
-    /// every one of those silently ignored.
+    /// The env-var names are a published contract — module docs,
+    /// `docs/toolkit_unified_system/15_testing_and_ci.md` and CI invocations all spell them
+    /// out. A rename that compiles would leave every one of those silently ignored.
     #[test]
     fn env_var_names_match_the_documented_contract() {
         assert_eq!(ENV_POSTGRES_TAG, "GEARS_TEST_PG_TAG");

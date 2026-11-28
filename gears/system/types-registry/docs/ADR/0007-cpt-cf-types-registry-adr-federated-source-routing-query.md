@@ -183,7 +183,7 @@ ADR-0002 separately decides that externally managed definitions and tenant state
 - **ADR-0001**: [0001-cpt-cf-types-registry-adr-storage-identity-query-model.md](./0001-cpt-cf-types-registry-adr-storage-identity-query-model.md)
 - **ADR-0002**: [0002-cpt-cf-types-registry-adr-external-source-live-delegation.md](./0002-cpt-cf-types-registry-adr-external-source-live-delegation.md)
 - **ADR-0011**: [0011-cpt-cf-types-registry-adr-managed-external-boundary.md](./0011-cpt-cf-types-registry-adr-managed-external-boundary.md) — bounds the contract: neither dependency registration nor reverse dependency-impact lookup is in it, everything that remains is mandatory, and the claim grammar is fixed as a rooted single segment.
-- **ToolKit plugins**: [../../../../../docs/TOOLKIT_PLUGINS.md](../../../../../docs/TOOLKIT_PLUGINS.md)
+- **ToolKit plugins**: [ToolKit plugins](../../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins)
 
 This decision directly addresses:
 

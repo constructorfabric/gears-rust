@@ -903,7 +903,7 @@ def cmd_all(args):
             "cargo",
             "test",
             "-p",
-            "toolkit-db",
+            "cf-gears-toolkit-db",
             "--features",
             "sqlite,integration",
             "--",

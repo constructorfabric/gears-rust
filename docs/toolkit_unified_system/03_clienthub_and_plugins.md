@@ -2,28 +2,30 @@
 
 ## ClientHub Overview
 
-The **ClientHub** provides type-safe client resolution for inter-gear communication. It supports both in-process and remote clients:
+The **ClientHub** (`libs/toolkit/src/client_hub.rs`) resolves typed clients for inter-gear calls:
 
-- **In-process clients** — direct function calls within the same process
-- **Remote clients** — gRPC clients for OoP gears (resolved via DirectoryClient)
-- **Scoped clients** — multiple implementations of the same interface keyed by scope (for plugins)
+- **In-process clients** — a local adapter registered by the provider gear
+- **Remote clients** — REST or gRPC clients that resolve the provider through the directory
+- **Scoped clients** — several implementations of one interface keyed by a `ClientScope` (plugins)
 
 ### Client types
 
-- **`*-sdk` crate** defines the trait & types exposed to other gears.
-- **Gear crate** implements a local adapter that implements the SDK trait for in-process communication.
-- **gRPC clients** implement the same SDK trait for remote communication.
-- Consumers resolve the typed client from ClientHub by interface type (+ optional scope).
+- **`*-sdk` crate** defines the trait and types exposed to other gears.
+- **Gear crate** implements a local adapter of the SDK trait for in-process calls.
+- **Remote clients** implement the same SDK trait.
+- Consumers resolve the client by interface type (plus a scope for plugins).
 
 ## In-Process vs Remote Clients
 
 | Aspect       | In-Process              | Remote (OoP)               |
 |--------------|-------------------------|----------------------------|
-| Transport    | Direct call             | gRPC                       |
-| Latency      | Nanoseconds             | Milliseconds               |
+| Transport    | Direct call             | REST or gRPC               |
 | Isolation    | Shared process          | Separate process           |
 | Contract     | Trait in `*-sdk/` crate | Trait in `*-sdk/` crate    |
-| Registration | `ClientHub::register()` | DirectoryClient + gRPC client + `ClientHub::register()` |
+| Registration | `ClientHub::register()` | `#[toolkit::consumes]` registers a resolving client unless a local one exists; see [09_oop_grpc_sdk_pattern.md](09_oop_grpc_sdk_pattern.md) |
+
+`get` returns, in order: a local registration, the calling gear's remote proxy, a process-wide remote
+proxy. A local registration always wins over a proxy.
 
 ## Publish in `init` (provider gear)
 
@@ -31,18 +33,25 @@ The **ClientHub** provides type-safe client resolution for inter-gear communicat
 #[async_trait::async_trait]
 impl Gear for MyGear {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        let cfg = ctx.gear_config::<crate::config::Config>();
-        let svc = std::sync::Arc::new(domain::service::MyService::new(ctx.db.clone(), cfg));
-        self.service.store(Some(svc.clone()));
+        let cfg: crate::config::Config = ctx.config_or_default()?;
+        let db = ctx.db_required()?;
+        let svc = Arc::new(domain::service::MyService::new(db, cfg));
+        self.service
+            .set(svc.clone())
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        let api: std::sync::Arc<dyn my_gear_sdk::MyGearApi> =
-            std::sync::Arc::new(crate::domain::local_client::MyGearLocalClient::new(svc));
-
+        let api: Arc<dyn my_gear_sdk::MyGearApi> =
+            Arc::new(crate::domain::local_client::MyGearLocalClient::new(svc));
         ctx.client_hub().register::<dyn my_gear_sdk::MyGearApi>(api);
         Ok(())
     }
 }
 ```
+
+`GearCtx` (`libs/toolkit/src/context.rs`) reads the gear's `gears.<name>.config` section with
+`config()` (section required), `config_or_default()`, and `config_expanded()` /
+`config_expanded_or_default()` (also expand `${VAR}` in fields marked `#[expand_vars]`). `db()` returns
+`Option<DBProvider>`; `db_required()` returns an error when the gear has no database.
 
 ## Consume (consumer gear)
 
@@ -52,253 +61,269 @@ let api = ctx.client_hub().get::<dyn my_gear_sdk::MyGearApi>()?;
 
 ## Scoped Clients (for Plugins)
 
-For plugin-like scenarios where multiple implementations of the same interface coexist, use scoped clients:
-
 ```rust
 use toolkit::client_hub::ClientScope;
-use toolkit_gts::gts_id;
 
-// Plugin registers with a scope (e.g., GTS instance ID)
-let scope = ClientScope::gts_id(gts_id!("cf.toolkit.plugins.plugin.v1~vendor.pkg.my_gear.plugin.v1~acme.test._.plugin.v1"));
-ctx.client_hub().register_scoped::<dyn MyPluginClient>(scope, plugin_impl);
+// A plugin registers under its GTS instance ID
+ctx.client_hub()
+    .register_scoped::<dyn MyPluginClient>(ClientScope::gts_id(&instance_id), plugin_impl);
 
-// Main gear resolves the selected plugin
+// The main gear resolves the selected plugin
 let scope = ClientScope::gts_id(&selected_instance_id);
 let plugin = ctx.client_hub().get_scoped::<dyn MyPluginClient>(&scope)?;
 ```
 
-### Key points
+Scoped and unscoped registrations are independent. New plugins register through
+`toolkit::plugins::bind_plugin_instances`, as tenant-resolver does; many older plugins still call
+`register_scoped` directly. See [Plugins](#plugins).
 
-- Scoped clients are independent from global (unscoped) clients
-- Use `ClientScope::gts_id()` for GTS-based plugin IDs
-- See `docs/TOOLKIT_PLUGINS.md` for the complete plugin architecture guide
+## Plugins
 
-## Plugin Architecture Overview
+A plugin system lets several implementations of one interface run side by side. A **main gear** owns
+the public API and delegates each call to one **plugin gear**, selected at runtime from the plugin
+instances published in types-registry.
 
-ToolKit’s plugin system enables **gear + plugins** patterns where:
+The reference implementation is `gears/system/tenant-resolver/`; the snippets below are taken from it:
 
-- **Main gear** exposes the public API and registers plugin **schemas** (GTS type definitions)
-- **Plugin gears** register their **instances** (metadata + scoped client)
-- The main gear resolves plugins via **scoped ClientHub** using GTS instance IDs
+| Crate | Role |
+|-------|------|
+| `tenant-resolver-sdk/` | Public trait `TenantResolverClient`, plugin trait `TenantResolverPluginClient`, GTS spec `TenantResolverPluginSpecV1` |
+| `tenant-resolver/` | Main gear: publishes the spec schema, selects a plugin by vendor, registers the public client |
+| `plugins/static-tr-plugin/` | Plugin with tenants from configuration |
+| `plugins/single-tenant-tr-plugin/` | Plugin with no configuration |
+| `plugins/rg-tr-plugin/` | Plugin backed by the resource-group gear (`deps = [resource_group]`) |
 
-> **Plugin Isolation Rule:** Regular gears **cannot** depend on or consume plugin gears directly. All plugin functionality must be accessed through the main gear’s public API (`hub.get::<dyn MyGearClient>()`). This ensures plugin implementations remain swappable and decoupled.
+> [!IMPORTANT]
+> **Plugin isolation rule.** Regular gears do not depend on or consume plugin gears. They call the
+> main gear's public API (`hub.get::<dyn TenantResolverClient>()`), so plugins stay swappable.
+
+### How it fits together
+
+1. The SDK declares the plugin spec, a GTS Type Schema derived from `PluginV1`
+   (`gts.cf.toolkit.plugins.plugin.v1~`, provided by `toolkit_gts`).
+2. The main gear publishes that schema with `gts_publication(crates = [<sdk>])`.
+3. Each plugin publishes one instance of the spec with `gts_publication(entities = ...)`, built from its
+   configuration (`vendor`, `priority`).
+4. The runtime publishes every manifest; see [Startup order](#startup-order) for when.
+5. In `init`, each plugin binds its plugin-trait implementation as a scoped client under
+   `ClientScope::gts_id(<instance id>)` (`toolkit::plugins::bind_plugin_instances`).
+6. On the first API call, the main gear lists the spec's instances from types-registry, picks one with
+   `toolkit::plugins::choose_registered_plugin_instance` and caches the choice in a `GtsPluginSelector`.
+
+A plugin is a gear like any other: its crate must be linked into the server binary (a dependency and a
+`use <crate> as _;` line in the server's `registered_gears.rs`, as for any gear) or it never publishes
+its instance and never binds a client. Selection by `vendor` and `priority` is what the toolkit helpers
+implement; a gear that needs another strategy (per tenant, per request) writes it on top of the listed
+instances.
+
+### Crate layout
 
 ```text
-┌────────────────────────────────────────────────────────────────────┐
-│                            MAIN MODULE                              │
-│  • Exposes public API (REST + ClientHub)                           │
-│  • Selects plugin based on config/context                          │
-│  • Routes calls to selected plugin                                 │
-└───────────────────────────────┬────────────────────────────────────┘
-                                │ hub.get_scoped::<dyn PluginClient>(&scope)
-                ┌───────────────┼───────────────┐
-                │               │               │
-                ▼               ▼               ▼
-        ┌───────────┐   ┌───────────┐   ┌───────────┐
-        │ Plugin A  │   │ Plugin B  │   │ Plugin C  │
-        └───────────┘   └───────────┘   └───────────┘
+gears/system/tenant-resolver/
+├── tenant-resolver-sdk/src/
+│   ├── lib.rs           # declare_gts_inventory!() + re-exports
+│   ├── api.rs           # TenantResolverClient (public)
+│   ├── plugin_api.rs    # TenantResolverPluginClient (plugins)
+│   ├── models.rs, error.rs
+│   └── gts.rs           # TenantResolverPluginSpecV1
+├── tenant-resolver/src/
+│   ├── gear.rs          # consumes + gts_publication(crates = ...), registers the public client
+│   ├── config.rs        # vendor
+│   └── domain/          # service.rs (selection, delegation), local_client.rs, error.rs
+└── plugins/static-tr-plugin/src/
+    ├── gear.rs          # gts_publication(entities = ...), binds the scoped client
+    ├── config.rs        # vendor, priority, plugin data
+    └── domain/          # Service implements TenantResolverPluginClient
 ```
 
-### When to Use Plugins
+### SDK
 
-Use the plugin pattern when:
-- Multiple implementations of the same interface need to coexist
-- The implementation is selected at runtime based on configuration or context
-- You want vendor-specific or tenant-specific behavior
-- New implementations should be addable without modifying the main gear
-
-**Examples:** Authentication providers (OAuth2, SAML, LDAP), LLM providers (OpenAI, Anthropic), file parsers, tenant resolvers, search engines.
-
-### Crate Structure
-
-```text
-gears/<gear-name>/
-├── <gear>-sdk/                 # SDK: API traits, models, errors, GTS types
-│   └── src/
-│       ├── api.rs              # Public API trait (for consumers)
-│       ├── plugin_api.rs       # Plugin API trait (implemented by plugins)
-│       ├── models.rs           # Shared models
-│       ├── error.rs            # Errors
-│       └── gts.rs              # GTS schema for plugin instances
-│
-├── <gear>/                     # Main gear with plugin discovery
-│   └── src/
-│       ├── gear.rs             # Gear with plugin discovery
-│       ├── config.rs           # Gear config (e.g., vendor selector)
-│       └── domain/
-│           ├── service.rs      # Plugin resolution and delegation
-│           └── local_client.rs # Public client adapter
-│
-└── plugins/                    # Plugin implementations
-    ├── <vendor-a>-plugin/
-    │   └── src/
-    │       ├── gear.rs         # Registers GTS instance + scoped client
-    │       └── config.rs       # Plugin config (vendor + priority)
-    └── <vendor-b>-plugin/
-```
-
-### Flow
-
-1. **Main gear** registers plugin schema with GTS (`gts_schema_with_refs_as_string()`)
-2. **Plugin** starts, registers instance + scoped client under `ClientScope::gts_id(instance_id)`
-3. **Main gear** resolves plugin by querying types-registry and using `choose_plugin_instance`
-4. **Requests** flow through the scoped client to the plugin implementation
-
-### Step 1: Define Two API Traits in SDK
+The SDK has two traits. Consumers see only the public one; the plugin trait may differ in shape and is
+called only by the main gear.
 
 ```rust
-// <gear>-sdk/src/api.rs — Public API, consumed by other gears
+// api.rs
 #[async_trait]
-pub trait MyGearClient: Send + Sync {
-    async fn do_work(&self, ctx: &SecurityContext, input: Input) -> Result<Output, MyError>;
+pub trait TenantResolverClient: Send + Sync {
+    async fn get_tenant(&self, ctx: &SecurityContext, id: TenantId)
+        -> Result<TenantInfo, TenantResolverError>;
+    // ...
 }
 
-// <gear>-sdk/src/plugin_api.rs — Plugin API, implemented by plugins
+// plugin_api.rs
 #[async_trait]
-pub trait MyGearPluginClient: Send + Sync {
-    async fn do_work(&self, ctx: &SecurityContext, input: Input) -> Result<Output, MyError>;
+pub trait TenantResolverPluginClient: Send + Sync {
+    async fn get_tenant(&self, ctx: &SecurityContext, id: TenantId)
+        -> Result<TenantInfo, TenantResolverError>;
+    // ...
 }
 ```
 
-**Why two traits?**
-- The public trait is the stable contract for consumers — they don’t know or care which plugin is used
-- The plugin trait may have different method signatures or additional methods
-- Consumers call `hub.get::<dyn MyGearClient>()` — the main gear handles plugin routing internally
+`TenantResolverError` is an older pattern: new plugin SDKs return `CanonicalError` from both traits, per
+[ADR 0005](../arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md).
 
-### Step 2: Define GTS Schema for Plugin Instances
+The plugin spec is a unit struct declared with the crate-local collector macro
+`toolkit_gts::local::gts_type_schema`. It must derive `Default` so `PluginV1::<P>::build_registration`
+can construct it.
 
 ```rust
-// <gear>-sdk/src/gts.rs
-use toolkit_gts::gts_type_schema;
-use toolkit_gts::PluginV1;
+// gts.rs
+use toolkit::gts::PluginV1;
+use toolkit_gts::local::gts_type_schema;
 
+#[derive(Default)]
 #[gts_type_schema(
     dir_path = "schemas",
     base = PluginV1,
-    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.y.my_gear.plugin.v1~"),
-    description = "My Gear plugin specification",
-    properties = ""
+    type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.tenant_resolver.plugin.v1~"),
+    description = "Tenant Resolver plugin specification",
+    properties = "",
 )]
-pub struct MyGearPluginSpecV1;
+pub struct TenantResolverPluginSpecV1;
 ```
 
-### Step 3: Main Gear Registers Schema + Public Client
+```rust
+// lib.rs: the collector that `gts_publication(crates = [tenant_resolver_sdk])` reads
+toolkit_gts::declare_gts_inventory!();
+```
+
+A crate listed in `crates = [...]` must use the `toolkit_gts::local::*` macros throughout; leftover
+crate-root declarations fail manifest collection (see `libs/toolkit-gts/src/local.rs`).
+
+Instance IDs append one segment to the spec's type ID:
+
+```text
+gts.cf.toolkit.plugins.plugin.v1~cf.core.tenant_resolver.plugin.v1~cf.builtin.static_tenant_resolver.plugin.v1
+└──── PluginV1 ────────────────┘└──── spec ──────────────────────┘└──── instance segment ─────────────────┘
+```
+
+The SDK depends on `toolkit`, `toolkit-gts` and `gts`.
+
+### Main gear
 
 ```rust
-// <gear>/src/gear.rs
+// tenant-resolver/src/gear.rs
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
-    name = "my-gear",
-    deps = ["types-registry"],  // depends on types-registry, NOT on plugin crates
-    capabilities = [rest]
+    name = "tenant-resolver",
+    gts_publication(crates = [tenant_resolver_sdk]),
 )]
-pub struct MyGear { /* ... */ }
+pub(crate) struct TenantResolver {
+    service: OnceLock<Arc<Service>>,
+}
 
 #[async_trait]
-impl Gear for MyGear {
+impl Gear for TenantResolver {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        let cfg: GearConfig = ctx.config_or_default()?;
+        let cfg: TenantResolverConfig = ctx.config_or_default()?;
+        let hub = ctx.client_hub();
+        let svc = Arc::new(Service::new(hub, cfg.vendor));
+        self.service
+            .set(svc.clone())
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // Register plugin SCHEMA in types-registry
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let schema_str = MyGearPluginSpecV1::gts_schema_with_refs_as_string();
-        let schema_json: serde_json::Value = serde_json::from_str(&schema_str)?;
-        let _ = registry.register(vec![schema_json]).await?;
-
-        let svc = Arc::new(Service::new(ctx.client_hub(), cfg.vendor));
-
-        // Register PUBLIC client (no scope) for other gears
-        let api: Arc<dyn MyGearClient> = Arc::new(LocalClient::new(svc.clone()));
-        ctx.client_hub().register::<dyn MyGearClient>(api);
-
+        let api: Arc<dyn TenantResolverClient> = Arc::new(TenantResolverLocalClient::new(svc));
+        ctx.client_hub().register::<dyn TenantResolverClient>(api);
         Ok(())
     }
 }
 ```
 
-### Step 4: Plugin Registers Instance + Scoped Client
+- `#[toolkit::consumes]` wires `dyn PlatformTypesRegistryApi`: the registry's local client when it
+  runs in this process, a resolving REST client otherwise. It adds no startup-order dependency.
+- `gts_publication(crates = [...])` publishes the SDK's declarations before application `init`. The
+  default publisher adapter is `types_registry_sdk::publication`, so the gear crate depends on
+  `types-registry-sdk` with the `rest-client` feature.
+- The main gear has no `deps` on plugin crates.
+
+The domain service resolves the plugin lazily and caches the selected instance ID
+(`tenant-resolver/src/domain/service.rs`, trimmed):
 
 ```rust
-// plugins/<vendor>-plugin/src/gear.rs
-use toolkit::client_hub::ClientScope;
-use toolkit::gts::PluginV1;
+use toolkit::client_hub::{ClientHub, ClientScope};
+use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+};
 
-#[toolkit::gear(
-    name = "vendor-a-plugin",
-    deps = ["types-registry"],
-)]
-pub struct VendorAPlugin { /* ... */ }
-
-#[async_trait]
-impl Gear for VendorAPlugin {
-    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        let cfg: PluginConfig = ctx.config_or_default()?;
-
-        let instance_id = MyGearPluginSpecV1::gts_make_instance_id("vendor_a.pkg.my_gear.plugin.v1");
-
-        // Register INSTANCE in types-registry (schema is already registered by main gear)
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let instance = PluginV1::<MyGearPluginSpecV1> {
-            id: instance_id.clone(),
-            vendor: cfg.vendor.clone(),
-            priority: cfg.priority,
-            properties: MyGearPluginSpecV1,
-        };
-        let instance_json = serde_json::to_value(&instance)?;
-        let _ = registry.register(vec![instance_json]).await?;
-
-        let service = Arc::new(Service::new());
-
-        // Register SCOPED client with GTS instance ID
-        let api: Arc<dyn MyGearPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn MyGearPluginClient>(ClientScope::gts_id(&instance_id), api);
-
-        Ok(())
-    }
+pub struct Service {
+    hub: Arc<ClientHub>,
+    vendor: String,
+    selector: GtsPluginSelector,
 }
-```
-
-Use `ctx.config()` only when startup must fail if `gears.<name>.config` is absent. For
-gears and plugins with defaults, use `ctx.config_or_default()` instead.
-
-### Step 5: Main Gear Resolves Plugin
-
-Use `choose_plugin_instance` from `toolkit::plugins` — do **not** copy selection logic into each gear.
-
-```rust
-// <gear>/src/domain/service.rs
-use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
 
 impl Service {
-    async fn get_plugin(&self) -> Result<Arc<dyn MyGearPluginClient>, DomainError> {
-        let instance_id = self.selector.get_or_init(|| self.resolve_plugin()).await?;
+    async fn get_plugin(&self) -> Result<Arc<dyn TenantResolverPluginClient>, DomainError> {
+        let instance_id = self
+            .selector
+            .get_or_init_with_timeout(
+                DISCOVERY_BUDGET,
+                || self.resolve_plugin(),
+                DomainError::TypesRegistryUnavailable,
+            )
+            .await?;
         let scope = ClientScope::gts_id(instance_id.as_ref());
         self.hub
-            .get_scoped::<dyn MyGearPluginClient>(&scope)
-            .map_err(|_| DomainError::PluginClientNotFound {
+            .try_get_scoped::<dyn TenantResolverPluginClient>(&scope)
+            .ok_or_else(|| DomainError::PluginUnavailable {
                 gts_id: instance_id.to_string(),
+                reason: "client not registered yet".into(),
             })
     }
 
     async fn resolve_plugin(&self) -> Result<String, DomainError> {
-        let registry = self.hub.get::<dyn TypesRegistryClient>()?;
-        let plugin_type_id = MyGearPluginSpecV1::gts_type_id().clone();
-        let instances = registry
-            .list(ListQuery::new()
-                .with_pattern(format!("{plugin_type_id}*"))
-                .with_is_type(false))
-            .await?;
+        let registry = self
+            .hub
+            .get::<dyn PlatformTypesRegistryApi>()
+            .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
 
-        // Shared selection: filters by vendor, picks lowest priority
-        Ok(choose_plugin_instance::<MyGearPluginSpecV1>(
+        let plugin_type_id = TenantResolverPluginSpecV1::gts_type_id();
+        let pattern = GtsIdPattern::try_new(plugin_type_id.as_ref())
+            .map_err(|e| DomainError::Internal(format!("plugin discovery pattern: {e}")))?;
+        // Follows every page; fails on any page error.
+        let instances = registry
+            .list_instances(
+                &PlatformSecurityContext::outbound_marker(),
+                ListEntitiesRequest::matching(pattern),
+            )
+            .await
+            .map_err(registry_failure)?;
+
+        Ok(choose_registered_plugin_instance::<
+            TenantResolverPluginSpecV1,
+            dyn TenantResolverPluginClient,
+        >(
+            &self.hub,
             &self.vendor,
-            instances.iter().map(|e| (e.gts_id.as_str(), &e.content)),
+            instances
+                .iter()
+                .map(|instance| (instance.id.as_ref(), instance.content.as_ref())),
         )?)
     }
 }
 ```
 
-Add `From<ChoosePluginError> for DomainError` in `domain/error.rs`:
+`registry_failure` (in the same file) maps registry errors to domain errors, using
+`toolkit::plugins::is_discovery_outage` to tell a retryable outage from a fault.
+
+Selection rules (`libs/toolkit/src/plugins/mod.rs`):
+
+- `choose_plugin_instance::<P>` decodes every listed entry as `PluginV1<P>`, whatever its vendor, and
+  fails with `ChoosePluginError::InvalidPluginInstance` on the first entry that does not decode or whose
+  `id` differs from the listed ID. The vendor filter runs only after that check, so one malformed
+  entry of any vendor fails the whole selection. Among entries whose `vendor` matches it returns the
+  one with the **lowest** `priority` (the first wins a tie), or `PluginNotFound` if none matches.
+- `choose_registered_plugin_instance::<P, C>` first drops entries without a scoped `C` client in the
+  hub, without validating them, then runs `choose_plugin_instance` on the rest; a registered entry
+  listed without content fails with `InvalidPluginInstance`. The registry keeps instances published
+  by earlier boots, including disabled plugins and other vendors' instances; this variant decodes and
+  selects only among plugins running in this process, so stale catalogue entries cannot fail it.
+  Prefer it.
+- `GtsPluginSelector` runs the resolver at most once at a time and caches only a successful result,
+  so a failed resolution is retried on the next call. `reset()` clears the cache.
+
+Map `ChoosePluginError` into the domain error:
 
 ```rust
 impl From<toolkit::plugins::ChoosePluginError> for DomainError {
@@ -307,7 +332,7 @@ impl From<toolkit::plugins::ChoosePluginError> for DomainError {
             toolkit::plugins::ChoosePluginError::InvalidPluginInstance { gts_id, reason } => {
                 Self::InvalidPluginInstance { gts_id, reason }
             }
-            toolkit::plugins::ChoosePluginError::PluginNotFound { vendor } => {
+            toolkit::plugins::ChoosePluginError::PluginNotFound { vendor, .. } => {
                 Self::PluginNotFound { vendor }
             }
         }
@@ -315,60 +340,107 @@ impl From<toolkit::plugins::ChoosePluginError> for DomainError {
 }
 ```
 
-### Gear Dependencies
+### Plugin gear
 
 ```rust
-// Main gear depends on types-registry, but NOT on plugin crates
-#[toolkit::gear(name = "my-gear", deps = ["types-registry"], capabilities = [rest])]
-pub struct MyGear { /* ... */ }
+// plugins/static-tr-plugin/src/gear.rs
+use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
+use types_registry_sdk::GtsId;
 
-// Each plugin depends on types-registry
-#[toolkit::gear(name = "vendor-a-plugin", deps = ["types-registry"])]
-pub struct VendorAPlugin { /* ... */ }
+const INSTANCE_SEGMENT: &str = "cf.builtin.static_tenant_resolver.plugin.v1";
+
+#[toolkit::gear(
+    name = "static-tr-plugin",
+    gts_publication(entities = Self::plugin_instance),
+)]
+#[derive(Default)]
+pub struct StaticTrPlugin {
+    service: OnceLock<Arc<dyn TenantResolverPluginClient>>,
+}
+
+impl StaticTrPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(GtsId, serde_json::Value)>> {
+        let cfg: StaticTrPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<TenantResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(GtsId::try_new(id.as_ref())?, document)])
+    }
+}
+
+#[async_trait]
+impl Gear for StaticTrPlugin {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let cfg: StaticTrPluginConfig = ctx.config_or_default()?;
+        let service: Arc<dyn TenantResolverPluginClient> = Arc::new(Service::from_config(&cfg)?);
+        self.service
+            .set(Arc::clone(&service))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // The instance was admitted before `init`: bind the scoped client to it.
+        bind_plugin_instances::<TenantResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &service,
+        )
+    }
+}
 ```
 
-### Plugin Configuration
+- `entities` builds documents from configuration only (`GtsPublicationInputs`); it runs before `init`.
+- `bind_plugin_instances` registers the client under `ClientScope::gts_id(id)` for every instance of the
+  spec in the admitted manifest, and fails if there is none.
+- The plugin crate depends on `types-registry-sdk` with the `rest-client` feature (default publisher
+  adapter) and on the SDK. It does not depend on the main gear.
+
+### Startup order
+
+The runtime publishes every `gts_publication(...)` manifest and waits until all are admitted before it
+runs any application `init`. Application gears then initialize in dependency order. The main gear does
+not depend on its plugins, so their relative `init` order is not fixed; that is why selection is lazy
+and skips instances without a bound client. A plugin declares `deps` only for gears it needs itself
+(`rg-tr-plugin` uses `deps = [resource_group]`; `deps` takes crate identifiers).
+
+Details: [startup sequence](08_lifecycle_stateful_tasks.md#startup-sequence),
+[publishing GTS documents](08_lifecycle_stateful_tasks.md#publishing-gts-documents),
+and the [SDK publication guide](../../gears/system/types-registry/types-registry-sdk/README.md#publishing-from-a-gear)
+(publication timeouts, retries, batch size under `gears.<gear>.config.gts_publication`).
+
+### Configuration
+
+The main gear selects by `vendor`; each plugin declares its `vendor` and `priority` (from
+`config/quickstart.yaml`):
 
 ```yaml
 gears:
-  my-gear:
+  tenant-resolver:
     config:
-      vendor: "VendorA"  # Select VendorA plugin
-
-  vendor-a-plugin:
+      vendor: "constructorfabric"
+  static-tr-plugin:
     config:
-      vendor: "VendorA"
-      priority: 10
-
-  vendor-b-plugin:
-    config:
-      vendor: "VendorB"
+      vendor: "constructorfabric"
       priority: 20
+      tenants: [ ... ]
 ```
 
-### Plugin Checklist
+Among registered instances with a matching vendor, the lowest `priority` wins; on a tie the first in
+listing order wins.
 
-- [ ] SDK defines both `<Gear>Client` trait (public) and `<Gear>PluginClient` trait (plugins)
-- [ ] SDK defines GTS schema type with `#[gts_type_schema]` (from `toolkit_gts`)
-- [ ] Main gear depends on `types-registry` but MUST NOT depend on plugin crates
-- [ ] Main gear registers plugin **schema** using `gts_type_schema_with_refs_as_string()`
-- [ ] Main gear registers public client WITHOUT scope
-- [ ] Main gear resolves plugin lazily (after types-registry is ready)
-- [ ] Each plugin depends on `types-registry`
-- [ ] Each plugin registers its **instance** (not schema)
-- [ ] Each plugin registers scoped client with `ClientScope::gts_id(&instance_id)`
-- [ ] Plugin selection uses priority for tiebreaking
-- [ ] Use `choose_plugin_instance` from `toolkit::plugins` for selection logic
+### Testing
 
-### Reference Example
-
-Study the production implementation in `gears/system/tenant-resolver/`:
-- `tenant-resolver-sdk/` — SDK with `TenantResolverClient`, `TenantResolverPluginClient`, and GTS spec
-- `tenant-resolver/` — Main gear that registers schema and selects plugin by vendor config
-- `plugins/static-tr-plugin/` — Config-based plugin implementation
-- `plugins/single-tenant-tr-plugin/` — Zero-config plugin implementation
-
-Also see: `examples/plugin-gears/tenant-resolver/`
+- **Selection.** `types_registry_sdk::testing_platform::MockTypesRegistry` (feature `test-util`) stands in
+  for the registry: `install(&hub)`, then `seed(id, content)` instances built with
+  `PluginV1::<P>::build_registration` and `register_scoped` the plugin clients that should count as
+  running. See `tenant-resolver/src/domain/service_tests.rs`.
+- **Plugin binding.** Build a `GearCtx` and attach a manifest with
+  `GearCtx::with_gts_publication_manifest_for_test` (`toolkit` feature `test-support`). See
+  `plugins/static-tr-plugin/src/gear_tests.rs`.
 
 ## ClientHub API Reference
 
@@ -387,6 +459,9 @@ ctx.client_hub().register_scoped::<dyn MyPluginClient>(scope, plugin);
 ```rust
 // Global client
 let api = ctx.client_hub().get::<dyn MyGearApi>()?;
+
+// Try global client (returns None if not found)
+let api = ctx.client_hub().try_get::<dyn MyGearApi>();
 
 // Scoped client
 let plugin = ctx.client_hub().get_scoped::<dyn MyPluginClient>(&scope)?;
@@ -412,25 +487,24 @@ use toolkit::client_hub::ClientHubError;
 
 match ctx.client_hub().get::<dyn MyGearApi>() {
     Ok(api) => { /* use api */ }
-    Err(ClientHubError::NotFound { type_key }) => { /* handle missing client */ }
-    Err(ClientHubError::TypeMismatch { type_key }) => { /* handle type mismatch */ }
+    Err(ClientHubError::NotFound { type_key }) => { /* nothing registered */ }
+    Err(ClientHubError::TypeMismatch { type_key }) => { /* stored value has another type */ }
+    // Returned only by `get_scoped`
+    Err(ClientHubError::ScopedNotFound { type_key, scope }) => { /* ... */ }
+    Err(ClientHubError::ScopedTypeMismatch { type_key, scope }) => { /* ... */ }
 }
 ```
 
-## Best practices
-
-- **SDK traits**: Define in `*-sdk` crate, require `Send + Sync + 'static`.
-- **Local adapters**: Implement SDK trait in gear crate, register in `init()`.
-- **gRPC clients**: Use `toolkit_transport_grpc::client` utilities (`connect_with_stack`, `connect_with_retry`).
-- **Plugins**: Use `ClientScope::gts_id()` for instance IDs; register scoped clients.
-- **Error handling**: Convert domain errors to SDK errors and to `Problem` for REST.
-- **Testing**: Register mock clients in tests using the same trait.
+In `init`, propagate with `?` (`ClientHubError` converts into `anyhow::Error`). In domain code, map it to
+the gear's domain error; REST handlers return `CanonicalError` (see
+[05_errors_rfc9457.md](05_errors_rfc9457.md)).
 
 ## Quick checklist
 
-- [ ] Define SDK trait with `async_trait` and `SecurityContext` first param.
-- [ ] Implement local adapter in gear crate.
-- [ ] Register client in `init()`: `ctx.client_hub().register::<dyn Trait>(api)`.
-- [ ] Consume client: `ctx.client_hub().get::<dyn Trait>()?`.
-- [ ] For plugins: use `ClientScope::gts_id()` and `register_scoped()`.
-- [ ] For OoP: use gRPC client utilities and register both local and remote clients.
+- [ ] Define the SDK trait with `async_trait`, `Send + Sync`, and the caller's `SecurityContext` as the first parameter (most SDKs take `&SecurityContext`; users-info takes it by value).
+- [ ] Implement a local adapter in the gear crate.
+- [ ] Register it in `init()`: `ctx.client_hub().register::<dyn Trait>(api)`.
+- [ ] Consume it: `ctx.client_hub().get::<dyn Trait>()?`, or `#[toolkit::consumes(contract = ..., from = "...")]` when the provider may run in another process.
+- [ ] Hand-written gRPC clients connect with `toolkit_transport_grpc::client::connect_with_stack(uri, &GrpcClientConfig)` or `connect_with_retry(uri, &GrpcClientConfig)`.
+- [ ] Plugins: follow [Plugins](#plugins).
+- [ ] Tests: register mock implementations of the same trait in a `ClientHub::new()`.

@@ -37,40 +37,33 @@ docker run -d --name jaeger \
   jaegertracing/all-in-one:latest
 ```
 
-```yaml
-server:
-  home_dir: "~/.cf-gears"
-  host: "127.0.0.1"
-  port: 8087
+[`config/quickstart.yaml`](../config/quickstart.yaml) already has an `opentelemetry:` block with
+service name `cf-gears-api`; both signals are disabled, and its tracing exporter points at
+`http://127.0.0.1:14317`. Enable tracing and point it at the Jaeger container with environment
+overrides, then start the example server with `config/quickstart.yaml`:
 
+```bash
+APP__OPENTELEMETRY__TRACING__ENABLED=true \
+APP__OPENTELEMETRY__TRACING__EXPORTER__ENDPOINT=http://127.0.0.1:4317 \
+  cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml run
+```
+
+Traces appear at <http://localhost:16686> under service `cf-gears-api`. In your own config the
+minimal block is:
+
+```yaml
 opentelemetry:
   resource:
     service_name: "cf-gears-api"
-    attributes:
-      service.version: "1.0.0"
-      deployment.environment: "dev"
-
   exporter:
     kind: "otlp_grpc"
     endpoint: "http://127.0.0.1:4317"
-    timeout_ms: 5000
-
   tracing:
     enabled: true
     sampler:
       parent_based_ratio:
         ratio: 1.0
-
-logging:
-  default:
-    console_level: "info"
 ```
-
-```bash
-cargo run --bin cf-gears-server -- --config config/with-tracing.yaml
-```
-
-Traces appear at <http://localhost:16686> under service `cf-gears-api`.
 
 ---
 
@@ -220,21 +213,19 @@ needs to be enabled inside the process.
 ### Correlating logs with traces
 
 For a backend to link a log line to the span that produced it, the record has
-to carry the ids. Enable:
+to carry the ids. This is on by default (`OpenTelemetryConfig::inject_trace_ids_into_logs`
+returns `true` when the key is absent): every JSON record emitted inside a sampled
+span gains top-level `trace_id` and `span_id` fields, in the same lowercase-hex
+form as the `traceparent` header. Records emitted outside a span are unchanged.
+
+The flag costs a span-context lookup per event. To opt out:
 
 ```yaml
 opentelemetry:
   tracing:
     logs_correlation:
-      inject_trace_ids_into_logs: true
+      inject_trace_ids_into_logs: false
 ```
-
-With this on, every JSON record emitted inside a sampled span gains top-level
-`trace_id` and `span_id` fields, in the same lowercase-hex form as the
-`traceparent` header. Records emitted outside a span are unchanged.
-
-The flag costs a context lookup per event, so it is off by default and the
-stock formatter is used unless it is enabled.
 
 ## Environment variable overrides
 
@@ -264,13 +255,14 @@ when missing:
 
 ```toml
 [dependencies]
-toolkit-http = { workspace = true, features = ["otel"] }      # .with_otel()
+toolkit-http = { workspace = true, features = ["otel"] }      # traceparent injection, .with_metrics()
 toolkit-contract = { workspace = true, features = ["otel"] }  # generated clients
 ```
 
-Without `toolkit-http/otel` the `with_otel()` method does not exist and the
-build fails; without `toolkit-contract/otel` generated clients compile fine but
-drop out of the trace.
+Without `toolkit-http/otel`, `with_otel()` still compiles and creates the client
+span but injects no `traceparent`, so the downstream service starts a new trace;
+`with_metrics` / `with_metrics_by` do not exist and the build fails. Without
+`toolkit-contract/otel` generated clients compile fine but drop out of the trace.
 
 ---
 
@@ -340,7 +332,7 @@ pub async fn get_user(&self, ctx: &SecurityContext, id: Uuid) -> Result<User, Do
 
 **No data at all.** Check that the relevant `enabled` flag is `true` — both
 default to `false`. On startup the bootstrap emits a `startup_check` span and
-runs a connectivity probe; look for `OpenTelemetry tracing initialized`,
+runs a connectivity probe; look for `OpenTelemetry layer created successfully`
 and `OpenTelemetry metrics initialized successfully`.
 
 **Traces stop at a service boundary.** Outbound HTTP needs `.with_otel()` and
@@ -350,9 +342,9 @@ context yet**, so an internal gRPC call currently starts a new, unlinked trace.
 **Config file fails to load.** `deny_unknown_fields` rejects any key it does not
 recognise. The block is `opentelemetry:`, not `tracing:`.
 
-**Data missing right after a restart.** Telemetry is flushed by
-`bootstrap::run::tracing_shutdown()` during graceful shutdown. A process killed
-with `SIGKILL` loses whatever is still batched.
+**Data missing right after a restart.** Both signals are flushed during graceful
+shutdown (the log shows `OpenTelemetry tracing flushed and shut down`). A process
+killed with `SIGKILL` loses whatever is still batched.
 
 **Performance.** Use `parent_based_ratio` in production (`0.01` = 1%). Export is
 batched on a background task. Consider `metrics.cardinality_limit` for

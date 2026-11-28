@@ -231,7 +231,7 @@ use toolkit_db::{ConnectOpts, Db, connect_db};
 /// on the day. The same tag the donor pins. Below the workspace floor
 /// (`test_containers::POSTGRES_TAG`) as pricing's is, and taken through
 /// `test_containers::postgres_tagged` so `GEARS_TEST_PG_TAG` still overrides it
-/// (docs/TESTING.md 4.4).
+/// (docs/toolkit_unified_system/15_testing_and_ci.md 4.4).
 pub const PG_TAG: &str = "16-alpine";
 
 /// The one container's name — fixed, so a later run finds it instead of

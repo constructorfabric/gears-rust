@@ -100,7 +100,7 @@ Generic Rust trait for storage, but without GTS-based discovery or ClientHub reg
 
 ## More Information
 
-The plugin architecture follows the standard ToolKit plugin pattern documented in `TOOLKIT_PLUGINS.md`:
+The plugin architecture follows the standard ToolKit plugin pattern documented in [ToolKit plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins):
 
 - Each plugin registers a GTS instance in Types Registry and a scoped client in ClientHub via `ClientScope::gts_id(&instance_id)`
 - The main gear discovers plugins via GTS-based lookup and resolves the correct plugin per resource type through a routing configuration

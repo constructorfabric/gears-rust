@@ -2,6 +2,8 @@
 
 ToolKit manages gear startup, background tasks and cooperative shutdown.
 
+**Design references:** [toolkit-oop ADR-0005 eventual readiness](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md) · [toolkit-oop DESIGN § OoP Bootstrap](../arch/toolkit-oop/DESIGN.md#oop-bootstrap) · [Architecture Manifest § 3.2.3 Platform-owned gear lifecycle](../ARCHITECTURE_MANIFEST.md#323-platform-owned-gear-lifecycle) · [types-registry DESIGN § Deployment preparation](../../gears/system/types-registry/docs/DESIGN.md#deployment-preparation)
+
 ## Core invariants
 
 - Use `CancellationToken` and child tokens for coordinated shutdown.
@@ -18,8 +20,8 @@ The runtime starts two groups in dependency order within each group:
 - **Application gear group**: all gears without `system`, including the API Gateway,
   resolvers and plugins.
 
-[Core gears](00_gear_overview.md#gear-categories) means all gears under `gears/system/`
-(possibly `gears/core/` in the future); repository placement does not select a startup group.
+[Core gears](00_gear_overview.md#gear-categories) means all gears under `gears/system/`;
+repository placement does not select a startup group.
 
 ### The system capability
 
@@ -80,29 +82,30 @@ gears:
         example.orders.v1.OrdersService: orders
 ```
 
-Service Discovery loads this map during system `init`; application installers add their names later.
-Until then, unconfigured names use first-registration ownership. Remote metadata is not propagated
-into Directory. Registration identity authorization is independent.
+Service Discovery loads this map during system `init`; until application installers are collected,
+unconfigured names keep first-registration ownership. Remote metadata is not propagated into
+Directory, and registration identity authorization is independent of this map. See the
+[ADR-0005 amendment](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md#amendment-2026-11-05-gts-admission-before-application-initialization).
 
 ### Failures, routes and readiness
 
-- Publication retries share a 120-second startup budget. Refusal or expiry stops started gears
-  and returns an error for supervisor restart. Shutdown cancels pending publication.
-- Both hosts serve probes before preparation, system routes after system startup, and tenant
-  routes after application initialization. Early routes need no AuthN resolver and reject tenant
-  calls with `503`. OoP serving spawns no children. All providers honor `advertised_in_directory()`.
+What the runtime does during preparation (shared 120-second publication budget, early probes and
+system routes, `503` for tenant routes until application initialization, restart on refusal or
+expiry) is decided in the [ADR-0005 amendment](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md#amendment-2026-11-05-gts-admission-before-application-initialization);
+probe semantics are in [ADR-0005 § Consequences](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md#consequences). What that means for gear code:
+
+- Make preparation retryable and migrations expand/contract-compatible with old pods: a
+  publication failure stops the process but undoes neither migrations nor partial admission.
+- One slow publisher delays every application `init` in the process; in exchange, plugins can
+  bind synchronously in `init`.
+- `await_ready` / `ready.notify()` only moves the gear's lifecycle state to `Running`; it does not
+  gate `start`, other gears, route publication or `/readyz`. For asynchronous business bootstrap,
+  do the work in `serve` and register a REST healthcheck that keeps `/readyz` at `503` until ready.
 - `application/preparation` clears after application startup and REST provider registration,
-  without waiting for children. Other dependencies and gear healthchecks still gate `/readyz`.
-- A gear's `await_ready` / `ready.notify()` changes its lifecycle state to `Running`,
-  without blocking `start`, other gears, route publication or the application readiness gate.
-  For asynchronous business bootstrap, work in `serve` and provide a REST healthcheck
-  to keep `/readyz` at `503` until ready.
-
-Publication failure does not undo migrations or partial admission. Use retryable preparation and
-expand/contract migrations compatible with old pods.
-
-The barrier permits synchronous plugin binding in `init`, but one slow publisher delays all
-applications. See [ADR-0005](../arch/toolkit-oop/ADR/0005-cpt-cf-adr-eventual-readiness.md).
+  without waiting for children; other dependencies and gear healthchecks still gate `/readyz`.
+  Shutdown cancels pending publication.
+- Early routes need no AuthN resolver. OoP serving spawns no children, and every provider honors
+  `advertised_in_directory()`.
 
 ## Publishing GTS documents
 
@@ -205,14 +208,14 @@ async fn serve(
 ### Implementation example
 
 ```rust
-impl ApiGateway {
+impl MyGear {
     async fn serve(
         self: std::sync::Arc<Self>,
         cancel: tokio_util::sync::CancellationToken,
         ready: toolkit::lifecycle::ReadySignal,
     ) -> anyhow::Result<()> {
         // Bind sockets/resources before flipping to Running
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await?;
+        let listener = tokio::net::TcpListener::bind(&self.bind_addr).await?;
         let app = self.build_app();
 
         // Notify that we're ready
@@ -230,322 +233,77 @@ impl ApiGateway {
 
 ## CancellationToken usage
 
-### Root token propagation
+- The process has one root token. `toolkit::run(RunOptions)` takes the shutdown strategy in
+  `RunOptions::shutdown`: `ShutdownOptions::Signals` (Ctrl+C / SIGTERM), `ShutdownOptions::Token(token)`
+  or `ShutdownOptions::Future(..)` (`libs/toolkit/src/runtime/runner.rs`). The bootstrap entry points
+  (`libs/toolkit/src/bootstrap/run.rs`, `bootstrap/oop.rs`) hook OS signals themselves and pass
+  `ShutdownOptions::Token`.
+- The `lifecycle(entry = ...)` method receives a child of the root token as `cancel`.
+- `GearCtx::cancellation_token()` returns the runtime's root token itself, not a child: calling
+  `.cancel()` on it shuts the whole process down. Derive child tokens from it (`child_token()`) for
+  work spawned in `init` or `post_init`, and cancel only those.
+- `stop_timeout` (default 30s) bounds how long `WithLifecycle` waits for the entry method to return
+  after cancellation; keep it below `shutdown_deadline` (35s), which is the hard backstop.
+
+Prefer running background work inside the lifecycle entry method (or a `WithLifecycle<T>`) so the
+runtime tracks its state and stop timeout. A bare `tokio::spawn` is invisible to the runtime; if you
+need one, select on a child token and keep the `JoinHandle`. With `lifecycle(entry = ...)` /
+`WithLifecycle` there is no user stop hook (`WithLifecycle` implements `RunnableCapability::stop`
+itself, `libs/toolkit/src/lifecycle.rs`), so await the handle before the entry method returns. With a
+[custom lifecycle](#custom-lifecycle), await it in your `RunnableCapability::stop`.
+
+## Custom lifecycle
+
+A gear that declares `stateful` without `lifecycle(...)` must implement
+`toolkit::contracts::RunnableCapability` itself; the macro registers the gear as that capability.
 
 ```rust
-// In main()
-let root_cancel = CancellationToken::new();
-let mut runtime = GearRuntime::builder()
-    .with_cancellation_token(root_cancel.clone())
-    .build();
-
-// Gears receive child tokens automatically
-```
-
-### Child tokens for background tasks
-
-```rust
-impl MyService {
-    pub fn new(db: Arc<DbHandle>, cancel: CancellationToken) -> Self {
-        let child = cancel.child_token();
-
-        // Spawn background task
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = child.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
-                        // Do periodic work
-                    }
-                }
-            }
-        });
-
-        Self { db, cancel }
-    }
-}
-```
-
-### Cooperative shutdown
-
-```rust
-pub async fn process_with_shutdown(
-    cancel: CancellationToken,
-) -> Result<Vec<TaskResult>, DomainError> {
-    let mut tasks = Vec::new();
-
-    for item in items {
-        tokio::select! {
-            result = process_item(item) => {
-                tasks.push(result?);
-            }
-            _ = cancel.cancelled() => {
-                // Graceful shutdown: return partial results
-                return Ok(tasks);
-            }
-        }
-    }
-
-    Ok(tasks)
-}
-```
-
-## Background task patterns
-
-### Periodic task
-
-```rust
-pub struct PeriodicTask {
-    cancel: CancellationToken,
-}
-
-impl PeriodicTask {
-    pub fn spawn(cancel: CancellationToken) {
-        let child = cancel.child_token();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-            loop {
-                tokio::select! {
-                    _ = child.cancelled() => break,
-                    _ = interval.tick() => {
-                        // Do periodic work
-                        if let Err(e) = do_periodic_work().await {
-                            tracing::error!("Periodic work failed: {}", e);
-                        }
-                    }
-                }
-            }
-        });
-    }
-}
-```
-
-### Event listener
-
-```rust
-pub struct EventListener {
-    receiver: broadcast::Receiver<Event>,
-    cancel: CancellationToken,
-}
-
-impl EventListener {
-    pub fn spawn(
-        mut receiver: broadcast::Receiver<Event>,
-        cancel: CancellationToken,
-    ) {
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    event = receiver.recv() => {
-                        match event {
-                            Ok(event) => handle_event(event).await,
-                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                                tracing::warn!("Event listener lagged, skipped {} events", skipped);
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
-                        }
-                    }
-                }
-            }
-        });
-    }
-}
-```
-
-### Work queue processor
-
-```rust
-pub struct WorkQueueProcessor {
-    queue: Arc<Mutex<VecDeque<WorkItem>>>,
-    cancel: CancellationToken,
-}
-
-impl WorkQueueProcessor {
-    pub fn spawn(
-        queue: Arc<Mutex<VecDeque<WorkItem>>>,
-        cancel: CancellationToken,
-    ) {
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                        let work = {
-                            let mut q = queue.lock().await;
-                            q.pop_front()
-                        };
-
-                        if let Some(work) = work {
-                            if let Err(e) = process_work(work).await {
-                                tracing::error!("Work processing failed: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-}
-```
-
-## Custom lifecycle (advanced)
-
-### Implement RunnableCapability
-
-```rust
-use toolkit::lifecycle::{RunnableCapability, RunnableHandle};
-
-pub struct CustomGear {
-    // Fields
-}
-
 #[async_trait]
-impl RunnableCapability for CustomGear {
-    async fn run(
-        self: Arc<Self>,
-        cancel: CancellationToken,
-    ) -> Result<RunnableHandle, anyhow::Error> {
-        let handle = tokio::spawn(async move {
-            // Custom lifecycle logic
-            self.run_with_cancel(cancel).await
-        });
+pub trait RunnableCapability: Send + Sync {
+    /// Start the gear's background task. `cancel` is a child of the runtime's root token.
+    async fn start(&self, cancel: CancellationToken) -> anyhow::Result<()>;
 
-        Ok(RunnableHandle::new(handle))
-    }
+    /// Stop the gear's background task.
+    async fn stop(&self, deadline_token: CancellationToken) -> anyhow::Result<()>;
 }
 ```
 
-## Graceful shutdown patterns
+`stop` receives a fresh **deadline token**, not the root token: it is not cancelled when `stop` is
+called (begin graceful shutdown) and is cancelled when the runtime's `shutdown_deadline` expires
+(abort now). The trait documentation in `libs/toolkit/src/contracts.rs` shows the recommended
+`tokio::select!` between graceful completion and `deadline_token.cancelled()`.
 
-### Clean shutdown sequence
-
-```rust
-impl MyGear {
-    async fn shutdown_gracefully(&self) -> Result<(), DomainError> {
-        // 1. Stop accepting new work
-        self.accepting_work.store(false, Ordering::SeqCst);
-
-        // 2. Wait for in-flight work to complete
-        self.wait_for_in_flight().await?;
-
-        // 3. Close connections
-        self.close_connections().await?;
-
-        // 4. Flush buffers
-        self.flush_buffers().await?;
-
-        Ok(())
-    }
-}
-```
-
-### Shutdown timeout handling
-
-```rust
-impl MyGear {
-    async fn serve(
-        self: Arc<Self>,
-        cancel: CancellationToken,
-        ready: ReadySignal,
-    ) -> anyhow::Result<()> {
-        // Setup
-        self.setup().await?;
-        ready.notify();
-
-        // Main loop
-        tokio::select! {
-            result = self.run_main_loop() => result,
-            _ = cancel.cancelled() => {
-                // Graceful shutdown with timeout
-                tokio::select! {
-                    result = self.shutdown_gracefully() => result,
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        tracing::warn!("Graceful shutdown timeout, forcing exit");
-                        Ok(())
-                    }
-                }
-            }
-        }
-    }
-}
-```
+For a reusable task, implement `toolkit::lifecycle::Runnable`
+(`async fn run(self: Arc<Self>, cancel: CancellationToken) -> anyhow::Result<()>`) and wrap it in
+`WithLifecycle<T>`, which implements `RunnableCapability` and handles the stop timeout
+(`with_stop_timeout`, `with_stop_timeout_fn`) and ready mode.
 
 ## Testing lifecycle
 
-### Test with manual cancellation
+Call the entry method directly with a token you control. A `ReadySignal` is built from a oneshot
+sender with `ReadySignal::from_sender`:
 
 ```rust
 #[tokio::test]
-async fn test_lifecycle_shutdown() {
+async fn serve_stops_on_cancel() {
     let cancel = CancellationToken::new();
-    let gear =  Arc::new(MyGear::new());
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let gear = Arc::new(MyGear::default());
 
-    // Start the gear
-    let handle = tokio::spawn({
-        let gear =  gear.clone();
-        let cancel = cancel.clone();
-        async move {
-            gear.serve(cancel, ReadySignal::new()).await
-        }
-    });
+    let task = tokio::spawn(gear.serve(cancel.clone(), ReadySignal::from_sender(ready_tx)));
+    ready_rx.await.expect("gear became ready");
 
-    // Let it run a bit
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Trigger shutdown
     cancel.cancel();
-
-    // Wait for graceful shutdown
-    let result = handle.await.unwrap();
-    assert!(result.is_ok());
-}
-```
-
-### Test background task cancellation
-
-```rust
-#[tokio::test]
-async fn test_background_task_cancellation() {
-    let cancel = CancellationToken::new();
-    let counter = Arc::new(AtomicU32::new(0));
-
-    let task_counter = counter.clone();
-    let task_cancel = cancel.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(10));
-
-        loop {
-            tokio::select! {
-                _ = task_cancel.cancelled() => break,
-                _ = interval.tick() => {
-                    task_counter.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-        }
-    });
-
-    // Let it run a bit
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Cancel and verify it stops
-    cancel.cancel();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let count = counter.load(Ordering::SeqCst);
-    assert!(count > 0, "Task should have run");
-    assert!(count < 20, "Task should have stopped quickly");
+    task.await.expect("task joined").expect("serve returned Ok");
 }
 ```
 
 ## Quick checklist
 
-- [ ] Add `lifecycle(entry = "...")` to `#[toolkit::gear(...)]` for background tasks.
-- [ ] Use `CancellationToken` for shutdown coordination.
-- [ ] Pass child tokens to background tasks.
-- [ ] Call `ready.notify()` after setup when using `await_ready`.
-- [ ] Use `tokio::select!` for cooperative shutdown.
-- [ ] Implement graceful shutdown with timeout handling.
-- [ ] Test lifecycle with manual cancellation.
-- [ ] Publish GTS documents with `gts_publication(...)`; notify `ReadySignal` only when the gear can serve.
+- [ ] Add `lifecycle(entry = "...")` and the `stateful` capability to `#[toolkit::gear(...)]` for background tasks.
+- [ ] Return from the entry method when `cancel` is cancelled; set `stop_timeout` below `shutdown_deadline`.
+- [ ] Derive child tokens from `cancel` or `GearCtx::cancellation_token()` for spawned work.
+- [ ] Call `ready.notify()` after setup when using `await_ready`; notify only when the gear can serve.
+- [ ] Do not wait for remote services in `pre_init`, `init`, `post_init` or `start`.
+- [ ] Publish GTS documents with `gts_publication(...)`.
+- [ ] Test the entry method with a manual `CancellationToken`.

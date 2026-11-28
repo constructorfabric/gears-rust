@@ -113,8 +113,8 @@ testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
 [dev-dependencies]
-# The workspace's pinned Redis image (`test_containers::redis()`, docs/TESTING.md
-# 4.4), for the Layer 3 fixtures in `tests/common/mod.rs`.
+# The workspace's pinned Redis image (`test_containers::redis()`,
+# docs/toolkit_unified_system/15_testing_and_ci.md 4.4), for the Layer 3 fixtures in `tests/common/mod.rs`.
 test-containers = { workspace = true }
 # `#[tokio::test]`, for the async unit tests that drive `ScriptExecutor` doubles
 # and the provider's pre-connection config failures.

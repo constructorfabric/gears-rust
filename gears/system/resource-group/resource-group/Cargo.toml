@@ -97,7 +97,7 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 # Database images are pinned centrally; `Postgres::default()` would take its
-# tag from testcontainers-modules (see docs/TESTING.md 4.4).
+# tag from testcontainers-modules (see docs/toolkit_unified_system/15_testing_and_ci.md 4.4).
 test-containers = { workspace = true }
 tower = { workspace = true }
 http-body-util = { workspace = true }

@@ -925,4 +925,4 @@ Entry numbers are stable and never reused, so a gap marks a closed question rath
 
 - **GTS spec**: [Global Type System](https://github.com/globaltypesystem/gts-spec)
 - **ToolKit**: [docs/toolkit_unified_system/README.md](../../../../docs/toolkit_unified_system/README.md)
-- **ToolKit plugins**: [docs/TOOLKIT_PLUGINS.md](../../../../docs/TOOLKIT_PLUGINS.md)
+- **ToolKit plugins**: [ToolKit plugins](../../../../docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins)

@@ -1,14 +1,8 @@
-# Testing Policy
+# Testing, Coverage and CI
 
-This document defines the test strategy, coverage requirements, and CI enforcement for
-Gears.  It is the single source of truth for "what must be tested and how."
+Test strategy, coverage thresholds, test commands and the CI jobs that enforce them. How to write unit, E2E and DB-behaviour tests is in [12](12_unit_testing.md), [13](13_e2e_testing.md) and [14](14_db_behavior_testing.md).
 
-Gears promotes a **shift-left**, green-build-oriented development model: contributors
-should be able to run the vast majority of checks on a local development machine before
-opening a pull request.  This is practical because the codebase has a low memory and CPU footprint with help of Rust, fast and deterministic local test execution, and a packaging model where many gear combinations can be exercised through a small number of binaries rather than a large distributed deployment.
-
-The unified `Makefile` and `tools/scripts/ci.py` entry points mirror CI behavior locally, so unit tests, most integration tests, linting, safety checks, coverage, and most E2E validation can usually be reproduced before the code ever reaches GitHub Actions. CI still remains the source of truth for cross-platform validation, scheduled suites, specialized lanes such as FIPS, and final merge protection, but contributors are expected to arrive with a locally green
-build whenever feasible.
+Most checks run locally through `make` (or `tools/scripts/ci.py` on Windows) the same way CI runs them; CI adds cross-platform runs, scheduled suites and FIPS lanes. Arrive at review with a locally green build.
 
 ---
 
@@ -19,13 +13,13 @@ build whenever feasible.
 | **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR on Ubuntu (`ci.yml` — `test` job); macOS and Windows nightly (`macos-windows-tests.yml`) |
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
 | **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
-| **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
-| **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, `cargo gears lint`, cargo-deny, cargo-kani, cargo-geiger | varies | Every PR (`ci.yml` — `test`, `security`, `lint` jobs) |
+| **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs to `main`/`develop` that touch Rust code (`clusterfuzzlite.yml`) |
+| **Static analysis** | Architectural rules, unsafe code, dependency licenses | clippy, `cargo gears lint`, cargo-deny; cargo-kani and cargo-geiger locally | varies | Every PR (`ci.yml` — `clippy`, `lint` jobs); `security` (cargo-deny) when dependencies or CI files change, or on manual dispatch; kani and geiger are not run in CI |
 
 Additional testing categories such as performance (#4054), upgrade / migration (#4117), and long-haul (#4118) or soak testing are expected to be added over time, but they are not yet implemented or enforced as part of the current project test matrix.
 
 ```bash
-make check                  # full quality gate (fmt + clippy + test + security)
+make check                  # full local quality gate (see section 7.2)
 ```
 
 ### Quick-reference commands
@@ -50,14 +44,14 @@ make e2e-usage-collector   # E2E — usage-collector lane, both backends (BACKEN
 make e2e-usage-collector BACKEND=timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
 make e2e-usage-collector BACKEND=clickhouse  # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
-make check                 # full quality gate (fmt + clippy + test + security)
-make all                   # full pipeline (build + check + toolkit-db-sqlite lane + e2e-local)
+make check                 # full local quality gate (see section 7.2)
+make all                   # check + toolkit-db-sqlite lane + e2e-local + openapi
 
 # CI gate: no database container built outside libs/test-containers (4.4)
 cargo xtask check-test-container-pins
 
 make build GEAR=file-parser      # one gear package plus SDK package
-make test GEAR=file-parser       # one gear package plus SDK package
+make test GEAR=file-parser       # gear + SDK packages and the crates that depend on them
 make run GEAR=file-parser        # server with only this gear feature set
 make e2e-local SUITE=file-parser # focused run: just this suite's tests
 make e2e-local GEAR=credstore    # run every shared-server suite that exercises a gear
@@ -68,34 +62,41 @@ make coverage GEAR=file-parser   # unit + E2E coverage for one gear scope
 
 ## 2. Coverage
 
-### 2.1 Threshold
+### 2.1 Thresholds
 
-The project-wide **line-coverage threshold is 80 %**.  The threshold is enforced in
-`tools/scripts/coverage.py` (`COVERAGE_THRESHOLD`) and printed as a warning when any gear
-or library falls below it.
+Two different numbers apply:
+
+- **Local report: 80 % line coverage.** `tools/scripts/coverage.py` (`COVERAGE_THRESHOLD`, overridable with `--threshold`) flags every gear or library below it in the per-gear report. It is a report, not a gate.
+- **CI floors: 85 % line coverage, for two gears only.** The `test-graph-storage` and `test-github-mirror-coverage` jobs in `ci.yml` run `cargo llvm-cov nextest ... --fail-under-lines 85` on their own packages and fail below it. Both jobs are path-filtered by the `changes` job: they run only when the PR touches their gear (`gears/graph-storage/**`; `gears/github-mirror/**`, `libs/**` or `gears-rust.mk` for github-mirror), dependency manifests (`**/Cargo.toml`, `Cargo.lock`, `deny.toml`) or CI files (`.github/workflows/**`, `.github/actions/**`), on manual dispatch, or when the `changes` job itself fails.
+- **Codecov PR status checks** (`.codecov.yml`): `patch` requires 85 % coverage of the lines changed in the PR (threshold 0 %); `project` requires overall coverage not to drop below the base commit's (`target: auto`) by more than 1 %.
+
+The workspace `coverage` job itself has no floor and does not fail on a percentage: it uploads the report to Codecov, which reports the two status checks above (see 2.3).
 
 ### 2.2 Coverage modes
 
 | Mode | Command | What it measures |
 |------|---------|------------------|
-| **Unit** | `make coverage-unit` | All `#[test]` functions across the workspace (compiled with `--all-features`) |
+| **Unit** | `make coverage-unit` | All `#[test]` functions across the workspace (`cargo llvm-cov --workspace` with the example server's E2E features, not `--all-features`) |
 | **E2E** | `make coverage-e2e-local` | Server code exercised by the pytest E2E suite via an instrumented binary |
 | **Combined** | `make coverage` | Unit + E2E accumulated into a single report |
 
-> **Why no separate "integration" coverage mode?**
-> Unit coverage already compiles with `--all-features`, which enables the `integration`
-> feature gate.  SQLite-backed integration tests therefore execute as part of
-> `make coverage-unit`.  A separate mode would re-run the same tests and produce
-> identical data — so it is intentionally omitted to avoid confusion.
+> **No "integration" coverage mode.** `make coverage-unit` does not enable the
+> `integration` feature, so integration tests are not in the local coverage report.
+> In CI, the `graph-storage` and `github-mirror` jobs upload coverage from their own
+> PostgreSQL lanes (2.3).
 
 ### 2.3 CI coverage
 
 The `coverage` job in `ci.yml` runs on every PR using `cargo-llvm-cov` (nightly) and
-uploads an LCOV report to Codecov.
+uploads an LCOV report to Codecov. It does not fail on a coverage percentage; Codecov
+evaluates the uploaded reports and posts the `patch` and `project` status checks on the PR
+(see 2.1). The
+graph-storage and github-mirror jobs upload their own reports as well, since the workspace
+job cannot run their PostgreSQL lanes.
 
 ### 2.4 Reports
 
-Local coverage commands produce four report formats under `coverage/<mode>/`:
+Local coverage commands produce five report files under `coverage/<mode>/`:
 
 | File | Format |
 |------|--------|
@@ -112,22 +113,28 @@ Local coverage commands produce four report formats under `coverage/<mode>/`:
 ### 3.1 Expectations
 
 - Every new public function, method, or behaviour **must** have at least one unit test.
-- Tests live next to the code they exercise, in a `#[cfg(test)] mod tests` block.
-- Use descriptive names: `test_<function>_<scenario>_<expected>`.
+- Tests live in a sibling file `<stem>_tests.rs`, included from the module under test with
+  `#[cfg(test)] #[path = "<stem>_tests.rs"] mod <stem>_tests;`. Architecture lint DE1101
+  (`cargo gears lint`, configured in [`dylint.toml`](../../dylint.toml)) rejects inline test
+  blocks over 100 lines; see
+  [ADR 0001](../adrs/tests/0001-tests-in-separate-files.md) and
+  [`12_unit_testing.md` § Test File Organization](12_unit_testing.md#test-file-organization).
+- Name tests after the behaviour they check, in snake_case and without a `test_` prefix:
+  `{subject}_{scenario}_{outcome}`, e.g. `stream_events_returns_404_for_unknown_subscription`.
 - Prefer deterministic assertions — avoid sleeping or time-dependent checks.
 
 ### 3.2 Running
 
 ```bash
 make test                              # workspace unit tests via nextest
-make test GEAR=file-parser             # one gear plus SDK package scope
+make test GEAR=file-parser             # gear + SDK packages and their reverse dependencies
 make test GEAR=file-parser GEAR_FEATURES=integration
 cargo test --workspace                 # all unit tests
 cargo test -p cf-gears-oagw            # single package
 cargo test -p cf-gears-toolkit-db -- cursor  # filtered by name
 ```
 
-`GEAR=<name>` defaults to packages `cf-gears-<name>` and `cf-gears-<name>-sdk`. Override `GEAR_PKG`, `GEAR_SDK_PKG`, `GEAR_FEATURES`, or `GEAR_TEST_ARGS` when a gear has non-standard package names or needs extra Cargo flags.
+`GEAR=<name>` selects the packages under `GEAR_PKG_DIRS` (default `gears,libs`) whose names match `GEAR_NAME_REGEXP` (`<name>`, `<name>-sdk`, `cf-gears-<name>`, `cf-gears-<name>-sdk`, and a prefixed form such as `bss-ledger`). `make test` adds every workspace crate that depends on them (`cargo gears ls packages ... --include-rdeps` in the `test` target of `.gears-dna/gears.mk`), so a change to a shared crate also runs its consumers' tests. Override `GEAR_NAME_REGEXP` or `GEAR_PKG_DIRS` for non-standard package names, and use `GEAR_FEATURES` or `GEAR_TEST_ARGS` for extra Cargo flags.
 
 ---
 
@@ -162,14 +169,14 @@ make test-integration                         # every integration lane (`make he
 
 ### 4.3 CI
 
-The `integration` job in `ci.yml` runs the SQLite, Postgres, PGQ (PostgreSQL 19, with
-`GEARS_TEST_PG_GRAPH_REQUIRED=1` so an unavailable image fails the step rather than skipping
-it) and MySQL integration tests plus macro UI tests on every PR (Ubuntu only).
+The `integration` job in `ci.yml` runs the toolkit-db SQLite, Postgres, PGQ (PostgreSQL 19)
+and MySQL lanes, most gear lanes (`make test-integration LANE=<lane>`), and the macro UI tests
+(`make test-macros`) on every PR (Ubuntu only).
 
 ### 4.4 Database container images
 
 Every fixture that starts a database container goes through
-[`libs/test-containers`](../libs/test-containers/src/lib.rs) (crate
+[`libs/test-containers`](../../libs/test-containers/src/lib.rs) (crate
 `cf-gears-test-containers`, imported as `test_containers`). It is the single place image
 versions are pinned, so a version change is one reviewed diff instead of a grep across the
 workspace.
@@ -200,7 +207,7 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`redis()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
+`kafka()`, `redis()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
 
 `timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
 `ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
@@ -222,6 +229,8 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
 | `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
 | `GEARS_TEST_REDIS_TAG` | `REDIS_TAG` |
+| `GEARS_TEST_KAFKA_TAG` | `KAFKA_TAG` |
+| `GEARS_TEST_NETSHOOT_TAG` | `NETSHOOT_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
@@ -230,13 +239,15 @@ GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features 
 `GEARS_TEST_TIMESCALEDB_TAG` and `GEARS_TEST_CLICKHOUSE_TAG` are each read by *both* lanes: the
 Rust plugin fixtures via `test_containers::timescaledb()` / `clickhouse()`, and the Python E2E
 sidecars via `timescaledb_tag()` / `clickhouse_tag()` in
-[`testing/e2e/lib/sidecars.py`](../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
+[`testing/e2e/lib/sidecars.py`](../../testing/e2e/lib/sidecars.py). A matrix run therefore keeps
 migrations and E2E on the same image instead of silently testing two different ones.
 
-Because those two pins are spelled once per language, each is duplicated across a Rust constant
-and a Python one. The unit tests `e2e_sidecar_pins_the_same_timescaledb_image` and
+Because those pins are spelled once per language, each is duplicated across a Rust constant
+and a Python one; the same holds for the PostgreSQL pin (`POSTGRES_TAG`, `GEARS_TEST_PG_TAG`,
+`postgres_tag()`), which self-managed PostgreSQL E2E lanes use. The unit tests
+`e2e_sidecar_pins_the_same_timescaledb_image`, `e2e_sidecar_pins_the_same_postgres_image` and
 `e2e_sidecar_pins_the_same_clickhouse_image` in `libs/test-containers` read `sidecars.py` and
-fail the build if either copy drifts — so a version bump is still a single reviewed decision even
+fail the build if any copy drifts — so a version bump is still a single reviewed decision even
 though it touches two files.
 
 `GEARS_TEST_PG_GRAPH_REQUIRED=1` turns an unavailable PostgreSQL 19 image into a failure rather
@@ -257,7 +268,8 @@ httpx).
 
 - Every user-facing REST endpoint **should** have at least one E2E smoke test.
 - Critical flows (CRUD, auth, error responses) **must** have full E2E coverage.
-- Mark lightweight, fast tests with `@pytest.mark.smoke` — these run on every PR.
+- Mark lightweight, fast tests with `@pytest.mark.smoke`; `make e2e-local-smoke` runs only them. CI
+  does not select by the marker yet: PRs run the full suite (5.3).
 
 ### 5.2 Modes
 
@@ -283,7 +295,8 @@ and `GEAR=` are mutually exclusive.
 The `e2e.yml` workflow runs:
 - **On PRs to `main`**: full E2E suite (local mode).
 - **Nightly**: full E2E suite. Failures auto-create a GitHub issue assigned to the last commit author.
-- **Manual dispatch**: smoke or full, selectable.
+- **Manual dispatch**: a `mode` input (`smoke` or `full`); both currently run the full suite (TODO in
+  `e2e.yml` to switch smoke to `make e2e-local-smoke`).
 - **Specialized lanes**: the same workflow also runs the mini-chat E2E suite, the
   RG + AuthZ end-to-end chain tests, and the usage-collector suite.
 
@@ -305,23 +318,15 @@ plugin connects and migrates a real TimescaleDB (or ClickHouse) at gear init, wh
 Docker is unreachable the suite skips rather than fails, so verify the skip count before
 reading a green run as coverage.
 
-Those containers are labelled per run, so two sessions can share one host without
-reaping each other's database: the label value ends in a per-process `RUN_ID`, and
-containers left behind by a crashed run (where `atexit` never fired) are swept on the
-next start by age rather than by label alone. Set `CF_GEARS_E2E_RUN_ID` to pin the run
-identity, and `CF_GEARS_E2E_REAP_MIN_AGE_SECS` (default 3600) to change how old a
-foreign container must be before it counts as leaked — lowering it below the length of
-a full session reintroduces the cross-session reap it exists to prevent. Values below
-the 600s floor (`REAP_MIN_AGE_FLOOR_SECS`), and anything that is not an integer, are
-rejected at import with an error naming the variable; unset or empty means the default.
-`reap_stale()` refuses a sub-floor threshold passed directly too, so neither a bad
-override nor a careless caller can turn the age-gated sweep into a host-wide removal.
+Those containers are labelled per run so that concurrent sessions on one host do not reap
+each other's database. The run-identity and reap-age settings (`CF_GEARS_E2E_RUN_ID`,
+`CF_GEARS_E2E_REAP_MIN_AGE_SECS`) are documented in
+[`testing/e2e/lib/sidecars.py`](../../testing/e2e/lib/sidecars.py).
 
 Other quality-related GitHub Actions under `.github/workflows` complement the E2E
 workflow:
-- **`ci.yml`** runs the main cross-platform quality gates: linting, unit tests,
-  integration tests, FIPS verification, coverage, security checks, architecture lints, and Cypilot
-  validation.
+- **`ci.yml`** runs the main quality gates: clippy, unit tests, integration tests, FIPS
+  verification, coverage, security checks, architecture lints, and CFS validation.
 - **`fmt.yml`** runs dedicated Rust formatting validation.
 - **`docs.yml`** checks Markdown links for documentation changes.
 - **`gts-validation.yml`** validates GTS identifiers in documentation and schema files.
@@ -329,7 +334,7 @@ workflow:
 
 ### 5.4 Writing E2E tests
 
-The detailed E2E guide is [`testing/e2e/README.md`](../testing/e2e/README.md). Use it as
+The detailed E2E guide is [`testing/e2e/README.md`](../../testing/e2e/README.md). Use it as
 the source of truth for:
 
 - **Adding a new suite** — naming conventions, `testing/e2e/suites/<suite>/` layout,
@@ -355,20 +360,18 @@ attacks.
 ### 6.1 When to fuzz
 
 - Before submitting changes to **parsers**, **validators**, or **deserialization** logic.
-- Nightly via ClusterFuzzLite in CI.
+- In CI, ClusterFuzzLite fuzzes pull requests to `main`/`develop` that touch Rust code.
 
 ### 6.2 Targets
 
-| Target | Priority | Component |
-|--------|----------|-----------|
-| `fuzz_odata_filter` | HIGH | OData `$filter` parser |
-| `fuzz_odata_cursor` | HIGH | Cursor pagination decoder |
-| `fuzz_yaml_config` | HIGH | YAML config parser |
-| `fuzz_html_parser` | MEDIUM | HTML document parser |
-| `fuzz_pdf_parser` | MEDIUM | PDF document parser |
-| `fuzz_json_config` | MEDIUM | JSON config parser |
-| `fuzz_odata_orderby` | MEDIUM | OData `$orderby` parser |
-| `fuzz_markdown_parser` | LOW | Markdown parser |
+Targets live in [`tools/fuzz/fuzz_targets/`](../../tools/fuzz/fuzz_targets/); `make fuzz-list` prints them.
+
+| Target | Component |
+|--------|-----------|
+| `fuzz_odata_filter` | OData `$filter` parser |
+| `fuzz_odata_cursor` | Cursor pagination decoder |
+| `fuzz_odata_orderby` | OData `$orderby` parser |
+| `fuzz_http_proxy_sanitize` | HTTP proxy request sanitization |
 
 ### 6.3 Running
 
@@ -380,8 +383,7 @@ make fuzz-build                          # build without running
 make fuzz-clean                          # remove fuzzing artifacts
 ```
 
-Fuzzing runs automatically in CI via ClusterFuzzLite.
-See [`fuzz/README.md`](../tools/fuzz/README.md) for corpus management and crash reproduction.
+See [`fuzz/README.md`](../../tools/fuzz/README.md) for corpus management and crash reproduction.
 
 ---
 
@@ -394,13 +396,12 @@ Requires Python 3.9+.
 ### 7.1 Cross-platform commands (`tools/scripts/ci.py`)
 
 ```bash
-python tools/scripts/ci.py all            # build + full check suite + e2e
-python tools/scripts/ci.py check          # fmt, clippy, test, audit, deny
+python tools/scripts/ci.py all            # check + toolkit-db SQLite integration + release build + e2e
+python tools/scripts/ci.py check          # fmt, cfs-validate, docker-pins, clippy, test, gts-docs, audit, deny
 python tools/scripts/ci.py fmt            # check formatting
 python tools/scripts/ci.py fmt --fix      # auto-format code
 python tools/scripts/ci.py clippy         # run linter
 python tools/scripts/ci.py clippy --fix   # attempt to fix warnings
-python tools/scripts/ci.py lint           # custom project compliance lints (via cargo gears lint)
 python tools/scripts/ci.py audit          # security audit
 python tools/scripts/ci.py deny           # license & dependency checks
 python tools/scripts/ci.py e2e-local      # build server + run E2E tests locally
@@ -435,18 +436,20 @@ cargo install cargo-llvm-cov                    # coverage backend (works on Win
 The `Makefile` wraps the same operations for convenience:
 
 ```bash
-make all        # build + check + toolkit-db-sqlite lane + e2e-local
-make check      # fmt + clippy + test + security
+make all        # check + integration lane toolkit-db-sqlite + e2e-local + openapi
+make check      # full local quality gate: formatting, clippy, architecture lints, security,
+                # docs/link/GTS checks, Dockerfile pins, CFS validation, unit tests
+                # (prerequisites of `check:` in gears-rust.mk)
 make build      # whole-project example server release binary
 make run        # default example server
-make fmt        # formatting check (cargo fmt --all -- --check)
+make fmt        # formatting check (cargo fmt --all --check)
 make dev-fmt    # auto-format (cargo fmt --all)
 make clippy     # linting (clippy --workspace --all-targets --all-features)
 make lint       # compile with -D warnings
-make gears-lint # custom architectural lints (via cargo gears lint)
+make dylint     # custom architectural lints (cargo gears lint --dylint)
 make deny       # cargo deny check
-make kani       # Kani formal verification (optional)
-make safety     # clippy + kani + lint + gears-lint
+make kani       # Kani formal verification (optional, not run in CI)
+make safety     # clippy + kani + lint + dylint
 ```
 
 Common gear-scoped targets accept `GEAR=<name>` for focused local iteration. `make build GEAR=<name>` and `make test GEAR=<name>` select the gear crate plus its SDK crate. `make run GEAR=<name>` composes `cf-gears-example-server` with the gear feature and the static local development core gears. E2E instead uses `SUITE=<name>`: `make e2e-local SUITE=<name>` maps kebab-case suite names to `testing/e2e/suites/<name_with_underscores>` (a suite is often, but not always, a gear).
@@ -458,19 +461,22 @@ Gear runtime settings are YAML-driven under `gears:<gear_name>:` with a `config`
 ```
 PR opened / updated
   ├── ci.yml
-  │     ├── clippy        — clippy
+  │     ├── clippy        — make clippy, test-container pin check
   │     ├── repo-checks   — repo file checks (gear names, release config)
-  │     ├── test          — unit tests (Ubuntu)
-  │     ├── integration   — DB integration tests (Ubuntu)
+  │     ├── test          — unit tests (Ubuntu; test-suite.yml)
+  │     ├── integration   — DB integration lanes and macro UI tests (Ubuntu)
   │     ├── test-fips     — FIPS verification / platform-specific FIPS test lanes
+  │     ├── test-graph-storage, test-github-mirror-coverage — gear lanes with an 85 % coverage floor
+  │     ├── test-onnx-embedding, test-magika — feature-specific lanes
   │     ├── security      — cargo-deny
   │     ├── coverage      — cargo-llvm-cov → Codecov upload
-  │     ├── lint          — custom architectural lints (cargo gears lint)
-  │     └── cypilot       — artifact / specification validation
+  │     ├── lint          — make dylint (cargo gears lint)
+  │     └── cfs           — artifact / specification validation (cfs.yml)
   │
-  ├── fmt.yml             — dedicated cargo fmt validation for Rust changes
+  ├── fmt.yml             — make fmt for Rust changes
   ├── docs.yml            — Markdown link checking for docs changes
   ├── gts-validation.yml  — GTS identifier validation for docs / schema changes
+  ├── clusterfuzzlite.yml — fuzzing (PRs touching Rust code)
   └── e2e.yml (PRs to main only)
         └── e2e           — full E2E suite (local mode), plus mini-chat, TR/AuthZ
                             and usage-collector E2E lanes
@@ -483,33 +489,18 @@ Additional quality workflows
 Nightly (schedule)
   ├── macos-windows-tests.yml — unit tests on macOS and Windows (auto-creates issue on failure)
   ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
-  ├── clusterfuzzlite      — fuzz testing
-  ├── codeql.yml           — scheduled code scanning
-  ├── pr-governance.yml    — governance / follow-up automation
-  └── pr-reviewer-check.yml — reviewer assignment checks
+  ├── clippy-nightly.yml, shear-nightly.yml — make clippy-deep, make shear
+  └── codeql.yml           — scheduled code scanning
+
+Other schedules
+  ├── pr-governance.yml    — governance / follow-up automation (08:00 and 13:00 UTC)
+  └── pr-reviewer-check.yml — reviewer assignment checks (every 10 minutes)
 ```
 
 ### 7.4 CI build cache
 
-On the organisation's self-hosted runners (`.github/runners/README.md`) the Rust jobs
-compile with sccache against the shared build cache, wired up by
-`.github/actions/ci-cache`: sccache for compiled objects, a download cache for the Cargo
-registry and git checkouts. Only a push to `main` writes. That job enters the
-`ci-trusted` environment, whose secrets `CI_CACHE_RW_KEY_ID` and `CI_CACHE_RW_SECRET`
-hold the read-write key and whose deployment-branch policy admits `main` alone; every
-other run reads with the read-only key the runner carries. PR code can read its job's
-key, so only the branch rule keeps the write key out of PRs.
-
-On a GitHub-hosted runner (fork pull requests, the `GEARS_FORCE_GITHUB_HOSTED` kill
-switch) the action prints a notice and does nothing: those runs keep
-`Swatinem/rust-cache` for the registry and build with plain rustc.
-
-The action's post step writes `sccache --show-stats` into the job summary. A `main`
-run whose job is not under `ci-trusted` shows a warning and reads only.
-
-Tool versions on the self-hosted runners (protoc, nextest, cargo-llvm-cov, cargo-hack,
-cargo-deny, cargo-shear, the nightly pin) come from the runner image, which the platform
-owners rebuild weekly; a bump in the workflows needs the matching change there.
+Self-hosted runners, the shared sccache build cache (`.github/actions/ci-cache`) and its
+read/write key policy are documented in [`.github/runners/README.md`](../../.github/runners/README.md).
 
 ## 8. Custom Architecture Lints
 
@@ -524,12 +515,13 @@ separate `cf-cli` repository) and are run via `cargo gears lint`.
 Useful local commands include:
 
 ```bash
-cargo gears lint          # run custom lints across the workspace
-make gears-lint           # Makefile shortcut for the above
+cargo gears lint --dylint # run custom lints across the workspace
+make dylint               # Makefile shortcut for the above
 make gts-docs             # validate GTS identifiers in docs and schema files
 ```
 
-The CI `lint` job applies the architecture lints to the workspace on every PR.
+The CI `lint` job runs `make dylint` on every PR. Lint settings (for example DE1101's
+`max_inline_test_lines` and `excluded_paths`) are in [`dylint.toml`](../../dylint.toml).
 
 ---
 
@@ -537,11 +529,11 @@ The CI `lint` job applies the architecture lints to the workspace on every PR.
 
 | Tool | Purpose | Command | CI job |
 |------|---------|---------|--------|
-| **clippy** | Lint for correctness and performance | `make clippy` | `test` |
-| **rustfmt** | Formatting enforcement | `make fmt` | `test` |
-| **cargo gears lint** | Project-specific architectural lints (layer separation, DTO placement) | `cargo gears lint` | `lint` |
+| **clippy** | Lint for correctness and performance | `make clippy` | `clippy` |
+| **rustfmt** | Formatting enforcement | `make fmt` | `fmt.yml` |
+| **cargo gears lint** | Project-specific architectural lints (layer separation, DTO placement, test file placement) | `make dylint` | `lint` |
 | **cargo-deny** | License compliance, advisories, banned crates | `make deny` | `security` |
-| **cargo-kani** | Formal verification of unsafe code and invariants | `make kani` | `test` (via `safety`) |
+| **cargo-kani** | Formal verification of unsafe code and invariants | `make kani` | manual |
 | **cargo-geiger** | Audit of `unsafe` usage in dependencies | `make geiger` | manual |
 
 ---
@@ -550,11 +542,11 @@ The CI `lint` job applies the architecture lints to the workspace on every PR.
 
 Before opening a PR, verify:
 
-- [ ] `make check` passes (fmt + clippy + unit tests + security)
+- [ ] `make check` passes (or, scoped to one gear, `make gear-ci GEAR=<gear>` and `make dylint`)
 - [ ] New code has unit tests
 - [ ] Integration tests added/updated if DB logic changed
 - [ ] E2E tests added/updated if REST endpoints changed
-- [ ] `make coverage-unit` shows no regression below the 80 % threshold
+- [ ] `make coverage-unit` shows no gear you touched newly below the 80 % report threshold
 - [ ] Fuzz targets updated if parser/validator logic changed
 - [ ] No `#[allow(unused)]` or `#[allow(dead_code)]` without justification
 
@@ -562,9 +554,9 @@ Before opening a PR, verify:
 
 ## 11. Related Documents
 
-- [CONTRIBUTING.md](../CONTRIBUTING.md) — development workflow, commit conventions, PR process
-- [testing/e2e/README.md](../testing/e2e/README.md) — E2E test guide, fixtures, advanced usage
-- [fuzz/README.md](../tools/fuzz/README.md) — fuzz target reference, corpus management
+- [CONTRIBUTING.md](../../CONTRIBUTING.md) — development workflow, commit conventions, PR process
+- [testing/e2e/README.md](../../testing/e2e/README.md) — E2E test guide, fixtures, advanced usage
+- [fuzz/README.md](../../tools/fuzz/README.md) — fuzz target reference, corpus management
 - `cargo-gears-lints` (in the `cf-cli` repository) — architecture lint catalog and development notes
-- [guidelines/SECURITY.md](../guidelines/SECURITY.md) — secure coding practices
-- [docs/QUICKSTART_GUIDE.md](./QUICKSTART_GUIDE.md) — getting started with the project
+- [guidelines/SECURITY.md](../../guidelines/SECURITY.md) — secure coding practices
+- [docs/QUICKSTART_GUIDE.md](../QUICKSTART_GUIDE.md) — getting started with the project

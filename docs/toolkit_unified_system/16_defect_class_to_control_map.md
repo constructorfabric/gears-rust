@@ -2,6 +2,7 @@
 
 # Defect Class → Control Map
 
+**Design references:** [authorization DESIGN](../arch/authorization/DESIGN.md) · [errors DESIGN](../arch/errors/DESIGN.md) · [database TRADEOFFS](../arch/database/TRADEOFFS.md) · [security overview](../security/SECURITY.md)
 
 <!-- toc -->
 
@@ -44,20 +45,25 @@ confirm each has a control, not a good intention.
   has a hole, and the hole will let the next one through too.
 
 Controls are ordered within each class from cheapest to most thorough. Cheap ones are not weaker —
-a lint that makes a mistake unrepresentable beats a test that catches it after the fact.
+a lint that makes a mistake unrepresentable beats a test that catches it after the fact. Controls
+marked *(proposed)* do not exist yet: no `cargo gears lint` rule implements them (see
+[`dylint.toml`](../../dylint.toml) for the configured lints), so until one does they are review
+items.
 
 ## Tenant isolation bypass
 
 An operation that reads or writes rows belonging to a tenant the caller cannot reach.
 
-- **Lint: an `AccessScope` obtained and then discarded.** Binding a scope to `_` or dropping it is
+- **Lint *(proposed)*: an `AccessScope` obtained and then discarded.** Binding a scope to `_` or dropping it is
   almost always a bypass, and it is statically detectable — the value exists precisely to be
   threaded into the query. This is the single highest-yield control for this class, because the
   mistake is invisible in review (the call to the enforcer *is* there) and invisible in tests that
   use one tenant.
-- **Lint or review gate: `AccessScope::allow_all()` on a production path** without a written
-  justification at the call site. Legitimate uses exist — an in-process PDP that cannot re-enter
-  itself, a migration — and each should have to say so.
+- **Lint *(proposed)* or review gate: `AccessScope::allow_all()` on a production path** without a
+  written justification at the call site. Legitimate uses exist — an in-process PDP that cannot
+  re-enter itself, a migration — and each should have to say so. `chat-engine` confines them to
+  named wrappers in one module, each with an `// AUTHZ-BYPASS: <reason>` marker
+  ([`chat-engine` DESIGN](../../gears/chat-engine/docs/DESIGN.md)).
 - **Two-tenant harness.** For every route, an object created under tenant A must be unreachable and
   unmodifiable under a context for tenant B. A single-tenant suite cannot fail on this class no
   matter how thorough it is, which is why coverage numbers say nothing here.
@@ -84,10 +90,11 @@ Tables with no tenant column — type registries, plugin catalogues, platform-wi
   tenant/resource/owner columns cannot be filtered, so the *only* protection is the permission
   check. Enumerate these entities explicitly; the danger is that they look scoped because every
   neighbouring table is.
-- Note the failure mode peculiar to this class: since there is nothing to filter, a resource
-  descriptor that advertises no properties makes a PDP's baseline constraint fail to *compile*, and
-  a permitted caller receives 500 rather than a result. Fail-closed here looks like an outage, not
-  like a denial.
+- Watch for the failure mode peculiar to this class: a resource descriptor that advertises no
+  properties makes a PDP's baseline constraint fail to compile, so a permitted caller gets 500, not a
+  result. Fail-closed here looks like an outage, not a denial. The rules behind it:
+  [`require_constraints` flag](../arch/authorization/DESIGN.md#require_constraints-flag),
+  [Fail-Closed Rules](../arch/authorization/DESIGN.md#fail-closed-rules).
 
 ## Wire ↔ storage type mismatch
 
@@ -195,11 +202,17 @@ survive.
 
 ## Related documents
 
-- `12_unit_testing.md`, `13_e2e_testing.md` — how to write the controls named above.
-- `14_security_review_checklist.md` — the walk-before-merge form of the tenant-scope, global-table,
-  disclosure and in-process classes.
-- `15_gear_api_baseline.md` — the walk-before-merge form of the API-completeness class.
-- `11_database_patterns.md` — transactions, isolation and retry, for the concurrency class.
-- `14_db_behavior_testing.md` — rules with no exceptions and the audit method for this map's "N+1 and query-count
-  regressions" and "Concurrency and write-skew" rows; the choices behind them are in
-  `docs/arch/database/TRADEOFFS.md`.
+- [`12_unit_testing.md`](12_unit_testing.md), [`13_e2e_testing.md`](13_e2e_testing.md) — how to
+  write the controls named above.
+- [`06_authn_authz_secure_orm.md` § Quick checklist](06_authn_authz_secure_orm.md#quick-checklist)
+  and the PR-review security rules in
+  [`docs/toolkit-pr-review/rules/security.md`](../toolkit-pr-review/rules/security.md) — the
+  walk-before-merge form of the tenant-scope, global-table, disclosure and in-process classes.
+- [`04_rest_operation_builder.md` § Quick checklist](04_rest_operation_builder.md#quick-checklist) —
+  the nearest existing checklist for the API-completeness class; there is no gear API baseline
+  document yet.
+- [`11_database_patterns.md`](11_database_patterns.md) — transactions, isolation and retry, for the
+  concurrency class.
+- [`14_db_behavior_testing.md`](14_db_behavior_testing.md) — rules with no exceptions and the audit
+  method for this map's "N+1 and query-count regressions" and "Concurrency and write-skew" rows; the
+  choices behind them are in [`docs/arch/database/TRADEOFFS.md`](../arch/database/TRADEOFFS.md).

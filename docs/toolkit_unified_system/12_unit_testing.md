@@ -3,7 +3,7 @@
 
 # Unit & Integration Testing Guide
 
-This document defines the philosophy, infrastructure, and patterns for unit and integration tests across all ToolKit gears. Gear-specific test plans (which test cases to add, gap analysis, domain-specific assertions) live in each gear's `docs/features/` folder.
+This document defines the philosophy, infrastructure, and patterns for unit and integration tests across all ToolKit gears. Gear-specific test plans (which test cases to add, gap analysis, domain-specific assertions) are out of scope. Commands, CI jobs and coverage rules are in [15_testing_and_ci.md](15_testing_and_ci.md).
 
 ---
 
@@ -35,7 +35,7 @@ Every test must pass all three:
    If yes — it belongs here. Type validation, hierarchy invariants, field constraints, error mapping — all deterministic, all testable without HTTP.
 
 2. **"Is this test atomic and fast?"**
-   One `#[test]` = one scenario. No `sleep()`, no `timeout()`, no retry loops. Each test creates its own SQLite DB and service instances. Tests run in parallel (`cargo test -j N`). Target: entire suite < 5 seconds.
+   One `#[test]` = one scenario. No `sleep()`, no `timeout()`, no retry loops. Each test creates its own SQLite DB and service instances. Tests run in parallel under `cargo nextest`. Target: entire suite < 5 seconds.
 
 3. **"Does removing this test reduce confidence in domain correctness?"**
    If not — the test is redundant. Every test must guard a specific behavior that, if broken, would allow data corruption, invariant violation, or silent failure.
@@ -46,10 +46,10 @@ Every test must pass all three:
 |-------|------|-----|
 | **Domain services** | Entity CRUD, lifecycle operations, business invariants | `#[tokio::test]` with SQLite `:memory:` + mocked AuthZ |
 | **Domain validation** | Format validation, invariant enforcement, field length limits | `#[test]` pure logic, no DB |
-| **Value objects** | Parsing, normalization, serde round-trip | `#[cfg(test)]` in-source |
-| **Error chains** | `DomainError` → gear error → RFC 9457 `Problem`, external error → `DomainError` | `#[test]` pure logic |
-| **DTO conversions** | `From` impls, serde attributes (`rename`, `skip_serializing_if`, `default`, `camelCase`) | `#[cfg(test)]` in-source |
-| **OData fields** | `FilterField` name/kind mapping, OData mapper field→column | `#[cfg(test)]` in-source |
+| **Value objects** | Parsing, normalization, serde round-trip | sibling `*_tests.rs` |
+| **Error chains** | `DomainError` → `CanonicalError` → RFC 9457 `Problem`, external error → `DomainError` | `#[test]` pure logic |
+| **DTO conversions** | `From` impls, serde attributes (`rename`, `skip_serializing_if`, `default`, `camelCase`) | sibling `*_tests.rs` |
+| **OData fields** | `FilterField` name/kind mapping, OData mapper field→column | sibling `*_tests.rs` |
 | **Seeding** | Idempotent bootstrap logic: create/skip/update semantics | `#[tokio::test]` with DB assertion |
 | **Surrogate ID non-exposure** | API responses contain string identifiers, never internal numeric IDs | REST-level `Router::oneshot` |
 
@@ -66,7 +66,7 @@ All of the above requires real PostgreSQL; the entries that name the transport o
 
 Routing a case to E2E only counts as coverage if the venue actually runs on PostgreSQL. Some pytest harnesses seed SQLite directly; sending a PostgreSQL-specific case there moves it out of the unit suite without testing it anywhere.
 
-Where the divergence is in the SQL or the schema rather than in the transport — a dialect rejection, a column width, a `CHECK` or FK — the better venue is usually a feature-gated Rust suite against real PostgreSQL via `testcontainers`, calling repository or service code directly. It is in use today (`--features integration`, a `test-<gear>-pg` target, a step in CI's `integration` job) and diagnoses the failure far more precisely than an HTTP status. See [Check which venue you actually have](13_e2e_testing.md#coverage-goal-one-call-per-api-method) in the E2E guide; record a gap only when neither venue exists.
+Where the divergence is in the SQL or the schema rather than in the transport — a dialect rejection, a column width, a `CHECK` or FK — the better venue is usually a feature-gated Rust suite against real PostgreSQL via `testcontainers`, calling repository or service code directly. It is in use today (`--features integration`, a `make test-integration LANE=<lane>` lane, one of `INTEGRATION_LANES` in `gears-rust.mk`, a step in CI's `integration` job) and diagnoses the failure far more precisely than an HTTP status. See [Check which venue you actually have](13_e2e_testing.md#coverage-goal-one-call-per-api-method) in the E2E guide; record a gap only when neither venue exists.
 
 ### Relationship to E2E Tests
 
@@ -77,7 +77,7 @@ Unit and E2E tests form a **complementary pair with zero overlap**:
 | Domain invariants | **Yes** (primary) | No |
 | Field validation | **Yes** (service-level) | No |
 | Table row correctness | **Yes** (SQLite) | Yes (PostgreSQL dialect) |
-| Error response format | DomainError→Problem mapping | HTTP headers + Content-Type |
+| Error response format | `DomainError` → `CanonicalError` → `Problem` mapping | HTTP headers + Content-Type |
 | Tenant isolation | AccessScope construction + scoped queries | Real tokens + real WHERE |
 | JSON wire format | DTO serde attrs in-source | Full HTTP roundtrip |
 | OData $filter | FilterField name/kind | Full parse→SQL→result chain |
@@ -88,31 +88,17 @@ If a bug is catchable by calling a Rust function directly, it lives in unit test
 
 ## Reliability Principles
 
-**Atomic** — one `#[test]` = one behavior. No compound "test everything" functions.
-
-**Fast** — no `sleep`, no `timeout`, no `tokio::time::*`, no polling. SQLite `:memory:` is ~1ms. Target: full suite < 5s.
-
-**Independent** — no shared state. Each test creates its own DB. `cargo test -j N` runs in parallel.
-
-**Synchronous where possible** — pure logic uses `#[test]`, not `#[tokio::test]`. Async only when DB is involved.
-
-**Direct DB assertions** — do not rely solely on service-layer reads (they go through AccessScope). Use the concrete entity type (e.g., `UserEntity::find()` with `use sea_orm::EntityTrait;` in scope) directly to verify table state.
-
-**No new crate dependencies for testing** — follow project conventions: `assert!(matches!(err, Variant { .. }), "msg: {err:?}")` not `assert_matches!`. Manual `vec![]` + loop for table-driven tests, not `rstest`. Plain `async fn` helpers, not fixtures.
-
-**No retry testing** — SERIALIZABLE retry loops are an implementation detail. Tests do not simulate contention.
+1. **Atomic**: each test verifies exactly one behavior. No compound "test everything" functions.
+2. **Fast**: no `sleep`, no `timeout`, no `tokio::time::*`, no polling, no retries. SQLite `:memory:` is ~1ms. Target: entire suite < 5s.
+3. **Independent**: no shared state. Each test creates its own `SQLite :memory:` DB and fresh service instances. Tests run in any order and in parallel.
+4. **Synchronous where possible**: pure logic tests are `#[test]`, not `#[tokio::test]`. Async only when DB or service layer is involved.
+5. **Direct DB queries for state verification**: use the concrete entity's `find()` method (e.g., `MyEntity::find()` with `use sea_orm::EntityTrait;` in scope) to inspect table state. Do not rely solely on service-layer reads to verify writes (service reads go through `AccessScope`, which may filter).
+6. **No new crate dependencies for testing**: `assert!(matches!(err, Variant { .. }), "msg: {err:?}")`, not `assert_matches!`. Manual `vec![]` + loop for table-driven tests, not `rstest`. Plain functions for setup, not fixtures.
+7. **No retry testing**: SERIALIZABLE retry loops are an implementation detail. Tests do not simulate contention.
 
 ---
 
 ## Test Infrastructure
-
-### Core Principles
-
-1. **Atomic**: each test verifies exactly one behavior. No "also check this while we're here".
-2. **Fast**: no `sleep`, no `timeout`, no `tokio::time::*`, no polling, no retries. Target: entire suite < 5s.
-3. **Independent**: no shared state. Each test creates its own `SQLite :memory:` DB and fresh service instances. Tests run in any order and in parallel.
-4. **Synchronous where possible**: pure logic tests are `#[test]`, not `#[tokio::test]`. Async only when DB or service layer is involved.
-5. **Direct DB queries for state verification**: use the concrete entity's `find()` method (e.g., `MyEntity::find()` with `use sea_orm::EntityTrait;` in scope) directly to inspect table state. Do NOT rely solely on service-layer reads to verify writes (service reads go through AccessScope which may filter).
 
 ### Anti-Patterns (DO NOT)
 
@@ -152,19 +138,23 @@ assert!(
 assert!(err.to_string().contains("not found"));
 ```
 
+Handlers return `CanonicalError`; the gear's `From<DomainError> for CanonicalError` is the mapping under test. Convert to the wire `Problem` to check the status (`Problem::status` is `Option<u16>`) and the GTS `problem_type`, as `chat-engine` does in [`api/rest/error_tests.rs`](../../gears/chat-engine/chat-engine/src/api/rest/error_tests.rs).
+
 **Table-driven tests** — use manual `vec![]` + loop (NOT `rstest`):
 
 ```rust
+use toolkit_canonical_errors::{CanonicalError, Problem};
+
 #[test]
 fn domain_errors_map_to_correct_status_codes() {
-    let cases: Vec<(DomainError, StatusCode)> = vec![
-        (DomainError::not_found("x"), StatusCode::NOT_FOUND),
-        (DomainError::validation("x"), StatusCode::BAD_REQUEST),
-        (DomainError::conflict("x"), StatusCode::CONFLICT),
+    let cases: Vec<(DomainError, u16)> = vec![
+        (DomainError::not_found("x"), 404),
+        (DomainError::validation("x"), 400),
+        (DomainError::conflict("x"), 409),
     ];
     for (err, expected_status) in cases {
-        let problem: Problem = err.into();
-        assert_eq!(problem.status, expected_status, "for error: {problem:?}");
+        let problem = Problem::from(CanonicalError::from(err));
+        assert_eq!(problem.status, Some(expected_status), "for error: {problem:?}");
     }
 }
 ```
@@ -192,58 +182,64 @@ fn value_object_invalid_cases() {
 }
 ```
 
-**Setup helpers** — plain `async fn` in `tests/common/mod.rs` (NOT fixtures, NOT `rstest`).
+**Setup helpers** — plain functions in a `#[cfg(test)] mod test_support;` module of the crate (NOT fixtures, NOT `rstest`).
 
-### Shared Test Helpers (`tests/common/mod.rs`)
+### Shared Test Helpers
 
-Extract duplicated setup code into a shared gear:
+Put setup shared by several test files in a crate-private `test_support` module. `users-info` declares `#[cfg(test)] mod test_support;` in `lib.rs`; [`test_support.rs`](../../examples/toolkit/users-info/users-info/src/test_support.rs) provides, among others:
 
 ```rust
-// tests/common/mod.rs
+/// SQLite in-memory DB with the gear's migrations applied.
+pub async fn inmem_db() -> Db { ... }
 
-/// SQLite in-memory DB with migrations. ~1ms per call.
-pub async fn test_db() -> Arc<DBProvider<DbError>> { ... }
+/// SecurityContext whose subject tenant is the first of `tenants`.
+pub fn ctx_allow_tenants(tenants: &[Uuid]) -> SecurityContext { ... }
 
-/// SecurityContext for given tenant.
-pub fn make_ctx(tenant_id: Uuid) -> SecurityContext { ... }
-
-/// AllowAll PolicyEnforcer (returns tenant-scoped AccessScope).
-pub fn make_enforcer() -> PolicyEnforcer { ... }
+/// Service graph wired with the in-memory DB and a mock AuthZ resolver.
+pub fn build_services(db: Db, config: ServiceConfig) -> Arc<ConcreteAppServices> { ... }
 ```
 
-Gear-specific helpers (e.g., `create_root_group`, `assert_closure_rows`) live alongside the shared helpers in `tests/common/`.
+The same file holds the gear's test doubles (`MockAuthZResolver`, `MockEventPublisher`, `MockAuditPort`). Integration tests under a crate's `tests/` directory cannot see `#[cfg(test)]` items; a few crates keep shared helpers for those in `tests/common/mod.rs`.
 
 ### Naming Convention
 
-Tests follow the pattern `{area}_{scenario}` in snake_case:
+Name a test after the behavior it checks, in snake_case, without a `test_` prefix (the test attribute and the `*_tests.rs` file already say it is a test). The usual shape is `{subject}_{scenario}_{outcome}`:
 
 ```
-entity_create_with_valid_parent_succeeds
-entity_move_under_descendant_returns_cycle_detected
-membership_add_duplicate_returns_conflict
-seeding_idempotent_on_second_run
-value_object_rejects_empty_string
+unsupported_operator_is_rejected
+stream_events_returns_404_for_unknown_subscription
+noop_provider_provision_user_reports_unsupported_operation
+not_found_maps_to_404
+a_rolled_back_enqueue_wakes_nothing
 ```
+
+[15 § 3](15_testing_and_ci.md#3-unit-tests) uses the same rule.
 
 ### Test File Organization
 
-```
-# In-source unit tests (pure logic, #[test] only — instant)
-<gear>-sdk/src/models.rs              # Value object validation, serde round-trip, SDK model shape
-<gear>-sdk/src/odata/<entity>.rs      # FilterField name/kind correctness
-<gear>/src/api/rest/dto.rs            # DTO From impls, serde rename, camelCase, skip_serializing_if
-<gear>/src/infra/storage/odata_mapper.rs  # OData mapper field→column mapping
+Unit tests live in a sibling file `<stem>_tests.rs` next to the module they test, included from that module:
 
-# Integration tests (SQLite :memory: DB, #[tokio::test])
-tests/
-  common/mod.rs               # Shared helpers + assertion helpers
-  domain_unit_test.rs         # DomainError construction, error chains, pure domain logic
-  api_rest_test.rs            # REST layer: Router::oneshot, status codes, JSON shapes, PATCH
-  authz_integration_test.rs   # PolicyEnforcer tenant scoping (mocked PDP)
-  tenant_filtering_db_test.rs # AccessScope + scoped queries on SQLite
-  tenant_scoping_test.rs      # AccessScope construction logic
-  <entity>_service_test.rs    # Domain service: CRUD, invariants, error paths
-  seeding_test.rs             # Idempotent seed: create/skip/update semantics
+```rust
+// src/gear.rs
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;
+```
+
+`#[path]` keeps the test file a child module, so it can test `pub(crate)` and private items with `use super::*;`. Architecture lint DE1101 (`cargo gears lint`, configured in [`dylint.toml`](../../dylint.toml)) rejects inline `#[cfg(test)]` blocks longer than `max_inline_test_lines` (100) and any inline tests in a module that already has a companion file; paths still being migrated are listed in its `excluded_paths`. Rationale: [ADR 0001 — tests in separate files](../adrs/tests/0001-tests-in-separate-files.md). Example: [`tenant-resolver/src/gear.rs`](../../gears/system/tenant-resolver/tenant-resolver/src/gear.rs).
+
+```
+# Unit tests (sibling files, #[test] / #[tokio::test])
+<gear>-sdk/src/models.rs + models_tests.rs        # value objects, serde round-trip
+<gear>-sdk/src/odata/<entity>.rs                   # FilterField name/kind
+<gear>/src/api/rest/dto.rs + dto_tests.rs          # DTO From impls, serde attributes
+<gear>/src/api/rest/error.rs + error_tests.rs      # DomainError → CanonicalError
+<gear>/src/domain/service/<x>.rs + <x>_tests.rs    # service logic on SQLite :memory: + mock PDP
+<gear>/src/test_support.rs                         # shared helpers and test doubles
+
+# Integration tests (public API only, usually behind the `integration` feature)
+<gear>/tests/<suite>.rs
 ```
 
 ---
@@ -268,27 +264,29 @@ assert!(matches!(result.unwrap_err(), DomainError::NotFound { .. }));
 ```rust
 let entity = result.unwrap();
 assert_eq!(entity.name, "Expected Name");
-assert_eq!(entity.tenant_id, ctx.tenant_id());
+assert_eq!(entity.tenant_id, ctx.subject_tenant_id());
 assert_eq!(entity.status, Status::Active);
 assert!(entity.created_at <= Utc::now());
 // Secondary fields matter too — don't skip them
 assert!(entity.metadata.is_none(), "fresh entity should have no metadata");
 ```
 
-**3. Mock call verification** — when using mocks, assert both *how many times* and *with what arguments* each mock was called:
+**3. Mock call verification** — when using test doubles, assert both *how many times* and *with what arguments* each one was called. Most gears use hand-written doubles that record calls ([`mock_manual.rs`](../../examples/toolkit/api-contracts/api-contracts/tests/mock_manual.rs)):
 ```rust
-// Verify the mock was called exactly once
-mock_repo.assert_called_once();
+let calls = payments.charge_calls();
+assert_eq!(calls.len(), 1, "charge must be called exactly once");
+assert_eq!(calls[0].amount_cents, 1000);
 
-// Verify it received the correct input — not just "it was called"
-mock_repo.assert_called_with(CreateEntityRequest {
-    name: "Expected Name".to_string(),
-    tenant_id: tenant_id,
-    ..
-});
+// Negative path: the double was never called
+assert!(payments.charge_calls().is_empty());
+```
 
-// Verify a mock was NOT called (for negative paths)
-mock_notifier.assert_not_called();
+`mockall` is a workspace dependency for cases where expectations are clearer ([`mock_mockall.rs`](../../examples/toolkit/api-contracts/api-contracts/tests/mock_mockall.rs)):
+```rust
+mock.expect_charge()
+    .withf(|_, req: &ChargeRequest| req.amount_cents == 1000 && req.currency == "USD")
+    .times(1)
+    .returning(move |_, _| Ok(ChargeResponse::new(payment_id, PaymentStatus::Pending)));
 ```
 
 **4. Secondary artifacts** — side effects beyond the return value. For DB-backed tests, verify the actual state in storage:
@@ -304,17 +302,7 @@ let orphans = RelatedEntity::find()
 assert_eq!(orphans, 0, "cascade delete must remove related rows");
 ```
 
-### What "Secondary Artifacts" Means in Practice
-
-When an operation succeeds, many things happen beyond the return value. Each is a potential bug surface:
-
-| Operation | What else to assert |
-|-----------|---------------------|
-| **Create entity** | All fields in DB match request (not just the returned struct). FK columns resolved to correct IDs. Timestamps set. |
-| **Update fields** | Changed fields updated in DB. **Unchanged fields untouched** — a partial update must not zero-out unrelated fields. |
-| **Delete entity** | Entity row gone. Related junction rows gone. Parent entity **unaffected**. |
-| **Service call with side effects** | Every observable side effect has an assertion. If a notification is sent, assert it. If a counter increments, assert it. |
-| **Error path** | Not only the error variant, but the error message contains expected context (entity name, field name, violating value). |
+Beyond storage state (see [Table State](#table-state-direct-db-queries)), assert every other observable side effect: a published event, a counter, a notification. On an error path, check that the message names the entity, field or violating value, not only the variant.
 
 ### The "Lazy Assert" Trap
 
@@ -349,9 +337,9 @@ For every write operation, use the concrete entity's `find()` method (e.g., `MyE
 
 | Operation | Required DB Assertions |
 |-----------|----------------------|
-| **Create entity** | Row exists with all fields matching request. FK columns resolved correctly. |
-| **Update fields** | Changed fields updated. Unchanged fields **untouched**. |
-| **Delete entity** | Row gone. Related rows (FK children) handled per cascade policy. |
+| **Create entity** | Row exists with all fields matching the request (not just the returned struct). FK columns resolved correctly. Timestamps set. |
+| **Update fields** | Changed fields updated. Unchanged fields **untouched**: a partial update must not zero out unrelated fields. |
+| **Delete entity** | Row gone. Related rows (FK children, junction rows) handled per cascade policy. Parent entity unaffected. |
 | **Seeding (create)** | Entity physically exists in DB. Junction rows present. |
 | **Seeding (unchanged)** | `updated_at` **not modified** on re-run. |
 
@@ -397,7 +385,7 @@ Tests that prevent data corruption or violate core business rules:
 ### P2 — Important (error paths, REST layer, edges)
 
 Tests that cover secondary paths and REST-level verification:
-- Error conversion chains (`ExternalError` → `DomainError` → `Problem`)
+- Error conversion chains (`ExternalError` → `DomainError` → `CanonicalError`)
 - REST endpoint coverage (PUT, PATCH, DELETE, hierarchy, force operations)
 - DTO conversion correctness (`From` impls, `#[serde(default)]`)
 - OData mapper field→column mapping
@@ -414,10 +402,10 @@ Tests that add confidence without blocking delivery:
 
 ## Acceptance Criteria (gear test suite)
 
-- All unit tests pass (`cargo test -p <gear> -p <gear>-sdk`) — 0 failed
+- All unit tests pass (`make test GEAR=<gear>`) — 0 failed
 - Full suite completes in < 5 seconds
 - Zero `sleep`, `timeout`, or `tokio::time` usage in tests
 - Every domain invariant from gear acceptance criteria is covered by at least one test
-- `make all` (or `make fmt && make lint && make test`) passes with zero errors
+- `make gear-ci GEAR=<gear>` (`fmt`, `clippy`, `test`) and `make dylint` pass with zero errors. `make all` is the full local pipeline (quality gate, integration lane, E2E, OpenAPI), not a per-gear unit-test gate.
 
 See also: [`14_db_behavior_testing.md`](14_db_behavior_testing.md) for DB behavior rules and the query-recorder and barrier tests (reusing this guide's setup), and [`TRADEOFFS.md`](../arch/database/TRADEOFFS.md) for choices such as batching versus per-row queries; concurrency correctness is out of scope here.

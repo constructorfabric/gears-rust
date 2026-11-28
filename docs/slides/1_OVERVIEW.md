@@ -708,7 +708,7 @@ make fuzz            # fuzz smoke tests (30s/target)
 
 On **Windows** (no `make`): `python tools/scripts/ci.py check`
 
-> Full strategy & CI details: `docs/TESTING.md`.
+> Full strategy & CI details: `docs/toolkit_unified_system/15_testing_and_ci.md`.
 
 ---
 
@@ -733,7 +733,7 @@ On **Windows** (no `make`): `python tools/scripts/ci.py check`
 - **Gear overview** — `docs/toolkit_unified_system/00_gear_overview.md`
 - **Authorization design** — `docs/arch/authorization/DESIGN.md`
 - **Security overview** — `docs/security/SECURITY.md`
-- **Testing** — `docs/TESTING.md` · **Contributing** — `CONTRIBUTING.md`
+- **Testing** — `docs/toolkit_unified_system/15_testing_and_ci.md` · **Contributing** — `CONTRIBUTING.md`
 - **Repo playbook** — `docs/REPO_PLAYBOOK.md`
 
 ---

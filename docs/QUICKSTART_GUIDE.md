@@ -1,79 +1,18 @@
 # Gears Server - Quickstart Guide
 
-Start Gears example server and verify it works. For project overview, see [README.md](../README.md).
-
----
-
-## Start the Server
+The maintained getting-started guide is [Build with Gears](web-docs/build-with-gears/index.mdx): prerequisites, first run, calling endpoints, and troubleshooting. This page keeps only the commands.
 
 ```bash
-# With example gears (tenant-resolver, users-info)
-make example
-
-# Or minimal (no example gears)
-make quickstart
+make example     # example server with the example gears (tenant-resolver, users-info, ...)
+make quickstart  # minimal server: types-registry plus the always-linked system gears
 ```
 
-Server runs on `http://127.0.0.1:8087/cf/`.
-The example configuration also sets `gears.api-gateway.config.prefix_path: "/cf"` in `config/quickstart.yaml`, so API docs and endpoints are exposed under `/cf`.
-Change `prefix_path` if you want a different base path, or set it to an empty string to serve the API at the root.
-
----
-
-## Verify It's Running
+Both run `cf-gears-example-server` with [`config/quickstart.yaml`](../config/quickstart.yaml) (see the `run` target in [`gears-rust.mk`](../gears-rust.mk)). The API is served at `http://127.0.0.1:8087/cf/`:
 
 ```bash
-curl -s http://127.0.0.1:8087/cf/health
-# {"status": "healthy", "timestamp": "..."}
+curl -s http://127.0.0.1:8087/cf/health          # health check
+curl -s http://127.0.0.1:8087/cf/openapi.json     # OpenAPI spec
+pkill -f cf-gears-example-server                  # stop the server
 ```
 
----
-
-## API Documentation
-
-### Interactive Documentation
-
-Open <http://127.0.0.1:8087/cf/docs> in your browser for the full API reference with interactive testing.
-
-### OpenAPI Spec
-
-```bash
-curl -s http://127.0.0.1:8087/cf/openapi.json > openapi.json
-```
-
-### Gear Examples
-
-Each gear has a QUICKSTART.md with minimal curl examples:
-
-- [File Parser](../gears/file-parser/QUICKSTART.md) - Parse documents into structured blocks
-- [Nodes Registry](../gears/system/nodes-registry/QUICKSTART.md) - Hardware and system info
-- [Tenant Resolver](../gears/system/tenant-resolver/QUICKSTART.md) - Multi-tenant hierarchy
-- [Construct](../gears/construct/QUICKSTART.md) - Record intake for connectors, and the subject's settings
-
-> **Note:** Gear quickstarts show basic usage only. Use `/cf/docs` for complete API documentation in the example setup. This path is configurable via `api_gateway.prefix_path`.
-
----
-
-## Stop the Server
-
-```bash
-pkill -f cf-gears-server
-```
-
----
-
-## Troubleshooting
-
-| Issue | Solution |
-|-------|----------|
-| Port 8087 in use | `pkill -f cf-gears-server` |
-| Empty tenant-resolver | Use `make example` instead of `make quickstart` |
-| Connection refused | Server not running - check logs |
-
----
-
-## Further Reading
-
-- [/cf/docs](http://127.0.0.1:8087/cf/docs) - Full API reference
-- [ARCHITECTURE_MANIFEST.md](ARCHITECTURE_MANIFEST.md) - Architecture principles
-- [TOOLKIT_UNIFIED_SYSTEM/README.md](./toolkit_unified_system/README.md) - Gear system
+Interactive API docs: <http://127.0.0.1:8087/cf/docs>.

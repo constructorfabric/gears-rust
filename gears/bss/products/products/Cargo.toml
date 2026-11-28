@@ -174,7 +174,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "te
 # writers genuinely in flight at once — `sqlite::memory:` is private to its
 # connection, so a second writer queues on the pool instead of contending.
 testcontainers-modules = { workspace = true }
-# The pinned-image requests every Postgres suite takes (docs/TESTING.md 4.4).
+# The pinned-image requests every Postgres suite takes
+# (docs/toolkit_unified_system/15_testing_and_ci.md 4.4).
 test-containers = { workspace = true }
 # A test's `SQLite` file lives in its own temporary directory, removed with the test (the database,
 # its `-wal` and its `-shm`); before, every run left its files in the user's temp dir.

@@ -142,7 +142,7 @@ gears:
 
 ### Creating Your First Gear
 
-See [TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [TOOLKIT_PLUGINS.md](docs/TOOLKIT_PLUGINS.md) for details.
+See [TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [ToolKit plugins](docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins) for details.
 
 Individual gears live under `gears/<name>/`, usually with a gear crate and an SDK crate. The Makefile builds a single gear by selecting those packages, while `make run GEAR=<name>` composes the example server with `--no-default-features` and the gear feature plus the static local development core gears. Runtime settings stay in YAML under `gears:<gear_name>:` with separate `config` and optional gear-owned `database` sections.
 
@@ -150,7 +150,7 @@ Individual gears live under `gears/<name>/`, usually with a gear crate and an SD
 
 - **[Architecture manifest](docs/ARCHITECTURE_MANIFEST.md)** - High-level overview of the architecture
 - **[Gears](docs/GEARS.md)** - List of all gears and their roles
-- **[TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [TOOLKIT_PLUGINS.md](docs/TOOLKIT_PLUGINS.md)** - how to add new gears.
+- **[TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [ToolKit plugins](docs/toolkit_unified_system/03_clienthub_and_plugins.md#plugins)** - how to add new gears.
 - **[Contributing](CONTRIBUTING.md)** - Development workflow and coding standards
 
 ## Security
@@ -268,7 +268,7 @@ cargo install cargo-llvm-cov                    # coverage backend (or run `make
 ```
 
 For the complete test strategy, coverage policy, CI pipeline details, and all
-available commands see **[docs/TESTING.md](docs/TESTING.md)**.
+available commands see **[Testing, Coverage and CI](docs/toolkit_unified_system/15_testing_and_ci.md)**.
 
 ## Contributing
 

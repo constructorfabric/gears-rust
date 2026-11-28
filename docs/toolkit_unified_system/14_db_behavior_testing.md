@@ -1,5 +1,7 @@
 # DB Behavior Testing & Audit Guide
 
+**Design references:** [database TRADEOFFS](../arch/database/TRADEOFFS.md) · [database ADR-0001 object namespacing](../arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md) · [secure-orm ADR-0001 CTE policy](../arch/secure-orm/ADR/0001-secure-cte-policy.md)
+
 <!-- Created: 2026-09-24 by Constructor Tech -->
 
 <!-- toc -->
